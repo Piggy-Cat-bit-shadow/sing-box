@@ -1,0 +1,152 @@
+package anytls
+
+import (
+	"context"
+	"crypto/sha256"
+	"io"
+	"net"
+	"testing"
+	"time"
+
+	singanytls "github.com/sagernet/sing-anytls"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/stretchr/testify/require"
+)
+
+type discardHandler struct{}
+
+func (discardHandler) NewConnectionEx(context.Context, net.Conn, M.Socksaddr, M.Socksaddr, N.CloseHandlerFunc) {
+}
+
+type captureHandler struct {
+	received chan []byte
+}
+
+func (h captureHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer conn.Close()
+	body, _ := io.ReadAll(conn)
+	h.received <- body
+	if onClose != nil {
+		onClose(nil)
+	}
+}
+
+type responseFallbackHandler struct {
+	payload  []byte
+	received chan []byte
+}
+
+func (h responseFallbackHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer conn.Close()
+	body := make([]byte, len(h.payload))
+	_, _ = io.ReadFull(conn, body)
+	h.received <- body
+	_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
+	if onClose != nil {
+		onClose(nil)
+	}
+}
+
+func TestFallbackPreservesAuthenticationProbe(t *testing.T) {
+	payload := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	backendReceived := make(chan []byte, 1)
+	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{
+		Handler:         discardHandler{},
+		FallbackHandler: responseFallbackHandler{payload: payload, received: backendReceived},
+	})
+	require.NoError(t, err)
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		_ = service.NewConnection(context.Background(), server, M.Socksaddr{}, func(error) { close(done) })
+	}()
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	response := make([]byte, 40)
+	_, err = io.ReadFull(client, response)
+	require.NoError(t, err)
+	require.Equal(t, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK", string(response))
+	select {
+	case received := <-backendReceived:
+		require.Equal(t, payload, received)
+	case <-time.After(time.Second):
+		t.Fatal("fallback backend did not receive payload")
+	}
+	client.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fallback connection did not close")
+	}
+}
+
+func TestFallbackOptionsRequireDestination(t *testing.T) {
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "anytls", option.AnyTLSInboundOptions{
+		Fallback: &option.ServerOptions{},
+	})
+	require.Error(t, err)
+}
+
+func TestFallbackForALPNRequiresTLS(t *testing.T) {
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "anytls", option.AnyTLSInboundOptions{
+		FallbackForALPN: map[string]*option.ServerOptions{
+			"http/1.1": {Server: "127.0.0.1", ServerPort: 8080},
+		},
+	})
+	require.Error(t, err)
+}
+
+func TestFallbackOptionsJSON(t *testing.T) {
+	var options option.AnyTLSInboundOptions
+	err := json.Unmarshal([]byte(`{
+        "fallback": {"server": "127.0.0.1", "server_port": 8080},
+        "fallback_for_alpn": {"h2": {"server": "127.0.0.1", "server_port": 8081}}
+    }`), &options)
+	require.NoError(t, err)
+	require.Equal(t, uint16(8080), options.Fallback.ServerPort)
+	require.Equal(t, uint16(8081), options.FallbackForALPN["h2"].ServerPort)
+}
+
+func TestNoFallbackKeepsAuthenticationFailure(t *testing.T) {
+	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{Handler: discardHandler{}})
+	require.NoError(t, err)
+	client, server := net.Pipe()
+	defer client.Close()
+	result := make(chan error, 1)
+	go func() {
+		result <- service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+	}()
+	_, err = client.Write([]byte("ordinary HTTP probe"))
+	require.NoError(t, err)
+	require.Error(t, <-result)
+}
+
+func TestFallbackHandlesWrongPassword(t *testing.T) {
+	received := make(chan []byte, 1)
+	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{
+		Handler:         discardHandler{},
+		FallbackHandler: captureHandler{received: received},
+	})
+	require.NoError(t, err)
+	client, server := net.Pipe()
+	defer client.Close()
+	wrongPassword := sha256.Sum256([]byte("wrong-password"))
+	payload := append(wrongPassword[:], []byte("probe payload")...)
+	go func() {
+		_ = service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+	}()
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	client.Close()
+	select {
+	case actual := <-received:
+		require.Equal(t, payload, actual)
+	case <-time.After(time.Second):
+		t.Fatal("wrong password did not enter fallback")
+	}
+}

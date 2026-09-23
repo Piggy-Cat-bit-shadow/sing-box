@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feat/http-inbound-masquerade
+      - testing
+      - feat/**
 
 permissions:
   contents: read
@@ -26,7 +27,7 @@ jobs:
           # the release toolchain. This portable Linux build uses upstream's
           # non-Cronet tag set, which still includes with_quic.
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          go build -trimpath -tags "$TAGS" -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.15.0-jiejie-masquerade.1" -o sing-box-linux-amd64 ./cmd/sing-box
+          go build -trimpath -tags "$TAGS" -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.15.0-jiejie-masquerade.2" -o sing-box-linux-amd64 ./cmd/sing-box
           sha256sum sing-box-linux-amd64 > sing-box-linux-amd64.sha256
       - uses: actions/upload-artifact@v4
         with:
