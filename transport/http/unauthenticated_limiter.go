@@ -32,6 +32,10 @@ type unauthenticatedLimiter struct {
 	// acquisitions counts acquire calls since the last sweep. It is read and
 	// written only under access.
 	acquisitions int
+	// accounted counts every request the limiter has accounted, including a
+	// failed authentication that was admitted. It exists for tests and is only
+	// ever mutated under access, so it adds no lock traffic on the hot path.
+	accounted int
 }
 
 type unauthenticatedState struct {
@@ -93,6 +97,7 @@ func (l *unauthenticatedLimiter) acquire(source string, now time.Time) (func(), 
 	}
 	l.access.Lock()
 	defer l.access.Unlock()
+	l.accounted++
 	// Amortized expiry: only sweep every cleanupInterval acquisitions or when the
 	// map is at its cap. Sweeping on every call was O(tracked IPs) per request.
 	l.acquisitions++
@@ -199,6 +204,17 @@ func (l *unauthenticatedLimiter) evictLocked(now time.Time) {
 		candidates = candidates[:len(candidates)-1]
 	}
 	_ = now
+}
+
+// accountedCount reports how many requests the limiter has accounted. It exists
+// for tests: unlike trackedCount it does not depend on sweep timing.
+func (l *unauthenticatedLimiter) accountedCount() int {
+	if l == nil {
+		return 0
+	}
+	l.access.Lock()
+	defer l.access.Unlock()
+	return l.accounted
 }
 
 // trackedCount reports the number of tracked IPs. It exists for tests.

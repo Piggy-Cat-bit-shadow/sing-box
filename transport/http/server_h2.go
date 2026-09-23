@@ -110,15 +110,21 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		h.serveUnauthenticatedFailure(ctx, writer, request, connectionSource, authErr, false)
 		return
 	}
-	if h.handler == nil {
-		h.server.logger.ErrorContext(ctx, "process connection from ", connectionSource, ": unexpected request: ", request.Method, " ", request.URL)
-		writer.WriteHeader(http.StatusNotFound)
-		return
-	}
 	// Authenticate FIRST, for the same reason as the tunnel path above.
 	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
 	if authErr != nil {
 		h.serveUnauthenticatedFailure(ctx, writer, request, connectionSource, authErr, true)
+		return
+	}
+	// Only a request that has already AUTHENTICATED may learn that no proxy
+	// handler is installed. Answering 404 before authenticating made a
+	// configured-but-absent proxy handler externally distinguishable from a
+	// normal web server and let an unauthenticated prober bypass the limiter
+	// entirely, since the limiter is only consulted on an authentication
+	// failure.
+	if h.handler == nil {
+		h.server.logger.ErrorContext(ctx, "process connection from ", connectionSource, ": unexpected request: ", request.Method, " ", request.URL)
+		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 	ctx = proxyCtx

@@ -2,7 +2,9 @@ package http
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,9 +15,11 @@ import (
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 func enabledLimits() option.UnauthenticatedLimits {
@@ -564,4 +568,122 @@ func testContext() context.Context {
 func parseSource(t *testing.T, source string) M.Socksaddr {
 	t.Helper()
 	return M.ParseSocksaddr(source)
+}
+
+// TestAuthenticatedRequestsNeverTouchTheLimiter is the regression for the
+// limiter's most important property.
+//
+// An authenticated proxy request must not acquire a slot, consume a token, or
+// consult the limiter map at all. Acquiring before authenticating made legitimate
+// traffic pay for the limiter and could delay it under abuse.
+//
+// The test drives the REAL handler (httpHandler.ServeHTTP) with valid
+// credentials while the limiter is already saturated, and proves the limiter
+// state was never touched by comparing a snapshot of it before and after.
+func TestAuthenticatedRequestsNeverTouchTheLimiter(t *testing.T) {
+	limits := enabledLimits()
+	limits.RequestsPerSecond = 0
+	limits.Burst = 0
+	limits.MaxConcurrentPerIP = 1
+	limiter := newUnauthenticatedLimiter(limits)
+	server := &Server{
+		logger:                 testLogger(),
+		authenticator:          auth.NewAuthenticator([]auth.User{{Username: "user", Password: "pass"}}),
+		overLimitDecoy:         NewOverLimitDecoy(),
+		masquerade:             countingMasquerade(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: limiter,
+	}
+	handler := &httpHandler{server: server, handler: closingHandler{}}
+
+	request := httptest.NewRequest(http.MethodConnect, "http://203.0.113.77:8080", nil)
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("user:pass")))
+	request.RemoteAddr = "203.0.113.9:1234"
+
+	limiter.access.Lock()
+	statesBefore := len(limiter.states)
+	acquisitionsBefore := limiter.acquisitions
+	limiter.access.Unlock()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatal("an authenticated request must never be answered by the over-limit decoy")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("an authenticated CONNECT is expected to be accepted, got %d", recorder.Code)
+	}
+
+	limiter.access.Lock()
+	statesAfter := len(limiter.states)
+	acquisitionsAfter := limiter.acquisitions
+	limiter.access.Unlock()
+
+	if statesAfter != statesBefore {
+		t.Fatalf("an authenticated request must not create limiter state: %d -> %d",
+			statesBefore, statesAfter)
+	}
+	if acquisitionsAfter != acquisitionsBefore {
+		t.Fatalf("an authenticated request must not be accounted by the limiter: %d -> %d",
+			acquisitionsBefore, acquisitionsAfter)
+	}
+}
+
+// TestFailedAuthenticationIsAccounted proves the mirror case: a failed
+// authentication IS accounted, otherwise the limiter would never engage.
+func TestFailedAuthenticationIsAccounted(t *testing.T) {
+	limits := enabledLimits()
+	limits.RequestsPerSecond = 0
+	limits.Burst = 0
+	limits.MaxConcurrentPerIP = 1
+	limiter := newUnauthenticatedLimiter(limits)
+	server := &Server{
+		logger:                 testLogger(),
+		authenticator:          auth.NewAuthenticator([]auth.User{{Username: "user", Password: "pass"}}),
+		overLimitDecoy:         NewOverLimitDecoy(),
+		masquerade:             countingMasquerade(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: limiter,
+	}
+	handler := &httpHandler{server: server}
+
+	request := httptest.NewRequest(http.MethodConnect, "http://203.0.113.77:8080", nil)
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("user:wrong")))
+	// httptest.NewRequest overwrites RemoteAddr with the real peer address, so the
+	// source is attributed the way it is in production behind the Nginx stream
+	// front end: via X-Forwarded-For (see badhttp.ForwardedSource).
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if limiter.accountedCount() != 1 {
+		t.Fatalf("a failed authentication must be accounted exactly once, got %d", limiter.accountedCount())
+	}
+	if rec := recorder.Result(); rec.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("an over-budget failure is expected to be answered by the local decoy, got %d", rec.StatusCode)
+	}
+}
+
+// closingHandler accepts a tunnel and immediately closes it, which is what
+// releases serveConnect. discardHandler (used elsewhere) accepts and never
+// closes, so it would block this test forever.
+type closingHandler struct{}
+
+func (closingHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	_ = conn.Close()
+	onClose(nil)
+}
+
+func (closingHandler) NewPacketConnectionEx(_ context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	_ = conn.Close()
+	onClose(nil)
+}
+
+// countingMasquerade is a masquerade handler that succeeds without any backend
+// network access.
+func countingMasquerade() http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	})
 }
