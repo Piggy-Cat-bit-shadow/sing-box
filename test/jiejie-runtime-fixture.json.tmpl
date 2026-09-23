@@ -1,0 +1,55 @@
+{
+  "log": {"level": "warn"},
+  "dns": {
+    "servers": [
+      {"tag": "local-agh", "type": "udp", "server": "127.0.0.1", "server_port": __DNS_PORT__}
+    ],
+    "final": "local-agh",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "anytls", "tag": "anytls-in",
+      "listen": "127.0.0.1", "listen_port": __ANYTLS_PORT__,
+      "users": [{"name": "example", "password": "example"}],
+      "tls": {"enabled": true, "server_name": "example.test", "certificate_path": "__CERT__", "key_path": "__KEY__"},
+      "fallback": {"server": "127.0.0.1", "server_port": __DECOY_PORT__}
+    },
+    {
+      "type": "shadowtls", "tag": "shadowtls-in",
+      "listen": "127.0.0.1", "listen_port": __SHADOWTLS_PORT__,
+      "version": 3, "password": "example",
+      "users": [{"name": "example", "password": "example"}],
+      "strict_mode": true,
+      "handshake": {"server": "www.intel.com", "server_port": 443, "detour": "direct", "domain_resolver": "local-agh"},
+      "detour": "ss2022-in"
+    },
+    {
+      "type": "shadowsocks", "tag": "ss2022-in",
+      "listen": "127.0.0.1", "listen_port": __SS_PORT__,
+      "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "network": "tcp"
+    },
+    {
+      "type": "http", "tag": "masque-h3",
+      "listen": "127.0.0.1", "listen_port": __H3_PORT__,
+      "version": 3, "server_profile": "jiejie-balanced-1g",
+      "users": [{"username": "example", "password": "example"}],
+      "tls": {"enabled": true, "server_name": "example.test", "certificate_path": "__CERT__", "key_path": "__KEY__"},
+      "masquerade": {"type": "proxy", "url": "http://127.0.0.1:__DECOY_PORT__", "rewrite_host": true},
+      "unauthenticated_limits": {"enabled": true, "max_concurrent_per_ip": 8, "requests_per_second": 10, "burst": 20, "idle_timeout": "10s"}
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct", "domain_resolver": "local-agh"},
+    {"type": "socks", "tag": "residential-socks", "server": "127.0.0.1", "server_port": __SOCKS_PORT__, "version": "5", "username": "example", "password": "example"}
+  ],
+  "route": {
+    "rules": [
+      {"user": ["residential"], "network": ["udp"], "action": "reject"},
+      {"user": ["residential"], "network": ["tcp"], "outbound": "residential-socks"},
+      {"ip_is_private": true, "outbound": "direct"}
+    ],
+    "final": "direct"
+  }
+}

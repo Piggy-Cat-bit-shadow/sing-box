@@ -136,6 +136,20 @@ jobs:
           cd test
           go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../integration-production.log
 
+      # Runs the REAL cmd/sing-box binary as a separate process and drives traffic
+      # at it from the test process. Everything above this uses include.Context +
+      # box.New + Start, which is in-process integration and never exercises
+      # main(), the CLI, signal handling or the process lifecycle.
+      - name: Actual binary process integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          go build -tags "$TAGS" -o /tmp/sing-box-production ./cmd/sing-box
+          cd test
+          SING_BOX_PRODUCTION_BINARY=/tmp/sing-box-production \
+            go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestProductionBinary' . 2>&1 | tee ../integration-process.log
+
   client-feature-integration:
     runs-on: ubuntu-latest
     steps:
