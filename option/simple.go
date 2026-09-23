@@ -27,7 +27,10 @@ type HTTPMixedInboundOptions struct {
 
 type _HTTPInboundOptions struct {
 	ListenOptions
-	Users          []auth.User             `json:"users,omitempty"`
+	Users []auth.User `json:"users,omitempty"`
+	// Masquerade handles unauthenticated HTTP/2 and HTTP/3 requests.  It uses
+	// the same schema and semantics as the Hysteria2 masquerade option.
+	Masquerade     *Hysteria2Masquerade    `json:"masquerade,omitempty"`
 	DomainResolver *DomainResolveOptions   `json:"domain_resolver,omitempty"`
 	SetSystemProxy bool                    `json:"set_system_proxy,omitempty"`
 	Version        badoption.Listable[int] `json:"version,omitempty" enum:"1,2,3"`

@@ -99,6 +99,10 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		tunnelCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
 		if authErr != nil {
 			h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
+			if h.server.masquerade != nil {
+				h.server.masquerade.ServeHTTP(writer, request)
+				return
+			}
 			writer.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
@@ -114,6 +118,10 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
 	if authErr != nil {
 		h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
+		if h.server.masquerade != nil {
+			h.server.masquerade.ServeHTTP(writer, request)
+			return
+		}
 		writer.Header().Set("Proxy-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
 		writer.WriteHeader(http.StatusProxyAuthRequired)
 		return
