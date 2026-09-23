@@ -523,6 +523,33 @@ Both were investigated rather than assumed:
 * **`with_acme` was dropped** from the minimal profile: certificates are
   provisioned by acme.sh outside sing-box.
 
+#### Dependencies that remain, and why
+
+Audited against the **Linux** analysis build, because the symbol set differs by
+platform and an audit run on macOS gives misleading answers. Measured on
+linux/amd64 under the minimal tag set:
+
+| Dependency | Symbols | Why it cannot be removed |
+| --- | --- | --- |
+| `github.com/metacubex/utls` | ~1304 | `quic-go` imports it unconditionally from `internal/handshake/tls_conn_utls.go`, with no build tag of its own. Removing it means forking quic-go. |
+| `github.com/godbus/dbus` | ~577 | Arrives through `common/settings`, which `common/listener` and `route` both import. It is Linux-only, so it does not appear in a macOS analysis build at all — which is exactly how an earlier audit missed it and CI caught it. |
+| `github.com/sagernet/sing-box/service/powerreport` | ~118 | Imported directly by `common/dialer` for traffic attribution. |
+| `github.com/sagernet/sing-box/service/oomkiller` | 0–41 | Also referenced by `common/dialer`, but the linker drops it on some platforms; the count varies, so it is reported rather than asserted. |
+| `github.com/mattn/go-runewidth` | ~38 | Pulled in by the `cmd/sing-box` CLI for terminal table formatting. Not on the proxy data path. |
+| `github.com/sagernet/sing-box/protocol/tailscale` | exactly 3 | The `generate tailcat` CLI subcommand. |
+
+That last one was tested for removal. Gating `generate tailcat` behind
+`jiejie_server_minimal` does remove the package, but it saved only **4,096 bytes**
+because the linker had already dead-code-eliminated the unused functions and only
+package metadata remained. Four kilobytes does not justify the extra
+build-constrained file, so the change was reverted under this fork's stopping
+rule.
+
+Everything else that was targeted is confirmed absent from the Linux build:
+hysteria, hysteria2, tuic, vless, vmess, trojan, tor, ssh, snell, bridge, mixed,
+redirect, tun, the MASQUE endpoint, naive, the QUIC DNS transport, resolved,
+origin_ca, ssmapi, api, and certmagic.
+
 #### Where the remaining size goes
 
 The binary is now dominated by Go runtime metadata rather than by any single

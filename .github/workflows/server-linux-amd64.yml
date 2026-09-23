@@ -249,7 +249,7 @@ jobs:
             "github.com/sagernet/sing-box/dns/transport/quic"
             "github.com/sagernet/sing-box/tailscale"
             "github.com/caddyserver/certmagic"
-            "github.com/godbus/dbus"
+            "github.com/sagernet/sing-box/service/resolved"
           )
           for pkg in "${pruned[@]}"; do
             if grep -qF "$pkg" /tmp/analysis-minimal.syms; then
@@ -291,7 +291,13 @@ jobs:
           # Known and accepted: quic-go imports metacubex/utls unconditionally,
           # and the upstream core (common/dialer, dns) imports the power report
           # and OOM killer services. Report them so a change is visible.
+          # dbus is Linux-only and arrives through common/settings, which
+          # common/listener and route import, so it cannot be pruned without
+          # editing upstream core packages. oomkiller links on some platforms and
+          # not others, so it is reported rather than asserted.
           for expected in "github.com/metacubex/utls" \
+                          "github.com/godbus/dbus" \
+                          "github.com/sagernet/sing-box/common/settings" \
                           "github.com/sagernet/sing-box/service/powerreport" \
                           "github.com/sagernet/sing-box/service/oomkiller"; do
             echo "expected-present: $expected ($(grep -cF "$expected" /tmp/analysis-minimal.syms) symbols)"
