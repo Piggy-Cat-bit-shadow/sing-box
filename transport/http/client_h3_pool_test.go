@@ -708,3 +708,82 @@ func TestMASQUEPoolDeadConnectionIsRedialed(t *testing.T) {
 	require.GreaterOrEqual(t, server.connections.count(), 2,
 		"the client must have established a second connection after the first died")
 }
+
+// startRejectingMASQUEServer is a real HTTP/3 server that completes the QUIC
+// handshake and then rejects every CONNECT with a non-200 status, which is a
+// failure that happens strictly AFTER the CONNECT header was sent.
+func startRejectingMASQUEServer(t *testing.T) *masquePoolServer {
+	t.Helper()
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	counter := &connectionCounter{conns: make(map[*quic.Conn]struct{})}
+	server := &masquePoolServer{
+		connections: counter,
+		tunnels:     &httpserverTunnelCounter{},
+	}
+	serverImpl := &http3.Server{
+		EnableDatagrams: true,
+		TLSConfig:       poolTestServerTLS(t),
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
+			counter.add(conn)
+			return ctx
+		},
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			// Refuse the tunnel. The QUIC and TLS handshakes already succeeded,
+			// so this failure is post-CONNECT.
+			writer.WriteHeader(http.StatusForbidden)
+		}),
+	}
+	go func() { _ = serverImpl.Serve(udpConn) }()
+	t.Cleanup(func() {
+		_ = serverImpl.Close()
+		udpConn.Close()
+	})
+	server.address = udpConn.LocalAddr().String()
+	return server
+}
+
+// TestMASQUENonReplayableFailureNeverReachesHTTP2 pins the replay-safety
+// invariant of the MASQUE version fallback.
+//
+// The HTTP/3 path may hand the tunnel to HTTP/2 only while the CONNECT is still
+// unsent. This test proves the only error that triggers that handoff
+// (ErrHTTP3Unavailable) is raised by the QUIC/TLS handshake stage, which happens
+// strictly BEFORE a stream is opened, and never by a post-CONNECT failure.
+//
+// Why it matters: if a failure occurring AFTER the CONNECT header was written
+// were classified as ErrHTTP3Unavailable, client.go would fall back to HTTP/2
+// and re-issue the CONNECT. The destination would then observe the tunnel being
+// opened twice, and any payload already written would be duplicated or
+// truncated. That is the same class of bug the generic
+// common/httpclient path guards with requestReplayable; the MASQUE path guards
+// it structurally instead, by never raising the fallback error after the stream
+// exists.
+//
+// The test forces a post-CONNECT failure (the server rejects the CONNECT with a
+// non-200 status) and asserts the returned error is NOT ErrHTTP3Unavailable, so
+// no fallback and therefore no replay can occur.
+func TestMASQUENonReplayableFailureNeverReachesHTTP2(t *testing.T) {
+	server := startRejectingMASQUEServer(t)
+	agent := newPoolTestAgent(t, server, 1)
+
+	var attempted bool
+	agent.beforeOpenStream = func(*http3PoolSlot) {
+		attempted = true
+	}
+
+	_, err := agent.DialContext(context.Background(), M.ParseSocksaddr("127.0.0.1:9"))
+	require.Error(t, err, "a rejected CONNECT must fail")
+	require.True(t, attempted, "the test must have reached the CONNECT stage")
+
+	require.False(t, errors.Is(err, ErrHTTP3Unavailable),
+		"a post-CONNECT failure must never be reported as HTTP/3 unavailable, "+
+			"because that would let the caller replay the CONNECT over HTTP/2; got %v", err)
+
+	// The connection itself must still be healthy: the server refused one tunnel,
+	// which says nothing about the transport or the authority.
+	require.Equal(t, 1, server.connections.count(),
+		"the QUIC handshake must have completed before the CONNECT was refused")
+}
