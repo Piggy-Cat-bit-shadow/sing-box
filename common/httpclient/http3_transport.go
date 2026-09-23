@@ -33,6 +33,7 @@ type http3FallbackTransport struct {
 	h3Transport   *http3.Transport
 	h2Fallback    innerTransport
 	fallbackDelay time.Duration
+	schedule      option.HTTP3FallbackSchedule
 	brokenAccess  sync.Mutex
 	broken        map[string]http3BrokenEntry
 }
@@ -108,6 +109,7 @@ func newHTTP3FallbackTransport(
 		h3Transport:   newHTTP3RoundTripper(rawDialer, baseTLSConfig, options),
 		h2Fallback:    h2Fallback,
 		fallbackDelay: fallbackDelay,
+		schedule:      options.HTTP3Fallback.Build(),
 		broken:        make(map[string]http3BrokenEntry),
 	}, nil
 }
@@ -302,13 +304,19 @@ func (t *http3FallbackTransport) h3Broken(authority string) bool {
 	return true
 }
 
+// clearH3Broken drops the recorded failure for an authority after a successful
+// HTTP/3 round trip. When reset_on_success is disabled the backoff counter is
+// preserved so the next failure continues the previous escalation.
 func (t *http3FallbackTransport) clearH3Broken(authority string) {
 	if authority == "" {
 		return
 	}
 	t.brokenAccess.Lock()
+	defer t.brokenAccess.Unlock()
+	if !t.schedule.ResetOnSuccess {
+		return
+	}
 	delete(t.broken, authority)
-	t.brokenAccess.Unlock()
 }
 
 func (t *http3FallbackTransport) markH3Broken(authority string) {
@@ -318,14 +326,7 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 	t.brokenAccess.Lock()
 	defer t.brokenAccess.Unlock()
 	entry := t.broken[authority]
-	if entry.backoff == 0 {
-		entry.backoff = 5 * time.Minute
-	} else {
-		entry.backoff *= 2
-		if entry.backoff > 48*time.Hour {
-			entry.backoff = 48 * time.Hour
-		}
-	}
+	entry.backoff = t.schedule.Next(entry.backoff)
 	entry.until = time.Now().Add(entry.backoff)
 	t.broken[authority] = entry
 }

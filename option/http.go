@@ -23,8 +23,10 @@ type HTTP2Options struct {
 
 type QUICOptions struct {
 	HTTP2Options
-	InitialPacketSize       int  `json:"initial_packet_size,omitempty"`
-	DisablePathMTUDiscovery bool `json:"disable_path_mtu_discovery,omitempty"`
+	InitialPacketSize       int                         `json:"initial_packet_size,omitempty"`
+	DisablePathMTUDiscovery bool                        `json:"disable_path_mtu_discovery,omitempty"`
+	HTTP3Fallback           *HTTP3FallbackOptions       `json:"http3_fallback,omitempty"`
+	HTTP3ConnectionPool     *HTTP3ConnectionPoolOptions `json:"http3_connection_pool,omitempty"`
 }
 
 type _HTTPClientOptions struct {
