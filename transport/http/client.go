@@ -80,8 +80,17 @@ type Client struct {
 	http2Unsupported                atomic.Bool
 	http2ExtendedConnectUnsupported atomic.Bool
 	http3                           http3Client
-	http3Broken                     atomic.Int64
-	http3Backoff                    atomic.Int64
+	// http3BrokenUntil is the expiry of the current HTTP/3 avoidance window.
+	// http3Escalation is the backoff that was applied for that window. They are
+	// stored separately on purpose: an earlier revision deleted the record when
+	// the window expired, which also discarded the escalation history, so a
+	// serial failure -> expiry -> failure sequence restarted at the initial
+	// backoff instead of continuing to grow.
+	http3BrokenUntil atomic.Int64
+	http3Escalation  atomic.Int64
+	// http3Schedule is the resolved http3_fallback configuration. With no
+	// configuration it equals the upstream 5s/x2/5m schedule.
+	http3Schedule option.HTTP3FallbackSchedule
 }
 
 func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outboundDialer N.Dialer, serverOptions option.ServerOptions, tlsOptions option.OutboundTLSOptions, options ClientOptions) (*Client, error) {
@@ -133,6 +142,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 		headers:                options.Headers.Clone(),
 		version:                options.Version,
 		disableVersionFallback: options.DisableVersionFallback,
+		// An absent http3_fallback keeps this client's own existing behaviour
+		// (5s initial, x2, 5m cap). option.HTTP3FallbackOptions.Build targets the
+		// common/httpclient path, whose upstream schedule is different
+		// (5m/48h), so it must not be used as the default here.
+		http3Schedule: resolveClientHTTP3Schedule(options.HTTP3Options.HTTP3Fallback),
 	}
 	if client.headers != nil {
 		client.host = client.headers.Get("Host")
@@ -192,24 +206,31 @@ func (c *Client) http3Available() bool {
 	if c.http3 == nil {
 		return false
 	}
-	brokenUntil := c.http3Broken.Load()
+	brokenUntil := c.http3BrokenUntil.Load()
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
 
+// markHTTP3Broken escalates the HTTP/3 avoidance window. The escalation counter
+// is deliberately NOT reset when the window expires, so a sequence of
+// failure -> expiry -> failure keeps growing rather than restarting.
 func (c *Client) markHTTP3Broken() {
-	backoff := time.Duration(c.http3Backoff.Load())
-	if backoff == 0 {
-		backoff = http3BrokenBackoffInitial
-	} else {
-		backoff = min(backoff*2, http3BrokenBackoffMax)
-	}
-	c.http3Backoff.Store(int64(backoff))
-	c.http3Broken.Store(time.Now().Add(backoff).UnixNano())
+	now := time.Now()
+	escalation := time.Duration(c.http3Escalation.Load())
+	// An expired window still counts as part of the same failure streak: the
+	// counter is only cleared by a successful HTTP/3 request.
+	next := c.http3Schedule.Next(escalation)
+	c.http3Escalation.Store(int64(next))
+	c.http3BrokenUntil.Store(now.Add(next).UnixNano())
 }
 
+// clearHTTP3Broken resets the avoidance window after a successful HTTP/3 use.
+// When reset_on_success is disabled the escalation history is preserved so the
+// next failure continues from where it left off.
 func (c *Client) clearHTTP3Broken() {
-	c.http3Broken.Store(0)
-	c.http3Backoff.Store(0)
+	c.http3BrokenUntil.Store(0)
+	if c.http3Schedule.ResetOnSuccess {
+		c.http3Escalation.Store(0)
+	}
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -351,9 +372,51 @@ func (c *Client) Close() error {
 }
 
 const (
-	http3BrokenBackoffInitial = 5 * time.Second
-	http3BrokenBackoffMax     = 5 * time.Minute
+	// upstreamHTTP3BackoffInitial and upstreamHTTP3BackoffMax are the defaults
+	// used when http3_fallback is not configured. They match the behaviour this
+	// MASQUE client had before the option existed, which is NOT the same as the
+	// common/httpclient schedule (5m / 48h).
+	upstreamHTTP3BackoffInitial = 5 * time.Second
+	upstreamHTTP3BackoffMax     = 5 * time.Minute
 )
+
+// resolveClientHTTP3Schedule resolves http3_fallback for the MASQUE client.
+//
+// A nil option yields this client's inherited defaults. A present but partial
+// object keeps the client defaults for whatever it leaves out, so setting only
+// initial_backoff does not silently adopt the common/httpclient values.
+func resolveClientHTTP3Schedule(fallback *option.HTTP3FallbackOptions) option.HTTP3FallbackSchedule {
+	if fallback == nil {
+		return option.HTTP3FallbackSchedule{
+			InitialBackoff: upstreamHTTP3BackoffInitial,
+			MaxBackoff:     upstreamHTTP3BackoffMax,
+			Multiplier:     2,
+			ResetOnSuccess: true,
+		}
+	}
+	schedule := option.HTTP3FallbackSchedule{
+		InitialBackoff: time.Duration(fallback.InitialBackoff),
+		MaxBackoff:     time.Duration(fallback.MaxBackoff),
+		Multiplier:     fallback.Multiplier,
+		ResetOnSuccess: true,
+	}
+	if fallback.ResetOnSuccess != nil {
+		schedule.ResetOnSuccess = *fallback.ResetOnSuccess
+	}
+	if schedule.InitialBackoff <= 0 {
+		schedule.InitialBackoff = upstreamHTTP3BackoffInitial
+	}
+	if schedule.MaxBackoff <= 0 {
+		schedule.MaxBackoff = upstreamHTTP3BackoffMax
+	}
+	if schedule.Multiplier <= 0 {
+		schedule.Multiplier = 2
+	}
+	if schedule.MaxBackoff < schedule.InitialBackoff {
+		schedule.MaxBackoff = schedule.InitialBackoff
+	}
+	return schedule
+}
 
 var (
 	ErrHTTP2Unsupported           = E.New("server does not support HTTP/2")
