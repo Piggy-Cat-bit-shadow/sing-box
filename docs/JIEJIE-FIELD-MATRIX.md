@@ -29,6 +29,25 @@ Legend:
 | `unauthenticated_limits` | `UnauthenticatedLimitsOptions` | Per-source-IP token bucket + in-flight counter, released on successful auth | `admitUnauthenticated` / `rejectUnauthenticated` in the shared HTTP handler | `TestUnauthenticatedLimiterDoesNotHitMasqueradeBackend`, `TestJiejieMinimalMASQUEH2/H3UnauthenticatedLimiter` | **IMPLEMENTED** |
 | `masquerade` | `Hysteria2Masquerade` | Handler built at inbound construction | `serveAuthFailure`, and `rejectUnauthenticated` for the over-limit case | `TestJiejieMinimalMASQUEH2Masquerade`, `TestJiejieMinimalMASQUEH3Masquerade`, `TestJiejieMinimalAnyTLSFallback` | **IMPLEMENTED** |
 
+### `unauthenticated_limits` sub-fields
+
+Every sub-field below is decoded by `UnauthenticatedLimitsOptions` and reaches
+`unauthenticatedLimiter.acquire` on the request path. `requests_per_second`,
+`burst`, `max_concurrent_per_ip` and `max_tracked_ips` are all consumed by the
+same `acquire` call; `idle_timeout` drives `expireLocked`.
+
+| Field | Default when omitted | Effect on the data path | Runtime test | Verdict |
+| --- | --- | --- | --- | --- |
+| `enabled` | `false` | When false no limiter is constructed at all, so behaviour is exactly upstream | `TestUnauthenticatedLimiterNotConstructedWhenDisabled` | **IMPLEMENTED** |
+| `requests_per_second` | 10 | Token refill rate; `0` disables refill | `TestUnauthenticatedLimiterBurstThenRefill` | **IMPLEMENTED** |
+| `burst` | 20 | Token bucket capacity | `TestUnauthenticatedLimiterBurstThenRefill` | **IMPLEMENTED** |
+| `max_concurrent_per_ip` | 8 | Holds the slot across the whole masquerade request, so it bounds backend concurrency | `TestUnauthenticatedLimiterConcurrencyPerIP` | **IMPLEMENTED** |
+| `idle_timeout` | 10s | Idle entries expire; in-flight ones never do | `TestUnauthenticatedLimiterExpiry`, `TestUnauthenticatedLimiterDoesNotExpireInFlightEntries` | **IMPLEMENTED** |
+| `max_tracked_ips` | 4096 | Caps limiter memory; reaching it evicts least-recently-seen idle entries | `TestUnauthenticatedLimiterTrackedIPCap` | **IMPLEMENTED** |
+| accounting position | — | Authenticated requests never touch the limiter; only a failed authentication is accounted | `TestAuthenticatedRequestsNeverTouchTheLimiter`, `TestFailedAuthenticationIsAccounted` | **IMPLEMENTED** |
+| unauthenticated body bound | 256 KiB (not configurable) | `http.MaxBytesReader` caps the body a failed-auth request can push at the decoy backend | `TestUnauthenticatedBodyIsBounded` | **IMPLEMENTED** |
+| expiry amortization | sweep every 256 acquisitions (not configurable) | Keeps `acquire` off an O(tracked IPs) path | `TestUnauthenticatedLimiterDoesNotSweepEveryRequest` | **IMPLEMENTED** |
+
 ### `jiejie-balanced-1g` profile values
 
 | Profile field | Value | Runtime test | Verdict |
