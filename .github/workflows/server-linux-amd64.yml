@@ -343,8 +343,11 @@ jobs:
           fi
           echo "size guard OK: $SIZE <= $MAX_BINARY_BYTES bytes"
 
-          # A secret-free fixture of the whole production topology.
-          openssl req -x509 -newkey rsa:2048 -keyout /tmp/tls.key -out /tmp/tls.crt \
+          # A secret-free fixture of the whole production topology. The
+          # certificate paths must match release/jiejie-production-topology.json.
+          mkdir -p /tmp/jiejie-fixture
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/jiejie-fixture/key.pem -out /tmp/jiejie-fixture/cert.pem \
             -days 1 -nodes -subj "/CN=example.test" 2>/dev/null
 
           echo "===== PRODUCTION TOPOLOGY CHECK ====="
