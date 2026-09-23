@@ -90,14 +90,19 @@ func (h *httpHandler) serveConnectUDP(ctx context.Context, writer http.ResponseW
 			return
 		}
 	}
-	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
+	// Normalize stream-level errors before they reach the routing layer, for the
+	// same reason as serveConnect: route/conn.go logs a copy failure at ERROR
+	// unless it recognises the error as a normal closure, and an http3.Error
+	// carrying ErrCodeNoError is not recognised on its own.
+	rawConn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
 		HTTP2Conn: v2rayhttp.NewHTTPConn(request.Body, writer),
 		Flusher:   writer.(http.Flusher),
 	})
+	conn := &normalizingConn{inner: rawConn}
 	done := make(chan struct{})
 	h.handler.NewPacketConnectionEx(ctx, newCapsuleConn(std_bufio.NewReader(conn), conn, destination), source, destination, N.OnceClose(func(it error) {
 		close(done)
 	}))
 	<-done
-	conn.CloseWrapper()
+	rawConn.CloseWrapper()
 }

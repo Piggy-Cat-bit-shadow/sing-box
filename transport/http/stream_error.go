@@ -4,11 +4,13 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
+	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // normalizeStreamError maps a transport-level stream error onto the sentinel
@@ -45,6 +47,14 @@ func normalizeStreamError(err error) error {
 			http3.ErrCodeRequestIncomplete, // the peer went away mid-request
 			http3.ErrCodeRequestRejected:   // the peer declined to serve it
 			return net.ErrClosed
+		case 0:
+			// A zero code means "no QUIC-level error": the tunnel simply ended.
+			// quic-go surfaces this as an *http3.Error with ErrorCode 0, which
+			// formats as "H3 error (0x0)" — exactly the message that was being
+			// logged at ERROR for an ordinary teardown. It is NOT
+			// http3.ErrCodeNoError (0x100); the two are different values, which is
+			// why an earlier attempt at this fix matched nothing.
+			return net.ErrClosed
 		}
 		// Every other HTTP/3 code (protocol violations, frame and settings
 		// errors, QPACK failures, internal errors) is a real fault and is
@@ -64,52 +74,110 @@ func normalizeStreamError(err error) error {
 	return err
 }
 
-// normalizingReadCloser wraps a response body so reads report normal closures as
-// sentinels the routing layer understands.
-type normalizingReadCloser struct {
-	io.ReadCloser
+// normalizingConn applies error normalization at the outermost connection
+// boundary handed to the routing layer.
+//
+// The embedded field is deliberately a NAMED field rather than an anonymous
+// embed. sing's N.UnwrapReader / N.UnwrapWriter walk the Upstream() chain and
+// `bufio.Copy` uses the fully unwrapped reader and writer, so an anonymous embed
+// would promote the inner conn's Upstream()/ReaderReplaceable()/WriterReplaceable()
+// methods and let the copy path skip this wrapper entirely. Keeping the inner
+// conn in a named field means those methods are not promoted, the unwrap chain
+// stops here, and normalization actually applies.
+type normalizingConn struct {
+	inner net.Conn
 }
 
-func (r normalizingReadCloser) Read(p []byte) (int, error) {
-	n, err := r.ReadCloser.Read(p)
+// net.Conn surface, delegating explicitly so nothing is promoted accidentally.
+func (c *normalizingConn) Read(p []byte) (int, error) {
+	n, err := c.inner.Read(p)
 	return n, normalizeStreamError(err)
 }
 
-// normalizingResponseWriter wraps a ResponseWriter so writes report normal
-// closures the same way.
-type normalizingResponseWriter struct {
-	http.ResponseWriter
-}
-
-func (w normalizingResponseWriter) Write(p []byte) (int, error) {
-	n, err := w.ResponseWriter.Write(p)
+func (c *normalizingConn) Write(p []byte) (int, error) {
+	n, err := c.inner.Write(p)
 	return n, normalizeStreamError(err)
 }
 
-func (w normalizingResponseWriter) Flush() {
-	if flusher, isFlusher := w.ResponseWriter.(http.Flusher); isFlusher {
-		flusher.Flush()
+func (c *normalizingConn) Close() error {
+	return c.inner.Close()
+}
+
+func (c *normalizingConn) LocalAddr() net.Addr {
+	return c.inner.LocalAddr()
+}
+
+func (c *normalizingConn) RemoteAddr() net.Addr {
+	return c.inner.RemoteAddr()
+}
+
+func (c *normalizingConn) SetDeadline(t time.Time) error {
+	return c.inner.SetDeadline(t)
+}
+
+func (c *normalizingConn) SetReadDeadline(t time.Time) error {
+	return c.inner.SetReadDeadline(t)
+}
+
+func (c *normalizingConn) SetWriteDeadline(t time.Time) error {
+	return c.inner.SetWriteDeadline(t)
+}
+
+// WriteBuffer and ReadBuffer carry the buffered copy path, which is what
+// route/conn.go actually uses.
+func (c *normalizingConn) WriteBuffer(buffer *buf.Buffer) error {
+	extendedConn, isExtendedConn := c.inner.(N.ExtendedConn)
+	if !isExtendedConn {
+		return nil
 	}
+	return normalizeStreamError(extendedConn.WriteBuffer(buffer))
 }
 
-// Unwrap exposes the underlying writer.
-//
-// IMPORTANT: this wrapper deliberately implements ONLY http.ResponseWriter and
-// http.Flusher. It must never be passed to code that type-asserts for
-// http3.HTTPStreamer or http3.Settingser, because those assertions would fail
-// and CONNECT-UDP datagrams would silently stop working. serveConnectUDP
-// therefore keeps using the original writer; only the TCP CONNECT path is
-// wrapped, which is the path that produced the spurious "H3 error (0x0)" ERROR.
-//
-// TestNormalizingWriterDoesNotClaimHTTP3Interfaces pins this.
-func (w normalizingResponseWriter) Unwrap() http.ResponseWriter {
-	return w.ResponseWriter
+func (c *normalizingConn) ReadBuffer(buffer *buf.Buffer) error {
+	extendedConn, isExtendedConn := c.inner.(N.ExtendedConn)
+	if !isExtendedConn {
+		return nil
+	}
+	return normalizeStreamError(extendedConn.ReadBuffer(buffer))
+}
+
+// ReadFrom is used by the copy path when the destination supports it.
+func (c *normalizingConn) ReadFrom(reader io.Reader) (int64, error) {
+	if readFrom, isReadFrom := c.inner.(io.ReaderFrom); isReadFrom {
+		n, err := readFrom.ReadFrom(reader)
+		return n, normalizeStreamError(err)
+	}
+	return io.Copy(struct{ io.Writer }{c}, reader)
+}
+
+// WriteTo is the mirror of ReadFrom.
+func (c *normalizingConn) WriteTo(writer io.Writer) (int64, error) {
+	if writeTo, isWriteTo := c.inner.(io.WriterTo); isWriteTo {
+		n, err := writeTo.WriteTo(writer)
+		return n, normalizeStreamError(err)
+	}
+	return io.Copy(writer, struct{ io.Reader }{c})
+}
+
+// CloseWrite forwards half-close, normalizing its error too. route/conn.go calls
+// it through N.WriteCloser, so it is one of the paths an orderly close travels.
+func (c *normalizingConn) CloseWrite() error {
+	if writeCloser, isWriteCloser := c.inner.(N.WriteCloser); isWriteCloser {
+		return normalizeStreamError(writeCloser.CloseWrite())
+	}
+	return nil
+}
+
+// NeedHandshakeForWrite forwards the optional handshake hint.
+func (c *normalizingConn) NeedHandshakeForWrite() bool {
+	return N.NeedHandshakeForWrite(c.inner)
 }
 
 // NormalizeStreamErrorForTest exposes the normalizer to the external integration
-// test module, which cannot reach unexported identifiers. It exists only so the
-// test/ module can assert the property the routing layer depends on, namely that
-// a normally closed HTTP/3 stream satisfies E.IsClosedOrCanceled.
+// test module, which cannot reach unexported identifiers. It exists so the test/
+// module can assert the property the routing layer depends on: that a normally
+// closed HTTP/3 stream satisfies E.IsClosedOrCanceled and is therefore not logged
+// at ERROR.
 func NormalizeStreamErrorForTest(err error) error {
 	return normalizeStreamError(err)
 }

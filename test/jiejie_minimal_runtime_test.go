@@ -10,12 +10,15 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
+	"github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	shttp "github.com/sagernet/sing-box/transport/http"
@@ -454,6 +457,18 @@ func TestJiejieMinimalMASQUEH2UnauthenticatedLimiter(t *testing.T) {
 
 func startMinimalMASQUEH3(t *testing.T, withLimiter bool) *minimalServer {
 	t.Helper()
+	return startMinimalMASQUEH3WithLogFile(t, withLimiter, "")
+}
+
+// startMinimalMASQUEH3WithLogFile starts the H3 listener and, when logPath is
+// non-empty, routes the instance's log output to that file so a test can assert
+// on the real messages the routing layer emitted.
+//
+// It builds the box directly rather than through startInstance, because
+// startInstance unconditionally overwrites options.Log with a level-only config
+// and would discard the output path.
+func startMinimalMASQUEH3WithLogFile(t *testing.T, withLimiter bool, logPath string) *minimalServer {
+	t.Helper()
 	decoy := startMinimalDecoyWeb(t)
 	origin := startMinimalHTTPOrigin(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
@@ -485,12 +500,33 @@ func startMinimalMASQUEH3(t *testing.T, withLimiter bool) *minimalServer {
 			IdleTimeout:        badoption.Duration(time.Minute),
 		}
 	}
-	startInstance(t, option.Options{
+	instanceOptions := option.Options{
 		Inbounds:  []option.Inbound{{Type: C.TypeHTTP, Tag: "masque-h3", Options: options}},
 		Outbounds: []option.Outbound{{Type: C.TypeDirect, Tag: "direct"}},
 		Route:     &option.RouteOptions{Final: "direct"},
-	})
+	}
+	if logPath == "" {
+		startInstance(t, instanceOptions)
+	} else {
+		instanceOptions.Log = &option.LogOptions{Level: "trace", Output: logPath, DisableColor: true}
+		startInstanceWithOptions(t, instanceOptions)
+	}
 	return &minimalServer{port: port, origin: origin}
+}
+
+// startInstanceWithOptions starts an instance without startInstance's log
+// override, so the caller's log configuration is preserved.
+func startInstanceWithOptions(t *testing.T, options option.Options) *box.Box {
+	t.Helper()
+	ctx, cancel := context.WithCancel(globalCtx)
+	instance, err := box.New(box.Options{Context: ctx, Options: options})
+	require.NoError(t, err)
+	require.NoError(t, instance.Start())
+	t.Cleanup(func() {
+		instance.Close()
+		cancel()
+	})
+	return instance
 }
 
 // dialMinimalH3Client opens an HTTP/3 connection to a profile-configured server.
@@ -649,7 +685,8 @@ func TestJiejieMinimalMASQUEH3ConnectUDP(t *testing.T) {
 }
 
 func TestJiejieMinimalMASQUEH3UnauthenticatedLimiter(t *testing.T) {
-	server := startMinimalMASQUEH3(t, true)
+	logPath := filepath.Join(t.TempDir(), "h3-limiter.log")
+	server := startMinimalMASQUEH3WithLogFile(t, true, logPath)
 	client := dialMinimalH3(t, server.port)
 
 	first := client.get(t, nil)
@@ -694,6 +731,33 @@ func TestJiejieMinimalMASQUEH3UnauthenticatedLimiter(t *testing.T) {
 		stream.Close()
 		response.Body.Close()
 	}
+
+	// An abrupt client-side abandonment: the tunnel is opened and then dropped
+	// without the server finishing its copy. This is the shape that produced the
+	// spurious "connection upload closed: H3 error (0x0)" at ERROR level, because
+	// route/conn.go logs a copy failure at ERROR unless E.IsClosedOrCanceled
+	// recognises it and an http3.Error with ErrCodeNoError was not recognised
+	// until transport/http normalized it at the stream boundary.
+	abandonHeaders := http.Header{}
+	abandonHeaders.Set("Proxy-Authorization", minimalBasicAuth())
+	for range 3 {
+		abandonedResponse, abandonedStream := client.connect(t, server.origin, abandonHeaders)
+		require.Equal(t, http.StatusOK, abandonedResponse.StatusCode)
+		// Write nothing, then close immediately.
+		abandonedStream.CancelRead(0)
+		abandonedStream.CancelWrite(0)
+		abandonedStream.Close()
+		abandonedResponse.Body.Close()
+	}
+	time.Sleep(700 * time.Millisecond)
+	content, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr, "the log file must exist")
+	logged := string(content)
+	require.NotEmpty(t, logged, "the captured log must not be empty, otherwise this assertion proves nothing")
+	require.NotContains(t, logged, "connection upload closed: H3 error",
+		"an orderly HTTP/3 tunnel close must not log a connection upload error")
+	require.NotContains(t, logged, "connection download closed: H3 error",
+		"an orderly HTTP/3 tunnel close must not log a connection download error")
 }
 
 // ---------------------------------------------------------------------------

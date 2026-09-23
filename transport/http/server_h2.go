@@ -215,19 +215,24 @@ func (h *httpHandler) serveConnect(ctx context.Context, writer http.ResponseWrit
 	}
 	writer.WriteHeader(http.StatusOK)
 	writer.(http.Flusher).Flush()
-	// Normalize stream-level errors before they reach the routing layer, so an
-	// orderly HTTP/3 tunnel close is reported as net.ErrClosed rather than as an
-	// unrecognised "H3 error (0x0)" that route/conn.go logs at ERROR level.
-	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
-		HTTP2Conn: v2rayhttp.NewHTTPConn(normalizingReadCloser{request.Body}, normalizingResponseWriter{writer}),
+	wrapped := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
+		HTTP2Conn: v2rayhttp.NewHTTPConn(request.Body, writer),
 		Flusher:   writer.(http.Flusher),
 	})
+	// Normalize stream-level errors at the OUTERMOST boundary, which is what the
+	// routing layer actually reads and writes.
+	//
+	// Wrapping only request.Body is not enough: NewHTTP2Wrapper layers a
+	// bufio.ExtendedConn on top, and its buffered write path bypasses the inner
+	// wrapper entirely, so an orderly HTTP/3 close still surfaced as an
+	// unrecognised "H3 error (0x0)" and route/conn.go logged it at ERROR.
+	conn := &normalizingConn{inner: wrapped}
 	done := make(chan struct{})
 	h.handler.NewConnectionEx(ctx, conn, source, destination, N.OnceClose(func(it error) {
 		close(done)
 	}))
 	<-done
-	conn.CloseWrapper()
+	wrapped.CloseWrapper()
 }
 
 func (h *httpHandler) serveForward(ctx context.Context, writer http.ResponseWriter, request *http.Request, source M.Socksaddr) {

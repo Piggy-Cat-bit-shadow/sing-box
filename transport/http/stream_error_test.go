@@ -4,11 +4,11 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/sagernet/quic-go/http3"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // TestNormalizeStreamErrorTranslatesNormalClosures covers the regression that
@@ -19,6 +19,9 @@ func TestNormalizeStreamErrorTranslatesNormalClosures(t *testing.T) {
 		name string
 		err  error
 	}{
+		// ErrorCode 0 is what quic-go actually produces for an orderly tunnel
+		// close; it formats as "H3 error (0x0)". It is NOT ErrCodeNoError.
+		{"h3 zero code", &http3.Error{ErrorCode: 0}},
 		{"h3 no error", &http3.Error{ErrorCode: http3.ErrCodeNoError}},
 		{"h3 no error local", &http3.Error{ErrorCode: http3.ErrCodeNoError, Remote: false}},
 		{"h3 request cancelled", &http3.Error{ErrorCode: http3.ErrCodeRequestCanceled}},
@@ -77,26 +80,56 @@ func TestNormalizeStreamErrorNilAndSentinels(t *testing.T) {
 	}
 }
 
-// TestNormalizingWriterDoesNotClaimHTTP3Interfaces is a guard for CONNECT-UDP.
+// TestNormalizingConnHidesUpstream is the guard for the bug that made two
+// earlier attempts at this fix ineffective.
 //
-// HTTP3StreamFunc type-asserts the ResponseWriter for http3.HTTPStreamer and
-// http3.Settingser. If the normalizing wrapper ever claimed those interfaces (or
-// if it were passed where the original is expected), the assertion would fail and
-// datagrams would silently stop working.
-func TestNormalizingWriterDoesNotClaimHTTP3Interfaces(t *testing.T) {
-	recorder := httptest.NewRecorder()
-	wrapped := normalizingResponseWriter{recorder}
+// sing's N.UnwrapReader and N.UnwrapWriter walk the Upstream() chain and
+// bufio.Copy uses the fully unwrapped reader and writer, so a wrapper that
+// exposes the inner connection's Upstream() is simply skipped. That is why
+// wrapping request.Body alone did nothing: the copy path unwrapped straight past
+// it and still saw the raw "H3 error (0x0)".
+//
+// normalizingConn therefore keeps the inner conn in a NAMED field so no method is
+// promoted. This test pins that: the wrapper must not advertise itself as
+// replaceable, and it must actually normalize what it passes through.
+func TestNormalizingConnHidesUpstream(t *testing.T) {
+	inner := &stubConn{readErr: &http3.Error{ErrorCode: 0}}
+	wrapped := &normalizingConn{inner: inner}
 
-	if _, isStreamer := any(wrapped).(http3.HTTPStreamer); isStreamer {
-		t.Fatal("the normalizing writer must not claim http3.HTTPStreamer")
+	// It must not be unwrappable, otherwise bufio.Copy bypasses it.
+	if _, isReplaceable := any(wrapped).(N.ReaderWithUpstream); isReplaceable {
+		t.Fatal("normalizingConn must not be reader-replaceable, or the copy path skips it")
 	}
-	if _, isSettingser := any(wrapped).(http3.Settingser); isSettingser {
-		t.Fatal("the normalizing writer must not claim http3.Settingser")
+	if _, isReplaceable := any(wrapped).(N.WriterWithUpstream); isReplaceable {
+		t.Fatal("normalizingConn must not be writer-replaceable, or the copy path skips it")
 	}
-	// It must still behave as a ResponseWriter and Flusher.
-	var _ http.ResponseWriter = wrapped
-	var _ http.Flusher = wrapped
-	if unwrapped := wrapped.Unwrap(); unwrapped != recorder {
-		t.Fatal("Unwrap must return the original writer")
+	if unwrapped := N.UnwrapReader(wrapped); unwrapped != any(wrapped) {
+		t.Fatal("N.UnwrapReader must stop at normalizingConn")
+	}
+
+	// And it must normalize a zero-code HTTP/3 error, which is the value quic-go
+	// actually produces for an orderly tunnel close.
+	_, err := wrapped.Read(make([]byte, 1))
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("a zero-code H3 error must normalize to net.ErrClosed, got %v", err)
+	}
+
+	// Write and WriteBuffer must behave the same way.
+	if _, err = wrapped.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write must normalize, got %v", err)
 	}
 }
+
+// stubConn is a net.Conn whose operations return a fixed error.
+type stubConn struct {
+	readErr error
+}
+
+func (c *stubConn) Read(p []byte) (int, error)         { return 0, c.readErr }
+func (c *stubConn) Write(p []byte) (int, error)        { return 0, c.readErr }
+func (c *stubConn) Close() error                       { return nil }
+func (c *stubConn) LocalAddr() net.Addr                { return nil }
+func (c *stubConn) RemoteAddr() net.Addr               { return nil }
+func (c *stubConn) SetDeadline(t time.Time) error      { return nil }
+func (c *stubConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *stubConn) SetWriteDeadline(t time.Time) error { return nil }
