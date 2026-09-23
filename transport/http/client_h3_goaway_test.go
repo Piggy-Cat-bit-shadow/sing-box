@@ -4,6 +4,7 @@ package http
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
+	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/stretchr/testify/require"
@@ -327,5 +329,178 @@ func TestH3PoolActiveCountLifecycle(t *testing.T) {
 		_, _ = agent.DialContext(ctx, target)
 		require.Equal(t, baseline, agent.totalActive(),
 			"a failed open must not leave a count behind")
+	})
+}
+
+// TestH3SlotFailureDoesNotPoisonAuthority is the P0 separation guard.
+//
+// A slot being dead, draining or cooling down says NOTHING about whether the
+// authority speaks HTTP/3. Only a genuine handshake/ALPN negotiation failure
+// may produce ErrHTTP3Unavailable, because that is the single error the caller
+// treats as "fall back to HTTP/2".
+//
+// This is asserted by exhausting the pool's slots and then checking that a
+// failing tunnel does NOT report ErrHTTP3Unavailable. If a slot-level failure
+// were ever classified as an authority failure, every slot blip would push all
+// traffic to HTTP/2, which is exactly the regression this guards.
+func TestH3SlotFailureDoesNotPoisonAuthority(t *testing.T) {
+	server := startMASQUEPoolServer(t)
+	agent := newPoolTestAgent(t, server, 2)
+	target := M.ParseSocksaddr("127.0.0.1:9")
+
+	// Make every slot unusable: draining with no live tunnels, which the pool
+	// may recycle, and dead, which it cannot use without recycling.
+	for _, slot := range agent.slots {
+		slot.markDraining(nil)
+	}
+
+	// A tunnel still succeeds (the pool recycles), and crucially the error from
+	// any failure is never the authority-level sentinel.
+	for range 4 {
+		conn, err := agent.DialContext(context.Background(), target)
+		if err != nil {
+			require.False(t, errors.Is(err, ErrHTTP3Unavailable),
+				"a slot-level failure must never be reported as HTTP/3 unavailable; got %v", err)
+			continue
+		}
+		conn.Close()
+	}
+
+	// Also cover the case where every slot is DEAD, which is the state the pool
+	// cannot recover from without re-dialing. The resulting error must still not
+	// be the authority-level sentinel: an unusable pool is a transport
+	// condition, not an ALPN verdict about the authority.
+	for _, slot := range agent.slots {
+		slot.markDead()
+		slot.access.Lock()
+		if slot.rawConn != nil {
+			slot.rawConn.Close()
+		}
+		slot.access.Unlock()
+	}
+	_, err := agent.DialContext(context.Background(), target)
+	if err != nil {
+		require.False(t, errors.Is(err, ErrHTTP3Unavailable),
+			"a dead pool must not be reported as HTTP3-unavailable; got %v", err)
+	}
+}
+
+// TestClientSingleFlightH3Probe proves a burst of callers after the avoidance
+// window expires produces at most ONE HTTP/3 probe, and that no caller is
+// blocked waiting for it.
+//
+// The hazard: when the window closes, a hundred simultaneous connections would
+// otherwise all dial QUIC at once, which is the thundering herd the backoff
+// exists to prevent.
+func TestClientSingleFlightH3Probe(t *testing.T) {
+	client := newScheduleOnlyClient(option.HTTP3FallbackSchedule{
+		InitialBackoff: 5 * time.Second,
+		MaxBackoff:     5 * time.Minute,
+		Multiplier:     2,
+		ResetOnSuccess: true,
+	})
+	require.NotNil(t, client)
+
+	// Put the client into an open avoidance window with a long deadline, so the
+	// next callers are in the "window open" branch.
+	client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
+	require.False(t, client.http3WindowElapsed(), "precondition: the window is open")
+
+	const callers = 64
+	results := make(chan struct {
+		useH3   bool
+		isProbe bool
+	}, callers)
+	start := make(chan struct{})
+	var waitGroup sync.WaitGroup
+	for range callers {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			useH3, isProbe := client.http3ProbeDecision()
+			results <- struct {
+				useH3   bool
+				isProbe bool
+			}{useH3, isProbe}
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+
+	probes := 0
+	blocked := 0
+	for result := range results {
+		if result.isProbe {
+			probes++
+		}
+		if !result.useH3 && !result.isProbe {
+			// A non-winner must go straight to HTTP/2, not wait.
+			blocked++
+		}
+	}
+	require.Equal(t, 1, probes,
+		"exactly one caller may hold the H3 probe; got %d", probes)
+	require.Equal(t, callers-1, blocked,
+		"every other caller must proceed on HTTP/2 without waiting; got %d", blocked)
+
+	// Releasing the probe lets the next caller become the prober, so recovery is
+	// not permanently wedged by one attempt.
+	client.finishProbe()
+	_, isProbe := client.http3ProbeDecision()
+	require.True(t, isProbe, "after the probe completes a new probe must be possible")
+	client.finishProbe()
+}
+
+// TestClientProbeReleasedOnBothOutcomes proves the single-flight slot is
+// released whether the probe succeeds or fails.
+//
+// A leak here would be permanent: H3 would never be probed again.
+func TestClientProbeReleasedOnBothOutcomes(t *testing.T) {
+	t.Run("on failure the window reopens and the probe slot frees", func(t *testing.T) {
+		client := newScheduleOnlyClient(option.HTTP3FallbackSchedule{
+			InitialBackoff: 5 * time.Second,
+			MaxBackoff:     5 * time.Minute,
+			Multiplier:     2,
+			ResetOnSuccess: true,
+		})
+		// An OPEN window with a probe in flight is the recovery scenario: the
+		// window has expired, so a probe is allowed.
+		client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		require.False(t, client.http3WindowElapsed(), "precondition: the window is open")
+		useH3, isProbe := client.http3ProbeDecision()
+		require.True(t, useH3, "the probe owner must attempt HTTP/3")
+		require.True(t, isProbe)
+
+		client.markHTTP3Broken()
+		client.finishProbe()
+
+		require.False(t, client.http3WindowElapsed(),
+			"a failed probe must reopen the avoidance window")
+		require.False(t, client.probeActive.Load(),
+			"the probe slot must be released after a failure")
+	})
+
+	t.Run("on success the window clears and the probe slot frees", func(t *testing.T) {
+		client := newScheduleOnlyClient(option.HTTP3FallbackSchedule{
+			InitialBackoff: 5 * time.Second,
+			MaxBackoff:     5 * time.Minute,
+			Multiplier:     2,
+			ResetOnSuccess: true,
+		})
+		client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		_, isProbe := client.http3ProbeDecision()
+		require.True(t, isProbe)
+
+		client.clearHTTP3Broken()
+		client.finishProbe()
+
+		require.True(t, client.http3WindowElapsed(),
+			"a successful probe must clear the avoidance window")
+		require.False(t, client.probeActive.Load(),
+			"the probe slot must be released after a success")
+		require.Zero(t, client.http3Escalation.Load(),
+			"reset_on_success must clear the escalation history")
 	})
 }

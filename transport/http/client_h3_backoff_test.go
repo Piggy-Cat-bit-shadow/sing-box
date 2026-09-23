@@ -28,10 +28,10 @@ func newScheduleOnlyClient(schedule option.HTTP3FallbackSchedule) *Client {
 	return &Client{http3Schedule: schedule}
 }
 
-// http3WindowExpired reports whether the avoidance window has elapsed. Unlike
+// http3WindowElapsed reports whether the avoidance window has elapsed. Unlike
 // http3Available it ignores whether an HTTP/3 client exists, so the schedule
 // state machine can be tested without a network.
-func (c *Client) http3WindowExpired() bool {
+func (c *Client) http3WindowElapsed() bool {
 	brokenUntil := c.http3BrokenUntil.Load()
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
@@ -191,15 +191,15 @@ func TestClientHTTP3AvailabilityWindow(t *testing.T) {
 
 	client.markHTTP3Broken()
 	require.NotZero(t, client.http3BrokenUntil.Load(), "a failure must open an avoidance window")
-	require.False(t, client.http3WindowExpired(), "the window must not be expired immediately")
+	require.False(t, client.http3WindowElapsed(), "the window must not be expired immediately")
 
 	// Wait out the window. This is a sub-100ms backoff by construction, so the
 	// test is fast while still exercising real time.
 	deadline := time.Now().Add(2 * time.Second)
-	for !client.http3WindowExpired() && time.Now().Before(deadline) {
+	for !client.http3WindowElapsed() && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	require.True(t, client.http3WindowExpired(), "the window must expire after the backoff elapses")
+	require.True(t, client.http3WindowElapsed(), "the window must expire after the backoff elapses")
 }
 
 // TestClientBackoffSurvivesWindowExpiry is the P0-5 regression: a serial
@@ -219,10 +219,10 @@ func TestClientBackoffSurvivesWindowExpiry(t *testing.T) {
 
 	// Let the window expire.
 	deadline := time.Now().Add(2 * time.Second)
-	for !client.http3WindowExpired() && time.Now().Before(deadline) {
+	for !client.http3WindowElapsed() && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
-	require.True(t, client.http3WindowExpired(), "precondition: the window must have expired")
+	require.True(t, client.http3WindowElapsed(), "precondition: the window must have expired")
 
 	// A retry fails. The backoff must grow, not restart.
 	client.markHTTP3Broken()
@@ -231,7 +231,7 @@ func TestClientBackoffSurvivesWindowExpiry(t *testing.T) {
 
 	// And again, to prove the growth continues rather than oscillating.
 	deadline = time.Now().Add(2 * time.Second)
-	for !client.http3WindowExpired() && time.Now().Before(deadline) {
+	for !client.http3WindowElapsed() && time.Now().Before(deadline) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	client.markHTTP3Broken()

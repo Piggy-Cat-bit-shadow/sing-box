@@ -45,7 +45,13 @@ func (c *Client) OpenTunnel(ctx context.Context, protocol string, path string) (
 }
 
 func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Conn, DatagramStream, error) {
-	if c.http3Available() {
+	// Single-flight recovery, identical to DialContext: one prober, everyone
+	// else on HTTP/2, and no caller blocked behind the probe.
+	useH3, isProbe := c.http3ProbeDecision()
+	if isProbe {
+		defer c.finishProbe()
+	}
+	if useH3 {
 		stream, err := c.http3.OpenTunnel(ctx, request)
 		if err == nil {
 			c.clearHTTP3Broken()

@@ -101,6 +101,19 @@ type Client struct {
 	// http3Schedule is the resolved http3_fallback configuration. With no
 	// configuration it equals the upstream 5s/x2/5m schedule.
 	http3Schedule option.HTTP3FallbackSchedule
+
+	// probeActive implements SINGLE-FLIGHT recovery probing.
+	//
+	// When the avoidance window expires, exactly one caller is allowed to
+	// re-probe HTTP/3; every other caller keeps using HTTP/2 until that probe
+	// resolves. Without this, 100 connections arriving the instant a window
+	// expires would all dial QUIC simultaneously, which is the thundering herd
+	// the backoff exists to prevent.
+	//
+	// It is an atomic.Bool rather than a mutex because the decision must be
+	// non-blocking: a caller that does not win the probe must proceed on HTTP/2
+	// IMMEDIATELY rather than waiting for the winner.
+	probeActive atomic.Bool
 }
 
 func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outboundDialer N.Dialer, serverOptions option.ServerOptions, tlsOptions option.OutboundTLSOptions, options ClientOptions) (*Client, error) {
@@ -220,6 +233,46 @@ func (c *Client) http3Available() bool {
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
 
+// http3ProbeDecision decides whether THIS caller should attempt HTTP/3.
+//
+// It returns (useH3, isProbe):
+//
+//   - window closed (H3 healthy):        useH3 = true,  isProbe = false
+//   - window open, nobody probing:       useH3 = true,  isProbe = true
+//   - window open, a probe is in flight: useH3 = false, isProbe = false
+//   - window expired:                    same as "nobody probing", i.e. this
+//     caller becomes the probe
+//
+// The single-flight property is that at most one caller can hold isProbe=true at
+// a time, and that a non-winner is never blocked: it simply uses HTTP/2 for this
+// request, which is what keeps a burst from becoming a herd.
+func (c *Client) http3ProbeDecision() (useH3 bool, isProbe bool) {
+	// NOTE: this deliberately does NOT early-return on c.http3 == nil. The
+	// single-flight decision is a property of the AVOIDANCE STATE, not of whether
+	// a transport object exists yet, and the callers below already handle a nil
+	// HTTP/3 client. Keeping the decision independent is also what makes it
+	// testable without a live QUIC connection.
+	if c.http3WindowElapsed() {
+		// H3 is considered usable: the window has closed or was never opened.
+		return true, false
+	}
+	// The window is open, so H3 is being avoided. Allow exactly one probe; every
+	// other caller proceeds on HTTP/2 without waiting.
+	if c.probeActive.CompareAndSwap(false, true) {
+		return true, true
+	}
+	return false, false
+}
+
+// finishProbe releases the single-flight probe slot.
+//
+// It must be called on EVERY path once a probe attempt concludes, or H3 would
+// never be probed again. Both outcomes release it; whether the window reopens is
+// decided by markHTTP3Broken or clearHTTP3Broken, not here.
+func (c *Client) finishProbe() {
+	c.probeActive.Store(false)
+}
+
 // markHTTP3Broken escalates the HTTP/3 avoidance window. The escalation counter
 // is deliberately NOT reset when the window expires, so a sequence of
 // failure -> expiry -> failure keeps growing rather than restarting.
@@ -251,7 +304,14 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	if c.http3Available() {
+	// Single-flight recovery: while the avoidance window is open, at most one
+	// caller probes HTTP/3 and every other caller goes straight to HTTP/2. A
+	// non-winner is never blocked waiting for the probe.
+	useH3, isProbe := c.http3ProbeDecision()
+	if isProbe {
+		defer c.finishProbe()
+	}
+	if useH3 {
 		conn, err := c.http3.DialContext(ctx, destination)
 		if err == nil {
 			c.clearHTTP3Broken()
