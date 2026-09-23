@@ -26,6 +26,31 @@ func init() {
 	NewHTTP3Client = newHTTP3Client
 }
 
+// http3PoolSlot owns one complete, independent HTTP/3 stack: its own UDP socket,
+// its own QUIC connection and its own http3.ClientConn. Slots share nothing, so
+// two slots are two QUIC connections rather than two streams on one.
+type http3PoolSlot struct {
+	transport *http3.Transport
+	access    sync.Mutex
+	conn      *http3.ClientConn
+	rawConn   net.Conn
+
+	// quicAccess guards quicConfig, which is created lazily per slot.
+	quicAccess sync.Mutex
+	quicConfig *quic.Config
+}
+
+// http3ClientImpl is the MASQUE tunnel client.
+//
+// The pool exists because every CONNECT and CONNECT-UDP tunnel previously shared
+// one QUIC connection, putting them all under a single congestion controller. A
+// pool of N gives N independent congestion controllers on the wire.
+//
+// A NEW tunnel picks a slot once, round-robin, and stays on it for its lifetime.
+// A tunnel is never migrated to another slot and its payload is never replayed,
+// which is the property that matters for CONNECT: a half-written tunnel body
+// cannot be rewound, so "do not replay" is about one tunnel, not about pinning
+// every tunnel to slot 0.
 type http3ClientImpl struct {
 	dialer        N.Dialer
 	tlsConfig     aTLS.Config
@@ -33,11 +58,12 @@ type http3ClientImpl struct {
 	authority     string
 	headers       http.Header
 	authorization string
-	quicConfig    *quic.Config
-	transport     *http3.Transport
-	access        sync.Mutex
-	conn          *http3.ClientConn
-	rawConn       net.Conn
+	// baseQUICConfig is cloned per slot, because sing-quic mutates the config it
+	// is handed.
+	baseQUICConfig *quic.Config
+
+	slots []*http3PoolSlot
+	next  atomic.Uint64
 }
 
 func newHTTP3Client(options ClientOptions, authorization string) (http3Client, error) {
@@ -48,8 +74,8 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 	if dialer == nil {
 		dialer = N.SystemDialer
 	}
-	quicConfig := httpclient.NewQUICConfig(options.HTTP3Options)
-	quicConfig.EnableDatagrams = true
+	baseQUICConfig := httpclient.NewQUICConfig(options.HTTP3Options)
+	baseQUICConfig.EnableDatagrams = true
 	headers := options.Headers.Clone()
 	authority := options.Server.String()
 	if options.Authority != "" {
@@ -61,27 +87,68 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		}
 		headers.Del("Host")
 	}
+	// A size of 1 is the upstream behaviour: exactly one transport, one lazily
+	// established connection.
+	poolSize, err := options.HTTP3Options.HTTP3ConnectionPool.Build()
+	if err != nil {
+		return nil, err
+	}
+	slots := make([]*http3PoolSlot, 0, poolSize)
+	for range poolSize {
+		slots = append(slots, &http3PoolSlot{
+			transport: &http3.Transport{EnableDatagrams: true, DisableCompression: true},
+		})
+	}
+
 	return &http3ClientImpl{
-		dialer:        dialer,
-		tlsConfig:     options.TLSConfig,
-		server:        options.Server,
-		authority:     authority,
-		headers:       headers,
-		authorization: authorization,
-		quicConfig:    quicConfig,
-		transport:     &http3.Transport{EnableDatagrams: true, DisableCompression: true},
+		dialer:         dialer,
+		tlsConfig:      options.TLSConfig,
+		server:         options.Server,
+		authority:      authority,
+		headers:        headers,
+		authorization:  authorization,
+		baseQUICConfig: baseQUICConfig,
+		slots:          slots,
 	}, nil
 }
 
-func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error) {
-	c.access.Lock()
-	defer c.access.Unlock()
-	if c.conn != nil && c.conn.Context().Err() == nil {
-		return c.conn, nil
+// quicConfigFor returns a per-slot QUIC config.
+//
+// sing-quic's DialEarly mutates the config it is given (it assigns
+// HandshakeIdleTimeout when unset), so a config shared between slots is a data
+// race once two slots dial concurrently. Each slot therefore gets its own copy.
+func (c *http3ClientImpl) quicConfigFor(slot *http3PoolSlot) *quic.Config {
+	slot.quicAccess.Lock()
+	defer slot.quicAccess.Unlock()
+	if slot.quicConfig == nil {
+		slot.quicConfig = c.baseQUICConfig.Clone()
 	}
-	if c.rawConn != nil {
-		c.rawConn.Close()
-		c.rawConn = nil
+	return slot.quicConfig
+}
+
+// pickSlot chooses the slot a NEW tunnel will use.
+func (c *http3ClientImpl) pickSlot() *http3PoolSlot {
+	if len(c.slots) == 1 {
+		return c.slots[0]
+	}
+	index := c.next.Add(1) - 1
+	return c.slots[index%uint64(len(c.slots))]
+}
+
+// slotCount reports how many independent QUIC connections this client can hold.
+func (c *http3ClientImpl) slotCount() int {
+	return len(c.slots)
+}
+
+func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*http3.ClientConn, error) {
+	slot.access.Lock()
+	defer slot.access.Unlock()
+	if slot.conn != nil && slot.conn.Context().Err() == nil {
+		return slot.conn, nil
+	}
+	if slot.rawConn != nil {
+		slot.rawConn.Close()
+		slot.rawConn = nil
 	}
 	rawConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, c.server)
 	if err != nil {
@@ -90,7 +157,7 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		}
 		return nil, E.Cause1(ErrHTTP3Unavailable, err)
 	}
-	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
+	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfigFor(slot))
 	if err != nil {
 		rawConn.Close()
 		if ctx.Err() != nil {
@@ -98,13 +165,17 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		}
 		return nil, E.Cause1(ErrHTTP3Unavailable, err)
 	}
-	c.conn = c.transport.NewClientConn(quicConn)
-	c.rawConn = rawConn
-	return c.conn, nil
+	slot.conn = slot.transport.NewClientConn(quicConn)
+	slot.rawConn = rawConn
+	return slot.conn, nil
 }
 
 func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {
-	clientConn, err := c.acquire(ctx)
+	// The slot is chosen exactly once per tunnel, before any bytes are written,
+	// so a failure can never cause this tunnel's payload to be replayed on
+	// another connection.
+	slot := c.pickSlot()
+	clientConn, err := c.acquire(slot, ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -184,31 +255,43 @@ func (c *http3ClientImpl) OpenTunnel(ctx context.Context, request tunnelRequest)
 	return &http3RequestDatagramStream{stream: stream, datagramsEnabled: clientConn.Settings().EnableDatagrams}, nil
 }
 
+// ResetConnection tears down every pooled connection so later tunnels dial
+// fresh. All slots are reset because a shared authority failure affects them all.
 func (c *http3ClientImpl) ResetConnection() {
-	c.access.Lock()
-	defer c.access.Unlock()
-	if c.conn != nil {
-		c.conn.CloseWithError(0, "")
-		c.conn = nil
-	}
-	if c.rawConn != nil {
-		c.rawConn.Close()
-		c.rawConn = nil
+	for _, slot := range c.slots {
+		slot.access.Lock()
+		if slot.conn != nil {
+			slot.conn.CloseWithError(0, "")
+			slot.conn = nil
+		}
+		if slot.rawConn != nil {
+			slot.rawConn.Close()
+			slot.rawConn = nil
+		}
+		slot.access.Unlock()
 	}
 }
 
+// Close releases every slot's connection, UDP socket and transport. A failure on
+// one slot does not prevent the others from being closed.
 func (c *http3ClientImpl) Close() error {
-	c.access.Lock()
-	defer c.access.Unlock()
-	if c.conn != nil {
-		c.conn.CloseWithError(0, "")
-		c.conn = nil
+	var closeErr error
+	for _, slot := range c.slots {
+		slot.access.Lock()
+		if slot.conn != nil {
+			slot.conn.CloseWithError(0, "")
+			slot.conn = nil
+		}
+		if slot.rawConn != nil {
+			slot.rawConn.Close()
+			slot.rawConn = nil
+		}
+		slot.access.Unlock()
+		closeErr = E.Append(closeErr, slot.transport.Close(), func(err error) error {
+			return E.Cause(err, "close http3 transport")
+		})
 	}
-	if c.rawConn != nil {
-		c.rawConn.Close()
-		c.rawConn = nil
-	}
-	return c.transport.Close()
+	return closeErr
 }
 
 type http3StreamConn struct {
