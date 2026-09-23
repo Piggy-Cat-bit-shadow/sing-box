@@ -102,8 +102,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # test/ is its own Go module, so it must be built from inside that
+          # directory.
+          #
+          # Scope: run the Jiejie Server Edition coverage plus the upstream
+          # HTTP/HTTP3 suites that exercise the same listeners. The remaining
+          # upstream tests in this module depend on a Docker daemon and on
+          # Linux-only features, which the runner does not provide, so they are
+          # deliberately not run here.
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          go test -tags "$TAGS" -v -count=1 ./test/... 2>&1 | tee integration.log
+          cd test
+          go test -tags "$TAGS" -v -count=1 -timeout 20m \
+            -run 'TestJiejie|TestHTTPInbound|TestHTTPForward|TestMASQUE' . 2>&1 | tee ../integration.log
       - name: Upload integration log
         if: always()
         uses: actions/upload-artifact@v4

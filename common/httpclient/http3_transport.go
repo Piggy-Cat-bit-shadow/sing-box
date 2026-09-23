@@ -44,10 +44,6 @@ func (t *http3Transport) pick(request *http.Request) *http3.Transport {
 	return t.transports[index%uint64(len(t.transports))]
 }
 
-func (t *http3Transport) roundTripOpt(request *http.Request, opt http3.RoundTripOpt) (*http.Response, error) {
-	return t.pick(request).RoundTripOpt(request, opt)
-}
-
 func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 	return t.pick(request).RoundTrip(request)
 }

@@ -191,14 +191,12 @@ func TestHTTP3PoolConcurrentPick(t *testing.T) {
 	)
 	var waitGroup sync.WaitGroup
 	for range workers {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+		waitGroup.Go(func() {
 			for range iterations {
 				request := mustRequest(t, http.MethodGet, "https://example.com/", nil, nil)
 				pool.pick(request)
 			}
-		}()
+		})
 	}
 	waitGroup.Wait()
 	access.Lock()
@@ -438,9 +436,7 @@ func runConcurrentRequests(t *testing.T, pool *http3Transport, address string, r
 	var waitGroup sync.WaitGroup
 	errs := make(chan error, requests)
 	for range requests {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+		waitGroup.Go(func() {
 			request, err := http.NewRequest(http.MethodGet, "https://"+address+"/", nil)
 			if err != nil {
 				errs <- err
@@ -453,7 +449,7 @@ func runConcurrentRequests(t *testing.T, pool *http3Transport, address string, r
 			}
 			defer response.Body.Close()
 			_, _ = io.Copy(io.Discard, response.Body)
-		}()
+		})
 	}
 	waitGroup.Wait()
 	close(errs)
