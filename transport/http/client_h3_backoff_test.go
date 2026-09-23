@@ -28,14 +28,6 @@ func newScheduleOnlyClient(schedule option.HTTP3FallbackSchedule) *Client {
 	return &Client{http3Schedule: schedule}
 }
 
-// http3WindowElapsed reports whether the avoidance window has elapsed. Unlike
-// http3Available it ignores whether an HTTP/3 client exists, so the schedule
-// state machine can be tested without a network.
-func (c *Client) http3WindowElapsed() bool {
-	brokenUntil := c.http3BrokenUntil.Load()
-	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
-}
-
 func scheduleFrom(t *testing.T, initial, maximum time.Duration, multiplier float64, reset *bool) option.HTTP3FallbackSchedule {
 	t.Helper()
 	return resolveClientHTTP3Schedule(&option.HTTP3FallbackOptions{
