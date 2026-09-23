@@ -34,31 +34,28 @@ func (h captureHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.So
 	}
 }
 
+type responseFallbackHandler struct {
+	payload  []byte
+	received chan []byte
+}
+
+func (h responseFallbackHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer conn.Close()
+	body := make([]byte, len(h.payload))
+	_, _ = io.ReadFull(conn, body)
+	h.received <- body
+	_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
+	if onClose != nil {
+		onClose(nil)
+	}
+}
+
 func TestFallbackPreservesAuthenticationProbe(t *testing.T) {
-	backend, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer backend.Close()
 	payload := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 	backendReceived := make(chan []byte, 1)
-	go func() {
-		conn, acceptErr := backend.Accept()
-		if acceptErr != nil {
-			return
-		}
-		defer conn.Close()
-		body := make([]byte, len(payload))
-		_, _ = io.ReadFull(conn, body)
-		backendReceived <- body
-		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"))
-	}()
-	address := backend.Addr().(*net.TCPAddr)
-	fallback := &fallbackHandler{
-		destination: M.ParseSocksaddrHostPort(address.IP.String(), uint16(address.Port)),
-		logger:      log.NewNOPFactory().Logger(),
-	}
 	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{
 		Handler:         discardHandler{},
-		FallbackHandler: fallback,
+		FallbackHandler: responseFallbackHandler{payload: payload, received: backendReceived},
 	})
 	require.NoError(t, err)
 	client, server := net.Pipe()
@@ -89,7 +86,16 @@ func TestFallbackPreservesAuthenticationProbe(t *testing.T) {
 
 func TestFallbackOptionsRequireDestination(t *testing.T) {
 	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "anytls", option.AnyTLSInboundOptions{
-		Fallback: &option.AnyTLSFallbackOptions{},
+		Fallback: &option.ServerOptions{},
+	})
+	require.Error(t, err)
+}
+
+func TestFallbackForALPNRequiresTLS(t *testing.T) {
+	_, err := NewInbound(context.Background(), nil, log.NewNOPFactory().Logger(), "anytls", option.AnyTLSInboundOptions{
+		FallbackForALPN: map[string]*option.ServerOptions{
+			"http/1.1": {Server: "127.0.0.1", ServerPort: 8080},
+		},
 	})
 	require.Error(t, err)
 }

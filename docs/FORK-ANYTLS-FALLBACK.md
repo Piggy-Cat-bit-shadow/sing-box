@@ -21,6 +21,16 @@ decoy TCP service instead of immediately closing the connection.
   "fallback": {
     "server": "127.0.0.1",
     "server_port": 28437
+  },
+  "fallback_for_alpn": {
+    "http/1.1": {
+      "server": "127.0.0.1",
+      "server_port": 28437
+    },
+    "h2": {
+      "server": "127.0.0.1",
+      "server_port": 28438
+    }
   }
 }
 ```
@@ -30,17 +40,22 @@ The fallback is raw TCP **after TLS termination**. For the example above, port
 the probe bytes it read while checking authentication in its cached connection,
 so the backend receives the complete original stream.
 
-No fallback is attempted for authenticated AnyTLS users, and omitting
-`fallback` preserves upstream authentication-failure behavior. The fallback
-destination must have a non-empty `server` and a non-zero `server_port`; invalid
-configuration fails during `sing-box check`/inbound creation.
+No fallback is attempted for authenticated AnyTLS users, and omitting both
+`fallback` and `fallback_for_alpn` preserves upstream authentication-failure
+behavior. The fallback destination must have a non-empty `server` and a non-zero
+`server_port`; invalid configuration fails during `sing-box check`/inbound
+creation. `fallback_for_alpn` uses the same semantics as Trojan: when it is
+present, a negotiated ALPN that has no configured entry is rejected; a default
+`fallback` is used only if there is no negotiated ALPN match.
 
 This feature does not override TLS ALPN. Set `tls.alpn` explicitly when using a
 browser-style backend. If `h2` is negotiated, the backend receives plaintext
 HTTP/2 preface and frames and must support h2c; this fork does not translate
-HTTP/2 to HTTP/1.1.
+HTTP/2 to HTTP/1.1. A simple deployment should advertise only `http/1.1` and
+use a plaintext HTTP/1.1 backend.
 
 The fallback backend is directly dialed only after authentication fails. It
 does not change the AnyTLS wire protocol, padding, authentication, outbound, or
-normal multiplexed data path. Run `go test ./protocol/anytls ./option` and
+normal multiplexed data path. Do not point fallback back to the AnyTLS listener:
+that configuration creates a loop. Run `go test ./protocol/anytls ./option` and
 `sing-box check -c config.json` before deployment.
