@@ -41,6 +41,10 @@ type Inbound struct {
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPInboundOptions) (adapter.Inbound, error) {
+	masqueradeHandler, err := http.NewMasqueradeHandler(ctx, options.Masquerade)
+	if err != nil {
+		return nil, err
+	}
 	versions := options.Versions()
 	serveHTTP1 := slices.Contains(versions, 1)
 	serveHTTP2 := slices.Contains(versions, 2)
@@ -63,6 +67,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			HTTP2:         serveHTTP2,
 			HTTP2Options:  options.HTTP2Options,
 			UDP:           true,
+			Masquerade:    masqueradeHandler,
 		}),
 		http3:       serveHTTP3,
 		quicOptions: options.HTTP3Options,

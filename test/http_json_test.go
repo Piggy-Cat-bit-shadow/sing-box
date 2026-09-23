@@ -54,3 +54,17 @@ func TestHTTPJSONConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "hello", string(body))
 }
+
+func TestHTTPMasqueradeJSONConfig(t *testing.T) {
+	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, []byte(`{
+		"inbounds": [{
+			"type": "http", "listen": "127.0.0.1", "listen_port": 1080,
+			"masquerade": {"type": "proxy", "url": "http://127.0.0.1:9444", "rewrite_host": true}
+		}], "outbounds": [{"type": "direct"}]
+	}`))
+	require.NoError(t, err)
+	inbound := options.Inbounds[0].Options.(*option.HTTPInboundOptions)
+	require.NotNil(t, inbound.Masquerade)
+	require.Equal(t, "proxy", inbound.Masquerade.Type)
+	require.Equal(t, "http://127.0.0.1:9444", inbound.Masquerade.ProxyOptions.URL)
+}
