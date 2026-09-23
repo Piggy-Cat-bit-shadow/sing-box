@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - feat/http-inbound-masquerade
+      - testing
+      - feat/**
 
 permissions:
   contents: read
