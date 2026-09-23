@@ -428,3 +428,210 @@ func (failingDialer) DialContext(ctx context.Context, network string, destinatio
 func (failingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	return nil, errors.New("listen failed")
 }
+
+// TestMASQUEClientWaitsForHandshakeBeforeCONNECT pins the invariant that a tunnel
+// is never created from a connection whose handshake has not completed.
+//
+// Why the invariant matters: quic-go's Transport.dial returns early only when
+// earlyConnChan fires, i.e. when 0-RTT data is actually available from a cached
+// session ticket; otherwise it blocks on HandshakeComplete(). A CONNECT sent
+// before handshake completion would therefore ride as 0-RTT application data,
+// which is replayable by design. The standard http3.ClientConn.roundTrip prevents
+// this by waiting for HandshakeComplete() for every method except GET_0RTT and
+// HEAD_0RTT. Our MASQUE client issues CONNECT through OpenRequestStream +
+// SendRequestHeader, bypassing that protection, so it performs the wait itself.
+//
+// Honest scope: this is defensive. On loopback the stall had to be forced to
+// observe the ordering at all, because a session-ticket 0-RTT race did not
+// reproduce here even with Allow0RTT enabled on the server. The test asserts the
+// ordering guarantee, which is what the code must provide regardless of whether
+// the race is currently reachable.
+func TestMASQUEClientWaitsForHandshakeBeforeCONNECT(t *testing.T) {
+	server := startStallingMASQUEServer(t)
+	agent := newPoolTestAgent(t, server.masquePoolServer, 1)
+
+	var (
+		observed  bool
+		attempted bool
+	)
+	agent.beforeOpenStream = func(slot *http3PoolSlot) {
+		attempted = true
+		slot.access.Lock()
+		quicConn := slot.quicConn
+		slot.access.Unlock()
+		if quicConn == nil {
+			return
+		}
+		select {
+		case <-quicConn.HandshakeComplete():
+			observed = true
+		default:
+		}
+	}
+
+	// Hold the server's TLS handshake open so the ordering is deterministic.
+	server.releaseHandshakeAfter(300 * time.Millisecond)
+
+	conn, err := agent.DialContext(context.Background(), M.ParseSocksaddr("127.0.0.1:9"))
+	require.NoError(t, err, "a stalled handshake must still complete and the tunnel must succeed")
+	conn.Close()
+
+	require.True(t, attempted, "the test must have attempted a CONNECT")
+	require.True(t, observed,
+		"the CONNECT must not be sent before the QUIC handshake completes")
+}
+
+// TestMASQUEClientHandshakeGateAlsoCoversConnectUDP proves the gate is not
+// TCP-CONNECT-only: CONNECT-UDP goes through the same openStream path.
+func TestMASQUEClientHandshakeGateAlsoCoversConnectUDP(t *testing.T) {
+	server := startStallingMASQUEServer(t)
+	agent := newPoolTestAgent(t, server.masquePoolServer, 1)
+
+	var (
+		observed  bool
+		attempted bool
+	)
+	agent.beforeOpenStream = func(slot *http3PoolSlot) {
+		attempted = true
+		slot.access.Lock()
+		quicConn := slot.quicConn
+		slot.access.Unlock()
+		if quicConn == nil {
+			return
+		}
+		select {
+		case <-quicConn.HandshakeComplete():
+			observed = true
+		default:
+		}
+	}
+
+	server.releaseHandshakeAfter(300 * time.Millisecond)
+
+	requestURL := mustParseURL(t, "https://example.test/.well-known/masque/udp/127.0.0.1/9/")
+	stream, err := agent.OpenTunnel(context.Background(), tunnelRequest{
+		url:      requestURL,
+		protocol: "connect-udp",
+	})
+	require.NoError(t, err)
+	stream.Close()
+
+	require.True(t, attempted, "the test must have attempted a CONNECT-UDP")
+	require.True(t, observed,
+		"CONNECT-UDP must also wait for the handshake before sending its headers")
+}
+
+// TestMASQUEClientHandshakeGateHandlesStalledHandshake proves the gate also
+// protects the failure path: a handshake that never completes must surface as an
+// error rather than hanging or sending the CONNECT anyway.
+func TestMASQUEClientHandshakeGateHandlesStalledHandshake(t *testing.T) {
+	server := startStallingMASQUEServer(t)
+	agent := newPoolTestAgent(t, server.masquePoolServer, 1)
+
+	// Never release the handshake before the assertion; the caller's deadline is
+	// the only thing that can end this. The cleanup callback releases it later.
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	_, err := agent.DialContext(ctx, M.ParseSocksaddr("127.0.0.1:9"))
+	require.Error(t, err, "a handshake that never completes must not hang forever")
+
+	// The tunnel must not have been established.
+	require.Equal(t, 0, server.tunnels.total,
+		"no tunnel may be created while the handshake is incomplete")
+}
+
+// stallingMASQUEServer is an HTTP/3 server whose TLS handshake can be held open,
+// which makes the ordering between handshake completion and CONNECT observable
+// deterministically instead of depending on loopback timing.
+type stallingMASQUEServer struct {
+	*masquePoolServer
+	release chan struct{}
+}
+
+// releaseHandshakeAfter lets the stalled TLS handshake proceed after d.
+func (s *stallingMASQUEServer) releaseHandshakeAfter(d time.Duration) {
+	var once sync.Once
+	go func() {
+		time.Sleep(d)
+		once.Do(func() {
+			select {
+			case <-s.release:
+			default:
+				close(s.release)
+			}
+		})
+	}()
+}
+
+// startStallingMASQUEServer starts a MASQUE pool server whose TLS handshake blocks
+// on GetConfigForClient until releaseHandshakeAfter is called.
+//
+// GetConfigForClient runs during the handshake, so blocking it keeps the QUIC
+// handshake incomplete — exactly the state in which a 0-RTT CONNECT would be sent.
+func startStallingMASQUEServer(t *testing.T) *stallingMASQUEServer {
+	t.Helper()
+
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+
+	release := make(chan struct{})
+	counter := &connectionCounter{conns: make(map[*quic.Conn]struct{})}
+	baseTLS := poolTestServerTLS(t)
+	baseTLS.GetConfigForClient = func(*stdTLS.ClientHelloInfo) (*stdTLS.Config, error) {
+		<-release
+		return nil, nil
+	}
+
+	serverImpl := &http3.Server{
+		EnableDatagrams: true,
+		TLSConfig:       baseTLS,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
+			counter.add(conn)
+			return ctx
+		},
+		Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method != http.MethodConnect {
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			writer.WriteHeader(http.StatusOK)
+			writer.(http.Flusher).Flush()
+			buffer := make([]byte, 4096)
+			for {
+				n, readErr := request.Body.Read(buffer)
+				if n > 0 {
+					if _, writeErr := writer.Write(buffer[:n]); writeErr != nil {
+						return
+					}
+					writer.(http.Flusher).Flush()
+				}
+				if readErr != nil {
+					return
+				}
+			}
+		}),
+	}
+	go func() { _ = serverImpl.Serve(udpConn) }()
+	t.Cleanup(func() {
+		// Release any still-stalled handshake first, otherwise Close blocks on the
+		// blocked GetConfigForClient goroutine and the test hangs during cleanup.
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		udpConn.Close()
+		_ = serverImpl.Close()
+	})
+
+	return &stallingMASQUEServer{
+		masquePoolServer: &masquePoolServer{
+			address:     udpConn.LocalAddr().String(),
+			connections: counter,
+			tunnels:     &httpserverTunnelCounter{},
+		},
+		release: release,
+	}
+}

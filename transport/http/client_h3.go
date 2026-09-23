@@ -33,7 +33,10 @@ type http3PoolSlot struct {
 	transport *http3.Transport
 	access    sync.Mutex
 	conn      *http3.ClientConn
-	rawConn   net.Conn
+	// quicConn is retained so a new tunnel can wait for the handshake to complete
+	// before sending its CONNECT header. See awaitHandshake.
+	quicConn *quic.Conn
+	rawConn  net.Conn
 
 	// quicAccess guards quicConfig, which is created lazily per slot.
 	quicAccess sync.Mutex
@@ -64,6 +67,12 @@ type http3ClientImpl struct {
 
 	slots []*http3PoolSlot
 	next  atomic.Uint64
+
+	// beforeOpenStream is a test hook invoked immediately before a tunnel opens
+	// its request stream. It is nil in production and exists so the ordering
+	// between the handshake gate and the CONNECT header can be asserted directly
+	// rather than inferred from timing.
+	beforeOpenStream func(slot *http3PoolSlot)
 }
 
 func newHTTP3Client(options ClientOptions, authorization string) (http3Client, error) {
@@ -164,6 +173,10 @@ func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*ht
 		// without poisoning the authority.
 		return nil, E.Cause(err, "establish HTTP/3 connection")
 	}
+	// qtls.DialEarly returns once the connection object exists, but it DOES honor
+	// ctx: with a peer that stalls its TLS handshake it returns the context error
+	// at the deadline (verified against the pinned sing-quic). No extra timeout
+	// wrapper is therefore needed here.
 	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfigFor(slot))
 	if err != nil {
 		rawConn.Close()
@@ -179,8 +192,40 @@ func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*ht
 		return nil, E.Cause(err, "establish HTTP/3 connection")
 	}
 	slot.conn = slot.transport.NewClientConn(quicConn)
+	slot.quicConn = quicConn
 	slot.rawConn = rawConn
 	return slot.conn, nil
+}
+
+// awaitHandshake blocks until the QUIC handshake for this slot has completed.
+//
+// Why this is required: sing-quic's DialEarly returns as soon as the connection
+// object exists, and OpenStreamSync only waits for stream limits, not for the
+// handshake. Our MASQUE client writes the CONNECT header with
+// OpenRequestStream + SendRequestHeader, which bypasses the protection the
+// standard http3.ClientConn.roundTrip applies. That method waits for
+// HandshakeComplete() for every request except GET_0RTT and HEAD_0RTT, and it is
+// what keeps ordinary requests out of 0-RTT.
+//
+// A proxy tunnel must not be created as 0-RTT application data: 0-RTT data is
+// replayable by design, so a captured CONNECT could be replayed by an attacker.
+// Session resumption itself is left enabled; only the sending of the CONNECT
+// header is gated.
+func (c *http3ClientImpl) awaitHandshake(slot *http3PoolSlot, ctx context.Context) error {
+	slot.access.Lock()
+	quicConn := slot.quicConn
+	slot.access.Unlock()
+	if quicConn == nil {
+		return nil
+	}
+	select {
+	case <-quicConn.HandshakeComplete():
+		return nil
+	case <-quicConn.Context().Done():
+		return context.Cause(quicConn.Context())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {
@@ -191,6 +236,17 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 	clientConn, err := c.acquire(slot, ctx)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Never send a CONNECT before the handshake completes; otherwise it could be
+	// transmitted as replayable 0-RTT data.
+	if err = c.awaitHandshake(slot, ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		return nil, nil, E.Cause(err, "await HTTP/3 handshake")
+	}
+	if c.beforeOpenStream != nil {
+		c.beforeOpenStream(slot)
 	}
 	stream, err := clientConn.OpenRequestStream(ctx)
 	if err != nil {
@@ -280,6 +336,7 @@ func (c *http3ClientImpl) ResetConnection() {
 			slot.conn.CloseWithError(0, "")
 			slot.conn = nil
 		}
+		slot.quicConn = nil
 		if slot.rawConn != nil {
 			slot.rawConn.Close()
 			slot.rawConn = nil
@@ -298,6 +355,7 @@ func (c *http3ClientImpl) Close() error {
 			slot.conn.CloseWithError(0, "")
 			slot.conn = nil
 		}
+		slot.quicConn = nil
 		if slot.rawConn != nil {
 			slot.rawConn.Close()
 			slot.rawConn = nil
