@@ -7,7 +7,9 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/log"
@@ -96,18 +98,20 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	tunnelHandler := h.server.tunnels[protocol]
 	if tunnelHandler != nil {
-		tunnelCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
-		if authErr != nil {
-			h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
-			if h.server.masquerade != nil {
-				h.server.masquerade.ServeHTTP(writer, request)
-				return
-			}
-			writer.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
-			writer.WriteHeader(http.StatusUnauthorized)
+		release, limited := h.admitUnauthenticated(ctx, writer, connectionSource)
+		if limited {
 			return
 		}
-		h.serveTunnel(tunnelCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
+		authCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
+		if authErr != nil {
+			release()
+			h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, false)
+			return
+		}
+		// Authentication succeeded: the request leaves the unauthenticated
+		// limiter immediately so proxy traffic is never throttled here.
+		release()
+		h.serveTunnel(authCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
 		return
 	}
 	if h.handler == nil {
@@ -115,17 +119,17 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
-	if authErr != nil {
-		h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
-		if h.server.masquerade != nil {
-			h.server.masquerade.ServeHTTP(writer, request)
-			return
-		}
-		writer.Header().Set("Proxy-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
-		writer.WriteHeader(http.StatusProxyAuthRequired)
+	release, limited := h.admitUnauthenticated(ctx, writer, connectionSource)
+	if limited {
 		return
 	}
+	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
+	if authErr != nil {
+		release()
+		h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, true)
+		return
+	}
+	release()
 	ctx = proxyCtx
 	source := badhttp.ForwardedSource(request, connectionSource)
 	if request.Method == http.MethodConnect {
@@ -141,6 +145,60 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	h.serveForward(ctx, writer, request, source)
+}
+
+// admitUnauthenticated consults the unauthenticated limiter for a request that
+// has not yet authenticated. It returns a release function that must be called
+// when the request finishes, plus a flag indicating that the request was
+// already answered because it exceeded a limit.
+//
+// When the limiter rejects a request it responds with a deliberately
+// indistinguishable result: the masquerade handler when one is configured,
+// otherwise a bare 429. It never emits 401/407 or any auth challenge, so a
+// limiter cannot be used to fingerprint the endpoint as a proxy.
+func (h *httpHandler) admitUnauthenticated(ctx context.Context, writer http.ResponseWriter, source M.Socksaddr) (func(), bool) {
+	limiter := h.server.unauthenticatedLimiter
+	if limiter == nil {
+		return func() {}, false
+	}
+	release, allowed := limiter.acquire(source.AddrString(), time.Now())
+	if allowed {
+		return release, false
+	}
+	h.server.logger.DebugContext(ctx, "unauthenticated request from ", source, " rate limited")
+	if h.server.masquerade != nil {
+		h.server.masquerade.ServeHTTP(writer, &http.Request{
+			Method: http.MethodGet,
+			URL:    &url.URL{Path: "/"},
+			Proto:  "HTTP/1.1",
+			Header: make(http.Header),
+		})
+		return func() {}, true
+	}
+	writer.WriteHeader(http.StatusTooManyRequests)
+	return func() {}, true
+}
+
+// serveAuthFailure handles a failed authentication attempt. With a masquerade
+// handler the request is served a normal web response, which is the intended
+// design path and therefore logged at debug level; the previous code logged
+// these at error level even though the client received a 200. Without a
+// masquerade handler a real 401/407 challenge is returned and logged as an
+// error, which stays an error.
+func (h *httpHandler) serveAuthFailure(ctx context.Context, writer http.ResponseWriter, request *http.Request, source M.Socksaddr, authErr error, proxyAuth bool) {
+	if h.server.masquerade != nil {
+		h.server.logger.DebugContext(ctx, E.Cause(authErr, "masquerade unauthenticated request from ", source))
+		h.server.masquerade.ServeHTTP(writer, request)
+		return
+	}
+	h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", source))
+	if proxyAuth {
+		writer.Header().Set("Proxy-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
+		writer.WriteHeader(http.StatusProxyAuthRequired)
+		return
+	}
+	writer.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`", charset="UTF-8"`)
+	writer.WriteHeader(http.StatusUnauthorized)
 }
 
 func (h *httpHandler) serveConnect(ctx context.Context, writer http.ResponseWriter, request *http.Request, source M.Socksaddr) {

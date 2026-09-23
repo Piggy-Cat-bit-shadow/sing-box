@@ -43,6 +43,9 @@ type _HTTPInboundOptions struct {
 	// accepts only the profiles provided by congestion_meta2. Unset keeps the
 	// current standard behaviour.
 	BBRProfile string `json:"bbr_profile,omitempty" enum:"conservative,standard,aggressive"`
+	// UnauthenticatedLimits bounds pre-authentication traffic on this inbound.
+	// Authenticated proxy traffic is never affected.
+	UnauthenticatedLimits *UnauthenticatedLimitsOptions `json:"unauthenticated_limits,omitempty"`
 	InboundTLSOptionsContainer
 	HTTP2Options HTTP2Options `json:"-"`
 	HTTP3Options QUICOptions  `json:"-"`

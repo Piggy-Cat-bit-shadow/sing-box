@@ -52,6 +52,9 @@ type ServerOptions struct {
 	// MaxHeaderBytes overrides the request header limit. Zero keeps the
 	// upstream default.
 	MaxHeaderBytes int
+	// UnauthenticatedLimits bounds pre-authentication traffic. A nil or
+	// disabled value installs no limiter at all.
+	UnauthenticatedLimits *option.UnauthenticatedLimitsOptions
 }
 
 type Server struct {
@@ -63,6 +66,8 @@ type Server struct {
 	tunnels        map[string]TunnelHandler
 	masquerade     http.Handler
 	maxHeaderBytes int
+
+	unauthenticatedLimiter *unauthenticatedLimiter
 }
 
 func NewServer(options ServerOptions) *Server {
@@ -75,6 +80,7 @@ func NewServer(options ServerOptions) *Server {
 		masquerade:     options.Masquerade,
 		maxHeaderBytes: options.MaxHeaderBytes,
 	}
+	server.unauthenticatedLimiter = newUnauthenticatedLimiter(options.UnauthenticatedLimits.Build())
 	if server.maxHeaderBytes <= 0 {
 		server.maxHeaderBytes = maxHeaderBytes
 	}
