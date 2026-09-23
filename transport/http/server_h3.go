@@ -63,7 +63,9 @@ func init() {
 		go func() {
 			serveErr := http3Server.ServeListener(quicListener)
 			udpConn.Close()
-			if serveErr != nil && !E.IsClosedOrCanceled(serveErr) {
+			// A listener that stops because the server is shutting down is
+			// expected. Anything else is a real fault and stays an error.
+			if serveErr != nil && !E.IsClosedOrCanceled(serveErr) && !isExpectedH3Closure(serveErr) {
 				logger.Error("http3 server closed: ", serveErr)
 			}
 		}()

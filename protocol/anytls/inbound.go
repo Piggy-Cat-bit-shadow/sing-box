@@ -149,7 +149,12 @@ func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadat
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
 	metadata.Destination = fallbackAddr
-	h.logger.InfoContext(ctx, "fallback connection to ", fallbackAddr)
+	// Falling back is the intended design path for a non-AnyTLS client, so it
+	// is logged at debug level. A public scanner hitting TCP/443 would
+	// otherwise produce a steady stream of info lines. Genuine failures on
+	// this path (routing errors, backend connection failures, TLS errors) are
+	// still reported as errors elsewhere.
+	h.logger.DebugContext(ctx, "fallback connection to ", fallbackAddr)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
