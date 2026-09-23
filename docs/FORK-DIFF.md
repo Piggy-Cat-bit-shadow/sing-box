@@ -27,6 +27,12 @@ artifact with the portable upstream build tags, including `with_quic`. It uses
 the upstream golangci-lint version for the Linux build, plus focused vet and
 feature tests; it intentionally does not run the upstream multi-platform matrix.
 
+The production binary is produced by the official Go linker in a single
+`go build` invocation with `-trimpath` and `-ldflags "-s -w"`, which drops the
+symbol table and DWARF debug information. No external `strip`, `objcopy`,
+`eu-strip`, or UPX/packer step is applied, so the published artifact is exactly
+what the Go linker emitted. The build tags are not reduced for size.
+
 There are no other intentional sing-box runtime behavior changes.
 
 ## Upstream sync policy

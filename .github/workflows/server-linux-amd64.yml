@@ -38,8 +38,13 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           VERSION=1.15.0-jiejie-masquerade.2
-          go build -trimpath -tags "$TAGS" -ldflags "-X github.com/sagernet/sing-box/constant.Version=$VERSION" -o sing-box-linux-amd64 ./cmd/sing-box
+          go build -trimpath -tags "$TAGS" -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$VERSION" -o sing-box-linux-amd64 ./cmd/sing-box
+          file sing-box-linux-amd64
+          ls -lh sing-box-linux-amd64
+          stat -c '%s' sing-box-linux-amd64
+          ./sing-box-linux-amd64 version
           ./sing-box-linux-amd64 version | grep -F "$VERSION"
+          ./sing-box-linux-amd64 version | grep -F "with_quic"
           CONFIG=$(mktemp)
           trap 'rm -f "$CONFIG"' EXIT
           cat > "$CONFIG" <<'EOF'
@@ -53,6 +58,7 @@ jobs:
           EOF
           ./sing-box-linux-amd64 check -c "$CONFIG"
           sha256sum sing-box-linux-amd64 > sing-box-linux-amd64.sha256
+          cat sing-box-linux-amd64.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: sing-box-linux-amd64
