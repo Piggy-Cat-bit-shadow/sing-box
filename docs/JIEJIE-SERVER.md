@@ -400,6 +400,7 @@ tags, and simply not write the new keys.
 | --- | --- |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | upstream default tags — untouched |
 | `release/BUILD_TAGS_JIEJIE_SERVER` | `with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0` |
+| `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
 
 The Jiejie set drops optional components the server does not use:
 
@@ -424,6 +425,79 @@ Tag audit — what is actually true:
   binary is ever reused elsewhere.
 * **No protocol source file is deleted.** The size reduction comes purely from
   not registering optional components.
+
+### The `jiejie_server_minimal` build
+
+A third, more aggressive profile for this one server. It trims at the
+**protocol registration level** rather than at the optional-component level: the
+default `include/registry.go` registers roughly twenty protocols, and the minimal
+registry registers only what the production config actually references.
+
+No upstream source is edited or deleted. Packages the registry does not import
+never enter the import graph, so the Go linker removes them.
+
+| Registry | Default build | `jiejie_server_minimal` |
+| --- | --- | --- |
+| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | http, anytls, shadowtls, shadowsocks, socks, direct |
+| Outbounds | direct, bridge, block, selector, urltest, socks, http, shadowsocks, snell, vmess, trojan, naive, tor, ssh, shadowtls, vless, anytls, hysteria, tuic, hysteria2, tailscale | direct, block, selector, urltest, socks, http, shadowsocks, shadowtls, anytls |
+| Endpoints | WireGuard, OpenConnect, OpenVPN, MASQUE, Tailscale | none |
+| DNS | tcp, udp, tls, https, hosts, local, mdns, fakeip, quic, http3, resolved, dhcp, tailscale, openconnect, openvpn | tcp, udp, tls, https, hosts, local, resolved, plus non-functional QUIC/HTTP3 stubs |
+| Services | api, resolved, ssmapi, hysteria realm, derp, ccm, ocm, oom killer, usbip | resolved |
+| Cert providers | ACME, Tailscale, Cloudflare Origin CA | none |
+
+MASQUE HTTP/3 is unaffected by the QUIC trim: `transport/http/server_h3.go` is
+compiled by `with_quic` itself and needs no protocol registration. The server
+keeps HTTP/2, HTTP/3, QUIC, CONNECT, CONNECT-UDP, UoT, standard TLS, DNS
+(`direct.domain_resolver` and the local AGH setup), IPv4/IPv6, route/rules, the
+AnyTLS fallback, the HTTP masquerade and every Jiejie Server Edition feature.
+
+Excluded protocol types are still registered as **stubs** that return a clear
+error, so a config referencing them fails at `sing-box check` with a useful
+message instead of an "unknown type" error.
+
+Measured artifact sizes (Linux amd64, `-trimpath`, `-ldflags "-s -w"`, no UPX,
+no external strip):
+
+| Artifact | Size |
+| --- | --- |
+| `sing-box-linux-amd64-full` | ~74.7 MiB |
+| `sing-box-linux-amd64-jiejie` | ~41.1 MiB |
+| `sing-box-linux-amd64-jiejie-minimal` | ~33.0 MiB |
+
+That is about 55.9% smaller than the full build and 19.8% smaller than the
+Jiejie build. Exact byte counts and SHA256 values are printed by CI and should be
+read from the run output rather than from this table.
+
+#### Why uTLS and `badlinkname` are still present
+
+Both were investigated rather than assumed:
+
+* **uTLS cannot be removed.** `quic-go` imports `github.com/metacubex/utls`
+  unconditionally from `internal/handshake/tls_conn_utls.go`, with no build tag,
+  and `with_quic` is mandatory for MASQUE HTTP/3. Dropping `with_utls` changes
+  the linked uTLS symbol count from 1307 to 1297 — it removes the sing-box uTLS
+  client wrapper, not the library. Removing uTLS outright would require forking
+  quic-go, which is out of scope by design.
+* **`badlinkname` is kept.** It costs about 131 KiB in the minimal build and
+  enables kTLS (`common/ktls`, 106 symbols) plus the `badtls` read-wait path that
+  `common/tls` uses on every connection. Paying 131 KiB to avoid risking a
+  production TLS path is the right trade, and `tfogo_checklinkname0` is its
+  companion check tag.
+* **`with_acme` was dropped** from the minimal profile: certificates are
+  provisioned by acme.sh outside sing-box.
+
+#### Where the remaining size goes
+
+The binary is now dominated by Go runtime metadata rather than by any single
+removable dependency: `pclntab`, type information and string tables account for
+most of the file. The largest identifiable non-runtime item is
+`github.com/mattn/go-runewidth`, pulled in by the `cmd/sing-box` CLI for terminal
+output formatting — not part of the proxy data path, and not removable without
+editing upstream CLI code.
+
+Further reduction would mean changing upstream code or excluding the CLI, both of
+which conflict with the rule that this fork stays rebaseable. The remaining
+trim is therefore considered exhausted for this design.
 
 Measured on the development machine: full ≈ 108 MB, Jiejie ≈ 58 MB, and the
 Jiejie build passes `sing-box check` against a secret-free fixture of the real

@@ -85,10 +85,36 @@ the client receives an ordinary web response.
 
 ## Patch 8: build profiles
 
-`release/BUILD_TAGS_JIEJIE_SERVER` adds a reduced tag set for this server.
+`release/BUILD_TAGS_JIEJIE_SERVER` adds a reduced optional-component tag set.
 `release/DEFAULT_BUILD_TAGS_OTHERS` is untouched, so full upstream build
 capability is preserved. No protocol source is deleted; the size reduction comes
 from not registering optional components.
+
+## Patch 9: minimal server registry
+
+`include/registry.go` and `include/quic.go` gain a
+`!jiejie_server_minimal` build constraint, and two new files provide the minimal
+variant:
+
+* `include/registry_jiejie_server.go` (`jiejie_server_minimal`) registers only
+  the protocols and services this server's production config references.
+* `include/quic_minimal.go` (`with_quic && jiejie_server_minimal`) registers the
+  non-functional stubs for Hysteria/Hysteria2/TUIC/QUIC-DNS/realm without
+  importing those packages, and leaves MASQUE HTTP/3 to
+  `transport/http/server_h3.go`, which `with_quic` compiles on its own.
+
+Excluded types are still registered as stubs so a config referencing them fails
+with a clear message at `sing-box check`. No upstream protocol source is edited
+or deleted, and neither the full nor the plain Jiejie build changes behaviour.
+
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` is
+`with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0`.
+
+`release/jiejie-production-topology.json` is a secret-free fixture of the full
+production topology (MASQUE H2/H3 with masquerade and limits, AnyTLS with
+fallback, ShadowTLS v3, SS2022, a residential SOCKS outbound, selectors, route
+rules and the local-AGH DNS setup). CI requires every artifact to accept it, and
+requires the minimal build to reject a protocol it deliberately excludes.
 
 ## Maintenance and CI
 

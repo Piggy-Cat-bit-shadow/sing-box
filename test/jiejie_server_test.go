@@ -235,8 +235,12 @@ func TestJiejieAnyTLSAuthenticatedStillWorks(t *testing.T) {
 				},
 			},
 			{
-				Type: C.TypeMixed,
-				Options: &option.HTTPMixedInboundOptions{
+				// A SOCKS inbound is used as the local test client because it
+				// exists in the full, jiejie and jiejie-minimal builds, whereas
+				// the mixed inbound is deliberately absent from the minimal
+				// server build.
+				Type: C.TypeSOCKS,
+				Options: &option.SocksInboundOptions{
 					ListenOptions: option.ListenOptions{
 						Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
 						ListenPort: clientPort,
@@ -269,7 +273,7 @@ func TestJiejieAnyTLSAuthenticatedStillWorks(t *testing.T) {
 				Type: C.RuleTypeDefault,
 				DefaultOptions: option.DefaultRule{
 					RawDefaultRule: option.RawDefaultRule{
-						Inbound: []string{"mixed-in"},
+						Inbound: []string{"socks-in"},
 					},
 					RuleAction: option.RuleAction{
 						Action: C.RuleActionTypeRoute,
@@ -728,8 +732,9 @@ func TestJiejieHTTP3UnavailableFallsBackToH2(t *testing.T) {
 	proxyPort := reserveOpenVPNTCPPort(t)
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
-			Type: C.TypeMixed,
-			Options: &option.HTTPMixedInboundOptions{
+			// SOCKS rather than mixed, so this works under the minimal build too.
+			Type: C.TypeSOCKS,
+			Options: &option.SocksInboundOptions{
 				ListenOptions: option.ListenOptions{
 					Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
 					ListenPort: proxyPort,
@@ -770,7 +775,7 @@ func TestJiejieHTTP3UnavailableFallsBackToH2(t *testing.T) {
 			Rules: []option.Rule{{
 				Type: C.RuleTypeDefault,
 				DefaultOptions: option.DefaultRule{
-					RawDefaultRule: option.RawDefaultRule{Inbound: []string{"mixed-in"}},
+					RawDefaultRule: option.RawDefaultRule{Inbound: []string{"socks-in"}},
 					RuleAction: option.RuleAction{
 						Action:       C.RuleActionTypeRoute,
 						RouteOptions: option.RouteActionOptions{Outbound: "masque-out"},

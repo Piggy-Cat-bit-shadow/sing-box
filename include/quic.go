@@ -1,4 +1,4 @@
-//go:build with_quic
+//go:build with_quic && !jiejie_server_minimal
 
 package include
 

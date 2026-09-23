@@ -128,10 +128,28 @@ Interpretation:
 * Watch for `H3_EXCESSIVE_LOAD` appearing in logs; if it does, raise
   `max_concurrent_streams`.
 
-## A/B 4 — full build vs Jiejie build
+## A/B 4 — full build vs Jiejie build vs Jiejie minimal build
 
 **Baseline**: `sing-box-linux-amd64-full`.
-**Candidate**: `sing-box-linux-amd64-jiejie`.
+**Candidates**: `sing-box-linux-amd64-jiejie` and
+`sing-box-linux-amd64-jiejie-minimal`.
+
+The minimal build registers far fewer protocols, so a useful additional check is
+that it still serves the whole production topology. Before any load test, confirm
+on the exact binary you intend to deploy:
+
+```sh
+sing-box check -c /etc/sing-box/config.json
+```
+
+and exercise MASQUE H2/H3 CONNECT and CONNECT-UDP, AnyTLS plus its fallback,
+ShadowTLS v3, SS2022, the residential SOCKS outbound and local-AGH resolution.
+CI already runs these against `release/jiejie-production-topology.json`, but
+verify against your real config before switching production over.
+
+A removed protocol is expected to be *rejected* by the minimal build at config
+load; that is the trim working, not a fault. The full and jiejie artifacts remain
+available unchanged for rollback.
 
 Procedure:
 

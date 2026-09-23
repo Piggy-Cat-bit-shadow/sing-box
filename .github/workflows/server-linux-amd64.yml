@@ -156,6 +156,58 @@ jobs:
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
             -o sing-box-linux-amd64-jiejie ./cmd/sing-box
 
+      - name: Build jiejie minimal server artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
+            -o sing-box-linux-amd64-jiejie-minimal ./cmd/sing-box
+
+      - name: Verify the minimal build actually pruned the unused protocols
+        shell: bash
+        run: |
+          set -euo pipefail
+          # -s -w strips the symbol table, so build a temporary unstripped copy
+          # purely to inspect the dependency graph. It is never uploaded.
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          go build -trimpath -tags "$TAGS" -o /tmp/analysis-minimal ./cmd/sing-box
+          go tool nm /tmp/analysis-minimal > /tmp/analysis-minimal.syms
+          failed=0
+          # tailscale is checked by package count rather than absence: the
+          # `generate tailcat` CLI subcommand in cmd/sing-box imports a few
+          # tailscale helpers directly, which is a cmd-level concern outside
+          # this registry-level trim. Everything else must be fully gone.
+          for pkg in hysteria hysteria2 tuic vless vmess trojan tor ssh snell \
+                     bridge mixed redirect tun masque wireguard openvpn \
+                     openconnect cloudflared clashapi dhcp; do
+            if grep -q "sing-box/protocol/$pkg\." /tmp/analysis-minimal.syms; then
+              echo "UNEXPECTED: protocol/$pkg is still linked in the minimal build"
+              failed=1
+            fi
+          done
+          tailscaleSymbols=$(grep -c "sing-box/protocol/tailscale" /tmp/analysis-minimal.syms || true)
+          echo "protocol/tailscale symbols (expected 3, from the generate-tailcat CLI): $tailscaleSymbols"
+          if [ "$tailscaleSymbols" -gt 10 ]; then
+            echo "UNEXPECTED: protocol/tailscale is linked beyond the CLI helpers"
+            failed=1
+          fi
+          # utls is expected to remain: quic-go imports it unconditionally.
+          for required in anytls shadowtls shadowsocks socks http direct \
+                          congestion_meta2; do
+            if ! grep -q "$required" /tmp/analysis-minimal.syms; then
+              echo "MISSING: $required must be present in the minimal build"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Dependency pruning verified."
+          rm -f /tmp/analysis-minimal /tmp/analysis-minimal.syms
+
       - name: Build jiejie GOAMD64=v3 experimental artifact
         shell: bash
         run: |
@@ -224,6 +276,7 @@ jobs:
             -days 1 -nodes -subj "/CN=example.test" 2>/dev/null
 
           for artifact in sing-box-linux-amd64-full sing-box-linux-amd64-jiejie \
+                          sing-box-linux-amd64-jiejie-minimal \
                           sing-box-linux-amd64-jiejie-v3 sing-box-linux-amd64-jiejie-static; do
             [ -f "$artifact" ] || continue
             echo "===== $artifact ====="
@@ -234,8 +287,20 @@ jobs:
             ./"$artifact" version
             ./"$artifact" version | grep -F "$JIEJIE_VERSION" || { echo "version mismatch in $artifact"; exit 1; }
             ./"$artifact" check -c /tmp/jiejie-topology.json
+            # The minimal build must additionally accept the complete production
+            # topology: MASQUE H2/H3, AnyTLS with fallback, ShadowTLS v3, SS2022,
+            # a residential SOCKS outbound, selectors, route rules and the
+            # local-AGH DNS setup.
+            ./"$artifact" check -c release/jiejie-production-topology.json
             sha256sum "$artifact" > "$artifact.sha256"
             cat "$artifact.sha256"
+          done
+
+          echo "===== SIZE COMPARISON ====="
+          for artifact in sing-box-linux-amd64-full sing-box-linux-amd64-jiejie \
+                          sing-box-linux-amd64-jiejie-minimal; do
+            [ -f "$artifact" ] || continue
+            printf '%-40s %12s bytes\n' "$artifact" "$(stat -c '%s' "$artifact")"
           done
 
           # The full artifact must retain upstream capabilities; the jiejie
@@ -243,6 +308,26 @@ jobs:
           ./sing-box-linux-amd64-full version | grep -F "with_quic"
           ./sing-box-linux-amd64-full version | grep -F "with_tailscale"
           ./sing-box-linux-amd64-jiejie version | grep -F "with_quic"
+
+          # The minimal artifact must keep with_quic (MASQUE HTTP/3) and must
+          # NOT carry the optional components or the removed QUIC protocols.
+          ./sing-box-linux-amd64-jiejie-minimal version | grep -F "with_quic"
+          ./sing-box-linux-amd64-jiejie-minimal version | grep -F "jiejie_server_minimal"
+          ! ./sing-box-linux-amd64-jiejie-minimal version | grep -F "with_tailscale"
+          ! ./sing-box-linux-amd64-jiejie-minimal version | grep -F "with_openvpn"
+
+          # The minimal build must refuse a protocol it deliberately excludes,
+          # proving the pruning is real rather than cosmetic.
+          cat > /tmp/excluded.json <<'JSON'
+          {"inbounds":[{"type":"vmess","tag":"x","listen":"127.0.0.1","listen_port":9099,
+            "users":[{"uuid":"00000000-0000-0000-0000-000000000000"}]}],
+           "outbounds":[{"type":"direct"}]}
+          JSON
+          if ./sing-box-linux-amd64-jiejie-minimal check -c /tmp/excluded.json >/dev/null 2>&1; then
+            echo "minimal build unexpectedly accepted the vmess inbound"
+            exit 1
+          fi
+          echo "minimal build correctly rejects excluded protocols"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -254,6 +339,8 @@ jobs:
             sing-box-linux-amd64-jiejie.sha256
             sing-box-linux-amd64-jiejie-v3
             sing-box-linux-amd64-jiejie-v3.sha256
+            sing-box-linux-amd64-jiejie-minimal
+            sing-box-linux-amd64-jiejie-minimal.sha256
             sing-box-linux-amd64-jiejie-static
             sing-box-linux-amd64-jiejie-static.sha256
           if-no-files-found: warn
