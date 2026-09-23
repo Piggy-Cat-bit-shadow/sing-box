@@ -1,127 +1,199 @@
 {
-  "log": {"level": "info"},
-
+  "log": {
+    "level": "info"
+  },
   "dns": {
     "servers": [
-      {"tag": "local-agh", "type": "udp", "server": "127.0.0.1", "server_port": 5335},
-      {"tag": "local-tcp", "type": "tcp", "server": "127.0.0.1", "server_port": 5335},
-      {"tag": "local-dot", "type": "tls", "server": "1.1.1.1", "domain_resolver": "local-agh"},
-      {"tag": "local-doh", "type": "https", "server": "1.1.1.1", "domain_resolver": "local-agh"},
-      {"tag": "local-hosts", "type": "hosts", "predefined": {"api.example.test": "127.0.0.1"}},
-      {"tag": "local-local", "type": "local"}
-    ],
-    "rules": [
-      {"domain": ["api.example.test"], "server": "local-hosts"},
-      {"domain_suffix": [".test"], "server": "local-agh"}
+      {
+        "tag": "local-agh",
+        "type": "udp",
+        "server": "127.0.0.1",
+        "server_port": 53
+      }
     ],
     "final": "local-agh",
     "strategy": "prefer_ipv4"
   },
-
   "inbounds": [
     {
-      "type": "http", "tag": "masque-h2",
-      "listen": "127.0.0.1", "listen_port": 28440,
+      "type": "http",
+      "tag": "masque-h2",
+      "listen": "127.0.0.1",
+      "listen_port": 28440,
       "version": 2,
-      "users": [{"username": "example", "password": "example"}],
-      "tls": {"enabled": true, "server_name": "riri.example.test", "certificate_path": "/tmp/tls.crt", "key_path": "/tmp/tls.key"},
-      "masquerade": {"type": "proxy", "url": "http://127.0.0.1:28437", "rewrite_host": true},
-      "unauthenticated_limits": {"enabled": true, "max_concurrent_per_ip": 8, "requests_per_second": 10, "burst": 20, "idle_timeout": "10s"}
+      "users": [
+        {
+          "username": "example",
+          "password": "example"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "riri.zhuzhu.jiejie12131.top",
+        "certificate_path": "/tmp/jiejie-fixture/cert.pem",
+        "key_path": "/tmp/jiejie-fixture/key.pem"
+      },
+      "masquerade": {
+        "type": "proxy",
+        "url": "http://127.0.0.1:28437",
+        "rewrite_host": true
+      },
+      "unauthenticated_limits": {
+        "enabled": true,
+        "max_concurrent_per_ip": 8,
+        "requests_per_second": 10,
+        "burst": 20,
+        "idle_timeout": "10s",
+        "max_tracked_ips": 4096
+      }
     },
     {
-      "type": "http", "tag": "masque-h3",
-      "listen": "127.0.0.1", "listen_port": 28443,
+      "type": "http",
+      "tag": "masque-h3",
+      "listen": "::",
+      "listen_port": 443,
       "version": 3,
       "server_profile": "jiejie-balanced-1g",
-      "bbr_profile": "standard",
-      "max_header_bytes": 65536,
-      "users": [{"username": "example", "password": "example"}],
-      "tls": {"enabled": true, "server_name": "riri.example.test", "certificate_path": "/tmp/tls.crt", "key_path": "/tmp/tls.key"},
-      "masquerade": {"type": "proxy", "url": "http://127.0.0.1:28437", "rewrite_host": true},
-      "unauthenticated_limits": {"enabled": true, "max_concurrent_per_ip": 8, "requests_per_second": 10, "burst": 20, "idle_timeout": "10s", "max_tracked_ips": 4096}
+      "users": [
+        {
+          "username": "example",
+          "password": "example"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "riri.zhuzhu.jiejie12131.top",
+        "certificate_path": "/tmp/jiejie-fixture/cert.pem",
+        "key_path": "/tmp/jiejie-fixture/key.pem"
+      },
+      "masquerade": {
+        "type": "proxy",
+        "url": "http://127.0.0.1:28437",
+        "rewrite_host": true
+      },
+      "unauthenticated_limits": {
+        "enabled": true,
+        "max_concurrent_per_ip": 8,
+        "requests_per_second": 10,
+        "burst": 20,
+        "idle_timeout": "10s",
+        "max_tracked_ips": 4096
+      }
     },
     {
-      "type": "anytls", "tag": "anytls-in",
-      "listen": "127.0.0.1", "listen_port": 28436,
-      "users": [{"name": "example", "password": "example"}],
-      "tls": {"enabled": true, "server_name": "api.example.test", "certificate_path": "/tmp/tls.crt", "key_path": "/tmp/tls.key"},
-      "fallback": {"server": "127.0.0.1", "server_port": 28437},
-      "fallback_for_alpn": {"h2": {"server": "127.0.0.1", "server_port": 28437}}
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "127.0.0.1",
+      "listen_port": 28436,
+      "users": [
+        {
+          "name": "example",
+          "password": "example"
+        },
+        {
+          "name": "residential",
+          "password": "example-residential"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "api.zhuzhu.jiejie12131.top",
+        "certificate_path": "/tmp/jiejie-fixture/cert.pem",
+        "key_path": "/tmp/jiejie-fixture/key.pem"
+      },
+      "fallback": {
+        "server": "127.0.0.1",
+        "server_port": 28437
+      }
     },
     {
-      "type": "shadowtls", "tag": "shadowtls-in",
-      "listen": "127.0.0.1", "listen_port": 28450,
+      "type": "shadowtls",
+      "tag": "shadowtls-in",
+      "listen": "127.0.0.1",
+      "listen_port": 28450,
       "version": 3,
-      "users": [{"name": "example", "password": "example"}],
-      "handshake": {"server": "127.0.0.1", "server_port": 443},
-      "detour": "direct",
-      "strict_mode": true
+      "users": [
+        {
+          "name": "example",
+          "password": "example"
+        }
+      ],
+      "password": "example",
+      "strict_mode": true,
+      "handshake": {
+        "server": "www.bing.com",
+        "server_port": 443,
+        "detour": "direct",
+        "domain_resolver": "local-agh"
+      },
+      "detour": "ss2022-in"
     },
     {
-      "type": "shadowsocks", "tag": "ss2022-in",
-      "listen": "127.0.0.1", "listen_port": 28460,
+      "type": "shadowsocks",
+      "tag": "ss2022-in",
+      "listen": "127.0.0.1",
+      "listen_port": 28460,
       "method": "2022-blake3-aes-128-gcm",
       "password": "AAAAAAAAAAAAAAAAAAAAAA==",
       "network": "tcp"
-    },
-    {
-      "type": "socks", "tag": "socks-in",
-      "listen": "127.0.0.1", "listen_port": 28470
     }
   ],
-
   "outbounds": [
-    {"type": "direct", "tag": "direct", "domain_resolver": "local-agh"},
-
-    {"type": "socks", "tag": "residential-socks",
-     "server": "127.0.0.1", "server_port": 1080,
-     "version": "5", "username": "example", "password": "example",
-     "domain_resolver": "local-agh",
-     "udp_over_tcp": {"enabled": true, "version": 2}},
-
-    {"type": "http", "tag": "masque-out",
-     "server": "127.0.0.1", "server_port": 28443, "version": 3,
-     "username": "example", "password": "example",
-     "http3_connection_pool": {"size": 2, "strategy": "round_robin"},
-     "http3_fallback": {"initial_backoff": "5s", "max_backoff": "5m", "multiplier": 2, "reset_on_success": true},
-     "tls": {"enabled": true, "server_name": "riri.example.test"}},
-
-    {"type": "http", "tag": "masque-out-h2",
-     "server": "127.0.0.1", "server_port": 28440, "version": 2,
-     "username": "example", "password": "example",
-     "tls": {"enabled": true, "server_name": "riri.example.test"}},
-
-    {"type": "anytls", "tag": "anytls-out",
-     "server": "127.0.0.1", "server_port": 28436, "password": "example",
-     "idle_session_check_interval": "30s", "idle_session_timeout": "30s", "min_idle_session": 0,
-     "tls": {"enabled": true, "server_name": "api.example.test"}},
-
-    {"type": "shadowtls", "tag": "shadowtls-out",
-     "server": "127.0.0.1", "server_port": 28450, "version": 3, "password": "example",
-     "tls": {"enabled": true, "server_name": "www.example.test"}},
-
-    {"type": "shadowsocks", "tag": "ss2022-out",
-     "server": "127.0.0.1", "server_port": 8388,
-     "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA==",
-     "domain_resolver": "local-agh"},
-
-    {"type": "selector", "tag": "select", "outbounds": ["residential-socks", "direct"], "default": "direct"},
-    {"type": "urltest", "tag": "auto", "outbounds": ["residential-socks", "direct"],
-     "url": "http://cp.cloudflare.com/", "interval": "3m", "tolerance": 50},
-    {"type": "block", "tag": "block"}
+    {
+      "type": "direct",
+      "tag": "direct",
+      "domain_resolver": "local-agh"
+    },
+    {
+      "type": "socks",
+      "tag": "residential-socks",
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "version": "5",
+      "username": "example",
+      "password": "example",
+      "domain_resolver": "local-agh"
+    }
   ],
-
   "route": {
     "rules": [
-      {"action": "sniff"},
-      {"protocol": "dns", "action": "hijack-dns"},
-      {"ip_is_private": true, "outbound": "direct"},
-      {"domain_suffix": [".cn"], "outbound": "direct"},
-      {"rule_set": [], "outbound": "residential-socks"},
-      {"action": "reject", "domain_suffix": [".ads.test"]}
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          ".cn"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "user": [
+          "residential"
+        ],
+        "network": [
+          "tcp"
+        ],
+        "outbound": "residential-socks"
+      },
+      {
+        "user": [
+          "residential"
+        ],
+        "network": [
+          "udp"
+        ],
+        "action": "reject"
+      }
     ],
-    "rule_set": [],
-    "final": "residential-socks",
+    "final": "direct",
     "auto_detect_interface": true
   }
 }
