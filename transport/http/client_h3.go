@@ -311,7 +311,7 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 	// allowing a single fresh connection), never an unbounded loop.
 	maxAttempts := len(c.slots) + 1
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for range maxAttempts {
 		slot, err := c.establishSlot(ctx)
 		if err != nil {
 			if lastErr != nil {

@@ -48,11 +48,10 @@ type goAwayPoolServer struct {
 	address     string
 	connections *connectionCounter
 	tunnels     *httpserverTunnelCounter
-	// hold keeps a CONNECT handler alive so the connection is not simply closed
-	// when GOAWAY is sent; without an active stream quic-go closes the
-	// connection immediately and there is nothing to drain.
-	hold chan struct{}
-	// release stops the held handler.
+	// release stops the CONNECT handler that is deliberately held open, so the
+	// connection is not simply closed when GOAWAY is sent. Without an active
+	// stream quic-go closes the connection immediately and there is nothing left
+	// to drain.
 	release   chan struct{}
 	server    *http3.Server
 	udpConn   net.PacketConn
@@ -414,16 +413,14 @@ func TestClientSingleFlightH3Probe(t *testing.T) {
 	start := make(chan struct{})
 	var waitGroup sync.WaitGroup
 	for range callers {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+		waitGroup.Go(func() {
 			<-start
 			useH3, isProbe := client.http3ProbeDecision()
 			results <- struct {
 				useH3   bool
 				isProbe bool
 			}{useH3, isProbe}
-		}()
+		})
 	}
 	close(start)
 	waitGroup.Wait()
