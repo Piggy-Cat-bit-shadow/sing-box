@@ -1,8 +1,7 @@
 {
-  "_note": "Feature matrix for the FORK's client-side capabilities. This is NOT the production topology and must never drive the minimal registry. It is used by client-feature tests that run against the upstream/default tag set, where HTTP outbounds and the extra protocol families exist. The production fixture is release/jiejie-production-topology.json.",
-
-  "log": {"level": "info"},
-
+  "log": {
+    "level": "info"
+  },
   "inbounds": [
     {
       "type": "socks",
@@ -11,10 +10,11 @@
       "listen_port": 28470
     }
   ],
-
   "outbounds": [
-    {"type": "direct", "tag": "direct"},
-
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
     {
       "type": "http",
       "tag": "masque-out-h3",
@@ -23,16 +23,21 @@
       "version": 3,
       "username": "example",
       "password": "example",
-      "http3_connection_pool": {"size": 2, "strategy": "round_robin"},
+      "http3_connection_pool": {
+        "size": 2,
+        "strategy": "round_robin"
+      },
       "http3_fallback": {
         "initial_backoff": "5s",
         "max_backoff": "5m",
         "multiplier": 2,
         "reset_on_success": true
       },
-      "tls": {"enabled": true, "server_name": "example.test"}
+      "tls": {
+        "enabled": true,
+        "server_name": "example.test"
+      }
     },
-
     {
       "type": "http",
       "tag": "masque-out-h2",
@@ -41,9 +46,11 @@
       "version": 2,
       "username": "example",
       "password": "example",
-      "tls": {"enabled": true, "server_name": "example.test"}
+      "tls": {
+        "enabled": true,
+        "server_name": "example.test"
+      }
     },
-
     {
       "type": "anytls",
       "tag": "anytls-out",
@@ -52,9 +59,11 @@
       "password": "example",
       "idle_session_check_interval": "30s",
       "idle_session_timeout": "30s",
-      "tls": {"enabled": true, "server_name": "example.test"}
+      "tls": {
+        "enabled": true,
+        "server_name": "example.test"
+      }
     },
-
     {
       "type": "shadowtls",
       "tag": "shadowtls-out",
@@ -62,9 +71,11 @@
       "server_port": 28450,
       "version": 3,
       "password": "example",
-      "tls": {"enabled": true, "server_name": "www.example.test"}
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.test"
+      }
     },
-
     {
       "type": "shadowsocks",
       "tag": "ss2022-out",
@@ -73,24 +84,44 @@
       "method": "2022-blake3-aes-128-gcm",
       "password": "AAAAAAAAAAAAAAAAAAAAAA=="
     },
-
-    {"type": "selector", "tag": "select", "outbounds": ["direct"], "default": "direct"},
+    {
+      "type": "selector",
+      "tag": "select",
+      "outbounds": [
+        "direct"
+      ],
+      "default": "direct"
+    },
     {
       "type": "urltest",
       "tag": "auto",
-      "outbounds": ["direct"],
+      "outbounds": [
+        "direct"
+      ],
       "url": "http://cp.cloudflare.com/",
       "interval": "3m",
       "tolerance": 50
     },
-    {"type": "block", "tag": "block"}
+    {
+      "type": "block",
+      "tag": "block"
+    }
   ],
-
   "route": {
     "rules": [
-      {"action": "sniff"},
-      {"ip_is_private": true, "outbound": "direct"},
-      {"action": "reject", "domain_suffix": [".ads.test"]}
+      {
+        "action": "sniff"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "action": "reject",
+        "domain_suffix": [
+          ".ads.test"
+        ]
+      }
     ],
     "final": "direct"
   }
