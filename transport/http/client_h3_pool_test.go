@@ -635,3 +635,76 @@ func startStallingMASQUEServer(t *testing.T) *stallingMASQUEServer {
 		release: release,
 	}
 }
+
+// TestMASQUEPoolSurvivesOneDeadConnection is the pool-health regression.
+//
+// A pool of two must tolerate one member's connection dying. Killing one
+// connection must not disable HTTP/3 for the authority, and subsequent tunnels
+// must still be served — including by the surviving member. The distinction that
+// matters is between a slot-level failure (this connection is gone) and an
+// authority-level failure (the server does not speak HTTP/3); only the latter
+// should trigger the HTTP/2 fallback.
+func TestMASQUEPoolSurvivesOneDeadConnection(t *testing.T) {
+	server := startMASQUEPoolServer(t)
+	agent := newPoolTestAgent(t, server, 2)
+
+	// Establish both connections.
+	target := M.ParseSocksaddr("127.0.0.1:9")
+	for range 4 {
+		conn, err := agent.DialContext(context.Background(), target)
+		require.NoError(t, err)
+		conn.Close()
+	}
+	require.GreaterOrEqual(t, server.connections.count(), 2,
+		"precondition: both pool members must have connected")
+
+	// Kill slot 0's connection abruptly, as a network failure would.
+	agent.slots[0].access.Lock()
+	if agent.slots[0].conn != nil {
+		agent.slots[0].conn.CloseWithError(0, "")
+	}
+	if agent.slots[0].rawConn != nil {
+		agent.slots[0].rawConn.Close()
+	}
+	agent.slots[0].access.Unlock()
+
+	// New tunnels must keep working. The client rotates, so the healthy member
+	// serves them, and a fresh connection is established for the dead slot.
+	succeeded := 0
+	for range 6 {
+		conn, err := agent.DialContext(context.Background(), target)
+		if err == nil {
+			succeeded++
+			conn.Close()
+		}
+	}
+	require.GreaterOrEqual(t, succeeded, 3,
+		"a dead pool member must not disable HTTP/3 for the authority; "+
+			"only %d of 6 tunnels succeeded", succeeded)
+}
+
+// TestMASQUEPoolDeadConnectionIsRedialed proves a killed slot recovers rather
+// than staying permanently poisoned.
+func TestMASQUEPoolDeadConnectionIsRedialed(t *testing.T) {
+	server := startMASQUEPoolServer(t)
+	agent := newPoolTestAgent(t, server, 1)
+
+	target := M.ParseSocksaddr("127.0.0.1:9")
+	conn, err := agent.DialContext(context.Background(), target)
+	require.NoError(t, err)
+	conn.Close()
+
+	// Kill the single slot's connection.
+	agent.slots[0].access.Lock()
+	agent.slots[0].conn.CloseWithError(0, "")
+	agent.slots[0].rawConn.Close()
+	agent.slots[0].access.Unlock()
+
+	// A later tunnel must dial a fresh connection rather than reuse the dead one.
+	conn, err = agent.DialContext(context.Background(), target)
+	require.NoError(t, err, "a dead connection must be redialed, not reused")
+	conn.Close()
+
+	require.GreaterOrEqual(t, server.connections.count(), 2,
+		"the client must have established a second connection after the first died")
+}
