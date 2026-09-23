@@ -274,3 +274,14 @@ func (c *http3ClientImpl) logPoolEvent(event string, slot *http3PoolSlot, err er
 	}
 	c.logger.Debug(args...)
 }
+
+// totalActive reports how many live tunnels the whole pool carries. It exists
+// for tests and for the diagnostic snapshot; a leaked count here means
+// least-active selection is silently avoiding a slot.
+func (c *http3ClientImpl) totalActive() int {
+	total := 0
+	for _, slot := range c.slots {
+		total += slot.health().Active
+	}
+	return total
+}
