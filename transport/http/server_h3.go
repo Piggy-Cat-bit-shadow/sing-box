@@ -44,11 +44,19 @@ func init() {
 			udpConn.Close()
 			return nil, err
 		}
+		// bbr_profile is validated at configuration load; an unset value
+		// resolves to standard, which is exactly the previous behaviour.
+		congestionProfile, profileErr := parseBBRProfile(options.BBRProfile.BBRProfileValue())
+		if profileErr != nil {
+			quicListener.Close()
+			udpConn.Close()
+			return nil, profileErr
+		}
 		http3Server := &http3.Server{
 			Handler:         handler,
 			EnableDatagrams: true,
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
-				conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard))
+				conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestionProfile))
 				return log.ContextWithNewID(ctx)
 			},
 		}
@@ -106,4 +114,19 @@ func (s *datagramStream) Close() error {
 	s.Stream.SetWriteDeadline(time.Now())
 	s.Stream.CancelRead(0)
 	return s.Stream.Close()
+}
+
+// parseBBRProfile maps an option name onto a profile that actually exists in
+// congestion_meta2. Only these three are accepted; nothing is invented here.
+func parseBBRProfile(name string) (congestion_meta2.Profile, error) {
+	switch name {
+	case "", option.BBRProfileStandard:
+		return congestion_meta2.ProfileStandard, nil
+	case option.BBRProfileConservative:
+		return congestion_meta2.ProfileConservative, nil
+	case option.BBRProfileAggressive:
+		return congestion_meta2.ProfileAggressive, nil
+	default:
+		return congestion_meta2.ProfileStandard, E.New("unsupported bbr_profile: ", name)
+	}
 }

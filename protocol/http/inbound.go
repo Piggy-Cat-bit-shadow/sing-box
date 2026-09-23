@@ -55,19 +55,26 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if !serveHTTP1 && !serveHTTP2 && options.SetSystemProxy {
 		return nil, E.New("set_system_proxy requires HTTP/1 or HTTP/2")
 	}
+	// server_profile only fills fields the user left unset; an explicit value
+	// always wins and an unset profile leaves upstream defaults in place.
+	resourceOptions, err := options.ResolveServerResources()
+	if err != nil {
+		return nil, err
+	}
 	inbound := &Inbound{
 		Adapter: inbound.NewAdapter(C.TypeHTTP, tag),
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
 		server: http.NewServer(http.ServerOptions{
-			Authenticator: auth.NewAuthenticator(options.Users),
-			Logger:        logger,
-			HTTP1:         serveHTTP1,
-			HTTP2:         serveHTTP2,
-			HTTP2Options:  options.HTTP2Options,
-			UDP:           true,
-			Masquerade:    masqueradeHandler,
+			Authenticator:  auth.NewAuthenticator(options.Users),
+			Logger:         logger,
+			HTTP1:          serveHTTP1,
+			HTTP2:          serveHTTP2,
+			HTTP2Options:   options.HTTP2Options,
+			UDP:            true,
+			Masquerade:     masqueradeHandler,
+			MaxHeaderBytes: resourceOptions.MaxHeaderBytes,
 		}),
 		http3:       serveHTTP3,
 		quicOptions: options.HTTP3Options,

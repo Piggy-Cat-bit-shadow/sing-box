@@ -34,12 +34,52 @@ type _HTTPInboundOptions struct {
 	DomainResolver *DomainResolveOptions   `json:"domain_resolver,omitempty"`
 	SetSystemProxy bool                    `json:"set_system_proxy,omitempty"`
 	Version        badoption.Listable[int] `json:"version,omitempty" enum:"1,2,3"`
+	// ServerProfile applies a named set of resource defaults. Explicit fields
+	// always win. Unset means upstream defaults.
+	ServerProfile string `json:"server_profile,omitempty"`
+	// MaxHeaderBytes overrides the request header limit. Unset means upstream.
+	MaxHeaderBytes int `json:"max_header_bytes,omitempty"`
+	// BBRProfile selects the HTTP/3 server congestion control profile. It
+	// accepts only the profiles provided by congestion_meta2. Unset keeps the
+	// current standard behaviour.
+	BBRProfile string `json:"bbr_profile,omitempty" enum:"conservative,standard,aggressive"`
 	InboundTLSOptionsContainer
 	HTTP2Options HTTP2Options `json:"-"`
 	HTTP3Options QUICOptions  `json:"-"`
 }
 
 type HTTPInboundOptions _HTTPInboundOptions
+
+// ServerResourceOptions is the resolved form of server_profile plus the
+// explicitly configured per-inbound resource fields.
+type ServerResourceOptions struct {
+	Profile        HTTPServerProfile
+	ProfileApplied bool
+	MaxHeaderBytes int
+}
+
+// ResolveServerResources applies the named profile to the version-specific
+// option sets, leaving every explicitly configured field untouched.
+func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, error) {
+	profile, applied, err := NewHTTPServerProfile(o.ServerProfile)
+	if err != nil {
+		return ServerResourceOptions{}, err
+	}
+	err = ValidateBBRProfile(o.BBRProfile)
+	if err != nil {
+		return ServerResourceOptions{}, err
+	}
+	if applied {
+		profile.ApplyToHTTP2(&o.HTTP2Options)
+		profile.ApplyToQUIC(&o.HTTP3Options)
+	}
+	o.HTTP3Options.BBRProfile = ServerBBRProfile{Name: o.BBRProfile}
+	return ServerResourceOptions{
+		Profile:        profile,
+		ProfileApplied: applied,
+		MaxHeaderBytes: o.MaxHeaderBytes,
+	}, nil
+}
 
 func (o HTTPInboundOptions) Versions() []int {
 	if len(o.Version) > 0 {

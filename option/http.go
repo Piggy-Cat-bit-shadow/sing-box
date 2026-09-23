@@ -27,6 +27,10 @@ type QUICOptions struct {
 	DisablePathMTUDiscovery bool                        `json:"disable_path_mtu_discovery,omitempty"`
 	HTTP3Fallback           *HTTP3FallbackOptions       `json:"http3_fallback,omitempty"`
 	HTTP3ConnectionPool     *HTTP3ConnectionPoolOptions `json:"http3_connection_pool,omitempty"`
+	// BBRProfile sets the HTTP/3 *server* congestion control profile. It is
+	// resolved from the http inbound `bbr_profile` option and is not a client
+	// setting.
+	BBRProfile ServerBBRProfile `json:"-"`
 }
 
 type _HTTPClientOptions struct {

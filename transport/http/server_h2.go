@@ -60,7 +60,7 @@ func (s *Server) serveHTTP2(ctx context.Context, conn net.Conn, reader *Reader, 
 	s.http2Server.ServeConn(serveConn, &http2.ServeConnOpts{
 		Context: ctx,
 		BaseConfig: &http.Server{
-			MaxHeaderBytes: maxHeaderBytes,
+			MaxHeaderBytes: s.maxHeaderBytes,
 		},
 		Handler: &httpHandler{
 			server:    s,

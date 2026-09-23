@@ -23,6 +23,9 @@ import (
 )
 
 const (
+	// maxHeaderBytes is the upstream request header limit. It stays the
+	// default so that an inbound which does not configure a limit behaves
+	// exactly as upstream.
 	maxHeaderBytes      = 1 << 20
 	idleTimeout         = 60 * time.Second
 	maxDiscardBodyBytes = 256 << 10
@@ -46,26 +49,34 @@ type ServerOptions struct {
 	UDP           bool
 	Tunnels       map[string]TunnelHandler
 	Masquerade    http.Handler
+	// MaxHeaderBytes overrides the request header limit. Zero keeps the
+	// upstream default.
+	MaxHeaderBytes int
 }
 
 type Server struct {
-	authenticator *auth.Authenticator
-	logger        logger.ContextLogger
-	http1         bool
-	http2Server   *http2.Server
-	udp           bool
-	tunnels       map[string]TunnelHandler
-	masquerade    http.Handler
+	authenticator  *auth.Authenticator
+	logger         logger.ContextLogger
+	http1          bool
+	http2Server    *http2.Server
+	udp            bool
+	tunnels        map[string]TunnelHandler
+	masquerade     http.Handler
+	maxHeaderBytes int
 }
 
 func NewServer(options ServerOptions) *Server {
 	server := &Server{
-		authenticator: options.Authenticator,
-		logger:        options.Logger,
-		http1:         options.HTTP1,
-		udp:           options.UDP,
-		tunnels:       options.Tunnels,
-		masquerade:    options.Masquerade,
+		authenticator:  options.Authenticator,
+		logger:         options.Logger,
+		http1:          options.HTTP1,
+		udp:            options.UDP,
+		tunnels:        options.Tunnels,
+		masquerade:     options.Masquerade,
+		maxHeaderBytes: options.MaxHeaderBytes,
+	}
+	if server.maxHeaderBytes <= 0 {
+		server.maxHeaderBytes = maxHeaderBytes
 	}
 	if options.HTTP2 {
 		server.http2Server = &http2.Server{
