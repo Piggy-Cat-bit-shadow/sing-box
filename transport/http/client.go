@@ -229,6 +229,16 @@ func (c *Client) http3Available() bool {
 	if c.http3 == nil {
 		return false
 	}
+	return c.http3WindowElapsed()
+}
+
+// http3WindowElapsed reports whether the HTTP/3 avoidance window has closed.
+//
+// Unlike http3Available it ignores whether an HTTP/3 client exists, so the
+// schedule state machine can be exercised without a live QUIC connection. It
+// lives in production code, not a test file, because the build without with_quic
+// still compiles this package and a test-only method would break that build.
+func (c *Client) http3WindowElapsed() bool {
 	brokenUntil := c.http3BrokenUntil.Load()
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
