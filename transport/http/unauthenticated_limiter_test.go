@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/stretchr/testify/require"
 )
 
 func enabledLimits() option.UnauthenticatedLimits {
@@ -686,4 +688,81 @@ func countingMasquerade() http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusOK)
 	})
+}
+
+// TestUnauthenticatedBodyIsBounded proves the request body an unauthenticated
+// peer can push at the decoy backend is actually capped.
+//
+// The proxy masquerade forwards the request to a real backend, so without a
+// bound a failed-authentication request could stream an arbitrarily large body
+// through it and consume unbounded server resources. maxUnauthenticatedBodyBytes
+// bounds that body; this test drives the real handler and measures how many bytes
+// the backend actually receives.
+func TestUnauthenticatedBodyIsBounded(t *testing.T) {
+	var received atomic.Int64
+	backendDone := make(chan struct{}, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		count, _ := io.Copy(io.Discard, request.Body)
+		received.Store(count)
+		writer.WriteHeader(http.StatusOK)
+		select {
+		case backendDone <- struct{}{}:
+		default:
+		}
+	}))
+	defer backend.Close()
+
+	masquerade, masqueradeErr := NewMasqueradeHandler(context.Background(), &option.Hysteria2Masquerade{
+		Type: "proxy",
+		ProxyOptions: option.Hysteria2MasqueradeProxy{
+			URL:         backend.URL,
+			RewriteHost: true,
+		},
+	})
+	require.NoError(t, masqueradeErr)
+
+	server := &Server{
+		logger:                 testLogger(),
+		authenticator:          auth.NewAuthenticator([]auth.User{{Username: "user", Password: "pass"}}),
+		masquerade:             masquerade,
+		overLimitDecoy:         NewOverLimitDecoy(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: newUnauthenticatedLimiter(enabledLimits()),
+	}
+	handler := &httpHandler{server: server}
+
+	// Ten times the bound, so the cap is unambiguously the limiting factor.
+	const offered = 10 * maxUnauthenticatedBodyBytes
+	request := httptest.NewRequest(http.MethodPost, backend.URL+"/upload", strings.NewReader(strings.Repeat("x", offered)))
+	request.Header.Set("X-Forwarded-For", "203.0.113.9")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	// The reverse proxy copies the body asynchronously, so wait for the backend
+	// to finish reading before sampling the byte count. Without this the
+	// assertion races the transfer and can observe a partial count.
+	select {
+	case <-backendDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the backend never finished reading the body")
+	}
+	// The backend is reached, so the request is genuinely in budget and the
+	// cap -- not the limiter -- is what stops the body.
+	count := received.Load()
+	if count == 0 {
+		t.Fatal("the in-budget unauthenticated request is expected to reach the backend")
+	}
+	if count > maxUnauthenticatedBodyBytes {
+		t.Fatalf("the backend received %d bytes, which exceeds the %d byte bound",
+			count, int64(maxUnauthenticatedBodyBytes))
+	}
+	// http.MaxBytesReader aborts the transfer at the bound, so the backend sees
+	// exactly the bound rather than a truncated tail. Proving the exact value is
+	// what shows the cap is enforced on the data path instead of the body simply
+	// having been dropped.
+	if count != maxUnauthenticatedBodyBytes {
+		t.Fatalf("expected the backend to receive exactly the %d byte bound, got %d",
+			int64(maxUnauthenticatedBodyBytes), count)
+	}
 }
