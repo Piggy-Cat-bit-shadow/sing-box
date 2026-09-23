@@ -6,156 +6,150 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box"
-	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/certificate"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/adapter/service"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport"
-	"github.com/sagernet/sing-box/dns/transport/hosts"
 	"github.com/sagernet/sing-box/dns/transport/local"
-	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/anytls"
-	"github.com/sagernet/sing-box/protocol/block"
 	"github.com/sagernet/sing-box/protocol/direct"
-	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
 	"github.com/sagernet/sing-box/protocol/socks"
-	"github.com/sagernet/sing-box/service/resolved"
-	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // Registry for the Jiejie Server Edition minimal build (`jiejie_server_minimal`).
 //
-// This is a protocol-registration-level trim for one specific production server.
-// It does not delete or modify any upstream protocol source: it simply does not
-// import the packages the server does not use, so they never enter the import
-// graph and the Go linker drops them from the binary.
+// Every registration below is justified by the real production configuration of
+// one specific server. Nothing is registered for test convenience: the test
+// harness adapts to this registry, never the other way round.
 //
-// Registered inbound:  http (MASQUE H2/H3), anytls, shadowtls, shadowsocks,
-//                      socks, direct
-// Registered outbound: direct, block, selector/urltest, socks, http,
-//                      shadowsocks, shadowtls, anytls
-// Registered endpoint: none (no WireGuard / OpenConnect / OpenVPN / Tailscale /
-//                      MASQUE endpoint is used)
-// Registered DNS:      tcp, udp, tls, https, hosts, local, plus QUIC stubs
-// Registered service:  resolved
-// Registered cert:     origin_ca only (no ACME, no Tailscale)
+// The trim is registration-level only. No upstream protocol source is edited or
+// deleted; a package this file does not import never enters the import graph, so
+// the Go linker drops it.
 //
-// Deliberately absent versus the default registry: tun, redirect/tproxy, mixed,
-// snell, vmess, vless, trojan, naive, tor, ssh, bridge, the MASQUE endpoint,
-// hysteria/hysteria2/tuic (also absent from the QUIC registration), WireGuard,
-// OpenConnect, OpenVPN, Tailscale, cloudflared, DHCP, mdns, fakeip, the clash
-// API, CCM/OCM, USBIP, DERP, sshd/SSM API and the OOM killer service.
+// Production topology this registry serves:
 //
-// Note on tor/ssh/vmess/vless/trojan: they are omitted because the production
-// routing table does not reference them. If any of them is ever needed, add the
-// Register call here rather than abandoning this build.
+//	TCP/443  Nginx Stream -> 127.0.0.1:28436 anytls-in  (native fallback -> 28437)
+//	                      -> 127.0.0.1:28440 masque-h2 (behind Nginx, HTTP/2)
+//	                      -> 127.0.0.1:28450 shadowtls-in
+//	                           detour -> ss2022-in -> route -> residential-socks / direct
+//	UDP/443  masque-h3 (HTTP/3, MASQUE L4)
+//	DNS      direct.domain_resolver and the ShadowTLS handshake resolver -> local-agh (UDP)
+//
+// See docs/JIEJIE-SERVER.md for the full rationale.
 
 func Context(ctx context.Context) context.Context {
 	return box.Context(ctx, InboundRegistry(), OutboundRegistry(), EndpointRegistry(), DNSTransportRegistry(), ServiceRegistry(), CertificateProviderRegistry())
 }
 
+// InboundRegistry registers the four public entry points, and nothing else.
+//
+// The socks and direct inbounds are deliberately NOT registered. Both previously
+// existed only so the integration tests could use an in-process client, which let
+// the test harness dictate the production binary. The tests now use real protocol
+// clients (HTTP/2, quic-go HTTP/3, sing-anytls, sing-shadowtls, sing-shadowsocks)
+// or a separately built test client, so neither inbound is needed here.
 func InboundRegistry() *inbound.Registry {
 	registry := inbound.NewRegistry()
 
-	// The server's public entry points.
 	http.RegisterInbound(registry)        // MASQUE over HTTP/2 (behind Nginx Stream) and HTTP/3 (UDP/443)
-	anytls.RegisterInbound(registry)      // AnyTLS with native fallback
-	shadowtls.RegisterInbound(registry)   // ShadowTLS v3
-	shadowsocks.RegisterInbound(registry) // Shadowsocks / SS2022
-	socks.RegisterInbound(registry)       // loopback helpers
-	direct.RegisterInbound(registry)      // direct inbound (used by TUN-less setups)
+	anytls.RegisterInbound(registry)      // AnyTLS, with native fallback to the Nginx web root
+	shadowtls.RegisterInbound(registry)   // ShadowTLS v3; detour targets the ss2022-in inbound
+	shadowsocks.RegisterInbound(registry) // Shadowsocks 2022, the ShadowTLS detour target
 
 	registerQUICInbounds(registry)
-	registerStubForRemovedInbounds(registry)
 
 	return registry
 }
 
+// OutboundRegistry registers exactly the two outbounds the production config
+// uses: direct, and the residential SOCKS5 upstream.
+//
+// block, selector, urltest, http, shadowsocks, shadowtls and anytls outbounds are
+// deliberately NOT registered:
+//
+//   - block is unnecessary. A route `reject` action returns a RejectedError from
+//     route/rule/rule_action.go and never resolves an outbound, so reject rules
+//     work without it. This was verified in source rather than assumed.
+//   - selector and urltest are not in the production routing table.
+//   - the http, shadowsocks, shadowtls and anytls outbounds exist on this server
+//     only for debugging and for the fork's client-side feature tests. Those run
+//     against the full/upstream build, so registering them here would enlarge the
+//     production binary purely to satisfy tests.
 func OutboundRegistry() *outbound.Registry {
 	registry := outbound.NewRegistry()
 
-	direct.RegisterOutbound(registry) // direct, used by DNS and fallback routing
-	block.RegisterOutbound(registry)  // reject rules
-	group.RegisterSelector(registry)  // selector
-	group.RegisterURLTest(registry)   // urltest
-	socks.RegisterOutbound(registry)  // residential SOCKS upstream
-	http.RegisterOutbound(registry)   // MASQUE client (A/B testing the server from itself)
-	shadowsocks.RegisterOutbound(registry)
-	shadowtls.RegisterOutbound(registry)
-	anytls.RegisterOutbound(registry)
+	direct.RegisterOutbound(registry) // direct, used by the default route and by DNS
+	socks.RegisterOutbound(registry)  // residential-socks, the SOCKS5 upstream
 
 	registerQUICOutbounds(registry)
-	registerStubForRemovedOutbounds(registry)
 
 	return registry
 }
 
-// EndpointRegistry registers no endpoint.
-//
-// The production server uses none of the endpoint types: no WireGuard, no
-// OpenConnect, no OpenVPN, no Tailscale, and no MASQUE *endpoint* (the MASQUE
-// server runs as an http inbound, not as an endpoint).
+// EndpointRegistry registers no endpoint: the production config uses none.
 func EndpointRegistry() *endpoint.Registry {
 	return endpoint.NewRegistry()
 }
 
+// DNSTransportRegistry registers the production resolver plus the transport
+// sing-box itself requires to start.
+//
+// The production resolver is local-agh, a plain `type: udp` server pointing at
+// 127.0.0.1:53 (AdGuard Home), so `udp` is the only one configured.
+//
+// `local` is ALSO required, and this was established by running the build rather
+// than by reading the config: box.go unconditionally initialises the DNS
+// transport manager with a fallback that creates a C.DNSTypeLocal transport, so
+// omitting it makes every start fail with "default DNS server fallback:
+// transport type not found: local". It is not a feature choice, it is a boot
+// dependency.
+//
+// The tcp, tls, https, hosts and resolved transports are genuinely absent:
+//
+//   - tcp: not needed even for truncation fallback. dns/transport/udp.go
+//     Exchange() inspects response.Truncated and calls its own exchangeTCP(),
+//     which dials TCP through the same dialer and never consults the transport
+//     registry. Covered by TestJiejieMinimalDNSTruncatedTCPFallback.
+//   - tls/https: the server uses local-agh over UDP; no DoT or DoH is configured.
+//   - hosts: no static host entries are configured.
+//   - resolved: systemd-resolved is not this server's resolver, and dropping it
+//     also keeps the D-Bus dependency out of the binary.
 func DNSTransportRegistry() *dns.TransportRegistry {
 	registry := dns.NewTransportRegistry()
 
-	// Required by direct.domain_resolver and the local AGH setup.
-	transport.RegisterTCP(registry)
 	transport.RegisterUDP(registry)
-	transport.RegisterTLS(registry)
-	transport.RegisterHTTPS(registry)
-	hosts.RegisterTransport(registry)
 	local.RegisterTransport(registry)
-	resolved.RegisterTransport(registry)
 
-	// QUIC/HTTP3 DNS and mdns/fakeip are not used; only stubs are registered.
 	registerQUICTransports(registry)
 
 	return registry
 }
 
+// ServiceRegistry registers nothing.
+//
+// The production config uses no sing-box service. In particular systemd-resolved
+// is not this server's resolver (local-agh is), so neither the resolved transport
+// nor its service is present, which also keeps the D-Bus dependency out of the
+// binary.
 func ServiceRegistry() *service.Registry {
 	registry := service.NewRegistry()
-
-	resolved.RegisterService(registry)
 
 	registerQUICServices(registry)
 
 	return registry
 }
 
-// CertificateProviderRegistry registers no certificate provider.
+// CertificateProviderRegistry registers no provider.
 //
-// Certificates on this server are provisioned by acme.sh outside sing-box, so
-// neither the ACME provider nor the Cloudflare Origin CA provider is needed.
-// Dropping origin_ca also drops the certmagic dependency, which it imports for
-// its storage interface; certmagic would otherwise stay linked for nothing.
+// Certificates are provisioned by acme.sh outside sing-box, so neither the ACME
+// provider nor the Cloudflare Origin CA provider is needed. Dropping the latter
+// also drops the certmagic dependency it pulled in for its storage interface.
 func CertificateProviderRegistry() *certificate.Registry {
 	return certificate.NewRegistry()
-}
-
-func registerStubForRemovedInbounds(registry *inbound.Registry) {
-	inbound.Register[option.ShadowsocksInboundOptions](registry, C.TypeShadowsocksR, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksInboundOptions) (adapter.Inbound, error) {
-		return nil, E.New("ShadowsocksR is deprecated and removed in sing-box 1.6.0")
-	})
-}
-
-func registerStubForRemovedOutbounds(registry *outbound.Registry) {
-	outbound.Register[option.ShadowsocksROutboundOptions](registry, C.TypeShadowsocksR, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksROutboundOptions) (adapter.Outbound, error) {
-		return nil, E.New("ShadowsocksR is deprecated and removed in sing-box 1.6.0")
-	})
-	outbound.Register[option.StubOptions](registry, C.TypeWireGuard, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Outbound, error) {
-		return nil, E.New("WireGuard outbound is deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, use WireGuard endpoint instead")
-	})
 }
