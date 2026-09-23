@@ -1,0 +1,61 @@
+name: Linux amd64 server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - testing
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25
+          cache: true
+      - name: Focused format check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -d option/anytls.go option/simple.go protocol/anytls/inbound.go protocol/anytls/inbound_test.go protocol/http/inbound.go transport/http/masquerade.go transport/http/masquerade_test.go transport/http/server.go transport/http/server_h2.go)"
+      - name: Linux lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=10m
+      - name: Focused vet and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          go vet -tags "$TAGS" ./protocol/anytls ./transport/http ./option
+          go test -tags "$TAGS" ./protocol/anytls ./transport/http ./option
+      - name: Build and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          VERSION=1.15.0-jiejie-masquerade.2
+          go build -trimpath -tags "$TAGS" -ldflags "-X github.com/sagernet/sing-box/constant.Version=$VERSION" -o sing-box-linux-amd64 ./cmd/sing-box
+          ./sing-box-linux-amd64 version | grep -F "$VERSION"
+          CONFIG=$(mktemp)
+          trap 'rm -f "$CONFIG"' EXIT
+          cat > "$CONFIG" <<'EOF'
+          {
+            "inbounds": [
+              {"type":"http","listen":"127.0.0.1","listen_port":1080,"masquerade":{"type":"string","content":"ok"}},
+              {"type":"anytls","listen":"127.0.0.1","listen_port":1081,"users":[{"name":"example","password":"example"}],"fallback":{"server":"127.0.0.1","server_port":8080}}
+            ],
+            "outbounds": [{"type":"direct"}]
+          }
+          EOF
+          ./sing-box-linux-amd64 check -c "$CONFIG"
+          sha256sum sing-box-linux-amd64 > sing-box-linux-amd64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-linux-amd64
+          path: |
+            sing-box-linux-amd64
+            sing-box-linux-amd64.sha256
