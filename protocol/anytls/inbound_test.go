@@ -2,6 +2,7 @@ package anytls
 
 import (
 	"context"
+	"crypto/sha256"
 	"io"
 	"net"
 	"testing"
@@ -18,6 +19,19 @@ import (
 type discardHandler struct{}
 
 func (discardHandler) NewConnectionEx(context.Context, net.Conn, M.Socksaddr, M.Socksaddr, N.CloseHandlerFunc) {
+}
+
+type captureHandler struct {
+	received chan []byte
+}
+
+func (h captureHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	defer conn.Close()
+	body, _ := io.ReadAll(conn)
+	h.received <- body
+	if onClose != nil {
+		onClose(nil)
+	}
 }
 
 func TestFallbackPreservesAuthenticationProbe(t *testing.T) {
@@ -78,4 +92,29 @@ func TestFallbackOptionsRequireDestination(t *testing.T) {
 		Fallback: &option.AnyTLSFallbackOptions{},
 	})
 	require.Error(t, err)
+}
+
+func TestFallbackHandlesWrongPassword(t *testing.T) {
+	received := make(chan []byte, 1)
+	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{
+		Handler:         discardHandler{},
+		FallbackHandler: captureHandler{received: received},
+	})
+	require.NoError(t, err)
+	client, server := net.Pipe()
+	defer client.Close()
+	wrongPassword := sha256.Sum256([]byte("wrong-password"))
+	payload := append(wrongPassword[:], []byte("probe payload")...)
+	go func() {
+		_ = service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+	}()
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	client.Close()
+	select {
+	case actual := <-received:
+		require.Equal(t, payload, actual)
+	case <-time.After(time.Second):
+		t.Fatal("wrong password did not enter fallback")
+	}
 }
