@@ -155,7 +155,14 @@ func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*ht
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, E.Cause1(ErrHTTP3Unavailable, err)
+		// A slot-level failure is NOT proof that the authority lacks HTTP/3: this
+		// particular pooled connection could not be established (transient UDP
+		// loss, a NAT rebinding, a closed socket). Reporting it as
+		// ErrHTTP3Unavailable would make the caller mark the whole authority
+		// broken and drop to HTTP/2 even though other slots are healthy. The
+		// error is therefore returned as a plain failure so the caller retries
+		// without poisoning the authority.
+		return nil, E.Cause(err, "establish HTTP/3 connection")
 	}
 	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfigFor(slot))
 	if err != nil {
@@ -163,7 +170,13 @@ func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*ht
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, E.Cause1(ErrHTTP3Unavailable, err)
+		// Same reasoning as above, except for a genuine protocol negotiation
+		// failure: if the server rejects the h3 ALPN then the authority really
+		// does not speak HTTP/3 and falling back is correct.
+		if isHTTP3NegotiationFailure(err) {
+			return nil, E.Cause1(ErrHTTP3Unavailable, err)
+		}
+		return nil, E.Cause(err, "establish HTTP/3 connection")
 	}
 	slot.conn = slot.transport.NewClientConn(quicConn)
 	slot.rawConn = rawConn
@@ -184,7 +197,10 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		return nil, nil, E.Cause1(ErrHTTP3Unavailable, err)
+		// The connection exists but could not open a stream. That is a failure on
+		// this slot, not evidence about the authority, so it does not trigger the
+		// authority-level fallback.
+		return nil, nil, E.Cause(err, "open HTTP/3 stream")
 	}
 	stop := context.AfterFunc(ctx, func() {
 		stream.CancelRead(0)
@@ -405,3 +421,28 @@ var (
 	_ N.WriteCloser  = (*http3StreamConn)(nil)
 	_ DatagramStream = (*http3RequestDatagramStream)(nil)
 )
+
+// isHTTP3NegotiationFailure reports whether a QUIC handshake failed because the
+// peer does not speak HTTP/3.
+//
+// This is the only handshake outcome that justifies an authority-level fallback:
+// it means the server itself declined the h3 protocol. A timeout, an unreachable
+// address or a closed socket says nothing about the authority and must not
+// disable HTTP/3 for it, because other pooled connections may still be healthy.
+func isHTTP3NegotiationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A TLS alert about ALPN surfaces as a CRYPTO_ERROR carrying
+	// "no application protocol"; quic-go wraps it in a TransportError with a
+	// crypto error code (0x100 + alert). Code 0x178 is alert 120,
+	// no_application_protocol.
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		const noApplicationProtocol = 0x100 + 120
+		if uint64(transportErr.ErrorCode) == noApplicationProtocol {
+			return true
+		}
+	}
+	return false
+}

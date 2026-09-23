@@ -1,6 +1,8 @@
 package option
 
 import (
+	"encoding/json"
+
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -54,4 +56,33 @@ func (o *HTTP3ConnectionPoolOptions) Build() (int, error) {
 func (o QUICOptions) ValidateClientOptions() error {
 	_, err := o.HTTP3ConnectionPool.Build()
 	return err
+}
+
+// clientOnlyHTTP3Fields are HTTP/3 settings that only an HTTP client can honour.
+// The http inbound shares QUICOptions with the outbound, so these have to be
+// rejected explicitly rather than being silently ignored.
+var clientOnlyHTTP3Fields = []string{"http3_fallback", "http3_connection_pool"}
+
+// rejectClientOnlyHTTP3Options fails decoding when a server-side option set
+// contains a client-only field.
+//
+// Silently accepting them would let a config look correct while having no effect,
+// which is the same class of problem as the server_profile bug this fork already
+// fixed once.
+func rejectClientOnlyHTTP3Options(content []byte) error {
+	if len(content) == 0 {
+		return nil
+	}
+	var probe map[string]json.RawMessage
+	err := json.Unmarshal(content, &probe)
+	if err != nil {
+		// Let the caller report its own decode error rather than masking it.
+		return nil
+	}
+	for _, field := range clientOnlyHTTP3Fields {
+		if _, present := probe[field]; present {
+			return E.New(field, " is a client-only option and cannot be used on an inbound")
+		}
+	}
+	return nil
 }

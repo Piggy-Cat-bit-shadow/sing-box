@@ -68,14 +68,77 @@ func TestClientFallbackBackoffSequenceUsesConfiguration(t *testing.T) {
 	}
 }
 
-// TestClientFallbackBackoffDefaultIsUpstream proves an unconfigured client keeps
-// the inherited upstream schedule.
+// TestClientFallbackBackoffDefaultIsUpstream is the regression for the two-client
+// confusion.
+//
+// There are TWO HTTP/3 clients in this codebase with DIFFERENT inherited
+// defaults: common/httpclient uses 5m -> 48h, while this MASQUE client has always
+// used 5s -> x2 -> 5m with a reset on success. option.HTTP3FallbackOptions.Build()
+// returns the former, so using it as this client's default would silently change
+// the behaviour of every existing MASQUE user. This test pins all four properties
+// of the MASQUE default.
 func TestClientFallbackBackoffDefaultIsUpstream(t *testing.T) {
-	client := newScheduleOnlyClient(resolveClientHTTP3Schedule(nil))
+	schedule := resolveClientHTTP3Schedule(nil)
 
+	require.Equal(t, 5*time.Second, schedule.InitialBackoff,
+		"the MASQUE client's default initial backoff is 5s, not common/httpclient's 5m")
+	require.Equal(t, 5*time.Minute, schedule.MaxBackoff,
+		"the MASQUE client's default maximum backoff is 5m, not common/httpclient's 48h")
+	require.Equal(t, 2.0, schedule.Multiplier)
+	require.True(t, schedule.ResetOnSuccess)
+
+	// And the running state machine must produce exactly 5s, 10s, 20s, ... 5m.
+	client := newScheduleOnlyClient(schedule)
+	expected := []time.Duration{
+		5 * time.Second,
+		10 * time.Second,
+		20 * time.Second,
+		40 * time.Second,
+		80 * time.Second,
+		160 * time.Second,
+		5 * time.Minute,
+		5 * time.Minute,
+	}
+	for index, want := range expected {
+		client.markHTTP3Broken()
+		require.Equal(t, want, time.Duration(client.http3Escalation.Load()),
+			"unconfigured failure #%d must follow the inherited 5s/x2/5m schedule", index+1)
+	}
+
+	// A success resets it back to 5s.
+	client.clearHTTP3Broken()
 	client.markHTTP3Broken()
-	require.Equal(t, upstreamHTTP3BackoffInitial, time.Duration(client.http3Escalation.Load()),
-		"an unconfigured client must start at the upstream initial backoff")
+	require.Equal(t, 5*time.Second, time.Duration(client.http3Escalation.Load()),
+		"a successful HTTP/3 use must reset an unconfigured client to 5s")
+}
+
+// TestClientFallbackMultiplierOneIsFixedBackoff covers the multiplier boundary.
+//
+// multiplier == 1 must mean "fixed backoff", not "jump to max". The previous
+// implementation treated next <= current as an overflow and returned max_backoff,
+// so multiplier 1 went straight to the ceiling on the first repeat.
+func TestClientFallbackMultiplierOneIsFixedBackoff(t *testing.T) {
+	reset := true
+	schedule := scheduleFrom(t, 100*time.Millisecond, 10*time.Second, 1, &reset)
+	client := newScheduleOnlyClient(schedule)
+
+	for index := range 5 {
+		client.markHTTP3Broken()
+		require.Equal(t, 100*time.Millisecond, time.Duration(client.http3Escalation.Load()),
+			"multiplier=1 must hold the backoff fixed at initial_backoff (iteration %d)", index+1)
+	}
+}
+
+// TestClientFallbackMultiplierBelowOneFallsBackToDefault rejects a shrinking
+// schedule.
+func TestClientFallbackMultiplierBelowOneFallsBackToDefault(t *testing.T) {
+	reset := true
+	schedule := scheduleFrom(t, 100*time.Millisecond, 10*time.Second, 0.5, &reset)
+	require.Equal(t, 2.0, schedule.Multiplier,
+		"a multiplier below 1 is not a schedule and must fall back to the default")
+
+	schedule = scheduleFrom(t, 100*time.Millisecond, 10*time.Second, 0, &reset)
+	require.Equal(t, 2.0, schedule.Multiplier)
 }
 
 // TestClientFallbackResetOnSuccessTrue proves reset_on_success=true restarts the

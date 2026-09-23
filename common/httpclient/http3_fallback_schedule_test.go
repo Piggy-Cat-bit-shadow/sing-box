@@ -3,6 +3,7 @@
 package httpclient
 
 import (
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -94,8 +95,11 @@ func TestHTTP3ScheduleExpiry(t *testing.T) {
 	if transport.h3Broken("a.example:443") {
 		t.Fatal("an expired entry must not report broken")
 	}
-	if _, found := transport.broken["a.example:443"]; found {
-		t.Fatal("an expired entry must be evicted on read")
+	// The entry is deliberately retained after expiry so the escalation history
+	// survives; it is reclaimed later by bounded cleanup, not by the read path.
+	// See TestHTTP3ScheduleEscalationSurvivesExpiry.
+	if _, found := transport.broken["a.example:443"]; !found {
+		t.Fatal("an expired entry must be retained so its escalation is not lost")
 	}
 }
 
@@ -250,4 +254,128 @@ func TestHTTP3ScheduleMaxBelowInitialIsClamped(t *testing.T) {
 	if schedule.MaxBackoff != 60*time.Second {
 		t.Fatalf("max_backoff below initial_backoff must be clamped up, got %v", schedule.MaxBackoff)
 	}
+}
+
+// TestHTTP3ScheduleEscalationSurvivesExpiry is the P0 regression for the generic
+// transport.
+//
+// h3Broken() used to delete the entry when the window expired, which discarded
+// the escalation counter as well. A serial
+// failure -> wait for expiry -> retry -> failure sequence therefore restarted at
+// initial_backoff instead of continuing to grow, so a flapping server never
+// escalated. The window and the escalation are now separate: expiry only ends the
+// window.
+func TestHTTP3ScheduleEscalationSurvivesExpiry(t *testing.T) {
+	schedule := option.HTTP3FallbackSchedule{
+		InitialBackoff: 5 * time.Second,
+		MaxBackoff:     5 * time.Minute,
+		Multiplier:     2,
+		ResetOnSuccess: true,
+	}
+	transport := newScheduleTransport(schedule)
+
+	// Failure 1 -> 5s.
+	transport.markH3Broken("a.example:443")
+	if got := transport.broken["a.example:443"].backoff; got != 5*time.Second {
+		t.Fatalf("first failure must be 5s, got %v", got)
+	}
+
+	// Let the window expire by rewinding the recorded deadline rather than
+	// sleeping, so the test is deterministic and instant.
+	expireEntry(transport, "a.example:443")
+	if transport.h3Broken("a.example:443") {
+		t.Fatal("an expired window must not block HTTP/3")
+	}
+
+	// Failure 2 after expiry -> 10s, not 5s again.
+	transport.markH3Broken("a.example:443")
+	if got := transport.broken["a.example:443"].backoff; got != 10*time.Second {
+		t.Fatalf("a failure after expiry must escalate to 10s, got %v", got)
+	}
+
+	expireEntry(transport, "a.example:443")
+	transport.markH3Broken("a.example:443")
+	if got := transport.broken["a.example:443"].backoff; got != 20*time.Second {
+		t.Fatalf("the escalation must continue to 20s, got %v", got)
+	}
+}
+
+// TestHTTP3ScheduleExpiredEntryIsReclaimedWithoutLosingEscalation covers the
+// cleanup half: expired entries must eventually be reclaimed so the map cannot
+// grow without bound, but reclamation must not be the thing that resets a live
+// escalation.
+func TestHTTP3ScheduleExpiredEntryIsReclaimedWithoutLosingEscalation(t *testing.T) {
+	transport := newScheduleTransport(jiejieSchedule())
+
+	// Fill the map to its cap with entries that are long expired AND untouched
+	// beyond the retention window, which is what makes them reclaimable.
+	old := time.Now().Add(-2 * time.Hour)
+	transport.brokenAccess.Lock()
+	for index := range maxTrackedAuthorities {
+		authority := "bulk-" + strconv.Itoa(index) + ".example:443"
+		transport.broken[authority] = http3BrokenEntry{
+			backoff: 5 * time.Second,
+			until:   old,
+			seen:    old,
+		}
+	}
+	transport.brokenAccess.Unlock()
+
+	if count := len(transport.broken); count != maxTrackedAuthorities {
+		t.Fatalf("precondition: expected a full map, got %d", count)
+	}
+
+	// A new authority must be admitted, which requires reclamation to run.
+	transport.markH3Broken("fresh.example:443")
+
+	transport.brokenAccess.Lock()
+	remaining := len(transport.broken)
+	_, freshPresent := transport.broken["fresh.example:443"]
+	transport.brokenAccess.Unlock()
+
+	if !freshPresent {
+		t.Fatal("a new authority must be admitted once stale entries are reclaimed")
+	}
+	if remaining > maxTrackedAuthorities {
+		t.Fatalf("the map must stay bounded, got %d entries", remaining)
+	}
+}
+
+// TestHTTP3ScheduleRecentlyExpiredEntryKeepsEscalation proves cleanup is
+// conservative: an entry that just expired must not be reclaimed, because its
+// escalation may still be needed.
+func TestHTTP3ScheduleRecentlyExpiredEntryKeepsEscalation(t *testing.T) {
+	transport := newScheduleTransport(jiejieSchedule())
+	transport.markH3Broken("keep.example:443")
+	transport.markH3Broken("keep.example:443")
+
+	// Expire the window but keep `seen` recent.
+	transport.brokenAccess.Lock()
+	entry := transport.broken["keep.example:443"]
+	entry.until = time.Now().Add(-time.Second)
+	entry.seen = time.Now()
+	transport.broken["keep.example:443"] = entry
+	transport.brokenAccess.Unlock()
+
+	if transport.h3Broken("keep.example:443") {
+		t.Fatal("the window is expired, so HTTP/3 must be available again")
+	}
+	// The entry escalated 5s -> 10s, so the next failure is 20s.
+	transport.markH3Broken("keep.example:443")
+	if got := transport.broken["keep.example:443"].backoff; got != 20*time.Second {
+		t.Fatalf("a recently expired entry must keep escalating (10s -> 20s), got %v", got)
+	}
+}
+
+// expireEntry rewinds an entry's deadline into the past so expiry can be tested
+// without sleeping for a production-length backoff.
+func expireEntry(transport *http3FallbackTransport, authority string) {
+	transport.brokenAccess.Lock()
+	defer transport.brokenAccess.Unlock()
+	entry, found := transport.broken[authority]
+	if !found {
+		return
+	}
+	entry.until = time.Now().Add(-time.Second)
+	transport.broken[authority] = entry
 }

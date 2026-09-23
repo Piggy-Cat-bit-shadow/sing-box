@@ -59,14 +59,17 @@ func TestServerProfileReachesHTTP2Server(t *testing.T) {
 	// object that actually serves traffic.
 	require.Equal(t, uint32(256), server.http2Server.MaxConcurrentStreams,
 		"max_concurrent_streams must reach the HTTP/2 server")
-	require.Equal(t, int32(4<<20), server.http2Server.MaxUploadBufferPerStream,
-		"stream_receive_window (4 MiB) must reach the HTTP/2 server")
-	require.Equal(t, int32(16<<20), server.http2Server.MaxUploadBufferPerConnection,
-		"connection_receive_window (16 MiB) must reach the HTTP/2 server")
 	require.Equal(t, 60*time.Second, server.http2Server.IdleTimeout,
 		"idle_timeout must reach the HTTP/2 server")
 	require.Equal(t, 64<<10, server.maxHeaderBytes,
 		"max_header_bytes must reach the HTTP/2 server")
+	// The profile must not size the receive windows: the option schema cannot
+	// express initial and maximum separately, so any value would also raise the
+	// initial window above the quic-go default.
+	require.Zero(t, time.Duration(resolved.HTTP2Options.KeepAlivePeriod),
+		"the profile must leave keep_alive_period disabled")
+	require.Nil(t, resolved.HTTP2Options.StreamReceiveWindow,
+		"the profile must leave stream_receive_window unset")
 }
 
 // TestServerProfileReachesQUICConfig checks the QUIC config the HTTP/3 listener
@@ -81,14 +84,20 @@ func TestServerProfileReachesQUICConfig(t *testing.T) {
 	quicConfig := httpclient.NewQUICConfig(resolved.HTTP3Options)
 	require.Equal(t, int64(256), quicConfig.MaxIncomingStreams,
 		"max_concurrent_streams must reach the QUIC config")
-	require.Equal(t, uint64(4<<20), quicConfig.InitialStreamReceiveWindow,
-		"stream_receive_window must reach the QUIC config")
-	require.Equal(t, uint64(16<<20), quicConfig.InitialConnectionReceiveWindow,
-		"connection_receive_window must reach the QUIC config")
-	require.Equal(t, uint64(4<<20), quicConfig.MaxStreamReceiveWindow)
-	require.Equal(t, uint64(16<<20), quicConfig.MaxConnectionReceiveWindow)
 	require.Equal(t, 60*time.Second, quicConfig.MaxIdleTimeout,
 		"idle_timeout must reach the QUIC config")
+	// The receive windows must be left at zero so quic-go applies its own
+	// defaults (2 MiB initial stream / 10 MiB initial connection). A non-zero
+	// value here would raise the INITIAL window, which is the opposite of a
+	// memory-conservative profile.
+	require.Zero(t, quicConfig.InitialStreamReceiveWindow,
+		"the profile must not raise the initial stream receive window")
+	require.Zero(t, quicConfig.InitialConnectionReceiveWindow,
+		"the profile must not raise the initial connection receive window")
+	require.Zero(t, quicConfig.MaxStreamReceiveWindow)
+	require.Zero(t, quicConfig.MaxConnectionReceiveWindow)
+	require.Zero(t, quicConfig.KeepAlivePeriod,
+		"the profile must not enable a QUIC keep-alive")
 }
 
 // TestServerProfileUnsetKeepsUpstreamDefaults is the compatibility half: with no
@@ -136,8 +145,10 @@ func TestExplicitValuesBeatProfileOnTheResolvedOptions(t *testing.T) {
 	require.Equal(t, badoption.Duration(5*time.Second), resolved.HTTP2Options.IdleTimeout)
 	require.Equal(t, 4096, resolved.MaxHeaderBytes,
 		"an explicit max_header_bytes must win over the profile")
-	// The profile still fills what was left unset.
-	require.Equal(t, uint64(16<<20), resolved.HTTP2Options.ConnectionReceiveWindow.Value())
+	// The profile leaves the windows unset, so the explicit stream window is the
+	// only one present and the connection window stays nil.
+	require.Nil(t, resolved.HTTP2Options.ConnectionReceiveWindow,
+		"the profile must not fill the connection receive window")
 }
 
 // TestBBRProfileReachesQUICOptions proves bbr_profile is carried on the resolved

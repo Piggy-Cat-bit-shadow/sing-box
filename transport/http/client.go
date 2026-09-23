@@ -409,7 +409,10 @@ func resolveClientHTTP3Schedule(fallback *option.HTTP3FallbackOptions) option.HT
 	if schedule.MaxBackoff <= 0 {
 		schedule.MaxBackoff = upstreamHTTP3BackoffMax
 	}
-	if schedule.Multiplier <= 0 {
+	// The multiplier must be >= 1. One means a fixed backoff; anything below one
+	// would make the backoff shrink on every failure, which is not a schedule, so
+	// it falls back to the default.
+	if schedule.Multiplier < 1 {
 		schedule.Multiplier = 2
 	}
 	if schedule.MaxBackoff < schedule.InitialBackoff {

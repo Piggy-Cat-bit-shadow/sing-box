@@ -92,8 +92,12 @@ func TestHTTP3BrokenExpiredEntryGarbageCollected(t *testing.T) {
 	if transport.h3Broken("a.example:443") {
 		t.Fatal("expired entry must report not broken")
 	}
-	if _, found := transport.broken["a.example:443"]; found {
-		t.Fatal("expired entry must be garbage-collected on read")
+	// Expiry ends the avoidance window but retains the entry, because deleting it
+	// here would also discard the escalation counter and a serial
+	// failure -> expiry -> failure sequence would restart at initial_backoff.
+	// Reclamation happens separately in bounded cleanup.
+	if _, found := transport.broken["a.example:443"]; !found {
+		t.Fatal("expired entry must be retained so its escalation survives")
 	}
 }
 

@@ -110,7 +110,15 @@ func (h *HTTPClient) UnmarshalJSONContext(ctx context.Context, content []byte) e
 	if err != nil {
 		return err
 	}
-	return unmarshalHTTPVersionOptions(ctx, content, (*_HTTPClientOptions)(h), h.Version, &h.HTTP2Options, &h.HTTP3Options)
+	err = unmarshalHTTPVersionOptions(ctx, content, (*_HTTPClientOptions)(h), h.Version, &h.HTTP2Options, &h.HTTP3Options)
+	if err != nil {
+		return err
+	}
+	// A top-level http_clients entry must validate its HTTP/3 client options the
+	// same way HTTPClientOptions and HTTPOutboundOptions do. Without this, an
+	// invalid pool size or strategy in http_clients was accepted at decode time
+	// and only failed later when the transport was constructed.
+	return h.HTTP3Options.ValidateClientOptions()
 }
 
 func unmarshalHTTPVersionOptions(ctx context.Context, content []byte, baseStruct any, version int, http2Options *HTTP2Options, http3Options *QUICOptions) error {
@@ -126,11 +134,21 @@ func unmarshalHTTPVersionOptions(ctx context.Context, content []byte, baseStruct
 	}
 }
 
+// unmarshalHTTPVersionsOptions decodes an HTTP INBOUND option set.
+//
+// The inbound shares the QUICOptions type with the outbound, so it would
+// otherwise silently accept the client-only http3_fallback and
+// http3_connection_pool fields. Those settings only affect an HTTP client; a
+// server that accepted them would appear to be configured while changing
+// nothing, which is worse than a clear error. They are rejected explicitly here.
 func unmarshalHTTPVersionsOptions(ctx context.Context, content []byte, baseStruct any, versions []int, http2Options *HTTP2Options, http3Options *QUICOptions) error {
 	for _, version := range versions {
 		if version < 1 || version > 3 {
 			return E.New("unknown HTTP version: ", version)
 		}
+	}
+	if err := rejectClientOnlyHTTP3Options(content); err != nil {
+		return err
 	}
 	switch {
 	case slices.Contains(versions, 3):

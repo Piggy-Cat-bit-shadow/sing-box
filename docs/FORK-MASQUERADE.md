@@ -48,10 +48,15 @@ source IP. It is an accounting pre-filter: a request is rejected only when it
 authenticated client is never denied service by it, and the limit is released the
 moment authentication succeeds.
 
-A rejected request still receives the masquerade response when one is configured
-(otherwise a bare `429`), and never receives `401`/`407` or an authentication
-header. A limited probe therefore looks exactly like an ordinary visitor, so the
-limiter cannot be used to fingerprint the endpoint as a proxy.
+A rejected request receives a locally generated `429` decoy, and never receives
+`401`/`407` or an authentication header. It also never reaches the masquerade
+backend, which is what makes the limiter an actual resource bound; serving the
+proxy masquerade over-limit would still issue one backend request per probe.
+
+The decoy keeps the proxy signal out but is not claimed to be
+path-indistinguishable: it answers every over-limit request with the same body and
+does not forward the request path. Forwarding the path would require reaching the
+backend, which is what the limiter exists to prevent.
 
 ## Tests
 

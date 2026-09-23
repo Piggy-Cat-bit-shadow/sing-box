@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
+	shttp "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -934,4 +935,40 @@ func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "origin-ok", string(body))
 	stream.Close()
+}
+
+// TestJiejieMinimalH3CloseNormalizationIsWired proves the HTTP/3 error
+// normalization the routing layer depends on is present and correct in the
+// PRODUCTION build.
+//
+// route/conn.go logs a copy failure at ERROR unless E.IsClosedOrCanceled
+// recognises it, and an http3.Error carrying ErrCodeNoError was not recognised,
+// which produced:
+//
+//	ERROR connection upload closed: H3 error (0x0)
+//
+// for an ordinary tunnel teardown. The fix normalizes such closures at the HTTP/3
+// stream boundary in transport/http/stream_error.go. Asserting on the
+// classification is both the real contract and deterministic, unlike capturing log
+// text, which the test harness overwrites.
+func TestJiejieMinimalH3CloseNormalizationIsWired(t *testing.T) {
+	normalClosures := []error{
+		&http3.Error{ErrorCode: http3.ErrCodeNoError},
+		&http3.Error{ErrorCode: http3.ErrCodeRequestCanceled},
+		&http3.Error{ErrorCode: http3.ErrCodeRequestIncomplete},
+	}
+	for _, closure := range normalClosures {
+		require.True(t, E.IsClosedOrCanceled(shttp.NormalizeStreamErrorForTest(closure)),
+			"%v must be recognized as a normal closure so the router does not log it as an error", closure)
+	}
+
+	realFaults := []error{
+		&http3.Error{ErrorCode: http3.ErrCodeGeneralProtocolError},
+		&http3.Error{ErrorCode: http3.ErrCodeInternalError},
+		&http3.Error{ErrorCode: http3.ErrCodeFrameError},
+	}
+	for _, fault := range realFaults {
+		require.False(t, E.IsClosedOrCanceled(shttp.NormalizeStreamErrorForTest(fault)),
+			"%v is a real fault and must still be logged as an error", fault)
+	}
 }

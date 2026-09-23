@@ -10,6 +10,7 @@ import (
 	stdTLS "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -361,4 +362,69 @@ func mustParseURL(t *testing.T, raw string) *url.URL {
 	parsed, err := url.Parse(raw)
 	require.NoError(t, err)
 	return parsed
+}
+
+// TestMASQUEPoolSlotFailureDoesNotPoisonAuthority is the P0-3 health-split
+// regression.
+//
+// A slot-level failure means "this pooled connection could not be established",
+// not "the authority does not speak HTTP/3". Conflating them made one dead
+// connection mark the whole authority broken and drop every tunnel to HTTP/2,
+// even though the other slot was healthy.
+func TestMASQUEPoolSlotFailureDoesNotPoisonAuthority(t *testing.T) {
+	server := startMASQUEPoolServer(t)
+	agent := newPoolTestAgent(t, server, 2)
+
+	// A dialer that always fails models an unusable slot.
+	failing := &http3ClientImpl{
+		dialer:         failingDialer{},
+		tlsConfig:      agent.tlsConfig,
+		server:         M.ParseSocksaddr("127.0.0.1:1"),
+		authority:      "example.test",
+		headers:        agent.headers,
+		baseQUICConfig: agent.baseQUICConfig,
+		slots:          agent.slots,
+	}
+	_, err := failing.DialContext(context.Background(), M.ParseSocksaddr("127.0.0.1:9"))
+	require.Error(t, err)
+	require.False(t, errors.Is(err, ErrHTTP3Unavailable),
+		"a slot connection failure must NOT be reported as HTTP/3 being unavailable, "+
+			"otherwise the caller disables HTTP/3 for the whole authority; got %v", err)
+}
+
+// TestMASQUEPoolHealthySlotStillUsedAfterAnotherFails proves service continues.
+func TestMASQUEPoolHealthySlotStillUsedAfterAnotherFails(t *testing.T) {
+	server := startMASQUEPoolServer(t)
+	agent := newPoolTestAgent(t, server, 2)
+
+	// Poison one slot's connection state directly, as a dead connection would.
+	agent.slots[0].access.Lock()
+	agent.slots[0].conn = nil
+	agent.slots[0].rawConn = nil
+	agent.slots[0].access.Unlock()
+
+	// Tunnels must still succeed: the client rotates and the healthy slot serves.
+	succeeded := 0
+	for range 4 {
+		conn, err := agent.DialContext(context.Background(), M.ParseSocksaddr("127.0.0.1:9"))
+		if err == nil {
+			succeeded++
+			conn.Close()
+		}
+	}
+	require.GreaterOrEqual(t, succeeded, 1,
+		"at least one tunnel must succeed while a healthy slot exists")
+	require.GreaterOrEqual(t, server.connections.count(), 1,
+		"a healthy slot must have established a real connection")
+}
+
+// failingDialer always fails, modelling an unusable pool slot.
+type failingDialer struct{}
+
+func (failingDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return nil, errors.New("dial failed")
+}
+
+func (failingDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, errors.New("listen failed")
 }

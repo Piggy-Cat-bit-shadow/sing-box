@@ -215,8 +215,11 @@ func (h *httpHandler) serveConnect(ctx context.Context, writer http.ResponseWrit
 	}
 	writer.WriteHeader(http.StatusOK)
 	writer.(http.Flusher).Flush()
+	// Normalize stream-level errors before they reach the routing layer, so an
+	// orderly HTTP/3 tunnel close is reported as net.ErrClosed rather than as an
+	// unrecognised "H3 error (0x0)" that route/conn.go logs at ERROR level.
 	conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
-		HTTP2Conn: v2rayhttp.NewHTTPConn(request.Body, writer),
+		HTTP2Conn: v2rayhttp.NewHTTPConn(normalizingReadCloser{request.Body}, normalizingResponseWriter{writer}),
 		Flusher:   writer.(http.Flusher),
 	})
 	done := make(chan struct{})

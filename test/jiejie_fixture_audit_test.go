@@ -34,10 +34,11 @@ type productionFixture struct {
 	} `json:"dns"`
 
 	Inbounds []struct {
-		Type   string `json:"type"`
-		Tag    string `json:"tag"`
-		Detour string `json:"detour"`
-		Users  []struct {
+		Type       string `json:"type"`
+		Tag        string `json:"tag"`
+		Detour     string `json:"detour"`
+		ListenPort uint16 `json:"listen_port"`
+		Users      []struct {
 			Name     string `json:"name"`
 			Username string `json:"username"`
 		} `json:"users"`
@@ -60,6 +61,7 @@ type productionFixture struct {
 			User     []string        `json:"user"`
 			Network  []string        `json:"network"`
 			Action   string          `json:"action"`
+			Strategy string          `json:"strategy"`
 			Type     string          `json:"type"`
 			RuleSet  json.RawMessage `json:"rule_set"`
 		} `json:"rules"`
@@ -234,6 +236,62 @@ func TestJiejieProductionFixtureModelsRealTopology(t *testing.T) {
 	}
 	if fixture.DNS.Final != "local-agh" {
 		t.Errorf("dns.final must be local-agh, got %q", fixture.DNS.Final)
+	}
+
+	// The real listen ports, so the fixture cannot drift back to placeholders.
+	listenPorts := make(map[string]uint16)
+	for _, inbound := range fixture.Inbounds {
+		listenPorts[inbound.Tag] = inbound.ListenPort
+	}
+	for tag, port := range map[string]uint16{
+		"masque-h2":    28440,
+		"masque-h3":    443,
+		"anytls-in":    28436,
+		"shadowtls-in": 8554,
+		"ss2022-in":    17414,
+	} {
+		if actual := listenPorts[tag]; actual != port {
+			t.Errorf("inbound %s must listen on the production port %d, got %d", tag, port, actual)
+		}
+	}
+
+	// route.final must be direct, not one of the conditional upstreams.
+	if fixture.Route.Final != "direct" {
+		t.Errorf("route.final must be direct, got %q", fixture.Route.Final)
+	}
+
+	// The residential split must exist and cover both networks: UDP rejected,
+	// TCP resolved to IPv4 and routed to the SOCKS upstream.
+	var residentialUDPReject, residentialTCPResolve, residentialTCPRoute bool
+	for _, rule := range fixture.Route.Rules {
+		isResidential := false
+		for _, user := range rule.User {
+			if user == "residential" {
+				isResidential = true
+			}
+		}
+		if !isResidential {
+			continue
+		}
+		for _, network := range rule.Network {
+			switch {
+			case network == "udp" && rule.Action == "reject":
+				residentialUDPReject = true
+			case network == "tcp" && rule.Action == "resolve" && rule.Strategy == "ipv4_only":
+				residentialTCPResolve = true
+			case network == "tcp" && rule.Outbound == "residential-socks":
+				residentialTCPRoute = true
+			}
+		}
+	}
+	if !residentialUDPReject {
+		t.Error("the residential user's UDP traffic must be rejected")
+	}
+	if !residentialTCPResolve {
+		t.Error("the residential user's TCP traffic must resolve with ipv4_only")
+	}
+	if !residentialTCPRoute {
+		t.Error("the residential user's TCP traffic must route to residential-socks")
 	}
 
 	// No test-only or client-only outbound may appear in the production fixture.

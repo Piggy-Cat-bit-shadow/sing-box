@@ -185,16 +185,42 @@ jobs:
             -run 'TestHTTPInboundHTTP2|TestHTTPInboundHTTP2Cleartext|TestHTTPInboundHTTP3|TestHTTPInboundConnectUDPHTTP2|TestHTTPInboundConnectUDPHTTP3|TestHTTPForwardHTTP2Responses|TestHTTPForwardEarlyResponse|TestHTTPForwardUnexpectedSwitchingProtocols|TestHTTPForwardUserIsolation' \
             . 2>&1 | tee ../integration-upstream.log
 
-      - name: Summarise the tag sets in use
+      # The summary states only what this job actually executes as data-plane
+      # behaviour. It deliberately does not claim coverage it does not have: an
+      # earlier revision said this job "covers the H3 connection pool" while the
+      # test it named only validated the config schema, and named the fallback
+      # backoff config test while the passing H3 fallback test relied on the
+      # pre-existing hardcoded schedule rather than the new option.
+      - name: Summarise what this job actually exercises
         if: always()
         shell: bash
         run: |
-          echo "PRODUCTION SERVER TESTS (separate job): -tags $(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
-          echo "CLIENT FEATURE TESTS (this job):        -tags $(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
-          echo "  covers the H3 connection pool, the fallback backoff, H3 -> H2"
-          echo "  fallback and reset_on_success, plus the upstream HTTP/2 and HTTP/3"
-          echo "  inbound and forward suites."
-          echo "Logs stay in this job output; no log is uploaded as an artifact."
+          cat <<'SUMMARY'
+          CLIENT FEATURE TESTS (this job): -tags $(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+
+          Runtime data-plane behaviour covered here:
+            * H3 -> H2 fallback over a real network path
+              (TestJiejieHTTP3UnavailableFallsBackToH2)
+            * AnyTLS fallback and authenticated AnyTLS with the fork's own
+              outbound (TestJiejieAnyTLSFallback*, TestJiejieAnyTLSAuthenticatedStillWorks)
+            * upstream HTTP/2 and HTTP/3 inbound, forward and CONNECT-UDP suites
+
+          Configuration-shape coverage only, NOT data-plane:
+            * TestJiejieHTTP3PoolConfiguration   — pool schema accepted/rejected
+            * TestJiejieH3FallbackBackoffConfiguration — backoff fields decode
+
+          Configuration EFFECT is proven instead by unit tests that drive the real
+          state machine and the real MASQUE client, in the production and unit
+          jobs:
+            * transport/http TestClientFallbackBackoffSequenceUsesConfiguration
+            * transport/http TestMASQUEPoolSizeTwoOpensTwoConnections
+            * transport/http TestMASQUEPoolConcurrentCONNECTSpreadsConnections
+
+          PRODUCTION SERVER TESTS run in a separate job with -tags
+          $(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL).
+
+          Logs stay in this job output; no log is uploaded as an artifact.
+          SUMMARY
 
   build-production:
     runs-on: ubuntu-latest

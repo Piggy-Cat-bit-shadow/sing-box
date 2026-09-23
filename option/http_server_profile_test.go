@@ -51,17 +51,23 @@ func TestHTTPServerProfileJiejieBalanced1GValues(t *testing.T) {
 	if profile.MaxConcurrentStreams != 256 {
 		t.Fatalf("max concurrent streams must be 256, got %d", profile.MaxConcurrentStreams)
 	}
-	if profile.StreamReceiveWindow != 4<<20 {
-		t.Fatalf("stream receive window must be 4 MiB, got %d", profile.StreamReceiveWindow)
+	// The profile must NOT set receive windows. The schema cannot express initial
+	// and maximum separately, so any value here would also raise the initial
+	// window above the quic-go default, which is not memory-conservative.
+	if profile.StreamReceiveWindow != 0 {
+		t.Fatalf("the profile must not override stream_receive_window, got %d", profile.StreamReceiveWindow)
 	}
-	if profile.ConnectionReceiveWindow != 16<<20 {
-		t.Fatalf("connection receive window must be 16 MiB, got %d", profile.ConnectionReceiveWindow)
+	if profile.ConnectionReceiveWindow != 0 {
+		t.Fatalf("the profile must not override connection_receive_window, got %d", profile.ConnectionReceiveWindow)
+	}
+	if profile.KeepAlivePeriod != 0 {
+		t.Fatalf("the profile must not enable a keep-alive, got %v", profile.KeepAlivePeriod)
 	}
 	if profile.IdleTimeout != 60*time.Second {
 		t.Fatalf("idle timeout must be 60s, got %v", profile.IdleTimeout)
 	}
-	if profile.KeepAlivePeriod <= 0 || profile.KeepAlivePeriod > 60*time.Second {
-		t.Fatalf("keep alive period must be a moderate positive value, got %v", profile.KeepAlivePeriod)
+	if profile.KeepAlivePeriod != 0 {
+		t.Fatalf("keep alive must stay disabled (0), got %v", profile.KeepAlivePeriod)
 	}
 }
 
@@ -76,17 +82,15 @@ func TestHTTPServerProfileFillsUnsetFields(t *testing.T) {
 	if http2.MaxConcurrentStreams != 256 {
 		t.Fatalf("max concurrent streams not applied: %d", http2.MaxConcurrentStreams)
 	}
-	if http2.StreamReceiveWindow.Value() != 4<<20 {
-		t.Fatalf("stream receive window not applied: %d", http2.StreamReceiveWindow.Value())
-	}
-	if http2.ConnectionReceiveWindow.Value() != 16<<20 {
-		t.Fatalf("connection receive window not applied: %d", http2.ConnectionReceiveWindow.Value())
+	if http2.StreamReceiveWindow != nil {
+		t.Fatalf("the profile must leave the stream receive window unset, got %d",
+			http2.StreamReceiveWindow.Value())
 	}
 	if time.Duration(http2.IdleTimeout) != 60*time.Second {
 		t.Fatalf("idle timeout not applied: %v", time.Duration(http2.IdleTimeout))
 	}
-	if time.Duration(http2.KeepAlivePeriod) == 0 {
-		t.Fatal("keep alive period not applied")
+	if time.Duration(http2.KeepAlivePeriod) != 0 {
+		t.Fatalf("the profile must leave keep_alive_period unset, got %v", time.Duration(http2.KeepAlivePeriod))
 	}
 }
 
@@ -137,8 +141,8 @@ func TestHTTPServerProfilePartialExplicitKeepsProfileForRest(t *testing.T) {
 		t.Fatalf("explicit field must win, got %d", http2.MaxConcurrentStreams)
 	}
 	// Everything else still comes from the profile.
-	if http2.StreamReceiveWindow.Value() != 4<<20 {
-		t.Fatalf("unset field must still take the profile value, got %d", http2.StreamReceiveWindow.Value())
+	if http2.StreamReceiveWindow != nil {
+		t.Fatal("an unset stream receive window must stay unset under the profile")
 	}
 	if time.Duration(http2.IdleTimeout) != 60*time.Second {
 		t.Fatalf("unset idle_timeout must take the profile value, got %v", time.Duration(http2.IdleTimeout))
@@ -246,5 +250,111 @@ func TestHTTP3PoolValidatedAtDecodeTime(t *testing.T) {
 		if err := decode(config); err != nil {
 			t.Fatalf("a valid pool must decode: %v (%s)", err, config)
 		}
+	}
+}
+
+// TestHTTPClientTopLevelValidatesPoolOptions covers the http_clients entry point.
+//
+// HTTPClientOptions and HTTPOutboundOptions already validated the HTTP/3 client
+// options; HTTPClient (the top-level `http_clients` list) did not, so an invalid
+// pool was accepted at decode time and failed later at transport construction.
+func TestHTTPClientTopLevelValidatesPoolOptions(t *testing.T) {
+	invalid := []string{
+		`{"tag":"c1","version":3,"http3_connection_pool":{"size":64}}`,
+		`{"tag":"c1","version":3,"http3_connection_pool":{"size":2,"strategy":"adaptive"}}`,
+		`{"tag":"c1","version":3,"http3_connection_pool":{"size":-1}}`,
+	}
+	for _, config := range invalid {
+		var client HTTPClient
+		if err := json.UnmarshalContext(context.Background(), []byte(config), &client); err == nil {
+			t.Fatalf("http_clients must reject an invalid pool at decode time: %s", config)
+		}
+	}
+
+	valid := []string{
+		`{"tag":"c1","version":3}`,
+		`{"tag":"c1","version":3,"http3_connection_pool":{"size":1}}`,
+		`{"tag":"c1","version":3,"http3_connection_pool":{"size":2,"strategy":"round_robin"}}`,
+	}
+	for _, config := range valid {
+		var client HTTPClient
+		if err := json.UnmarshalContext(context.Background(), []byte(config), &client); err != nil {
+			t.Fatalf("a valid http_clients entry must decode: %v (%s)", err, config)
+		}
+	}
+}
+
+// TestHTTPInboundRejectsClientOnlyHTTP3Options ensures the inbound does not
+// silently accept settings it cannot honour.
+//
+// The inbound shares QUICOptions with the outbound, so http3_fallback and
+// http3_connection_pool would otherwise be accepted and do nothing. A config that
+// appears to configure something and silently ignores it is worse than an error.
+func TestHTTPInboundRejectsClientOnlyHTTP3Options(t *testing.T) {
+	rejected := []string{
+		`{"version":3,"http3_fallback":{"initial_backoff":"5s"}}`,
+		`{"version":3,"http3_connection_pool":{"size":2}}`,
+		`{"version":[2,3],"http3_connection_pool":{"size":2,"strategy":"round_robin"}}`,
+		`{"version":3,"http3_fallback":{"initial_backoff":"5s"},"http3_connection_pool":{"size":2}}`,
+	}
+	for _, config := range rejected {
+		var inbound HTTPInboundOptions
+		err := json.UnmarshalContext(context.Background(), []byte(config), &inbound)
+		if err == nil {
+			t.Fatalf("an inbound must reject the client-only option in: %s", config)
+		}
+	}
+
+	accepted := []string{
+		`{"version":3}`,
+		`{"version":3,"server_profile":"jiejie-balanced-1g"}`,
+		`{"version":3,"bbr_profile":"aggressive","max_header_bytes":65536}`,
+		`{"version":2,"stream_receive_window":"4MB"}`,
+	}
+	for _, config := range accepted {
+		var inbound HTTPInboundOptions
+		if err := json.UnmarshalContext(context.Background(), []byte(config), &inbound); err != nil {
+			t.Fatalf("a valid inbound option set must decode: %v (%s)", err, config)
+		}
+	}
+}
+
+// TestJiejieProfileDoesNotRaiseQUICWindows is the regression for the profile
+// over-reaching.
+//
+// quic-go's defaults are 2 MiB initial stream / 6 MiB max stream and 10 MiB
+// initial connection / 15 MiB max connection, with keep-alive disabled.
+// common/httpclient.NewQUICConfig applies one configured value to BOTH the
+// initial and the maximum window, so a profile that sets a receive window raises
+// the initial window as a side effect. The profile must therefore leave the
+// windows alone entirely.
+func TestJiejieProfileDoesNotRaiseQUICWindows(t *testing.T) {
+	profile, applied, err := NewHTTPServerProfile(HTTPServerProfileNameJiejieBalanced1G)
+	if err != nil || !applied {
+		t.Fatalf("profile must resolve: %v", err)
+	}
+
+	options := HTTP2Options{}
+	profile.ApplyToHTTP2(&options)
+
+	if options.StreamReceiveWindow != nil {
+		t.Fatalf("stream_receive_window must stay unset so quic-go keeps its 2 MiB default, got %d",
+			options.StreamReceiveWindow.Value())
+	}
+	if options.ConnectionReceiveWindow != nil {
+		t.Fatalf("connection_receive_window must stay unset so quic-go keeps its 10 MiB default, got %d",
+			options.ConnectionReceiveWindow.Value())
+	}
+	if options.KeepAlivePeriod != 0 {
+		t.Fatalf("keep_alive_period must stay 0 (disabled, the quic-go default), got %v",
+			time.Duration(options.KeepAlivePeriod))
+	}
+
+	// The parts the profile legitimately sets must still be applied.
+	if options.MaxConcurrentStreams != 256 {
+		t.Fatalf("max_concurrent_streams must still be applied, got %d", options.MaxConcurrentStreams)
+	}
+	if time.Duration(options.IdleTimeout) != 60*time.Second {
+		t.Fatalf("idle_timeout must still be applied, got %v", time.Duration(options.IdleTimeout))
 	}
 }

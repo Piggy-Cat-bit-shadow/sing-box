@@ -264,15 +264,43 @@ wins, and an unset profile changes nothing.
 | --- | --- |
 | `max_header_bytes` | 64 KiB |
 | `max_concurrent_streams` | 256 |
-| `stream_receive_window` | 4 MiB |
-| `connection_receive_window` | 16 MiB |
 | `idle_timeout` | 60s |
-| `keep_alive_period` | 30s |
 
 `max_header_bytes` can also be set directly, with or without a profile.
 
 Upstream never sets `MaxIncomingStreams` to a bounded value; this fork does
 **not** change that default. Only selecting a profile tightens it.
+
+### What the profile deliberately does NOT set
+
+The profile sets no receive window and no keep-alive, and this is a correction
+rather than an omission. Measured against quic-go v0.61.0-sing-box-mod.7
+(`internal/protocol/params.go`):
+
+| QUIC parameter | quic-go default |
+| --- | --- |
+| `InitialStreamReceiveWindow` | 2 MiB |
+| `MaxStreamReceiveWindow` | 6 MiB |
+| `InitialConnectionReceiveWindow` | 10 MiB |
+| `MaxConnectionReceiveWindow` | 15 MiB |
+| `KeepAlivePeriod` | 0 (disabled) |
+
+`common/httpclient.NewQUICConfig` assigns a configured `stream_receive_window` to
+**both** the initial and the maximum window. An earlier revision of this profile
+set 4 MiB and 16 MiB, which therefore *raised* the initial windows above the
+library defaults (2 MiB → 4 MiB and 10 MiB → 16 MiB) and added a 30s keep-alive
+that actively pings idle connections. That is the opposite of a
+memory-conservative profile on a 1 GiB host, and it was never measured. It has
+been removed.
+
+The option schema cannot currently express initial and maximum windows
+separately, so lowering a maximum would unavoidably raise an initial. The honest
+choice is to leave both alone. If you want to tune them, set them explicitly and
+measure — an explicit value always wins over the profile.
+
+Treat the profile as bounding **stream count, header size and idle lifetime**,
+which are the parts that are unambiguously binding. Do not read it as a total
+memory bound: see the note in section 12 about connection-level admission.
 
 ## 9. `bbr_profile`
 
@@ -323,17 +351,39 @@ How it behaves:
   addresses. When full, the least recently seen idle entries are evicted.
 * Standard library only (`netip`, `sync`). No new dependency.
 
-### Anti-fingerprinting
+### What an over-limit request receives
 
-A rejected request is answered with the **masquerade handler** when one is
-configured, otherwise a bare `429`. It never returns `401`/`407` and never emits
-`WWW-Authenticate` or `Proxy-Authenticate`. The limiter must not itself reveal
-that the endpoint is a proxy; tests assert this for both the masquerade and
-non-masquerade cases.
+An over-limit request is answered by a **locally generated decoy**, not by the
+masquerade handler:
 
-Because a limited request still receives the decoy page, the limiter is
-deliberately not visible to a prober. What it bounds is the rate at which such
-requests are admitted.
+* status `429`, `Content-Type: text/html`, `Retry-After`, and a small static body;
+* no `401`, no `407`, no `WWW-Authenticate`, no `Proxy-Authenticate`;
+* **no request to the masquerade backend.**
+
+The backend point is the reason this changed. Serving the proxy masquerade
+over-limit meant that every over-limit probe still issued one real HTTP request to
+the configured backend, so an attacker kept driving backend load no matter how far
+over budget it went. That is not a resource bound despite the name.
+`TestUnauthenticatedLimiterDoesNotHitMasqueradeBackend` counts real backend hits
+and requires them to stay at 1 once the budget is exhausted.
+
+The decoy is deliberately **not** a cached copy of the backend page: caching would
+require fetching it, and a stale or per-user page would be a worse disguise than a
+generic server response.
+
+### What the limiter does and does not hide
+
+It hides that the endpoint is a **proxy**: no auth challenge, no proxy-specific
+headers, and an over-limit response that looks like an ordinary rate-limited web
+server.
+
+It does **not** claim path-level indistinguishability, and an earlier revision of
+this document overstated it. The decoy answers every over-limit request with the
+same body and does not forward the request path, so a prober that compares
+responses to different paths can tell them apart. Anything that forwarded the path
+would have to reach the backend, which is exactly what the limiter exists to
+avoid. The trade is deliberate: bound the backend, keep the proxy signal out, and
+do not promise more than that.
 
 ## 11. Log behaviour
 
@@ -356,6 +406,19 @@ Classification uses only `errors.Is`, `errors.As` and real quic-go error codes.
 **No string matching is used anywhere.**
 
 ## 12. Deterministic resource bounds instead of a fake `memory_budget`
+
+**Scope of these bounds, stated precisely.** They bound stream count, header
+size, idle lifetime, receive windows and rate. They do **not** bound the number of
+QUIC connections. `max_concurrent_streams` limits streams within a connection and
+the unauthenticated limiter counts HTTP requests, so neither stops a peer from
+opening many QUIC connections that complete a handshake and never send a request.
+There is currently no connection-count or per-source connection cap.
+
+Adding one would mean hooking quic-go's connection acceptance, which is a
+structural change to a pinned dependency, so it is deliberately not implemented.
+If connection-count admission is added later this section must be updated; until
+then, treat the profile as bounding streams and memory *per connection*, not the
+number of connections.
 
 An earlier plan proposed a `memory_budget` option. It is **not implemented**.
 

@@ -38,14 +38,38 @@ const (
 
 // httpserverProfiles is the single place where profile numbers live. They are
 // deliberately conservative and are never used unless a profile is selected.
+//
+// What this profile does NOT do is as important as what it does. Measured against
+// quic-go v0.61.0-sing-box-mod.7 (internal/protocol/params.go):
+//
+//	InitialStreamReceiveWindow      2 MiB
+//	MaxStreamReceiveWindow          6 MiB
+//	InitialConnectionReceiveWindow  10 MiB
+//	MaxConnectionReceiveWindow      15 MiB
+//	KeepAlivePeriod                 0 (disabled)
+//
+// An earlier revision of this profile set stream_receive_window to 4 MiB and
+// connection_receive_window to 16 MiB. Both of those values are applied by
+// NewQUICConfig to BOTH the initial and the maximum window, so the profile
+// RAISED the initial windows above the library defaults (2 MiB -> 4 MiB and
+// 10 MiB -> 16 MiB) and enabled a 30s keep-alive that the default does not have.
+// That is the opposite of a memory-conservative profile and it was never
+// measured, so it has been removed.
+//
+// The current schema cannot express initial and maximum windows separately, so
+// the honest choice is to leave the receive windows entirely alone rather than
+// raise the initial window as a side effect of lowering the maximum. Stream
+// limits, the header cap and the idle timeout are the parts that are
+// unambiguously binding, and those are what this profile sets.
 var httpserverProfiles = map[string]HTTPServerProfile{
 	HTTPServerProfileNameJiejieBalanced1G: {
-		MaxHeaderBytes:          64 * kibibyte,
-		MaxConcurrentStreams:    256,
-		StreamReceiveWindow:     4 * mebibyte,
-		ConnectionReceiveWindow: 16 * mebibyte,
-		IdleTimeout:             60 * time.Second,
-		KeepAlivePeriod:         30 * time.Second,
+		MaxHeaderBytes:       64 * kibibyte,
+		MaxConcurrentStreams: 256,
+		IdleTimeout:          60 * time.Second,
+		// KeepAlivePeriod is deliberately zero: it inherits the quic-go default of
+		// "disabled". Actively pinging idle QUIC connections keeps them (and their
+		// state) alive on a 1 GiB host, which is the opposite of the intent.
+		// Receive windows are deliberately NOT set: see the comment above.
 	},
 }
 

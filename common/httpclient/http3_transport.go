@@ -48,9 +48,20 @@ func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error
 	return t.pick(request).RoundTrip(request)
 }
 
+// http3BrokenEntry tracks one authority's HTTP/3 avoidance state.
+//
+// until and backoff are deliberately separate. An earlier revision stored them
+// in one record and deleted the record when the window expired, which also threw
+// away the escalation history: a serial failure -> expiry -> failure sequence
+// restarted at initial_backoff instead of continuing to grow. Expiry now only
+// ends the window; the escalation is cleared solely by a successful round trip
+// when reset_on_success is enabled.
 type http3BrokenEntry struct {
 	until   time.Time
 	backoff time.Duration
+	// seen is the last time this authority was touched. It drives bounded cleanup
+	// so stale entries can be reclaimed without discarding a live escalation.
+	seen time.Time
 }
 
 type http3FallbackTransport struct {
@@ -344,6 +355,16 @@ func (t *http3FallbackTransport) Close() error {
 	return E.Errors(t.h3Pool.Close(), t.h2Fallback.Close())
 }
 
+// maxTrackedAuthorities bounds the broken-state map. Without a bound a client
+// talking to many hosts could grow it without limit.
+const maxTrackedAuthorities = 4096
+
+// authorityRetention is how long an expired entry is kept before cleanup may
+// reclaim it. Keeping an expired entry for a while is what lets the escalation
+// history survive a window expiry; retention only exists to stop the map growing
+// forever.
+const authorityRetention = time.Hour
+
 func (t *http3FallbackTransport) h3Broken(authority string) bool {
 	if authority == "" {
 		return false
@@ -354,11 +375,27 @@ func (t *http3FallbackTransport) h3Broken(authority string) bool {
 	if !found {
 		return false
 	}
-	if entry.until.IsZero() || !time.Now().Before(entry.until) {
-		delete(t.broken, authority)
-		return false
+	now := time.Now()
+	// An expired window no longer blocks HTTP/3, but the escalation is retained
+	// so a subsequent failure continues from where it left off.
+	entry.seen = now
+	t.broken[authority] = entry
+	return now.Before(entry.until)
+}
+
+// cleanupLocked reclaims entries that have been expired and untouched for longer
+// than the retention window. It is opportunistic: it runs when the map is at its
+// cap, so the common path pays nothing.
+func (t *http3FallbackTransport) cleanupLocked(now time.Time) {
+	if len(t.broken) < maxTrackedAuthorities {
+		return
 	}
-	return true
+	cutoff := now.Add(-authorityRetention)
+	for authority, entry := range t.broken {
+		if entry.until.Before(now) && entry.seen.Before(cutoff) {
+			delete(t.broken, authority)
+		}
+	}
 }
 
 // clearH3Broken drops the recorded failure for an authority after a successful
@@ -382,9 +419,12 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 	}
 	t.brokenAccess.Lock()
 	defer t.brokenAccess.Unlock()
+	now := time.Now()
+	t.cleanupLocked(now)
 	entry := t.broken[authority]
 	entry.backoff = t.schedule.Next(entry.backoff)
-	entry.until = time.Now().Add(entry.backoff)
+	entry.until = now.Add(entry.backoff)
+	entry.seen = now
 	t.broken[authority] = entry
 }
 

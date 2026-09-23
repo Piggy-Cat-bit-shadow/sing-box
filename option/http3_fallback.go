@@ -53,7 +53,10 @@ func (o *HTTP3FallbackOptions) Build() HTTP3FallbackSchedule {
 	if schedule.MaxBackoff <= 0 {
 		schedule.MaxBackoff = upstreamH3MaxBackoff
 	}
-	if schedule.Multiplier <= 0 {
+	// The multiplier must be >= 1. Exactly 1 means a fixed backoff; anything
+	// below 1 would make the backoff shrink on every failure, which is not a
+	// schedule, so it falls back to the default.
+	if schedule.Multiplier < 1 {
 		schedule.Multiplier = upstreamH3Multiplier
 	}
 	if schedule.MaxBackoff < schedule.InitialBackoff {
@@ -75,13 +78,21 @@ func (s HTTP3FallbackSchedule) Next(current time.Duration) time.Duration {
 	if current <= 0 {
 		return s.InitialBackoff
 	}
+	// multiplier == 1 means a FIXED backoff: the schedule stays at
+	// initial_backoff and never escalates. This must be handled explicitly,
+	// because a "next <= current implies overflow" guard would treat the
+	// unchanged value as an error and jump straight to max_backoff.
+	if s.Multiplier <= 1 {
+		return s.InitialBackoff
+	}
 	next := time.Duration(float64(current) * s.Multiplier)
+	// Guard against duration overflow or a multiplier that does not actually
+	// grow the value. Both are treated as "already at the ceiling".
 	if next <= current {
-		// Guard against zero/NaN-ish multipliers and duration overflow.
-		next = s.MaxBackoff
+		return s.MaxBackoff
 	}
 	if next > s.MaxBackoff {
-		next = s.MaxBackoff
+		return s.MaxBackoff
 	}
 	return next
 }

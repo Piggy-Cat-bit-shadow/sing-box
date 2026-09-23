@@ -50,7 +50,7 @@
     {
       "type": "http",
       "tag": "masque-h3",
-      "listen": "::",
+      "listen": "0.0.0.0",
       "listen_port": 443,
       "version": 3,
       "server_profile": "jiejie-balanced-1g",
@@ -110,7 +110,7 @@
       "type": "shadowtls",
       "tag": "shadowtls-in",
       "listen": "127.0.0.1",
-      "listen_port": 28450,
+      "listen_port": 8554,
       "version": 3,
       "users": [
         {
@@ -121,7 +121,7 @@
       "password": "example",
       "strict_mode": true,
       "handshake": {
-        "server": "www.bing.com",
+        "server": "www.intel.com",
         "server_port": 443,
         "detour": "direct",
         "domain_resolver": "local-agh"
@@ -132,7 +132,7 @@
       "type": "shadowsocks",
       "tag": "ss2022-in",
       "listen": "127.0.0.1",
-      "listen_port": 28460,
+      "listen_port": 17414,
       "method": "2022-blake3-aes-128-gcm",
       "password": "AAAAAAAAAAAAAAAAAAAAAA==",
       "network": "tcp"
@@ -158,21 +158,23 @@
   "route": {
     "rules": [
       {
-        "action": "sniff"
-      },
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "ip_is_private": true,
-        "outbound": "direct"
-      },
-      {
-        "domain_suffix": [
-          ".cn"
+        "user": [
+          "residential"
         ],
-        "outbound": "direct"
+        "network": [
+          "udp"
+        ],
+        "action": "reject"
+      },
+      {
+        "user": [
+          "residential"
+        ],
+        "network": [
+          "tcp"
+        ],
+        "action": "resolve",
+        "strategy": "ipv4_only"
       },
       {
         "user": [
@@ -184,13 +186,8 @@
         "outbound": "residential-socks"
       },
       {
-        "user": [
-          "residential"
-        ],
-        "network": [
-          "udp"
-        ],
-        "action": "reject"
+        "ip_is_private": true,
+        "outbound": "direct"
       }
     ],
     "final": "direct",
