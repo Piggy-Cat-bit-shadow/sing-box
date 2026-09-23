@@ -87,7 +87,7 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	ctx := log.ContextWithNewID(request.Context())
 	connectionSource := h.source
 	if !connectionSource.IsValid() {
-		connectionSource = M.ParseSocksaddr(request.RemoteAddr).Unwrap()
+		connectionSource = h.resolveSource(request)
 	}
 	var protocol string
 	if request.Method == http.MethodConnect {
@@ -98,13 +98,14 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	tunnelHandler := h.server.tunnels[protocol]
 	if tunnelHandler != nil {
-		release, limited := h.admitUnauthenticated(ctx, writer, connectionSource)
-		if limited {
-			return
-		}
+		release, overLimit := h.admitUnauthenticated(connectionSource)
 		authCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
 		if authErr != nil {
 			release()
+			if overLimit {
+				h.rejectUnauthenticated(ctx, writer, connectionSource)
+				return
+			}
 			h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, false)
 			return
 		}
@@ -119,13 +120,14 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	release, limited := h.admitUnauthenticated(ctx, writer, connectionSource)
-	if limited {
-		return
-	}
+	release, overLimit := h.admitUnauthenticated(connectionSource)
 	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
 	if authErr != nil {
 		release()
+		if overLimit {
+			h.rejectUnauthenticated(ctx, writer, connectionSource)
+			return
+		}
 		h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, true)
 		return
 	}
@@ -147,25 +149,31 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	h.serveForward(ctx, writer, request, source)
 }
 
-// admitUnauthenticated consults the unauthenticated limiter for a request that
-// has not yet authenticated. It returns a release function that must be called
-// when the request finishes, plus a flag indicating that the request was
-// already answered because it exceeded a limit.
+// admitUnauthenticated accounts an unauthenticated request against the limiter.
 //
-// When the limiter rejects a request it responds with a deliberately
-// indistinguishable result: the masquerade handler when one is configured,
-// otherwise a bare 429. It never emits 401/407 or any auth challenge, so a
-// limiter cannot be used to fingerprint the endpoint as a proxy.
-func (h *httpHandler) admitUnauthenticated(ctx context.Context, writer http.ResponseWriter, source M.Socksaddr) (func(), bool) {
+// It records whether the budget was exceeded but never answers the request by
+// itself. The decision is deferred until authentication has been attempted,
+// because only a failed authentication identifies an abusive peer. Refusing
+// before authenticating would break a legitimate client that simply
+// reconnects more often than the unauthenticated budget allows.
+//
+// The returned release function must be called when the request finishes.
+func (h *httpHandler) admitUnauthenticated(source M.Socksaddr) (release func(), overLimit bool) {
 	limiter := h.server.unauthenticatedLimiter
 	if limiter == nil {
 		return func() {}, false
 	}
 	release, allowed := limiter.acquire(source.AddrString(), time.Now())
-	if allowed {
-		return release, false
-	}
-	h.server.logger.DebugContext(ctx, "unauthenticated request from ", source, " rate limited")
+	return release, !allowed
+}
+
+// rejectUnauthenticated answers a request that both failed authentication and
+// exceeded the unauthenticated budget. It responds with a deliberately
+// indistinguishable result: the masquerade handler when one is configured,
+// otherwise a bare 429. It never emits 401/407 or any auth challenge, so the
+// limiter cannot be used to fingerprint the endpoint as a proxy.
+func (h *httpHandler) rejectUnauthenticated(ctx context.Context, writer http.ResponseWriter, source M.Socksaddr) {
+	h.server.logger.DebugContext(ctx, "unauthenticated request from ", source, " over the unauthenticated budget")
 	if h.server.masquerade != nil {
 		h.server.masquerade.ServeHTTP(writer, &http.Request{
 			Method: http.MethodGet,
@@ -173,10 +181,9 @@ func (h *httpHandler) admitUnauthenticated(ctx context.Context, writer http.Resp
 			Proto:  "HTTP/1.1",
 			Header: make(http.Header),
 		})
-		return func() {}, true
+		return
 	}
 	writer.WriteHeader(http.StatusTooManyRequests)
-	return func() {}, true
 }
 
 // serveAuthFailure handles a failed authentication attempt. With a masquerade
@@ -351,4 +358,17 @@ func (w flushWriter) Write(p []byte) (int, error) {
 	}
 	w.ResponseWriter.(http.Flusher).Flush()
 	return n, nil
+}
+
+// resolveSource determines the peer address for a request. It prefers the
+// address captured when the connection was accepted, then quic-go's HTTP/3
+// context value, and finally http.Request.RemoteAddr.
+func (h *httpHandler) resolveSource(request *http.Request) M.Socksaddr {
+	if request == nil {
+		return M.Socksaddr{}
+	}
+	if source, loaded := http3RemoteAddr(request); loaded {
+		return source.Unwrap()
+	}
+	return M.ParseSocksaddr(request.RemoteAddr).Unwrap()
 }

@@ -350,33 +350,85 @@ func TestUnauthenticatedLimiterNeverEmitsAuthChallenge(t *testing.T) {
 				}
 			}
 
-			// First request consumes the single token.
-			firstRecorder := httptest.NewRecorder()
-			release, limited := handler.admitUnauthenticated(testContext(), firstRecorder, source)
-			if limited {
-				t.Fatal("the first request must be admitted")
+			// First request consumes the single token and is within budget.
+			release, overLimit := handler.admitUnauthenticated(source)
+			if overLimit {
+				t.Fatal("the first request must be within budget")
 			}
 			release()
 
-			// Second request exceeds the budget.
-			secondRecorder := httptest.NewRecorder()
-			_, limited = handler.admitUnauthenticated(testContext(), secondRecorder, source)
-			if !limited {
-				t.Fatal("the second request must be limited")
+			// Second request exceeds the budget. It is only *accounted* here;
+			// the rejection is emitted by rejectUnauthenticated, which the
+			// handler calls after authentication has failed.
+			release, overLimit = handler.admitUnauthenticated(source)
+			if !overLimit {
+				t.Fatal("the second request must be over budget")
 			}
-			assertNoAuthChallenge(secondRecorder)
+			release()
+
+			recorder := httptest.NewRecorder()
+			handler.rejectUnauthenticated(testContext(), recorder, source)
+			assertNoAuthChallenge(recorder)
 
 			if testCase.masquerade != nil {
-				if secondRecorder.Code != http.StatusOK {
-					t.Fatalf("a limited request must receive the masquerade response, got %d", secondRecorder.Code)
+				if recorder.Code != http.StatusOK {
+					t.Fatalf("a rejected request must receive the masquerade response, got %d", recorder.Code)
 				}
-				if !strings.Contains(secondRecorder.Body.String(), "normal site") {
-					t.Fatalf("expected the masquerade body, got %q", secondRecorder.Body.String())
+				if !strings.Contains(recorder.Body.String(), "normal site") {
+					t.Fatalf("expected the masquerade body, got %q", recorder.Body.String())
 				}
-			} else if secondRecorder.Code != http.StatusTooManyRequests {
-				t.Fatalf("without masquerade a limited request must be a generic 429, got %d", secondRecorder.Code)
+			} else if recorder.Code != http.StatusTooManyRequests {
+				t.Fatalf("without masquerade a rejected request must be a generic 429, got %d", recorder.Code)
 			}
 		})
+	}
+}
+
+// TestUnauthenticatedLimiterDoesNotBlockBeforeAuthentication is the critical
+// correctness rule: exceeding the unauthenticated budget must not, by itself,
+// refuse a request. Only a failed authentication combined with an exceeded
+// budget is rejected, so a legitimate client that reconnects frequently is
+// never denied service.
+func TestUnauthenticatedLimiterDoesNotBlockBeforeAuthentication(t *testing.T) {
+	limits := enabledLimits()
+	limits.RequestsPerSecond = 0.0001
+	limits.Burst = 1
+	limits.MaxConcurrentPerIP = 1
+	handler := &httpHandler{server: &Server{
+		logger:                 testLogger(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: newUnauthenticatedLimiter(limits),
+	}}
+	source := parseSource(t, "1.2.3.4:5000")
+
+	// Consume the budget.
+	release, overLimit := handler.admitUnauthenticated(source)
+	if overLimit {
+		t.Fatal("the first request must be within budget")
+	}
+	release()
+
+	// Every subsequent request is flagged over budget, but the flag alone must
+	// never produce a response: the caller still attempts authentication.
+	release, overLimit = handler.admitUnauthenticated(source)
+	release()
+	if !overLimit {
+		t.Fatal("the budget must be reported as exceeded")
+	}
+	// There is no writer involved, proving admission does not answer.
+}
+
+// TestUnauthenticatedLimiterDisabledAdmitsEverything checks that no limiter
+// means no accounting and no rejection.
+func TestUnauthenticatedLimiterDisabledAdmitsEverything(t *testing.T) {
+	handler := &httpHandler{server: &Server{logger: testLogger()}}
+	source := parseSource(t, "1.2.3.4:5000")
+	for range 100 {
+		release, overLimit := handler.admitUnauthenticated(source)
+		release()
+		if overLimit {
+			t.Fatal("without a limiter nothing may be reported as over budget")
+		}
 	}
 }
 
