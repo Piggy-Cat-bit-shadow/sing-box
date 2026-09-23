@@ -438,46 +438,83 @@ never enter the import graph, so the Go linker removes them.
 
 | Registry | Default build | `jiejie_server_minimal` |
 | --- | --- | --- |
-| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | http, anytls, shadowtls, shadowsocks, socks, direct |
-| Outbounds | direct, bridge, block, selector, urltest, socks, http, shadowsocks, snell, vmess, trojan, naive, tor, ssh, shadowtls, vless, anytls, hysteria, tuic, hysteria2, tailscale | direct, block, selector, urltest, socks, http, shadowsocks, shadowtls, anytls |
+| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | **http, anytls, shadowtls, shadowsocks** |
+| Outbounds | direct, bridge, block, selector, urltest, socks, http, shadowsocks, snell, vmess, trojan, naive, tor, ssh, shadowtls, vless, anytls, hysteria, tuic, hysteria2, tailscale | **direct, socks** |
 | Endpoints | WireGuard, OpenConnect, OpenVPN, MASQUE, Tailscale | none |
-| DNS | tcp, udp, tls, https, hosts, local, mdns, fakeip, quic, http3, resolved, dhcp, tailscale, openconnect, openvpn | tcp, udp, tls, https, hosts, local, resolved, plus non-functional QUIC/HTTP3 stubs |
-| Services | api, resolved, ssmapi, hysteria realm, derp, ccm, ocm, oom killer, usbip | resolved |
+| DNS transports | tcp, udp, tls, https, hosts, local, mdns, fakeip, quic, http3, resolved, dhcp, tailscale, openconnect, openvpn | **udp, local** |
+| Services | api, resolved, ssmapi, hysteria realm, derp, ccm, ocm, oom killer, usbip | none |
 | Cert providers | ACME, Tailscale, Cloudflare Origin CA | none |
+
+Every entry in the minimal column exists because the production configuration
+uses it. Nothing is registered for test convenience: the integration tests drive
+real protocol clients, and the client-side fork features run against the full
+build instead.
+
+Three of these deserve an explicit justification, because the obvious answer is
+wrong in each case:
+
+* **`socks` appears only as an outbound.** It is the residential SOCKS5 upstream.
+  The `socks` inbound is deliberately absent; it previously existed only so tests
+  could use an in-process client, which let the test harness dictate the
+  production binary.
+* **`local` DNS appears even though only `local-agh` (UDP) is configured.** It is
+  not a feature choice: `box.go` unconditionally initialises the DNS transport
+  manager with a fallback that constructs a `local` transport, so omitting it
+  makes every start fail with
+  `default DNS server fallback: transport type not found: local`. This was found
+  by running the build, not by reading the config.
+* **`block` is absent and that is safe.** A route `reject` action returns a
+  `RejectedError` from `route/rule/rule_action.go` and never resolves an outbound,
+  so reject rules work without it. Verified in source.
+
+The `tcp` DNS transport is absent and is not needed for truncation fallback:
+`dns/transport/udp.go` `Exchange()` inspects `response.Truncated` and calls its
+own `exchangeTCP()`, which dials TCP through the same dialer and never consults
+the transport registry. Covered by `TestJiejieMinimalDNSTruncatedTCPFallback`.
 
 MASQUE HTTP/3 is unaffected by the QUIC trim: `transport/http/server_h3.go` is
 compiled by `with_quic` itself and needs no protocol registration. The server
 keeps HTTP/2, HTTP/3, QUIC, CONNECT, CONNECT-UDP, UoT, standard TLS, DNS
 (`direct.domain_resolver` and the local AGH setup), IPv4/IPv6, route/rules, the
-AnyTLS fallback, the HTTP masquerade and every Jiejie Server Edition feature.
+AnyTLS fallback, the HTTP masquerade and every Jiejie Server Edition feature that
+runs server-side.
 
-Excluded protocol types are still registered as **stubs** that return a clear
-error, so a config referencing them fails at `sing-box check` with a useful
-message instead of an "unknown type" error.
+Excluded types are **not** registered as stubs. An earlier revision imported
+`protocol/naive` and `transport/v2ray` purely to return a friendlier error, which
+pulled the very packages the trim exists to remove back into the import graph. A
+config that references a removed type now fails at `sing-box check` with
+`unknown inbound type` (or the equivalent). The one safety net that needs no
+import already exists upstream: `transport/v2ray.NewQUICServer` returns
+`os.ErrInvalid` when no constructor is registered.
 
 Measured artifact sizes (Linux amd64, `-trimpath`, `-ldflags "-s -w"`, no UPX,
 no external strip):
 
 | Artifact | Size |
 | --- | --- |
-| `sing-box-linux-amd64-full` | ~74.7 MiB |
-| `sing-box-linux-amd64-jiejie` | ~41.1 MiB |
-| `sing-box-linux-amd64-jiejie-minimal` | ~33.0 MiB |
+| `sing-box-linux-amd64` (the only published binary) | ~32.0 MiB |
 
-That is about 55.9% smaller than the full build and 19.8% smaller than the
-Jiejie build. Exact byte counts and SHA256 values are printed by CI and should be
-read from the run output rather than from this table.
+Exact byte counts and the SHA256 are printed by CI; read them from the run output
+rather than from this table. The full and plain Jiejie tag sets still exist in the
+repository and can be built by hand for debugging, but CI no longer publishes
+them.
 
-#### Why uTLS and `badlinkname` are still present
+#### Why the uTLS library and `badlinkname` are still present
 
 Both were investigated rather than assumed:
 
-* **uTLS cannot be removed.** `quic-go` imports `github.com/metacubex/utls`
-  unconditionally from `internal/handshake/tls_conn_utls.go`, with no build tag,
-  and `with_quic` is mandatory for MASQUE HTTP/3. Dropping `with_utls` changes
-  the linked uTLS symbol count from 1307 to 1297 — it removes the sing-box uTLS
-  client wrapper, not the library. Removing uTLS outright would require forking
-  quic-go, which is out of scope by design.
+* **The `with_utls` tag IS removed from the minimal build; the uTLS library is
+  not.** These are two different things and an earlier revision of this document
+  conflated them. The minimal tag set is
+  `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` — it does
+  not contain `with_utls`, so sing-box's own uTLS feature wrapper
+  (`common/tls/utls_client.go`, `reality_client.go`, `reality_server.go`) is not
+  compiled and the config option `tls.utls.enabled` is unavailable.
+  What remains is the library: `quic-go` imports `github.com/metacubex/utls`
+  unconditionally from `internal/handshake/tls_conn_utls.go`, with no build tag
+  of its own, and `with_quic` is mandatory for MASQUE HTTP/3. The minimal binary
+  therefore still contains uTLS symbols. Removing those would require forking
+  quic-go, which this fork does not do.
 * **`badlinkname` is kept.** It costs about 131 KiB in the minimal build and
   enables kTLS (`common/ktls`, 106 symbols) plus the `badtls` read-wait path that
   `common/tls` uses on every connection. Paying 131 KiB to avoid risking a
