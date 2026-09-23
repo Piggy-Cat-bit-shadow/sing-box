@@ -11,6 +11,7 @@ import (
 	singanytls "github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,31 @@ func TestFallbackForALPNRequiresTLS(t *testing.T) {
 		},
 	})
 	require.Error(t, err)
+}
+
+func TestFallbackOptionsJSON(t *testing.T) {
+	var options option.AnyTLSInboundOptions
+	err := json.Unmarshal([]byte(`{
+        "fallback": {"server": "127.0.0.1", "server_port": 8080},
+        "fallback_for_alpn": {"h2": {"server": "127.0.0.1", "server_port": 8081}}
+    }`), &options)
+	require.NoError(t, err)
+	require.Equal(t, uint16(8080), options.Fallback.ServerPort)
+	require.Equal(t, uint16(8081), options.FallbackForALPN["h2"].ServerPort)
+}
+
+func TestNoFallbackKeepsAuthenticationFailure(t *testing.T) {
+	service, err := singanytls.NewService("correct-password", singanytls.ServiceOptions{Handler: discardHandler{}})
+	require.NoError(t, err)
+	client, server := net.Pipe()
+	defer client.Close()
+	result := make(chan error, 1)
+	go func() {
+		result <- service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+	}()
+	_, err = client.Write([]byte("ordinary HTTP probe"))
+	require.NoError(t, err)
+	require.Error(t, <-result)
 }
 
 func TestFallbackHandlesWrongPassword(t *testing.T) {
