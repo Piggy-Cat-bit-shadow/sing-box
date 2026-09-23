@@ -30,7 +30,7 @@ make configuration loading fail. The reverse proxy preserves the backend's real
 status and response body; it does not manufacture a fixed `200 OK`.
 
 Run `sing-box check -c config.json` before deployment. The focused Linux artifact
-workflow builds with `release/DEFAULT_BUILD_TAGS`, which includes `with_quic`.
+workflow builds with `release/DEFAULT_BUILD_TAGS_OTHERS`, which includes `with_quic`.
 
 To sync upstream, fetch `upstream`, rebase this one feature commit on its target
 branch, run the HTTP test suite, and push the rebased feature branch. Do not
