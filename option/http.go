@@ -91,6 +91,11 @@ func (o *HTTPClientOptions) UnmarshalJSONContext(ctx context.Context, content []
 	if err != nil {
 		return err
 	}
+	// Reject invalid HTTP/3 client options at decode time.
+	err = options.HTTP3Options.ValidateClientOptions()
+	if err != nil {
+		return err
+	}
 	options.Tag = ""
 	*o = HTTPClientOptions(options)
 	return nil

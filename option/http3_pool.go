@@ -47,3 +47,11 @@ func (o *HTTP3ConnectionPoolOptions) Build() (int, error) {
 	}
 	return size, nil
 }
+
+// ValidateClientOptions rejects invalid HTTP/3 client options at configuration
+// decode time, so `sing-box check` fails early rather than when the transport is
+// first constructed.
+func (o QUICOptions) ValidateClientOptions() error {
+	_, err := o.HTTP3ConnectionPool.Build()
+	return err
+}

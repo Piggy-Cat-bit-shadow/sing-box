@@ -1,9 +1,11 @@
 package option
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
@@ -195,5 +197,37 @@ func TestHTTPInboundNoProfileKeepsUpstream(t *testing.T) {
 	}
 	if resolved.MaxHeaderBytes != 0 {
 		t.Fatalf("expected no header override, got %d", resolved.MaxHeaderBytes)
+	}
+}
+
+// TestHTTP3PoolValidatedAtDecodeTime ensures `sing-box check` rejects an
+// invalid pool instead of failing later when the transport is constructed.
+func TestHTTP3PoolValidatedAtDecodeTime(t *testing.T) {
+	decode := func(config string) error {
+		var options HTTPOutboundOptions
+		return json.UnmarshalContext(context.Background(), []byte(config), &options)
+	}
+	invalid := []string{
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","http3_connection_pool":{"size":64},"tls":{"enabled":true,"server_name":"x.test"}}`,
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","http3_connection_pool":{"size":2,"strategy":"adaptive"},"tls":{"enabled":true,"server_name":"x.test"}}`,
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","http3_connection_pool":{"size":-1},"tls":{"enabled":true,"server_name":"x.test"}}`,
+	}
+	for _, config := range invalid {
+		if err := decode(config); err == nil {
+			t.Fatalf("an invalid pool must be rejected at decode time: %s", config)
+		}
+	}
+
+	valid := []string{
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","tls":{"enabled":true,"server_name":"x.test"}}`,
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","http3_connection_pool":{"size":1},"tls":{"enabled":true,"server_name":"x.test"}}`,
+		`{"server":"1.2.3.4","server_port":443,"version":3,"username":"a","password":"b","http3_connection_pool":{"size":2,"strategy":"round_robin"},"tls":{"enabled":true,"server_name":"x.test"}}`,
+		// An absent pool must keep decoding, i.e. upstream compatibility.
+		`{"server":"1.2.3.4","server_port":443,"version":2,"username":"a","password":"b","tls":{"enabled":true,"server_name":"x.test"}}`,
+	}
+	for _, config := range valid {
+		if err := decode(config); err != nil {
+			t.Fatalf("a valid pool must decode: %v (%s)", err, config)
+		}
 	}
 }
