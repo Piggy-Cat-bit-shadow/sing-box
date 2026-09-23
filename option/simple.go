@@ -53,16 +53,34 @@ type _HTTPInboundOptions struct {
 
 type HTTPInboundOptions _HTTPInboundOptions
 
-// ServerResourceOptions is the resolved form of server_profile plus the
-// explicitly configured per-inbound resource fields.
+// ServerResourceOptions carries the EFFECTIVE option sets an inbound must use.
+//
+// It returns the resolved values rather than mutating the options in place. An
+// earlier revision applied the profile to a copy inside
+// ResolveServerResources and returned only the header limit, so the caller kept
+// using the original HTTP2Options/HTTP3Options and the profile, the receive
+// windows and bbr_profile never reached the server. Returning the effective
+// values makes that mistake impossible to repeat: the caller has nothing else to
+// use.
 type ServerResourceOptions struct {
 	Profile        HTTPServerProfile
 	ProfileApplied bool
+	// HTTP2Options is the effective HTTP/2 option set: the user's values with
+	// any unset field filled from the profile.
+	HTTP2Options HTTP2Options
+	// HTTP3Options is the effective QUIC option set, including the resolved
+	// BBRProfile that the HTTP/3 listener must apply.
+	HTTP3Options QUICOptions
+	// MaxHeaderBytes is the effective request header limit, already falling back
+	// to the profile and then to the upstream default. It is never zero.
 	MaxHeaderBytes int
 }
 
-// ResolveServerResources applies the named profile to the version-specific
-// option sets, leaving every explicitly configured field untouched.
+// ResolveServerResources returns the effective option sets for this inbound.
+//
+// The profile fills only fields the user left unset, so an explicit value always
+// wins. With no profile selected, nothing is changed and the result equals the
+// inbound's own options.
 func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, error) {
 	profile, applied, err := NewHTTPServerProfile(o.ServerProfile)
 	if err != nil {
@@ -72,15 +90,31 @@ func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, err
 	if err != nil {
 		return ServerResourceOptions{}, err
 	}
+
+	// Work on copies and hand the copies back, so no caller can accidentally
+	// keep using unresolved options.
+	http2Options := o.HTTP2Options
+	http3Options := o.HTTP3Options
 	if applied {
-		profile.ApplyToHTTP2(&o.HTTP2Options)
-		profile.ApplyToQUIC(&o.HTTP3Options)
+		profile.ApplyToHTTP2(&http2Options)
+		profile.ApplyToQUIC(&http3Options)
 	}
-	o.HTTP3Options.BBRProfile = ServerBBRProfile{Name: o.BBRProfile}
+	// The BBR profile applies to the HTTP/3 server regardless of whether a
+	// resource profile was selected; an unset value resolves to standard, which
+	// is the previous hardcoded behaviour.
+	http3Options.BBRProfile = ServerBBRProfile{Name: o.BBRProfile}
+
+	maxHeaderBytes := o.MaxHeaderBytes
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = profile.MaxHeaderBytesValue(UpstreamMaxHeaderBytes)
+	}
+
 	return ServerResourceOptions{
 		Profile:        profile,
 		ProfileApplied: applied,
-		MaxHeaderBytes: o.MaxHeaderBytes,
+		HTTP2Options:   http2Options,
+		HTTP3Options:   http3Options,
+		MaxHeaderBytes: maxHeaderBytes,
 	}, nil
 }
 

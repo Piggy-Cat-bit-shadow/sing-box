@@ -23,7 +23,7 @@ import (
 )
 
 func init() {
-	ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.QUICOptions) (io.Closer, error) {
+	ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.QUICOptions, maxHeaderBytes int) (io.Closer, error) {
 		err := qtls.ConfigureHTTP3(tlsConfig)
 		if err != nil {
 			return nil, err
@@ -55,6 +55,11 @@ func init() {
 		http3Server := &http3.Server{
 			Handler:         handler,
 			EnableDatagrams: true,
+			// max_header_bytes must apply to HTTP/3 as well as HTTP/2. Without
+			// this, the HTTP/3 server silently used http.DefaultMaxHeaderBytes
+			// and the configured limit only affected the loopback HTTP/2
+			// listener, which is the opposite of what the profile is for.
+			MaxHeaderBytes: maxHeaderBytes,
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 				conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestionProfile))
 				return log.ContextWithNewID(ctx)

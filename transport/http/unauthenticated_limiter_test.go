@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,79 +309,126 @@ func TestNormalizedIP(t *testing.T) {
 }
 
 // TestUnauthenticatedLimiterNeverEmitsAuthChallenge is the anti-fingerprinting
-// requirement: when the limiter rejects a request it must never answer with
-// 401/407 or an authentication header.
+// requirement: a rejected request must never look like a proxy rejection.
 func TestUnauthenticatedLimiterNeverEmitsAuthChallenge(t *testing.T) {
-	testCases := []struct {
-		name       string
-		masquerade http.Handler
-	}{
-		{name: "without masquerade"},
-		{name: "with masquerade", masquerade: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-			writer.Header().Set("Content-Type", "text/html")
-			writer.WriteHeader(http.StatusOK)
-			_, _ = writer.Write([]byte("<html>normal site</html>"))
-		})},
+	limits := enabledLimits()
+	limits.RequestsPerSecond = 0.0001
+	limits.Burst = 1
+	limits.MaxConcurrentPerIP = 1
+	handler := &httpHandler{server: &Server{
+		logger:                 testLogger(),
+		overLimitDecoy:         NewOverLimitDecoy(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: newUnauthenticatedLimiter(limits),
+	}}
+	source := parseSource(t, "1.2.3.4:5000")
+	request, err := http.NewRequest(http.MethodGet, "https://example.test/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
 	}
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			limits := enabledLimits()
-			limits.RequestsPerSecond = 0.0001
-			limits.Burst = 1
-			limits.MaxConcurrentPerIP = 1
-			server := &Server{
-				logger:                 testLogger(),
-				masquerade:             testCase.masquerade,
-				maxHeaderBytes:         1 << 20,
-				unauthenticatedLimiter: newUnauthenticatedLimiter(limits),
-			}
-			handler := &httpHandler{server: server}
-			source := parseSource(t, "1.2.3.4:5000")
 
-			assertNoAuthChallenge := func(recorder *httptest.ResponseRecorder) {
-				t.Helper()
-				if recorder.Code == http.StatusUnauthorized || recorder.Code == http.StatusProxyAuthRequired {
-					t.Fatalf("limiter must never return %d", recorder.Code)
-				}
-				if value := recorder.Header().Get("WWW-Authenticate"); value != "" {
-					t.Fatalf("limiter must never emit WWW-Authenticate, got %q", value)
-				}
-				if value := recorder.Header().Get("Proxy-Authenticate"); value != "" {
-					t.Fatalf("limiter must never emit Proxy-Authenticate, got %q", value)
-				}
-			}
+	recorder := httptest.NewRecorder()
+	handler.rejectUnauthenticated(testContext(), recorder, request, source)
 
-			// First request consumes the single token and is within budget.
-			release, overLimit := handler.admitUnauthenticated(source)
-			if overLimit {
-				t.Fatal("the first request must be within budget")
-			}
-			release()
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", recorder.Code)
+	}
+	if value := recorder.Header().Get("Proxy-Authenticate"); value != "" {
+		t.Fatalf("must not emit Proxy-Authenticate, got %q", value)
+	}
+	if value := recorder.Header().Get("WWW-Authenticate"); value != "" {
+		t.Fatalf("must not emit WWW-Authenticate, got %q", value)
+	}
+	if recorder.Code == http.StatusProxyAuthRequired {
+		t.Fatal("must not return 407")
+	}
+	if recorder.Code == http.StatusUnauthorized {
+		t.Fatal("must not return 401")
+	}
+	// And it must look like an ordinary web server response.
+	if !strings.Contains(recorder.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("expected an html response, got %q", recorder.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(recorder.Body.String(), "429") {
+		t.Fatalf("expected a 429 body, got %q", recorder.Body.String())
+	}
+}
 
-			// Second request exceeds the budget. It is only *accounted* here;
-			// the rejection is emitted by rejectUnauthenticated, which the
-			// handler calls after authentication has failed.
-			release, overLimit = handler.admitUnauthenticated(source)
-			if !overLimit {
-				t.Fatal("the second request must be over budget")
-			}
-			release()
+// TestUnauthenticatedLimiterDoesNotHitMasqueradeBackend is the P0-6 assertion.
+//
+// The limiter exists to bound the resources an unauthenticated peer consumes.
+// Serving the proxy masquerade over-limit would still issue one backend request
+// per probe, so the backend must stop receiving traffic once the budget is
+// exhausted. This counts real backend hits.
+func TestUnauthenticatedLimiterDoesNotHitMasqueradeBackend(t *testing.T) {
+	var backendHits atomic.Int64
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		backendHits.Add(1)
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte("decoy site"))
+	}))
+	defer backend.Close()
 
-			recorder := httptest.NewRecorder()
-			handler.rejectUnauthenticated(testContext(), recorder, source)
-			assertNoAuthChallenge(recorder)
+	masquerade, masqueradeErr := NewMasqueradeHandler(context.Background(), &option.Hysteria2Masquerade{
+		Type: "proxy",
+		ProxyOptions: option.Hysteria2MasqueradeProxy{
+			URL:         backend.URL,
+			RewriteHost: true,
+		},
+	})
+	if masqueradeErr != nil {
+		t.Fatalf("build masquerade: %v", masqueradeErr)
+	}
 
-			if testCase.masquerade != nil {
-				if recorder.Code != http.StatusOK {
-					t.Fatalf("a rejected request must receive the masquerade response, got %d", recorder.Code)
-				}
-				if !strings.Contains(recorder.Body.String(), "normal site") {
-					t.Fatalf("expected the masquerade body, got %q", recorder.Body.String())
-				}
-			} else if recorder.Code != http.StatusTooManyRequests {
-				t.Fatalf("without masquerade a rejected request must be a generic 429, got %d", recorder.Code)
-			}
-		})
+	limits := enabledLimits()
+	limits.RequestsPerSecond = 0.0001
+	limits.Burst = 1
+	limits.MaxConcurrentPerIP = 1
+	server := &Server{
+		logger:                 testLogger(),
+		masquerade:             masquerade,
+		overLimitDecoy:         NewOverLimitDecoy(),
+		maxHeaderBytes:         1 << 20,
+		unauthenticatedLimiter: newUnauthenticatedLimiter(limits),
+	}
+	handler := &httpHandler{server: server}
+	source := parseSource(t, "1.2.3.4:5000")
+	request, err := http.NewRequest(http.MethodGet, "https://example.test/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	// The first unauthenticated request is within budget and legitimately reaches
+	// the masquerade backend.
+	release, overLimit := handler.admitUnauthenticated(source)
+	if overLimit {
+		t.Fatal("the first request must be within budget")
+	}
+	recorder := httptest.NewRecorder()
+	server.masquerade.ServeHTTP(recorder, request)
+	release()
+	if hits := backendHits.Load(); hits != 1 {
+		t.Fatalf("an in-budget masquerade request is expected to reach the backend once, got %d", hits)
+	}
+
+	// Every later request is over budget. Each must be answered locally.
+	for index := range 10 {
+		release, overLimit = handler.admitUnauthenticated(source)
+		if !overLimit {
+			t.Fatalf("request %d must be over budget", index+2)
+		}
+		recorder = httptest.NewRecorder()
+		handler.rejectUnauthenticated(testContext(), recorder, request, source)
+		release()
+		if recorder.Code != http.StatusTooManyRequests {
+			t.Fatalf("expected 429, got %d", recorder.Code)
+		}
+		if value := recorder.Header().Get("Proxy-Authenticate"); value != "" {
+			t.Fatalf("must not emit Proxy-Authenticate, got %q", value)
+		}
+	}
+	if hits := backendHits.Load(); hits != 1 {
+		t.Fatalf("an over-limit request must NOT reach the masquerade backend; backend hits rose to %d", hits)
 	}
 }
 

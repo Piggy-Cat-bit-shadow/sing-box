@@ -33,7 +33,11 @@ const (
 	realm               = "sing-box"
 )
 
-var ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.QUICOptions) (io.Closer, error)
+// ConfigureHTTP3ListenerFunc builds the HTTP/3 listener. maxHeaderBytes is the
+// effective request header limit resolved from server_profile and
+// max_header_bytes; the HTTP/3 server needs it explicitly because it does not
+// share the HTTP/2 server's configuration.
+var ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.QUICOptions, maxHeaderBytes int) (io.Closer, error)
 
 type Handler interface {
 	N.TCPConnectionHandlerEx
@@ -58,13 +62,17 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	authenticator  *auth.Authenticator
-	logger         logger.ContextLogger
-	http1          bool
-	http2Server    *http2.Server
-	udp            bool
-	tunnels        map[string]TunnelHandler
-	masquerade     http.Handler
+	authenticator *auth.Authenticator
+	logger        logger.ContextLogger
+	http1         bool
+	http2Server   *http2.Server
+	udp           bool
+	tunnels       map[string]TunnelHandler
+	masquerade    http.Handler
+	// overLimitDecoy answers a request that both failed authentication and
+	// exceeded the unauthenticated budget. It never touches the masquerade
+	// backend, so an over-limit peer cannot keep driving it.
+	overLimitDecoy http.Handler
 	maxHeaderBytes int
 
 	unauthenticatedLimiter *unauthenticatedLimiter
@@ -81,6 +89,11 @@ func NewServer(options ServerOptions) *Server {
 		maxHeaderBytes: options.MaxHeaderBytes,
 	}
 	server.unauthenticatedLimiter = newUnauthenticatedLimiter(options.UnauthenticatedLimits.Build())
+	if server.unauthenticatedLimiter != nil {
+		// Only install the decoy when a limiter exists, so an unconfigured server
+		// keeps the upstream response shape exactly.
+		server.overLimitDecoy = NewOverLimitDecoy()
+	}
 	if server.maxHeaderBytes <= 0 {
 		server.maxHeaderBytes = maxHeaderBytes
 	}
@@ -155,7 +168,7 @@ func (s *Server) ListenHTTP3(ctx context.Context, logger logger.Logger, listener
 	return ConfigureHTTP3ListenerFunc(ctx, logger, listener, &httpHandler{
 		server:  s,
 		handler: handler,
-	}, tlsConfig, options)
+	}, tlsConfig, options, s.maxHeaderBytes)
 }
 
 func (s *Server) finishConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc, err error) {

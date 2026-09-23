@@ -174,8 +174,20 @@ func TestHTTPInboundServerProfileResolution(t *testing.T) {
 	if !resolved.ProfileApplied {
 		t.Fatal("the profile must be reported as applied")
 	}
-	if resolved.MaxHeaderBytes != 0 {
-		t.Fatalf("an unset max_header_bytes must stay 0 so the server keeps its default, got %d", resolved.MaxHeaderBytes)
+	// MaxHeaderBytes now always reports the EFFECTIVE limit: the profile value.
+	if resolved.MaxHeaderBytes != 64<<10 {
+		t.Fatalf("the profile's 64 KiB header limit must be reported, got %d", resolved.MaxHeaderBytes)
+	}
+	// And the effective option sets must carry the profile too, not just the
+	// header limit. This is the regression guard for the bug where the profile
+	// filled a copy that the caller never used.
+	if resolved.HTTP2Options.MaxConcurrentStreams != 256 {
+		t.Fatalf("the effective HTTP/2 options must carry the profile, got %d streams",
+			resolved.HTTP2Options.MaxConcurrentStreams)
+	}
+	if resolved.HTTP3Options.BBRProfile.BBRProfileValue() != "standard" {
+		t.Fatalf("the effective QUIC options must carry the BBR profile, got %q",
+			resolved.HTTP3Options.BBRProfile.BBRProfileValue())
 	}
 }
 
@@ -195,8 +207,13 @@ func TestHTTPInboundNoProfileKeepsUpstream(t *testing.T) {
 	if resolved.ProfileApplied {
 		t.Fatal("an unset profile must not be applied")
 	}
-	if resolved.MaxHeaderBytes != 0 {
-		t.Fatalf("expected no header override, got %d", resolved.MaxHeaderBytes)
+	if resolved.MaxHeaderBytes != UpstreamMaxHeaderBytes {
+		t.Fatalf("with no profile the upstream %d header default must apply, got %d",
+			UpstreamMaxHeaderBytes, resolved.MaxHeaderBytes)
+	}
+	if resolved.HTTP2Options.MaxConcurrentStreams != 0 {
+		t.Fatalf("with no profile the HTTP/2 options must be untouched, got %d streams",
+			resolved.HTTP2Options.MaxConcurrentStreams)
 	}
 }
 

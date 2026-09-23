@@ -13,6 +13,12 @@ import (
 // ~1 GiB RAM server that terminates public HTTP/3.
 const HTTPServerProfileNameJiejieBalanced1G = "jiejie-balanced-1g"
 
+// UpstreamMaxHeaderBytes is the request header limit upstream sing-box uses when
+// nothing overrides it. transport/http keeps its own copy for the HTTP/2 server;
+// this one exists so option resolution can report the effective value without
+// importing the transport layer.
+const UpstreamMaxHeaderBytes = 1 << 20
+
 // HTTPServerProfile holds the default values a named profile applies. Every
 // field is a default only: an explicitly configured inbound field always wins,
 // and an unselected profile is a zero value that changes nothing.
