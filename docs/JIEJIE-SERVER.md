@@ -268,8 +268,27 @@ wins, and an unset profile changes nothing.
 
 `max_header_bytes` can also be set directly, with or without a profile.
 
+### `max_concurrent_streams` and the baseline that matters
+
 Upstream never sets `MaxIncomingStreams` to a bounded value; this fork does
 **not** change that default. Only selecting a profile tightens it.
+
+The baseline is worth stating precisely, because comparing against the wrong one
+gives the wrong answer. Measured against the pinned
+quic-go v0.61.0-sing-box-mod.7:
+
+| Baseline | `MaxIncomingStreams` |
+| --- | --- |
+| quic-go raw zero-value default (`internal/protocol/params.go`) | 100 |
+| Effective MASQUE H3 baseline (`transport/http/server_h3.go` replaces a zero with `1<<60`) | effectively unlimited |
+| `jiejie-balanced-1g` | 256 |
+
+So against quic-go's raw default the profile looks like a 2.5× increase, but
+against the baseline that actually ships — the MASQUE HTTP/3 listener, which
+must not cap concurrent CONNECT streams at 100 — the profile **lowers** the
+limit from effectively unlimited to a bounded 256. That is the intended
+direction, and `TestJiejieProfileStreamLimitIsConservativeForTheMASQUEPath`
+asserts it while recording the raw default so neither reading is hidden.
 
 ### What the profile deliberately does NOT set
 
