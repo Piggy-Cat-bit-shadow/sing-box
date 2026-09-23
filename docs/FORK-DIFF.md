@@ -1,6 +1,6 @@
 # Fork diff manifest
 
-Base: `SagerNet/sing-box` `testing`  
+Base: `SagerNet/sing-box` `testing`
 Fork: `Piggy-Cat-bit-shadow/sing-box` `testing`
 
 This fork intentionally changes only the following areas.
