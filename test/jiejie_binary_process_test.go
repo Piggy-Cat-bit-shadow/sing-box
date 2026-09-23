@@ -65,7 +65,7 @@ func reservePort(t *testing.T) uint16 {
 	return port
 }
 
-func reserveUDPPort(t *testing.T) uint16 {
+func reserveLoopbackUDPPort(t *testing.T) uint16 {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
@@ -257,8 +257,8 @@ func TestProductionBinaryStartupAndAnyTLSTraffic(t *testing.T) {
 	ssPort := reservePort(t)
 	shadowTLSPort := reservePort(t)
 	socksPort := reservePort(t)
-	dnsPort := reserveUDPPort(t)
-	h3Port := reserveUDPPort(t)
+	dnsPort := reserveLoopbackUDPPort(t)
+	h3Port := reserveLoopbackUDPPort(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.test")
 
 	configPath := writeRuntimeFixture(t, map[string]string{
@@ -352,8 +352,8 @@ func TestProductionBinaryShadowTLSDetourSS2022(t *testing.T) {
 	ssPort := reservePort(t)
 	shadowTLSPort := reservePort(t)
 	socksPort := reservePort(t)
-	dnsPort := reserveUDPPort(t)
-	h3Port := reserveUDPPort(t)
+	dnsPort := reserveLoopbackUDPPort(t)
+	h3Port := reserveLoopbackUDPPort(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.test")
 
 	configPath := writeRuntimeFixture(t, map[string]string{
