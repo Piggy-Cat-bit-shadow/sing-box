@@ -32,6 +32,36 @@ status and response body; it does not manufacture a fixed `200 OK`.
 Run `sing-box check -c config.json` before deployment. The focused Linux artifact
 workflow builds with `release/DEFAULT_BUILD_TAGS_OTHERS`, which includes `with_quic`.
 
-To sync upstream, fetch `upstream`, rebase this one feature commit on its target
-branch, run the HTTP test suite, and push the rebased feature branch. Do not
-force-push upstream history.
+## Logging
+
+When a masquerade handler is configured, an unauthenticated or wrong-password
+request is the intended design path: the client receives an ordinary web
+response. Those requests are logged at **debug**, not error. Without a masquerade
+handler a real `401`/`407` is still returned and still logged at **error**, so
+genuine authentication failures remain visible.
+
+## Interaction with `unauthenticated_limits`
+
+The optional `unauthenticated_limits` object bounds pre-authentication traffic per
+source IP. It is an accounting pre-filter: a request is rejected only when it
+**both** fails authentication **and** exceeds the budget. A legitimate
+authenticated client is never denied service by it, and the limit is released the
+moment authentication succeeds.
+
+A rejected request still receives the masquerade response when one is configured
+(otherwise a bare `429`), and never receives `401`/`407` or an authentication
+header. A limited probe therefore looks exactly like an ordinary visitor, so the
+limiter cannot be used to fingerprint the endpoint as a proxy.
+
+## Tests
+
+Real end-to-end coverage lives in `test/jiejie_server_test.go`
+(`TestJiejieMASQUEH2Masquerade`, `TestJiejieMASQUEH3Masquerade`,
+`TestJiejieMASQUEH3UnauthenticatedLimits`,
+`TestJiejieMASQUEH3AuthenticatedTrafficNotLimited`). The H3 cases use a real
+quic-go HTTP/3 client rather than curl, so they do not depend on the runner's
+curl supporting HTTP/3.
+
+To sync upstream, fetch `upstream`, rebase these feature commits on the target
+branch, run the HTTP test suite and `./test/...`, and push the rebased feature
+branch. Do not force-push upstream history.

@@ -14,7 +14,8 @@ permissions:
   contents: read
 
 env:
-  JIEJIE_VERSION: 1.15.0-jiejie-masquerade.3
+  # Read from release/JIEJIE_VERSION in the steps that need it, so the version
+  # lives in exactly one place.
   FOCUSED_GOFMT_PATHS: >-
     option/anytls.go
     option/simple.go
@@ -121,10 +122,15 @@ jobs:
           go-version: ~1.25
           cache: true
 
+      - name: Read version
+        id: version
+        run: echo "value=$(cat release/JIEJIE_VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Build full artifact (upstream default tags)
         shell: bash
         run: |
           set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           go build -trimpath -tags "$TAGS" \
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
@@ -134,6 +140,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
           go build -trimpath -tags "$TAGS" \
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
@@ -143,6 +150,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
           GOAMD64=v3 go build -trimpath -tags "$TAGS" \
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
@@ -152,6 +160,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
           if CGO_ENABLED=0 go build -trimpath -tags "$TAGS" \
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
@@ -166,6 +175,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
           # A secret-free production topology fixture exercising this fork's
           # features: MASQUE H2/H3 with masquerade, server_profile,
           # unauthenticated_limits, AnyTLS native fallback, the H3 connection
