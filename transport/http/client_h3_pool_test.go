@@ -215,14 +215,20 @@ func TestMASQUEPoolSizeTwoOpensTwoConnections(t *testing.T) {
 	agent := newPoolTestAgent(t, server, 2)
 	require.Equal(t, 2, agent.slotCount())
 
+	// The pool is lazy and least-active, so both members connect only under
+	// concurrent pressure. Holding two tunnels open at once is what forces the
+	// second connection; sequential dials would legitimately reuse the first.
 	target := M.ParseSocksaddr("127.0.0.1:9")
-	for index := range 8 {
-		conn, err := agent.DialContext(context.Background(), target)
-		require.NoError(t, err, "CONNECT %d", index+1)
-		_, err = conn.Write([]byte("ping"))
-		require.NoError(t, err)
-		conn.Close()
-	}
+	first, err := agent.DialContext(context.Background(), target)
+	require.NoError(t, err)
+	_, err = first.Write([]byte("ping"))
+	require.NoError(t, err)
+	second, err := agent.DialContext(context.Background(), target)
+	require.NoError(t, err)
+	_, err = second.Write([]byte("ping"))
+	require.NoError(t, err)
+	first.Close()
+	second.Close()
 	require.GreaterOrEqual(t, server.connections.count(), 2,
 		"pool size 2 must open two independent QUIC connections, not two streams on one")
 }
@@ -297,11 +303,14 @@ func TestMASQUEPoolResetAndCloseReleaseEverySlot(t *testing.T) {
 	agent := newPoolTestAgent(t, server, 2)
 
 	target := M.ParseSocksaddr("127.0.0.1:9")
-	for index := range 4 {
-		conn, err := agent.DialContext(context.Background(), target)
-		require.NoError(t, err, "CONNECT %d", index+1)
-		conn.Close()
-	}
+	// Force both members to connect: the pool is lazy, so this needs two live
+	// tunnels at once rather than several sequential ones.
+	openA, err := agent.DialContext(context.Background(), target)
+	require.NoError(t, err)
+	openB, err := agent.DialContext(context.Background(), target)
+	require.NoError(t, err)
+	openA.Close()
+	openB.Close()
 	require.GreaterOrEqual(t, server.connections.count(), 2)
 
 	// ResetConnection must drop every slot's connection and socket.
@@ -644,19 +653,29 @@ func startStallingMASQUEServer(t *testing.T) *stallingMASQUEServer {
 // matters is between a slot-level failure (this connection is gone) and an
 // authority-level failure (the server does not speak HTTP/3); only the latter
 // should trigger the HTTP/2 fallback.
+//
+// The pool is LAZY: a slot only dials when it is selected, and least-active
+// selection keeps reusing an idle slot until there is concurrent pressure. The
+// test therefore FORCES both members to connect by holding tunnels open
+// concurrently, rather than assuming that sequential dials fill the pool. That
+// assumption was valid under the old round-robin and is no longer.
 func TestMASQUEPoolSurvivesOneDeadConnection(t *testing.T) {
 	server := startMASQUEPoolServer(t)
 	agent := newPoolTestAgent(t, server, 2)
 
-	// Establish both connections.
+	// Hold one tunnel open on each slot so both connections must exist.
 	target := M.ParseSocksaddr("127.0.0.1:9")
-	for range 4 {
+	held := make([]net.Conn, 0, 2)
+	for range 2 {
 		conn, err := agent.DialContext(context.Background(), target)
 		require.NoError(t, err)
-		conn.Close()
+		held = append(held, conn)
 	}
 	require.GreaterOrEqual(t, server.connections.count(), 2,
-		"precondition: both pool members must have connected")
+		"precondition: both pool members must have connected under concurrent load")
+	for _, conn := range held {
+		conn.Close()
+	}
 
 	// Kill slot 0's connection abruptly, as a network failure would.
 	agent.slots[0].access.Lock()

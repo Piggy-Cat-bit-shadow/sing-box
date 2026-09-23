@@ -51,6 +51,16 @@ type ClientOptions struct {
 	DisableVersionFallback bool
 	HTTP2Options           option.HTTP2Options
 	HTTP3Options           option.QUICOptions
+
+	// Logger receives pool lifecycle events at debug level. It may be nil, in
+	// which case the pool stays silent rather than panicking.
+	Logger logger.ContextLogger
+	// OnHTTP3Success is invoked when a tunnel is confirmed established over
+	// HTTP/3, so the owner can clear its authority-level backoff. The pool itself
+	// deliberately does NOT own the authority state machine: slot health and
+	// authority health are separate concerns, and keeping the callback here is
+	// what stops a single bad slot from poisoning the authority.
+	OnHTTP3Success func()
 }
 
 type http3Client interface {

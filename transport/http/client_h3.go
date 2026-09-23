@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-quic"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -29,19 +30,8 @@ func init() {
 // http3PoolSlot owns one complete, independent HTTP/3 stack: its own UDP socket,
 // its own QUIC connection and its own http3.ClientConn. Slots share nothing, so
 // two slots are two QUIC connections rather than two streams on one.
-type http3PoolSlot struct {
-	transport *http3.Transport
-	access    sync.Mutex
-	conn      *http3.ClientConn
-	// quicConn is retained so a new tunnel can wait for the handshake to complete
-	// before sending its CONNECT header. See awaitHandshake.
-	quicConn *quic.Conn
-	rawConn  net.Conn
-
-	// quicAccess guards quicConfig, which is created lazily per slot.
-	quicAccess sync.Mutex
-	quicConfig *quic.Config
-}
+// http3PoolSlot is defined in client_h3_slot.go together with its state
+// machine and health accounting.
 
 // http3ClientImpl is the MASQUE tunnel client.
 //
@@ -65,8 +55,18 @@ type http3ClientImpl struct {
 	// is handed.
 	baseQUICConfig *quic.Config
 
-	slots []*http3PoolSlot
-	next  atomic.Uint64
+	// logger may be nil; logf guards for that so a client built without one does
+	// not panic on a debug path.
+	logger logger.ContextLogger
+	// onSuccess clears the authority-level HTTP/3 backoff after a confirmed
+	// success. See ClientOptions.OnHTTP3Success.
+	onSuccess func()
+
+	// slots holds the pool. Its length never exceeds maxSlots: a pool that grew
+	// on every failure would turn a flapping server into unbounded UDP sockets.
+	slots    []*http3PoolSlot
+	maxSlots int
+	next     atomic.Uint64
 
 	// beforeOpenStream is a test hook invoked immediately before a tunnel opens
 	// its request stream. It is nil in production and exists so the ordering
@@ -117,31 +117,92 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		headers:        headers,
 		authorization:  authorization,
 		baseQUICConfig: baseQUICConfig,
+		logger:         options.Logger,
+		onSuccess:      options.OnHTTP3Success,
 		slots:          slots,
+		maxSlots:       poolSize,
 	}, nil
 }
 
-// quicConfigFor returns a per-slot QUIC config.
+// quicConfigForLocked returns a per-slot QUIC config.
 //
 // sing-quic's DialEarly mutates the config it is given (it assigns
 // HandshakeIdleTimeout when unset), so a config shared between slots is a data
 // race once two slots dial concurrently. Each slot therefore gets its own copy.
-func (c *http3ClientImpl) quicConfigFor(slot *http3PoolSlot) *quic.Config {
-	slot.quicAccess.Lock()
-	defer slot.quicAccess.Unlock()
+//
+// The caller MUST already hold slot.access. This is not stylistic: acquire()
+// holds the slot lock for the whole dial, and an earlier version of this helper
+// took the same lock again, which self-deadlocked every first dial. The "Locked"
+// suffix marks the contract so the mistake is visible at the call site.
+func (c *http3ClientImpl) quicConfigForLocked(slot *http3PoolSlot) *quic.Config {
 	if slot.quicConfig == nil {
 		slot.quicConfig = c.baseQUICConfig.Clone()
 	}
 	return slot.quicConfig
 }
 
+// selectionCooldown is how long a slot that failed to establish (or failed to
+// open a stream) is skipped before it becomes eligible again.
+//
+// It is deliberately short. A failure is usually transient (a NAT rebinding, a
+// lost packet, a server restart), and keeping capacity out of rotation for long
+// periods would push traffic onto H2 for no reason. Repeated failures are still
+// visible through consecutiveFailures.
+const selectionCooldown = 5 * time.Second
+
 // pickSlot chooses the slot a NEW tunnel will use.
+//
+// Strategy: healthy least-active. Among eligible slots the one with the fewest
+// live tunnels wins, because that is the slot whose congestion controller has
+// the least queued work. Ties are broken by round-robin so that equally idle
+// slots are used evenly rather than always preferring the first.
+//
+// This replaced unconditional round-robin, which had two defects: it could hand
+// a new tunnel to a connection that had already received GOAWAY, and it ignored
+// how loaded each connection was.
+//
+// It returns nil when no slot is eligible. The caller must then consult the
+// authority-level state rather than assuming H3 is unusable: an ineligible slot
+// is not evidence about the authority. See establishSlot.
 func (c *http3ClientImpl) pickSlot() *http3PoolSlot {
-	if len(c.slots) == 1 {
-		return c.slots[0]
+	now := time.Now()
+	var (
+		best          *http3PoolSlot
+		bestActive    int
+		eligibleCount int
+	)
+	for _, slot := range c.slots {
+		if !slot.eligible(now) {
+			continue
+		}
+		eligibleCount++
+		health := slot.health()
+		if best == nil || health.Active < bestActive {
+			best = slot
+			bestActive = health.Active
+		}
 	}
-	index := c.next.Add(1) - 1
-	return c.slots[index%uint64(len(c.slots))]
+	if best == nil {
+		return nil
+	}
+	// Round-robin only among the equally-least-active candidates, so the choice
+	// stays even without making the least-active rule meaningless.
+	if eligibleCount > 1 {
+		candidate := c.next.Add(1)
+		if candidate%uint64(eligibleCount) == 0 {
+			// Occasionally take the round-robin candidate instead, so ties rotate.
+			for _, slot := range c.slots {
+				if !slot.eligible(now) {
+					continue
+				}
+				if slot.health().Active == bestActive {
+					best = slot
+					break
+				}
+			}
+		}
+	}
+	return best
 }
 
 // slotCount reports how many independent QUIC connections this client can hold.
@@ -177,7 +238,7 @@ func (c *http3ClientImpl) acquire(slot *http3PoolSlot, ctx context.Context) (*ht
 	// ctx: with a peer that stalls its TLS handshake it returns the context error
 	// at the deadline (verified against the pinned sing-quic). No extra timeout
 	// wrapper is therefore needed here.
-	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfigFor(slot))
+	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfigForLocked(slot))
 	if err != nil {
 		rawConn.Close()
 		if ctx.Err() != nil {
@@ -228,71 +289,290 @@ func (c *http3ClientImpl) awaitHandshake(slot *http3PoolSlot, ctx context.Contex
 	}
 }
 
-func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {
-	// The slot is chosen exactly once per tunnel, before any bytes are written,
-	// so a failure can never cause this tunnel's payload to be replayed on
-	// another connection.
-	slot := c.pickSlot()
-	clientConn, err := c.acquire(slot, ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	// Never send a CONNECT before the handshake completes; otherwise it could be
-	// transmitted as replayable 0-RTT data.
-	if err = c.awaitHandshake(slot, ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+// openStream opens a CONNECT request stream on a healthy slot, with bounded
+// pre-write slot failover.
+//
+// REPLAY SAFETY is the governing rule here, and it is structural rather than
+// advisory:
+//
+//   - The slot is chosen, and any slot-level retry happens, strictly BEFORE
+//     SendRequestHeader is called. At that point no CONNECT byte has been sent
+//     and the server has not seen this tunnel, so trying another slot cannot
+//     duplicate anything.
+//   - Once SendRequestHeader has been called the attempt is marked
+//     non-replayable and NO further slot is tried, whatever the failure. The
+//     header may be partially on the wire; re-sending it on another connection
+//     would make the authority observe the same tunnel twice.
+//
+// The two are different concepts and are deliberately not merged: pre-write
+// failover is not protocol fallback replay.
+func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3ActiveStream, *http3.ClientConn, error) {
+	// Bounded so a pool of N slots costs at most N + 1 attempts (the extra one
+	// allowing a single fresh connection), never an unbounded loop.
+	maxAttempts := len(c.slots) + 1
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		slot, err := c.establishSlot(ctx)
+		if err != nil {
+			if lastErr != nil {
+				return nil, nil, lastErr
+			}
+			return nil, nil, err
 		}
-		return nil, nil, E.Cause(err, "await HTTP/3 handshake")
-	}
-	if c.beforeOpenStream != nil {
-		c.beforeOpenStream(slot)
-	}
-	stream, err := clientConn.OpenRequestStream(ctx)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+		clientConn, err := c.acquire(slot, ctx)
+		if err != nil {
+			lastErr = err
+			c.noteSlotFailure(slot, err)
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			continue
 		}
-		// The connection exists but could not open a stream. That is a failure on
-		// this slot, not evidence about the authority, so it does not trigger the
-		// authority-level fallback.
-		return nil, nil, E.Cause(err, "open HTTP/3 stream")
-	}
-	stop := context.AfterFunc(ctx, func() {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
-	})
-	var response *http.Response
-	err = stream.SendRequestHeader(request)
-	if err == nil {
-		response, err = stream.ReadResponse()
-	}
-	if err == nil {
-		select {
-		case <-clientConn.ReceivedSettings():
-		case <-clientConn.Context().Done():
-			err = context.Cause(clientConn.Context())
-		case <-ctx.Done():
+		// Never send a CONNECT before the handshake completes; otherwise it could
+		// be transmitted as replayable 0-RTT data.
+		if err = c.awaitHandshake(slot, ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			lastErr = E.Cause(err, "await HTTP/3 handshake")
+			c.noteSlotFailure(slot, err)
+			continue
+		}
+		if c.beforeOpenStream != nil {
+			c.beforeOpenStream(slot)
+		}
+		stream, err := clientConn.OpenRequestStream(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			// GOAWAY is the one open failure with a specific meaning: the
+			// connection still works, but it will never accept a new request
+			// stream. The slot must stop receiving tunnels immediately, while
+			// its existing tunnels keep running.
+			if isGoAwayError(err) {
+				if slot.markDraining(err) {
+					c.logPoolEvent("H3_SLOT_DRAINING", slot, err)
+				}
+				lastErr = E.Cause(err, "open HTTP/3 stream")
+				// Pre-write, so moving to another healthy slot is safe. It is NOT
+				// evidence about the authority.
+				continue
+			}
+			// Any other open failure is a slot-level problem. It does not poison
+			// the authority, because other slots may be perfectly healthy.
+			c.noteSlotFailure(slot, err)
+			lastErr = E.Cause(err, "open HTTP/3 stream")
+			continue
+		}
+
+		// From here on the CONNECT is in flight: this tunnel is non-replayable.
+		// No code below may retry on another slot.
+		//
+		// The active count is taken only now, so a failed open above can never
+		// leak a count, and it is released exactly once by the returned release
+		// function.
+		slot.acquireActive()
+		releaseActive := c.activeReleaser(slot)
+
+		stop := context.AfterFunc(ctx, func() {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+		})
+		var response *http.Response
+		err = stream.SendRequestHeader(request)
+		if err == nil {
+			response, err = stream.ReadResponse()
+		}
+		if err == nil {
+			select {
+			case <-clientConn.ReceivedSettings():
+			case <-clientConn.Context().Done():
+				err = context.Cause(clientConn.Context())
+			case <-ctx.Done():
+				err = ctx.Err()
+			}
+		}
+		if !stop() {
 			err = ctx.Err()
 		}
-	}
-	if !stop() {
-		err = ctx.Err()
-	}
-	if err != nil {
-		stream.CancelRead(0)
-		stream.Close()
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+		if err != nil {
+			stream.CancelRead(0)
+			stream.Close()
+			releaseActive()
+			if ctx.Err() != nil {
+				return nil, nil, ctx.Err()
+			}
+			// The CONNECT was already sent, so this must NOT be retried on
+			// another slot even though the failure is reported here.
+			if isGoAwayError(err) {
+				slot.markDraining(err)
+			}
+			return nil, nil, E.Cause(err, "HTTP/3 CONNECT")
 		}
-		return nil, nil, E.Cause(err, "HTTP/3 CONNECT")
+		if response.StatusCode != http.StatusOK {
+			stream.CancelRead(0)
+			stream.Close()
+			releaseActive()
+			return nil, nil, statusError(response)
+		}
+		slot.markHealthy()
+		if c.onSuccess != nil {
+			// A confirmed HTTP/3 tunnel clears the AUTHORITY-level backoff, which
+			// is a different decision from the slot's own health above.
+			c.onSuccess()
+		}
+		return &http3ActiveStream{RequestStream: stream, release: releaseActive}, clientConn, nil
 	}
-	if response.StatusCode != http.StatusOK {
-		stream.CancelRead(0)
-		stream.Close()
-		return nil, nil, statusError(response)
+	if lastErr == nil {
+		lastErr = E.New("no HTTP/3 pool slot could open a stream")
 	}
-	return stream, clientConn, nil
+	return nil, nil, lastErr
+}
+
+// http3ActiveStream wraps a RequestStream so closing it releases the slot's
+// active-tunnel count exactly once.
+type http3ActiveStream struct {
+	*http3.RequestStream
+	release func()
+}
+
+func (s *http3ActiveStream) Close() error {
+	s.release()
+	return s.RequestStream.Close()
+}
+
+// activeReleaser returns a function that decrements the slot's active count at
+// most once, so a double Close cannot corrupt the count.
+func (c *http3ClientImpl) activeReleaser(slot *http3PoolSlot) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			slot.releaseActive()
+		})
+	}
+}
+
+// establishSlot returns a slot that may take a new tunnel, creating a fresh
+// connection if every existing slot is unavailable.
+//
+// This is the layer that keeps SLOT health separate from AUTHORITY health. A
+// slot being dead, draining or cooling down says nothing about whether the
+// authority speaks HTTP/3, so this never marks the authority broken. Only the
+// caller's H3-unavailable signal does that.
+func (c *http3ClientImpl) establishSlot(ctx context.Context) (*http3PoolSlot, error) {
+	slot := c.pickSlot()
+	if slot != nil {
+		return slot, nil
+	}
+	// No slot is currently eligible. Before concluding anything about the
+	// authority, try to replace unusable slots with a fresh connection.
+	c.replaceClosedSlots()
+	slot = c.pickSlot()
+	if slot != nil {
+		return slot, nil
+	}
+	// Every slot is draining or dead. Recycle an unusable slot IN PLACE rather
+	// than appending, so the pool cannot grow past maxSlots.
+	return c.recycleSlot(ctx)
+}
+
+// noteSlotFailure records a slot-level failure and retires the slot if it has
+// become unusable.
+func (c *http3ClientImpl) noteSlotFailure(slot *http3PoolSlot, err error) {
+	slot.markFailure(time.Now(), selectionCooldown)
+	health := slot.health()
+	if health.Connected {
+		// The connection object still exists, so the slot keeps its place in the
+		// pool and returns after its cooldown.
+		c.logPoolEvent("H3_SLOT_COOLDOWN", slot, err)
+		return
+	}
+	slot.markDead()
+	c.logPoolEvent("H3_SLOT_DEAD", slot, err)
+}
+
+// replaceClosedSlots drops closed slots and refills the pool up to its size with
+// fresh connections, so a retired slot does not permanently reduce capacity.
+func (c *http3ClientImpl) replaceClosedSlots() {
+	now := time.Now()
+	for _, slot := range c.slots {
+		if !slot.shouldClose() {
+			continue
+		}
+		slot.access.Lock()
+		if slot.conn != nil {
+			slot.conn.CloseWithError(0, "")
+			slot.conn = nil
+		}
+		slot.quicConn = nil
+		if slot.rawConn != nil {
+			slot.rawConn.Close()
+			slot.rawConn = nil
+		}
+		slot.state = http3SlotHealthy
+		slot.consecutiveFailures = 0
+		slot.cooldownUntil = time.Time{}
+		slot.drainingSince = time.Time{}
+		slot.created = now
+		slot.access.Unlock()
+	}
+}
+
+// recycleSlot re-dials the least useful unusable slot, in place.
+//
+// It never appends: the pool size is a hard cap, and growing it on failure would
+// let a misbehaving server multiply the client's UDP sockets and goroutines. A
+// replacement reuses the existing transport so no orphan transport is leaked.
+func (c *http3ClientImpl) recycleSlot(ctx context.Context) (*http3PoolSlot, error) {
+	if len(c.slots) == 0 {
+		return nil, E.New("the HTTP/3 pool is empty")
+	}
+	// Prefer a dead slot, then a draining one with no active tunnels, then the
+	// least-active slot overall. Re-dialing a slot that still carries traffic
+	// would cut live tunnels, so it is the last resort.
+	var target *http3PoolSlot
+	for _, slot := range c.slots {
+		health := slot.health()
+		switch health.State {
+		case http3SlotDead:
+			target = slot
+		case http3SlotDraining:
+			if health.Active == 0 && target == nil {
+				target = slot
+			}
+		}
+		if target != nil {
+			break
+		}
+	}
+	if target == nil {
+		// Nothing is safely recyclable: every slot is either healthy, cooling
+		// down, or draining with live tunnels. Report that instead of forcing a
+		// connection out from under live traffic.
+		return nil, E.New("no HTTP/3 pool slot can be recycled")
+	}
+	slot := &http3PoolSlot{
+		transport: target.transport,
+		created:   time.Now(),
+	}
+	_, err := c.acquire(slot, ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Swap the contents in place so the pool length is unchanged.
+	target.access.Lock()
+	target.conn = slot.conn
+	target.quicConn = slot.quicConn
+	target.rawConn = slot.rawConn
+	target.quicConfig = slot.quicConfig
+	target.state = http3SlotHealthy
+	target.consecutiveFailures = 0
+	target.cooldownUntil = time.Time{}
+	target.drainingSince = time.Time{}
+	target.created = time.Now()
+	target.access.Unlock()
+	return target, nil
 }
 
 func (c *http3ClientImpl) DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
@@ -369,7 +649,9 @@ func (c *http3ClientImpl) Close() error {
 }
 
 type http3StreamConn struct {
-	stream      *http3.RequestStream
+	// stream is the active-stream wrapper, so closing this connection releases
+	// the pool slot's active-tunnel count exactly once.
+	stream      *http3ActiveStream
 	remoteAddr  net.Addr
 	writeAccess sync.Mutex
 	closed      atomic.Bool
@@ -437,7 +719,8 @@ func (c *http3StreamConn) NeedAdditionalReadDeadline() bool {
 }
 
 type http3RequestDatagramStream struct {
-	stream           *http3.RequestStream
+	// stream is the active-stream wrapper; see http3StreamConn.
+	stream           *http3ActiveStream
 	datagramsEnabled bool
 }
 
