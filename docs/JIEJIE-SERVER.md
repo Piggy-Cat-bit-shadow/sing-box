@@ -503,17 +503,46 @@ Measured on the development machine: full ≈ 108 MB, Jiejie ≈ 58 MB, and the
 Jiejie build passes `sing-box check` against a secret-free fixture of the real
 production topology.
 
-### Experimental artifacts
+### The single production artifact
 
-These are **not** the production default and are never deployed automatically.
+CI publishes **exactly one** binary, and it is built from
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`:
 
-* `sing-box-linux-amd64-jiejie-v3` — built with `GOAMD64=v3`. Only deploy this
-  if the host CPU satisfies Go's amd64 v3 requirements; check with
-  `lscpu`/`/proc/cpuinfo` for AVX2 and BMI2. Keep the generic artifact as the
-  fallback, because the VPS host CPU can change.
-* `sing-box-linux-amd64-jiejie-static` — built with `CGO_ENABLED=0`. Built only
-  if it compiles; the CI step is non-fatal. The default production artifact
-  keeps CGO enabled.
+```
+sing-box-linux-amd64
+sing-box-linux-amd64.sha256
+```
+
+That is the only artifact the workflow uploads. `full`, the plain Jiejie build,
+the `GOAMD64=v3` build and the `CGO_ENABLED=0` build are no longer produced by
+the default workflow. Their tag files and source-level build capability remain in
+the repository, so they can still be built by hand for debugging:
+
+```sh
+TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+go build -trimpath -tags "$TAGS" -o sing-box-debug ./cmd/sing-box
+```
+
+They are compatibility and debugging capabilities, not parallel releases.
+
+The only build-time variations that were formerly published and are worth
+knowing about if you ever build manually:
+
+* `GOAMD64=v3` requires the host CPU to satisfy Go's amd64 v3 requirements
+  (AVX2); check with `lscpu`. A v3 binary will crash with an illegal instruction
+  on an unsupported CPU, and the VPS host CPU can change under you.
+* `CGO_ENABLED=0` produces a static binary. The production artifact keeps CGO
+  enabled, which is the normal Go behaviour for this target.
+
+### Binary size guard
+
+Because the minimal build is now the product, CI enforces a raw ELF size ceiling
+of **38,000,000 bytes** (`MAX_BINARY_BYTES` in the workflow). A build over that
+limit fails with `production binary size regression`, which almost always means a
+protocol or service that should have been pruned has found its way back into the
+registry. The current size is about 34.6 MB, leaving roughly 3.3 MiB of headroom
+for normal Go and dependency growth. The guard measures the raw binary, never the
+artifact archive size.
 
 ## 15. Rebasing onto upstream
 

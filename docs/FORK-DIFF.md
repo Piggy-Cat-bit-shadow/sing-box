@@ -118,18 +118,30 @@ requires the minimal build to reject a protocol it deliberately excludes.
 
 ## Maintenance and CI
 
-The GitHub Actions workflow runs three jobs:
+CI now has one job and one product: it tests broadly and publishes exactly one
+binary. The workflow runs three jobs:
 
 * **lint-and-unit-tests** — `gofmt`, upstream golangci-lint, `vet` and unit tests
-  under both tag sets, race tests for the new concurrent state, and HTTP/3 pool
-  benchmarks as a regression reference.
-* **integration-tests** — builds the Jiejie binary and runs `./test/...`, which
-  now contains real AnyTLS fallback and MASQUE H2/H3 coverage.
-* **build-artifacts** — builds and verifies four artifacts: full, Jiejie,
-  Jiejie `GOAMD64=v3` (experimental) and Jiejie static `CGO_ENABLED=0`
-  (experimental, non-fatal if it fails). Each gets `file`, `ldd`, size, version,
-  SHA256 and `sing-box check` against a secret-free fixture of the production
-  topology.
+  under **both** the production/minimal tag set and the upstream default tag set,
+  race tests under the production tag set, and HTTP/3 pool benchmarks as a
+  regression reference. The production tag set is the one that must pass; the
+  upstream run is a compatibility signal and never substitutes for it.
+* **integration-tests** — builds the production binary with
+  `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` and runs two groups:
+  * **Group A (production, minimal tags)** — `TestJiejie*`: AnyTLS fallback and
+    valid AnyTLS, MASQUE H2/H3 masquerade, authenticated CONNECT, the H3
+    connection pool, H3 → H2 fallback, and the unauthenticated limiter.
+  * **Group B (upstream compatibility, default tags)** — the upstream HTTP/2 and
+    HTTP/3 inbound and forward suites, which need the full tag set (and in some
+    cases Docker, which the runner lacks) and are therefore run only as a subset.
+  Test logs stay in the job output and are **not** uploaded as artifacts.
+* **build-production** — needs both jobs above, so the shipped binary is only
+  produced after everything has passed. It builds `sing-box-linux-amd64`, audits
+  dependency pruning with a temporary unstripped copy (deleted immediately and
+  never uploaded), verifies version and tags, runs `sing-box check` against the
+  secret-free production fixture, asserts an excluded protocol is still rejected,
+  enforces the binary size guard, writes the SHA256 and uploads exactly one
+  artifact.
 
 The production binary is produced by the official Go linker in a single
 `go build` invocation with `-trimpath` and `-ldflags "-s -w"`, which drops the
