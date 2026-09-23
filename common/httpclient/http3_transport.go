@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -20,8 +21,35 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+// http3Transport holds one or more independent HTTP/3 transports. With a pool
+// size of 1 it is the upstream single-transport transport; larger sizes let
+// concurrent requests spread over genuinely separate QUIC connections.
 type http3Transport struct {
-	h3Transport *http3.Transport
+	transports []*http3.Transport
+	next       atomic.Uint64
+}
+
+// pick returns the transport for the given request. Rotation only happens for
+// replayable requests: a request with a one-shot body must keep using a stable
+// member so that a failing attempt can never be retried onto another
+// connection with an already-consumed body.
+func (t *http3Transport) pick(request *http.Request) *http3.Transport {
+	if len(t.transports) == 1 {
+		return t.transports[0]
+	}
+	if !requestReplayable(request) {
+		return t.transports[0]
+	}
+	index := t.next.Add(1) - 1
+	return t.transports[index%uint64(len(t.transports))]
+}
+
+func (t *http3Transport) roundTripOpt(request *http.Request, opt http3.RoundTripOpt) (*http.Response, error) {
+	return t.pick(request).RoundTripOpt(request, opt)
+}
+
+func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.pick(request).RoundTrip(request)
 }
 
 type http3BrokenEntry struct {
@@ -30,7 +58,7 @@ type http3BrokenEntry struct {
 }
 
 type http3FallbackTransport struct {
-	h3Transport   *http3.Transport
+	h3Pool        *http3Transport
 	h2Fallback    innerTransport
 	fallbackDelay time.Duration
 	schedule      option.HTTP3FallbackSchedule
@@ -88,14 +116,35 @@ func newHTTP3RoundTripper(
 	return h3Transport
 }
 
+// newHTTP3RoundTrippers builds `size` fully independent HTTP/3 transports.
+// Each one owns its own QUIC connection pool, so they really are separate
+// connections rather than streams within one connection.
+func newHTTP3RoundTrippers(
+	rawDialer N.Dialer,
+	baseTLSConfig tls.Config,
+	options option.QUICOptions,
+) ([]*http3.Transport, error) {
+	size, err := options.HTTP3ConnectionPool.Build()
+	if err != nil {
+		return nil, err
+	}
+	transports := make([]*http3.Transport, 0, size)
+	for range size {
+		transports = append(transports, newHTTP3RoundTripper(rawDialer, baseTLSConfig, options))
+	}
+	return transports, nil
+}
+
 func newHTTP3Transport(
 	rawDialer N.Dialer,
 	baseTLSConfig tls.Config,
 	options option.QUICOptions,
 ) (innerTransport, error) {
-	return &http3Transport{
-		h3Transport: newHTTP3RoundTripper(rawDialer, baseTLSConfig, options),
-	}, nil
+	transports, err := newHTTP3RoundTrippers(rawDialer, baseTLSConfig, options)
+	if err != nil {
+		return nil, err
+	}
+	return &http3Transport{transports: transports}, nil
 }
 
 func newHTTP3FallbackTransport(
@@ -105,8 +154,12 @@ func newHTTP3FallbackTransport(
 	options option.QUICOptions,
 	fallbackDelay time.Duration,
 ) (innerTransport, error) {
+	transports, err := newHTTP3RoundTrippers(rawDialer, baseTLSConfig, options)
+	if err != nil {
+		return nil, err
+	}
 	return &http3FallbackTransport{
-		h3Transport:   newHTTP3RoundTripper(rawDialer, baseTLSConfig, options),
+		h3Pool:        &http3Transport{transports: transports},
 		h2Fallback:    h2Fallback,
 		fallbackDelay: fallbackDelay,
 		schedule:      options.HTTP3Fallback.Build(),
@@ -114,17 +167,21 @@ func newHTTP3FallbackTransport(
 	}, nil
 }
 
-func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error) {
-	return t.h3Transport.RoundTrip(request)
-}
-
 func (t *http3Transport) CloseIdleConnections() {
-	t.h3Transport.CloseIdleConnections()
+	for _, transport := range t.transports {
+		transport.CloseIdleConnections()
+	}
 }
 
 func (t *http3Transport) Close() error {
-	t.CloseIdleConnections()
-	return t.h3Transport.Close()
+	var err error
+	for _, transport := range t.transports {
+		transport.CloseIdleConnections()
+		err = E.Append(err, transport.Close(), func(err error) error {
+			return E.Cause(err, "close http3 transport")
+		})
+	}
+	return err
 }
 
 func (t *http3FallbackTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -139,7 +196,11 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 	if t.h3Broken(authority) {
 		return t.h2FallbackRoundTrip(request)
 	}
-	response, err := t.h3Transport.RoundTripOpt(request, http3.RoundTripOpt{OnlyCachedConn: true})
+	// Probe for an already-established QUIC connection on the member this
+	// request would use. The probe and any follow-up share the same member so
+	// that the cached-connection check is meaningful.
+	member := t.h3Pool.pick(request)
+	response, err := member.RoundTripOpt(request, http3.RoundTripOpt{OnlyCachedConn: true})
 	if err == nil {
 		t.clearH3Broken(authority)
 		return response, nil
@@ -149,7 +210,7 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 		return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
 	}
 	if !requestReplayable(request) {
-		response, err = t.h3Transport.RoundTrip(request)
+		response, err = member.RoundTrip(request)
 		if err == nil {
 			t.clearH3Broken(authority)
 			return response, nil
@@ -157,10 +218,10 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 		t.markH3Broken(authority)
 		return nil, err
 	}
-	return t.roundTripHTTP3Race(request, authority)
+	return t.roundTripHTTP3Race(request, authority, member)
 }
 
-func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, authority string) (*http.Response, error) {
+func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, authority string, member *http3.Transport) (*http.Response, error) {
 	type result struct {
 		response *http.Response
 		err      error
@@ -181,7 +242,7 @@ func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, autho
 				err      error
 			)
 			if useH3 {
-				response, err = t.h3Transport.RoundTrip(raceRequest)
+				response, err = member.RoundTrip(raceRequest)
 			} else {
 				response, err = t.h2FallbackRoundTrip(raceRequest)
 			}
@@ -278,13 +339,13 @@ func (t *http3FallbackTransport) h2FallbackRoundTrip(request *http.Request) (*ht
 }
 
 func (t *http3FallbackTransport) CloseIdleConnections() {
-	t.h3Transport.CloseIdleConnections()
+	t.h3Pool.CloseIdleConnections()
 	t.h2Fallback.CloseIdleConnections()
 }
 
 func (t *http3FallbackTransport) Close() error {
 	t.CloseIdleConnections()
-	return t.h3Transport.Close()
+	return E.Errors(t.h3Pool.Close(), t.h2Fallback.Close())
 }
 
 func (t *http3FallbackTransport) h3Broken(authority string) bool {
