@@ -222,46 +222,57 @@ func TestUnauthenticatedLimiterExpiry(t *testing.T) {
 	}
 }
 
-// TestUnauthenticatedLimiterDoesNotSweepEveryRequest proves the hot path is not
-// O(tracked IPs).
+// TestUnauthenticatedLimiterDoesNotSweepEveryRequest proves the amortized-expiry
+// claim directly: a single request must not cost O(tracked IPs).
 //
-// A full sweep on every acquire is what this replaced; the test asserts the sweep
-// counter only advances periodically, and that a single request after many
-// tracked IPs does not visit them all.
+// Sweeping on every acquire made the limiter's hot path linear in the number of
+// tracked addresses, so with max_tracked_ips=4096 every request scanned 4096
+// entries while holding the mutex. This test fills the map well past
+// cleanupInterval with entries that are NOT idle-expired, then measures how many
+// entries the expiry sweeps walked across a small number of requests.
+//
+// The assertion is on the total visited count rather than on the counter value,
+// so it cannot be satisfied by a sweep that happens to run at a different time:
+// if expiry went back to running on every acquire, each request would visit every
+// tracked entry and the total would immediately exceed the bound below.
 func TestUnauthenticatedLimiterDoesNotSweepEveryRequest(t *testing.T) {
 	limits := enabledLimits()
 	limits.IdleTimeout = time.Hour // nothing should expire during this test
-	limits.MaxTrackedIPs = 1024
+	limits.MaxTrackedIPs = 4096
 	limits.RequestsPerSecond = 100000
 	limits.Burst = 100000
 	limiter := newUnauthenticatedLimiter(limits)
 	now := time.Now()
 
-	// Fill the map well below its cap so only the periodic counter can trigger a
-	// sweep.
-	for index := range 200 {
-		limiter.allowed(fmt.Sprintf("10.0.0.%d:1000", index%256), now)
+	const tracked = 1000
+	for index := range tracked {
+		limiter.allowed(fmt.Sprintf("10.%d.%d.1:1000", index/256, index%256), now)
 	}
-	if limiter.acquisitions == 0 && limiter.trackedCount() < cleanupInterval {
-		t.Fatal("precondition: the sweep counter must not have wrapped yet")
-	}
-
-	// A single acquisition must not reset the counter to zero more than once per
-	// interval; the observable guarantee is that entries survive because nothing is
-	// idle-expired, and the counter advances monotonically within an interval.
-	before := limiter.acquisitions
-	limiter.allowed("10.9.9.9:1000", now)
-	after := limiter.acquisitions
-	if after != before+1 && after != 0 {
-		t.Fatalf("the sweep counter must advance by one, or wrap to zero; got %d -> %d", before, after)
+	if count := limiter.trackedCount(); count < cleanupInterval {
+		t.Fatalf("precondition: expected more than %d tracked IPs, got %d", cleanupInterval, count)
 	}
 	if limiter.trackedCount() == 0 {
 		t.Fatal("entries must not be reclaimed while they are not idle-expired")
 	}
+
+	// Measure only the requests issued after the map was filled.
+	visitedBefore := limiter.visitedCount()
+	const requests = 16
+	for index := range requests {
+		limiter.allowed(fmt.Sprintf("172.16.0.%d:1000", index), now)
+	}
+	visited := limiter.visitedCount() - visitedBefore
+
+	// At most one sweep may occur in 16 acquisitions (cleanupInterval is 256), so
+	// the total entries walked cannot exceed one pass over the map. Per-request
+	// sweeping would walk requests*tracked = 16,000 entries.
+	if maxVisited := limiter.trackedCount(); visited > maxVisited {
+		t.Fatalf("expiry should be amortized: %d requests visited %d entries, "+
+			"which is more than one pass over the %d tracked IPs",
+			requests, visited, maxVisited)
+	}
 }
 
-// TestUnauthenticatedLimiterDoesNotExpireInFlightEntries makes sure an IP
-// cannot reset its own budget by simply waiting while a request is in flight.
 func TestUnauthenticatedLimiterDoesNotExpireInFlightEntries(t *testing.T) {
 	limits := enabledLimits()
 	limits.IdleTimeout = time.Millisecond

@@ -36,6 +36,11 @@ type unauthenticatedLimiter struct {
 	// failed authentication that was admitted. It exists for tests and is only
 	// ever mutated under access, so it adds no lock traffic on the hot path.
 	accounted int
+	// entriesVisited counts the state entries expireLocked has walked. It exists
+	// for tests: it is the direct measurement of the amortized-expiry claim,
+	// which is that a single request must not pay O(tracked IPs). Like the
+	// counters above it is only mutated under access.
+	entriesVisited int
 }
 
 type unauthenticatedState struct {
@@ -163,6 +168,7 @@ func (l *unauthenticatedLimiter) allowed(source string, now time.Time) bool {
 // and are not currently serving a request.
 func (l *unauthenticatedLimiter) expireLocked(now time.Time) {
 	deadline := now.Add(-l.limits.IdleTimeout)
+	l.entriesVisited += len(l.states)
 	for address, state := range l.states {
 		if state.concurrent == 0 && state.lastSeen.Before(deadline) {
 			delete(l.states, address)
@@ -204,6 +210,17 @@ func (l *unauthenticatedLimiter) evictLocked(now time.Time) {
 		candidates = candidates[:len(candidates)-1]
 	}
 	_ = now
+}
+
+// visitedCount reports how many state entries expiry sweeps have walked. It
+// exists for tests.
+func (l *unauthenticatedLimiter) visitedCount() int {
+	if l == nil {
+		return 0
+	}
+	l.access.Lock()
+	defer l.access.Unlock()
+	return l.entriesVisited
 }
 
 // accountedCount reports how many requests the limiter has accounted. It exists
