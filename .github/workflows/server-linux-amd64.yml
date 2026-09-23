@@ -5,12 +5,36 @@ on:
   push:
     branches:
       - testing
+      - feat/jiejie-server-edition
+  pull_request:
+    branches:
+      - testing
 
 permissions:
   contents: read
 
+env:
+  JIEJIE_VERSION: 1.15.0-jiejie-masquerade.3
+  FOCUSED_GOFMT_PATHS: >-
+    option/anytls.go
+    option/simple.go
+    option/http.go
+    option/http3_fallback.go
+    option/http3_pool.go
+    option/http_server_profile.go
+    option/http_unauthenticated_limits.go
+    protocol/anytls/inbound.go
+    protocol/http/inbound.go
+    transport/http/masquerade.go
+    transport/http/server.go
+    transport/http/server_h2.go
+    transport/http/server_h3.go
+    transport/http/h3_error_class.go
+    transport/http/unauthenticated_limiter.go
+    common/httpclient/http3_transport.go
+
 jobs:
-  verify-and-build:
+  lint-and-unit-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -18,50 +42,198 @@ jobs:
         with:
           go-version: ~1.25
           cache: true
-      - name: Focused format check
+      - name: Format check
         shell: bash
         run: |
           set -euo pipefail
-          test -z "$(gofmt -d option/anytls.go option/simple.go protocol/anytls/inbound.go protocol/anytls/inbound_test.go protocol/http/inbound.go transport/http/masquerade.go transport/http/masquerade_test.go transport/http/server.go transport/http/server_h2.go)"
+          unformatted="$(gofmt -l $FOCUSED_GOFMT_PATHS)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Linux lint
         run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=10m
-      - name: Focused vet and tests
+      - name: Vet and unit tests (default tags)
         shell: bash
         run: |
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          go vet -tags "$TAGS" ./protocol/anytls ./transport/http ./option
-          go test -tags "$TAGS" ./protocol/anytls ./transport/http ./option
-      - name: Build and validate
+          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./common/httpclient
+          go test -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./common/httpclient
+      - name: Vet and unit tests (jiejie tags)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
+          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./common/httpclient
+          go test -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./common/httpclient
+      - name: Race tests for new concurrent state
         shell: bash
         run: |
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          VERSION=1.15.0-jiejie-masquerade.2
-          go build -trimpath -tags "$TAGS" -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$VERSION" -o sing-box-linux-amd64 ./cmd/sing-box
-          file sing-box-linux-amd64
-          ls -lh sing-box-linux-amd64
-          stat -c '%s' sing-box-linux-amd64
-          ./sing-box-linux-amd64 version
-          ./sing-box-linux-amd64 version | grep -F "$VERSION"
-          ./sing-box-linux-amd64 version | grep -F "with_quic"
-          CONFIG=$(mktemp)
-          trap 'rm -f "$CONFIG"' EXIT
-          cat > "$CONFIG" <<'EOF'
+          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./option
+      - name: HTTP/3 pool benchmarks (regression reference only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          go test -tags "$TAGS" -run '^$' -bench 'BenchmarkHTTP3Pool' -benchtime=50x ./common/httpclient | tee benchmarks.txt
+          echo "NOTE: CI runner numbers are a regression reference and do not predict VPS throughput."
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25
+          cache: true
+      - name: Build jiejie binary for integration testing
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
+          go build -tags "$TAGS" -o sing-box-jiejie ./cmd/sing-box
+          ./sing-box-jiejie version
+      - name: Integration tests (AnyTLS fallback, MASQUE H2/H3, H3 pool)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          go test -tags "$TAGS" -v -count=1 ./test/... 2>&1 | tee integration.log
+      - name: Upload integration log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-log
+          path: integration.log
+          if-no-files-found: warn
+
+  build-artifacts:
+    runs-on: ubuntu-latest
+    needs: [lint-and-unit-tests]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25
+          cache: true
+
+      - name: Build full artifact (upstream default tags)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
+            -o sing-box-linux-amd64-full ./cmd/sing-box
+
+      - name: Build jiejie artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
+          go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
+            -o sing-box-linux-amd64-jiejie ./cmd/sing-box
+
+      - name: Build jiejie GOAMD64=v3 experimental artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
+          GOAMD64=v3 go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
+            -o sing-box-linux-amd64-jiejie-v3 ./cmd/sing-box
+
+      - name: Attempt jiejie static (CGO_ENABLED=0) experimental artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER)
+          if CGO_ENABLED=0 go build -trimpath -tags "$TAGS" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
+            -o sing-box-linux-amd64-jiejie-static ./cmd/sing-box; then
+            echo "CGO_ENABLED=0 build succeeded"
+          else
+            echo "CGO_ENABLED=0 build failed; skipping static artifact (not fatal)"
+            rm -f sing-box-linux-amd64-jiejie-static
+          fi
+
+      - name: Verify artifacts against secret-free topology fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A secret-free production topology fixture exercising this fork's
+          # features: MASQUE H2/H3 with masquerade, server_profile,
+          # unauthenticated_limits, AnyTLS native fallback, the H3 connection
+          # pool and the fallback backoff. No real password, UUID, API key or
+          # private certificate is used.
+          cat > /tmp/jiejie-topology.json <<'EOF'
           {
+            "log": {"level": "info"},
             "inbounds": [
-              {"type":"http","listen":"127.0.0.1","listen_port":1080,"masquerade":{"type":"string","content":"ok"}},
-              {"type":"anytls","listen":"127.0.0.1","listen_port":1081,"users":[{"name":"example","password":"example"}],"fallback":{"server":"127.0.0.1","server_port":8080}}
+              {"type":"http","tag":"masque-h2","listen":"127.0.0.1","listen_port":28440,"version":2,
+               "users":[{"username":"example","password":"example"}],
+               "masquerade":{"type":"proxy","url":"http://127.0.0.1:28437","rewrite_host":true}},
+              {"type":"http","tag":"masque-h3","listen":"127.0.0.1","listen_port":28443,"version":3,
+               "server_profile":"jiejie-balanced-1g",
+               "users":[{"username":"example","password":"example"}],
+               "tls":{"enabled":true,"server_name":"riri.example.test","certificate_path":"/tmp/tls.crt","key_path":"/tmp/tls.key"},
+               "masquerade":{"type":"proxy","url":"http://127.0.0.1:28437","rewrite_host":true},
+               "unauthenticated_limits":{"enabled":true,"max_concurrent_per_ip":8,"requests_per_second":10,"burst":20,"idle_timeout":"10s"}},
+              {"type":"anytls","tag":"anytls","listen":"127.0.0.1","listen_port":28436,
+               "users":[{"name":"example","password":"example"}],
+               "tls":{"enabled":true,"server_name":"api.example.test","certificate_path":"/tmp/tls.crt","key_path":"/tmp/tls.key"},
+               "fallback":{"server":"127.0.0.1","server_port":28437}}
             ],
-            "outbounds": [{"type":"direct"}]
+            "outbounds": [
+              {"type":"direct","tag":"direct"},
+              {"type":"http","tag":"masque-out","server":"127.0.0.1","server_port":28443,"version":3,
+               "username":"example","password":"example",
+               "http3_connection_pool":{"size":2,"strategy":"round_robin"},
+               "http3_fallback":{"initial_backoff":"5s","max_backoff":"5m","multiplier":2,"reset_on_success":true},
+               "tls":{"enabled":true,"server_name":"riri.example.test"}}
+            ],
+            "route": {"final":"direct"}
           }
           EOF
-          ./sing-box-linux-amd64 check -c "$CONFIG"
-          sha256sum sing-box-linux-amd64 > sing-box-linux-amd64.sha256
-          cat sing-box-linux-amd64.sha256
+          openssl req -x509 -newkey rsa:2048 -keyout /tmp/tls.key -out /tmp/tls.crt \
+            -days 1 -nodes -subj "/CN=example.test" 2>/dev/null
+
+          for artifact in sing-box-linux-amd64-full sing-box-linux-amd64-jiejie \
+                          sing-box-linux-amd64-jiejie-v3 sing-box-linux-amd64-jiejie-static; do
+            [ -f "$artifact" ] || continue
+            echo "===== $artifact ====="
+            file "$artifact"
+            (ldd "$artifact" 2>&1 | head -3) || true
+            ls -lh "$artifact"
+            echo "bytes: $(stat -c '%s' "$artifact")"
+            ./"$artifact" version
+            ./"$artifact" version | grep -F "$JIEJIE_VERSION" || { echo "version mismatch in $artifact"; exit 1; }
+            ./"$artifact" check -c /tmp/jiejie-topology.json
+            sha256sum "$artifact" > "$artifact.sha256"
+            cat "$artifact.sha256"
+          done
+
+          # The full artifact must retain upstream capabilities; the jiejie
+          # artifact must keep with_quic and drop the optional components.
+          ./sing-box-linux-amd64-full version | grep -F "with_quic"
+          ./sing-box-linux-amd64-full version | grep -F "with_tailscale"
+          ./sing-box-linux-amd64-jiejie version | grep -F "with_quic"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: sing-box-linux-amd64
+          name: sing-box-linux-amd64-server
           path: |
-            sing-box-linux-amd64
-            sing-box-linux-amd64.sha256
+            sing-box-linux-amd64-full
+            sing-box-linux-amd64-full.sha256
+            sing-box-linux-amd64-jiejie
+            sing-box-linux-amd64-jiejie.sha256
+            sing-box-linux-amd64-jiejie-v3
+            sing-box-linux-amd64-jiejie-v3.sha256
+            sing-box-linux-amd64-jiejie-static
+            sing-box-linux-amd64-jiejie-static.sha256
+          if-no-files-found: warn
