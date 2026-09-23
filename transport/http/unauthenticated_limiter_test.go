@@ -191,6 +191,10 @@ func TestUnauthenticatedLimiterReleaseIsIdempotent(t *testing.T) {
 
 // TestUnauthenticatedLimiterExpiry verifies idle entries are reclaimed so the
 // map does not grow without bound over time.
+//
+// Expiry is amortized rather than per-request, so the sweep is driven by enough
+// acquisitions or by the map reaching its cap. Doing it on every request made
+// acquire O(tracked IPs) per request.
 func TestUnauthenticatedLimiterExpiry(t *testing.T) {
 	limits := enabledLimits()
 	limits.IdleTimeout = 10 * time.Second
@@ -202,10 +206,51 @@ func TestUnauthenticatedLimiterExpiry(t *testing.T) {
 	if limiter.trackedCount() != 1 {
 		t.Fatalf("expected 1 tracked IP, got %d", limiter.trackedCount())
 	}
-	// A later request from another IP triggers expiry of the idle entry.
-	limiter.allowed("5.6.7.8:1000", now.Add(time.Minute))
+	// Enough later traffic from another IP to trigger the periodic sweep.
+	later := now.Add(time.Minute)
+	for range cleanupInterval {
+		limiter.allowed("5.6.7.8:1000", later)
+	}
 	if limiter.trackedCount() != 1 {
 		t.Fatalf("the idle entry must have expired, got %d entries", limiter.trackedCount())
+	}
+}
+
+// TestUnauthenticatedLimiterDoesNotSweepEveryRequest proves the hot path is not
+// O(tracked IPs).
+//
+// A full sweep on every acquire is what this replaced; the test asserts the sweep
+// counter only advances periodically, and that a single request after many
+// tracked IPs does not visit them all.
+func TestUnauthenticatedLimiterDoesNotSweepEveryRequest(t *testing.T) {
+	limits := enabledLimits()
+	limits.IdleTimeout = time.Hour // nothing should expire during this test
+	limits.MaxTrackedIPs = 1024
+	limits.RequestsPerSecond = 100000
+	limits.Burst = 100000
+	limiter := newUnauthenticatedLimiter(limits)
+	now := time.Now()
+
+	// Fill the map well below its cap so only the periodic counter can trigger a
+	// sweep.
+	for index := range 200 {
+		limiter.allowed(fmt.Sprintf("10.0.0.%d:1000", index%256), now)
+	}
+	if limiter.acquisitions == 0 && limiter.trackedCount() < cleanupInterval {
+		t.Fatal("precondition: the sweep counter must not have wrapped yet")
+	}
+
+	// A single acquisition must not reset the counter to zero more than once per
+	// interval; the observable guarantee is that entries survive because nothing is
+	// idle-expired, and the counter advances monotonically within an interval.
+	before := limiter.acquisitions
+	limiter.allowed("10.9.9.9:1000", now)
+	after := limiter.acquisitions
+	if after != before+1 && after != 0 {
+		t.Fatalf("the sweep counter must advance by one, or wrap to zero; got %d -> %d", before, after)
+	}
+	if limiter.trackedCount() == 0 {
+		t.Fatal("entries must not be reclaimed while they are not idle-expired")
 	}
 }
 

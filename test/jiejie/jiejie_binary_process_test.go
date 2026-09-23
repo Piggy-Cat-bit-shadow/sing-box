@@ -1,4 +1,4 @@
-package main
+package jiejie_test
 
 import (
 	std_bufio "bufio"

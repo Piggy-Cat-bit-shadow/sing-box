@@ -49,6 +49,49 @@ type _HTTPInboundOptions struct {
 	InboundTLSOptionsContainer
 	HTTP2Options HTTP2Options `json:"-"`
 	HTTP3Options QUICOptions  `json:"-"`
+	// Present records which resource fields the user actually wrote, so a profile
+	// can distinguish "absent" from "explicitly zero". Without it,
+	// `keep_alive_period: 0` is indistinguishable from omitting the key and the
+	// profile would silently overwrite an explicit zero.
+	Present ResourceFieldPresence `json:"-"`
+}
+
+// ResourceFieldPresence records the resource fields that appeared in the config.
+type ResourceFieldPresence struct {
+	MaxConcurrentStreams    bool
+	IdleTimeout             bool
+	KeepAlivePeriod         bool
+	StreamReceiveWindow     bool
+	ConnectionReceiveWindow bool
+	MaxHeaderBytes          bool
+}
+
+// resourceFieldNames maps the JSON key to the presence flag it sets.
+var resourceFieldNames = map[string]func(*ResourceFieldPresence){
+	"max_concurrent_streams":    func(p *ResourceFieldPresence) { p.MaxConcurrentStreams = true },
+	"idle_timeout":              func(p *ResourceFieldPresence) { p.IdleTimeout = true },
+	"keep_alive_period":         func(p *ResourceFieldPresence) { p.KeepAlivePeriod = true },
+	"stream_receive_window":     func(p *ResourceFieldPresence) { p.StreamReceiveWindow = true },
+	"connection_receive_window": func(p *ResourceFieldPresence) { p.ConnectionReceiveWindow = true },
+	"max_header_bytes":          func(p *ResourceFieldPresence) { p.MaxHeaderBytes = true },
+}
+
+// recordPresence inspects the raw JSON for the resource keys the user supplied.
+func recordPresence(content []byte) ResourceFieldPresence {
+	var presence ResourceFieldPresence
+	if len(content) == 0 {
+		return presence
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(content, &probe); err != nil {
+		return presence
+	}
+	for key, set := range resourceFieldNames {
+		if _, present := probe[key]; present {
+			set(&presence)
+		}
+	}
+	return presence
 }
 
 type HTTPInboundOptions _HTTPInboundOptions
@@ -96,8 +139,11 @@ func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, err
 	http2Options := o.HTTP2Options
 	http3Options := o.HTTP3Options
 	if applied {
-		profile.ApplyToHTTP2(&http2Options)
-		profile.ApplyToQUIC(&http3Options)
+		// The presence set lets the profile distinguish an absent field from an
+		// explicit zero. An explicitly configured value always wins, including
+		// `keep_alive_period: 0` and `max_concurrent_streams: 0`.
+		profile.ApplyToHTTP2WithPresence(&http2Options, o.Present)
+		profile.ApplyToQUICWithPresence(&http3Options, o.Present)
 	}
 	// The BBR profile applies to the HTTP/3 server regardless of whether a
 	// resource profile was selected; an unset value resolves to standard, which
@@ -105,8 +151,14 @@ func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, err
 	http3Options.BBRProfile = ServerBBRProfile{Name: o.BBRProfile}
 
 	maxHeaderBytes := o.MaxHeaderBytes
-	if maxHeaderBytes <= 0 {
+	if !o.Present.MaxHeaderBytes {
+		// Only an absent max_header_bytes falls back to the profile. An explicit
+		// value, including a nonsensical one, is the user's decision and is
+		// validated below.
 		maxHeaderBytes = profile.MaxHeaderBytesValue(UpstreamMaxHeaderBytes)
+	}
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = UpstreamMaxHeaderBytes
 	}
 
 	return ServerResourceOptions{
@@ -134,6 +186,10 @@ func (o *HTTPInboundOptions) UnmarshalJSONContext(ctx context.Context, content [
 	if err != nil {
 		return err
 	}
+	// Record which resource fields the user wrote BEFORE unmarshalling the
+	// version-specific options, so the profile can tell "absent" from
+	// "explicitly zero".
+	o.Present = recordPresence(content)
 	return unmarshalHTTPVersionsOptions(ctx, content, (*_HTTPInboundOptions)(o), o.Versions(), &o.HTTP2Options, &o.HTTP3Options)
 }
 

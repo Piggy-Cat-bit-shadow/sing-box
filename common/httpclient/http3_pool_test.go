@@ -10,6 +10,7 @@ import (
 	stdTLS "crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -535,3 +536,167 @@ func generateTestCertificate(t testing.TB) stdTLS.Certificate {
 func newTestPoolB(tb testing.TB, size int) *http3Transport {
 	return newTestPool(tb, size)
 }
+
+// bodyRecordingTransport stands in for the HTTP/2 fallback and records exactly
+// what body bytes it is asked to send.
+type bodyRecordingTransport struct {
+	access sync.Mutex
+	bodies []string
+	calls  int
+}
+
+func (b *bodyRecordingTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	b.access.Lock()
+	b.calls++
+	b.access.Unlock()
+	var received string
+	if request.Body != nil {
+		payload, err := io.ReadAll(request.Body)
+		if err == nil {
+			received = string(payload)
+		}
+	}
+	b.access.Lock()
+	b.bodies = append(b.bodies, received)
+	b.access.Unlock()
+	return newTestResponse(request), nil
+}
+
+func (b *bodyRecordingTransport) CloseIdleConnections() {}
+
+func (b *bodyRecordingTransport) Close() error { return nil }
+
+func (b *bodyRecordingTransport) snapshot() (int, []string) {
+	b.access.Lock()
+	defer b.access.Unlock()
+	return b.calls, append([]string(nil), b.bodies...)
+}
+
+// TestHTTP3NonReplayableBodyIsNotReplayedToH2 is the replay-safety regression for
+// the generic transport.
+//
+// The non-ErrNoCachedConn branch used to clone and retry unconditionally, before
+// any replayability check, so a request with a one-shot body could reach the
+// HTTP/2 fallback with a body the HTTP/3 attempt had already consumed.
+//
+// This test drives the decision function directly with a failing probe and
+// inspects what the fallback actually receives. Driving it end to end through
+// RoundTripOpt is not viable in a unit test: a stub transport there spins on a
+// real dial until the 5s idle timeout. The decision logic is what regressed, so
+// that is what is tested, and the end-to-end path stays covered by the
+// TestHTTP3PoolNonReplayableBodySentAtMostOnce integration test.
+func TestHTTP3NonReplayableBodyIsNotReplayedToH2(t *testing.T) {
+	probeFailure := errors.New("http3 probe failed")
+
+	testCases := []struct {
+		name           string
+		payload        string
+		provideGetBody bool
+		expectFallback bool
+	}{
+		{
+			name:           "one-shot body is not replayed",
+			payload:        "one-shot-payload",
+			provideGetBody: false,
+			expectFallback: false,
+		},
+		{
+			name:           "rewindable body is replayed",
+			payload:        "rewindable-payload",
+			provideGetBody: true,
+			expectFallback: true,
+		},
+		{
+			name:           "bodyless request is replayed",
+			payload:        "",
+			provideGetBody: false,
+			expectFallback: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fallback := &bodyRecordingTransport{}
+			transport := &http3FallbackTransport{
+				h3Pool:     newStubH3Pool(),
+				h2Fallback: fallback,
+				schedule:   (*option.HTTP3FallbackOptions)(nil).Build(),
+				broken:     make(map[string]http3BrokenEntry),
+			}
+
+			request := buildProbeRequest(t, testCase.payload, testCase.provideGetBody)
+
+			_, err := transport.handleProbeFailure(request, probeFailure)
+
+			calls, bodies := fallback.snapshot()
+			if testCase.expectFallback {
+				if err != nil {
+					t.Fatalf("a replayable request must fall back: %v", err)
+				}
+				if calls != 1 {
+					t.Fatalf("expected exactly one fallback call, got %d", calls)
+				}
+				if testCase.payload != "" && bodies[0] != testCase.payload {
+					t.Fatalf("the fallback received %q, want exactly %q", bodies[0], testCase.payload)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatal("a non-replayable request must fail rather than be retried")
+			}
+			if calls != 0 {
+				t.Fatalf("the HTTP/2 fallback must NOT be called for a non-replayable request, "+
+					"but it was called %d time(s) with bodies %q", calls, bodies)
+			}
+		})
+	}
+}
+
+// buildProbeRequest constructs the request shapes the replay decision cares about.
+func buildProbeRequest(t *testing.T, payload string, provideGetBody bool) *http.Request {
+	t.Helper()
+	var body io.Reader
+	if payload != "" {
+		body = strings.NewReader(payload)
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://broken.example/upload", body)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if payload == "" {
+		request.Body = nil
+	}
+	if !provideGetBody {
+		request.GetBody = nil
+	}
+	return request
+}
+
+// newTestResponse builds a minimal successful response for the fake transports.
+func newTestResponse(request *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Request:    request,
+		Header:     make(http.Header),
+	}
+}
+
+// stubH3Pool is a pool whose probe always fails with a chosen error, so the
+// non-ErrNoCachedConn branch of roundTripHTTP3 can be driven deterministically.
+type stubH3Pool struct{}
+
+func newStubH3Pool() *stubH3Pool {
+	return &stubH3Pool{}
+}
+
+// pick returns a live member so the caller reaches the round trip rather than a
+// nil dereference.
+func (p *stubH3Pool) pick(request *http.Request) *http3.Transport {
+	return &http3.Transport{}
+}
+
+func (p *stubH3Pool) CloseIdleConnections() {}
+
+func (p *stubH3Pool) Close() error { return nil }

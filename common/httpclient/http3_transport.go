@@ -21,6 +21,17 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+// http3Pool is the part of http3Transport the fallback transport depends on.
+//
+// It is an interface so tests can supply a pool whose probe fails
+// deterministically, which is what makes the replay-safety guard testable without
+// a network. The concrete *http3Transport is the only production implementation.
+type http3Pool interface {
+	pick(request *http.Request) *http3.Transport
+	CloseIdleConnections()
+	Close() error
+}
+
 // http3Transport holds one or more independent HTTP/3 transports. With a pool
 // size of 1 it is the upstream single-transport transport; larger sizes let
 // concurrent requests spread over genuinely separate QUIC connections.
@@ -65,7 +76,7 @@ type http3BrokenEntry struct {
 }
 
 type http3FallbackTransport struct {
-	h3Pool        *http3Transport
+	h3Pool        http3Pool
 	h2Fallback    innerTransport
 	fallbackDelay time.Duration
 	schedule      option.HTTP3FallbackSchedule
@@ -214,7 +225,14 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 	}
 	if !errors.Is(err, http3.ErrNoCachedConn) {
 		t.markH3Broken(authority)
-		return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
+		// Replay safety: a request whose body cannot be rewound must never be
+		// retried, here or on any other transport. The body may already have been
+		// partially consumed by the failed attempt, so re-sending it would
+		// transmit a truncated or duplicated payload. This check has to come
+		// BEFORE the fallback, not after: an earlier revision cloned and retried
+		// unconditionally, so a non-replayable request could reach the HTTP/2
+		// fallback with a consumed body.
+		return t.handleProbeFailure(request, err)
 	}
 	if !requestReplayable(request) {
 		response, err = member.RoundTrip(request)
@@ -226,6 +244,21 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 		return nil, err
 	}
 	return t.roundTripHTTP3Race(request, authority, member)
+}
+
+// handleProbeFailure decides what to do when the cached-connection probe fails
+// with something other than ErrNoCachedConn.
+//
+// Replay safety: a request whose body cannot be rewound must never be retried,
+// here or on any other transport. The HTTP/3 attempt may already have consumed
+// part of the body, so re-sending it would transmit a truncated or duplicated
+// payload. An earlier revision cloned and retried unconditionally, before any
+// replayability check.
+func (t *http3FallbackTransport) handleProbeFailure(request *http.Request, probeErr error) (*http.Response, error) {
+	if !requestReplayable(request) {
+		return nil, probeErr
+	}
+	return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
 }
 
 func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, authority string, member *http3.Transport) (*http.Response, error) {

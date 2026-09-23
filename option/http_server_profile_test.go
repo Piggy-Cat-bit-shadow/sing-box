@@ -358,3 +358,128 @@ func TestJiejieProfileDoesNotRaiseQUICWindows(t *testing.T) {
 		t.Fatalf("idle_timeout must still be applied, got %v", time.Duration(options.IdleTimeout))
 	}
 }
+
+// TestProfileDoesNotOverrideExplicitZero is the regression for the "explicit
+// fields always win" contract.
+//
+// max_concurrent_streams, idle_timeout, keep_alive_period and max_header_bytes are
+// plain values, so an explicit 0 and an omitted key both decode to 0. Without
+// presence tracking the profile cannot tell them apart and silently overwrites the
+// explicit zero. keep_alive_period: 0 means "disable keep-alive", which is the
+// opposite of what the profile sets, so getting this wrong is a behaviour change
+// the user did not ask for.
+func TestProfileDoesNotOverrideExplicitZero(t *testing.T) {
+	testCases := []struct {
+		name          string
+		config        string
+		checkResolved func(t *testing.T, resolved ServerResourceOptions)
+	}{
+		{
+			name:   "explicit keep_alive_period 0 survives the profile",
+			config: `{"version":3,"server_profile":"jiejie-balanced-1g","keep_alive_period":"0s"}`,
+			checkResolved: func(t *testing.T, resolved ServerResourceOptions) {
+				if resolved.HTTP2Options.KeepAlivePeriod != 0 {
+					t.Fatalf("keep_alive_period: 0 must stay 0, got %v",
+						time.Duration(resolved.HTTP2Options.KeepAlivePeriod))
+				}
+			},
+		},
+		{
+			name:   "explicit max_concurrent_streams 0 survives the profile",
+			config: `{"version":3,"server_profile":"jiejie-balanced-1g","max_concurrent_streams":0}`,
+			checkResolved: func(t *testing.T, resolved ServerResourceOptions) {
+				if resolved.HTTP2Options.MaxConcurrentStreams != 0 {
+					t.Fatalf("max_concurrent_streams: 0 must stay 0, got %d",
+						resolved.HTTP2Options.MaxConcurrentStreams)
+				}
+			},
+		},
+		{
+			name:   "explicit idle_timeout 0 survives the profile",
+			config: `{"version":3,"server_profile":"jiejie-balanced-1g","idle_timeout":"0s"}`,
+			checkResolved: func(t *testing.T, resolved ServerResourceOptions) {
+				if resolved.HTTP2Options.IdleTimeout != 0 {
+					t.Fatalf("idle_timeout: 0 must stay 0, got %v",
+						time.Duration(resolved.HTTP2Options.IdleTimeout))
+				}
+			},
+		},
+		{
+			name:   "absent fields still take the profile",
+			config: `{"version":3,"server_profile":"jiejie-balanced-1g"}`,
+			checkResolved: func(t *testing.T, resolved ServerResourceOptions) {
+				if time.Duration(resolved.HTTP2Options.IdleTimeout) != 60*time.Second {
+					t.Fatalf("an absent idle_timeout must take the profile's 60s, got %v",
+						time.Duration(resolved.HTTP2Options.IdleTimeout))
+				}
+				if resolved.HTTP2Options.MaxConcurrentStreams != 256 {
+					t.Fatalf("an absent max_concurrent_streams must take the profile's 256, got %d",
+						resolved.HTTP2Options.MaxConcurrentStreams)
+				}
+			},
+		},
+		{
+			name:   "explicit non-zero still wins",
+			config: `{"version":3,"server_profile":"jiejie-balanced-1g","max_concurrent_streams":7,"idle_timeout":"5s"}`,
+			checkResolved: func(t *testing.T, resolved ServerResourceOptions) {
+				if resolved.HTTP2Options.MaxConcurrentStreams != 7 {
+					t.Fatalf("explicit 7 must win, got %d", resolved.HTTP2Options.MaxConcurrentStreams)
+				}
+				if time.Duration(resolved.HTTP2Options.IdleTimeout) != 5*time.Second {
+					t.Fatalf("explicit 5s must win, got %v", time.Duration(resolved.HTTP2Options.IdleTimeout))
+				}
+			},
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			var inbound HTTPInboundOptions
+			err := json.UnmarshalContext(context.Background(), []byte(testCase.config), &inbound)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			resolved, err := inbound.ResolveServerResources()
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			testCase.checkResolved(t, resolved)
+		})
+	}
+}
+
+// TestProfilePresenceTrackingIsPopulated covers the presence set itself.
+func TestProfilePresenceTrackingIsPopulated(t *testing.T) {
+	var inbound HTTPInboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{
+		"version": 3,
+		"keep_alive_period": "0s",
+		"max_header_bytes": 8192
+	}`), &inbound)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !inbound.Present.KeepAlivePeriod {
+		t.Fatal("an explicit keep_alive_period must be recorded as present")
+	}
+	if !inbound.Present.MaxHeaderBytes {
+		t.Fatal("an explicit max_header_bytes must be recorded as present")
+	}
+	if inbound.Present.IdleTimeout {
+		t.Fatal("an absent idle_timeout must NOT be recorded as present")
+	}
+	if inbound.Present.MaxConcurrentStreams {
+		t.Fatal("an absent max_concurrent_streams must NOT be recorded as present")
+	}
+
+	// An explicit max_header_bytes wins over the profile.
+	inbound.ServerProfile = HTTPServerProfileNameJiejieBalanced1G
+	resolved, err := inbound.ResolveServerResources()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if resolved.MaxHeaderBytes != 8192 {
+		t.Fatalf("an explicit max_header_bytes must win over the profile's 64 KiB, got %d",
+			resolved.MaxHeaderBytes)
+	}
+}

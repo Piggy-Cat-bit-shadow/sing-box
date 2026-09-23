@@ -1,6 +1,6 @@
 //go:build !jiejie_server_minimal
 
-package main
+package jiejie_test
 
 // Client-feature integration tests for the Jiejie Server Edition fork.
 //
@@ -79,7 +79,7 @@ func TestJiejieHTTP3UnavailableFallsBackToH2(t *testing.T) {
 	// no H3 listener exists on the UDP port, the client must fall back.
 	h2Port := startJiejieMASQUEH2(t, decoyAddr)
 
-	proxyPort := reserveOpenVPNTCPPort(t)
+	proxyPort := reserveTCPPort(t)
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
 			// SOCKS rather than mixed, so this works under the minimal build too.
@@ -202,8 +202,8 @@ func TestJiejieHTTP3PoolConfiguration(t *testing.T) {
 func TestJiejieAnyTLSAuthenticatedStillWorks(t *testing.T) {
 	_, targetAddr := startDecoyOrigins(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	anytlsPort := reserveOpenVPNTCPPort(t)
-	clientPort := reserveOpenVPNTCPPort(t)
+	anytlsPort := reserveTCPPort(t)
+	clientPort := reserveTCPPort(t)
 
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{
@@ -225,7 +225,7 @@ func TestJiejieAnyTLSAuthenticatedStillWorks(t *testing.T) {
 					},
 					Fallback: &option.ServerOptions{
 						Server:     "127.0.0.1",
-						ServerPort: reserveOpenVPNTCPPort(t),
+						ServerPort: reserveTCPPort(t),
 					},
 				},
 			},

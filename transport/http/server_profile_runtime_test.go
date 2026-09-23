@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +22,6 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/byteformats"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 
@@ -127,16 +125,20 @@ func TestServerProfileUnsetKeepsUpstreamDefaults(t *testing.T) {
 // TestExplicitValuesBeatProfileOnTheResolvedOptions proves the precedence rule
 // survives the refactor: an explicitly configured field is not overwritten.
 func TestExplicitValuesBeatProfileOnTheResolvedOptions(t *testing.T) {
-	explicitStream := testMemoryBytes(t, 1<<20)
-	options := option.HTTPInboundOptions{
-		ServerProfile:  option.HTTPServerProfileNameJiejieBalanced1G,
-		MaxHeaderBytes: 4096,
-	}
-	options.HTTP2Options = option.HTTP2Options{
-		MaxConcurrentStreams: 7,
-		StreamReceiveWindow:  explicitStream,
-		IdleTimeout:          badoption.Duration(5 * time.Second),
-	}
+	// Decode through JSON rather than constructing the struct directly.
+	// ResourceFieldPresence is populated by the decoder, so a programmatically
+	// built value cannot express "the user wrote this field", and the profile
+	// would fill it. JSON is the real configuration path.
+	var options option.HTTPInboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{
+		"version": 3,
+		"server_profile": "jiejie-balanced-1g",
+		"max_header_bytes": 4096,
+		"max_concurrent_streams": 7,
+		"stream_receive_window": "1MB",
+		"idle_timeout": "5s"
+	}`), &options)
+	require.NoError(t, err)
 	resolved, err := options.ResolveServerResources()
 	require.NoError(t, err)
 
@@ -285,13 +287,6 @@ func TestH3HeaderLimitDefaultsToUpstream(t *testing.T) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-func testMemoryBytes(t *testing.T, value int64) *byteformats.MemoryBytes {
-	t.Helper()
-	parsed := byteformats.MemoryBytes{}
-	require.NoError(t, parsed.UnmarshalJSON([]byte(strconv.FormatInt(value, 10))))
-	return &parsed
-}
 
 // startH3ServerWithHeaderLimit starts a real HTTP/3 server on loopback with the
 // given header limit, mirroring how transport/http/server_h3.go builds it.

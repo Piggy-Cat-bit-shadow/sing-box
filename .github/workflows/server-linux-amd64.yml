@@ -133,8 +133,12 @@ jobs:
           # test/ is its own Go module, so it is built from inside that directory.
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           echo "production tags: $TAGS"
-          cd test
-          go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../integration-production.log
+          # test/jiejie is its own package with no Docker dependency. The upstream
+          # test package imports the whole upstream integration suite, which pulls
+          # images for shadowsocks-rust, v2ray, trojan, naive, hysteria, tuic and
+          # xray even when only Jiejie tests are selected.
+          cd test/jiejie
+          go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../../integration-production.log
 
       # Runs the REAL cmd/sing-box binary as a separate process and drives traffic
       # at it from the test process. Everything above this uses include.Context +
@@ -146,9 +150,9 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           go build -tags "$TAGS" -o /tmp/sing-box-production ./cmd/sing-box
-          cd test
+          cd test/jiejie
           SING_BOX_PRODUCTION_BINARY=/tmp/sing-box-production \
-            go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestProductionBinary' . 2>&1 | tee ../integration-process.log
+            go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestProductionBinary' . 2>&1 | tee ../../integration-process.log
 
   client-feature-integration:
     runs-on: ubuntu-latest
@@ -170,10 +174,10 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           echo "client-feature tags: $TAGS"
-          cd test
+          cd test/jiejie
           go test -tags "$TAGS" -v -count=1 -timeout 20m \
             -run 'TestJiejieH3FallbackBackoffConfiguration|TestJiejieHTTP3UnavailableFallsBackToH2|TestJiejieHTTP3PoolConfiguration|TestJiejieAnyTLSAuthenticatedStillWorks|TestJiejieAnyTLSFallback' \
-            . 2>&1 | tee ../integration-client-feature.log
+            . 2>&1 | tee ../../integration-client-feature.log
 
       - name: Upstream HTTP compatibility tests (default tags)
         shell: bash

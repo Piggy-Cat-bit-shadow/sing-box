@@ -17,10 +17,21 @@ import (
 // cannot multiply its budget by opening many connections. The map is bounded
 // by maxTracked and entries expire after idleTimeout, so an attacker sending
 // from random addresses cannot grow the map without bound.
+// cleanupInterval is how many acquired slots pass between full expiry sweeps.
+//
+// Sweeping on every request made acquire O(tracked IPs) per request, so with
+// max_tracked_ips=4096 every request scanned 4096 entries under the mutex. Expiry
+// is now amortized: a sweep runs periodically and whenever the map approaches its
+// cap, which keeps memory bounded without paying O(n) on the hot path.
+const cleanupInterval = 256
+
 type unauthenticatedLimiter struct {
 	access sync.Mutex
 	limits option.UnauthenticatedLimits
 	states map[netip.Addr]*unauthenticatedState
+	// acquisitions counts acquire calls since the last sweep. It is read and
+	// written only under access.
+	acquisitions int
 }
 
 type unauthenticatedState struct {
@@ -82,7 +93,13 @@ func (l *unauthenticatedLimiter) acquire(source string, now time.Time) (func(), 
 	}
 	l.access.Lock()
 	defer l.access.Unlock()
-	l.expireLocked(now)
+	// Amortized expiry: only sweep every cleanupInterval acquisitions or when the
+	// map is at its cap. Sweeping on every call was O(tracked IPs) per request.
+	l.acquisitions++
+	if l.acquisitions >= cleanupInterval || len(l.states) >= l.limits.MaxTrackedIPs {
+		l.acquisitions = 0
+		l.expireLocked(now)
+	}
 	state, loaded := l.states[address]
 	if !loaded {
 		// Enforce the tracked-IP cap before adding a new entry so a flood of

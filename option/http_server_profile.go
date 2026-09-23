@@ -174,3 +174,33 @@ func (o ServerBBRProfile) BBRProfileValue() string {
 	}
 	return o.Name
 }
+
+// ApplyToHTTP2WithPresence fills only the fields the user did NOT write.
+//
+// The presence set matters because these fields are plain values, not pointers:
+// an explicit `keep_alive_period: 0` and an omitted key both decode to 0. The
+// profile must not overwrite an explicit zero, because "explicit fields always
+// win" is the contract this fork documents. `keep_alive_period: 0` in particular
+// means "disable keep-alive", which is the opposite of what the profile sets.
+func (p HTTPServerProfile) ApplyToHTTP2WithPresence(options *HTTP2Options, present ResourceFieldPresence) {
+	if !present.MaxConcurrentStreams && p.MaxConcurrentStreams > 0 && options.MaxConcurrentStreams == 0 {
+		options.MaxConcurrentStreams = p.MaxConcurrentStreams
+	}
+	if !present.StreamReceiveWindow && p.StreamReceiveWindow > 0 && options.StreamReceiveWindow == nil {
+		options.StreamReceiveWindow = memoryBytesValue(p.StreamReceiveWindow)
+	}
+	if !present.ConnectionReceiveWindow && p.ConnectionReceiveWindow > 0 && options.ConnectionReceiveWindow == nil {
+		options.ConnectionReceiveWindow = memoryBytesValue(p.ConnectionReceiveWindow)
+	}
+	if !present.IdleTimeout && p.IdleTimeout > 0 && options.IdleTimeout == 0 {
+		options.IdleTimeout = badoption.Duration(p.IdleTimeout)
+	}
+	if !present.KeepAlivePeriod && p.KeepAlivePeriod > 0 && options.KeepAlivePeriod == 0 {
+		options.KeepAlivePeriod = badoption.Duration(p.KeepAlivePeriod)
+	}
+}
+
+// ApplyToQUICWithPresence is the QUIC form of ApplyToHTTP2WithPresence.
+func (p HTTPServerProfile) ApplyToQUICWithPresence(options *QUICOptions, present ResourceFieldPresence) {
+	p.ApplyToHTTP2WithPresence(&options.HTTP2Options, present)
+}

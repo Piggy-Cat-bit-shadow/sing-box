@@ -29,8 +29,13 @@ const (
 	maxHeaderBytes      = 1 << 20
 	idleTimeout         = 60 * time.Second
 	maxDiscardBodyBytes = 256 << 10
-	discardBodyTimeout  = 5 * time.Second
-	realm               = "sing-box"
+	// maxUnauthenticatedBodyBytes bounds the request body an unauthenticated
+	// (failed-authentication) request may push at the masquerade backend. Normal
+	// web requests are far smaller; this exists so a failed-auth probe cannot
+	// stream an unbounded body through the reverse proxy.
+	maxUnauthenticatedBodyBytes = 256 << 10
+	discardBodyTimeout          = 5 * time.Second
+	realm                       = "sing-box"
 )
 
 // ConfigureHTTP3ListenerFunc builds the HTTP/3 listener. maxHeaderBytes is the

@@ -97,21 +97,17 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 	}
 	tunnelHandler := h.server.tunnels[protocol]
 	if tunnelHandler != nil {
-		release, overLimit := h.admitUnauthenticated(connectionSource)
+		// Authenticate FIRST. A successful authentication must not touch the
+		// limiter at all: no token is consumed, no concurrent slot is taken and
+		// the limiter map is not consulted. Acquiring before authenticating made
+		// authenticated traffic pay for the limiter and could delay it under
+		// abuse.
 		authCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
-		if authErr != nil {
-			release()
-			if overLimit {
-				h.rejectUnauthenticated(ctx, writer, request, connectionSource)
-				return
-			}
-			h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, false)
+		if authErr == nil {
+			h.serveTunnel(authCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
 			return
 		}
-		// Authentication succeeded: the request leaves the unauthenticated
-		// limiter immediately so proxy traffic is never throttled here.
-		release()
-		h.serveTunnel(authCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
+		h.serveUnauthenticatedFailure(ctx, writer, request, connectionSource, authErr, false)
 		return
 	}
 	if h.handler == nil {
@@ -119,18 +115,12 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	release, overLimit := h.admitUnauthenticated(connectionSource)
+	// Authenticate FIRST, for the same reason as the tunnel path above.
 	proxyCtx, authErr := h.server.authenticate(ctx, request, "Proxy-Authorization")
 	if authErr != nil {
-		release()
-		if overLimit {
-			h.rejectUnauthenticated(ctx, writer, request, connectionSource)
-			return
-		}
-		h.serveAuthFailure(ctx, writer, request, connectionSource, authErr, true)
+		h.serveUnauthenticatedFailure(ctx, writer, request, connectionSource, authErr, true)
 		return
 	}
-	release()
 	ctx = proxyCtx
 	source := badhttp.ForwardedSource(request, connectionSource)
 	if request.Method == http.MethodConnect {
@@ -146,24 +136,6 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	h.serveForward(ctx, writer, request, source)
-}
-
-// admitUnauthenticated accounts an unauthenticated request against the limiter.
-//
-// It records whether the budget was exceeded but never answers the request by
-// itself. The decision is deferred until authentication has been attempted,
-// because only a failed authentication identifies an abusive peer. Refusing
-// before authenticating would break a legitimate client that simply
-// reconnects more often than the unauthenticated budget allows.
-//
-// The returned release function must be called when the request finishes.
-func (h *httpHandler) admitUnauthenticated(source M.Socksaddr) (release func(), overLimit bool) {
-	limiter := h.server.unauthenticatedLimiter
-	if limiter == nil {
-		return func() {}, false
-	}
-	release, allowed := limiter.acquire(source.AddrString(), time.Now())
-	return release, !allowed
 }
 
 // rejectUnauthenticated answers a request that both failed authentication and
@@ -182,6 +154,54 @@ func (h *httpHandler) rejectUnauthenticated(ctx context.Context, writer http.Res
 		decoy = NewOverLimitDecoy()
 	}
 	decoy.ServeHTTP(writer, request)
+}
+
+// serveUnauthenticatedFailure handles a request that has already FAILED
+// authentication. It is only reached on that path, so authenticated proxy
+// traffic never touches the limiter.
+//
+// Order of operations:
+//
+//  1. acquire the limiter slot (token + per-IP concurrency);
+//  2. if allowed, serve the masquerade handler while HOLDING the slot, so the
+//     concurrency bound covers the entire backend request, not just admission;
+//  3. if over limit, answer with the local decoy and never reach the backend.
+func (h *httpHandler) serveUnauthenticatedFailure(ctx context.Context, writer http.ResponseWriter, request *http.Request, source M.Socksaddr, authErr error, proxyAuth bool) {
+	release, overLimit := h.admitUnauthenticated(source)
+	if overLimit {
+		release()
+		h.rejectUnauthenticated(ctx, writer, request, source)
+		return
+	}
+	if h.server.masquerade != nil {
+		// The slot is released only after the masquerade handler returns, which is
+		// what makes the per-IP concurrency bound cover the backend request.
+		defer release()
+		// Bound the body an unauthenticated peer can push at the decoy backend.
+		// Without this a failed-auth request could stream an arbitrarily large
+		// body through the reverse proxy.
+		if request.Body != nil && request.Body != http.NoBody {
+			request.Body = http.MaxBytesReader(writer, request.Body, maxUnauthenticatedBodyBytes)
+		}
+		h.serveAuthFailure(ctx, writer, request, source, authErr, proxyAuth)
+		return
+	}
+	release()
+	h.serveAuthFailure(ctx, writer, request, source, authErr, proxyAuth)
+}
+
+// admitUnauthenticated accounts a FAILED authentication attempt against the
+// limiter.
+//
+// It is called only after authentication has failed, so it never consumes budget
+// for legitimate proxy traffic.
+func (h *httpHandler) admitUnauthenticated(source M.Socksaddr) (release func(), overLimit bool) {
+	limiter := h.server.unauthenticatedLimiter
+	if limiter == nil {
+		return func() {}, false
+	}
+	release, allowed := limiter.acquire(source.AddrString(), time.Now())
+	return release, !allowed
 }
 
 // serveAuthFailure handles a failed authentication attempt. With a masquerade

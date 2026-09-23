@@ -1,4 +1,4 @@
-package main
+package jiejie_test
 
 import (
 	std_bufio "bufio"
@@ -94,7 +94,7 @@ func loopbackPort(t *testing.T, address string) uint16 {
 func TestJiejieAnyTLSFallbackNotAnAnyTLSClient(t *testing.T) {
 	decoyAddr, _ := startDecoyOrigins(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	anytlsPort := reserveOpenVPNTCPPort(t)
+	anytlsPort := reserveTCPPort(t)
 
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
@@ -152,7 +152,7 @@ func TestJiejieAnyTLSFallbackNotAnAnyTLSClient(t *testing.T) {
 func TestJiejieAnyTLSFallbackWrongPassword(t *testing.T) {
 	decoyAddr, _ := startDecoyOrigins(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	anytlsPort := reserveOpenVPNTCPPort(t)
+	anytlsPort := reserveTCPPort(t)
 
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
@@ -209,7 +209,7 @@ func TestJiejieAnyTLSFallbackWrongPassword(t *testing.T) {
 func startJiejieMASQUEH2(t *testing.T, decoyAddr string) uint16 {
 	t.Helper()
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	port := reserveOpenVPNTCPPort(t)
+	port := reserveTCPPort(t)
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
 			Type: C.TypeHTTP,
@@ -355,7 +355,7 @@ func TestJiejieMASQUEH2Masquerade(t *testing.T) {
 func startJiejieMASQUEH3(t *testing.T, decoyAddr string, extra func(*option.HTTPInboundOptions)) uint16 {
 	t.Helper()
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	port := reserveOpenVPNUDPPort(t)
+	port := reserveUDPPort(t)
 	inbound := &option.HTTPInboundOptions{
 		ListenOptions: option.ListenOptions{
 			Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),

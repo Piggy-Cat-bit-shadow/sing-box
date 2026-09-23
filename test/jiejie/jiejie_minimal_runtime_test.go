@@ -1,4 +1,4 @@
-package main
+package jiejie_test
 
 import (
 	std_bufio "bufio"
@@ -171,7 +171,7 @@ func startMinimalMASQUEH2(t *testing.T, withLimiter bool) *minimalServer {
 	decoy := startMinimalDecoyWeb(t)
 	origin := startMinimalHTTPOrigin(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
-	port := reserveOpenVPNTCPPort(t)
+	port := reserveTCPPort(t)
 
 	options := &option.HTTPInboundOptions{
 		ListenOptions: option.ListenOptions{
@@ -472,7 +472,7 @@ func startMinimalMASQUEH3WithLogFile(t *testing.T, withLimiter bool, logPath str
 	decoy := startMinimalDecoyWeb(t)
 	origin := startMinimalHTTPOrigin(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
-	port := reserveOpenVPNUDPPort(t)
+	port := reserveUDPPort(t)
 
 	options := &option.HTTPInboundOptions{
 		ListenOptions: option.ListenOptions{
@@ -771,7 +771,7 @@ func TestJiejieMinimalMASQUEH3UnauthenticatedLimiter(t *testing.T) {
 func TestJiejieMinimalAnyTLSFallback(t *testing.T) {
 	decoy := startMinimalDecoyWeb(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
-	anytlsPort := reserveOpenVPNTCPPort(t)
+	anytlsPort := reserveTCPPort(t)
 
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{{
@@ -861,8 +861,8 @@ func TestJiejieMinimalAnyTLSFallback(t *testing.T) {
 func TestJiejieMinimalShadowTLSInboundRegisters(t *testing.T) {
 	ssPassword := mkBase64(t, 16)
 	method := shadowaead_2022.List[0]
-	shadowTLSPort := reserveOpenVPNTCPPort(t)
-	ssPort := reserveOpenVPNTCPPort(t)
+	shadowTLSPort := reserveTCPPort(t)
+	ssPort := reserveTCPPort(t)
 
 	instance := startInstance(t, option.Options{
 		Inbounds: []option.Inbound{
@@ -930,8 +930,8 @@ func TestJiejieMinimalShadowTLSInboundRegisters(t *testing.T) {
 func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
 	originAddress := startMinimalHTTPOrigin(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
-	h2Port := reserveOpenVPNTCPPort(t)
-	h3Port := reserveOpenVPNUDPPort(t)
+	h2Port := reserveTCPPort(t)
+	h3Port := reserveUDPPort(t)
 
 	// The profile is applied to an H3 listener; the H2 listener is asserted via
 	// its own inbound so both protocols are covered.

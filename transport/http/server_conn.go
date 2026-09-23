@@ -53,7 +53,9 @@ func (c *serverConn) serve() {
 
 func (c *serverConn) serveRequest() (requestResult, error) {
 	c.conn.SetReadDeadline(time.Now().Add(idleTimeout))
-	c.reader.setLimit(maxHeaderBytes)
+	// Use the resolved per-server limit, not the package constant, so
+	// max_header_bytes applies to HTTP/1.1 as well as HTTP/2 and HTTP/3.
+	c.reader.setLimit(int64(c.server.maxHeaderBytes))
 	request, err := badhttp.ReadRequest(c.reader.Reader)
 	c.reader.setLimit(-1)
 	c.conn.SetReadDeadline(time.Time{})

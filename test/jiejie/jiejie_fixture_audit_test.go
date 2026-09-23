@@ -1,4 +1,4 @@
-package main
+package jiejie_test
 
 import (
 	"encoding/json"
@@ -72,7 +72,7 @@ type productionFixture struct {
 
 func loadProductionFixture(t *testing.T) (*productionFixture, string) {
 	t.Helper()
-	path := filepath.Join("..", "release", "jiejie-production-topology.json")
+	path := filepath.Join("..", "..", "release", "jiejie-production-topology.json")
 	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read production fixture: %v", err)

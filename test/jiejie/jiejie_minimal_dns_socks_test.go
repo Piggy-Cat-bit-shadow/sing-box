@@ -1,4 +1,4 @@
-package main
+package jiejie_test
 
 import (
 	std_bufio "bufio"
@@ -204,7 +204,7 @@ func TestJiejieMinimalResidentialSOCKSOutbound(t *testing.T) {
 	// The entry point is a Shadowsocks 2022 inbound, which the minimal registry
 	// does register; the socks inbound is deliberately absent, so the test drives
 	// the path with a real SS2022 client instead.
-	entryPort := reserveOpenVPNTCPPort(t)
+	entryPort := reserveTCPPort(t)
 	entryPassword := mkBase64(t, 16)
 	const entryMethod = "2022-blake3-aes-128-gcm"
 	startInstance(t, option.Options{

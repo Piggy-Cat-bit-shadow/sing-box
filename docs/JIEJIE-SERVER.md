@@ -714,7 +714,81 @@ Treat these as unproven on this server until you measure them:
 * `GOAMD64=v3` and `CGO_ENABLED=0` artifacts.
 * Any non-default `stream_receive_window` / `connection_receive_window`.
 
-## 17. No unmeasured performance claims
+## 17. Source capability vs the published artifact
+
+The fork's **source** and the **published artifact** are not the same thing, and
+conflating them is misleading.
+
+| Capability | In the fork's source | In `sing-box-linux-amd64` |
+| --- | --- | --- |
+| HTTP/3 connection pool (client) | yes | **not registered** |
+| Configurable HTTP/3 fallback backoff (client) | yes | **not registered** |
+| `http` / `anytls` / `shadowtls` / `shadowsocks` inbounds | yes | yes |
+| `direct` / `socks` outbounds | yes | yes |
+| UDP DNS | yes | yes |
+| HTTP, AnyTLS, ShadowTLS, Shadowsocks outbounds | yes | **no** |
+| Hysteria, TUIC, VLESS, VMess, Trojan, naive, tor, ssh, snell, mixed, tun, … | yes | **no** |
+
+`sing-box-linux-amd64` is built from
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`, which registers no HTTP outbound. It is
+therefore a **server**, and it cannot act as a pool-enabled HTTP client.
+
+In particular: **enabling `http3_connection_pool` on the server changes nothing
+about client behaviour.** The pool is a client-side transport feature; it creates
+multiple QUIC connections from the client to the server. Setting it on an inbound
+is now rejected outright, because the inbound shares the option type with the
+outbound and would otherwise be accepted while doing nothing.
+
+To use the pool, run the client build (the upstream/default tag set, or a
+hand-built binary) with a `http` outbound configured as shown in section 5.
+
+## 18. Unauthenticated traffic: what is bounded, and where the source IP comes from
+
+### The H2 path behind Nginx sees Nginx, not the client
+
+The production topology is:
+
+```
+public TCP/443 -> Nginx Stream -> 127.0.0.1:28440 -> sing-box HTTP/2
+```
+
+There is no PROXY protocol on that hop, so the source address sing-box observes for
+HTTP/2 is **127.0.0.1** — the Nginx process — not the public client. Any per-IP
+policy on the H2 inbound therefore applies to a single address, which makes it a
+**global budget for that listener** rather than a per-client one.
+
+The H3 path is different:
+
+```
+public UDP/443 -> sing-box HTTP/3
+```
+
+sing-box accepts those QUIC connections directly, so per-source-IP limits there
+are genuinely per client.
+
+Consequences to be aware of:
+
+* On H3, `unauthenticated_limits` is per real client IP, as intended.
+* On H2, `max_concurrent_per_ip` and `requests_per_second` collapse into one
+  shared budget for everything arriving through Nginx. That is still a useful
+  bound — it caps how much unauthenticated work the loopback listener can
+  generate — but it is not per client.
+* If you need real per-client IPs on the H2 path you must add PROXY protocol on
+  the Nginx hop and enable it in sing-box. That is deliberately **not**
+  implemented here; it would change the listener and the config schema.
+
+The production fixture uses `unauthenticated_limits` on both listeners. Treat the
+H2 entry as a loopback budget, not a per-client limit.
+
+### The body bound
+
+A failed-authentication request may reach the masquerade backend, so its request
+body is capped at 256 KiB (`maxUnauthenticatedBodyBytes`). Without this a
+failed-auth probe could stream an arbitrarily large body through the reverse
+proxy. Over-limit requests never reach the backend at all and receive the local
+decoy instead.
+
+## 19. No unmeasured performance claims
 
 This fork does **not** claim that any option makes the server faster. The
 benchmarks in CI are regression references on shared runners, and loopback
