@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -54,11 +55,25 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if len(options.PaddingScheme) > 0 {
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
+	var fallback N.TCPConnectionHandlerEx
+	if options.Fallback != nil {
+		if options.Fallback.Server == "" {
+			return nil, E.New("missing AnyTLS fallback server")
+		}
+		if options.Fallback.ServerPort == 0 {
+			return nil, E.New("missing AnyTLS fallback server port")
+		}
+		fallback = &fallbackHandler{
+			destination: M.ParseSocksaddrHostPort(options.Fallback.Server, options.Fallback.ServerPort),
+			logger:      logger,
+		}
+	}
 
 	service, err := anytls.NewMultiService[string](anytls.ServiceOptions{
-		PaddingScheme: paddingScheme,
-		Handler:       (*inboundHandler)(inbound),
-		Logger:        logger,
+		PaddingScheme:   paddingScheme,
+		Handler:         (*inboundHandler)(inbound),
+		FallbackHandler: fallback,
+		Logger:          logger,
 	})
 	if err != nil {
 		return nil, err
@@ -79,6 +94,25 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 	})
 	return inbound, nil
+}
+
+type fallbackHandler struct {
+	destination M.Socksaddr
+	logger      logger.ContextLogger
+}
+
+func (h *fallbackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	upstream, err := N.SystemDialer.DialContext(ctx, N.NetworkTCP, h.destination)
+	if err != nil {
+		h.logger.DebugContext(ctx, "AnyTLS fallback backend dial failed: ", err)
+		N.CloseOnHandshakeFailure(conn, onClose, err)
+		return
+	}
+	h.logger.DebugContext(ctx, "AnyTLS fallback connection from ", source, " to ", h.destination)
+	err = bufio.CopyConn(ctx, conn, upstream)
+	if onClose != nil {
+		onClose(err)
+	}
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
