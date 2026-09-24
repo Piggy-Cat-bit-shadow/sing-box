@@ -167,7 +167,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
-			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
+			// A scanner that connects and sends garbage, or that drops the
+			// connection mid-handshake, is routine traffic on a public port.
+			// Only an unrecognised failure is worth an operator's attention.
+			logPreAuthFailure(ctx, h.logger, metadata.Source, err, "TLS handshake")
 			return
 		}
 		conn = tlsConn
@@ -187,7 +190,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
-		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		// The one-shot pre-auth read deadline lands here as an i/o timeout when
+		// a peer completes TLS and then stays silent. That is the timeout doing
+		// its job, not a fault, so it must not flood the error log.
+		logPreAuthFailure(ctx, h.logger, metadata.Source, err, "")
 	}
 }
 
