@@ -97,7 +97,7 @@ these would be accepted and silently change nothing — the same failure mode as
 | --- | --- | --- |
 | `memory_budget` | **NOT IMPLEMENTED** | A byte-accurate QUIC memory budget cannot be measured honestly on the current quic-go/sing-quic lifecycle. Deterministic limits are used instead. |
 | H3 connection-count / per-source connection cap | **NOT IMPLEMENTED** | Would require hooking quic-go's connection acceptance. `max_concurrent_streams` bounds streams *within* a connection and the limiter counts HTTP requests, so neither bounds the number of connections. The documentation states this limitation rather than implying a total bound. |
-| Server-side enforcement of `max_header_bytes` over HTTP/3 | **NOT IMPLEMENTED (protocol limitation)** | HTTP/3 carries the limit as `SETTINGS_MAX_FIELD_SECTION_SIZE`; quic-go publishes it but does not police inbound header blocks. The tests assert the advertisement, not a rejection. |
+| Server-side enforcement of `max_header_bytes` over HTTP/3 | **IMPLEMENTED** | quic-go v0.61.0-sing-box-mod.7 enforces it at two levels: the raw HEADERS frame length is checked before the block is read, and the decoded field section is re-checked by `requestFromHeaders`. An oversized block gets `431` and the handler never runs; trailers are bounded the same way. `TestH3HeaderLimitIsEnforced` proves this over the real QUIC/H3 wire. An earlier revision of this table wrongly called it a protocol limitation. |
 
 ---
 

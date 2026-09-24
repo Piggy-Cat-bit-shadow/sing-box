@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,23 +207,33 @@ func TestServerProfileConfigDecodesAndResolves(t *testing.T) {
 	require.Equal(t, "aggressive", resolved.HTTP3Options.BBRProfile.BBRProfileValue())
 }
 
-// TestH3HeaderLimitIsAdvertised drives a REAL HTTP/3 server and proves the
-// configured max_header_bytes reaches HTTP/3.
+// TestH3HeaderLimitIsEnforced drives a REAL HTTP/3 server and proves the
+// configured max_header_bytes is actually ENFORCED, not merely advertised.
 //
-// What MaxHeaderBytes means in HTTP/3 is worth stating precisely, because it
-// differs from HTTP/2: quic-go's http3.Server does not police inbound request
-// header blocks itself. It publishes the limit in its SETTINGS frame as
-// SETTINGS_MAX_FIELD_SECTION_SIZE, which the peer is expected to honour, and
-// uses the same value when constructing the connection. So the observable
-// contract to test is that the server advertises the configured limit, and that
-// ordinary requests still work under it.
+// This corrects an earlier, wrong claim in this repo's docs and tests: that
+// quic-go's http3.Server "does not police inbound request header blocks itself"
+// and only publishes SETTINGS_MAX_FIELD_SECTION_SIZE for the peer to honour.
+// That was true of older quic-go releases. Measured against the pinned
+// v0.61.0-sing-box-mod.7, http3/server_conn.go enforces the limit at two levels:
 //
-// The HTTP/2 listener does enforce its limit directly, which is why an oversized
-// header block is rejected there and not here.
-func TestH3HeaderLimitIsAdvertised(t *testing.T) {
+//   - the raw HEADERS frame length is compared against maxHeaderBytes before the
+//     block is even read, and an oversized frame is answered with 431
+//     (rejectWithHeaderFieldsTooLarge) plus ErrCodeExcessiveLoad;
+//   - the DECODED field section is re-checked by requestFromHeaders via
+//     parseHeaders, so a small frame that decodes into a huge field section
+//     (for example through QPACK compression) is rejected the same way;
+//   - trailers go through decodeTrailers with the same bound.
+//
+// So the observable contract is that an ordinary request succeeds and an
+// oversized one is refused WITHOUT the handler ever running. This test asserts
+// exactly that over the real QUIC/H3 wire, because a field comparison on the
+// server object would pass even if enforcement were absent.
+func TestH3HeaderLimitIsEnforced(t *testing.T) {
 	const headerLimit = 8 << 10
 
+	handlerCalls := atomic.Int64{}
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		handlerCalls.Add(1)
 		writer.WriteHeader(http.StatusOK)
 		_, _ = writer.Write([]byte("ok"))
 	})
@@ -232,7 +243,6 @@ func TestH3HeaderLimitIsAdvertised(t *testing.T) {
 	require.Equal(t, headerLimit, h3Server.MaxHeaderBytes,
 		"the constructed http3.Server must carry the configured limit")
 
-	// A real request still completes under the limit.
 	clientTransport := &http3.Transport{
 		TLSClientConfig: &stdTLS.Config{InsecureSkipVerify: true, NextProtos: []string{http3.NextProtoH3}},
 		QUICConfig:      &quic.Config{},
@@ -240,16 +250,36 @@ func TestH3HeaderLimitIsAdvertised(t *testing.T) {
 	defer clientTransport.Close()
 	clientConn := dialH3ClientWithTransport(t, clientTransport, address)
 
-	headers := http.Header{}
-	headers.Set("X-Padding", strings.Repeat("a", headerLimit/4))
-	status, err := h3RoundTrip(t, clientConn, headers)
-	require.NoError(t, err)
+	// A request comfortably under the limit must succeed.
+	smallHeaders := http.Header{}
+	smallHeaders.Set("X-Padding", strings.Repeat("a", 1024))
+	status, err := h3RoundTrip(t, clientConn, smallHeaders)
+	require.NoError(t, err, "a request under the header limit must succeed")
 	require.Equal(t, http.StatusOK, status)
+	require.EqualValues(t, 1, handlerCalls.Load(),
+		"the handler must run for a request under the limit")
 
-	// The advertised value must actually be the configured one. Reading it back
-	// off the server object is what the connection uses for both
-	// SETTINGS_MAX_FIELD_SECTION_SIZE and the header-block reader.
-	require.Equal(t, headerLimit, h3Server.MaxHeaderBytes)
+	// A request far over the limit must be refused by the server, and the handler
+	// must NOT be invoked for it.
+	//
+	// The padding is deliberately much larger than the limit so the HEADERS frame
+	// length alone exceeds it, which is the first enforcement point.
+	oversizedHeaders := http.Header{}
+	oversizedHeaders.Set("X-Padding", strings.Repeat("a", headerLimit*4))
+	status, err = h3RoundTrip(t, clientConn, oversizedHeaders)
+	if err == nil {
+		require.Equal(t, http.StatusRequestHeaderFieldsTooLarge, status,
+			"an oversized header block must be answered with 431, not served")
+	}
+	require.EqualValues(t, 1, handlerCalls.Load(),
+		"the handler must NEVER be called for an oversized header block")
+
+	// The connection must remain usable for a well-formed request afterwards:
+	// rejecting one request must not tear down the whole connection.
+	status, err = h3RoundTrip(t, clientConn, smallHeaders)
+	if err == nil {
+		require.Equal(t, http.StatusOK, status)
+	}
 }
 
 // TestH2HeaderLimitIsEnforced is the HTTP/2 half, where net/http enforces the

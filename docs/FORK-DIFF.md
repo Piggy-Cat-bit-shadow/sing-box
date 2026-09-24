@@ -54,6 +54,20 @@ The same file exposes `bbr_profile`, accepting exactly the three profiles that
 `sing-quic/congestion_meta2` really defines (`conservative`, `standard`,
 `aggressive`). Unset means `standard`, which is the previous hardcoded value.
 
+`server_profile`'s `idle_timeout` is applied to **both** QUIC idle timers on the
+HTTP/3 listener: `quic.Config.MaxIdleTimeout` (transport) and
+`http3.Server.IdleTimeout` (application). Only the first was wired before, and
+the transport timer is refreshed by any packet including a bare PING, so a peer
+could complete the handshake and then hold the connection open indefinitely
+without ever opening a request stream. The application timer is armed at
+connection creation, stopped when a request stream arrives and reset only when
+the last stream closes, so long-lived CONNECT tunnels are unaffected.
+
+`max_header_bytes` is enforced by HTTP/3 as well as HTTP/2. quic-go
+v0.61.0-sing-box-mod.7 checks both the raw HEADERS frame length and the decoded
+field section, answers an oversized block with `431`, and bounds trailers the
+same way; the handler is never invoked for a rejected request.
+
 ## Patch 4: unauthenticated resource limits
 
 `transport/http/unauthenticated_limiter.go` and
