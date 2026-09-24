@@ -50,6 +50,16 @@ error path. No `Proxy-Authenticate` or `WWW-Authenticate` is ever emitted, and
 no proxy-shaped status code is returned. `fallback_for_alpn` routes by the
 negotiated ALPN when configured.
 
+*ALPN audit.* Production configures **no** ALPN on the AnyTLS inbound, so Go
+negotiates no protocol. This was measured rather than assumed, for every
+client-side offer: `["h2"]`, `["http/1.1"]`, `["h2","http/1.1"]` and no ALPN all
+complete the handshake with an empty negotiated protocol and are all served a
+normal `HTTP/1.1 200 OK` by the fallback backend. The conclusion is that pinning
+an ALPN on this inbound would change nothing observable for a fallback client,
+while risking legitimate AnyTLS clients, so **no ALPN change is made**. The
+measurement is pinned by `TestJiejieAnyTLSALPNMatrix` so a future change has to
+confront it instead of asserting an improvement.
+
 **MASQUE H2.** GET and CONNECT with no credentials and with wrong credentials are
 served the masquerade web decoy. This includes CONNECT: an unauthenticated
 CONNECT does not get a proxy error, it gets the decoy page. One case is recorded
@@ -134,7 +144,7 @@ TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
 # Probe behaviour, HTTP/2 and HTTP/3 matrices
 (cd test && go test -tags "$TAGS" -run 'TestJiejieMASQUE.*ProbeMatrix' ./jiejie/)
 
-# AnyTLS fallback and the one-shot post-TLS read bound
+# AnyTLS fallback, ALPN behaviour and the one-shot post-TLS read bound
 (cd test && go test -tags "$TAGS" -run 'TestJiejieAnyTLS' ./jiejie/)
 
 # ShadowTLS probe fallback against a local decoy
