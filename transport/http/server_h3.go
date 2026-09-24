@@ -36,7 +36,26 @@ func init() {
 		if quicConfig.MaxIncomingStreams == 0 {
 			quicConfig.MaxIncomingStreams = 1 << 60
 		}
-		quicConfig.Allow0RTT = true
+		// 0-RTT is disabled on the proxy inbound.
+		//
+		// Why: a CONNECT is not a safe, idempotent request. It creates a tunnel,
+		// and 0-RTT data is REPLAYABLE BY DESIGN, so a captured CONNECT could be
+		// replayed by a network attacker. The HTTP/3 layer does not filter this
+		// for us -- quic-go's own comment in http3/server.go says "It's the
+		// client's responsibility to decide which requests are eligible for
+		// 0-RTT" -- so a third-party client is free to send CONNECT as early data
+		// if the server permits 0-RTT at all.
+		//
+		// Our own client already refuses to do so: it gates every CONNECT on
+		// HandshakeComplete (see client_h3.go awaitHandshake). This setting makes
+		// the server enforce the same rule for clients that do not.
+		//
+		// The cost is nil for the data path: session resumption still works, and
+		// only the ability to send application data in the first flight is lost,
+		// which for a proxy tunnel means one extra round trip on a resumed
+		// connection. That is a fair trade for removing a replay vector on a
+		// production inbound.
+		quicConfig.Allow0RTT = false
 		quicConfig.DisablePathManager = true
 		quicConfig.EnableDatagrams = true
 		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, quicConfig)
