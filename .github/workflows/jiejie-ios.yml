@@ -243,12 +243,22 @@ jobs:
           go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator -profile jiejie-ios-slim
           echo "=== built XCFramework size ==="
           du -sh Libbox.xcframework
-          # Total bytes across every slice binary, recorded for SIZE-REPORT.txt.
-          find Libbox.xcframework -name Libbox -type f | while read -r f; do
-            echo "$(wc -c < "$f" | tr -d ' ')  $f"
+          # A .framework tree contains SYMLINKS (Versions/A, Versions/Current and
+          # the top-level binary all resolve to one file), so the size must be
+          # measured on the REAL binary of each slice. Summing every match would
+          # count the same bytes two or three times and report a number that
+          # looks like three frameworks.
+          : > /tmp/full-libbox-bytes
+          for slice in Libbox.xcframework/ios-*; do
+            [ -d "$slice" ] || continue
+            # -L follows the symlink inside the slice to the real file.
+            size="$(find -L "$slice" -name Libbox -type f -exec stat -f %z {} \; | sort -rn | head -1)"
+            echo "$(basename "$slice"): ${size:-0} bytes"
+            echo "${size:-0}" >> /tmp/full-libbox-bytes
           done
-          find Libbox.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/full-libbox-bytes
-          echo "full Libbox total: $(cat /tmp/full-libbox-bytes) bytes"
+          awk '{s+=$1} END {print s+0}' /tmp/full-libbox-bytes > /tmp/full-libbox-total
+          mv /tmp/full-libbox-total /tmp/full-libbox-bytes
+          echo "full Libbox total (per-slice, deduplicated): $(cat /tmp/full-libbox-bytes) bytes"
 
       - name: Build device-only Libbox (shipping slice)
         run: |
@@ -290,14 +300,15 @@ jobs:
 
           echo "=== device-only framework size ==="
           du -sh Libbox-device.xcframework
-          find Libbox-device.xcframework -name Libbox -type f -exec ls -la {} \;
-          find Libbox-device.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/device-libbox-bytes
-          echo "device-only Libbox total: $(cat /tmp/device-libbox-bytes) bytes"
-          echo "=== device-only XCFramework size ==="
-          du -sh Libbox.xcframework
-          find Libbox.xcframework -name Libbox -type f -exec ls -la {} \;
-          find Libbox.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/device-libbox-bytes
-          echo "device-only Libbox total: $(cat /tmp/device-libbox-bytes) bytes"
+          find -L Libbox-device.xcframework -name Libbox -type f -exec ls -la {} \;
+          # Real binary only, for the same symlink reason as the full build.
+          find -L Libbox-device.xcframework -name Libbox -type f -exec stat -f %z {} \; \
+            | sort -rn | head -1 > /tmp/device-libbox-bytes
+          echo "device-only Libbox (real binary): $(cat /tmp/device-libbox-bytes) bytes"
+          # NOTE: the device-only total is captured from Libbox-device.xcframework
+          # and must NOT be re-read from Libbox.xcframework, which still holds the
+          # two-slice build. An earlier revision did exactly that and reported the
+          # device-only size as identical to the full size.
 
       - name: Install Libbox into the pinned Apple client
         run: |
