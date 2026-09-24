@@ -56,6 +56,15 @@ jobs:
           # the commit the main repository pins. No clone of a moving branch.
           submodules: recursive
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # Caching is done explicitly below so the key can carry the tag
+          # flavour. Enabling setup-go's cache as well would double-save the
+          # same directory and fight over the key.
+          cache: false
+
       - name: Toolchain and revision report
         run: |
           set -euo pipefail
@@ -68,15 +77,6 @@ jobs:
           echo "--- xcode-select -p ---";  xcode-select -p
           echo "--- xcodebuild ---";       xcodebuild -version
           echo "--- go ---";               go version
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          # Caching is done explicitly below so the key can carry the tag
-          # flavour. Enabling setup-go's cache as well would double-save the
-          # same directory and fight over the key.
-          cache: false
 
       - name: Restore Go caches
         uses: actions/cache/restore@v4
