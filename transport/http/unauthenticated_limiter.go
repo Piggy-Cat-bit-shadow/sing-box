@@ -41,6 +41,14 @@ type unauthenticatedLimiter struct {
 	// which is that a single request must not pay O(tracked IPs). Like the
 	// counters above it is only mutated under access.
 	entriesVisited int
+	// capRejections counts new-source admissions refused because the map was
+	// already full. It exists for tests, to prove the full-map path fails closed
+	// in constant time instead of running a per-request eviction scan.
+	capRejections int
+	// atCapSweeps counts consecutive at-cap requests since the last sweep on the
+	// full-map path. It rate-limits that sweep so a flood of new sources cannot
+	// force an O(tracked IPs) scan per request.
+	atCapSweeps int
 }
 
 type unauthenticatedState struct {
@@ -103,20 +111,45 @@ func (l *unauthenticatedLimiter) acquire(source string, now time.Time) (func(), 
 	l.access.Lock()
 	defer l.access.Unlock()
 	l.accounted++
-	// Amortized expiry: only sweep every cleanupInterval acquisitions or when the
-	// map is at its cap. Sweeping on every call was O(tracked IPs) per request.
+	// Amortized expiry. The sweep must NOT also be forced merely because the map
+	// is at its cap: with the cap reached and a flood of new sources arriving,
+	// "at the cap" is true on every single request, which would make expireLocked
+	// an O(tracked IPs) scan per request -- exactly the amplification the
+	// amortized design exists to remove. The at-cap case is instead handled once
+	// below, when a NEW source actually needs admitting.
 	l.acquisitions++
-	if l.acquisitions >= cleanupInterval || len(l.states) >= l.limits.MaxTrackedIPs {
+	if l.acquisitions >= cleanupInterval {
 		l.acquisitions = 0
 		l.expireLocked(now)
 	}
 	state, loaded := l.states[address]
 	if !loaded {
-		// Enforce the tracked-IP cap before adding a new entry so a flood of
-		// random addresses cannot grow the map.
+		// The map is full and this source is new. Run ONE expiry sweep and then
+		// fail closed rather than scanning per request.
+		//
+		// The previous behaviour evicted an entry to make room, which meant a
+		// flood of random source addresses turned every request into an O(n)
+		// candidate scan plus a partial selection sort, all while holding
+		// l.access. Since a source that keeps changing its address can never
+		// build a meaningful token budget anyway, admitting it buys nothing:
+		// refusing it is both cheaper and stricter.
+		//
+		// Note this only affects NEW unauthenticated sources. Already-tracked
+		// sources keep their own token and concurrency state, so an attacker
+		// cannot reset an existing source's budget by filling the map.
 		if len(l.states) >= l.limits.MaxTrackedIPs {
-			l.evictLocked(now)
+			// At the cap. Sweep for genuinely idle entries, but only on the
+			// amortized cadence: sweeping on every at-cap request would
+			// reintroduce O(tracked IPs) per request precisely when the map is
+			// full, which is the state an address-flooding source is trying to
+			// create.
+			l.atCapSweeps++
+			if l.atCapSweeps >= cleanupInterval {
+				l.atCapSweeps = 0
+				l.expireLocked(now)
+			}
 			if len(l.states) >= l.limits.MaxTrackedIPs {
+				l.capRejections++
 				return func() {}, false
 			}
 		}
@@ -176,42 +209,6 @@ func (l *unauthenticatedLimiter) expireLocked(now time.Time) {
 	}
 }
 
-// evictLocked frees space when the tracked-IP cap is reached. It first drops
-// expired entries (handled by the caller) and then removes the least recently
-// seen idle entries until there is room for one more.
-func (l *unauthenticatedLimiter) evictLocked(now time.Time) {
-	need := len(l.states) - l.limits.MaxTrackedIPs + 1
-	if need <= 0 {
-		return
-	}
-	type candidate struct {
-		address  netip.Addr
-		lastSeen time.Time
-	}
-	candidates := make([]candidate, 0, len(l.states))
-	for address, state := range l.states {
-		if state.concurrent > 0 {
-			// Never evict an IP with an in-flight unauthenticated request:
-			// that would let it reset its own budget.
-			continue
-		}
-		candidates = append(candidates, candidate{address: address, lastSeen: state.lastSeen})
-	}
-	// Partial selection sort: only the oldest `need` entries matter.
-	for evicted := 0; evicted < need && len(candidates) > 0; evicted++ {
-		oldest := 0
-		for index := 1; index < len(candidates); index++ {
-			if candidates[index].lastSeen.Before(candidates[oldest].lastSeen) {
-				oldest = index
-			}
-		}
-		delete(l.states, candidates[oldest].address)
-		candidates[oldest] = candidates[len(candidates)-1]
-		candidates = candidates[:len(candidates)-1]
-	}
-	_ = now
-}
-
 // visitedCount reports how many state entries expiry sweeps have walked. It
 // exists for tests.
 func (l *unauthenticatedLimiter) visitedCount() int {
@@ -242,4 +239,15 @@ func (l *unauthenticatedLimiter) trackedCount() int {
 	l.access.Lock()
 	defer l.access.Unlock()
 	return len(l.states)
+}
+
+// capRejectionCount reports how many new sources were refused because the map
+// was full. It exists for tests.
+func (l *unauthenticatedLimiter) capRejectionCount() int {
+	if l == nil {
+		return 0
+	}
+	l.access.Lock()
+	defer l.access.Unlock()
+	return l.capRejections
 }

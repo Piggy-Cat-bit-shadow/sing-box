@@ -419,6 +419,10 @@ func (t *http3FallbackTransport) h3Broken(authority string) bool {
 // cleanupLocked reclaims entries that have been expired and untouched for longer
 // than the retention window. It is opportunistic: it runs when the map is at its
 // cap, so the common path pays nothing.
+//
+// It is NOT sufficient on its own to bound the map. When every tracked entry is
+// recent, the sweep frees nothing, so markH3Broken must additionally decline to
+// admit a new authority rather than growing past the cap.
 func (t *http3FallbackTransport) cleanupLocked(now time.Time) {
 	if len(t.broken) < maxTrackedAuthorities {
 		return
@@ -454,7 +458,17 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 	defer t.brokenAccess.Unlock()
 	now := time.Now()
 	t.cleanupLocked(now)
-	entry := t.broken[authority]
+	entry, tracked := t.broken[authority]
+	if !tracked && len(t.broken) >= maxTrackedAuthorities {
+		// The map is full and this authority is not in it. Adding it would make
+		// the map grow without bound under a workload that keeps inventing new
+		// authorities, so the entry is simply not created. The consequence is
+		// deliberately the SAFE one: h3Broken reports an untracked authority as
+		// not broken, so HTTP/3 is still attempted for it rather than being
+		// pinned to HTTP/2 forever with no path back. Escalation is merely not
+		// remembered for that authority.
+		return
+	}
 	entry.backoff = t.schedule.Next(entry.backoff)
 	entry.until = now.Add(entry.backoff)
 	entry.seen = now
