@@ -103,11 +103,7 @@ func (h *HTTPClient) UnmarshalJSONContext(ctx context.Context, content []byte) e
 	if err != nil {
 		return err
 	}
-	err = unmarshalHTTPVersionOptions(ctx, content, (*_HTTPClientOptions)(h), h.Version, &h.HTTP2Options, &h.HTTP3Options)
-	if err != nil {
-		return err
-	}
-	return nil
+	return unmarshalHTTPVersionOptions(ctx, content, (*_HTTPClientOptions)(h), h.Version, &h.HTTP2Options, &h.HTTP3Options)
 }
 
 func unmarshalHTTPVersionOptions(ctx context.Context, content []byte, baseStruct any, version int, http2Options *HTTP2Options, http3Options *QUICOptions) error {

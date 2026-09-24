@@ -44,6 +44,15 @@ func parseConnectUDPTarget(path string) (M.Socksaddr, bool) {
 	return destination, true
 }
 
+func connectUDPURL(destination M.Socksaddr) *url.URL {
+	host := destination.AddrString()
+	port := "/" + strconv.Itoa(int(destination.Port)) + "/"
+	return &url.URL{
+		Path:    connectUDPPathPrefix + host + port,
+		RawPath: connectUDPPathPrefix + strings.ReplaceAll(url.PathEscape(host), ":", "%3A") + port,
+	}
+}
+
 func requestIsConnectUDP(request *http.Request) bool {
 	return request.Method == http.MethodGet && requestIsUpgrade(request) && strings.EqualFold(request.Header.Get("Upgrade"), connectUDPProtocol)
 }

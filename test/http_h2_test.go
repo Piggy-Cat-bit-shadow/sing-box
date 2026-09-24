@@ -11,14 +11,21 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	sTLS "github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	sHTTP "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -145,6 +152,188 @@ func TestHTTPInboundHTTP2(t *testing.T) {
 	require.Equal(t, int32(4), origin.connections.Load())
 }
 
+type http2ProxyServer struct {
+	listener    net.Listener
+	connections atomic.Int32
+	streams     atomic.Int32
+}
+
+func startHTTP2ProxyServer(t *testing.T, certPem string, keyPem string) *http2ProxyServer {
+	certificate, err := tls.LoadX509KeyPair(certPem, keyPem)
+	require.NoError(t, err)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+		NextProtos:   []string{http2.NextProtoTLS},
+	})
+	require.NoError(t, err)
+	server := &http2ProxyServer{listener: listener}
+	h2Server := &http2.Server{}
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		server.streams.Add(1)
+		if request.Method != http.MethodConnect || request.Header.Get("Proxy-Authorization") != proxyAuthorization {
+			writer.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+		conn, err := net.Dial("tcp", request.Host)
+		if err != nil {
+			writer.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		go func() {
+			io.Copy(conn, request.Body)
+			conn.(*net.TCPConn).CloseWrite()
+		}()
+		buffer := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buffer)
+			if n > 0 {
+				_, err = writer.Write(buffer[:n])
+				if err != nil {
+					break
+				}
+				writer.(http.Flusher).Flush()
+			}
+			if err != nil {
+				break
+			}
+		}
+		conn.Close()
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			server.connections.Add(1)
+			go func() {
+				err = conn.(*tls.Conn).Handshake()
+				if err != nil {
+					conn.Close()
+					return
+				}
+				h2Server.ServeConn(conn, &http2.ServeConnOpts{Handler: handler})
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		listener.Close()
+	})
+	return server
+}
+
+func (s *http2ProxyServer) port() uint16 {
+	return uint16(s.listener.Addr().(*net.TCPAddr).Port)
+}
+
+func TestHTTPOutboundHTTP2(t *testing.T) {
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	proxyServer := startHTTP2ProxyServer(t, certPem, keyPem)
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeHTTP,
+				Options: &option.HTTPOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: proxyServer.port(),
+					},
+					Username: "sekai",
+					Password: "password",
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+						},
+					},
+				},
+			},
+		},
+	})
+	origin := newForwardOrigin(t)
+	for i := 0; i < 3; i++ {
+		client := proxyClient(t, clientPort)
+		request, err := http.NewRequest(http.MethodGet, origin.url("/hello"), nil)
+		require.NoError(t, err)
+		request.Header.Set("User-Agent", "")
+		response, err := client.Do(request)
+		require.NoError(t, err)
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, "hello", string(body))
+		client.CloseIdleConnections()
+	}
+	require.Equal(t, int32(1), proxyServer.connections.Load())
+	require.Equal(t, int32(3), proxyServer.streams.Load())
+}
+
+func TestHTTPSelfTLS(t *testing.T) {
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	startTLSHTTPInbound(t, certPem, keyPem, nil, nil)
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeHTTP,
+				Options: &option.HTTPOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: serverPort,
+					},
+					Username: "sekai",
+					Password: "password",
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+						},
+					},
+				},
+			},
+		},
+	})
+	origin := newForwardOrigin(t)
+	client := proxyClient(t, clientPort)
+	for i := 0; i < 3; i++ {
+		request, err := http.NewRequest(http.MethodGet, origin.url("/hello"), nil)
+		require.NoError(t, err)
+		request.Header.Set("User-Agent", "")
+		response, err := client.Do(request)
+		require.NoError(t, err)
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		require.NoError(t, err)
+		require.Equal(t, "hello", string(body))
+	}
+	require.Equal(t, int32(1), origin.connections.Load())
+}
+
 func TestHTTPForwardEarlyResponse(t *testing.T) {
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
 	startTLSHTTPInbound(t, certPem, keyPem, nil, nil)
@@ -216,6 +405,114 @@ func TestHTTPInboundHTTP2Cleartext(t *testing.T) {
 	require.NoError(t, err)
 	forwardResponse.Body.Close()
 	require.Equal(t, http.StatusBadRequest, forwardResponse.StatusCode)
+}
+
+func TestHTTPOutboundHTTP2Deadline(t *testing.T) {
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	startTLSHTTPInbound(t, certPem, keyPem, nil, nil)
+	origin := newForwardOrigin(t)
+	detour, err := sTLS.NewDialerFromOptions(globalCtx, log.NewNOPFactory().Logger(), N.SystemDialer, "127.0.0.1", option.OutboundTLSOptions{
+		Enabled:         true,
+		ServerName:      "example.org",
+		CertificatePath: certPem,
+		ALPN:            []string{http2.NextProtoTLS},
+	})
+	require.NoError(t, err)
+	client, err := sHTTP.NewClient(sHTTP.ClientOptions{
+		Dialer:   detour,
+		Server:   M.ParseSocksaddrHostPort("127.0.0.1", serverPort),
+		Username: "sekai",
+		Password: "password",
+		Version:  2,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+	conn, err := client.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(origin.host()))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(100*time.Millisecond)))
+	_, err = conn.Read(make([]byte, 1))
+	require.True(t, E.IsTimeout(err))
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = conn.Write([]byte("GET /hello HTTP/1.1\r\nHost: " + origin.host() + "\r\n\r\n"))
+	require.NoError(t, err)
+	response, err := http.ReadResponse(std_bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	require.Equal(t, "hello", string(body))
+}
+
+func TestHTTPOutboundHTTP2NoFallback(t *testing.T) {
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeHTTP,
+				Options: &option.HTTPInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: serverPort,
+					},
+					Version: []int{1},
+					Users:   []auth.User{{Username: "sekai", Password: "password"}},
+					InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+						TLS: &option.InboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+							KeyPath:         keyPem,
+						},
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{{Type: C.TypeDirect}},
+	})
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeHTTP,
+				Options: &option.HTTPOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: serverPort,
+					},
+					Username:               "sekai",
+					Password:               "password",
+					Version:                2,
+					DisableVersionFallback: true,
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+						},
+					},
+				},
+			},
+		},
+	})
+	origin := newForwardOrigin(t)
+	client := proxyClient(t, clientPort)
+	for i := 0; i < 2; i++ {
+		response, err := client.Get(origin.url("/hello"))
+		require.NoError(t, err)
+		response.Body.Close()
+		require.Equal(t, http.StatusBadGateway, response.StatusCode)
+	}
+	require.Equal(t, int32(0), origin.connections.Load())
 }
 
 func startSwitchingProtocolsOrigin(t *testing.T) *net.TCPAddr {
