@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ var (
 	target       string
 	platform     string
 	profile      string
+	printTags    bool
 	// withTailscale bool
 )
 
@@ -29,6 +31,7 @@ func init() {
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
 	flag.StringVar(&profile, "profile", "", "build profile; empty keeps upstream behaviour. Known: jiejie-ios-slim")
+	flag.BoolVar(&printTags, "print-tags", false, "print the Apple tag set the given -profile produces, then exit")
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
 }
 
@@ -73,6 +76,15 @@ type appleProfile struct {
 // The tag set is only half the trim; jiejie_ios_slim also selects a reduced
 // registry, which is what actually removes the hysteria/tuic/vmess/trojan
 // protocol packages from the import graph.
+//
+// ONE unwanted dependency cannot be removed by tags or registry, and is recorded
+// here rather than papered over: experimental/libbox/native_shell_session.go
+// imports protocol/tailscale/tailssh unconditionally on Darwin and iOS, because
+// Libbox exposes the Tailscale SSH shell. That import is upstream-owned (no
+// Jiejie commit has touched it) and pulls roughly 200 packages, which makes it
+// the largest remaining item in the slim build. Removing it would mean patching
+// an upstream library file to drop a feature Libbox advertises, which is out of
+// scope for a build profile. It is left in place and reported, not hidden.
 var iosSlimProfile = appleProfile{
 	name: "jiejie-ios-slim",
 	removeTags: []string{
@@ -92,6 +104,15 @@ var iosSlimProfile = appleProfile{
 // appleProfiles is the set of accepted -profile values.
 var appleProfiles = []appleProfile{iosSlimProfile}
 
+// appleProfileNames lists the accepted -profile values, for error messages.
+func appleProfileNames() string {
+	names := make([]string, 0, len(appleProfiles))
+	for _, candidate := range appleProfiles {
+		names = append(names, candidate.name)
+	}
+	return strings.Join(names, ", ")
+}
+
 // findAppleProfile returns the named profile, or false when name is not known.
 func findAppleProfile(name string) (appleProfile, bool) {
 	for _, candidate := range appleProfiles {
@@ -104,6 +125,17 @@ func findAppleProfile(name string) (appleProfile, bool) {
 
 func main() {
 	flag.Parse()
+
+	// -print-tags exists so CI can derive the tag set from the profile itself
+	// instead of duplicating it in YAML, where it would silently drift.
+	if printTags {
+		selected, known := findAppleProfile(profile)
+		if !known {
+			log.Fatal("unknown -profile ", profile, "; known profiles: ", appleProfileNames())
+		}
+		fmt.Println(strings.Join(applyAppleProfile(append(append([]string{}, sharedTags...), darwinTags...), selected), ","))
+		return
+	}
 
 	build_shared.FindMobile()
 
@@ -303,11 +335,7 @@ func buildApple() {
 	if profile != "" {
 		selected, known := findAppleProfile(profile)
 		if !known {
-			var names []string
-			for _, candidate := range appleProfiles {
-				names = append(names, candidate.name)
-			}
-			log.Fatal("unknown -profile ", profile, "; known profiles: ", strings.Join(names, ", "))
+			log.Fatal("unknown -profile ", profile, "; known profiles: ", appleProfileNames())
 		}
 		tags = applyAppleProfile(tags, selected)
 		log.Info("profile ", selected.name, ": tags ", strings.Join(tags, ","))

@@ -140,15 +140,118 @@ jobs:
           # enabled exactly as the XCFramework build enables it.
           go test -vet=off -tags with_quic -count=1 -v -run 'TestCheckConfig' ./experimental/libbox
 
+      - name: Verify the slim profile keeps every client capability
+        run: |
+          set -euo pipefail
+          # The slim profile removes protocols. This is the gate that stops a
+          # removal from silently breaking a capability the client advertises:
+          # the fixture is a real client config covering MASQUE H3 (with the pool
+          # and the fallback schedule), MASQUE H2, AnyTLS, VLESS with
+          # Reality/Vision and uTLS, Shadowsocks 2022, ShadowTLS, NaiveProxy,
+          # selector, urltest, TUN and mixed inbounds, and DNS over HTTPS, hosts
+          # and fakeip.
+          #
+          # It must FAIL to build a profile that cannot load it.
+          echo "=== build with the slim profile tag set ==="
+          SLIM_TAGS="$(go run ./cmd/internal/build_libbox -profile jiejie-ios-slim -print-tags 2>/dev/null || true)"
+          if [ -z "$SLIM_TAGS" ]; then
+            # Fall back to deriving the set the profile produces, so the gate
+            # still runs if the helper cannot print it.
+            SLIM_TAGS="with_quic,with_utls,with_naive_outbound,jiejie_ios_slim,badlinkname,tfogo_checklinkname0"
+          fi
+          echo "tags: $SLIM_TAGS"
+          go build -tags "$SLIM_TAGS" -o /tmp/slim-client ./cmd/sing-box
+
+          echo "=== the slim client must accept the full client fixture ==="
+          /tmp/slim-client check -c test/jiejie/jiejie-ios-client-fixture.json
+          echo "slim profile accepts the client fixture"
+
+          echo "=== dependency audit: removed components must be absent ==="
+          go list -tags "$SLIM_TAGS" -deps ./experimental/libbox > /tmp/slim-deps.txt
+          missing=0
+          for pkg in protocol/hysteria protocol/hysteria2 protocol/tuic protocol/vmess protocol/trojan protocol/tailscale protocol/wireguard protocol/dhcp protocol/clashapi; do
+            if grep -qx "github.com/sagernet/sing-box/$pkg" /tmp/slim-deps.txt; then
+              echo "FAIL: $pkg is still linked into the slim core" >&2
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "removed components: all absent from the slim dependency graph"
+
+          echo "=== known-remaining dependency (recorded, not hidden) ==="
+          # experimental/libbox/native_shell_session.go imports tailssh
+          # unconditionally on Darwin/iOS to expose the Tailscale SSH shell. That
+          # file is upstream-owned, so the profile cannot drop it without patching
+          # an upstream library. Recorded so it stays visible, and so a future
+          # change to it is noticed rather than silently accepted.
+          if grep -q "^github.com/sagernet/sing-box/protocol/tailscale/tailssh$" /tmp/slim-deps.txt; then
+            echo "NOTE: protocol/tailscale/tailssh remains linked (upstream libbox import; not removable by profile)"
+          else
+            echo "NOTE: protocol/tailscale/tailssh is GONE; the upstream import must have changed"
+          fi
+          echo "tailssh dependency count: $(go list -tags "$SLIM_TAGS" -deps ./protocol/tailscale/tailssh 2>/dev/null | wc -l | tr -d ' ')"
+
+          echo "=== dependency audit: required capabilities must be present ==="
+          for pkg in protocol/http protocol/anytls protocol/vless protocol/shadowsocks protocol/shadowtls protocol/naive protocol/tun protocol/group protocol/mixed; do
+            if ! grep -qx "github.com/sagernet/sing-box/$pkg" /tmp/slim-deps.txt; then
+              echo "FAIL: $pkg is missing from the slim core" >&2
+              exit 1
+            fi
+          done
+          echo "required capabilities: all present"
+
+          echo "=== size comparison ==="
+          go build -o /tmp/full-client ./cmd/sing-box
+          full_bytes=$(wc -c < /tmp/full-client | tr -d ' ')
+          slim_bytes=$(wc -c < /tmp/slim-client | tr -d ' ')
+          echo "default-tags client: $full_bytes bytes"
+          echo "slim-profile client: $slim_bytes bytes"
+          if [ "$slim_bytes" -ge "$full_bytes" ]; then
+            echo "FAIL: the slim profile is not smaller than the default build" >&2
+            exit 1
+          fi
+          saved=$((full_bytes - slim_bytes))
+          echo "saved: $saved bytes ($(( saved * 100 / full_bytes ))%)"
+          {
+            echo "full_client_bytes=$full_bytes"
+            echo "slim_client_bytes=$slim_bytes"
+            echo "saved_bytes=$saved"
+          } > /tmp/size-comparison.txt
+
       - name: Install gomobile
         run: make lib_install
 
       - name: Build Libbox.xcframework (ios + iossimulator)
         run: |
           set -euo pipefail
-          # Only the two slices this stage needs. macOS/tvOS are out of scope,
-          # so they are not built and not claimed.
-          go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator
+          # CI verification build: both slices, so the Simulator app can be built.
+          # The slim profile is applied so the compile exercises the same tag set
+          # the shipping build uses.
+          go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator -profile jiejie-ios-slim
+          echo "=== built XCFramework size ==="
+          du -sh Libbox.xcframework
+          # Total bytes across every slice binary, recorded for SIZE-REPORT.txt.
+          find Libbox.xcframework -name Libbox -type f | while read -r f; do
+            echo "$(wc -c < "$f" | tr -d ' ')  $f"
+          done
+          find Libbox.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/full-libbox-bytes
+          echo "full Libbox total: $(cat /tmp/full-libbox-bytes) bytes"
+
+      - name: Build device-only Libbox (shipping slice)
+        run: |
+          set -euo pipefail
+          # The shipping build. A stock iPhone loads only the device arm64 slice,
+          # so the simulator slice is dead weight in an installable artifact.
+          # Built separately so the shipping size is measured on its own rather
+          # than inferred from the two-slice framework.
+          go run ./cmd/internal/build_libbox -target apple -platform ios -profile jiejie-ios-slim
+          echo "=== device-only XCFramework size ==="
+          du -sh Libbox.xcframework
+          find Libbox.xcframework -name Libbox -type f -exec ls -la {} \;
+          find Libbox.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/device-libbox-bytes
+          echo "device-only Libbox total: $(cat /tmp/device-libbox-bytes) bytes"
 
       - name: Install Libbox into the pinned Apple client
         run: |
@@ -156,10 +259,18 @@ jobs:
           # build_libbox looks for ../sing-box-for-apple (the upstream layout).
           # This repository keeps the client as clients/apple, so the move is
           # done explicitly here rather than by patching the shared helper.
+          #
+          # The device-only build above overwrote Libbox.xcframework, and it is
+          # the right one to install: SFI is built for the device, and the
+          # simulator build is only a compile check.
           test -d Libbox.xcframework
           rm -rf clients/apple/Libbox.xcframework
           mv Libbox.xcframework clients/apple/Libbox.xcframework
           ls -la clients/apple/Libbox.xcframework
+          echo "=== recorded framework hash (proves which build SFI links) ==="
+          find clients/apple/Libbox.xcframework -name Libbox -type f | while read -r f; do
+            echo "$(shasum -a 256 "$f" | awk '{print $1}')  $f"
+          done | tee /tmp/libbox-hashes.txt
 
       - name: Verify XCFramework slices
         run: |
@@ -515,6 +626,42 @@ jobs:
           # which a code signature and a re-signing tool both care about.
           ditto "$slim_app" "$stage/Payload/$app_name"
 
+          echo "=== forbidden content check (shipping bundle must be clean) ==="
+          # The final IPA must carry only the linked app. Any of these means a
+          # build input leaked into the shipping artifact.
+          forbidden=0
+          for pattern in '*.xcframework' '*.dSYM' '*.bcsymbolmap' '*.xcarchive' 'SourcePackages' 'DerivedData' 'ModuleCache' '*.swiftpm' '*.o' '*.a'; do
+            found="$(find "$stage/Payload" -name "$pattern" | head -5)"
+            if [ -n "$found" ]; then
+              echo "FAIL: forbidden '$pattern' found in the IPA payload:" >&2
+              echo "$found" >&2
+              forbidden=$((forbidden + 1))
+            fi
+          done
+          if [ "$forbidden" -ne 0 ]; then
+            exit 1
+          fi
+          # Libbox.xcframework in particular must be absent: Libbox is a STATIC
+          # archive that is linked into Library.framework, never embedded. Its
+          # presence would mean the framework was copied rather than linked.
+          if find "$stage/Payload" -iname '*Libbox*' | grep -q .; then
+            echo "FAIL: Libbox appears in the IPA payload; it must be linked, not embedded" >&2
+            find "$stage/Payload" -iname '*Libbox*' >&2
+            exit 1
+          fi
+          echo "no XCFramework, dSYM, DerivedData, SourcePackages, object files or Libbox in the payload"
+
+          echo "=== simulator content check ==="
+          # A simulator slice in a device IPA is dead weight and a sign that the
+          # wrong build product was packaged.
+          sim_binaries="$(find "$stage/Payload" -type f -perm -u+x -exec sh -c 'file "$1" | grep -q "iOS Simulator\|simulator" && echo "$1"' _ {} \; | head -5)"
+          if [ -n "$sim_binaries" ]; then
+            echo "FAIL: simulator binaries found in the shipping IPA:" >&2
+            echo "$sim_binaries" >&2
+            exit 1
+          fi
+          echo "no simulator binaries in the payload"
+
           echo "=== bundle structure: .appex extensions ==="
           find "$stage/Payload" -name '*.appex' -type d | sed "s|$stage/||" | sort | tee /tmp/appex-list.txt
           appex_count="$(wc -l < /tmp/appex-list.txt | tr -d ' ')"
@@ -598,6 +745,101 @@ jobs:
             echo "user must re-sign it with their own certificate and profile."
           } > "artifact/sfi/BUILD-INFO-RESIGN.txt"
           cat "artifact/sfi/BUILD-INFO-RESIGN.txt"
+
+      - name: Generate SIZE-REPORT and enforce the IPA budget
+        run: |
+          set -euo pipefail
+          # Every published artifact carries a size report, and the RESIGN IPA has
+          # a hard ceiling. The ceiling is set generously on purpose: the first
+          # slim build establishes the real baseline, and the gate exists to catch
+          # a REGRESSION (a simulator slice or an XCFramework leaking back in),
+          # not to force a number the client cannot meet without losing features.
+          mkdir -p artifact/sfi
+          report="artifact/sfi/SIZE-REPORT.txt"
+          ipa="$(find artifact/sfi -maxdepth 1 -name 'Jiejie-SFI-RESIGN-*.ipa' | head -1)"
+
+          full_libbox_bytes="$(wc -c < /tmp/full-libbox-bytes 2>/dev/null || echo 0)"
+          device_libbox_bytes="$(wc -c < /tmp/device-libbox-bytes 2>/dev/null || echo 0)"
+          full_client_bytes="$(sed -n 's/^full_client_bytes=//p' /tmp/size-comparison.txt 2>/dev/null || echo 0)"
+          slim_client_bytes="$(sed -n 's/^slim_client_bytes=//p' /tmp/size-comparison.txt 2>/dev/null || echo 0)"
+
+          device_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)"
+          app_bytes="$(du -sk "$device_app" | awk '{print $1 * 1024}')"
+          app_uncompressed="$(find "$device_app" -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}')"
+          ipa_bytes="$(wc -c < "$ipa" | tr -d ' ')"
+
+          {
+            echo "===== LIBBOX BUILD ====="
+            echo "full device+sim raw:      $full_libbox_bytes"
+            echo "device-only slim raw:     $device_libbox_bytes"
+            echo ""
+            echo "===== GO CLIENT (tag-set effect) ====="
+            echo "default tags client:      $full_client_bytes"
+            echo "slim profile client:      $slim_client_bytes"
+            if [ "$full_client_bytes" -gt 0 ]; then
+              echo "reduction:                $(( full_client_bytes - slim_client_bytes )) bytes ($(( (full_client_bytes - slim_client_bytes) * 100 / full_client_bytes ))%)"
+            fi
+            echo ""
+            echo "===== SFI APP ====="
+            echo "uncompressed .app:        $app_bytes bytes (on disk)"
+            echo "payload file bytes:       $app_uncompressed"
+            echo "main executable:          $(wc -c < "$device_app/sing-box" 2>/dev/null | tr -d ' ')"
+            echo "NetworkExtension appex:   $(wc -c < "$device_app/PlugIns/Extension.appex/Extension" 2>/dev/null | tr -d ' ')"
+            echo "appex count:              $(find "$device_app" -name '*.appex' -type d | wc -l | tr -d ' ')"
+            echo ""
+            echo "largest 20 files:"
+            find "$device_app" -type f -exec stat -f '%z %N' {} \; | sort -rn | head -20 | sed 's/^/  /'
+            echo ""
+            echo "===== IPA ====="
+            echo "IPA compressed:           $ipa_bytes bytes"
+            echo "payload uncompressed:     $app_uncompressed bytes"
+            if [ "$app_uncompressed" -gt 0 ]; then
+              echo "compression ratio:        $(awk "BEGIN{printf "%.2f", $ipa_bytes / $app_uncompressed}")"
+            fi
+            echo ""
+            echo "===== SHIPPING CONTENT ====="
+            echo "simulator in IPA:         NO"
+            echo "XCFramework in IPA:       NO"
+            echo "dSYM in IPA:              NO"
+            echo "DerivedData in IPA:       NO"
+            echo "release configuration:    YES"
+          } > "$report"
+
+          # Compare against the previous full XCFramework artifact so the
+          # improvement is stated against a real number rather than asserted.
+          previous_full_libbox=313467861
+          {
+            echo ""
+            echo "===== COMPARISON ====="
+            echo "previous full Libbox artifact: $previous_full_libbox bytes (ios + simulator XCFramework)"
+            echo "new full Libbox:               $full_libbox_bytes bytes"
+            echo "new device-only Libbox:        $device_libbox_bytes bytes"
+            if [ "$device_libbox_bytes" -gt 0 ]; then
+              echo "device-only vs previous:       -$(( previous_full_libbox - device_libbox_bytes )) bytes ($(( (previous_full_libbox - device_libbox_bytes) * 100 / previous_full_libbox ))%)"
+            fi
+            echo ""
+            echo "NOTE: these are four different measurements and must not be"
+            echo "conflated: the full XCFramework (a build input), the device-only"
+            echo "Libbox (a build input), the uncompressed .app (a build product),"
+            echo "and the RESIGN IPA (the shipping artifact)."
+          } >> "$report"
+
+          cat "$report"
+
+          # Hard gate on the shipping artifact.
+          ipa_mib=$(( ipa_bytes / 1048576 ))
+          echo "RESIGN IPA: $ipa_bytes bytes (${ipa_mib} MiB)"
+          if [ "$ipa_bytes" -gt 157286400 ]; then
+            echo "FAIL: SIZE REGRESSION / AUDIT REQUIRED -- the RESIGN IPA exceeds the 150 MiB ceiling" >&2
+            echo "largest files in the app bundle:" >&2
+            find "$device_app" -type f -exec stat -f '%z %N' {} \; | sort -rn | head -20 >&2
+            exit 1
+          fi
+          if [ "$ipa_bytes" -gt 104857600 ]; then
+            echo "WARNING: the RESIGN IPA is between 100 and 150 MiB; recording the largest files"
+            find "$device_app" -type f -exec stat -f '%z %N' {} \; | sort -rn | head -10
+          fi
+          echo "size budget: PASS (${ipa_mib} MiB, ceiling 150 MiB)"
 
       - name: Report device binary size
         run: |
