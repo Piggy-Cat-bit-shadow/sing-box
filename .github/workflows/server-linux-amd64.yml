@@ -6,6 +6,7 @@ on:
     branches:
       - testing
       - feat/jiejie-server-edition
+      - 'integrate/**'
   pull_request:
     branches:
       - testing
