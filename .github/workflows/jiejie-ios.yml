@@ -180,23 +180,34 @@ jobs:
       - name: Verify Jiejie HTTP3 markers in the built framework
         run: |
           set -euo pipefail
-          # Artifact-level evidence that the Jiejie H3 options are in the core
-          # SFI will link, not merely present in the source tree. Go keeps the
-          # JSON option names as string literals, so a plain strings(1) finds
-          # them even after linking; if a future toolchain inlines them away,
-          # the config smoke test plus the recorded core SHA remain the
-          # equivalent proof, so this step reports rather than hard-fails on a
-          # missing literal.
+          # Artifact-level evidence that the Jiejie H3 options are compiled into
+          # the core SFI links, not merely present in the source tree.
+          #
+          # The framework binary is a fat STATIC ARCHIVE (the CI log reports
+          # "current ar archive"), not a linked executable, so the option names
+          # live as string literals in the __cstring sections of the archive
+          # members. Xcode's bundled `strings` also fails on an archive this
+          # size ("failed to flush output"), so grep -a is used instead: it
+          # scans the raw bytes and does not need to parse the Mach-O container.
           provider="clients/apple/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox"
-          [ -f "$provider" ] || provider="$(find clients/apple/Libbox.xcframework -name Libbox -type f -perm -u+x | head -1)"
-          echo "inspecting: $provider"
+          [ -f "$provider" ] || provider="$(find clients/apple/Libbox.xcframework -name Libbox -type f | head -1)"
+          echo "inspecting: $provider ($(wc -c < "$provider" | tr -d ' ') bytes)"
+
+          missing=0
           for marker in http3_connection_pool http3_fallback; do
-            if strings -a "$provider" | grep -q "$marker"; then
+            if LC_ALL=C grep -a -q -- "$marker" "$provider"; then
               echo "FOUND marker: $marker"
             else
-              echo "NOTE: marker literal not found in binary: $marker (see config smoke test)"
+              echo "MISSING marker: $marker"
+              missing=$((missing + 1))
             fi
           done
+
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: $missing Jiejie HTTP/3 marker(s) absent from the built framework" >&2
+            exit 1
+          fi
+          echo "Both Jiejie HTTP/3 option markers are present in the built framework."
 
       - name: Collect Libbox artifact
         run: |
@@ -285,16 +296,20 @@ jobs:
           log=/tmp/sfi-simulator-build.log
           echo "=== SFI build failure classification ==="
           if grep -q 'LibboxPromotePowerReportDraft' "$log"; then
-            echo "CAUSE: pinned Apple client calls LibboxPromotePowerReportDraft(),"
-            echo "       which no core ref exports (introduced by Apple 88fbbc0)."
+            echo "CAUSE: the pinned Apple client calls LibboxPromotePowerReportDraft(),"
+            echo "       which core commit 3aff5d0f1 (2026-09-23) renamed to"
+            echo "       DiscardPowerReportDraft(). The Apple gitlink is 2026-09-14."
           fi
-          if grep -q 'usePlatformAutoRedirect' "$log"; then
-            echo "CAUSE: core requires usePlatformAutoRedirect()/createAutoRedirect(),"
-            echo "       which the pinned Apple client does not implement."
+          if grep -q 'usePlatformAutoRedirect\|ExtensionPlatformInterface' "$log"; then
+            echo "CAUSE: core commit 061889303 (2026-09-23) added"
+            echo "       UsePlatformAutoRedirect()/createAutoRedirect(), which the"
+            echo "       pinned Apple client does not implement."
           fi
           echo
-          echo "This is upstream Libbox Swift/Core API skew, not a Jiejie regression:"
+          echo "This is upstream Libbox Swift/Core API skew at two different pin"
+          echo "dates, not a Jiejie regression:"
           echo "Jiejie commits touching experimental/libbox: $(git log --oneline HEAD --not upstream/testing -- experimental/libbox/ 2>/dev/null | wc -l | tr -d ' ')"
+          echo "Libbox diff vs upstream/testing: '$(git diff --stat upstream/testing HEAD -- experimental/libbox/ 2>/dev/null)'"
           echo "See docs/JIEJIE-IOS.md for the recorded blocker and the resolution options."
           echo
           echo "=== first compile errors ==="
