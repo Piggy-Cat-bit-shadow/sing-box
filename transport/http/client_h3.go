@@ -315,17 +315,27 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 	// allowing a single fresh connection), never an unbounded loop.
 	maxAttempts := len(c.slots) + 1
 	var lastErr error
+	// transportFailures counts attempts that failed while ESTABLISHING transport
+	// (dial, QUIC handshake, stream open) as opposed to failing after the CONNECT
+	// header was written. Only this class may be promoted to "authority is
+	// temporarily unavailable", and only once every attempt has been consumed.
+	transportFailures := 0
+	attempts := 0
 	for range maxAttempts {
+		attempts++
 		slot, err := c.establishSlot(ctx)
 		if err != nil {
 			if lastErr != nil {
-				return nil, nil, lastErr
+				return nil, nil, c.promoteExhaustedTransportFailure(lastErr, transportFailures, attempts, maxAttempts)
 			}
 			return nil, nil, err
 		}
 		clientConn, err := c.acquire(slot, ctx)
 		if err != nil {
 			lastErr = err
+			if isHTTP3TransportEstablishmentFailure(err) {
+				transportFailures++
+			}
 			c.noteSlotFailure(slot, err)
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
@@ -339,6 +349,9 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 				return nil, nil, ctx.Err()
 			}
 			lastErr = E.Cause(err, "await HTTP/3 handshake")
+			if isHTTP3TransportEstablishmentFailure(err) {
+				transportFailures++
+			}
 			c.noteSlotFailure(slot, err)
 			continue
 		}
@@ -365,6 +378,9 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 			}
 			// Any other open failure is a slot-level problem. It does not poison
 			// the authority, because other slots may be perfectly healthy.
+			if isHTTP3TransportEstablishmentFailure(err) {
+				transportFailures++
+			}
 			c.noteSlotFailure(slot, err)
 			lastErr = E.Cause(err, "open HTTP/3 stream")
 			continue
@@ -431,7 +447,84 @@ func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request)
 	if lastErr == nil {
 		lastErr = E.New("no HTTP/3 pool slot could open a stream")
 	}
-	return nil, nil, lastErr
+	// Every attempt was consumed without a single tunnel being established. If
+	// ALL of those attempts failed while establishing transport, the authority is
+	// treated as temporarily unavailable so the caller can fall back to HTTP/2.
+	return nil, nil, c.promoteExhaustedTransportFailure(lastErr, transportFailures, attempts, maxAttempts)
+}
+
+// promoteExhaustedTransportFailure upgrades an exhausted pool to an
+// authority-level "HTTP/3 unavailable" signal, but ONLY when every attempt
+// failed for a transport-establishment reason.
+//
+// Why this is needed: a silent UDP blackhole is the common mobile-network
+// failure, and it produces a handshake TIMEOUT rather than a protocol error.
+// Without this promotion the user would simply see a timeout, even though the
+// authority serves HTTP/2 perfectly well. That is exactly the case fallback
+// exists for.
+//
+// Why it is restricted: only transport establishment counts. A certificate
+// failure, a wrong TLS server name, an auth failure, a 407, a non-200 CONNECT
+// response or any post-write error must NOT be laundered into "the server does
+// not speak HTTP/3", because retrying those over HTTP/2 would either fail
+// identically or mask a real configuration error. Those paths never reach here:
+// they return directly above.
+//
+// Every attempt must have failed this way. A single non-transport failure means
+// the pool was not uniformly unable to connect, so the authority is not
+// condemned.
+func (c *http3ClientImpl) promoteExhaustedTransportFailure(lastErr error, transportFailures, attempts, maxAttempts int) error {
+	if lastErr == nil || transportFailures == 0 {
+		return lastErr
+	}
+	// Guard against condemning the authority from a single unlucky attempt: the
+	// pool must have been genuinely exhausted.
+	if attempts < maxAttempts {
+		return lastErr
+	}
+	if transportFailures != attempts {
+		return lastErr
+	}
+	if errors.Is(lastErr, ErrHTTP3Unavailable) {
+		// Already classified; nothing to promote.
+		return lastErr
+	}
+	return E.Cause1(ErrHTTP3Unavailable, lastErr)
+}
+
+// isHTTP3TransportEstablishmentFailure reports whether err is a failure to
+// ESTABLISH transport, as opposed to a failure of an established tunnel or of
+// the protocol negotiation itself.
+//
+// Negotiation failure is deliberately excluded: isHTTP3NegotiationFailure
+// already classifies it precisely (the server answered and rejected h3), and it
+// is reported as ErrHTTP3Unavailable at its own call site.
+func isHTTP3TransportEstablishmentFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isHTTP3NegotiationFailure(err) {
+		// Precise classification already exists for this case.
+		return false
+	}
+	// A caller-side cancellation or deadline is NOT evidence about the server.
+	// It means we stopped waiting, so it must never condemn the authority.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// A QUIC handshake timeout is the silent-UDP-blackhole signature: the
+	// handshake never completed, and nothing on the wire ever came back.
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return true
+	}
+	// A concrete transport error means the transport layer answered and refused,
+	// which is also a transport-establishment failure.
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	return false
 }
 
 // http3ActiveStream wraps a RequestStream so closing it releases the slot's
