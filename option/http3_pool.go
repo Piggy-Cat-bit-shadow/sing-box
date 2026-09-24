@@ -12,13 +12,32 @@ import (
 //
 // Size 1 (and an absent object) is exactly the upstream behaviour: one transport.
 type HTTP3ConnectionPoolOptions struct {
-	Size     int    `json:"size,omitempty"`
+	Size int `json:"size,omitempty"`
+	// Strategy is retained for configuration compatibility, but it does NOT
+	// select a scheduler. It is validated (`round_robin` is the only accepted
+	// value) and then never consulted, because the two consumers schedule their
+	// own members:
+	//
+	//   - the generic HTTP client (common/httpclient) rotates members with an
+	//     atomic round-robin counter;
+	//   - the MASQUE tunnel client (transport/http) picks the healthy
+	//     least-active slot, breaking ties by round-robin.
+	//
+	// The MASQUE scheduler is the one that matters here: the pool exists to spread
+	// proxy tunnels, and least-active is what keeps one saturated QUIC connection
+	// from being chosen while another sits idle.
+	//
+	// It is deliberately NOT removed: dropping the field would make existing
+	// configurations fail to decode. Do not document it as a user-selectable
+	// scheduler, and do not add a second accepted value without also making a
+	// consumer honour it.
 	Strategy string `json:"strategy,omitempty" enum:"round_robin"`
 }
 
 const (
-	// HTTP3PoolStrategyRoundRobin is the only strategy implemented by the
-	// first version. It is deliberately simple: no adaptive scheduling.
+	// HTTP3PoolStrategyRoundRobin is the only accepted value for Strategy. It is
+	// accepted for compatibility; see the field comment for what actually
+	// schedules pool members.
 	HTTP3PoolStrategyRoundRobin = "round_robin"
 
 	// MaxHTTP3ConnectionPoolSize bounds the pool so that a configuration

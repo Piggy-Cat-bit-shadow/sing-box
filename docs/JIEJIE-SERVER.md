@@ -226,7 +226,7 @@ H2 fallback behaviour is unchanged.
 | Field | Type | Default |
 | --- | --- | --- |
 | `size` | int, 1..8 | `1` |
-| `strategy` | string | `round_robin` |
+| `strategy` | string | `round_robin` (accepted for compatibility; not a scheduler) |
 
 * `size: 1` (or an absent object) is exactly the upstream single-transport
   behaviour, including lazy connection setup.
@@ -234,8 +234,17 @@ H2 fallback behaviour is unchanged.
   concurrent requests use two separate QUIC connections rather than two streams
   on one connection.
 * Sizes above 8 and unknown strategies are rejected at config load.
-* **Start with `size: 2`.** Larger values are not recommended without your own
-  measurements.
+* `strategy` is **not** a user-selectable scheduler. Only `round_robin` is
+  accepted, and the value is validated and then ignored: each consumer schedules
+  its own members (the generic HTTP client rotates with an atomic counter; the
+  MASQUE tunnel client picks the healthy least-active slot and breaks ties by
+  rotation). The field is retained so existing configurations keep loading. See
+  the `HTTP3ConnectionPoolOptions` comment in `option/http3_pool.go`.
+* **Keep `size: 1` unless you have measured otherwise.** `size: 1` is the
+  baseline and behaves like upstream; `size: 2` is an experiment. The pool's
+  correctness is covered by tests, but no throughput benefit has been
+  demonstrated on a real VPS, so a larger pool is unproven rather than
+  recommended.
 
 Replay safety (enforced in tests):
 
