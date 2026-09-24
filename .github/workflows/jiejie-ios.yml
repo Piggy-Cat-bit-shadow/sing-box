@@ -13,8 +13,7 @@ on:
   push:
     branches:
       - testing
-      - feat/jiejie-ios-libbox
-      - 'integrate/**'
+      - 'feat/jiejie-*'
     paths:
       # H3 core: the options and the implementations this stage exists to ship.
       - 'option/**'

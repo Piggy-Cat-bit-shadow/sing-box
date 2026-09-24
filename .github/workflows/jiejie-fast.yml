@@ -6,7 +6,7 @@ name: Jiejie Fast
 
 on:
   push:
-    branches: [feat/jiejie-server-edition, testing, 'integrate/**']
+    branches: [testing, 'feat/jiejie-*']
     paths-ignore:
       - 'docs/**'
       - '**/*.md'

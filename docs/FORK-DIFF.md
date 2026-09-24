@@ -3,8 +3,13 @@
 Base: `SagerNet/sing-box` `testing`
 Fork: `Piggy-Cat-bit-shadow/sing-box`
 Current version: `1.15.0-jiejie-masquerade.3`
-Development branch: `feat/jiejie-server-edition`
-Production branch: `testing`
+Long-term branches:
+  `testing` — the shipping Jiejie Server Edition line
+  `trusttunnel-experimental` — archive of the retired TrustTunnel experiment
+
+There is no separate development branch. Work lands on `testing`; short-lived
+`feat/jiejie-*` branches exist only while a change is being verified, and are
+deleted once its workflows are green.
 
 This fork intentionally changes only the following areas. Everything is
 optional and off by default; an unmodified configuration behaves like upstream.
@@ -168,7 +173,7 @@ There are no other intentional sing-box runtime behavior changes.
 
 ```sh
 git fetch upstream
-git switch feat/jiejie-server-edition
+git switch testing
 git log --oneline HEAD..upstream/testing
 git diff HEAD...upstream/testing
 git rebase upstream/testing        # or: git merge upstream/testing

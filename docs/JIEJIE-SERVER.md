@@ -694,7 +694,7 @@ artifact archive size.
 
 ```sh
 git fetch upstream
-git switch feat/jiejie-server-edition
+git switch testing
 git rebase upstream/testing        # or: git merge upstream/testing
 ```
 

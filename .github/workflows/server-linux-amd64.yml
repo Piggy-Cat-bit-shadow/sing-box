@@ -5,8 +5,7 @@ on:
   push:
     branches:
       - testing
-      - feat/jiejie-server-edition
-      - 'integrate/**'
+      - 'feat/jiejie-*'
   pull_request:
     branches:
       - testing

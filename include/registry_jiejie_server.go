@@ -36,10 +36,15 @@ import (
 //
 //	TCP/443  Nginx Stream -> 127.0.0.1:28436 anytls-in  (native fallback -> 28437)
 //	                      -> 127.0.0.1:28440 masque-h2 (behind Nginx, HTTP/2)
-//	                      -> 127.0.0.1:28450 shadowtls-in
+//	                      -> 127.0.0.1:8554  shadowtls-in
 //	                           detour -> ss2022-in -> route -> residential-socks / direct
 //	UDP/443  masque-h3 (HTTP/3, MASQUE L4)
 //	DNS      direct.domain_resolver and the ShadowTLS handshake resolver -> local-agh (UDP)
+//
+// The ports above are the ones release/jiejie-production-topology.json actually
+// declares, which is the reference baseline. Keep the two in step: the fixture is
+// what `sing-box check` and the integration tests exercise, so a comment that
+// disagrees with it is simply wrong.
 //
 // See docs/JIEJIE-SERVER.md for the full rationale.
 
