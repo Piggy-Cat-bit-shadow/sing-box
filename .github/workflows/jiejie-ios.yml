@@ -234,6 +234,12 @@ jobs:
           # CI verification build: both slices, so the Simulator app can be built.
           # The slim profile is applied so the compile exercises the same tag set
           # the shipping build uses.
+          #
+          # The previous output is removed first. gomobile writes into an existing
+          # Libbox.xcframework rather than replacing it, so without this the
+          # second build below would silently reuse the first build's slices and
+          # the device-only size would be a copy of the two-slice size.
+          rm -rf Libbox.xcframework
           go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator -profile jiejie-ios-slim
           echo "=== built XCFramework size ==="
           du -sh Libbox.xcframework
@@ -251,7 +257,29 @@ jobs:
           # so the simulator slice is dead weight in an installable artifact.
           # Built separately so the shipping size is measured on its own rather
           # than inferred from the two-slice framework.
+          #
+          # The two-slice output is removed FIRST. Without this gomobile reuses
+          # the existing framework and the "device-only" artifact still contains
+          # the simulator slice, which is exactly the regression this stage
+          # exists to prevent.
+          rm -rf Libbox.xcframework
           go run ./cmd/internal/build_libbox -target apple -platform ios -profile jiejie-ios-slim
+
+          echo "=== device-only assertions ==="
+          # Assert the simulator slice is genuinely gone, rather than trusting
+          # that -platform ios did what it says.
+          if find Libbox.xcframework -type d -name '*simulator*' | grep -q .; then
+            echo "FAIL: the device-only build still contains a simulator slice:" >&2
+            find Libbox.xcframework -type d -name '*simulator*' >&2
+            exit 1
+          fi
+          slices="$(find Libbox.xcframework -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')"
+          echo "slice directories: $slices"
+          if [ "$slices" -ne 1 ]; then
+            echo "FAIL: expected exactly one slice, got $slices" >&2
+            find Libbox.xcframework -maxdepth 1 -mindepth 1 -type d >&2
+            exit 1
+          fi
           echo "=== device-only XCFramework size ==="
           du -sh Libbox.xcframework
           find Libbox.xcframework -name Libbox -type f -exec ls -la {} \;
@@ -763,8 +791,14 @@ jobs:
           report="artifact/sfi/SIZE-REPORT.txt"
           ipa="$(find artifact/sfi -maxdepth 1 -name 'Jiejie-SFI-RESIGN-*.ipa' | head -1)"
 
-          full_libbox_bytes="$(wc -c < /tmp/full-libbox-bytes 2>/dev/null || echo 0)"
-          device_libbox_bytes="$(wc -c < /tmp/device-libbox-bytes 2>/dev/null || echo 0)"
+          # NOTE: these files HOLD a byte count, so they must be read with cat.
+          # `wc -c < file` counts the characters of the number itself -- for
+          # "267794520\n" that is 10, which is how an earlier revision reported a
+          # 267 MB framework as "10 bytes".
+          full_libbox_bytes="$(cat /tmp/full-libbox-bytes 2>/dev/null || echo 0)"
+          device_libbox_bytes="$(cat /tmp/device-libbox-bytes 2>/dev/null || echo 0)"
+          full_libbox_bytes="${full_libbox_bytes:-0}"
+          device_libbox_bytes="${device_libbox_bytes:-0}"
           full_client_bytes="$(sed -n 's/^full_client_bytes=//p' /tmp/size-comparison.txt 2>/dev/null || echo 0)"
           slim_client_bytes="$(sed -n 's/^slim_client_bytes=//p' /tmp/size-comparison.txt 2>/dev/null || echo 0)"
 
@@ -819,8 +853,10 @@ jobs:
             echo "previous full Libbox artifact: $previous_full_libbox bytes (ios + simulator XCFramework)"
             echo "new full Libbox:               $full_libbox_bytes bytes"
             echo "new device-only Libbox:        $device_libbox_bytes bytes"
-            if [ "$device_libbox_bytes" -gt 0 ]; then
+            if [ "$device_libbox_bytes" -gt 1000000 ]; then
               echo "device-only vs previous:       -$(( previous_full_libbox - device_libbox_bytes )) bytes ($(( (previous_full_libbox - device_libbox_bytes) * 100 / previous_full_libbox ))%)"
+            else
+              echo "device-only vs previous:       UNAVAILABLE (device-only size was not captured)"
             fi
             echo ""
             echo "NOTE: these are four different measurements and must not be"
