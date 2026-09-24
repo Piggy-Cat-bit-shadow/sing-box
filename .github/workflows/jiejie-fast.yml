@@ -1,0 +1,211 @@
+name: Jiejie Fast
+# Fast feedback for every push and pull request. This workflow deliberately does
+# NOT build Apple, Windows packages, soak or benchmarks: those live in their own
+# workflows so a docs typo cannot cost a macOS runner, and so this one can finish
+# in minutes rather than tens of minutes.
+
+on:
+  push:
+    branches: [feat/jiejie-server-edition, testing, 'integrate/**']
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+# A newer push to the same ref cancels the older run, so pushing five times does
+# not queue five identical builds on stale commits.
+concurrency:
+  group: jiejie-fast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# NOTE: GOTOOLCHAIN is deliberately NOT pinned to `local` here. golangci-lint
+# v2.13.2 requires a newer Go than the module's minimum and fetches that
+# toolchain itself; pinning local makes `go run .../golangci-lint@v2.13.2` fail
+# with "requires go >= 1.26.0 (running go 1.25.5; GOTOOLCHAIN=local)" before
+# lint can run at all.
+
+jobs:
+  format-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # Caching is done explicitly below so the key can include the tag
+          # flavour. Using setup-go's cache AND a manual actions/cache on the
+          # same directory would double-save and fight over the key.
+          cache: false
+      - name: Restore Go caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-fast-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: jiejie-fast-${{ runner.os }}-
+      - name: Format check
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l . 2>/dev/null | grep -v '^\.gocache' | grep -v '^\.gomodcache' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+      - name: Lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=10m
+      - name: Save Go caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-fast-${{ runner.os }}-${{ hashFiles('go.sum') }}
+
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-core-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: jiejie-core-${{ runner.os }}-
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Production tag set (vet + unit)
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          echo "tags: $TAGS"
+          go vet -tags "$TAGS" ./option ./transport/http ./common/httpclient ./include \
+            ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks
+          go test -tags "$TAGS" -count=1 -timeout 15m \
+            ./option ./transport/http ./common/httpclient ./include \
+            ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks
+      - name: Focused race tests
+        run: |
+          set -euo pipefail
+          PROD_TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          # Only the packages with new concurrent state, so the race detector
+          # stays fast enough to run on every push.
+          go test -tags "$PROD_TAGS" -race -count=1 -timeout 15m ./transport/http ./common/httpclient ./option
+      - name: Save Go caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-core-${{ runner.os }}-${{ hashFiles('go.sum') }}
+
+  build-gate:
+    # Both product builds must compile. This proves the two tag sets have not
+    # drifted into mutual breakage without paying for a full platform build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Restore Go caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: jiejie-build-${{ runner.os }}-
+      - name: Server Minimal compiles
+        run: ./scripts/ci/build-client.sh linux amd64 server-minimal /tmp/server-minimal
+      - name: Client Full compiles
+        run: ./scripts/ci/build-client.sh linux amd64 client-full /tmp/client-full
+      - name: Server Minimal really rejects the pruned protocols
+        run: |
+          set -euo pipefail
+          # Symbol check plus a behavioural check. Symbols alone could pass while
+          # the registry entry is present, and behaviour alone would not show
+          # whether a pruned protocol package was linked back in.
+          for proto in hysteria hysteria2 tuic vless vmess trojan; do
+            symbols=$(go tool nm /tmp/server-minimal | grep -c "protocol/$proto\." || true)
+            echo "server-minimal $proto symbols: $symbols"
+            if [ "$symbols" -ne 0 ]; then
+              echo "FAIL: Server Minimal was polluted with $proto" >&2
+              exit 1
+            fi
+          done
+          # The protocols the production topology actually needs must be present.
+          for proto in http anytls shadowtls shadowsocks socks direct; do
+            symbols=$(go tool nm /tmp/server-minimal | grep -c "protocol/$proto\." || true)
+            echo "server-minimal $proto symbols: $symbols"
+            if [ "$symbols" -eq 0 ]; then
+              echo "FAIL: Server Minimal is missing $proto" >&2
+              exit 1
+            fi
+          done
+      - name: Every bundled example config still validates
+        run: |
+          set -euo pipefail
+          # Guards the docs against schema drift: an example that no longer
+          # decodes fails CI instead of misleading an operator.
+          shopt -s nullglob
+          examples=(examples/jiejie-client/*.json)
+          if [ ${#examples[@]} -eq 0 ]; then
+            echo "no bundled example configs to check"
+            exit 0
+          fi
+          for example in "${examples[@]}"; do
+            echo "checking $example"
+            /tmp/client-full check -c "$example"
+          done
+      - name: Save Go caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: jiejie-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
+
+  fast-summary:
+    needs: [format-and-lint, core-tests, build-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise
+        run: |
+          {
+            echo "### Jiejie Fast"
+            echo ""
+            echo "| job | result |"
+            echo "| --- | --- |"
+            echo "| format-and-lint | ${{ needs.format-and-lint.result }} |"
+            echo "| core-tests | ${{ needs.core-tests.result }} |"
+            echo "| build-gate | ${{ needs.build-gate.result }} |"
+            echo ""
+            echo "Not covered here (by design): Windows packaging, macOS CLI, Apple Libbox,"
+            echo "iOS/macOS GUI, soak, benchmarks. See the client, apple and slow workflows."
+          } >> "$GITHUB_STEP_SUMMARY"
