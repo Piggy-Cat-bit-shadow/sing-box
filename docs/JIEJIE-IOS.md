@@ -121,22 +121,40 @@ checked-out client is not exactly the pinned commit.
 
 No deprecated Libbox API was re-added to the core to accommodate the old pin.
 
-## What the workflow still produces
+## What the workflow produces
 
-Because the Libbox artifact is the Jiejie deliverable, it is collected and
-uploaded as soon as the framework is built, before the SFI application build
-runs. A failing SFI build therefore does not cost the `Libbox.xcframework`
-artifact.
+Verified end to end on GitHub's `macos-latest` runner (Xcode 26.6, Go 1.25.5):
 
-The SFI build step is **not** wrapped in `continue-on-error` and does not skip
-its assertions: it runs for real and fails red when it cannot compile. A
-separate classification step then states the cause from the build log and prints
-the Libbox/Jiejie evidence, so the failure reads as a diagnosis rather than an
-unexplained red job.
+| Step | Result |
+| --- | --- |
+| TrustTunnel zero audit | pass |
+| Libbox config smoke test (`with_quic`) | pass, 4/4 |
+| `Libbox.xcframework` (ios-arm64 + ios-arm64_x86_64-simulator) | pass |
+| Jiejie H3 markers in the built framework | `http3_connection_pool`, `http3_fallback` both found |
+| SFI Simulator build (Release, unsigned) | pass |
+| SFI generic iOS device build (Release, unsigned) | pass |
+| SFI device-only slim build (arm64) | pass |
+| `UNSIGNED` IPA packaging | pass |
+| Apple client source-guard | pass |
+
+The device-only build drops the simulator and x86_64 slices, since a stock
+iPhone loads neither. Measured sizes from that run:
+
+| Artifact | Size |
+| --- | --- |
+| device-only `sing-box.app` | 119 MB |
+| `sing-box` executable | 36.4 MB |
+| `SFI-device-arm64-UNSIGNED.ipa` | 39.1 MB |
+
+The executable was verified as `Mach-O 64-bit executable arm64`, and the
+signature state as `no _CodeSignature directory` plus
+`code object is not signed at all`.
 
 ## Signing
 
 Artifacts are named `UNSIGNED` and their `BUILD-INFO.txt` records
-`signed: false` and `installable_on_stock_ios: false`. No IPA is fabricated from
-an unsigned `.app`, and no signing identity, certificate or provisioning profile
-is requested anywhere in this stage.
+`signed: false` and `installable_on_stock_ios: false`. The IPA is a plain
+`Payload/*.app` archive with no valid signature, so it installs only after the
+user signs it with their own certificate and provisioning profile. No signing
+identity, certificate or provisioning profile is requested anywhere in this
+stage, and no signed IPA is fabricated from an unsigned app.
