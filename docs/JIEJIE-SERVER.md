@@ -440,7 +440,7 @@ never enter the import graph, so the Go linker removes them.
 
 | Registry | Default build | `jiejie_server_minimal` |
 | --- | --- | --- |
-| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | **http, anytls, shadowtls, shadowsocks** |
+| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | **http, anytls, naive, shadowtls, shadowsocks** |
 | Outbounds | direct, bridge, block, selector, urltest, socks, http, shadowsocks, snell, vmess, trojan, naive, tor, ssh, shadowtls, vless, anytls, hysteria, tuic, hysteria2, tailscale | **direct, socks** |
 | Endpoints | WireGuard, OpenConnect, OpenVPN, MASQUE, Tailscale | none |
 | DNS transports | tcp, udp, tls, https, hosts, local, mdns, fakeip, quic, http3, resolved, dhcp, tailscale, openconnect, openvpn | **udp, local** |
