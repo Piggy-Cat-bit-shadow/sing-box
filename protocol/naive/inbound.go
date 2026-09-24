@@ -240,12 +240,20 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// tunnel exactly as before.
 	usePadding := request.Header.Get("Padding") != ""
 
-	hostPort := request.Header.Get("-connect-authority")
+	// The tunnel target comes from the CONNECT request itself: URL.Host, falling
+	// back to Host. This mirrors klzgrad/forwardproxy exactly.
+	//
+	// A previous revision consulted a "-connect-authority" header FIRST. That
+	// header is not part of the Naive protocol, no client (including this fork's
+	// own outbound) ever sends it, and honouring it let a request whose real
+	// target was A be tunnelled to B instead. That is not privilege escalation --
+	// the client chooses the CONNECT target anyway -- but it makes the routed and
+	// logged destination disagree with the requested one, which silently defeats
+	// any routing rule or audit written against the visible target. Undocumented
+	// request surface with no compatibility benefit is not worth keeping.
+	hostPort := request.URL.Host
 	if hostPort == "" {
-		hostPort = request.URL.Host
-		if hostPort == "" {
-			hostPort = request.Host
-		}
+		hostPort = request.Host
 	}
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 	if !destination.IsValid() {
