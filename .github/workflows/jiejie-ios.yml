@@ -339,8 +339,20 @@ jobs:
       - name: Confirm the Apple client was not modified
         run: |
           set -euo pipefail
-          # Libbox.xcframework is an untracked build input, so it is expected to
-          # appear. Any tracked Swift/project/package change is not.
+          # The gitlink may be UPDATED as a commit (that is how the pin moves),
+          # but the checked-out client must never be PATCHED here. Libbox
+          # .xcframework is an untracked build input, so it is expected to
+          # appear; any tracked Swift/project/package change is not.
+          echo "--- pinned gitlink recorded in the parent repository ---"
+          pinned="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
+          actual="$(git -C clients/apple rev-parse HEAD)"
+          echo "pinned: $pinned"
+          echo "actual: $actual"
+          if [ "$pinned" != "$actual" ]; then
+            echo "FAIL: clients/apple is not at the commit the parent pins" >&2
+            exit 1
+          fi
+
           echo "--- submodule status (Libbox.xcframework is expected, nothing else) ---"
           git -C clients/apple status --short
           dirty="$(git -C clients/apple status --short --untracked-files=no)"
@@ -353,7 +365,7 @@ jobs:
             echo "FAIL: Package.resolved changed" >&2
             exit 1
           fi
-          echo "Apple client: no tracked modifications"
+          echo "Apple client: at the pinned commit, no tracked modifications"
 
       - name: Collect unsigned SFI artifact
         run: |

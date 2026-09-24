@@ -27,10 +27,11 @@ The Apple client is consumed as the submodule gitlink, never as a moving branch.
 The workflow checks out with `submodules: recursive` and fails if the submodule
 ends up with any tracked modification.
 
-## Blocker: pinned Apple commit and this core disagree on the Libbox Swift API
+## The Libbox Swift API skew, and how it was resolved
 
-The SFI application build does not compile against a Libbox generated from this
-core. Two errors, both in the same direction:
+The Apple gitlink originally pinned `2b1763a` (2026-09-14) did not compile
+against a Libbox generated from this core. Two errors, both in the same
+direction:
 
 | Error | Direction | Detail |
 | --- | --- | --- |
@@ -88,22 +89,37 @@ from a different, newer UI would not demonstrate "official SFI + Jiejie Libbox".
 
 The pin was therefore left untouched and the failure recorded instead.
 
-## Resolution options (not applied here)
+### Resolution: the Apple pin was moved to the earliest compatible commit
 
-Pick one deliberately; each changes what the stage is proving.
+The pin was updated from `2b1763a` (2026-09-14) to
+`65fae11640bf67c0966aae8e12ece6596d2a3469` (2026-09-24), which is the **earliest
+commit across all official Apple refs** that satisfies every condition:
 
-1. **Move the pin to the Apple commit that matches this core.** Smallest change
-   to the Apple side, but it is an Apple-client update and must be an explicit,
-   reviewed decision, not a side effect of an iOS build job.
-2. **Add the missing Libbox exports in the core.** A `PromotePowerReportDraft`
-   counterpart and the auto-redirect platform hooks would have to be
-   implemented in `experimental/libbox`, which is upstream-owned code and
-   beyond a build-pipeline stage.
-3. **Build SFI for the simulator only, without the power-report path.** Not
-   available: the call site is unconditional in `ExtensionProvider.swift`.
+| Condition | Verified |
+| --- | --- |
+| no longer calls `LibboxPromotePowerReportDraft` | yes — calls `LibboxDiscardPowerReportDraft` |
+| implements `usePlatformAutoRedirect` | yes |
+| implements `createAutoRedirect` | yes |
 
-Option 1 is the likely path, as a dedicated change whose diff is visibly about
-the Apple client.
+`65fae11` is the earliest: its parent `4731a25` adds the auto-redirect stub but
+still calls `PromotePowerReportDraft`, so it does not compile. Neither `stable`
+nor `main` ever implements `usePlatformAutoRedirect`, so `dev` is the only ref
+that can pair with this core.
+
+The pin moved 14 commits. Only two are interface fixes:
+
+```
+4731a25 Add stub for platform auto redirect
+65fae11 Discard unfinished power report draft instead of promoting it
+```
+
+The other twelve are ordinary client fixes that came along because the two
+interface fixes sit on top of them (iOS/macOS UI, terminal, font and
+taildrop work). Only the submodule gitlink changed; no Swift, `.pbxproj`,
+`.entitlements` or `Package.resolved` was hand-edited, and CI fails if the
+checked-out client is not exactly the pinned commit.
+
+No deprecated Libbox API was re-added to the core to accommodate the old pin.
 
 ## What the workflow still produces
 
