@@ -20,8 +20,6 @@ env:
     option/anytls.go
     option/simple.go
     option/http.go
-    option/http3_fallback.go
-    option/http3_pool.go
     option/http_server_profile.go
     option/http_unauthenticated_limits.go
     protocol/anytls/inbound.go
