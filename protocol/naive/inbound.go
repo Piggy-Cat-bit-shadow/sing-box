@@ -275,10 +275,25 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	source := badhttp.SourceAddress(request)
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
-		conn, _, err := hijacker.Hijack()
+		conn, bufferedReadWriter, err := hijacker.Hijack()
 		if err != nil {
 			n.badRequest(ctx, request, E.New("hijack failed"))
 			return
+		}
+		// Hijack returns a *bufio.ReadWriter whose Reader may already hold bytes
+		// the HTTP server read past the request headers. Those bytes are the
+		// START of the tunnel -- a client that pipelines the AnyTLS-style prologue
+		// or a UoT request header immediately after CONNECT has them buffered
+		// here. Dropping the reader discards them, which desynchronises the
+		// tunnel from its first byte.
+		//
+		// klzgrad/forwardproxy handles this explicitly ("bufReader may contain
+		// unprocessed buffered data from the client") and forwards the buffered
+		// bytes before streaming. This fork now does the same, by making the
+		// buffered bytes the FIRST thing the tunnel reads rather than replaying
+		// them into the socket.
+		if bufferedReadWriter != nil && bufferedReadWriter.Reader != nil {
+			conn = &hijackedConn{Conn: conn, reader: bufferedReadWriter.Reader}
 		}
 		n.newConnection(ctx, false, &naiveConn{Conn: conn, paddingConn: paddingConn{enabled: usePadding}}, userName, source, destination)
 	} else {

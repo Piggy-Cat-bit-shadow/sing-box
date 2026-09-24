@@ -1,6 +1,7 @@
 package naive
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
 	"math/rand"
@@ -319,3 +320,40 @@ func (c *naiveH2Conn) RearHeadroom() int                  { return c.rearHeadroo
 func (c *naiveH2Conn) WriterMTU() int                     { return c.writerMTU() }
 func (c *naiveH2Conn) ReaderReplaceable() bool            { return c.readerReplaceable() }
 func (c *naiveH2Conn) WriterReplaceable() bool            { return c.writerReplaceable() }
+
+// hijackedConn returns bytes buffered by the HTTP server before the tunnel
+// starts, then reads from the underlying connection.
+//
+// When net/http hijacks a connection it hands back a *bufio.ReadWriter whose
+// Reader may already contain bytes the server read past the request headers. A
+// client that sends its tunnel prologue immediately after CONNECT -- which is
+// what a pipelining client does -- has those bytes sitting in that buffer. If
+// they are discarded the tunnel begins mid-stream: the first UoT request header
+// or padding frame header is missing and every subsequent read is misaligned.
+//
+// The buffered bytes are consumed FIRST, exactly in order, so the tunnel sees a
+// single continuous stream. Only the read side is intercepted: writes go straight
+// to the socket, because the server has already flushed the response and nothing
+// else is buffered on the write side.
+type hijackedConn struct {
+	net.Conn
+	reader *bufio.Reader
+	// drained is set once the buffered bytes are exhausted, after which reads
+	// pass straight through with no extra bookkeeping.
+	drained bool
+}
+
+func (c *hijackedConn) Read(p []byte) (int, error) {
+	if !c.drained && c.reader != nil {
+		if c.reader.Buffered() > 0 {
+			return c.reader.Read(p)
+		}
+		c.drained = true
+	}
+	return c.Conn.Read(p)
+}
+
+// Upstream exposes the wrapped connection so wrappers that unwrap (bufio,
+// deadline helpers, common.Cast) still reach the real socket rather than
+// stopping at this adapter.
+func (c *hijackedConn) Upstream() any { return c.Conn }
