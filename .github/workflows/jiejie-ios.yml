@@ -369,12 +369,21 @@ jobs:
           # It is therefore named UNSIGNED and is never described as
           # installable on a stock, unmodified iPhone.
           mkdir -p artifact/sfi
-          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1 || true)"
+          # The SFI SCHEME builds a target whose product is sing-box.app, so
+          # the bundle is discovered by platform directory rather than assumed
+          # to be named after the scheme.
+          echo "--- device-only products tree ---"
+          find clients/apple/build/DerivedDataDeviceSlim/Build/Products -maxdepth 2 -type d | sort | head -10
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1 || true)"
           if [ -z "$slim_app" ]; then
-            echo "FAIL: device-only SFI.app was not produced" >&2
+            echo "FAIL: device-only app bundle was not produced" >&2
             exit 1
           fi
           echo "device-only app: $slim_app"
+
+          app_name="$(basename "$slim_app")"
+          bin_name="${app_name%.app}"
+          echo "app bundle: $app_name"
 
           stage="$(mktemp -d)"
           mkdir -p "$stage/Payload"
@@ -383,16 +392,16 @@ jobs:
           # Record what is actually inside, and confirm there is no signature to
           # lose: an unsigned app either has no _CodeSignature or an empty one.
           echo "--- binary architecture ---"
-          file "$stage/Payload/SFI.app/SFI" || true
-          lipo -info "$stage/Payload/SFI.app/SFI" || true
+          file "$stage/Payload/$app_name/$bin_name" || true
+          lipo -info "$stage/Payload/$app_name/$bin_name" || true
           echo "--- code signature presence ---"
-          if [ -d "$stage/Payload/SFI.app/_CodeSignature" ]; then
+          if [ -d "$stage/Payload/$app_name/_CodeSignature" ]; then
             echo "_CodeSignature directory present (contents below)"
-            ls -la "$stage/Payload/SFI.app/_CodeSignature" || true
+            ls -la "$stage/Payload/$app_name/_CodeSignature" || true
           else
             echo "no _CodeSignature directory: the app is unsigned"
           fi
-          codesign -dv "$stage/Payload/SFI.app" 2>&1 | head -5 || echo "codesign reports no signature (expected)"
+          codesign -dv "$stage/Payload/$app_name" 2>&1 | head -5 || echo "codesign reports no signature (expected)"
 
           ( cd "$stage" && zip -qry SFI-device-arm64-UNSIGNED.ipa Payload )
           mv "$stage/SFI-device-arm64-UNSIGNED.ipa" artifact/sfi/
@@ -408,11 +417,11 @@ jobs:
           set -euo pipefail
           # Size audit for the device-only variant: the Go core dominates the
           # binary, so the framework and the final executable are both recorded.
-          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1)"
-          echo "--- device-only SFI.app size ---"
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)"
+          echo "--- device-only app size: $slim_app ---"
           du -sh "$slim_app"
           echo "--- top-level binary ---"
-          ls -la "$slim_app/SFI" 2>/dev/null || true
+          find "$slim_app" -maxdepth 1 -type f -perm -u+x -exec ls -la {} \; 2>/dev/null || true
           echo "--- embedded frameworks ---"
           ls -la "$slim_app/Frameworks" 2>/dev/null | head -10 || true
           for fw in "$slim_app"/Frameworks/*; do
@@ -473,22 +482,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifact/sfi
-          # The product sits at <Products>/Release-iphonesimulator/SFI.app, so
-          # the search needs depth 3 rather than 2. The tree is printed first so
-          # a future layout change is visible in the log rather than only as a
-          # failure.
+          # The SFI scheme builds a target whose product is sing-box.app, not
+          # SFI.app, so the bundle is discovered under the platform directory.
+          # The tree is printed first so a layout change is visible in the log
+          # rather than only as a failure.
           echo "--- simulator products tree ---"
           find clients/apple/build/DerivedData/Build/Products -maxdepth 2 -type d | sort | head -20
-          app_path="$(find clients/apple/build/DerivedData/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1)"
+          app_path="$(find clients/apple/build/DerivedData/Build/Products/Release-iphonesimulator -maxdepth 1 -name '*.app' -type d | head -1)"
           if [ -z "$app_path" ]; then
-            echo "FAIL: simulator SFI.app was not produced" >&2
+            echo "FAIL: simulator app bundle was not produced" >&2
             exit 1
           fi
           echo "simulator app: $app_path"
           ditto -c -k --sequesterRsrc --keepParent "$app_path" artifact/sfi/SFI-simulator-UNSIGNED.zip
           echo "device products tree ---"
           find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 2 -type d 2>/dev/null | sort | head -20 || true
-          device_app="$(find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1 || true)"
+          device_app="$(find clients/apple/build/DerivedDataDevice/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1 || true)"
           if [ -n "$device_app" ]; then
             echo "device app: $device_app"
             ditto -c -k --sequesterRsrc --keepParent "$device_app" artifact/sfi/SFI-device-UNSIGNED.zip
