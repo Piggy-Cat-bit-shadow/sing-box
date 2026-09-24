@@ -1,4 +1,4 @@
-# Jiejie benchmark plan
+# Jiejie VPS benchmark plan
 
 This document describes how to A/B the Jiejie Server Edition options on the real
 VPS. It exists because CI runner numbers and loopback numbers do **not** predict
@@ -17,10 +17,10 @@ to be tested; the test plan below is how you test them.
 
 ## What CI measures (and what it does not)
 
-CI runs `BenchmarkHTTP3Pool1`, `BenchmarkHTTP3Pool2` and pool-selection
-microbenchmarks. These are **regression references only**: they run on a shared
-runner against a loopback HTTP/3 server. They can detect a gross regression in
-the pool code path. They cannot tell you what will happen on your VPS.
+CI builds the production binary, runs the server integration suite on loopback,
+and enforces a binary size guard. Those are regression signals only. They cannot
+tell you what will happen on your VPS, which is why every number below has to be
+measured on the real host.
 
 ## Metrics to record for every run
 
@@ -39,74 +39,7 @@ the pool code path. They cannot tell you what will happen on your VPS.
 
 Always sample RSS and FD **during** the load, not only before and after.
 
-## A/B 1 — HTTP/3 connection pool, `size: 1` vs `size: 2`
-
-The primary experiment.
-
-**Baseline client config**
-
-```json
-"http3_connection_pool": { "size": 1, "strategy": "round_robin" }
-```
-
-**Candidate client config**
-
-```json
-"http3_connection_pool": { "size": 2, "strategy": "round_robin" }
-```
-
-Procedure:
-
-1. Run a single-stream throughput test (`iperf3 -c HOST`) for both.
-2. Run a multi-stream test (`iperf3 -c HOST -P 8`) for both.
-3. Run a CONNECT-UDP throughput test for both.
-4. Record the server-side QUIC connection count for each.
-
-Interpretation:
-
-* If single-stream throughput is unchanged and multi-stream improves, the pool
-  is doing what it is designed to do.
-* If nothing changes, keep `size: 1` — it is the simpler, upstream-shaped
-  configuration.
-* If RSS rises noticeably with no throughput gain, keep `size: 1`.
-
-Do not assume `size: 2` is faster. Two QUIC connections mean two congestion
-controllers and more connection state on both ends.
-
-## A/B 2 — fallback backoff, upstream vs Jiejie
-
-The goal is recovery behaviour, not throughput.
-
-**Upstream behaviour**: omit `http3_fallback` (5m, x2, 48h cap).
-
-**Jiejie recommendation**:
-
-```json
-"http3_fallback": {
-  "initial_backoff": "5s",
-  "max_backoff": "5m",
-  "multiplier": 2,
-  "reset_on_success": true
-}
-```
-
-Procedure:
-
-1. Establish working HTTP/3.
-2. Simulate UDP loss (client-side firewall rule or a temporarily blocked
-   UDP/443) for ~30 seconds.
-3. Restore UDP.
-4. Measure **time until traffic returns to HTTP/3**.
-
-With the upstream schedule the client can stay on HTTP/2 for up to 48 hours.
-With the Jiejie schedule it should return within about 5 minutes worst case, and
-immediately once a successful HTTP/3 round trip occurs
-(`reset_on_success: true`).
-
-Expected result: a large reduction in recovery time. This is a correctness /
-UX improvement, not a throughput one.
-
-## A/B 3 — server profile, unset vs `jiejie-balanced-1g`
+## A/B 1 — server profile, unset vs `jiejie-balanced-1g`
 
 Measure resource behaviour under load, not speed.
 
@@ -128,11 +61,11 @@ Interpretation:
 * Watch for `H3_EXCESSIVE_LOAD` appearing in logs; if it does, raise
   `max_concurrent_streams`.
 
-## A/B 4 — full build vs Jiejie build vs Jiejie minimal build
+## A/B 2 — Jiejie minimal build vs a plain upstream build
 
-**Baseline**: `sing-box-linux-amd64-full`.
-**Candidates**: `sing-box-linux-amd64-jiejie` and
-`sing-box-linux-amd64-jiejie-minimal`.
+**Baseline**: `sing-box` built from upstream with `release/DEFAULT_BUILD_TAGS`.
+**Candidate**: `sing-box-linux-amd64` from this fork, built with
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`.
 
 The minimal build registers far fewer protocols, so a useful additional check is
 that it still serves the whole production topology. Before any load test, confirm
@@ -148,25 +81,23 @@ CI already runs these against `release/jiejie-production-topology.json`, but
 verify against your real config before switching production over.
 
 A removed protocol is expected to be *rejected* by the minimal build at config
-load; that is the trim working, not a fault. The full and jiejie artifacts remain
-available unchanged for rollback.
+load; that is the trim working, not a fault.
 
 Procedure:
 
 1. Run the same throughput and latency tests against both.
 2. Compare binary size, RSS and CPU.
-3. Confirm the production config still passes `sing-box check` on the Jiejie
-   build (it is checked in CI against a secret-free fixture).
+3. Confirm the production config still passes `sing-box check` on both.
 
 Interpretation:
 
-* The Jiejie build is roughly half the size. Expect **no throughput difference**;
+* The minimal build is roughly half the size. Expect **no throughput difference**;
   the removed components are unregistered optional features, not hot-path code.
 * A throughput difference would indicate something unexpected — investigate
   before adopting.
-* Keep the full build available as the fallback.
+* Keep the previous binary available for rollback.
 
-## A/B 5 — `GOAMD64` default vs `v3`
+## A/B 3 — `GOAMD64` default vs `v3`
 
 **Baseline**: `sing-box-linux-amd64-jiejie` (GOAMD64 default/`v1`).
 **Candidate**: `sing-box-linux-amd64-jiejie-v3`.
@@ -193,7 +124,7 @@ Interpretation:
 * If there is no clear, repeatable benefit, **keep the generic build**. The VPS
   host CPU can change under you on migration, and the generic build always runs.
 
-## A/B 6 — `CGO_ENABLED=1` vs `CGO_ENABLED=0`
+## A/B 4 — `CGO_ENABLED=1` vs `CGO_ENABLED=0`
 
 **Baseline**: `sing-box-linux-amd64-jiejie` (CGO enabled).
 **Candidate**: `sing-box-linux-amd64-jiejie-static`.

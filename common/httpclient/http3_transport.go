@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -21,65 +20,19 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// http3Pool is the part of http3Transport the fallback transport depends on.
-//
-// It is an interface so tests can supply a pool whose probe fails
-// deterministically, which is what makes the replay-safety guard testable without
-// a network. The concrete *http3Transport is the only production implementation.
-type http3Pool interface {
-	pick(request *http.Request) *http3.Transport
-	CloseIdleConnections()
-	Close() error
-}
-
-// http3Transport holds one or more independent HTTP/3 transports. With a pool
-// size of 1 it is the upstream single-transport transport; larger sizes let
-// concurrent requests spread over genuinely separate QUIC connections.
 type http3Transport struct {
-	transports []*http3.Transport
-	next       atomic.Uint64
+	h3Transport *http3.Transport
 }
 
-// pick returns the transport for the given request. Rotation only happens for
-// replayable requests: a request with a one-shot body must keep using a stable
-// member so that a failing attempt can never be retried onto another
-// connection with an already-consumed body.
-func (t *http3Transport) pick(request *http.Request) *http3.Transport {
-	if len(t.transports) == 1 {
-		return t.transports[0]
-	}
-	if !requestReplayable(request) {
-		return t.transports[0]
-	}
-	index := t.next.Add(1) - 1
-	return t.transports[index%uint64(len(t.transports))]
-}
-
-func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error) {
-	return t.pick(request).RoundTrip(request)
-}
-
-// http3BrokenEntry tracks one authority's HTTP/3 avoidance state.
-//
-// until and backoff are deliberately separate. An earlier revision stored them
-// in one record and deleted the record when the window expired, which also threw
-// away the escalation history: a serial failure -> expiry -> failure sequence
-// restarted at initial_backoff instead of continuing to grow. Expiry now only
-// ends the window; the escalation is cleared solely by a successful round trip
-// when reset_on_success is enabled.
 type http3BrokenEntry struct {
 	until   time.Time
 	backoff time.Duration
-	// seen is the last time this authority was touched. It drives bounded cleanup
-	// so stale entries can be reclaimed without discarding a live escalation.
-	seen time.Time
 }
 
 type http3FallbackTransport struct {
-	h3Pool        http3Pool
+	h3Transport   *http3.Transport
 	h2Fallback    innerTransport
 	fallbackDelay time.Duration
-	schedule      option.HTTP3FallbackSchedule
 	brokenAccess  sync.Mutex
 	broken        map[string]http3BrokenEntry
 }
@@ -134,35 +87,14 @@ func newHTTP3RoundTripper(
 	return h3Transport
 }
 
-// newHTTP3RoundTrippers builds `size` fully independent HTTP/3 transports.
-// Each one owns its own QUIC connection pool, so they really are separate
-// connections rather than streams within one connection.
-func newHTTP3RoundTrippers(
-	rawDialer N.Dialer,
-	baseTLSConfig tls.Config,
-	options option.QUICOptions,
-) ([]*http3.Transport, error) {
-	size, err := options.HTTP3ConnectionPool.Build()
-	if err != nil {
-		return nil, err
-	}
-	transports := make([]*http3.Transport, 0, size)
-	for range size {
-		transports = append(transports, newHTTP3RoundTripper(rawDialer, baseTLSConfig, options))
-	}
-	return transports, nil
-}
-
 func newHTTP3Transport(
 	rawDialer N.Dialer,
 	baseTLSConfig tls.Config,
 	options option.QUICOptions,
 ) (innerTransport, error) {
-	transports, err := newHTTP3RoundTrippers(rawDialer, baseTLSConfig, options)
-	if err != nil {
-		return nil, err
-	}
-	return &http3Transport{transports: transports}, nil
+	return &http3Transport{
+		h3Transport: newHTTP3RoundTripper(rawDialer, baseTLSConfig, options),
+	}, nil
 }
 
 func newHTTP3FallbackTransport(
@@ -172,34 +104,25 @@ func newHTTP3FallbackTransport(
 	options option.QUICOptions,
 	fallbackDelay time.Duration,
 ) (innerTransport, error) {
-	transports, err := newHTTP3RoundTrippers(rawDialer, baseTLSConfig, options)
-	if err != nil {
-		return nil, err
-	}
 	return &http3FallbackTransport{
-		h3Pool:        &http3Transport{transports: transports},
+		h3Transport:   newHTTP3RoundTripper(rawDialer, baseTLSConfig, options),
 		h2Fallback:    h2Fallback,
 		fallbackDelay: fallbackDelay,
-		schedule:      options.HTTP3Fallback.Build(),
 		broken:        make(map[string]http3BrokenEntry),
 	}, nil
 }
 
+func (t *http3Transport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return t.h3Transport.RoundTrip(request)
+}
+
 func (t *http3Transport) CloseIdleConnections() {
-	for _, transport := range t.transports {
-		transport.CloseIdleConnections()
-	}
+	t.h3Transport.CloseIdleConnections()
 }
 
 func (t *http3Transport) Close() error {
-	var err error
-	for _, transport := range t.transports {
-		transport.CloseIdleConnections()
-		err = E.Append(err, transport.Close(), func(err error) error {
-			return E.Cause(err, "close http3 transport")
-		})
-	}
-	return err
+	t.CloseIdleConnections()
+	return t.h3Transport.Close()
 }
 
 func (t *http3FallbackTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -214,28 +137,17 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 	if t.h3Broken(authority) {
 		return t.h2FallbackRoundTrip(request)
 	}
-	// Probe for an already-established QUIC connection on the member this
-	// request would use. The probe and any follow-up share the same member so
-	// that the cached-connection check is meaningful.
-	member := t.h3Pool.pick(request)
-	response, err := member.RoundTripOpt(request, http3.RoundTripOpt{OnlyCachedConn: true})
+	response, err := t.h3Transport.RoundTripOpt(request, http3.RoundTripOpt{OnlyCachedConn: true})
 	if err == nil {
 		t.clearH3Broken(authority)
 		return response, nil
 	}
 	if !errors.Is(err, http3.ErrNoCachedConn) {
 		t.markH3Broken(authority)
-		// Replay safety: a request whose body cannot be rewound must never be
-		// retried, here or on any other transport. The body may already have been
-		// partially consumed by the failed attempt, so re-sending it would
-		// transmit a truncated or duplicated payload. This check has to come
-		// BEFORE the fallback, not after: an earlier revision cloned and retried
-		// unconditionally, so a non-replayable request could reach the HTTP/2
-		// fallback with a consumed body.
-		return t.handleProbeFailure(request, err)
+		return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
 	}
 	if !requestReplayable(request) {
-		response, err = member.RoundTrip(request)
+		response, err = t.h3Transport.RoundTrip(request)
 		if err == nil {
 			t.clearH3Broken(authority)
 			return response, nil
@@ -243,25 +155,10 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 		t.markH3Broken(authority)
 		return nil, err
 	}
-	return t.roundTripHTTP3Race(request, authority, member)
+	return t.roundTripHTTP3Race(request, authority)
 }
 
-// handleProbeFailure decides what to do when the cached-connection probe fails
-// with something other than ErrNoCachedConn.
-//
-// Replay safety: a request whose body cannot be rewound must never be retried,
-// here or on any other transport. The HTTP/3 attempt may already have consumed
-// part of the body, so re-sending it would transmit a truncated or duplicated
-// payload. An earlier revision cloned and retried unconditionally, before any
-// replayability check.
-func (t *http3FallbackTransport) handleProbeFailure(request *http.Request, probeErr error) (*http.Response, error) {
-	if !requestReplayable(request) {
-		return nil, probeErr
-	}
-	return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
-}
-
-func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, authority string, member *http3.Transport) (*http.Response, error) {
+func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, authority string) (*http.Response, error) {
 	type result struct {
 		response *http.Response
 		err      error
@@ -282,7 +179,7 @@ func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, autho
 				err      error
 			)
 			if useH3 {
-				response, err = member.RoundTrip(raceRequest)
+				response, err = t.h3Transport.RoundTrip(raceRequest)
 			} else {
 				response, err = t.h2FallbackRoundTrip(raceRequest)
 			}
@@ -379,24 +276,14 @@ func (t *http3FallbackTransport) h2FallbackRoundTrip(request *http.Request) (*ht
 }
 
 func (t *http3FallbackTransport) CloseIdleConnections() {
-	t.h3Pool.CloseIdleConnections()
+	t.h3Transport.CloseIdleConnections()
 	t.h2Fallback.CloseIdleConnections()
 }
 
 func (t *http3FallbackTransport) Close() error {
 	t.CloseIdleConnections()
-	return E.Errors(t.h3Pool.Close(), t.h2Fallback.Close())
+	return t.h3Transport.Close()
 }
-
-// maxTrackedAuthorities bounds the broken-state map. Without a bound a client
-// talking to many hosts could grow it without limit.
-const maxTrackedAuthorities = 4096
-
-// authorityRetention is how long an expired entry is kept before cleanup may
-// reclaim it. Keeping an expired entry for a while is what lets the escalation
-// history survive a window expiry; retention only exists to stop the map growing
-// forever.
-const authorityRetention = time.Hour
 
 func (t *http3FallbackTransport) h3Broken(authority string) bool {
 	if authority == "" {
@@ -408,46 +295,20 @@ func (t *http3FallbackTransport) h3Broken(authority string) bool {
 	if !found {
 		return false
 	}
-	now := time.Now()
-	// An expired window no longer blocks HTTP/3, but the escalation is retained
-	// so a subsequent failure continues from where it left off.
-	entry.seen = now
-	t.broken[authority] = entry
-	return now.Before(entry.until)
+	if entry.until.IsZero() || !time.Now().Before(entry.until) {
+		delete(t.broken, authority)
+		return false
+	}
+	return true
 }
 
-// cleanupLocked reclaims entries that have been expired and untouched for longer
-// than the retention window. It is opportunistic: it runs when the map is at its
-// cap, so the common path pays nothing.
-//
-// It is NOT sufficient on its own to bound the map. When every tracked entry is
-// recent, the sweep frees nothing, so markH3Broken must additionally decline to
-// admit a new authority rather than growing past the cap.
-func (t *http3FallbackTransport) cleanupLocked(now time.Time) {
-	if len(t.broken) < maxTrackedAuthorities {
-		return
-	}
-	cutoff := now.Add(-authorityRetention)
-	for authority, entry := range t.broken {
-		if entry.until.Before(now) && entry.seen.Before(cutoff) {
-			delete(t.broken, authority)
-		}
-	}
-}
-
-// clearH3Broken drops the recorded failure for an authority after a successful
-// HTTP/3 round trip. When reset_on_success is disabled the backoff counter is
-// preserved so the next failure continues the previous escalation.
 func (t *http3FallbackTransport) clearH3Broken(authority string) {
 	if authority == "" {
 		return
 	}
 	t.brokenAccess.Lock()
-	defer t.brokenAccess.Unlock()
-	if !t.schedule.ResetOnSuccess {
-		return
-	}
 	delete(t.broken, authority)
+	t.brokenAccess.Unlock()
 }
 
 func (t *http3FallbackTransport) markH3Broken(authority string) {
@@ -456,22 +317,16 @@ func (t *http3FallbackTransport) markH3Broken(authority string) {
 	}
 	t.brokenAccess.Lock()
 	defer t.brokenAccess.Unlock()
-	now := time.Now()
-	t.cleanupLocked(now)
-	entry, tracked := t.broken[authority]
-	if !tracked && len(t.broken) >= maxTrackedAuthorities {
-		// The map is full and this authority is not in it. Adding it would make
-		// the map grow without bound under a workload that keeps inventing new
-		// authorities, so the entry is simply not created. The consequence is
-		// deliberately the SAFE one: h3Broken reports an untracked authority as
-		// not broken, so HTTP/3 is still attempted for it rather than being
-		// pinned to HTTP/2 forever with no path back. Escalation is merely not
-		// remembered for that authority.
-		return
+	entry := t.broken[authority]
+	if entry.backoff == 0 {
+		entry.backoff = 5 * time.Minute
+	} else {
+		entry.backoff *= 2
+		if entry.backoff > 48*time.Hour {
+			entry.backoff = 48 * time.Hour
+		}
 	}
-	entry.backoff = t.schedule.Next(entry.backoff)
-	entry.until = now.Add(entry.backoff)
-	entry.seen = now
+	entry.until = time.Now().Add(entry.backoff)
 	t.broken[authority] = entry
 }
 

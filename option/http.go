@@ -23,13 +23,11 @@ type HTTP2Options struct {
 
 type QUICOptions struct {
 	HTTP2Options
-	InitialPacketSize       int                         `json:"initial_packet_size,omitempty"`
-	DisablePathMTUDiscovery bool                        `json:"disable_path_mtu_discovery,omitempty"`
-	HTTP3Fallback           *HTTP3FallbackOptions       `json:"http3_fallback,omitempty"`
-	HTTP3ConnectionPool     *HTTP3ConnectionPoolOptions `json:"http3_connection_pool,omitempty"`
+	InitialPacketSize       int  `json:"initial_packet_size,omitempty"`
+	DisablePathMTUDiscovery bool `json:"disable_path_mtu_discovery,omitempty"`
 	// BBRProfile sets the HTTP/3 *server* congestion control profile. It is
-	// resolved from the http inbound `bbr_profile` option and is not a client
-	// setting.
+	// resolved from the http inbound `bbr_profile` option. This fork is
+	// VPS-only, so the only HTTP/3 options here are the server's.
 	BBRProfile ServerBBRProfile `json:"-"`
 }
 
@@ -91,11 +89,6 @@ func (o *HTTPClientOptions) UnmarshalJSONContext(ctx context.Context, content []
 	if err != nil {
 		return err
 	}
-	// Reject invalid HTTP/3 client options at decode time.
-	err = options.HTTP3Options.ValidateClientOptions()
-	if err != nil {
-		return err
-	}
 	options.Tag = ""
 	*o = HTTPClientOptions(options)
 	return nil
@@ -114,11 +107,7 @@ func (h *HTTPClient) UnmarshalJSONContext(ctx context.Context, content []byte) e
 	if err != nil {
 		return err
 	}
-	// A top-level http_clients entry must validate its HTTP/3 client options the
-	// same way HTTPClientOptions and HTTPOutboundOptions do. Without this, an
-	// invalid pool size or strategy in http_clients was accepted at decode time
-	// and only failed later when the transport was constructed.
-	return h.HTTP3Options.ValidateClientOptions()
+	return nil
 }
 
 func unmarshalHTTPVersionOptions(ctx context.Context, content []byte, baseStruct any, version int, http2Options *HTTP2Options, http3Options *QUICOptions) error {
@@ -135,20 +124,11 @@ func unmarshalHTTPVersionOptions(ctx context.Context, content []byte, baseStruct
 }
 
 // unmarshalHTTPVersionsOptions decodes an HTTP INBOUND option set.
-//
-// The inbound shares the QUICOptions type with the outbound, so it would
-// otherwise silently accept the client-only http3_fallback and
-// http3_connection_pool fields. Those settings only affect an HTTP client; a
-// server that accepted them would appear to be configured while changing
-// nothing, which is worse than a clear error. They are rejected explicitly here.
 func unmarshalHTTPVersionsOptions(ctx context.Context, content []byte, baseStruct any, versions []int, http2Options *HTTP2Options, http3Options *QUICOptions) error {
 	for _, version := range versions {
 		if version < 1 || version > 3 {
 			return E.New("unknown HTTP version: ", version)
 		}
-	}
-	if err := rejectClientOnlyHTTP3Options(content); err != nil {
-		return err
 	}
 	switch {
 	case slices.Contains(versions, 3):

@@ -96,14 +96,6 @@ jobs:
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./option
 
-      - name: HTTP/3 pool benchmarks (regression reference only)
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go test -tags "$TAGS" -run '^$' -bench 'BenchmarkHTTP3Pool' -benchtime=50x ./common/httpclient
-          echo "NOTE: runner numbers are a regression reference and do not predict VPS throughput."
-
   production-minimal-integration:
     runs-on: ubuntu-latest
     steps:
@@ -154,81 +146,9 @@ jobs:
           SING_BOX_PRODUCTION_BINARY=/tmp/sing-box-production \
             go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestProductionBinary' . 2>&1 | tee ../../integration-process.log
 
-  client-feature-integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ~1.25
-          cache: true
-
-      # The fork's client-side features (HTTP/3 connection pool, fallback
-      # backoff, H3 -> H2 fallback) need HTTP outbounds and the full protocol
-      # registry, which the production minimal build deliberately omits. They run
-      # under the upstream default tag set here, and never substitute for the
-      # production group above.
-      - name: Client feature tests (default tags)
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          echo "client-feature tags: $TAGS"
-          cd test/jiejie
-          go test -tags "$TAGS" -v -count=1 -timeout 20m \
-            -run 'TestJiejieH3FallbackBackoffConfiguration|TestJiejieHTTP3UnavailableFallsBackToH2|TestJiejieHTTP3PoolConfiguration|TestJiejieAnyTLSAuthenticatedStillWorks|TestJiejieAnyTLSFallback' \
-            . 2>&1 | tee ../../integration-client-feature.log
-
-      - name: Upstream HTTP compatibility tests (default tags)
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          cd test
-          go test -tags "$TAGS" -v -count=1 -timeout 20m \
-            -run 'TestHTTPInboundHTTP2|TestHTTPInboundHTTP2Cleartext|TestHTTPInboundHTTP3|TestHTTPInboundConnectUDPHTTP2|TestHTTPInboundConnectUDPHTTP3|TestHTTPForwardHTTP2Responses|TestHTTPForwardEarlyResponse|TestHTTPForwardUnexpectedSwitchingProtocols|TestHTTPForwardUserIsolation' \
-            . 2>&1 | tee ../integration-upstream.log
-
-      # The summary states only what this job actually executes as data-plane
-      # behaviour. It deliberately does not claim coverage it does not have: an
-      # earlier revision said this job "covers the H3 connection pool" while the
-      # test it named only validated the config schema, and named the fallback
-      # backoff config test while the passing H3 fallback test relied on the
-      # pre-existing hardcoded schedule rather than the new option.
-      - name: Summarise what this job actually exercises
-        if: always()
-        shell: bash
-        run: |
-          cat <<'SUMMARY'
-          CLIENT FEATURE TESTS (this job): -tags $(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-
-          Runtime data-plane behaviour covered here:
-            * H3 -> H2 fallback over a real network path
-              (TestJiejieHTTP3UnavailableFallsBackToH2)
-            * AnyTLS fallback and authenticated AnyTLS with the fork's own
-              outbound (TestJiejieAnyTLSFallback*, TestJiejieAnyTLSAuthenticatedStillWorks)
-            * upstream HTTP/2 and HTTP/3 inbound, forward and CONNECT-UDP suites
-
-          Configuration-shape coverage only, NOT data-plane:
-            * TestJiejieHTTP3PoolConfiguration   — pool schema accepted/rejected
-            * TestJiejieH3FallbackBackoffConfiguration — backoff fields decode
-
-          Configuration EFFECT is proven instead by unit tests that drive the real
-          state machine and the real MASQUE client, in the production and unit
-          jobs:
-            * transport/http TestClientFallbackBackoffSequenceUsesConfiguration
-            * transport/http TestMASQUEPoolSizeTwoOpensTwoConnections
-            * transport/http TestMASQUEPoolConcurrentCONNECTSpreadsConnections
-
-          PRODUCTION SERVER TESTS run in a separate job with -tags
-          $(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL).
-
-          Logs stay in this job output; no log is uploaded as an artifact.
-          SUMMARY
-
   build-production:
     runs-on: ubuntu-latest
-    needs: [lint-and-unit-tests, production-minimal-integration, client-feature-integration]
+    needs: [lint-and-unit-tests, production-minimal-integration]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
@@ -284,7 +204,6 @@ jobs:
             "github.com/sagernet/sing-box/protocol/mixed"
             "github.com/sagernet/sing-box/protocol/redirect"
             "github.com/sagernet/sing-box/protocol/tun"
-            "github.com/sagernet/sing-box/protocol/masque"
             "github.com/sagernet/sing-box/protocol/naive"
             "github.com/sagernet/sing-box/service/resolved"
             "github.com/sagernet/sing-box/service/origin_ca"
@@ -413,28 +332,7 @@ jobs:
           sha256sum "$BINARY" > "$BINARY.sha256"
           cat "$BINARY.sha256"
 
-      # A Linux client-full build, deliberately separate from the production
-      # server binary. It is NOT a VPS service binary: it exists so the client
-      # side (MASQUE, the H3 pool, the fallback schedule) can be exercised and
-      # debugged with the same core SHA the server ships.
-      - name: Build the Linux client-full binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_CLIENT_FULL)
-          echo "client-full tags: $TAGS"
-          go build \
-            -trimpath \
-            -tags "$TAGS" \
-            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
-            -o sing-box-client-full-linux-amd64 \
-            ./cmd/sing-box
-          file sing-box-client-full-linux-amd64
-          sha256sum sing-box-client-full-linux-amd64 > sing-box-client-full-linux-amd64.sha256
-          cat sing-box-client-full-linux-amd64.sha256
-
-      - name: Write BUILD-INFO for both Linux artifacts
+      - name: Write BUILD-INFO for the VPS artifact
         shell: bash
         run: |
           set -euo pipefail
@@ -443,67 +341,50 @@ jobs:
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
           BRANCH="$(git rev-parse --abbrev-ref HEAD)"
           SERVER_TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
-          CLIENT_TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_FULL)"
           SERVER_BYTES="$(stat -c '%s' sing-box-linux-amd64)"
-          CLIENT_BYTES="$(stat -c '%s' sing-box-client-full-linux-amd64)"
-
-          write_info() {
-            local out="$1" role="$2" binary="$3" tags="$4" bytes="$5" minimal="$6" sha="$7"
-            {
-              echo "Jiejie sing-box Linux artifact"
-              echo "=============================="
-              echo "ROLE=$role"
-              echo "SERVER_MINIMAL=$minimal"
-              echo "version:            $JIEJIE_VERSION"
-              echo "core_sha:           $CORE_SHA"
-              echo "core_short_sha:     $SHORT_SHA"
-              echo "branch:             $BRANCH"
-              echo "go_version:         $(go version)"
-              echo "GOOS:               linux"
-              echo "GOARCH:             amd64"
-              echo "CGO_ENABLED:        ${CGO_ENABLED:-0}"
-              echo "build_tags:         $tags"
-              echo "builder:            official Go linker, -trimpath -s -w"
-              echo "binary:             $binary"
-              echo "binary_bytes:       $bytes"
-              echo "binary_sha256:      $sha"
-              echo "trusttunnel:        false"
-              echo "build_time_utc:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-              echo "workflow_run_id:    ${GITHUB_RUN_ID}"
-            } > "$out"
-            cat "$out"
-          }
-
-          write_info "BUILD-INFO-VPS.txt" \
-            "VPS_PRODUCTION_SERVER" "sing-box-linux-amd64" "$SERVER_TAGS" "$SERVER_BYTES" "true" \
-            "$(sha256sum sing-box-linux-amd64 | awk '{print $1}')"
-
-          write_info "BUILD-INFO-CLIENT-FULL.txt" \
-            "LINUX_CLIENT_FULL_DEBUG" "sing-box-client-full-linux-amd64" "$CLIENT_TAGS" "$CLIENT_BYTES" "false" \
-            "$(sha256sum sing-box-client-full-linux-amd64 | awk '{print $1}')"
+          SERVER_SHA="$(sha256sum sing-box-linux-amd64 | awk '{print $1}')"
 
           {
+            echo "Jiejie VPS production server"
+            echo "============================"
+            echo "ROLE=VPS_PRODUCTION_SERVER"
+            echo "SERVER_MINIMAL=true"
+            echo "PRODUCT_SCOPE=VPS_ONLY"
+            echo "version:            $JIEJIE_VERSION"
+            echo "core_sha:           $CORE_SHA"
+            echo "core_short_sha:     $SHORT_SHA"
+            echo "branch:             $BRANCH"
+            echo "go_version:         $(go version)"
+            echo "GOOS:               linux"
+            echo "GOARCH:             amd64"
+            echo "CGO_ENABLED:        ${CGO_ENABLED:-0}"
+            echo "build_tags:         $SERVER_TAGS"
+            echo "builder:            official Go linker, -trimpath -s -w"
+            echo "binary:             sing-box-linux-amd64"
+            echo "binary_bytes:       $SERVER_BYTES"
+            echo "binary_sha256:      $SERVER_SHA"
+            echo "trusttunnel:        false"
+            echo "ios_product:        false"
+            echo "client_product:     false"
+            echo "build_time_utc:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run_id:    ${GITHUB_RUN_ID}"
             echo ""
-            echo "SERVER_MINIMAL=true means the VPS binary carries only the"
-            echo "production protocol set. The client-full binary is a debug"
-            echo "and comparison build and must NOT be deployed as a service."
-          } >> BUILD-INFO-CLIENT-FULL.txt
+            echo "This fork ships exactly one product. There is no iOS, Apple,"
+            echo "Windows or Linux client artifact, and no TrustTunnel support."
+          } > BUILD-INFO-VPS.txt
+          cat BUILD-INFO-VPS.txt
 
-      - name: Linux size report
+      - name: VPS binary size report
         shell: bash
         run: |
           set -euo pipefail
           {
             echo "===== VPS PRODUCTION BINARY ====="
-            echo "bytes:  $(stat -c '%s' sing-box-linux-amd64)"
-            echo "mib:    $(awk "BEGIN{printf \"%.1f\", $(stat -c '%s' sing-box-linux-amd64)/1048576}")"
+            echo "bytes:   $(stat -c '%s' sing-box-linux-amd64)"
+            echo "mib:     $(awk "BEGIN{printf \"%.1f\", $(stat -c '%s' sing-box-linux-amd64)/1048576}")"
             echo "ceiling: $MAX_BINARY_BYTES"
             echo ""
-            echo "===== LINUX CLIENT FULL ====="
-            echo "bytes:  $(stat -c '%s' sing-box-client-full-linux-amd64)"
-            echo "mib:    $(awk "BEGIN{printf \"%.1f\", $(stat -c '%s' sing-box-client-full-linux-amd64)/1048576}")"
-            echo ""
-            echo "Neither binary is compressed or packed: both use the official Go"
+            echo "The binary is not compressed or packed: it uses the official Go"
             echo "linker with -trimpath -s -w. No UPX, no external strip."
           } > SIZE-REPORT-linux.txt
           cat SIZE-REPORT-linux.txt
@@ -518,12 +399,3 @@ jobs:
             SIZE-REPORT-linux.txt
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Jiejie-Client-Full-linux-amd64-${{ steps.version.outputs.value }}-${{ github.sha }}
-          path: |
-            sing-box-client-full-linux-amd64
-            sing-box-client-full-linux-amd64.sha256
-            BUILD-INFO-CLIENT-FULL.txt
-            SIZE-REPORT-linux.txt
-          if-no-files-found: error

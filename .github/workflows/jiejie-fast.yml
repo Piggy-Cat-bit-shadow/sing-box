@@ -1,8 +1,12 @@
 name: Jiejie Fast
-# Fast feedback for every push and pull request. This workflow deliberately does
-# NOT build Apple, Windows packages, soak or benchmarks: those live in their own
-# workflows so a docs typo cannot cost a macOS runner, and so this one can finish
-# in minutes rather than tens of minutes.
+# Fast feedback for every push and pull request, for the one product this fork
+# ships: the Jiejie VPS production server binary.
+#
+# Scope is deliberately narrow. This workflow proves the production tag set
+# still builds, still passes its unit and race tests, and still excludes the
+# protocols the production topology does not use. It does NOT build clients,
+# Apple libraries, Windows packages, soak runs or benchmarks; those product
+# lines were removed when the fork was narrowed to VPS-only.
 
 on:
   push:
@@ -73,7 +77,7 @@ jobs:
             ~/.cache/go-build
           key: jiejie-fast-${{ runner.os }}-${{ hashFiles('go.sum') }}
 
-  core-tests:
+  server-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -103,12 +107,12 @@ jobs:
           go test -tags "$TAGS" -count=1 -timeout 15m \
             ./option ./transport/http ./common/httpclient ./include \
             ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks
-      - name: Focused race tests
+      - name: Race tests for the server's concurrent state
         run: |
           set -euo pipefail
           PROD_TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          # Only the packages with new concurrent state, so the race detector
-          # stays fast enough to run on every push.
+          # Only the packages with concurrent state on the server data path, so
+          # the race detector stays fast enough to run on every push.
           go test -tags "$PROD_TAGS" -race -count=1 -timeout 15m ./transport/http ./common/httpclient ./option
       - name: Save Go caches
         if: always()
@@ -120,8 +124,8 @@ jobs:
           key: jiejie-core-${{ runner.os }}-${{ hashFiles('go.sum') }}
 
   build-gate:
-    # Both product builds must compile. This proves the two tag sets have not
-    # drifted into mutual breakage without paying for a full platform build.
+    # The single product must compile, and must still be the trimmed server:
+    # the protocols the production topology does not use have to stay out.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -139,10 +143,8 @@ jobs:
             ~/.cache/go-build
           key: jiejie-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
           restore-keys: jiejie-build-${{ runner.os }}-
-      - name: Server Minimal compiles
-        run: ./scripts/ci/build-client.sh linux amd64 server-minimal /tmp/server-minimal
-      - name: Client Full compiles
-        run: ./scripts/ci/build-client.sh linux amd64 client-full /tmp/client-full
+      - name: Build Server Minimal
+        run: ./scripts/ci/build-server.sh linux amd64 /tmp/server-minimal
       - name: Server Minimal really rejects the pruned protocols
         run: |
           set -euo pipefail
@@ -166,21 +168,19 @@ jobs:
               exit 1
             fi
           done
-      - name: Every bundled example config still validates
+      - name: The production topology fixture still validates
         run: |
           set -euo pipefail
-          # Guards the docs against schema drift: an example that no longer
-          # decodes fails CI instead of misleading an operator.
-          shopt -s nullglob
-          examples=(examples/jiejie-client/*.json)
-          if [ ${#examples[@]} -eq 0 ]; then
-            echo "no bundled example configs to check"
-            exit 0
-          fi
-          for example in "${examples[@]}"; do
-            echo "checking $example"
-            /tmp/client-full check -c "$example"
-          done
+          # release/jiejie-production-topology.json is the product contract: the
+          # one configuration the shipped binary must accept.
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/jiejie-fixture-key.pem -out /tmp/jiejie-fixture-cert.pem \
+            -days 1 -nodes -subj "/CN=example.test" 2>/dev/null
+          mkdir -p /tmp/jiejie-fixture
+          mv /tmp/jiejie-fixture-key.pem /tmp/jiejie-fixture/key.pem
+          mv /tmp/jiejie-fixture-cert.pem /tmp/jiejie-fixture/cert.pem
+          /tmp/server-minimal check -c release/jiejie-production-topology.json
+          echo "production fixture: OK"
       - name: Save Go caches
         if: always()
         uses: actions/cache/save@v4
@@ -191,7 +191,7 @@ jobs:
           key: jiejie-build-${{ runner.os }}-${{ hashFiles('go.sum') }}
 
   fast-summary:
-    needs: [format-and-lint, core-tests, build-gate]
+    needs: [format-and-lint, server-tests, build-gate]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -200,12 +200,14 @@ jobs:
           {
             echo "### Jiejie Fast"
             echo ""
+            echo "Fork scope: VPS-only. One product: the Linux amd64 production server binary."
+            echo ""
             echo "| job | result |"
             echo "| --- | --- |"
             echo "| format-and-lint | ${{ needs.format-and-lint.result }} |"
-            echo "| core-tests | ${{ needs.core-tests.result }} |"
+            echo "| server-tests | ${{ needs.server-tests.result }} |"
             echo "| build-gate | ${{ needs.build-gate.result }} |"
             echo ""
-            echo "Not covered here (by design): Windows packaging, macOS CLI, Apple Libbox,"
-            echo "iOS/macOS GUI, soak, benchmarks. See the client, apple and slow workflows."
+            echo "Not covered here (by design): soak and benchmark runs, and the"
+            echo "release packaging in the Linux server workflow."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -5,22 +5,10 @@ package httpclient
 import (
 	"testing"
 	"time"
-
-	"github.com/sagernet/sing-box/option"
 )
 
-// upstreamScheduleTransport builds a fallback transport configured with the
-// upstream (default) backoff schedule, i.e. as if http3_fallback were absent.
-func upstreamScheduleTransport() *http3FallbackTransport {
-	var options *option.HTTP3FallbackOptions
-	return &http3FallbackTransport{
-		schedule: options.Build(),
-		broken:   make(map[string]http3BrokenEntry),
-	}
-}
-
 func TestHTTP3BrokenAuthorityIsolation(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.markH3Broken("a.example:443")
 	if !transport.h3Broken("a.example:443") {
@@ -32,7 +20,7 @@ func TestHTTP3BrokenAuthorityIsolation(t *testing.T) {
 }
 
 func TestHTTP3BrokenBackoffPerAuthority(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.markH3Broken("a.example:443")
 	if transport.broken["a.example:443"].backoff != 5*time.Minute {
@@ -58,7 +46,7 @@ func TestHTTP3BrokenBackoffPerAuthority(t *testing.T) {
 }
 
 func TestHTTP3BrokenBackoffCap(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.broken["a.example:443"] = http3BrokenEntry{backoff: 48 * time.Hour, until: time.Now().Add(48 * time.Hour)}
 	transport.markH3Broken("a.example:443")
@@ -68,7 +56,7 @@ func TestHTTP3BrokenBackoffCap(t *testing.T) {
 }
 
 func TestHTTP3BrokenClearDeletesEntry(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.markH3Broken("a.example:443")
 	transport.markH3Broken("b.example:443")
@@ -83,7 +71,7 @@ func TestHTTP3BrokenClearDeletesEntry(t *testing.T) {
 }
 
 func TestHTTP3BrokenExpiredEntryGarbageCollected(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.broken["a.example:443"] = http3BrokenEntry{
 		backoff: 5 * time.Minute,
@@ -92,17 +80,13 @@ func TestHTTP3BrokenExpiredEntryGarbageCollected(t *testing.T) {
 	if transport.h3Broken("a.example:443") {
 		t.Fatal("expired entry must report not broken")
 	}
-	// Expiry ends the avoidance window but retains the entry, because deleting it
-	// here would also discard the escalation counter and a serial
-	// failure -> expiry -> failure sequence would restart at initial_backoff.
-	// Reclamation happens separately in bounded cleanup.
-	if _, found := transport.broken["a.example:443"]; !found {
-		t.Fatal("expired entry must be retained so its escalation survives")
+	if _, found := transport.broken["a.example:443"]; found {
+		t.Fatal("expired entry must be garbage-collected on read")
 	}
 }
 
 func TestHTTP3BrokenEmptyAuthorityNoOp(t *testing.T) {
-	transport := upstreamScheduleTransport()
+	transport := &http3FallbackTransport{broken: make(map[string]http3BrokenEntry)}
 
 	transport.markH3Broken("")
 	if len(transport.broken) != 0 {

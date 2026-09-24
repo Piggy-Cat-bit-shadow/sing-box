@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,8 +20,6 @@ var (
 	debugEnabled bool
 	target       string
 	platform     string
-	profile      string
-	printTags    bool
 	// withTailscale bool
 )
 
@@ -30,121 +27,11 @@ func init() {
 	flag.BoolVar(&debugEnabled, "debug", false, "enable debug")
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
-	flag.StringVar(&profile, "profile", "", "build profile; empty keeps upstream behaviour. Known: jiejie-ios-slim")
-	flag.BoolVar(&printTags, "print-tags", false, "print the Apple tag set the given -profile produces, then exit")
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
-}
-
-// appleProfile describes an opt-in Apple build profile.
-//
-// A profile exists so that the Jiejie client can be built smaller WITHOUT
-// changing what the default `-target apple` invocation produces. Upstream's
-// behaviour must stay byte-for-byte what it was: the default path applies no
-// profile, so nothing here can regress it.
-type appleProfile struct {
-	// name is the value accepted by -profile.
-	name string
-	// removeTags are dropped from the default Apple tag set.
-	removeTags []string
-	// addTags are appended after the removals.
-	addTags []string
-}
-
-// iosSlimProfile is the Jiejie iOS slim client profile.
-//
-// Every removed tag was chosen because a mobile proxy client does not use the
-// component, and each removal was checked against a real configuration before
-// being adopted (see test/jiejie/jiejie-ios-client-fixture.json):
-//
-//   - with_tailscale / with_wireguard: no Tailscale or WireGuard endpoint is
-//     configured by this client. Dropping tailscale also removes the largest
-//     single dependency tree.
-//   - with_usbip, with_openvpn, with_openconnect: server-side or desktop-only
-//     transports with no place on iOS.
-//   - with_dhcp: the client resolves through configured DNS transports; it does
-//     not need a DHCP DNS transport.
-//   - with_clash_api: the in-app client does not expose the Clash API.
-//
-// What is deliberately KEPT, because the client needs it:
-//
-//   - with_quic    : MASQUE HTTP/3, the H3 pool, the H3 fallback schedule.
-//   - with_utls    : VLESS Reality/Vision needs a uTLS fingerprint.
-//   - with_naive_outbound : the NaiveProxy outbound.
-//   - with_acme / with_ccm / with_ocm / with_cloudflared : client-side features.
-//   - badlinkname / tfogo_checklinkname0 : required by the Apple toolchain.
-//
-// The tag set is only half the trim; jiejie_ios_slim also selects a reduced
-// registry, which is what actually removes the hysteria/tuic/vmess/trojan
-// protocol packages from the import graph.
-//
-// ONE unwanted dependency cannot be removed by tags or registry, and is recorded
-// here rather than papered over: experimental/libbox/native_shell_session.go
-// imports protocol/tailscale/tailssh unconditionally on Darwin and iOS, because
-// Libbox exposes the Tailscale SSH shell. That import is upstream-owned (no
-// Jiejie commit has touched it) and pulls roughly 200 packages, which makes it
-// the largest remaining item in the slim build. Removing it would mean patching
-// an upstream library file to drop a feature Libbox advertises, which is out of
-// scope for a build profile. It is left in place and reported, not hidden.
-var iosSlimProfile = appleProfile{
-	name: "jiejie-ios-slim",
-	removeTags: []string{
-		"with_tailscale",
-		"with_wireguard",
-		"with_usbip",
-		"with_openvpn",
-		"with_openconnect",
-		"with_dhcp",
-		"with_clash_api",
-	},
-	addTags: []string{
-		"jiejie_ios_slim",
-	},
-}
-
-// appleProfiles is the set of accepted -profile values.
-var appleProfiles = []appleProfile{iosSlimProfile}
-
-// appleProfileNames lists the accepted -profile values, for error messages.
-func appleProfileNames() string {
-	names := make([]string, 0, len(appleProfiles))
-	for _, candidate := range appleProfiles {
-		names = append(names, candidate.name)
-	}
-	return strings.Join(names, ", ")
-}
-
-// findAppleProfile returns the named profile, or false when name is not known.
-func findAppleProfile(name string) (appleProfile, bool) {
-	for _, candidate := range appleProfiles {
-		if candidate.name == name {
-			return candidate, true
-		}
-	}
-	return appleProfile{}, false
 }
 
 func main() {
 	flag.Parse()
-
-	// -print-tags exists so CI can derive the tag set from the profile itself
-	// instead of duplicating it in YAML, where it would silently drift.
-	if printTags {
-		// With no -profile this prints the UPSTREAM default Apple tag set, which
-		// is what a comparison build must use as its baseline. Comparing the slim
-		// profile against an untagged build would be meaningless: the untagged
-		// build is smaller precisely because it lacks with_quic and the rest.
-		base := append(append([]string{}, sharedTags...), darwinTags...)
-		if profile == "" {
-			fmt.Println(strings.Join(base, ","))
-			return
-		}
-		selected, known := findAppleProfile(profile)
-		if !known {
-			log.Fatal("unknown -profile ", profile, "; known profiles: ", appleProfileNames())
-		}
-		fmt.Println(strings.Join(applyAppleProfile(base, selected), ","))
-		return
-	}
 
 	build_shared.FindMobile()
 
@@ -176,7 +63,7 @@ func init() {
 	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
 	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
 
-	sharedTags = append(sharedTags, "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "badlinkname", "tfogo_checklinkname0")
+	sharedTags = append(sharedTags, "with_gvisor", "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_openconnect", "badlinkname", "tfogo_checklinkname0")
 	darwinTags = append(darwinTags, "with_dhcp", "grpcnotrace")
 	// memcTags = append(memcTags, "with_tailscale")
 	sharedTags = append(sharedTags, "with_tailscale", "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop", "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube", "ts_omit_aws", "ts_omit_synology", "ts_omit_bird")
@@ -339,17 +226,6 @@ func buildApple() {
 		tags = append(tags, debugTags...)
 	}
 
-	// Apply an optional profile. With no -profile the tag set is exactly what it
-	// was before profiles existed, so upstream behaviour is untouched.
-	if profile != "" {
-		selected, known := findAppleProfile(profile)
-		if !known {
-			log.Fatal("unknown -profile ", profile, "; known profiles: ", appleProfileNames())
-		}
-		tags = applyAppleProfile(tags, selected)
-		log.Info("profile ", selected.name, ": tags ", strings.Join(tags, ","))
-	}
-
 	args = append(args, "-tags", strings.Join(tags, ","))
 	args = append(args, "./experimental/libbox")
 
@@ -369,40 +245,4 @@ func buildApple() {
 		os.Rename("Libbox.xcframework", targetDir)
 		log.Info("copied to ", targetDir)
 	}
-}
-
-// applyAppleProfile returns tags with the profile's removals applied and its
-// additions appended.
-//
-// A tag the profile asks to remove but which is not present is not an error: the
-// default set is upstream's and may change, and a silent no-op is safer than a
-// build failure over a tag that was never there.
-//
-// It is idempotent: applying the same profile twice yields the same set, so a
-// tag is never duplicated if this is ever called on its own output.
-func applyAppleProfile(tags []string, selected appleProfile) []string {
-	removed := make(map[string]bool, len(selected.removeTags))
-	for _, tag := range selected.removeTags {
-		removed[tag] = true
-	}
-	filtered := make([]string, 0, len(tags)+len(selected.addTags))
-	seen := make(map[string]bool, len(tags))
-	for _, tag := range tags {
-		if removed[tag] {
-			continue
-		}
-		if seen[tag] {
-			continue
-		}
-		seen[tag] = true
-		filtered = append(filtered, tag)
-	}
-	for _, tag := range selected.addTags {
-		if seen[tag] {
-			continue
-		}
-		seen[tag] = true
-		filtered = append(filtered, tag)
-	}
-	return filtered
 }

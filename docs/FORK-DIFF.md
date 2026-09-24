@@ -2,18 +2,29 @@
 
 Base: `SagerNet/sing-box` `testing`
 Fork: `Piggy-Cat-bit-shadow/sing-box`
-Current version: `1.15.0-jiejie-masquerade.3`
-Long-term branches:
-  `testing` — the shipping Jiejie Server Edition line
-  `trusttunnel-experimental` — archive of the retired TrustTunnel experiment
+Current version: `1.15.0-jiejie-masquerade.4`
 
-There is no separate development branch. Work lands on `testing`; short-lived
+**Jiejie Server Edition is a VPS-only fork.**
+
+This repository ships exactly one custom product: a minimal Linux amd64
+production server binary.
+
+It does not ship or maintain:
+
+- iOS clients
+- Apple Libbox products
+- Windows clients
+- Linux full clients
+- TrustTunnel
+- general-purpose client features
+
+The single long-term branch is `testing`. Work lands there; short-lived
 `feat/jiejie-*` branches exist only while a change is being verified, and are
 deleted once its workflows are green.
 
-This fork intentionally changes only the following areas. Everything is
-optional and off by default; an unmodified configuration behaves like upstream.
-See [JIEJIE-SERVER.md](JIEJIE-SERVER.md) for the full reference.
+This fork intentionally changes only the server-side areas listed below.
+Everything is optional and off by default; an unmodified configuration behaves
+like upstream. See [JIEJIE-SERVER.md](JIEJIE-SERVER.md) for the full reference.
 
 ## Patch 1: HTTP inbound masquerade
 
@@ -30,27 +41,7 @@ protocol, authentication algorithm, padding, outbound, or `sing-anytls`.
 Fallback occurs after TLS termination and routes only to the configured backend.
 See [FORK-ANYTLS-FALLBACK.md](FORK-ANYTLS-FALLBACK.md).
 
-## Patch 3: configurable HTTP/3 fallback backoff
-
-`common/httpclient/http3_transport.go` gains an optional `http3_fallback` client
-option (`initial_backoff`, `max_backoff`, `multiplier`, `reset_on_success`).
-Absent, the upstream schedule (5m, doubling, 48h cap) is used unchanged. State
-stays keyed by request authority and is cleared on a successful HTTP/3 round
-trip. HTTP/2 fallback logic is untouched.
-
-## Patch 4: HTTP/3 connection pool
-
-`common/httpclient/http3_transport.go` gains an optional
-`http3_connection_pool` client option (`size`, `strategy`). `size: 1` (or an
-absent object) is exactly the upstream single-transport behaviour. `size: 2`
-creates two independent HTTP/3 transports, hence two independent QUIC
-connections. Non-rewindable request bodies are always served by one member and
-are never replayed onto another connection.
-
-This patch also fixes an upstream leak: `http3FallbackTransport.Close()` closed
-only the HTTP/3 transport and leaked the HTTP/2 fallback.
-
-## Patch 5: HTTP server resource profile
+## Patch 3: HTTP server resource profile
 
 `transport/http/server.go`, `server_h2.go`, `server_h3.go` and
 `option/http_server_profile.go` add an optional `server_profile` and a direct
@@ -63,7 +54,7 @@ The same file exposes `bbr_profile`, accepting exactly the three profiles that
 `sing-quic/congestion_meta2` really defines (`conservative`, `standard`,
 `aggressive`). Unset means `standard`, which is the previous hardcoded value.
 
-## Patch 6: unauthenticated resource limits
+## Patch 4: unauthenticated resource limits
 
 `transport/http/unauthenticated_limiter.go` and
 `option/http_unauthenticated_limits.go` add an optional
@@ -79,7 +70,7 @@ exposes the peer address through a request-context key rather than
 `http.Request.RemoteAddr`, so per-source-IP logic would otherwise see an empty
 address on the public UDP/443 path.
 
-## Patch 7: log classification
+## Patch 5: log classification
 
 `transport/http/h3_error_class.go` classifies HTTP/3 and QUIC errors using
 `errors.Is`, `errors.As` and real quic-go error codes — never string matching —
@@ -88,14 +79,16 @@ stays an error. `protocol/anytls/inbound.go` logs the normal fallback path at
 debug instead of info, and the masquerade auth-failure path logs at debug because
 the client receives an ordinary web response.
 
-## Patch 8: build profiles
+## Patch 6: the production build profile
 
-`release/BUILD_TAGS_JIEJIE_SERVER` adds a reduced optional-component tag set.
-`release/DEFAULT_BUILD_TAGS_OTHERS` is untouched, so full upstream build
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` is the one profile this fork ships:
+`with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0`.
+
+The upstream `release/DEFAULT_BUILD_TAGS*` files are untouched, so upstream build
 capability is preserved. No protocol source is deleted; the size reduction comes
 from not registering optional components.
 
-## Patch 9: minimal server registry
+## Patch 7: minimal server registry
 
 `include/registry.go` and `include/quic.go` gain a
 `!jiejie_server_minimal` build constraint, and two new files provide the minimal
@@ -103,17 +96,19 @@ variant:
 
 * `include/registry_jiejie_server.go` (`jiejie_server_minimal`) registers only
   the protocols and services this server's production config references.
-* `include/quic_minimal.go` (`with_quic && jiejie_server_minimal`) registers the
-  non-functional stubs for Hysteria/Hysteria2/TUIC/QUIC-DNS/realm without
-  importing those packages, and leaves MASQUE HTTP/3 to
-  `transport/http/server_h3.go`, which `with_quic` compiles on its own.
+* `include/quic_minimal.go` (`with_quic && jiejie_server_minimal`) leaves every
+  QUIC-protocol registration empty. MASQUE HTTP/3 is implemented by
+  `transport/http/server_h3.go`, which `with_quic` compiles on its own and needs
+  nothing registered here.
 
-Excluded types are still registered as stubs so a config referencing them fails
-with a clear message at `sing-box check`. No upstream protocol source is edited
-or deleted, and neither the full nor the plain Jiejie build changes behaviour.
+The empty registrations are deliberate. An earlier revision imported protocols
+purely to return a friendlier error for a type the build removes, which pulled
+the very packages the trim exists to remove back into the import graph. A config
+naming a removed type now fails `sing-box check` with "unknown inbound type"
+(or the equivalent), which is the honest outcome.
 
-`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` is
-`with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0`.
+No upstream protocol source is edited or deleted, and the upstream full build is
+unchanged.
 
 `release/jiejie-production-topology.json` is a secret-free fixture of the full
 production topology (MASQUE H2/H3 with masquerade and limits, AnyTLS with
@@ -123,30 +118,38 @@ requires the minimal build to reject a protocol it deliberately excludes.
 
 ## Maintenance and CI
 
-CI now has one job and one product: it tests broadly and publishes exactly one
-binary. The workflow runs three jobs:
+Two workflows, one product.
 
-* **lint-and-unit-tests** — `gofmt`, upstream golangci-lint, `vet` and unit tests
-  under **both** the production/minimal tag set and the upstream default tag set,
-  race tests under the production tag set, and HTTP/3 pool benchmarks as a
-  regression reference. The production tag set is the one that must pass; the
-  upstream run is a compatibility signal and never substitutes for it.
-* **integration-tests** — builds the production binary with
-  `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` and runs two groups:
-  * **Group A (production, minimal tags)** — `TestJiejie*`: AnyTLS fallback and
-    valid AnyTLS, MASQUE H2/H3 masquerade, authenticated CONNECT, the H3
-    connection pool, H3 → H2 fallback, and the unauthenticated limiter.
-  * **Group B (upstream compatibility, default tags)** — the upstream HTTP/2 and
-    HTTP/3 inbound and forward suites, which need the full tag set (and in some
-    cases Docker, which the runner lacks) and are therefore run only as a subset.
-  Test logs stay in the job output and are **not** uploaded as artifacts.
+**Jiejie Fast** (`.github/workflows/jiejie-fast.yml`) is the fast gate on every
+push and pull request:
+
+* **format-and-lint** — `gofmt` and upstream golangci-lint.
+* **server-tests** — `vet` and unit tests under the production tag set, plus race
+  tests for the server's concurrent state.
+* **build-gate** — the Server Minimal binary must compile, must still exclude the
+  pruned protocols, and must accept `release/jiejie-production-topology.json`.
+
+**Linux amd64 server** (`.github/workflows/server-linux-amd64.yml`) is the
+release gate:
+
+* **lint-and-unit-tests** — `gofmt`, lint, `vet` and unit tests under **both** the
+  production/minimal tag set and the upstream default tag set. The production tag
+  set is the one that must pass; the upstream run is a compatibility signal and
+  never substitutes for it.
+* **production-minimal-integration** — builds the production binary and runs
+  `TestJiejie*` (AnyTLS fallback, MASQUE H2/H3 masquerade, authenticated CONNECT
+  and CONNECT-UDP, the unauthenticated limiter) and the actual-binary process
+  tests. Test logs stay in the job output and are **not** uploaded as artifacts.
 * **build-production** — needs both jobs above, so the shipped binary is only
   produced after everything has passed. It builds `sing-box-linux-amd64`, audits
   dependency pruning with a temporary unstripped copy (deleted immediately and
   never uploaded), verifies version and tags, runs `sing-box check` against the
   secret-free production fixture, asserts an excluded protocol is still rejected,
-  enforces the binary size guard, writes the SHA256 and uploads exactly one
-  artifact.
+  enforces the binary size guard, writes `BUILD-INFO-VPS.txt` and the size
+  report, and uploads exactly one artifact.
+
+The single published artifact is
+`Jiejie-VPS-linux-amd64-<version>-<sha>`.
 
 The production binary is produced by the official Go linker in a single
 `go build` invocation with `-trimpath` and `-ldflags "-s -w"`, which drops the

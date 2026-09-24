@@ -18,11 +18,11 @@ cd "$root"
 
 eval "$(./scripts/ci/version.sh)"
 
+# This fork ships exactly one product, so exactly one flavour is known. The
+# client flavours were removed when the project was narrowed to VPS-only.
 tags_file=""
 case "$flavor" in
-  server-minimal)      tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
-  client-full)         tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_FULL" ;;
-  client-windows)      tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_WINDOWS" ;;
+  server-minimal) tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
 esac
 tags="$(cat "$tags_file" 2>/dev/null || echo unknown)"
 

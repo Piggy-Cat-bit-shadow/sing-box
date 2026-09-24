@@ -52,13 +52,12 @@ Only these areas are modified. Nothing else in sing-box behaves differently.
 | --- | --- | --- |
 | HTTP inbound masquerade | `option/simple.go`, `transport/http/masquerade.go`, `transport/http/server_h2.go`, `protocol/http/inbound.go` | upstream behaviour |
 | AnyTLS native fallback | `option/anytls.go`, `protocol/anytls/inbound.go` | upstream behaviour |
-| HTTP/3 fallback backoff | `option/http3_fallback.go`, `common/httpclient/http3_transport.go` | upstream 5m/x2/48h |
 | HTTP/3 connection pool | `option/http3_pool.go`, `common/httpclient/http3_transport.go` | one transport |
 | Server resource profile | `option/http_server_profile.go`, `transport/http/server.go` | upstream defaults |
 | HTTP/3 BBR profile | `option/http_server_profile.go`, `transport/http/server_h3.go` | standard |
 | Unauthenticated limits | `option/http_unauthenticated_limits.go`, `transport/http/unauthenticated_limiter.go` | no limiter |
 | Log classification | `transport/http/h3_error_class.go`, `protocol/anytls/inbound.go` | quieter expected paths only |
-| Build profiles / CI | `release/BUILD_TAGS_JIEJIE_SERVER`, `.github/workflows/` | unchanged default build |
+| Build profile / CI | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`, `.github/workflows/` | unchanged default build |
 
 See [FORK-DIFF.md](FORK-DIFF.md) for the patch manifest.
 
@@ -69,8 +68,6 @@ configuration behaves like upstream.
 
 * `masquerade` — unset means upstream 401/407 challenges.
 * AnyTLS `fallback` / `fallback_for_alpn` — unset means no fallback.
-* `http3_fallback` — unset means the upstream 5m/x2/48h schedule.
-* `http3_connection_pool` — unset or `size: 1` means a single transport.
 * `server_profile` — unset means upstream limits (including ~unlimited
   `MaxIncomingStreams` and the 1 MiB header cap).
 * `max_header_bytes` — unset means the upstream 1 MiB.
@@ -169,93 +166,7 @@ UDP/443 socket, and the H2 path is already behind Nginx.
 }
 ```
 
-## 5. MASQUE client recommended configuration
-
-```json
-{
-  "type": "http",
-  "tag": "masque-out",
-  "server": "riri.zhuzhu.jiejie12131.top",
-  "server_port": 443,
-  "version": 3,
-  "username": "REPLACE_ME",
-  "password": "REPLACE_ME",
-  "tls": {
-    "enabled": true,
-    "server_name": "riri.zhuzhu.jiejie12131.top"
-  },
-  "http3_connection_pool": {
-    "size": 2,
-    "strategy": "round_robin"
-  },
-  "http3_fallback": {
-    "initial_backoff": "5s",
-    "max_backoff": "5m",
-    "multiplier": 2,
-    "reset_on_success": true
-  }
-}
-```
-
-## 6. `http3_fallback`
-
-Controls how long a client stays on an earlier HTTP version after an HTTP/3
-failure, per request authority.
-
-| Field | Type | Default (upstream) |
-| --- | --- | --- |
-| `initial_backoff` | duration | `5m` |
-| `max_backoff` | duration | `48h` |
-| `multiplier` | number | `2` |
-| `reset_on_success` | bool | `true` |
-
-* Absent object reproduces the upstream schedule exactly.
-* `reset_on_success` is a pointer internally, so omitting it defaults to `true`
-  while an explicit `false` still works.
-* A successful HTTP/3 round trip clears the authority's broken state
-  immediately, so HTTP/3 becomes preferred again at once.
-* State stays keyed by authority; expired entries are evicted on read.
-* The recommended values above give 5s, 10s, 20s, 40s, 80s, 160s, then a 5m
-  ceiling — a transient UDP loss no longer parks a client on HTTP/2 for hours.
-* If `max_backoff` is below `initial_backoff` it is clamped up.
-
-H2 fallback behaviour is unchanged.
-
-## 7. `http3_connection_pool`
-
-| Field | Type | Default |
-| --- | --- | --- |
-| `size` | int, 1..8 | `1` |
-| `strategy` | string | `round_robin` (accepted for compatibility; not a scheduler) |
-
-* `size: 1` (or an absent object) is exactly the upstream single-transport
-  behaviour, including lazy connection setup.
-* `size: 2` creates two fully independent `http3.Transport` instances, so
-  concurrent requests use two separate QUIC connections rather than two streams
-  on one connection.
-* Sizes above 8 and unknown strategies are rejected at config load.
-* `strategy` is **not** a user-selectable scheduler. Only `round_robin` is
-  accepted, and the value is validated and then ignored: each consumer schedules
-  its own members (the generic HTTP client rotates with an atomic counter; the
-  MASQUE tunnel client picks the healthy least-active slot and breaks ties by
-  rotation). The field is retained so existing configurations keep loading. See
-  the `HTTP3ConnectionPoolOptions` comment in `option/http3_pool.go`.
-* **Keep `size: 1` unless you have measured otherwise.** `size: 1` is the
-  baseline and behaves like upstream; `size: 2` is an experiment. The pool's
-  correctness is covered by tests, but no throughput benefit has been
-  demonstrated on a real VPS, so a larger pool is unproven rather than
-  recommended.
-
-Replay safety (enforced in tests):
-
-* A request whose body cannot be rewound (no `GetBody`) is always served by the
-  same pool member and is never retried onto another connection, so a consumed
-  body can never be replayed.
-* Bodyless and rewindable requests rotate.
-* Broken/fallback state is keyed by authority, not by pool member, so one dead
-  connection cannot poison the pool.
-
-## 8. `server_profile` and `max_header_bytes`
+## 5. `server_profile` and `max_header_bytes`
 
 `server_profile` supplies **defaults only**. Any field you set explicitly always
 wins, and an unset profile changes nothing.
@@ -330,7 +241,7 @@ Treat the profile as bounding **stream count, header size and idle lifetime**,
 which are the parts that are unambiguously binding. Do not read it as a total
 memory bound: see the note in section 12 about connection-level admission.
 
-## 9. `bbr_profile`
+## 6. `bbr_profile`
 
 The dependency `github.com/sagernet/sing-quic/congestion_meta2` really does
 export three profiles, so all three are exposed. Nothing is invented.
@@ -349,7 +260,7 @@ Changing this profile is **unmeasured** on this server. Treat it as an A/B
 experiment (see [JIEJIE-BENCHMARK.md](JIEJIE-BENCHMARK.md)); do not assume
 `aggressive` is faster.
 
-## 10. `unauthenticated_limits`
+## 7. `unauthenticated_limits`
 
 Bounds what an unauthenticated peer can consume on a publicly exposed inbound.
 
@@ -413,7 +324,7 @@ would have to reach the backend, which is exactly what the limiter exists to
 avoid. The trade is deliberate: bound the backend, keep the proxy signal out, and
 do not promise more than that.
 
-## 11. Log behaviour
+## 8. Log behaviour
 
 * **Masquerade auth failure** (masquerade configured, client served a normal
   page): `DEBUG`. Previously this logged `ERROR authentication failed` even
@@ -433,7 +344,7 @@ do not promise more than that.
 Classification uses only `errors.Is`, `errors.As` and real quic-go error codes.
 **No string matching is used anywhere.**
 
-## 12. Deterministic resource bounds instead of a fake `memory_budget`
+## 9. Deterministic resource bounds instead of a fake `memory_budget`
 
 **Scope of these bounds, stated precisely.** They bound stream count, header
 size, idle lifetime, receive windows and rate. They do **not** bound the number of
@@ -471,13 +382,13 @@ Instead this profile uses **deterministic, inspectable bounds**:
 These are predictable, testable and independent of allocator behaviour. Use them
 and observe real RSS; do not trust a synthetic budget number.
 
-## 13. How to restore upstream behaviour
+## 10. How to restore upstream behaviour
 
 Delete the fork's optional keys from your config. Specifically:
 
 * remove `masquerade`
 * remove AnyTLS `fallback` and `fallback_for_alpn`
-* remove `http3_fallback`, `http3_connection_pool`, `server_profile`,
+* remove `server_profile`,
   `max_header_bytes`, `bbr_profile`, `unauthenticated_limits`
 
 With all of them absent the binary behaves like upstream sing-box for every one
@@ -485,12 +396,12 @@ of these code paths. You can also just use the
 `sing-box-linux-amd64-full` artifact, which is built with upstream's default
 tags, and simply not write the new keys.
 
-## 14. Build profiles
+## 11. Build profiles
 
 | File | Purpose |
 | --- | --- |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | upstream default tags — untouched |
-| `release/BUILD_TAGS_JIEJIE_SERVER` | `with_quic,with_utls,with_acme,badlinkname,tfogo_checklinkname0` |
+| `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
 
 The Jiejie set drops optional components the server does not use:
@@ -699,7 +610,7 @@ registry. The current size is about 34.6 MB, leaving roughly 3.3 MiB of headroom
 for normal Go and dependency growth. The guard measures the raw binary, never the
 artifact archive size.
 
-## 15. Rebasing onto upstream
+## 12. Rebasing onto upstream
 
 ```sh
 git fetch upstream
@@ -729,48 +640,37 @@ The two most likely conflict points after an upstream rebase:
 * `transport/http/server.go` / `server_h2.go` — upstream owns the header
   limit constant and the auth-failure branch. Re-apply the `maxHeaderBytes`
   field and the `serveAuthFailure` split if upstream rewrites those lines.
-* `common/httpclient/http3_transport.go` — upstream owns the broken-state map.
-  Re-apply the schedule and the pool on top.
 
-## 16. What is experimental
+## 13. What is experimental
 
 Treat these as unproven on this server until you measure them:
 
-* `http3_connection_pool.size > 1` — correctness is tested; the throughput gain
-  is not.
 * `bbr_profile` values other than `standard`.
 * `GOAMD64=v3` and `CGO_ENABLED=0` artifacts.
 * Any non-default `stream_receive_window` / `connection_receive_window`.
 
-## 17. Source capability vs the published artifact
+## 14. Source capability vs the published artifact
 
 The fork's **source** and the **published artifact** are not the same thing, and
 conflating them is misleading.
 
 | Capability | In the fork's source | In `sing-box-linux-amd64` |
 | --- | --- | --- |
-| HTTP/3 connection pool (client) | yes | **not registered** |
-| Configurable HTTP/3 fallback backoff (client) | yes | **not registered** |
 | `http` / `anytls` / `shadowtls` / `shadowsocks` inbounds | yes | yes |
 | `direct` / `socks` outbounds | yes | yes |
 | UDP DNS | yes | yes |
-| HTTP, AnyTLS, ShadowTLS, Shadowsocks outbounds | yes | **no** |
 | Hysteria, TUIC, VLESS, VMess, Trojan, naive, tor, ssh, snell, mixed, tun, … | yes | **no** |
 
 `sing-box-linux-amd64` is built from
-`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`, which registers no HTTP outbound. It is
-therefore a **server**, and it cannot act as a pool-enabled HTTP client.
+`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`, which registers only the inbound
+types the production topology uses and only the `direct` and `socks` outbounds.
+It is a **server**, and it is the only product this fork ships.
 
-In particular: **enabling `http3_connection_pool` on the server changes nothing
-about client behaviour.** The pool is a client-side transport feature; it creates
-multiple QUIC connections from the client to the server. Setting it on an inbound
-is now rejected outright, because the inbound shares the option type with the
-outbound and would otherwise be accepted while doing nothing.
+Client-side equivalents (an `http` outbound, the HTTP/3 connection pool, the
+configurable fallback schedule) are not part of this fork and are not published.
+Use upstream sing-box for a client.
 
-To use the pool, run the client build (the upstream/default tag set, or a
-hand-built binary) with a `http` outbound configured as shown in section 5.
-
-## 18. Unauthenticated traffic: what is bounded, and where the source IP comes from
+## 15. Unauthenticated traffic: what is bounded, and where the source IP comes from
 
 ### The H2 path behind Nginx sees Nginx, not the client
 
@@ -816,7 +716,7 @@ failed-auth probe could stream an arbitrarily large body through the reverse
 proxy. Over-limit requests never reach the backend at all and receive the local
 decoy instead.
 
-## 19. No unmeasured performance claims
+## 16. No unmeasured performance claims
 
 This fork does **not** claim that any option makes the server faster. The
 benchmarks in CI are regression references on shared runners, and loopback

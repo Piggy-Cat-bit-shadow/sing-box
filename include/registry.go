@@ -1,4 +1,4 @@
-//go:build !jiejie_server_minimal && !jiejie_ios_slim
+//go:build !jiejie_server_minimal
 
 package include
 
@@ -27,7 +27,6 @@ import (
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/http"
-	"github.com/sagernet/sing-box/protocol/masque"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing-box/protocol/redirect"
@@ -93,7 +92,6 @@ func OutboundRegistry() *outbound.Registry {
 	group.RegisterURLTest(registry)
 
 	socks.RegisterOutbound(registry)
-	http.RegisterOutbound(registry)
 	shadowsocks.RegisterOutbound(registry)
 	snell.RegisterOutbound(registry)
 	vmess.RegisterOutbound(registry)
@@ -118,7 +116,6 @@ func EndpointRegistry() *endpoint.Registry {
 	registerWireGuardEndpoint(registry)
 	registerOpenConnectEndpoint(registry)
 	registerOpenVPNEndpoints(registry)
-	masque.RegisterEndpoint(registry)
 	registerTailscaleEndpoint(registry)
 
 	return registry

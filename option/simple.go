@@ -245,10 +245,7 @@ func (o *HTTPOutboundOptions) UnmarshalJSONContext(ctx context.Context, content 
 	if err != nil {
 		return err
 	}
-	// Validate the HTTP/3 client options at decode time so that `sing-box check`
-	// rejects a bad pool size or strategy instead of failing later when the
-	// transport is built.
-	return o.HTTP3Options.ValidateClientOptions()
+	return nil
 }
 
 func (o HTTPOutboundOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {

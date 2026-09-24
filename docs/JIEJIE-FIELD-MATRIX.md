@@ -67,18 +67,6 @@ memory-conservative, so the profile leaves all three alone.
 
 ---
 
-## HTTP client — HTTP/3 behaviour (client side)
-
-| Field | Decode | Effective runtime value | Data path | Runtime test | Verdict |
-| --- | --- | --- | --- | --- | --- |
-| `http3_fallback` | `option.HTTP3FallbackOptions` on the outbound and `http_clients` | Schedule consumed by **two independent** state machines: `common/httpclient` (default 5m/48h) and `transport/http` MASQUE client (default 5s/5m) | `markHTTP3Broken` / `clearHTTP3Broken` / `h3Broken` on both transports | `TestClientFallbackBackoffSequenceUsesConfiguration`, `TestClientFallbackBackoffDefaultIsUpstream`, `TestClientFallbackResetOnSuccessTrue/False`, `TestClientBackoffSurvivesWindowExpiry`, `TestHTTP3ScheduleEscalationSurvivesExpiry` | **IMPLEMENTED** |
-| `http3_fallback.multiplier == 1` | same | Fixed backoff (never escalates, never jumps to max) | `HTTP3FallbackSchedule.Next` | `TestClientFallbackMultiplierOneIsFixedBackoff` | **IMPLEMENTED** |
-| `http3_connection_pool` | `option.HTTP3ConnectionPoolOptions` | Pool size driving N independent transports/connections | **Two** consumers: generic RoundTripper (`common/httpclient`) and the MASQUE tunnel client (`transport/http/client_h3.go`) | `TestMASQUEPoolSizeTwoOpensTwoConnections`, `TestMASQUEPoolConcurrentCONNECTSpreadsConnections`, `TestMASQUEPoolConcurrentConnectUDPSpreadsConnections`, plus the `common/httpclient` pool tests | **IMPLEMENTED** |
-| `http3_connection_pool.size = 1` | same | Exactly one transport and one lazily established connection | both consumers | `TestMASQUEPoolSizeOneUsesOneConnection`, `TestHTTP3ConnectionPoolSizeOneSingleConnection` | **IMPLEMENTED** |
-| pool slot health vs authority fallback | — | A slot connection failure does **not** mark the authority broken; only an ALPN negotiation failure does | `acquire` → `isHTTP3NegotiationFailure`, consumed by `Client.DialContext` | `TestMASQUEPoolSlotFailureDoesNotPoisonAuthority`, `TestMASQUEPoolHealthySlotStillUsedAfterAnotherFails` | **IMPLEMENTED** |
-
----
-
 ## AnyTLS inbound
 
 | Field | Decode | Effective runtime value | Data path | Runtime test | Verdict |
@@ -96,25 +84,10 @@ inbound.
 
 | Field | Where | Behaviour | Test |
 | --- | --- | --- | --- |
-| `http3_fallback` on an **inbound** | `option.HTTPInboundOptions` | Rejected at decode: "client-only option" | `TestHTTPInboundRejectsClientOnlyHTTP3Options` |
-| `http3_connection_pool` on an **inbound** | same | Rejected at decode | same |
 
 The inbound shares `QUICOptions` with the outbound, so without an explicit check
 these would be accepted and silently change nothing — the same failure mode as the
 `server_profile` bug.
-
----
-
-## Client-only vs server-only HTTP/3 options
-
-| Option | Inbound (server) | Outbound / `http_clients` (client) |
-| --- | --- | --- |
-| `initial_packet_size` | used | used |
-| `disable_path_mtu_discovery` | used | used |
-| `stream_receive_window`, `connection_receive_window`, `idle_timeout`, `keep_alive_period`, `max_concurrent_streams` | used | used |
-| `http3_fallback` | **rejected** | used |
-| `http3_connection_pool` | **rejected** | used |
-| `bbr_profile` | used (set via the inbound's `bbr_profile` key) | N/A |
 
 ---
 
@@ -137,12 +110,8 @@ TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
 go test -tags "$TAGS" -run 'TestServerProfile|TestH3HeaderLimit|TestH2HeaderLimit|TestBBRProfile|TestHTTPServerProfile|TestJiejieProfile' \
   ./option ./transport/http
 
-# Client-side HTTP/3 behaviour
-go test -tags "$TAGS" -run 'TestClientFallback|TestMASQUEPool|TestHTTP3Schedule' \
-  ./transport/http ./common/httpclient
-
 # Runtime data path in the production build
-cd test && go test -tags "$TAGS" -run 'TestJiejie|TestProductionBinary' .
+cd test/jiejie && go test -tags "$TAGS" -run 'TestJiejie|TestProductionBinary' .
 ```
 
 If a field is added and no runtime test can observe its effect, add it here as
