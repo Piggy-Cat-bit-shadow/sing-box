@@ -107,7 +107,7 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 
 func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, err error) {
 	if !p.enabled {
-		return writer.Write(data)
+		return writeFull(writer, data)
 	}
 	if p.writePadding < paddingCount {
 		paddingSize := rand.Intn(256)
@@ -118,21 +118,43 @@ func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, er
 		header[2] = byte(paddingSize)
 		common.Must1(buffer.Write(data))
 		common.Must(buffer.WriteZeroN(paddingSize))
-		_, err = writer.Write(buffer.Bytes())
-		if err == nil {
-			n = len(data)
+		// A frame header is already on the wire once ANY byte of the frame is
+		// written, so the write must complete or the stream is corrupt.
+		if _, writeErr := writeFull(writer, buffer.Bytes()); writeErr != nil {
+			// Deliberately do NOT advance the frame counter: the peer never
+			// received a complete frame, so it must not expect the padding
+			// accounting to move.
+			return 0, writeErr
 		}
 		p.writePadding++
-		return
+		return len(data), nil
 	}
-	return writer.Write(data)
+	return writeFull(writer, data)
+}
+
+// writeFull writes all of data and returns the byte count io.Writer reported.
+//
+// It exists because io.Writer's contract permits a Write to return
+// n < len(data) with a NIL error, and such a result must be treated as a
+// failure. The previous code checked only the error and therefore reported the
+// full payload length even when bytes were dropped, which silently truncated the
+// tunnel and advanced the padding frame counter past a frame the peer never
+// fully received; the next write then emitted raw bytes into a stream the peer
+// was still parsing as framed.
+func writeFull(writer io.Writer, data []byte) (int, error) {
+	written, err := writer.Write(data)
+	if err != nil {
+		return written, err
+	}
+	if written != len(data) {
+		return written, io.ErrShortWrite
+	}
+	return written, nil
 }
 
 func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffer) error {
-	if !p.enabled {
-		return common.Error(writer.Write(buffer.Bytes()))
-	}
-	if p.writePadding < paddingCount {
+	framed := false
+	if p.enabled && p.writePadding < paddingCount {
 		bufferLen := buffer.Len()
 		if bufferLen > 65535 {
 			_, err := p.writeChunked(writer, buffer.Bytes())
@@ -143,16 +165,24 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 		binary.BigEndian.PutUint16(header, uint16(bufferLen))
 		header[2] = byte(paddingSize)
 		common.Must(buffer.WriteZeroN(paddingSize))
+		framed = true
+	}
+	if _, err := writeFull(writer, buffer.Bytes()); err != nil {
+		// As above: a frame that was not fully written must not advance the
+		// counter, or the peer's framing and ours diverge.
+		return err
+	}
+	if framed {
 		p.writePadding++
 	}
-	return common.Error(writer.Write(buffer.Bytes()))
+	return nil
 }
 
 func (p *paddingConn) writeChunked(writer io.Writer, data []byte) (n int, err error) {
 	if !p.enabled {
 		// Without padding there is no 2-byte frame length, so there is no
 		// 65535-byte frame limit to respect. Write straight through.
-		return writer.Write(data)
+		return writeFull(writer, data)
 	}
 	for len(data) > 0 {
 		var chunk []byte
