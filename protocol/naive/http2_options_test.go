@@ -129,3 +129,41 @@ func memoryBytes(t *testing.T, bytes int64) *byteformats.MemoryBytes {
 	require.NoError(t, value.UnmarshalJSON([]byte(strconv.FormatInt(bytes, 10))))
 	return value
 }
+
+// TestDocumentedInboundExampleDecodes guards against documentation drift: the
+// JSON in docs/configuration/inbound/naive.md must actually decode.
+//
+// "type" and "tag" are deliberately absent here because they belong to the
+// enclosing option.Inbound, not to the inbound's own option struct.
+func TestDocumentedInboundExampleDecodes(t *testing.T) {
+	var options option.NaiveInboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{
+		"network": "tcp",
+		"listen": "127.0.0.1",
+		"listen_port": 28545,
+		"users": [{"username": "sekai", "password": "password"}],
+		"quic_congestion_control": "",
+		"masquerade": {
+			"type": "proxy",
+			"url": "http://127.0.0.1:28437",
+			"rewrite_host": true
+		},
+		"max_concurrent_streams": 64,
+		"idle_timeout": "60s",
+		"stream_receive_window": 1048576,
+		"connection_receive_window": 4194304,
+		"tls": {"enabled": false}
+	}`), &options)
+	require.NoError(t, err, "the documented inbound example must decode")
+
+	require.Equal(t, option.NetworkList("tcp"), options.Network)
+	require.Equal(t, 64, options.HTTP2Options.MaxConcurrentStreams)
+	require.Equal(t, 60*time.Second, time.Duration(options.HTTP2Options.IdleTimeout))
+	require.NotNil(t, options.HTTP2Options.StreamReceiveWindow)
+	require.EqualValues(t, 1<<20, options.HTTP2Options.StreamReceiveWindow.Value())
+	require.NotNil(t, options.HTTP2Options.ConnectionReceiveWindow)
+	require.EqualValues(t, 4<<20, options.HTTP2Options.ConnectionReceiveWindow.Value())
+	require.NotNil(t, options.Masquerade)
+	require.Equal(t, "http://127.0.0.1:28437", options.Masquerade.ProxyOptions.URL)
+	require.True(t, options.Masquerade.ProxyOptions.RewriteHost)
+}
