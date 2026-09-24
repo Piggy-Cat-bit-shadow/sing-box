@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/http"
+	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
 	"github.com/sagernet/sing-box/protocol/socks"
@@ -52,7 +53,16 @@ func Context(ctx context.Context) context.Context {
 	return box.Context(ctx, InboundRegistry(), OutboundRegistry(), EndpointRegistry(), DNSTransportRegistry(), ServiceRegistry(), CertificateProviderRegistry())
 }
 
-// InboundRegistry registers the four public entry points, and nothing else.
+// InboundRegistry registers the five public entry points, and nothing else.
+//
+// naive is the Native Naive server (klzgrad/naiveproxy-compatible CONNECT plus
+// UoT v1/v2 and a Web masquerade). It adds NO UDP listener: UoT is carried inside
+// the HTTP/2 CONNECT over TCP, so UDP/443 stays exclusively MASQUE.
+//
+// Registering this inbound deliberately does NOT pull in the Naive OUTBOUND or
+// the Chromium/Cronet client stack: protocol/naive/outbound.go carries its own
+// `with_naive_outbound` build tag, so a server build compiles only inbound.go and
+// inbound_conn.go. `go list -deps ./include` confirms cronet is absent.
 //
 // The socks and direct inbounds are deliberately NOT registered. Both previously
 // existed only so the integration tests could use an in-process client, which let
@@ -64,6 +74,7 @@ func InboundRegistry() *inbound.Registry {
 
 	http.RegisterInbound(registry)        // MASQUE over HTTP/2 (behind Nginx Stream) and HTTP/3 (UDP/443)
 	anytls.RegisterInbound(registry)      // AnyTLS, with native fallback to the Nginx web root
+	naive.RegisterInbound(registry)       // Native Naive, incl. UoT v1/v2 and the Web masquerade
 	shadowtls.RegisterInbound(registry)   // ShadowTLS v3; detour targets the ss2022-in inbound
 	shadowsocks.RegisterInbound(registry) // Shadowsocks 2022, the ShadowTLS detour target
 
