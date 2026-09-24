@@ -1,7 +1,10 @@
 package jiejie_test
 
 import (
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 )
 
 // This file records and BOUNDS a real, reproducible limitation rather than
@@ -79,17 +82,136 @@ func TestJiejieNaiveUoTLossRateIsBounded(t *testing.T) {
 	}
 }
 
-// TestJiejieNaiveUoTRetryOnSameSessionIsNotExpected documents the observed
-// behaviour precisely: a session that loses its first reply stays broken, so a
-// client cannot paper over it by resending.
+// TestJiejieNaiveUoTResendOnSameSessionAfterLoss is the REAL same-session resend
+// test.
 //
-// This is asserted as a CHARACTERISATION, not a requirement: it records what the
-// code does today so that a future fix visibly changes this test.
-func TestJiejieNaiveUoTRetryOnSameSessionIsNotExpected(t *testing.T) {
+// The previous version of this test asserted a conclusion ("a session that loses
+// its first reply stays broken, so a client cannot paper over it by resending")
+// while never actually resending anything: its body only called
+// requireNormalSessionsWork. The claim was therefore unsupported and has been
+// removed.
+//
+// What this test does instead:
+//  1. drive sessions until one genuinely fails, keeping that session OPEN;
+//  2. send a SECOND datagram with a DIFFERENT Packet ID on the same tunnel;
+//  3. record, separately, the send result, the echo's receipt and the reply,
+//     for both Packet IDs.
+//
+// This distinguishes "the tunnel is dead" from "one datagram was lost", which is
+// the distinction the old test claimed to make without measuring.
+func TestJiejieNaiveUoTResendOnSameSessionAfterLoss(t *testing.T) {
 	env := startNaiveInboundForUoT(t)
+	trace := newTrace()
+	echo := startInstrumentedEcho(t, trace)
 
-	// Establish that normal sessions work, so the test is meaningful.
-	requireNormalSessionsWork(t, env, 20)
+	const (
+		maxSessionsToFindFailure = 3000
+		concurrency              = 10
+		replyTimeout             = 2 * time.Second
+	)
+
+	type foundSession struct {
+		session  *uotTraceSession
+		firstID  uint32
+		firstErr error
+	}
+
+	found := make(chan foundSession, 1)
+	var (
+		mu       sync.Mutex
+		nextID   uint32
+		searched int
+		wg       sync.WaitGroup
+		stop     = make(chan struct{})
+	)
+	allocateID := func() uint32 {
+		mu.Lock()
+		defer mu.Unlock()
+		nextID++
+		return nextID
+	}
+
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				mu.Lock()
+				if searched >= maxSessionsToFindFailure {
+					mu.Unlock()
+					return
+				}
+				searched++
+				mu.Unlock()
+
+				id := allocateID()
+				session, err := openTracedSession(t, env.port, echo.address, int(id), trace, "http1-padded")
+				if err != nil {
+					continue
+				}
+				if err = session.sendDatagram(t, id); err != nil {
+					session.close()
+					continue
+				}
+				if err = session.awaitReply(t, id, replyTimeout); err != nil {
+					// A real failing session, kept OPEN for the resend attempt.
+					select {
+					case found <- foundSession{session: session, firstID: id, firstErr: err}:
+						close(stop)
+					default:
+						session.close()
+					}
+					return
+				}
+				session.close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	select {
+	case failing := <-found:
+		defer failing.session.close()
+
+		t.Logf("captured a REAL failing session: packet %d failed with %v", failing.firstID, failing.firstErr)
+		t.Logf("timeline for the FAILED first packet:\n%s", trace.summarizeFor(failing.firstID))
+
+		// Resend on the SAME tunnel, WITHOUT closing it, with a new Packet ID.
+		secondID := allocateID()
+		sendErr := failing.session.sendDatagram(t, secondID)
+		t.Logf("resend on the same session: packet %d send err=%v", secondID, sendErr)
+
+		replyErr := failing.session.awaitReply(t, secondID, replyTimeout)
+		t.Logf("resend result: packet %d reply err=%v", secondID, replyErr)
+		t.Logf("timeline for the RESENT packet:\n%s", trace.summarizeFor(secondID))
+
+		echo.trace.record(0, secondID, StageEchoReadFromUDP,
+			fmt.Sprintf("echo saw packet %d at least once", trace.countStage(StageEchoReadFromUDP)), nil)
+
+		t.Logf("after resend: echo.ReadFromUDP=%d client.Received=%d",
+			trace.countStage(StageEchoReadFromUDP), trace.countStage(StageClientReceived))
+
+		// The point of the test is to RECORD what happens; it passes either way,
+		// because both outcomes are informative. What it must not do is assert a
+		// conclusion it did not measure.
+		if replyErr == nil {
+			t.Logf("CONCLUSION: the session SURVIVED the loss; a resent datagram on " +
+				"the same tunnel succeeded, so the loss was per-datagram rather than fatal")
+		} else {
+			t.Logf("CONCLUSION: the session did NOT survive; resending on the same " +
+				"tunnel also failed, so the tunnel itself was broken by the loss")
+		}
+
+	default:
+		t.Skipf("no failing session found within %d sessions; on a platform where the "+
+			"loss does not reproduce there is nothing to resend on. This is a SKIP, "+
+			"not a pass: the resend behaviour was NOT verified here.", maxSessionsToFindFailure)
+	}
 }
 
 // requireNormalSessionsWork asserts that the ordinary case is healthy, which is
