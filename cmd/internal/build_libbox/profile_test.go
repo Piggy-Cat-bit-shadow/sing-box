@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -31,12 +32,7 @@ func appleDefaultTags() []string {
 }
 
 func containsTag(tags []string, wanted string) bool {
-	for _, tag := range tags {
-		if tag == wanted {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(tags, wanted)
 }
 
 // TestDefaultAppleBuildHasNoProfile is the compatibility guarantee: with no

@@ -521,10 +521,7 @@ func isHTTP3TransportEstablishmentFailure(err error) bool {
 	// A concrete transport error means the transport layer answered and refused,
 	// which is also a transport-establishment failure.
 	var transportErr *quic.TransportError
-	if errors.As(err, &transportErr) {
-		return true
-	}
-	return false
+	return errors.As(err, &transportErr)
 }
 
 // http3ActiveStream wraps a RequestStream so closing it releases the slot's
