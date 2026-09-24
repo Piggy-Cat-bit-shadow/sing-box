@@ -253,33 +253,46 @@ jobs:
       - name: Build device-only Libbox (shipping slice)
         run: |
           set -euo pipefail
-          # The shipping build. A stock iPhone loads only the device arm64 slice,
-          # so the simulator slice is dead weight in an installable artifact.
-          # Built separately so the shipping size is measured on its own rather
-          # than inferred from the two-slice framework.
+          # The shipping slice. A stock iPhone loads only device arm64, so the
+          # simulator slice is dead weight in an installable artifact.
           #
-          # The two-slice output is removed FIRST. Without this gomobile reuses
-          # the existing framework and the "device-only" artifact still contains
-          # the simulator slice, which is exactly the regression this stage
-          # exists to prevent.
+          # gomobile CANNOT produce a device-only framework: build.go contains
+          # "Special case to build iossimulator if -target=ios", which adds the
+          # simulator platform whenever ios is requested. So the device slice is
+          # EXTRACTED from the built framework rather than requested, which needs
+          # no gomobile patch and no private API.
           rm -rf Libbox.xcframework
           go run ./cmd/internal/build_libbox -target apple -platform ios -profile jiejie-ios-slim
 
+          echo "=== extract the device-only slice ==="
+          # Keep the two-slice framework for the Simulator build, then reduce a
+          # copy to the shipping device-only slice.
+          rm -rf Libbox-simulator.xcframework
+          cp -R Libbox.xcframework Libbox-simulator.xcframework
+          ./scripts/ci/extract_device_slice.py Libbox.xcframework Libbox-device.xcframework
+
           echo "=== device-only assertions ==="
-          # Assert the simulator slice is genuinely gone, rather than trusting
-          # that -platform ios did what it says.
-          if find Libbox.xcframework -type d -name '*simulator*' | grep -q .; then
-            echo "FAIL: the device-only build still contains a simulator slice:" >&2
-            find Libbox.xcframework -type d -name '*simulator*' >&2
+          # The extracted framework must have exactly one slice and no simulator.
+          if find Libbox-device.xcframework -type d -name '*simulator*' | grep -q .; then
+            echo "FAIL: the device-only framework still contains a simulator slice:" >&2
+            find Libbox-device.xcframework -type d -name '*simulator*' >&2
             exit 1
           fi
-          slices="$(find Libbox.xcframework -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')"
+          slices="$(find Libbox-device.xcframework -maxdepth 1 -mindepth 1 -type d | wc -l | tr -d ' ')"
           echo "slice directories: $slices"
           if [ "$slices" -ne 1 ]; then
             echo "FAIL: expected exactly one slice, got $slices" >&2
-            find Libbox.xcframework -maxdepth 1 -mindepth 1 -type d >&2
+            find Libbox-device.xcframework -maxdepth 1 -mindepth 1 -type d >&2
             exit 1
           fi
+          # Info.plist must list exactly what is present.
+          plutil -p Libbox-device.xcframework/Info.plist | grep LibraryIdentifier
+
+          echo "=== device-only framework size ==="
+          du -sh Libbox-device.xcframework
+          find Libbox-device.xcframework -name Libbox -type f -exec ls -la {} \;
+          find Libbox-device.xcframework -name Libbox -type f -exec stat -f %z {} \; | awk '{s+=$1} END {print s+0}' > /tmp/device-libbox-bytes
+          echo "device-only Libbox total: $(cat /tmp/device-libbox-bytes) bytes"
           echo "=== device-only XCFramework size ==="
           du -sh Libbox.xcframework
           find Libbox.xcframework -name Libbox -type f -exec ls -la {} \;
@@ -296,10 +309,15 @@ jobs:
           # The device-only build above overwrote Libbox.xcframework, and it is
           # the right one to install: SFI is built for the device, and the
           # simulator build is only a compile check.
-          test -d Libbox.xcframework
+          # The DEVICE-ONLY framework is installed. SFI is built for the device,
+          # and this is the shipping slice; the two-slice build above exists only
+          # as the Simulator compile check.
+          test -d Libbox-device.xcframework
           rm -rf clients/apple/Libbox.xcframework
-          mv Libbox.xcframework clients/apple/Libbox.xcframework
+          mv Libbox-device.xcframework clients/apple/Libbox.xcframework
           ls -la clients/apple/Libbox.xcframework
+          echo "=== installed slices ==="
+          find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
           echo "=== recorded framework hash (proves which build SFI links) ==="
           find clients/apple/Libbox.xcframework -name Libbox -type f | while read -r f; do
             echo "$(shasum -a 256 "$f" | awk '{print $1}')  $f"
@@ -405,6 +423,20 @@ jobs:
             -scheme SFI \
             -skipPackagePluginValidation
 
+      - name: Install the two-slice Libbox for the Simulator build
+        run: |
+          set -euo pipefail
+          # The Simulator app needs the simulator slice, which the device-only
+          # shipping framework deliberately does not carry. The full two-slice
+          # framework is swapped in FOR THE SIMULATOR BUILD ONLY; the device
+          # builds re-install the device-only framework first, so the shipping
+          # IPA is still built against the shipping slice.
+          test -d Libbox-simulator.xcframework
+          rm -rf clients/apple/Libbox.xcframework
+          mv Libbox-simulator.xcframework clients/apple/Libbox.xcframework
+          echo "slices for the simulator build:"
+          find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
+
       - name: Build SFI for the iOS Simulator (unsigned)
         id: sfi_simulator_build
         working-directory: clients/apple
@@ -458,6 +490,18 @@ jobs:
           echo "=== first compile errors ==="
           grep -E 'error:' "$log" | sort -u | head -20 || true
           exit 1
+
+      - name: Install the device-only Libbox for the device builds
+        run: |
+          set -euo pipefail
+          # The shipping slice. The Simulator step above swapped in the two-slice
+          # framework, so the device-only one is restored here to keep the
+          # shipping builds honest about what they link.
+          test -d Libbox-device.xcframework
+          rm -rf clients/apple/Libbox.xcframework
+          mv Libbox-device.xcframework clients/apple/Libbox.xcframework
+          echo "slices for the device builds:"
+          find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
 
       - name: Build SFI for a generic iOS device (unsigned)
         id: device_build
