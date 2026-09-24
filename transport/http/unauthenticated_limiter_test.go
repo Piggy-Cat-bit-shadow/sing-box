@@ -196,6 +196,112 @@ func TestUnauthenticatedLimiterReleaseIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestLimiterReleaseIsTrulyPerAcquisitionIdempotent is the regression test for a
+// real bug in the release closure.
+//
+// The old release decremented "whatever slot this IP currently holds":
+//
+//	release := func() {
+//	    lock
+//	    if current.concurrent > 0 { current.concurrent-- }
+//	}
+//
+// That only prevents the counter going negative. It is NOT idempotent per
+// acquisition: with max_concurrent_per_ip=2 and requests A and B both holding a
+// slot, a second A.release() decrements again and frees B's slot, so a THIRD
+// request is admitted while B is still running. This test pins the correct
+// behaviour: one acquisition may release at most once, and another
+// acquisition's slot is never touched.
+func TestLimiterReleaseIsTrulyPerAcquisitionIdempotent(t *testing.T) {
+	limits := enabledLimits()
+	limits.MaxConcurrentPerIP = 2
+	// A generous bucket so the concurrency limit, not the token limit, is what
+	// rejects requests here.
+	limits.Burst = 100
+	limits.RequestsPerSecond = 100
+	limiter := newUnauthenticatedLimiter(limits)
+	now := time.Now()
+
+	releaseA, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("A must be admitted")
+	}
+	releaseB, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("B must be admitted while the limit is 2")
+	}
+	// Both slots are now held, so the account is full. This baseline is what
+	// makes the post-release assertion meaningful: any decrement beyond A's own
+	// single slot is observable as an extra admission.
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("the third concurrent request must be refused before any release")
+	}
+
+	// A releases three times, but only the first may take effect. Exactly one
+	// slot is freed, so exactly one further request fits -- and a second one must
+	// still be refused because B has not released.
+	//
+	// Under the old release semantics each extra call decremented again, so both
+	// of A's extra calls wrongly freed B's slot and TWO further requests were
+	// admitted while B was still running.
+	releaseA()
+	releaseA()
+	releaseA()
+
+	releaseC, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("A's single legitimate release must free exactly one slot")
+	}
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("a repeated release of A must not free B's slot: the account is full " +
+			"again once C takes A's freed slot, so this request must be rejected " +
+			"while B is still running")
+	}
+
+	// Repeating C's release must not free anything else either. At this point
+	// only B holds a slot, so exactly one more request fits and the one after
+	// that must still be refused.
+	releaseC()
+	releaseC()
+	releaseC2, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("the slot freed by A must still be reusable after C released it")
+	}
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("a repeated release of C must not free B's slot")
+	}
+	_ = releaseC2
+
+	// Now B really finishes, freeing the last held slot.
+	releaseB()
+	releaseD, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("after B releases, a new request must be admitted")
+	}
+	// B's release was one-shot, so repeating it must not free D's slot.
+	releaseB()
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("a repeated release of B must not free another acquisition's slot")
+	}
+
+	// D's repeated release is also a no-op, and the counter must never have gone
+	// negative: with everything released, two requests fit and the third does not.
+	releaseD()
+	releaseD()
+	releaseE, allowed := limiter.acquire("1.2.3.4:1000", now)
+	if !allowed {
+		t.Fatal("with nothing in flight a new request must be admitted; a negative " +
+			"concurrency counter would show up here")
+	}
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("the second slot must be available after a clean release")
+	}
+	if _, allowed := limiter.acquire("1.2.3.4:1000", now); allowed {
+		t.Fatal("the concurrency limit must still be enforced after all the releases")
+	}
+	releaseE()
+}
+
 // TestUnauthenticatedLimiterExpiry verifies idle entries are reclaimed so the
 // map does not grow without bound over time.
 //

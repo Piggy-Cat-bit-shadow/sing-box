@@ -178,12 +178,28 @@ func (l *unauthenticatedLimiter) acquire(source string, now time.Time) (func(), 
 	}
 	state.tokens--
 	state.concurrent++
+	// The release below is ONE-SHOT PER ACQUISITION.
+	//
+	// Decrementing whatever slot the IP currently holds is not enough: with
+	// max_concurrent_per_ip=2, request A and request B can both be admitted, and
+	// then a double A.release() would decrement a second time and hand B's slot
+	// away, letting a third request in while B is still running. The guard
+	// "current.concurrent > 0" only stops the counter going negative; it does
+	// not make the release idempotent.
+	//
+	// sync.Once ties the decrement to THIS acquisition, so calling release any
+	// number of times has the effect of calling it exactly once. It adds no
+	// global locking to the hot path: the only shared state is the release's own
+	// once flag, and the decrement itself takes the same l.access it always did.
+	var releaseOnce sync.Once
 	return func() {
-		l.access.Lock()
-		defer l.access.Unlock()
-		if current, ok := l.states[address]; ok && current.concurrent > 0 {
-			current.concurrent--
-		}
+		releaseOnce.Do(func() {
+			l.access.Lock()
+			defer l.access.Unlock()
+			if current, ok := l.states[address]; ok && current.concurrent > 0 {
+				current.concurrent--
+			}
+		})
 	}, true
 }
 
