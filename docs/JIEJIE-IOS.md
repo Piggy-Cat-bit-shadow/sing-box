@@ -152,9 +152,64 @@ signature state as `no _CodeSignature directory` plus
 
 ## Signing
 
-Artifacts are named `UNSIGNED` and their `BUILD-INFO.txt` records
+Artifacts are named `UNSIGNED`/`RESIGN` and their `BUILD-INFO` records
 `signed: false` and `installable_on_stock_ios: false`. The IPA is a plain
 `Payload/*.app` archive with no valid signature, so it installs only after the
 user signs it with their own certificate and provisioning profile. No signing
 identity, certificate or provisioning profile is requested anywhere in this
 stage, and no signed IPA is fabricated from an unsigned app.
+
+## The RESIGN IPA
+
+`Jiejie-SFI-RESIGN-<shortsha>.ipa` is the deliverable for users who sign
+on-device with their own tool (for example 全能签). It is the complete SFI
+bundle, packaged with `ditto` so symlinks and extended attributes survive:
+
+- every `.appex` extension (ActionExtension, Extension, FileProviderExtension,
+  ShareExtension, WidgetExtension, IntentsExtension),
+- the `Frameworks` directory,
+- all resource bundles.
+
+Nothing is stripped, because the signer has to sign all of these consistently;
+removing the `NetworkExtension` target or an App Group-bearing extension would
+produce a bundle that cannot be re-signed correctly. A missing
+`Extension.appex` fails the step rather than shipping an incomplete bundle.
+
+Its `BUILD-INFO-RESIGN.txt` records the requested keys:
+
+```
+SIGNED=false
+PURPOSE=local-resigning
+SIGNING_METHOD=user-provided signer
+CORE_SHA=<testing sha>
+APPLE_SOURCE_SHA=<apple submodule sha>
+```
+
+### It embeds no signing material
+
+The workflow contains no `secrets.*` reference, no `env` secrets block, no P12,
+no certificate, no password and no provisioning profile, and all three builds
+run with `CODE_SIGNING_ALLOWED=NO` and an empty identity. Re-signing happens
+entirely on the user's device with the user's own credentials.
+
+### It is proven to carry this run's Jiejie core
+
+`Libbox.xcframework` is a **static** archive, so it is not embedded as a
+framework. It is linked into `Library.framework`, which the app and the network
+extension load at runtime. The verification step therefore checks both halves:
+
+1. the main executable and `PlugIns/Extension.appex/Extension` each link
+   `@rpath/Library.framework/Library`;
+2. that `Library.framework/Library` binary contains `http3_connection_pool` and
+   `http3_fallback`.
+
+A stale upstream Libbox would fail (2), because upstream has neither option. The
+same step also asserts TrustTunnel is absent from the shipped core. The result is
+written to `core-provenance.txt`, including the core host's size and SHA256.
+
+### This is a to-be-re-signed IPA
+
+It is not a signed IPA and it is not installable as-is on a stock, unmodified
+iPhone. It is explicitly named RESIGN so that it can never be mistaken for a
+finished build. No App Store, TestFlight or notarization step is involved.
+

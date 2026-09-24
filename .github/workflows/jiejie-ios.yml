@@ -412,6 +412,194 @@ jobs:
           echo "ipa_bytes: $(wc -c < artifact/sfi/SFI-device-arm64-UNSIGNED.ipa | tr -d ' ')"
           echo "ipa_sha256: $(shasum -a 256 artifact/sfi/SFI-device-arm64-UNSIGNED.ipa | awk '{print $1}')"
 
+      - name: Verify the SFI bundle carries the Jiejie core, not an upstream one
+        run: |
+          set -euo pipefail
+          # Requirement: prove the FINAL app bundle runs the Libbox built in this
+          # run, rather than an upstream framework left over from elsewhere.
+          #
+          # The XCFramework is a STATIC archive, so it is not embedded as a
+          # framework; it is linked into Library.framework, which the app and the
+          # network extension load at runtime. The proof therefore has two parts:
+          #
+          #   1. the app and the packet-tunnel extension both link
+          #      @rpath/Library.framework/Library;
+          #   2. that Library.framework binary actually contains the Jiejie H3
+          #      option markers.
+          #
+          # A stale upstream Libbox would fail (2), because upstream has neither
+          # http3_connection_pool nor http3_fallback.
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)"
+          app_name="$(basename "$slim_app")"
+          bin_name="${app_name%.app}"
+
+          core_host="$slim_app/Frameworks/Library.framework/Library"
+          if [ ! -f "$core_host" ]; then
+            echo "FAIL: Library.framework not found in the app bundle" >&2
+            find "$slim_app/Frameworks" -maxdepth 2 >&2 || true
+            exit 1
+          fi
+          echo "core host: $core_host ($(wc -c < "$core_host" | tr -d ' ') bytes)"
+
+          echo "--- 1. linkage ---"
+          for binary in "$slim_app/$bin_name" "$slim_app/PlugIns/Extension.appex/Extension"; do
+            if [ ! -f "$binary" ]; then
+              echo "FAIL: expected binary missing: $binary" >&2
+              exit 1
+            fi
+            if otool -L "$binary" | grep -q '@rpath/Library.framework/Library'; then
+              echo "OK  links Library.framework: ${binary#$slim_app/}"
+            else
+              echo "FAIL: does not link Library.framework: $binary" >&2
+              otool -L "$binary" >&2
+              exit 1
+            fi
+          done
+
+          echo "--- 2. Jiejie markers inside that Library.framework ---"
+          missing=0
+          for marker in http3_connection_pool http3_fallback; do
+            if LC_ALL=C grep -a -q -- "$marker" "$core_host"; then
+              echo "FOUND: $marker"
+            else
+              echo "MISSING: $marker"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "FAIL: the app's core does not contain the Jiejie H3 options; it is not this run's Libbox" >&2
+            exit 1
+          fi
+
+          echo "--- 3. expected upstream-side absence ---"
+          # TrustTunnel must not appear in the shipped core either.
+          if LC_ALL=C grep -a -q -- 'sing-trusttunnel' "$core_host"; then
+            echo "FAIL: TrustTunnel present in the shipped core" >&2
+            exit 1
+          fi
+          echo "TrustTunnel: absent from the shipped core"
+
+          {
+            echo "core_host: $core_host"
+            echo "core_host_bytes: $(wc -c < "$core_host" | tr -d ' ')"
+            echo "core_host_sha256: $(shasum -a 256 "$core_host" | awk '{print $1}')"
+            echo "links_library_framework: app=yes extension=yes"
+            echo "jiejie_marker_http3_connection_pool: present"
+            echo "jiejie_marker_http3_fallback: present"
+            echo "trusttunnel: absent"
+          } > artifact/core-provenance.txt
+          cat artifact/core-provenance.txt
+
+      - name: Package the RESIGN IPA for local re-signing
+        run: |
+          set -euo pipefail
+          # A RESIGN IPA is the full, unmodified SFI bundle handed to the user so
+          # they can sign it on-device with their own signer ("全能签").
+          #
+          # It deliberately keeps EVERYTHING: all .appex extensions, the
+          # Frameworks directory, resource bundles and the NetworkExtension
+          # targets. Stripping any of them would change the entitlement and
+          # App Group structure the signer needs to match, and would produce a
+          # bundle that cannot be re-signed correctly.
+          #
+          # No certificate, private key, P12, password or provisioning profile
+          # is embedded, and no GitHub secret is used anywhere in this workflow.
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -1)"
+          app_name="$(basename "$slim_app")"
+
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          ipa_name="Jiejie-SFI-RESIGN-${short_sha}.ipa"
+
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/Payload"
+          # ditto preserves symlinks, extended attributes and resource forks,
+          # which a code signature and a re-signing tool both care about.
+          ditto "$slim_app" "$stage/Payload/$app_name"
+
+          echo "=== bundle structure: .appex extensions ==="
+          find "$stage/Payload" -name '*.appex' -type d | sed "s|$stage/||" | sort | tee /tmp/appex-list.txt
+          appex_count="$(wc -l < /tmp/appex-list.txt | tr -d ' ')"
+          echo "appex count: $appex_count"
+
+          echo "=== bundle structure: frameworks ==="
+          find "$stage/Payload" -name '*.framework' -type d | sed "s|$stage/||" | sort | tee /tmp/framework-list.txt
+          echo "framework count: $(wc -l < /tmp/framework-list.txt | tr -d ' ')"
+
+          echo "=== bundle structure: resource bundles ==="
+          find "$stage/Payload" -name '*.bundle' -type d | sed "s|$stage/||" | sort | head -30
+
+          echo "=== bundle structure: Mach-O binaries ==="
+          find "$stage/Payload" -type f -perm -u+x | while read -r f; do
+            if file "$f" | grep -q 'Mach-O'; then
+              echo "$(wc -c < "$f" | tr -d ' ')  ${f#$stage/}"
+            fi
+          done | sort -rn | tee /tmp/binary-list.txt
+
+          # The NetworkExtension target must survive: it is the packet tunnel the
+          # VPN profile activates, and a re-sign has to cover it too.
+          if [ ! -f "$stage/Payload/$app_name/PlugIns/Extension.appex/Extension" ]; then
+            echo "FAIL: NetworkExtension (Extension.appex) missing from the bundle" >&2
+            exit 1
+          fi
+          echo "OK: NetworkExtension Extension.appex present"
+
+          echo "=== signature state before packaging ==="
+          # Nothing here depends on a signature; this only documents that the
+          # bundle is unsigned, so the user's signer starts from a clean slate.
+          if find "$stage/Payload" -name '_CodeSignature' -type d | grep -q .; then
+            echo "note: _CodeSignature directories present"
+            find "$stage/Payload" -name '_CodeSignature' -type d | sed "s|$stage/||"
+          else
+            echo "no _CodeSignature anywhere: bundle is unsigned"
+          fi
+
+          ( cd "$stage" && zip -qry "$ipa_name" Payload )
+          mv "$stage/$ipa_name" artifact/sfi/
+          rm -rf "$stage"
+
+          echo "=== RESIGN IPA ==="
+          echo "name:   $ipa_name"
+          echo "bytes:  $(wc -c < "artifact/sfi/$ipa_name" | tr -d ' ')"
+          echo "sha256: $(shasum -a 256 "artifact/sfi/$ipa_name" | awk '{print $1}')"
+
+          # BUILD-INFO for this artifact, using the exact keys requested.
+          core_sha="$(git rev-parse HEAD)"
+          apple_sha="$(git -C clients/apple rev-parse HEAD)"
+          {
+            echo "Jiejie SFI RESIGN IPA"
+            echo "====================="
+            echo "SIGNED=false"
+            echo "PURPOSE=local-resigning"
+            echo "SIGNING_METHOD=user-provided signer"
+            echo "CORE_SHA=$core_sha"
+            echo "APPLE_SOURCE_SHA=$apple_sha"
+            echo ""
+            echo "artifact:            $ipa_name"
+            echo "artifact_bytes:      $(wc -c < "artifact/sfi/$ipa_name" | tr -d ' ')"
+            echo "artifact_sha256:     $(shasum -a 256 "artifact/sfi/$ipa_name" | awk '{print $1}')"
+            echo "go_version:          $(go version)"
+            echo "xcode_version:       $(xcodebuild -version | tr '\n' ' ')"
+            echo "architecture:        arm64 (device only)"
+            echo "appex_count:         $appex_count"
+            echo "with_quic:           true"
+            echo "trusttunnel:         false"
+            echo "build_time_utc:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run_id:     ${GITHUB_RUN_ID}"
+            echo ""
+            echo "This is a TO-BE-RE-SIGNED IPA, not a signed one."
+            echo ""
+            echo "It contains the complete, unmodified SFI app bundle: every"
+            echo ".appex extension, the Frameworks directory, resource bundles"
+            echo "and the NetworkExtension target, so a local signer can sign"
+            echo "all of them consistently."
+            echo ""
+            echo "It embeds NO certificate, private key, P12, password or"
+            echo "provisioning profile, and this workflow uses no signing"
+            echo "secret. It cannot be installed as-is on a stock iPhone; the"
+            echo "user must re-sign it with their own certificate and profile."
+          } > "artifact/sfi/BUILD-INFO-RESIGN.txt"
+          cat "artifact/sfi/BUILD-INFO-RESIGN.txt"
+
       - name: Report device binary size
         run: |
           set -euo pipefail
@@ -534,8 +722,23 @@ jobs:
               printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "$f"
             done > SHA256SUMS )
           cat artifact/sfi/BUILD-INFO.txt
+
+          echo "--- required deliverables ---"
+          # The RESIGN IPA is the artifact the user actually needs for on-device
+          # re-signing, so its absence is a failure rather than a warning.
+          resign_ipa="$(find artifact/sfi -maxdepth 1 -name 'Jiejie-SFI-RESIGN-*.ipa' | head -1)"
+          if [ -z "$resign_ipa" ]; then
+            echo "FAIL: the RESIGN IPA was not produced" >&2
+            find artifact/sfi -maxdepth 1 | sort >&2
+            exit 1
+          fi
+          echo "RESIGN IPA: $resign_ipa ($(wc -c < "$resign_ipa" | tr -d ' ') bytes)"
+          echo "SHA256:     $(shasum -a 256 "$resign_ipa" | awk '{print $1}')"
+
           echo "--- artifact tree ---"
           find artifact -type f | sort
+          echo "--- SHA256SUMS ---"
+          cat artifact/sfi/SHA256SUMS
 
       - name: Save Go caches
         if: always()
@@ -546,11 +749,11 @@ jobs:
             ~/Library/Caches/go-build
           key: jiejie-ios-${{ runner.os }}-${{ hashFiles('go.sum') }}
 
-      - name: Upload unsigned SFI
+      - name: Upload SFI artifacts (UNSIGNED + RESIGN)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Jiejie-SFI-iOS-UNSIGNED-${{ github.sha }}
+          name: Jiejie-SFI-iOS-UNSIGNED-RESIGN-${{ github.sha }}
           path: artifact/sfi
           if-no-files-found: warn
 
