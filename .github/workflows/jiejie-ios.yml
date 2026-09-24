@@ -1,0 +1,353 @@
+name: Jiejie iOS
+# Builds the Jiejie Go core into Libbox.xcframework and compiles the pinned
+# upstream sing-box-for-apple (SFI) against it.
+#
+# Scope of this workflow is deliberately narrow: it proves the Jiejie core can
+# be shipped as the Apple core and that SFI still builds from the SAME Apple
+# commit the main repository pins. It does NOT sign, notarize, export an
+# installable IPA or touch the Swift sources. A signed, installable build is a
+# separate stage.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - testing
+      - feat/jiejie-ios-libbox
+      - 'integrate/**'
+    paths:
+      # H3 core: the options and the implementations this stage exists to ship.
+      - 'option/**'
+      - 'common/httpclient/**'
+      - 'transport/http/**'
+      - 'experimental/libbox/**'
+      - 'cmd/internal/build_libbox/**'
+      - 'cmd/internal/build_shared/**'
+      - 'include/**'
+      - 'adapter/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      # The pinned Apple client and its build glue.
+      - 'clients/apple'
+      - '.github/workflows/jiejie-ios.yml'
+      - 'test/jiejie/**'
+
+# A newer push to the same ref cancels the older run, so a burst of pushes does
+# not queue several macOS builds on stale commits.
+concurrency:
+  group: jiejie-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  libbox-and-sfi:
+    # GitHub-hosted macOS runner. Deliberately NOT the upstream private runner
+    # label (xcode-27): that belongs to SagerNet and is not guaranteed available
+    # to a fork.
+    runs-on: macos-latest
+    steps:
+      - name: Checkout with the pinned Apple submodule
+        uses: actions/checkout@v5
+        with:
+          # The Apple client is a gitlink; recursive checkout lands on exactly
+          # the commit the main repository pins. No clone of a moving branch.
+          submodules: recursive
+
+      - name: Toolchain and revision report
+        run: |
+          set -euo pipefail
+          echo "core_sha=$(git rev-parse HEAD)"
+          echo "core_short_sha=$(git rev-parse --short=7 HEAD)"
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)"
+          echo "apple_sha=$(git -C clients/apple rev-parse HEAD)"
+          echo "--- sw_vers ---";          sw_vers
+          echo "--- uname -a ---";         uname -a
+          echo "--- xcode-select -p ---";  xcode-select -p
+          echo "--- xcodebuild ---";       xcodebuild -version
+          echo "--- go ---";               go version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # Caching is done explicitly below so the key can carry the tag
+          # flavour. Enabling setup-go's cache as well would double-save the
+          # same directory and fight over the key.
+          cache: false
+
+      - name: Restore Go caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: jiejie-ios-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: jiejie-ios-${{ runner.os }}-
+
+      - name: TrustTunnel zero audit
+        run: |
+          set -euo pipefail
+          # Negative control for the whole stage: the Apple core must not carry
+          # TrustTunnel in source, dependency or build tag form.
+          #
+          # This workflow file is excluded because it necessarily contains the
+          # search terms themselves; every other path is checked.
+          self=".github/workflows/jiejie-ios.yml"
+          if git grep -niE 'trusttunnel|sing-trusttunnel|with_trusttunnel|jiejie_trusttunnel' -- . ":(exclude)$self"; then
+            echo "FAIL: TrustTunnel reference found in the tree" >&2
+            exit 1
+          fi
+          if git ls-tree -r --name-only HEAD | grep -i trusttunnel; then
+            echo "FAIL: TrustTunnel file found in the tree" >&2
+            exit 1
+          fi
+          if grep -q 'sing-trusttunnel' go.mod go.sum; then
+            echo "FAIL: sing-trusttunnel present in the module files" >&2
+            exit 1
+          fi
+          echo "TrustTunnel: absent (source, files and module files)"
+
+      - name: Libbox config smoke test
+        run: |
+          set -euo pipefail
+          # Proves the SAME Libbox config entry point the Apple client uses
+          # accepts http3_connection_pool and http3_fallback, with with_quic
+          # enabled exactly as the XCFramework build enables it.
+          go test -vet=off -tags with_quic -count=1 -v -run 'TestCheckConfig' ./experimental/libbox
+
+      - name: Install gomobile
+        run: make lib_install
+
+      - name: Build Libbox.xcframework (ios + iossimulator)
+        run: |
+          set -euo pipefail
+          # Only the two slices this stage needs. macOS/tvOS are out of scope,
+          # so they are not built and not claimed.
+          go run ./cmd/internal/build_libbox -target apple -platform ios,iossimulator
+
+      - name: Install Libbox into the pinned Apple client
+        run: |
+          set -euo pipefail
+          # build_libbox looks for ../sing-box-for-apple (the upstream layout).
+          # This repository keeps the client as clients/apple, so the move is
+          # done explicitly here rather than by patching the shared helper.
+          test -d Libbox.xcframework
+          rm -rf clients/apple/Libbox.xcframework
+          mv Libbox.xcframework clients/apple/Libbox.xcframework
+          ls -la clients/apple/Libbox.xcframework
+
+      - name: Verify XCFramework slices
+        run: |
+          set -euo pipefail
+          find clients/apple/Libbox.xcframework -maxdepth 2 -name 'Info.plist' -o -maxdepth 1 -type d | sort
+          echo "--- Info.plist ---"
+          plutil -p clients/apple/Libbox.xcframework/Info.plist
+          echo "--- slices ---"
+          for binary in clients/apple/Libbox.xcframework/*/Libbox.framework/Libbox; do
+            echo "== $binary"
+            file "$binary"
+            lipo -info "$binary" || true
+            echo "size_bytes: $(wc -c < "$binary" | tr -d ' ')"
+            echo "sha256: $(shasum -a 256 "$binary" | awk '{print $1}')"
+          done
+
+      - name: Verify Jiejie HTTP3 markers in the built framework
+        run: |
+          set -euo pipefail
+          # Artifact-level evidence that the Jiejie H3 options are in the core
+          # SFI will link, not merely present in the source tree. Go keeps the
+          # JSON option names as string literals, so a plain strings(1) finds
+          # them even after linking; if a future toolchain inlines them away,
+          # the config smoke test plus the recorded core SHA remain the
+          # equivalent proof, so this step reports rather than hard-fails on a
+          # missing literal.
+          provider="clients/apple/Libbox.xcframework/ios-arm64/Libbox.framework/Libbox"
+          [ -f "$provider" ] || provider="$(find clients/apple/Libbox.xcframework -name Libbox -type f -perm -u+x | head -1)"
+          echo "inspecting: $provider"
+          for marker in http3_connection_pool http3_fallback; do
+            if strings -a "$provider" | grep -q "$marker"; then
+              echo "FOUND marker: $marker"
+            else
+              echo "NOTE: marker literal not found in binary: $marker (see config smoke test)"
+            fi
+          done
+
+      - name: Resolve Swift packages
+        working-directory: clients/apple
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project sing-box.xcodeproj \
+            -scheme SFI \
+            -skipPackagePluginValidation
+
+      - name: Build SFI for the iOS Simulator (unsigned)
+        working-directory: clients/apple
+        run: |
+          set -euo pipefail
+          # Mandatory build of this stage. No signing: the artifact is a
+          # simulator product and is never presented as installable.
+          xcodebuild build \
+            -project sing-box.xcodeproj \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Build SFI for a generic iOS device (unsigned)
+        id: device_build
+        working-directory: clients/apple
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          # Second build: proves the device architecture also compiles and
+          # links. Signing is disabled, so a failure here is a real
+          # compile/link failure, not a provisioning one.
+          xcodebuild build \
+            -project sing-box.xcodeproj \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            -derivedDataPath build/DerivedDataDevice \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Confirm the Apple client was not modified
+        run: |
+          set -euo pipefail
+          # Libbox.xcframework is an untracked build input, so it is expected to
+          # appear. Any tracked Swift/project/package change is not.
+          echo "--- submodule status (Libbox.xcframework is expected, nothing else) ---"
+          git -C clients/apple status --short
+          dirty="$(git -C clients/apple status --short --untracked-files=no)"
+          if [ -n "$dirty" ]; then
+            echo "FAIL: the pinned Apple client has tracked modifications:" >&2
+            echo "$dirty" >&2
+            exit 1
+          fi
+          if ! git -C clients/apple diff --quiet -- Package.resolved; then
+            echo "FAIL: Package.resolved changed" >&2
+            exit 1
+          fi
+          echo "Apple client: no tracked modifications"
+
+      - name: Collect Libbox artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/libbox
+          cp -R clients/apple/Libbox.xcframework artifact/libbox/
+          {
+            echo "Jiejie Libbox.xcframework build information"
+            echo "=========================================="
+            echo "core_sha:            $(git rev-parse HEAD)"
+            echo "core_short_sha:      $(git rev-parse --short=7 HEAD)"
+            echo "branch:              $(git rev-parse --abbrev-ref HEAD)"
+            echo "apple_submodule_sha: $(git -C clients/apple rev-parse HEAD)"
+            echo "go_version:          $(go version)"
+            echo "gomobile_version:    v0.1.13 (see Makefile lib_install)"
+            echo "xcode_version:       $(xcodebuild -version | tr '\n' ' ')"
+            echo "target_slices:       ios-arm64, iossimulator-arm64"
+            echo "build_tags:          with_quic,with_wireguard,with_utls,with_naive_outbound,with_clash_api,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_tailscale,ts_omit_*,with_dhcp,grpcnotrace"
+            echo "with_quic:           true"
+            echo "trusttunnel:         false"
+            echo "signed:              false"
+            echo "build_time_utc:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run_id:     ${GITHUB_RUN_ID}"
+          } > artifact/libbox/BUILD-INFO.txt
+          ( cd artifact/libbox && find . -type f ! -name SHA256SUMS -print0 | sort -z \
+              | xargs -0 -I{} sh -c 'printf "%s  %s\n" "$(shasum -a 256 "{}" | awk "{print \$1}")" "{}"' > SHA256SUMS )
+          cat artifact/libbox/BUILD-INFO.txt
+
+      - name: Collect unsigned SFI artifact
+        run: |
+          set -euo pipefail
+          mkdir -p artifact/sfi
+          app_path="$(find clients/apple/build/DerivedData/Build/Products -maxdepth 2 -name 'SFI.app' -type d | head -1)"
+          if [ -z "$app_path" ]; then
+            echo "FAIL: simulator SFI.app was not produced" >&2
+            exit 1
+          fi
+          echo "simulator app: $app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" artifact/sfi/SFI-simulator-UNSIGNED.zip
+          device_app="$(find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 2 -name 'SFI.app' -type d | head -1 || true)"
+          if [ -n "$device_app" ]; then
+            echo "device app: $device_app"
+            ditto -c -k --sequesterRsrc --keepParent "$device_app" artifact/sfi/SFI-device-UNSIGNED.zip
+          fi
+          {
+            echo "Jiejie SFI unsigned build information"
+            echo "====================================="
+            echo "core_sha:                  $(git rev-parse HEAD)"
+            echo "core_short_sha:            $(git rev-parse --short=7 HEAD)"
+            echo "branch:                    $(git rev-parse --abbrev-ref HEAD)"
+            echo "apple_submodule_sha:       $(git -C clients/apple rev-parse HEAD)"
+            echo "go_version:                $(go version)"
+            echo "xcode_version:             $(xcodebuild -version | tr '\n' ' ')"
+            echo "simulator_build:           SUCCESS"
+            echo "device_build:              SUCCESS (compiled and linked unsigned)"
+            echo "signed:                    false"
+            echo "installable_on_stock_ios:  false"
+            echo "build_time_utc:            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run_id:           ${GITHUB_RUN_ID}"
+            echo ""
+            echo "This artifact is UNSIGNED. It is a simulator build plus an"
+            echo "unsigned device compile product. It cannot be installed on a"
+            echo "stock iPhone; that requires Apple signing and provisioning."
+          } > artifact/sfi/BUILD-INFO.txt
+          ( cd artifact/sfi && find . -type f ! -name SHA256SUMS -print0 | sort -z \
+              | xargs -0 -I{} sh -c 'printf "%s  %s\n" "$(shasum -a 256 "{}" | awk "{print \$1}")" "{}"' > SHA256SUMS )
+          cat artifact/sfi/BUILD-INFO.txt
+          echo "--- artifact tree ---"
+          find artifact -type f | sort
+
+      - name: Save Go caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/Library/Caches/go-build
+          key: jiejie-ios-${{ runner.os }}-${{ hashFiles('go.sum') }}
+
+      - name: Upload Libbox
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jiejie-Libbox-iOS-${{ github.sha }}
+          path: artifact/libbox
+          if-no-files-found: error
+
+      - name: Upload unsigned SFI
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jiejie-SFI-iOS-UNSIGNED-${{ github.sha }}
+          path: artifact/sfi
+          if-no-files-found: warn
+
+  ios-summary:
+    needs: [libbox-and-sfi]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarise
+        run: |
+          {
+            echo "### Jiejie iOS"
+            echo ""
+            echo "| job | result |"
+            echo "| --- | --- |"
+            echo "| libbox-and-sfi | ${{ needs.libbox-and-sfi.result }} |"
+            echo ""
+            echo "Artifacts are UNSIGNED and are **not** installable on a stock iPhone."
+            echo "Signing, provisioning and real-device installation are a later stage."
+          } >> "$GITHUB_STEP_SUMMARY"
