@@ -494,7 +494,7 @@ no external strip):
 
 | Artifact | Size |
 | --- | --- |
-| `sing-box-linux-amd64` (the only published binary) | ~32.1 MiB |
+| `sing-box-linux-amd64` (the only published binary) | ~32.2 MiB |
 
 Exact byte counts and the SHA256 are printed by CI; read them from the run output
 rather than from this table. The full and plain Jiejie tag sets still exist in the
@@ -606,8 +606,9 @@ Because the minimal build is now the product, CI enforces a raw ELF size ceiling
 of **38,000,000 bytes** (`MAX_BINARY_BYTES` in the workflow). A build over that
 limit fails with `production binary size regression`, which almost always means a
 protocol or service that should have been pruned has found its way back into the
-registry. As of `1.15.0-jiejie-masquerade.5` the raw ELF is **33,616,056 bytes**
-(32.06 MiB), leaving about 4.2 MiB of headroom for normal Go and dependency
+registry. As of `1.15.0-jiejie-masquerade.5` the raw ELF is **33,775,908 bytes**
+(32.2 MiB), up **16,384 bytes (+0.049%)** from `1.15.0-jiejie-masquerade.4` on the
+same toolchain, leaving about 4.03 MiB of headroom for normal Go and dependency
 growth. The guard measures the raw binary, never the artifact archive size.
 
 ## 12. Rebasing onto upstream
