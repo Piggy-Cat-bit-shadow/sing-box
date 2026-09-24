@@ -113,7 +113,7 @@ jobs:
           PROD_TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           # Only the packages with concurrent state on the server data path, so
           # the race detector stays fast enough to run on every push.
-          go test -tags "$PROD_TAGS" -race -count=1 -timeout 15m ./transport/http ./common/httpclient ./protocol/naive ./option
+          go test -tags "$PROD_TAGS" -race -count=1 -timeout 15m ./transport/http ./common/httpclient ./protocol/naive ./route ./option
       - name: Save Go caches
         if: always()
         uses: actions/cache/save@v4

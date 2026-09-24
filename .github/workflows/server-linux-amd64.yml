@@ -94,7 +94,9 @@ jobs:
         run: |
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./protocol/naive ./option
+          # ./route carries the per-datagram target guard, which runs on the
+          # UDP data path for every non-connect UoT session.
+          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./protocol/naive ./route ./option
 
   production-minimal-integration:
     runs-on: ubuntu-latest
