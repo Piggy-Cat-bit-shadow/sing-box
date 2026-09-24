@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -115,7 +116,7 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 		}
 		n.httpServer = &http.Server{
 			//nolint:staticcheck
-			Handler: h2c.NewHandler(n, &http2.Server{}),
+			Handler: h2c.NewHandler(n, n.http2Server()),
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
 			},
@@ -158,6 +159,45 @@ func (n *Inbound) Close() error {
 		n.h3Server,
 		n.tlsConfig,
 	)
+}
+
+// http2Server builds the HTTP/2 server for this inbound from the configured
+// HTTP2Options.
+//
+// The inbound previously used a bare `&http2.Server{}`, so every bound was an
+// upstream default that configuration could not reach. Each field below is
+// applied ONLY when set, so an unconfigured inbound behaves exactly as before.
+//
+// These are SERVER-side bounds. Setting a receive window here limits how much a
+// peer may have in flight toward this server -- it is an admission control, not a
+// client tuning knob, and a large value works against the 1 GiB target host
+// rather than for it.
+func (n *Inbound) http2Server() *http2.Server {
+	options := n.options.HTTP2Options
+	server := &http2.Server{}
+	if options.MaxConcurrentStreams > 0 {
+		// Bounds how many concurrent tunnels one HTTP/2 connection may open. A
+		// Naive CONNECT is one stream per tunnel, so this is the per-connection
+		// tunnel limit.
+		server.MaxConcurrentStreams = uint32(options.MaxConcurrentStreams)
+	}
+	if options.IdleTimeout > 0 {
+		// Closes connections that go fully idle, which is what stops a peer from
+		// parking many finished-but-open HTTP/2 connections.
+		server.IdleTimeout = time.Duration(options.IdleTimeout)
+	}
+	if options.StreamReceiveWindow != nil {
+		// SERVER-side per-stream upload buffer: how much data the peer may push
+		// toward this server on one stream before it must wait for the server to
+		// consume. Lowering it is the memory-conservative direction.
+		server.MaxUploadBufferPerStream = int32(options.StreamReceiveWindow.Value())
+	}
+	if options.ConnectionReceiveWindow != nil {
+		// The connection-wide counterpart, shared by all streams on the
+		// connection.
+		server.MaxUploadBufferPerConnection = int32(options.ConnectionReceiveWindow.Value())
+	}
+	return server
 }
 
 func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

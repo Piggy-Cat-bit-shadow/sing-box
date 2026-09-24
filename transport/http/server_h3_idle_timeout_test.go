@@ -143,14 +143,18 @@ func TestH3ConnectionWithNoRequestStreamIsReclaimed(t *testing.T) {
 // This is the regression guard for long-lived CONNECT tunnels, which are the
 // only reason this inbound exists.
 func TestH3ActiveStreamIsNotKilledByApplicationIdleTimeout(t *testing.T) {
-	const idleTimeout = 300 * time.Millisecond
+	// A short idle window keeps the test quick; the handler then blocks for many
+	// times that window, so the test is not sensitive to scheduling jitter under
+	// a loaded parallel test run.
+	const idleTimeout = 200 * time.Millisecond
+	const handlerDelay = 2 * time.Second
 
 	// The handler deliberately blocks for well over the idle timeout before
 	// responding, standing in for a long-lived tunnel.
 	handlerDone := make(chan struct{})
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		select {
-		case <-time.After(3 * idleTimeout):
+		case <-time.After(handlerDelay):
 		case <-request.Context().Done():
 			return
 		}
