@@ -444,3 +444,8 @@ func TestJiejieNaiveUDPAssociationsAreReleased(t *testing.T) {
 	require.LessOrEqual(t, afterListeners-beforeListeners, 2,
 		"finished UoT sessions must not leak fixed-port UDP sockets")
 }
+
+// runtimeGoroutines returns the current goroutine count. It exists so the
+// exception-path tests can share the lifecycle helper without importing runtime
+// in several files.
+func runtimeGoroutines() int { return runtime.NumGoroutine() }
