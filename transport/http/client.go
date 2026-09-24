@@ -234,6 +234,11 @@ func ResolveVersion(version int, path string, host string) int {
 // It lives in production code rather than a test file because this package
 // compiles in builds without with_quic, where a test-only method would break the
 // build.
+//
+// An unset deadline (0) means "never broken", which is also "not avoiding", so
+// it reports true. A deadline that has passed reports true as well; the caller
+// distinguishes the two cases via http3ProbeDecision, which needs to know
+// whether a failure happened at all.
 func (c *Client) http3WindowElapsed() bool {
 	brokenUntil := c.http3BrokenUntil.Load()
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
@@ -241,29 +246,45 @@ func (c *Client) http3WindowElapsed() bool {
 
 // http3ProbeDecision decides whether THIS caller should attempt HTTP/3.
 //
-// It returns (useH3, isProbe):
+// The avoidance state machine has exactly three states, and the single-flight
+// probe belongs to the third:
 //
-//   - window closed (H3 healthy):        useH3 = true,  isProbe = false
-//   - window open, nobody probing:       useH3 = true,  isProbe = true
-//   - window open, a probe is in flight: useH3 = false, isProbe = false
-//   - window expired:                    same as "nobody probing", i.e. this
-//     caller becomes the probe
+//	A. never broken (brokenUntil == 0)
+//	   Every caller uses HTTP/3, and nobody is "the probe".
 //
-// The single-flight property is that at most one caller can hold isProbe=true at
-// a time, and that a non-winner is never blocked: it simply uses HTTP/2 for this
-// request, which is what keeps a burst from becoming a herd.
+//	B. broken, window still open (now < brokenUntil)
+//	   Every caller goes to HTTP/2 immediately. NOTHING probes here: the whole
+//	   point of the window is to stop touching HTTP/3 until it closes. Probing
+//	   inside the window would defeat the backoff entirely, turning a failing
+//	   server into a per-request QUIC establishment attempt.
+//
+//	C. broken, window expired (brokenUntil != 0 && now >= brokenUntil)
+//	   Exactly ONE caller wins the CAS and probes HTTP/3; every other caller
+//	   goes to HTTP/2 immediately and never waits for the probe. This is the
+//	   thundering-herd guard: when the window closes, a burst of connections
+//	   must not all dial QUIC at once.
+//
+// The returned pair is (useH3, isProbe). A caller with isProbe == true owns the
+// single-flight slot and MUST call finishProbe when its attempt concludes.
 func (c *Client) http3ProbeDecision() (useH3 bool, isProbe bool) {
 	// NOTE: this deliberately does NOT early-return on c.http3 == nil. The
 	// single-flight decision is a property of the AVOIDANCE STATE, not of whether
 	// a transport object exists yet, and the callers below already handle a nil
 	// HTTP/3 client. Keeping the decision independent is also what makes it
 	// testable without a live QUIC connection.
-	if c.http3WindowElapsed() {
-		// H3 is considered usable: the window has closed or was never opened.
+	brokenUntil := c.http3BrokenUntil.Load()
+
+	// State A: never broken, so HTTP/3 is simply usable.
+	if brokenUntil == 0 {
 		return true, false
 	}
-	// The window is open, so H3 is being avoided. Allow exactly one probe; every
-	// other caller proceeds on HTTP/2 without waiting.
+
+	// State B: still inside the avoidance window. No probes here at all.
+	if time.Now().UnixNano() < brokenUntil {
+		return false, false
+	}
+
+	// State C: the window has expired. One caller becomes the recovery probe.
 	if c.probeActive.CompareAndSwap(false, true) {
 		return true, true
 	}
@@ -310,9 +331,9 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	// Single-flight recovery: while the avoidance window is open, at most one
-	// caller probes HTTP/3 and every other caller goes straight to HTTP/2. A
-	// non-winner is never blocked waiting for the probe.
+	// Avoidance scheduling: while the window is open every caller goes straight
+	// to HTTP/2, and once it expires exactly one caller becomes the recovery
+	// probe while the others keep using HTTP/2 without waiting.
 	useH3, isProbe := c.http3ProbeDecision()
 	if isProbe {
 		defer c.finishProbe()

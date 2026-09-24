@@ -385,25 +385,28 @@ func TestH3SlotFailureDoesNotPoisonAuthority(t *testing.T) {
 }
 
 // TestClientSingleFlightH3Probe proves a burst of callers after the avoidance
-// window expires produces at most ONE HTTP/3 probe, and that no caller is
+// window EXPIRES produces exactly ONE HTTP/3 probe, and that no caller is
 // blocked waiting for it.
 //
 // The hazard: when the window closes, a hundred simultaneous connections would
 // otherwise all dial QUIC at once, which is the thundering herd the backoff
 // exists to prevent.
+//
+// The window must be EXPIRED here. An open window is a different state, covered
+// by TestClientNoProbeWhileBackoffActive: nothing may probe inside it.
 func TestClientSingleFlightH3Probe(t *testing.T) {
 	client := newScheduleOnlyClient(option.HTTP3FallbackSchedule{
-		InitialBackoff: 5 * time.Second,
+		InitialBackoff: 5 * time.Millisecond,
 		MaxBackoff:     5 * time.Minute,
 		Multiplier:     2,
 		ResetOnSuccess: true,
 	})
 	require.NotNil(t, client)
 
-	// Put the client into an open avoidance window with a long deadline, so the
-	// next callers are in the "window open" branch.
-	client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
-	require.False(t, client.http3WindowElapsed(), "precondition: the window is open")
+	// Put the client into an EXPIRED avoidance window: H3 failed at some point,
+	// and the backoff has now elapsed. This is the only state that may probe.
+	client.http3BrokenUntil.Store(time.Now().Add(-time.Millisecond).UnixNano())
+	require.True(t, client.http3WindowElapsed(), "precondition: the window has expired")
 
 	const callers = 64
 	results := make(chan struct {
@@ -427,27 +430,25 @@ func TestClientSingleFlightH3Probe(t *testing.T) {
 	close(results)
 
 	probes := 0
-	blocked := 0
+	usedH3 := 0
+	onHTTP2 := 0
 	for result := range results {
 		if result.isProbe {
 			probes++
 		}
-		if !result.useH3 && !result.isProbe {
-			// A non-winner must go straight to HTTP/2, not wait.
-			blocked++
+		if result.useH3 {
+			usedH3++
+		} else {
+			// A non-winner must go straight to HTTP/2, not wait for the probe.
+			onHTTP2++
 		}
 	}
 	require.Equal(t, 1, probes,
 		"exactly one caller may hold the H3 probe; got %d", probes)
-	require.Equal(t, callers-1, blocked,
-		"every other caller must proceed on HTTP/2 without waiting; got %d", blocked)
-
-	// Releasing the probe lets the next caller become the prober, so recovery is
-	// not permanently wedged by one attempt.
-	client.finishProbe()
-	_, isProbe := client.http3ProbeDecision()
-	require.True(t, isProbe, "after the probe completes a new probe must be possible")
-	client.finishProbe()
+	require.Equal(t, 1, usedH3,
+		"only the probe owner may use HTTP/3; got %d", usedH3)
+	require.Equal(t, callers-1, onHTTP2,
+		"every other caller must proceed on HTTP/2 without waiting; got %d", onHTTP2)
 }
 
 // TestClientProbeReleasedOnBothOutcomes proves the single-flight slot is
@@ -462,10 +463,10 @@ func TestClientProbeReleasedOnBothOutcomes(t *testing.T) {
 			Multiplier:     2,
 			ResetOnSuccess: true,
 		})
-		// An OPEN window with a probe in flight is the recovery scenario: the
-		// window has expired, so a probe is allowed.
-		client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
-		require.False(t, client.http3WindowElapsed(), "precondition: the window is open")
+		// The probe is only reachable from an EXPIRED window; the window is then
+		// reopened by the failure.
+		client.http3BrokenUntil.Store(time.Now().Add(-time.Millisecond).UnixNano())
+		require.True(t, client.http3WindowElapsed(), "precondition: the window has expired")
 		useH3, isProbe := client.http3ProbeDecision()
 		require.True(t, useH3, "the probe owner must attempt HTTP/3")
 		require.True(t, isProbe)
@@ -486,7 +487,7 @@ func TestClientProbeReleasedOnBothOutcomes(t *testing.T) {
 			Multiplier:     2,
 			ResetOnSuccess: true,
 		})
-		client.http3BrokenUntil.Store(time.Now().Add(time.Hour).UnixNano())
+		client.http3BrokenUntil.Store(time.Now().Add(-time.Millisecond).UnixNano())
 		_, isProbe := client.http3ProbeDecision()
 		require.True(t, isProbe)
 
@@ -495,6 +496,8 @@ func TestClientProbeReleasedOnBothOutcomes(t *testing.T) {
 
 		require.True(t, client.http3WindowElapsed(),
 			"a successful probe must clear the avoidance window")
+		require.Zero(t, client.http3BrokenUntil.Load(),
+			"a successful probe must clear the deadline outright")
 		require.False(t, client.probeActive.Load(),
 			"the probe slot must be released after a success")
 		require.Zero(t, client.http3Escalation.Load(),
