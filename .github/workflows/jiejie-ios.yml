@@ -336,6 +336,90 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
+      - name: Build SFI for a generic iOS device, device-only (unsigned, slim)
+        working-directory: clients/apple
+        run: |
+          set -euo pipefail
+          # Device-only means arm64 alone, no simulator slice and no x86_64.
+          # A stock iPhone never loads either, so dropping them is the whole
+          # point of this variant: it is the artifact a user would actually
+          # install (and sign themselves).
+          xcodebuild build \
+            -project sing-box.xcodeproj \
+            -scheme SFI \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            -derivedDataPath build/DerivedDataDeviceSlim \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            EXCLUDED_ARCHS="x86_64 arm64e" \
+            VALIDATE_PRODUCT=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package the device build as an UNSIGNED IPA
+        run: |
+          set -euo pipefail
+          # An IPA is just Payload/<App>.app zipped. This one is UNSIGNED: it
+          # carries no valid signature, so it installs only after the user
+          # signs it with their own certificate and provisioning profile.
+          #
+          # It is therefore named UNSIGNED and is never described as
+          # installable on a stock, unmodified iPhone.
+          mkdir -p artifact/sfi
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1 || true)"
+          if [ -z "$slim_app" ]; then
+            echo "FAIL: device-only SFI.app was not produced" >&2
+            exit 1
+          fi
+          echo "device-only app: $slim_app"
+
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/Payload"
+          cp -R "$slim_app" "$stage/Payload/"
+
+          # Record what is actually inside, and confirm there is no signature to
+          # lose: an unsigned app either has no _CodeSignature or an empty one.
+          echo "--- binary architecture ---"
+          file "$stage/Payload/SFI.app/SFI" || true
+          lipo -info "$stage/Payload/SFI.app/SFI" || true
+          echo "--- code signature presence ---"
+          if [ -d "$stage/Payload/SFI.app/_CodeSignature" ]; then
+            echo "_CodeSignature directory present (contents below)"
+            ls -la "$stage/Payload/SFI.app/_CodeSignature" || true
+          else
+            echo "no _CodeSignature directory: the app is unsigned"
+          fi
+          codesign -dv "$stage/Payload/SFI.app" 2>&1 | head -5 || echo "codesign reports no signature (expected)"
+
+          ( cd "$stage" && zip -qry SFI-device-arm64-UNSIGNED.ipa Payload )
+          mv "$stage/SFI-device-arm64-UNSIGNED.ipa" artifact/sfi/
+          rm -rf "$stage"
+
+          echo "--- IPA contents (top level) ---"
+          unzip -l artifact/sfi/SFI-device-arm64-UNSIGNED.ipa | head -15
+          echo "ipa_bytes: $(wc -c < artifact/sfi/SFI-device-arm64-UNSIGNED.ipa | tr -d ' ')"
+          echo "ipa_sha256: $(shasum -a 256 artifact/sfi/SFI-device-arm64-UNSIGNED.ipa | awk '{print $1}')"
+
+      - name: Report device binary size
+        run: |
+          set -euo pipefail
+          # Size audit for the device-only variant: the Go core dominates the
+          # binary, so the framework and the final executable are both recorded.
+          slim_app="$(find clients/apple/build/DerivedDataDeviceSlim/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1)"
+          echo "--- device-only SFI.app size ---"
+          du -sh "$slim_app"
+          echo "--- top-level binary ---"
+          ls -la "$slim_app/SFI" 2>/dev/null || true
+          echo "--- embedded frameworks ---"
+          ls -la "$slim_app/Frameworks" 2>/dev/null | head -10 || true
+          for fw in "$slim_app"/Frameworks/*; do
+            [ -e "$fw" ] || continue
+            echo "$(basename "$fw"): $(du -sh "$fw" | awk '{print $1}')"
+          done
+
       - name: Confirm the Apple client sources were not modified
         run: |
           set -euo pipefail
@@ -389,14 +473,22 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifact/sfi
-          app_path="$(find clients/apple/build/DerivedData/Build/Products -maxdepth 2 -name 'SFI.app' -type d | head -1)"
+          # The product sits at <Products>/Release-iphonesimulator/SFI.app, so
+          # the search needs depth 3 rather than 2. The tree is printed first so
+          # a future layout change is visible in the log rather than only as a
+          # failure.
+          echo "--- simulator products tree ---"
+          find clients/apple/build/DerivedData/Build/Products -maxdepth 2 -type d | sort | head -20
+          app_path="$(find clients/apple/build/DerivedData/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1)"
           if [ -z "$app_path" ]; then
             echo "FAIL: simulator SFI.app was not produced" >&2
             exit 1
           fi
           echo "simulator app: $app_path"
           ditto -c -k --sequesterRsrc --keepParent "$app_path" artifact/sfi/SFI-simulator-UNSIGNED.zip
-          device_app="$(find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 2 -name 'SFI.app' -type d | head -1 || true)"
+          echo "device products tree ---"
+          find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 2 -type d 2>/dev/null | sort | head -20 || true
+          device_app="$(find clients/apple/build/DerivedDataDevice/Build/Products -maxdepth 3 -name 'SFI.app' -type d | head -1 || true)"
           if [ -n "$device_app" ]; then
             echo "device app: $device_app"
             ditto -c -k --sequesterRsrc --keepParent "$device_app" artifact/sfi/SFI-device-UNSIGNED.zip
@@ -412,14 +504,20 @@ jobs:
             echo "xcode_version:             $(xcodebuild -version | tr '\n' ' ')"
             echo "simulator_build:           SUCCESS"
             echo "device_build:              SUCCESS (compiled and linked unsigned)"
+            echo "device_only_build:         SUCCESS (arm64 only, slim)"
+            echo "ipa:                       SFI-device-arm64-UNSIGNED.ipa"
             echo "signed:                    false"
             echo "installable_on_stock_ios:  false"
             echo "build_time_utc:            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "workflow_run_id:           ${GITHUB_RUN_ID}"
             echo ""
-            echo "This artifact is UNSIGNED. It is a simulator build plus an"
-            echo "unsigned device compile product. It cannot be installed on a"
-            echo "stock iPhone; that requires Apple signing and provisioning."
+            echo "This artifact is UNSIGNED. It contains a simulator build, an"
+            echo "unsigned generic-device compile product, and an UNSIGNED"
+            echo "device-only IPA (arm64)."
+            echo ""
+            echo "The IPA cannot be installed on a stock, unmodified iPhone: it"
+            echo "carries no valid signature. Installing it requires signing it"
+            echo "with your own certificate and provisioning profile."
           } > artifact/sfi/BUILD-INFO.txt
           # Same portable loop as the Libbox step: an .app bundle has many
           # files, and `xargs -I{}` overruns ARG_MAX on it.
