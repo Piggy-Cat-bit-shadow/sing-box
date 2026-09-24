@@ -336,13 +336,11 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
-      - name: Confirm the Apple client was not modified
+      - name: Confirm the Apple client sources were not modified
         run: |
           set -euo pipefail
           # The gitlink may be UPDATED as a commit (that is how the pin moves),
-          # but the checked-out client must never be PATCHED here. Libbox
-          # .xcframework is an untracked build input, so it is expected to
-          # appear; any tracked Swift/project/package change is not.
+          # but no source file may be PATCHED here.
           echo "--- pinned gitlink recorded in the parent repository ---"
           pinned="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
           actual="$(git -C clients/apple rev-parse HEAD)"
@@ -353,19 +351,39 @@ jobs:
             exit 1
           fi
 
-          echo "--- submodule status (Libbox.xcframework is expected, nothing else) ---"
+          echo "--- submodule status ---"
           git -C clients/apple status --short
-          dirty="$(git -C clients/apple status --short --untracked-files=no)"
-          if [ -n "$dirty" ]; then
-            echo "FAIL: the pinned Apple client has tracked modifications:" >&2
-            echo "$dirty" >&2
+
+          # Source files must be untouched. Package.resolved is EXCLUDED on
+          # purpose: `xcodebuild -resolvePackageDependencies` rewrites the
+          # checked-in lockfile as a normal part of resolving, so treating it
+          # as a hand edit would fail on every run. Its change is recorded
+          # below for the log rather than asserted against.
+          echo "--- enforced: no modified Swift/source/project files ---"
+          modified="$(git -C clients/apple status --short --untracked-files=no \
+            | grep -vE 'Package\.resolved$' || true)"
+          if [ -n "$modified" ]; then
+            echo "FAIL: the pinned Apple client has tracked source modifications:" >&2
+            echo "$modified" >&2
             exit 1
           fi
-          if ! git -C clients/apple diff --quiet -- Package.resolved; then
-            echo "FAIL: Package.resolved changed" >&2
+          echo "OK: no Swift, xcodeproj or entitlement file was modified"
+
+          echo "--- recorded: Package.resolved delta produced by package resolution ---"
+          if git -C clients/apple diff --quiet -- '**/Package.resolved'; then
+            echo "Package.resolved: unchanged by resolution"
+          else
+            echo "Package.resolved: rewritten by xcodebuild -resolvePackageDependencies (expected)"
+            git -C clients/apple diff --stat -- '**/Package.resolved'
+          fi
+
+          echo "--- enforced: no .swift file differs from the pinned commit ---"
+          if git -C clients/apple diff --name-only -- '*.swift' | grep -q .; then
+            echo "FAIL: Swift source differs from the pinned commit" >&2
+            git -C clients/apple diff --name-only -- '*.swift' >&2
             exit 1
           fi
-          echo "Apple client: at the pinned commit, no tracked modifications"
+          echo "Apple client: at the pinned commit, no Swift or project modifications"
 
       - name: Collect unsigned SFI artifact
         run: |
