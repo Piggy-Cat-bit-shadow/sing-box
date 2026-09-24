@@ -32,7 +32,23 @@ func generatePaddingHeader() string {
 	return string(padding)
 }
 
+// paddingConn implements the Naive padding frame codec.
+//
+// The frame format matches klzgrad/forwardproxy exactly and must not be
+// changed: a 2-byte big-endian original data size, a 1-byte padding size, the
+// data, then that many zero padding bytes. Padding applies to the first
+// paddingCount frames in each direction and is then dropped entirely.
+//
+// `enabled` records whether the client negotiated padding by sending the
+// Padding header. It is NOT a validity requirement: a CONNECT without the
+// header is a plain HTTP proxy request and simply uses unpadded framing, which
+// is what the reference implementation does.
 type paddingConn struct {
+	// enabled is set from the client's Padding header. When false the connection
+	// is plain I/O and no frame header is ever written or expected.
+	enabled bool
+	// readPadding and writePadding count frames in each direction. Padding stops
+	// once both reach paddingCount.
 	readPadding      int
 	writePadding     int
 	readRemaining    int
@@ -40,6 +56,9 @@ type paddingConn struct {
 }
 
 func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, err error) {
+	if !p.enabled {
+		return reader.Read(buffer)
+	}
 	if p.readRemaining > 0 {
 		if len(buffer) > p.readRemaining {
 			buffer = buffer[:p.readRemaining]
@@ -74,7 +93,7 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 		if len(buffer) > originalDataSize {
 			buffer = buffer[:originalDataSize]
 		}
-		n, err = reader.Read(buffer)
+		n, err = io.ReadFull(reader, buffer)
 		if err != nil {
 			return
 		}
@@ -87,6 +106,9 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 }
 
 func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, err error) {
+	if !p.enabled {
+		return writer.Write(data)
+	}
 	if p.writePadding < paddingCount {
 		paddingSize := rand.Intn(256)
 		buffer := buf.NewSize(3 + len(data) + paddingSize)
@@ -107,6 +129,9 @@ func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, er
 }
 
 func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffer) error {
+	if !p.enabled {
+		return common.Error(writer.Write(buffer.Bytes()))
+	}
 	if p.writePadding < paddingCount {
 		bufferLen := buffer.Len()
 		if bufferLen > 65535 {
@@ -124,6 +149,11 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 }
 
 func (p *paddingConn) writeChunked(writer io.Writer, data []byte) (n int, err error) {
+	if !p.enabled {
+		// Without padding there is no 2-byte frame length, so there is no
+		// 65535-byte frame limit to respect. Write straight through.
+		return writer.Write(data)
+	}
 	for len(data) > 0 {
 		var chunk []byte
 		if len(data) > 65535 {
@@ -144,32 +174,36 @@ func (p *paddingConn) writeChunked(writer io.Writer, data []byte) (n int, err er
 }
 
 func (p *paddingConn) frontHeadroom() int {
-	if p.writePadding < paddingCount {
+	if p.enabled && p.writePadding < paddingCount {
 		return 3
 	}
 	return 0
 }
 
 func (p *paddingConn) rearHeadroom() int {
-	if p.writePadding < paddingCount {
+	if p.enabled && p.writePadding < paddingCount {
 		return 255
 	}
 	return 0
 }
 
 func (p *paddingConn) writerMTU() int {
-	if p.writePadding < paddingCount {
+	if p.enabled && p.writePadding < paddingCount {
 		return 65535
 	}
 	return 0
 }
 
+// readerReplaceable and writerReplaceable report that the padding layer can be
+// dropped from the connection stack. Both directions must be past the padding
+// window, and an unpadded connection is replaceable immediately because there is
+// no frame layer at all.
 func (p *paddingConn) readerReplaceable() bool {
-	return p.readPadding == paddingCount
+	return !p.enabled || p.readPadding == paddingCount
 }
 
 func (p *paddingConn) writerReplaceable() bool {
-	return p.writePadding == paddingCount
+	return !p.enabled || p.writePadding == paddingCount
 }
 
 type naiveConn struct {

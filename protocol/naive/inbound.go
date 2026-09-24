@@ -16,6 +16,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	transportHttp "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -51,6 +52,11 @@ type Inbound struct {
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
 	h3Server         io.Closer
+	// masquerade serves ordinary web traffic on the proxy port. It is nil when
+	// no masquerade is configured, in which case the upstream reject behaviour
+	// is kept. It is shared with the HTTP/MASQUE inbounds and has no access to
+	// the proxy data path, so it can never open a tunnel.
+	masquerade http.Handler
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
@@ -84,6 +90,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.tlsConfig = tlsConfig
 	}
+	masqueradeHandler, err := transportHttp.NewMasqueradeHandler(ctx, options.Masquerade)
+	if err != nil {
+		return nil, err
+	}
+	inbound.masquerade = masqueradeHandler
 	return inbound, nil
 }
 
@@ -151,27 +162,43 @@ func (n *Inbound) Close() error {
 
 func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	ctx := log.ContextWithNewID(request.Context())
-	if request.Method != "CONNECT" {
-		rejectHTTP(writer, http.StatusBadRequest)
-		n.badRequest(ctx, request, E.New("not CONNECT request"))
-		return
-	} else if request.Header.Get("Padding") == "" {
-		rejectHTTP(writer, http.StatusBadRequest)
-		n.badRequest(ctx, request, E.New("missing naive padding"))
+
+	// A Naive proxy request is, by definition, an authenticated HTTP CONNECT.
+	// Everything else is "not a proxy request" and is handled by the masquerade
+	// when one is configured.
+	//
+	// This shape deliberately mirrors klzgrad/forwardproxy: the request is
+	// parsed FIRST, authentication is checked SECOND, and only a request that is
+	// both a CONNECT and correctly authenticated ever reaches the tunnel. A
+	// missing Padding header is NOT a reason to reject a CONNECT -- see below.
+	if request.Method != http.MethodConnect {
+		n.serveWebOrReject(ctx, writer, request, http.StatusBadRequest, E.New("not CONNECT request"))
 		return
 	}
+
 	userName, password, authOk := badhttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
 		authOk = n.authenticator.Verify(userName, password)
 	}
 	if !authOk {
-		rejectHTTP(writer, http.StatusProxyAuthRequired)
-		n.badRequest(ctx, request, E.New("authorization failed"))
+		// An unauthenticated CONNECT must never open a tunnel. With a
+		// masquerade configured it is answered as ordinary web traffic so the
+		// endpoint does not advertise a proxy authentication surface; without
+		// one it keeps the upstream 407 challenge.
+		n.serveWebOrReject(ctx, writer, request, http.StatusProxyAuthRequired, E.New("authorization failed"))
 		return
 	}
-	writer.Header().Set("Padding", generatePaddingHeader())
-	writer.WriteHeader(http.StatusOK)
-	writer.(http.Flusher).Flush()
+
+	// A CONNECT that carries no Padding header is NOT invalid. The Padding
+	// header is a Naive EXTENSION: klzgrad/forwardproxy only enables padding
+	// frames when the client actually sent the header, and treats a CONNECT
+	// without it as a standard HTTP proxy request. Rejecting it here broke
+	// plain HTTP CONNECT clients and every Naive client that does not pad.
+	//
+	// The response Padding header is still emitted for a padding client so the
+	// negotiation completes, and padding frames are then read/written on the
+	// tunnel exactly as before.
+	usePadding := request.Header.Get("Padding") != ""
 
 	hostPort := request.Header.Get("-connect-authority")
 	if hostPort == "" {
@@ -180,8 +207,24 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			hostPort = request.Host
 		}
 	}
-	source := badhttp.SourceAddress(request)
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
+	if !destination.IsValid() {
+		n.serveWebOrReject(ctx, writer, request, http.StatusBadRequest, E.New("invalid CONNECT target: ", hostPort))
+		return
+	}
+
+	if usePadding {
+		writer.Header().Set("Padding", generatePaddingHeader())
+	}
+	writer.WriteHeader(http.StatusOK)
+	flusher, isFlusher := writer.(http.Flusher)
+	if !isFlusher {
+		n.badRequest(ctx, request, E.New("response writer is not a flusher"))
+		return
+	}
+	flusher.Flush()
+
+	source := badhttp.SourceAddress(request)
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
 		conn, _, err := hijacker.Hijack()
@@ -189,15 +232,49 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			n.badRequest(ctx, request, E.New("hijack failed"))
 			return
 		}
-		n.newConnection(ctx, false, &naiveConn{Conn: conn}, userName, source, destination)
+		n.newConnection(ctx, false, &naiveConn{Conn: conn, paddingConn: paddingConn{enabled: usePadding}}, userName, source, destination)
 	} else {
 		n.newConnection(ctx, true, &naiveH2Conn{
 			reader:        request.Body,
 			writer:        writer,
-			flusher:       writer.(http.Flusher),
+			flusher:       flusher,
 			remoteAddress: source,
+			paddingConn:   paddingConn{enabled: usePadding},
 		}, userName, source, destination)
 	}
+}
+
+// serveWebOrReject answers a request that is not an authenticated Naive CONNECT.
+//
+// With a masquerade configured the request is served the masquerade handler,
+// which is a normal web response and reveals nothing about the proxy. Without
+// one, the request is rejected with the given status exactly as before.
+//
+// The masquerade path is deliberately WEB-ONLY: it is only reached before any
+// tunnel exists, and it never receives the tunnel connection. That ordering is
+// what makes "an unauthenticated CONNECT can never become a tunnel" true by
+// construction rather than by a later check.
+func (n *Inbound) serveWebOrReject(ctx context.Context, writer http.ResponseWriter, request *http.Request, statusCode int, err error) {
+	if n.masquerade != nil {
+		// Logged at debug: a probe or a browser hitting the port is the
+		// intended design path for the masquerade and must not flood the error
+		// log. Real faults on the tunnel path are still logged as errors.
+		n.logger.DebugContext(ctx, E.Cause(err, "masquerade request from ", request.RemoteAddr))
+		n.serveMasquerade(ctx, writer, request)
+		return
+	}
+	rejectHTTP(writer, statusCode)
+	n.badRequest(ctx, request, err)
+}
+
+// serveMasquerade serves the decoy web response, with the request sanitised so
+// that the proxy credential can never leak to the web backend.
+func (n *Inbound) serveMasquerade(ctx context.Context, writer http.ResponseWriter, request *http.Request) {
+	// Proxy-Authorization carries a proxy credential in the clear. It must never
+	// be forwarded to the masquerade backend, whatever the backend is.
+	request.Header.Del("Proxy-Authorization")
+	request.Header.Del("Proxy-Connection")
+	n.masquerade.ServeHTTP(writer, request)
 }
 
 func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net.Conn, userName string, source M.Socksaddr, destination M.Socksaddr) {

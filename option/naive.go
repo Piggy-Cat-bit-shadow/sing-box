@@ -11,6 +11,19 @@ type NaiveInboundOptions struct {
 	Users                 []auth.User `json:"users,omitempty"`
 	Network               NetworkList `json:"network,omitempty"`
 	QUICCongestionControl string      `json:"quic_congestion_control,omitempty" enum:"bbr,cubic,reno"`
+	// Masquerade handles requests that are NOT authenticated Naive proxy
+	// requests -- ordinary browser traffic, probes, and proxy attempts with no
+	// or wrong credentials. It uses the same schema and semantics as the
+	// Hysteria2 and HTTP inbound masquerade, so a normal website can be served
+	// on the same port as the proxy.
+	//
+	// Unset means the upstream behaviour: the request is rejected with a proxy
+	// authentication challenge or a bad-request status.
+	//
+	// This is a WEB response only. It can never establish a proxy tunnel: the
+	// tunnel path requires successful authentication first, and the masquerade
+	// handler has no access to the proxy or UoT data paths.
+	Masquerade *Hysteria2Masquerade `json:"masquerade,omitempty"`
 	InboundTLSOptionsContainer
 }
 
