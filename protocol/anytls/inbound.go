@@ -171,6 +171,18 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 			return
 		}
 		conn = tlsConn
+		// The TLS handshake is complete but the peer has proven nothing yet:
+		// sing-anytls reads the prologue with a single ReadOnceFrom that carries
+		// no deadline, so a peer which completes the handshake and then sends
+		// nothing holds its FD, goroutine, TLS state and buffers open
+		// indefinitely. Bound exactly that first application read.
+		//
+		// Installed AFTER the handshake so it never competes with the handshake
+		// timeout, and one-shot: the deadline is cleared as soon as any
+		// application byte arrives, so a legitimate AnyTLS session -- and a
+		// legitimate fallback backend, which only receives the connection after
+		// the first read succeeded -- is unaffected afterwards.
+		conn = newFirstReadTimeoutConn(conn, defaultPreAuthTimeout())
 	}
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
