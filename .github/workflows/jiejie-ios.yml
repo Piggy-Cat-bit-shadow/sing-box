@@ -203,7 +203,12 @@ jobs:
           echo "required capabilities: all present"
 
           echo "=== size comparison ==="
-          go build -o /tmp/full-client ./cmd/sing-box
+          # The baseline must be the DEFAULT APPLE tag set, not an untagged build:
+          # an untagged build is smaller precisely because it lacks with_quic and
+          # the other Apple tags, so comparing against it would invert the result.
+          FULL_TAGS="$(go run ./cmd/internal/build_libbox -print-tags)"
+          echo "baseline tags: $FULL_TAGS"
+          go build -tags "$FULL_TAGS" -o /tmp/full-client ./cmd/sing-box
           full_bytes=$(wc -c < /tmp/full-client | tr -d ' ')
           slim_bytes=$(wc -c < /tmp/slim-client | tr -d ' ')
           echo "default-tags client: $full_bytes bytes"

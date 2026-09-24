@@ -129,11 +129,20 @@ func main() {
 	// -print-tags exists so CI can derive the tag set from the profile itself
 	// instead of duplicating it in YAML, where it would silently drift.
 	if printTags {
+		// With no -profile this prints the UPSTREAM default Apple tag set, which
+		// is what a comparison build must use as its baseline. Comparing the slim
+		// profile against an untagged build would be meaningless: the untagged
+		// build is smaller precisely because it lacks with_quic and the rest.
+		base := append(append([]string{}, sharedTags...), darwinTags...)
+		if profile == "" {
+			fmt.Println(strings.Join(base, ","))
+			return
+		}
 		selected, known := findAppleProfile(profile)
 		if !known {
 			log.Fatal("unknown -profile ", profile, "; known profiles: ", appleProfileNames())
 		}
-		fmt.Println(strings.Join(applyAppleProfile(append(append([]string{}, sharedTags...), darwinTags...), selected), ","))
+		fmt.Println(strings.Join(applyAppleProfile(base, selected), ","))
 		return
 	}
 

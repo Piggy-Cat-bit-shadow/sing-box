@@ -106,3 +106,27 @@ func TestUnknownProfileIsRejected(t *testing.T) {
 	require.True(t, known)
 	require.Equal(t, iosSlimProfile.name, selected.name)
 }
+
+// TestDefaultTagSetIsTheComparisonBaseline guards the size comparison the iOS
+// workflow performs.
+//
+// The baseline must be the DEFAULT Apple tag set. An earlier revision compared
+// the slim profile against an untagged build, which is smaller precisely because
+// it lacks with_quic and the other Apple tags, so the comparison inverted and the
+// gate failed on a correct profile.
+func TestDefaultTagSetIsTheComparisonBaseline(t *testing.T) {
+	base := append(append([]string{}, sharedTags...), darwinTags...)
+
+	require.True(t, containsTag(base, "with_quic"),
+		"the baseline must include with_quic, or the comparison is meaningless")
+	require.True(t, containsTag(base, "with_tailscale"),
+		"the baseline must include the tags the slim profile removes")
+	require.False(t, containsTag(base, "jiejie_ios_slim"),
+		"the baseline must not carry the slim marker")
+
+	slim := applyAppleProfile(base, iosSlimProfile)
+	require.True(t, containsTag(slim, "jiejie_ios_slim"))
+	require.False(t, containsTag(slim, "with_tailscale"))
+	require.Less(t, len(slim), len(base)+1,
+		"the slim set must not be larger than the baseline it is compared against")
+}
