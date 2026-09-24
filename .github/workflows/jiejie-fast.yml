@@ -10,7 +10,7 @@ name: Jiejie Fast
 
 on:
   push:
-    branches: [testing, 'feat/jiejie-*', 'cleanup/*']
+    branches: [testing, 'feat/jiejie-*', 'cleanup/*', 'sync/*']
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
