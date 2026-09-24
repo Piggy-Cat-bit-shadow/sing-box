@@ -154,8 +154,16 @@ const selectionCooldown = 5 * time.Second
 //
 // Strategy: healthy least-active. Among eligible slots the one with the fewest
 // live tunnels wins, because that is the slot whose congestion controller has
-// the least queued work. Ties are broken by round-robin so that equally idle
-// slots are used evenly rather than always preferring the first.
+// the least queued work. Ties are resolved by an atomic round-robin over the
+// tied slots alone, so equally idle slots are used evenly.
+//
+// The tie-break deliberately operates on the collected minimum set rather than
+// on "the first eligible slot whose active equals the minimum". The earlier
+// form compared against the whole eligible count while scanning for the first
+// match, which meant it almost always re-selected the lowest-indexed tied slot:
+// rotation was possible only on an exact modulus hit, and even then it landed
+// on that same first match. The measured effect was that slot 0 served every
+// tunnel whenever the slots were tied, which defeats the purpose of a pool.
 //
 // This replaced unconditional round-robin, which had two defects: it could hand
 // a new tunnel to a connection that had already received GOAWAY, and it ignored
@@ -167,42 +175,38 @@ const selectionCooldown = 5 * time.Second
 func (c *http3ClientImpl) pickSlot() *http3PoolSlot {
 	now := time.Now()
 	var (
-		best          *http3PoolSlot
-		bestActive    int
-		eligibleCount int
+		bestActive  int
+		leastActive []*http3PoolSlot
 	)
+	// Pass 1: find the minimum active count among eligible slots and collect
+	// every slot that shares it.
 	for _, slot := range c.slots {
 		if !slot.eligible(now) {
 			continue
 		}
-		eligibleCount++
-		health := slot.health()
-		if best == nil || health.Active < bestActive {
-			best = slot
-			bestActive = health.Active
+		active := slot.health().Active
+		switch {
+		case leastActive == nil:
+			bestActive = active
+			leastActive = append(leastActive, slot)
+		case active < bestActive:
+			bestActive = active
+			leastActive = leastActive[:0]
+			leastActive = append(leastActive, slot)
+		case active == bestActive:
+			leastActive = append(leastActive, slot)
 		}
 	}
-	if best == nil {
+	if len(leastActive) == 0 {
 		return nil
 	}
-	// Round-robin only among the equally-least-active candidates, so the choice
-	// stays even without making the least-active rule meaningless.
-	if eligibleCount > 1 {
-		candidate := c.next.Add(1)
-		if candidate%uint64(eligibleCount) == 0 {
-			// Occasionally take the round-robin candidate instead, so ties rotate.
-			for _, slot := range c.slots {
-				if !slot.eligible(now) {
-					continue
-				}
-				if slot.health().Active == bestActive {
-					best = slot
-					break
-				}
-			}
-		}
+	// Pass 2: rotate within the tied set. One atomic increment is enough to
+	// spread consecutive selections across the ties.
+	if len(leastActive) == 1 {
+		return leastActive[0]
 	}
-	return best
+	index := c.next.Add(1) - 1
+	return leastActive[index%uint64(len(leastActive))]
 }
 
 // slotCount reports how many independent QUIC connections this client can hold.
