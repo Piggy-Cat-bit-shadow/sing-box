@@ -73,15 +73,24 @@ func NewMasqueradeHandler(ctx context.Context, options *option.Hysteria2Masquera
 // decoy is generated locally instead, so an over-limit request costs a few bytes
 // of formatting and no outbound connection.
 //
-// It is deliberately indistinguishable from an ordinary web server response: a
-// plain 429, a text/html content type and a small static body. It must never
-// carry Proxy-Authenticate, WWW-Authenticate or any other proxy-shaped signal,
+// It is deliberately an ordinary-LOOKING web server response: a plain 429, a
+// text/html content type and a small static body. It must never carry
+// Proxy-Authenticate, WWW-Authenticate or any other proxy-shaped signal,
 // because that would let a prober fingerprint the endpoint by tripping the
 // limiter.
 //
+// What this does NOT claim is that the decoy is indistinguishable from the real
+// masquerade backend. It is not: the backend serves the decoy site's own HTML
+// and headers, while this is a generic 429, so a prober that compares an
+// over-limit response against a normal one can tell them apart. The goal here is
+// narrower and is the one that actually matters -- an over-limit response must
+// not reveal the PROXY AUTHENTICATION SURFACE, and it must not let an attacker
+// keep driving the real backend.
+//
 // It is intentionally NOT a cached copy of the backend page. Caching the backend
-// would require fetching it, and a stale or per-user page would be a worse
-// disguise than a generic server response.
+// would require fetching it (which would defeat the resource bound above), and a
+// stale or per-user page would be a worse disguise than a generic server
+// response.
 func NewOverLimitDecoy() http.Handler {
 	const body = "<!DOCTYPE html><html><head><title>429 Too Many Requests</title></head>" +
 		"<body><h1>429 Too Many Requests</h1>" +

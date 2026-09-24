@@ -506,17 +506,22 @@ func TestJiejieMASQUEH3UnauthenticatedLimits(t *testing.T) {
 	require.True(t, limits.Enabled)
 }
 
-// TestJiejieMASQUEH3LimiterIsIndistinguishableWhenExhausted proves the limiter
-// does not become a proxy fingerprint once the budget is exhausted. A limited
-// unauthenticated request is served the same decoy site as an unlimited one,
-// never a 429 with proxy semantics and never an auth challenge.
+// TestJiejieMASQUEH3LimiterDoesNotRevealProxyAuthWhenExhausted proves the
+// limiter does not become a proxy fingerprint once the budget is exhausted: an
+// unauthenticated request is never answered with an auth challenge, whatever
+// the limiter decides.
 //
-// Note the limiter deliberately still serves the decoy page for limited
-// requests when a masquerade is configured: replying differently would reveal
-// that the endpoint is a proxy. What the limiter bounds is the rate at which
-// those requests are admitted, which is asserted at the unit level in
+// The name says "does not reveal the proxy auth surface" rather than
+// "indistinguishable", because it is NOT indistinguishable. Over-limit requests
+// are answered by a locally generated 429 decoy (see NewOverLimitDecoy) whose
+// body and headers differ from the real masquerade backend, so a prober that
+// compares the two CAN tell them apart. The guarantee is the narrower, honest
+// one: no Proxy-Authenticate/WWW-Authenticate, no 401/407, and the real backend
+// is not driven by over-limit traffic.
+//
+// The resource bound itself is asserted at the unit level in
 // transport/http/unauthenticated_limiter_test.go.
-func TestJiejieMASQUEH3LimiterIsIndistinguishableWhenExhausted(t *testing.T) {
+func TestJiejieMASQUEH3LimiterDoesNotRevealProxyAuthWhenExhausted(t *testing.T) {
 	decoyAddr, _ := startDecoyOrigins(t)
 	port := startJiejieMASQUEH3(t, decoyAddr, func(inbound *option.HTTPInboundOptions) {
 		inbound.UnauthenticatedLimits = &option.UnauthenticatedLimitsOptions{

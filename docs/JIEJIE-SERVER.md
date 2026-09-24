@@ -723,3 +723,17 @@ benchmarks in CI are regression references on shared runners, and loopback
 numbers do not predict a real path. Whether `size: 2` helps, and by how much,
 is to be determined by your own A/B on the VPS —
 see [JIEJIE-BENCHMARK.md](JIEJIE-BENCHMARK.md).
+
+## 17. Related documents
+
+* [JIEJIE-PROBE-RESISTANCE-MATRIX.md](JIEJIE-PROBE-RESISTANCE-MATRIX.md) — what
+  each public protocol does for an unauthenticated or wrongly authenticated
+  probe, the resource bounds, and the honest list of what is still
+  protocol-observable.
+* [JIEJIE-NGINX-ALPN-HARDENING.md](JIEJIE-NGINX-ALPN-HARDENING.md) — the
+  operator-side hardening of the Nginx Stream front door for the MASQUE H2 SNI.
+  This is a production front-door change, not a sing-box change, and it is not
+  applied by anything in this repository.
+* [JIEJIE-FIELD-MATRIX.md](JIEJIE-FIELD-MATRIX.md) — per-field implementation
+  status, including the items deliberately left NOT IMPLEMENTED.
+* [FORK-DIFF.md](FORK-DIFF.md) — the patch manifest.
