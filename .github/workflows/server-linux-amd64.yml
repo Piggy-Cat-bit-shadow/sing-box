@@ -6,6 +6,7 @@ on:
     branches:
       - testing
       - 'feat/jiejie-*'
+      - 'cleanup/*'
   pull_request:
     branches:
       - testing
