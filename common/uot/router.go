@@ -38,11 +38,17 @@ func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata ad
 		}
 		metadata.Domain = metadata.Destination.Fqdn
 		metadata.Destination = request.Destination
+		// In the non-connect form every datagram carries its own destination,
+		// which the session-level routing decision does not cover.
+		metadata.UoTDatagramDestinations = !request.IsConnect
 		return r.router.RoutePacketConnection(ctx, uot.NewConn(conn, *request), metadata)
 	case uot.LegacyMagicAddress:
 		r.logger.InfoContext(ctx, "inbound legacy UoT connection")
 		metadata.Domain = metadata.Destination.Fqdn
 		metadata.Destination = M.Socksaddr{Addr: netip.IPv4Unspecified()}
+		// The legacy form has no request destination at all: every datagram is
+		// addressed individually.
+		metadata.UoTDatagramDestinations = true
 		return r.RoutePacketConnection(ctx, uot.NewConn(conn, uot.Request{}), metadata)
 	}
 	return r.router.RouteConnection(ctx, conn, metadata)
@@ -69,12 +75,14 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 		}
 		metadata.Domain = metadata.Destination.Fqdn
 		metadata.Destination = request.Destination
+		metadata.UoTDatagramDestinations = !request.IsConnect
 		r.router.RoutePacketConnectionEx(ctx, uot.NewConn(conn, *request), metadata, onClose)
 		return
 	case uot.LegacyMagicAddress:
 		r.logger.InfoContext(ctx, "inbound legacy UoT connection")
 		metadata.Domain = metadata.Destination.Fqdn
 		metadata.Destination = M.Socksaddr{Addr: netip.IPv4Unspecified()}
+		metadata.UoTDatagramDestinations = true
 		r.RoutePacketConnectionEx(ctx, uot.NewConn(conn, uot.Request{}), metadata, onClose)
 		return
 	}

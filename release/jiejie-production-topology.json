@@ -107,6 +107,30 @@
       }
     },
     {
+      "type": "naive",
+      "tag": "naive-in",
+      "listen": "127.0.0.1",
+      "listen_port": 28438,
+      "network": "tcp",
+      "users": [
+        {
+          "username": "example",
+          "password": "example"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "riri.zhuzhu.jiejie12131.top",
+        "certificate_path": "/tmp/jiejie-fixture/cert.pem",
+        "key_path": "/tmp/jiejie-fixture/key.pem"
+      },
+      "masquerade": {
+        "type": "proxy",
+        "url": "http://127.0.0.1:28437",
+        "rewrite_host": true
+      }
+    },
+    {
       "type": "shadowtls",
       "tag": "shadowtls-in",
       "listen": "127.0.0.1",
@@ -184,6 +208,39 @@
           "tcp"
         ],
         "outbound": "residential-socks"
+      },
+      {
+        "inbound": [
+          "naive-in"
+        ],
+        "action": "resolve"
+      },
+      {
+        "inbound": [
+          "naive-in"
+        ],
+        "ip_cidr": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16",
+          "0.0.0.0/8",
+          "100.64.0.0/10",
+          "192.0.0.0/24",
+          "192.0.2.0/24",
+          "198.18.0.0/15",
+          "198.51.100.0/24",
+          "203.0.113.0/24",
+          "240.0.0.0/4",
+          "::1/128",
+          "::/128",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8",
+          "2001:db8::/32"
+        ],
+        "action": "reject"
       },
       {
         "ip_is_private": true,

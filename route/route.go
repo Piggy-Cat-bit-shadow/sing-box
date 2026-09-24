@@ -321,6 +321,17 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
+	// A packet session is authorised once, from its session destination. Some
+	// transports (notably the non-connect forms of UoT v1 and v2) then carry a
+	// DIFFERENT destination on every datagram, so the session decision does not
+	// cover them. Guard those per-datagram destinations with the same rules, so
+	// a session approved for one address cannot be used to reach another -
+	// which would otherwise expose loopback and internal services.
+	if metadata.UoTDatagramDestinations {
+		conn = newPacketDestinationGuard(ctx, r, conn, metadata, func(destination M.Socksaddr) {
+			r.logger.DebugContext(ctx, "drop datagram to ", destination, ": rejected by route rule")
+		})
+	}
 	if selectedRule != nil {
 		metadata.RouteRule = selectedRule.String()
 	}

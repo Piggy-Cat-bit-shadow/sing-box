@@ -79,11 +79,16 @@ type InboundContext struct {
 	UDPDisableDomainUnmapping bool
 	UDPConnect                bool
 	UDPTimeout                time.Duration
-	TLSFragment               bool
-	TLSFragmentFallbackDelay  time.Duration
-	TLSRecordFragment         bool
-	TLSSpoof                  string
-	TLSSpoofMethod            tlsspoof.Method
+	// UoTDatagramDestinations is set when a UDP-over-TCP session carries a
+	// per-datagram destination (the non-connect forms of UoT). The session
+	// destination authorises only the session itself in that case, so each
+	// datagram's own destination still has to be checked against the rules.
+	UoTDatagramDestinations  bool
+	TLSFragment              bool
+	TLSFragmentFallbackDelay time.Duration
+	TLSRecordFragment        bool
+	TLSSpoof                 string
+	TLSSpoofMethod           tlsspoof.Method
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType
