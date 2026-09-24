@@ -199,24 +199,20 @@ func TestFirstReadTimeoutConcurrentClearAndRead(t *testing.T) {
 
 	var group sync.WaitGroup
 	for range 8 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			buffer := make([]byte, 8)
 			for range 16 {
 				if _, err := wrapped.Read(buffer); err != nil {
 					return
 				}
 			}
-		}()
+		})
 	}
-	group.Add(1)
-	go func() {
-		defer group.Done()
+	group.Go(func() {
 		for range 64 {
 			underlying.clearDeadlineOnce()
 		}
-	}()
+	})
 	group.Wait()
 	require.False(t, underlying.firstReadDeadlineArmed())
 }
