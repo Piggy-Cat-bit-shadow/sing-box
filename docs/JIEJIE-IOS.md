@@ -34,8 +34,27 @@ core. Two errors, both in the same direction:
 
 | Error | Direction | Detail |
 | --- | --- | --- |
-| `cannot find 'LibboxPromotePowerReportDraft' in scope` | Swift expects · core lacks | Called from `Library/Network/ExtensionProvider.swift:182`. Introduced by Apple commit `88fbbc0 "Add power report"`. **No core ref exports it**, including `upstream/testing`. The core's own `experimental/libbox/power_report.go` exports `DiscardPowerReportDraft`, not a `Promote…` counterpart. |
-| `type 'ExtensionPlatformInterface' does not conform to protocol 'LibboxPlatformInterfaceProtocol'` | Core expects · Swift lacks | Core `experimental/libbox/platform.go` requires `UsePlatformAutoRedirect() bool` and `createAutoRedirect(_:handler:)`. The pinned Apple client implements neither. |
+| `cannot find 'LibboxPromotePowerReportDraft' in scope` | Swift expects · core lacks | Called from `Library/Network/ExtensionProvider.swift:182`. The core **renamed** this export: commit `3aff5d0f1` (2026-09-23) changed `PromotePowerReportDraft()` into `DiscardPowerReportDraft()`. |
+| `type 'ExtensionPlatformInterface' does not conform to protocol 'LibboxPlatformInterfaceProtocol'` | Core expects · Swift lacks | Core commit `061889303` (2026-09-23) added `UsePlatformAutoRedirect()` and `createAutoRedirect(_:handler:)` to `experimental/libbox/platform.go`. The pinned Apple client implements neither. |
+
+### The pin is one Apple release behind the core
+
+Both core changes landed on **2026-09-23**. The Apple gitlink pins **2026-09-14**
+(`2b1763a`, "Update App Store marketing versions", Apple 1.14.1). The pinned
+client predates the core's Libbox interface change by nine days, so it calls an
+export that no longer exists and lacks the two methods that now exist.
+
+Neither change is Jiejie's:
+
+```sh
+git log --format='%h %ci %s' -1 3aff5d0f1
+# 3aff5d0f1 2026-09-23 Close idle connections of unreferenced outbounds and DNS servers
+git log --format='%h %ci %s' -1 061889303
+# 061889303 2026-09-23 Implement fully functional auto redirect for Android
+
+# Both are in upstream as well, so upstream's own pin has the same skew.
+git merge-base --is-ancestor 3aff5d0f1 upstream/testing   # -> yes
+```
 
 ### This is not a Jiejie regression
 
@@ -49,20 +68,16 @@ git log --oneline origin/testing --not upstream/testing -- experimental/libbox/
 # The Libbox package is identical to upstream.
 git diff --stat upstream/testing origin/testing -- experimental/libbox/
 # -> (empty)
-
-# The missing export is missing upstream too.
-git grep 'PromotePowerReportDraft' upstream/testing -- 'experimental/libbox/*.go'
-# -> (empty)
 ```
 
 So a pristine upstream core at this commit is mismatched with the pinned Apple
-commit in exactly the same way. The skew is between two upstream repositories,
-at two different points in time, not between Jiejie and upstream.
+commit in exactly the same way. The skew is between two upstream repositories
+pinned at two different dates, not between Jiejie and upstream.
 
-The two mechanisms that keep a core and an Apple client in step are the
-submodule pin and Apple's own release CI; upstream builds `Libbox.xcframework`
-as a standalone artifact and the Apple app is built in its own repository, so a
-pin that has drifted shows up exactly like this.
+This is inherent to how the two repositories are kept in step: the core pins the
+Apple client by gitlink, and upstream builds `Libbox.xcframework` as a
+standalone artifact while the Apple app is built in its own repository. A pin
+that has drifted behind a Libbox interface change surfaces exactly like this.
 
 ### Why the submodule was not upgraded
 
