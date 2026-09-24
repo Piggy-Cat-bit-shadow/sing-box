@@ -312,9 +312,13 @@ jobs:
           # The DEVICE-ONLY framework is installed. SFI is built for the device,
           # and this is the shipping slice; the two-slice build above exists only
           # as the Simulator compile check.
+          #
+          # Copied, not moved: the slice and marker verification below reads it,
+          # and the device builds later re-install it after the Simulator build
+          # swaps in the two-slice framework.
           test -d Libbox-device.xcframework
           rm -rf clients/apple/Libbox.xcframework
-          mv Libbox-device.xcframework clients/apple/Libbox.xcframework
+          cp -R Libbox-device.xcframework clients/apple/Libbox.xcframework
           ls -la clients/apple/Libbox.xcframework
           echo "=== installed slices ==="
           find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
@@ -433,7 +437,7 @@ jobs:
           # IPA is still built against the shipping slice.
           test -d Libbox-simulator.xcframework
           rm -rf clients/apple/Libbox.xcframework
-          mv Libbox-simulator.xcframework clients/apple/Libbox.xcframework
+          cp -R Libbox-simulator.xcframework clients/apple/Libbox.xcframework
           echo "slices for the simulator build:"
           find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
 
@@ -499,7 +503,7 @@ jobs:
           # shipping builds honest about what they link.
           test -d Libbox-device.xcframework
           rm -rf clients/apple/Libbox.xcframework
-          mv Libbox-device.xcframework clients/apple/Libbox.xcframework
+          cp -R Libbox-device.xcframework clients/apple/Libbox.xcframework
           echo "slices for the device builds:"
           find clients/apple/Libbox.xcframework -maxdepth 1 -mindepth 1 -type d
 
