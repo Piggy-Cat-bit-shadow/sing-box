@@ -221,8 +221,12 @@ jobs:
             echo "build_time_utc:      $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "workflow_run_id:     ${GITHUB_RUN_ID}"
           } > artifact/libbox/BUILD-INFO.txt
-          ( cd artifact/libbox && find . -type f ! -name SHA256SUMS -print0 | sort -z \
-              | xargs -0 -I{} sh -c 'printf "%s  %s\n" "$(shasum -a 256 "{}" | awk "{print \$1}")" "{}"' > SHA256SUMS )
+          # Portable hashing without xargs: an XCFramework holds many files, and
+          # `xargs -I{}` spawns one long command per file, which overruns
+          # ARG_MAX ("command line cannot be assembled, too long").
+          ( cd artifact/libbox && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r f; do
+              printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "$f"
+            done > SHA256SUMS )
           cat artifact/libbox/BUILD-INFO.txt
           echo "--- framework binaries ---"
           for binary in artifact/libbox/Libbox.xcframework/*/Libbox.framework/Libbox; do
@@ -372,8 +376,11 @@ jobs:
             echo "unsigned device compile product. It cannot be installed on a"
             echo "stock iPhone; that requires Apple signing and provisioning."
           } > artifact/sfi/BUILD-INFO.txt
-          ( cd artifact/sfi && find . -type f ! -name SHA256SUMS -print0 | sort -z \
-              | xargs -0 -I{} sh -c 'printf "%s  %s\n" "$(shasum -a 256 "{}" | awk "{print \$1}")" "{}"' > SHA256SUMS )
+          # Same portable loop as the Libbox step: an .app bundle has many
+          # files, and `xargs -I{}` overruns ARG_MAX on it.
+          ( cd artifact/sfi && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r f; do
+              printf '%s  %s\n' "$(shasum -a 256 "$f" | awk '{print $1}')" "$f"
+            done > SHA256SUMS )
           cat artifact/sfi/BUILD-INFO.txt
           echo "--- artifact tree ---"
           find artifact -type f | sort
