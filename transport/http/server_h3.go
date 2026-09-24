@@ -79,6 +79,40 @@ func init() {
 			// and the configured limit only affected the loopback HTTP/2
 			// listener, which is the opposite of what the profile is for.
 			MaxHeaderBytes: maxHeaderBytes,
+			// idle_timeout is the HTTP/3 APPLICATION-layer idle timeout, which
+			// is a different knob from quic.Config.MaxIdleTimeout.
+			//
+			// quic.Config.MaxIdleTimeout (set inside httpclient.NewQUICConfig)
+			// is the QUIC transport idle timeout. It is refreshed by ANY packet
+			// on the connection, including a bare PING, so a peer that does
+			// nothing but PING can hold a fully established QUIC connection --
+			// and all of its state -- open indefinitely without ever creating an
+			// HTTP/3 request stream.
+			//
+			// http3.Server.IdleTimeout closes that gap. Measured against
+			// quic-go v0.61.0-sing-box-mod.7 (http3/server_conn.go):
+			//
+			//   - the timer is armed when the connection is created;
+			//   - handleRequestStream STOPS it as soon as a request stream
+			//     arrives, so an in-flight request can never be killed by it;
+			//   - clearStream RESETS it only when the LAST active stream goes
+			//     away, so a long-lived CONNECT tunnel is safe for as long as it
+			//     is open and restarts the countdown only once the connection is
+			//     genuinely idle;
+			//   - PING frames do not touch it at all ("activity at the QUIC layer
+			//     like PING frames are not considered", http3/server.go).
+			//
+			// That is exactly the intended behaviour: authenticated long-lived
+			// CONNECT tunnels are unaffected, while a connection that completes
+			// the QUIC handshake and then never opens a request stream is
+			// reclaimed. This closes the established-connection resource gap
+			// without patching quic-go and without inventing a connection-count
+			// cap that has no measured basis.
+			//
+			// Zero (the upstream default, and what an unselected profile leaves
+			// here) disables the timer entirely, so upstream behaviour is
+			// preserved when no profile is configured.
+			IdleTimeout: time.Duration(options.IdleTimeout),
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 				conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestionProfile))
 				return log.ContextWithNewID(ctx)

@@ -294,6 +294,14 @@ func TestH3HeaderLimitDefaultsToUpstream(t *testing.T) {
 // given header limit, mirroring how transport/http/server_h3.go builds it.
 func startH3ServerWithHeaderLimit(t *testing.T, handler http.Handler, maxHeaderBytes int) (*http3.Server, string, func()) {
 	t.Helper()
+	return startH3Server(t, handler, maxHeaderBytes, 0)
+}
+
+// startH3Server starts a real HTTP/3 server on loopback with the given header
+// limit and application idle timeout, mirroring how
+// transport/http/server_h3.go builds it.
+func startH3Server(t *testing.T, handler http.Handler, maxHeaderBytes int, idleTimeout time.Duration) (*http3.Server, string, func()) {
+	t.Helper()
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	require.NoError(t, err)
 
@@ -301,6 +309,7 @@ func startH3ServerWithHeaderLimit(t *testing.T, handler http.Handler, maxHeaderB
 		Handler:         handler,
 		EnableDatagrams: true,
 		MaxHeaderBytes:  maxHeaderBytes,
+		IdleTimeout:     idleTimeout,
 		TLSConfig:       testServerTLSConfig(t),
 		QUICConfig:      &quic.Config{},
 	}
