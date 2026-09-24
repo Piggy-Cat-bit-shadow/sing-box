@@ -72,7 +72,7 @@ memory-conservative, so the profile leaves all three alone.
 | Field | Decode | Effective runtime value | Data path | Runtime test | Verdict |
 | --- | --- | --- | --- | --- | --- |
 | `fallback` | `option.AnyTLSInboundOptions` | Upstream sing-anytls `FallbackHandler` | AnyTLS inbound → fallback backend | `TestJiejieMinimalAnyTLSFallback` (ordinary HTTPS and raw TLS clients both reach the decoy) | **IMPLEMENTED** |
-| `fallback_for_alpn` | same | Per-ALPN fallback destination map | same | Not covered by a runtime test in this fork; upstream behaviour is untouched. | **DECODE ONLY** |
+| `fallback_for_alpn` | same | Per-ALPN fallback destination map; the negotiated ALPN selects the backend, and an advertised ALPN with no entry uses the shared default | `tls.Config` NextProtos routing in `protocol/anytls/inbound.go` | `TestJiejieAnyTLSFallbackForALPNRoutesPerALPN` | **IMPLEMENTED** |
 | `padding_scheme`, `users`, TLS | upstream | upstream | upstream | upstream suites | unchanged upstream |
 
 `server_profile` and `bbr_profile` do not apply to AnyTLS; it is not an HTTP
