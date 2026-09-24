@@ -36,6 +36,7 @@ import (
 // decoy website, and returns the port plus a hit counter for the backend.
 func startNaiveMasqueradeEnv(t *testing.T) (uint16, *int32) {
 	t.Helper()
+	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
 
@@ -288,6 +289,7 @@ func TestJiejieNaiveMasqueradeAuthenticatedConnectStillWorks(t *testing.T) {
 // TestJiejieNaiveMasqueradeBackendUnavailableFailsClosed proves a broken web
 // backend cannot turn an unauthorised request into a tunnel.
 func TestJiejieNaiveMasqueradeBackendUnavailableFailsClosed(t *testing.T) {
+	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
 	originAddr := startOriginBackend(t)

@@ -47,6 +47,7 @@ type uotTestEnv struct {
 // server, and returns both.
 func startNaiveInboundForUoT(t *testing.T) *uotTestEnv {
 	t.Helper()
+	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
 
@@ -46,10 +47,27 @@ type naiveTestEnv struct {
 	masqueraded bool
 }
 
+// requireFullNaiveRegistry skips the Naive tests when the build does not register
+// the Naive inbound.
+//
+// The Naive inbound is deliberately NOT part of the jiejie_server_minimal
+// production registry: that registry contains only the four inbounds this
+// server actually runs. These tests therefore need the FULL registry, and without
+// this guard they would fail with a confusing "outbound type not found: naive"
+// that looks like a code defect instead of a build-tag mismatch.
+func requireFullNaiveRegistry(t *testing.T) {
+	t.Helper()
+	if _, loaded := include.InboundRegistry().CreateOptions("naive"); !loaded {
+		t.Skip("the naive inbound is not registered in this build " +
+			"(jiejie_server_minimal); run the Naive tests WITHOUT that tag")
+	}
+}
+
 // startNaiveInbound starts a Naive inbound with TLS, one user, and optionally a
 // masquerade pointing at a decoy web backend.
 func startNaiveInbound(t *testing.T, withMasquerade bool) *naiveTestEnv {
 	t.Helper()
+	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
 
@@ -319,6 +337,7 @@ func TestJiejieNaiveNoAuthRejected(t *testing.T) {
 
 // TestJiejieNaiveMultipleUsers proves a second user authenticates independently.
 func TestJiejieNaiveMultipleUsers(t *testing.T) {
+	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
 	originAddr := startOriginBackend(t)
@@ -377,6 +396,7 @@ func TestJiejieNaiveMultipleUsers(t *testing.T) {
 // TestJiejieNaiveMalformedRequestsDoNotCrash feeds malformed input and checks the
 // server keeps serving afterwards.
 func TestJiejieNaiveMalformedRequestsDoNotCrash(t *testing.T) {
+	requireFullNaiveRegistry(t)
 	env := startNaiveInbound(t, false)
 
 	malformed := []struct {
@@ -483,6 +503,7 @@ func TestJiejieNaiveConcurrentConnections(t *testing.T) {
 // the pipe keeps the request body open, and the response body is the other half
 // of the tunnel.
 func TestJiejieNaiveHTTP2Connect(t *testing.T) {
+	requireFullNaiveRegistry(t)
 	env := startNaiveInbound(t, false)
 
 	transport := &http2.Transport{}
