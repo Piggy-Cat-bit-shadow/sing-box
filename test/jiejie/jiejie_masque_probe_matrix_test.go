@@ -88,6 +88,7 @@ func TestJiejieMASQUEH2ProbeMatrix(t *testing.T) {
 		})
 
 		t.Run("CONNECT-UDP "+credential.label, func(t *testing.T) {
+			requireH2ExtendedConnectUsable(t)
 			response := probeConnectUDPH2(t, clientConn, udpTarget, credential.headers)
 			defer response.Body.Close()
 			body, err := io.ReadAll(response.Body)
@@ -190,7 +191,6 @@ func probeConnectUDPH2(t *testing.T, clientConn *http2.ClientConn, udpTarget str
 	t.Cleanup(func() { _ = pipeWriter.Close() })
 
 	requestHeader := http.Header{
-		":protocol":        []string{"connect-udp"},
 		"Capsule-Protocol": []string{"?1"},
 	}
 	for name, values := range headers {
@@ -204,7 +204,7 @@ func probeConnectUDPH2(t *testing.T, clientConn *http2.ClientConn, udpTarget str
 			Path:   minimalConnectUDPPath(udpTarget),
 		},
 		Host:   "example.org",
-		Header: requestHeader,
+		Header: h2ExtendedConnectHeader(requestHeader),
 		Body:   pipeReader,
 	})
 	require.NoError(t, err)

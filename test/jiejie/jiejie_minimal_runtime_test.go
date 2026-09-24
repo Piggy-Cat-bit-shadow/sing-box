@@ -303,6 +303,14 @@ func TestJiejieMinimalMASQUEH2Masquerade(t *testing.T) {
 // TestJiejieMinimalMASQUEH2ConnectUDP proves the L4 UDP path works on the
 // minimal registry over HTTP/2 CONNECT-UDP.
 func TestJiejieMinimalMASQUEH2ConnectUDP(t *testing.T) {
+	// Go 1.27's net/http refuses to send the ":protocol" pseudo-header that an
+	// HTTP/2 extended CONNECT requires, and the sing-box H2 server reads that
+	// pseudo-header from the header map (it falls back to the Proto field only
+	// for HTTP/3). There is no way to express this from a test client on 1.27,
+	// so the test skips there rather than probing something different from
+	// production. The HTTP/3 equivalent runs on every toolchain.
+	requireH2ExtendedConnectUsable(t)
+
 	server := startMinimalMASQUEH2(t, false)
 	udpTarget := startMinimalUDPEchoAddr(t)
 	clientConn := dialMinimalH2(t, server.port)
