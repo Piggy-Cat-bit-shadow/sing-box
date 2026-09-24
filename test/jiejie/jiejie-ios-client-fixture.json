@@ -1,0 +1,214 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      },
+      {
+        "tag": "remote-doh",
+        "type": "https",
+        "server": "dns.example.invalid",
+        "detour": "proxy"
+      },
+      {
+        "tag": "hosts-entry",
+        "type": "hosts",
+        "path": [
+          "example.invalid",
+          "127.0.0.1"
+        ]
+      },
+      {
+        "tag": "fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15"
+      }
+    ],
+    "rules": [
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "fakeip"
+      }
+    ],
+    "final": "local",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "mtu": 9000
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "masque-h3",
+        "anytls",
+        "vless-reality",
+        "shadowtls-ss2022",
+        "naive",
+        "direct"
+      ],
+      "default": "masque-h3",
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": [
+        "masque-h3",
+        "anytls"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "type": "http",
+      "tag": "masque-h3",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "version": 3,
+      "username": "example-user",
+      "password": "example-password",
+      "http3_connection_pool": {
+        "size": 2,
+        "strategy": "round_robin"
+      },
+      "http3_fallback": {
+        "initial_backoff": "5s",
+        "max_backoff": "5m",
+        "multiplier": 2,
+        "reset_on_success": true
+      },
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid"
+      }
+    },
+    {
+      "type": "http",
+      "tag": "masque-h2",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "version": 2,
+      "username": "example-user",
+      "password": "example-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid"
+      }
+    },
+    {
+      "type": "anytls",
+      "tag": "anytls",
+      "server": "203.0.113.11",
+      "server_port": 443,
+      "password": "example-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid"
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "server": "203.0.113.12",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "shadowtls",
+      "tag": "shadowtls-ss2022",
+      "server": "203.0.113.13",
+      "server_port": 443,
+      "version": 3,
+      "password": "example-shadowtls-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid"
+      },
+      "detour": "ss2022"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss2022",
+      "server": "203.0.113.13",
+      "server_port": 443,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+    },
+    {
+      "type": "naive",
+      "tag": "naive",
+      "server": "203.0.113.14",
+      "server_port": 443,
+      "username": "example-user",
+      "password": "example-password",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.invalid"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
