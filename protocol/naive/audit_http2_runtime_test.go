@@ -48,9 +48,9 @@ func TestAuditHTTP2ServerUsesRealFields(t *testing.T) {
 	// The returned value must be usable by the HTTP/2 server implementation.
 	require.NotNil(t, server)
 
-	// Sanity: the type is the library's own, so the fields above are the ones it
-	// reads at runtime.
-	var _ *http2.Server = server
+	// Sanity: the value is the library's own type, so the fields asserted above
+	// are exactly the ones it reads at runtime.
+	require.IsType(t, &http2.Server{}, server)
 }
 
 // TestAuditHTTP2DefaultsAreUpstream proves an unconfigured inbound leaves every

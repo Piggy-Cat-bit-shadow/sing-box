@@ -184,10 +184,7 @@ type shortWriter struct {
 }
 
 func (w *shortWriter) Write(p []byte) (int, error) {
-	n := len(p)
-	if n > w.limit {
-		n = w.limit
-	}
+	n := min(len(p), w.limit)
 	w.written += n
 	return n, nil
 }
