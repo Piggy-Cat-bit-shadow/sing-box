@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Diagnostic runs that locate the intermittent UoT datagram loss by RECORDING
@@ -119,7 +121,7 @@ func TestDiagUoTLossByTransport(t *testing.T) {
 func TestDiagUoTLossUnderChurn(t *testing.T) {
 	const (
 		totalWorkers = 10
-		perWorker    = 100
+		perWorker    = 200 // 2000 sessions, above the required 1000
 	)
 	env := startNaiveInboundForUoT(t)
 	trace := newTrace()
@@ -181,9 +183,11 @@ func TestDiagUoTLossUnderChurn(t *testing.T) {
 		trace.countStage(StageEchoWriteToUDP),
 		trace.countStage(StageClientReceived))
 
-	// Report the real number. This test exists to MEASURE, and it only fails if
-	// the harness itself collapsed.
-	if len(failures) == total {
-		t.Fatal("every session failed: the harness is broken, not measuring loss")
-	}
+	// STRICT acceptance. The root cause is fixed and proven, so this now asserts
+	// zero loss instead of reporting a tolerance. A single failure means the
+	// regression is back.
+	require.Empty(t, failures,
+		"no datagram may be lost under churn: %d of %d sessions failed, which means "+
+			"the hijack buffered-reader regression is back or a new cause was "+
+			"introduced", len(failures), total)
 }
