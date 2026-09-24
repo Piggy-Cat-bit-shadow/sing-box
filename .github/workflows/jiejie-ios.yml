@@ -91,24 +91,47 @@ jobs:
         run: |
           set -euo pipefail
           # Negative control for the whole stage: the Apple core must not carry
-          # TrustTunnel in source, dependency or build tag form.
+          # TrustTunnel as code, dependency, build tag or shipped file.
           #
-          # This workflow file is excluded because it necessarily contains the
-          # search terms themselves; every other path is checked.
-          self=".github/workflows/jiejie-ios.yml"
-          if git grep -niE 'trusttunnel|sing-trusttunnel|with_trusttunnel|jiejie_trusttunnel' -- . ":(exclude)$self"; then
-            echo "FAIL: TrustTunnel reference found in the tree" >&2
-            exit 1
-          fi
+          # This checks IMPLEMENTATION, not prose. Documentation that states
+          # TrustTunnel is absent (and this workflow, which contains the search
+          # terms themselves) is not a violation; a Go source file, a dependency
+          # or a build tag referencing it is.
+          echo "--- checked-in TrustTunnel files (expect none) ---"
           if git ls-tree -r --name-only HEAD | grep -i trusttunnel; then
-            echo "FAIL: TrustTunnel file found in the tree" >&2
+            echo "FAIL: TrustTunnel file is checked in" >&2
             exit 1
           fi
+
+          echo "--- TrustTunnel in Go source (expect none) ---"
+          if git grep -niE 'trusttunnel|sing-trusttunnel' -- '*.go' ':(exclude)*_test.go'; then
+            echo "FAIL: TrustTunnel reference in Go source" >&2
+            exit 1
+          fi
+
+          echo "--- TrustTunnel build tags (expect none) ---"
+          if grep -rniE 'with_trusttunnel|jiejie_trusttunnel' --include='*.go' --include='Dockerfile*' --include='Makefile' . 2>/dev/null; then
+            echo "FAIL: TrustTunnel build tag present" >&2
+            exit 1
+          fi
+
+          echo "--- sing-trusttunnel module dependency (expect none) ---"
           if grep -q 'sing-trusttunnel' go.mod go.sum; then
             echo "FAIL: sing-trusttunnel present in the module files" >&2
             exit 1
           fi
-          echo "TrustTunnel: absent (source, files and module files)"
+          if [ -f test/go.mod ] && grep -q 'sing-trusttunnel' test/go.mod test/go.sum; then
+            echo "FAIL: sing-trusttunnel present in the test module files" >&2
+            exit 1
+          fi
+
+          echo "--- TrustTunnel in the Libbox package the Apple core is built from ---"
+          if git grep -niE 'trusttunnel' -- experimental/libbox/; then
+            echo "FAIL: TrustTunnel reference in experimental/libbox" >&2
+            exit 1
+          fi
+
+          echo "TrustTunnel: absent (files, Go source, build tags, module files, Libbox)"
 
       - name: Libbox config smoke test
         run: |
