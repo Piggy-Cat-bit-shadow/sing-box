@@ -29,15 +29,19 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	ctx         context.Context
-	router      adapter.ConnectionRouterEx
-	logger      log.ContextLogger
-	listener    *listener.Listener
-	server      *http.Server
-	tlsConfig   tls.ServerConfig
-	http3       bool
-	quicOptions option.QUICOptions
-	http3Server io.Closer
+	ctx       context.Context
+	router    adapter.ConnectionRouterEx
+	logger    log.ContextLogger
+	listener  *listener.Listener
+	server    *http.Server
+	tlsConfig tls.ServerConfig
+	// tcpNextProtos is the ALPN list for the TCP listener only. It is resolved
+	// once at construction and applied through a transport-scoped view, so the
+	// HTTP/3 listener cannot add h3 to what a TCP client negotiates.
+	tcpNextProtos []string
+	http3         bool
+	quicOptions   option.QUICOptions
+	http3Server   io.Closer
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPInboundOptions) (adapter.Inbound, error) {
@@ -97,7 +101,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, err
 		}
 		if tlsConfig != nil {
-			inbound.server.ConfigureTLS(tlsConfig)
+			// Resolve the TCP ALPN list and keep it as a transport-scoped VIEW.
+			//
+			// The view wraps the shared config rather than replacing it, so the
+			// certificate provider, the ACME service and the watcher still exist
+			// exactly once. It is what the TCP handshake uses, which is how the
+			// HTTP/3 listener's h3 stays off this transport.
+			inbound.tcpNextProtos = inbound.server.ConfigureTLS(tlsConfig)
 		}
 		inbound.tlsConfig = tlsConfig
 	}
@@ -159,7 +169,9 @@ func (h *Inbound) Close() error {
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	if h.tlsConfig != nil {
-		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
+		// The TCP handshake uses the TCP-scoped view, never the shared config, so
+		// h3 cannot appear in what a TCP client is offered.
+		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tcpTLSConfig())
 		if err != nil {
 			N.CloseOnHandshakeFailure(conn, onClose, err)
 			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source, ": TLS handshake"))
@@ -196,4 +208,16 @@ func (h *Inbound) streamUserPacketConnection(ctx context.Context, conn N.PacketC
 	metadata.User = user
 	h.logger.InfoContext(ctx, "[", user, "] inbound packet connection to ", metadata.Destination)
 	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+// tcpTLSConfig returns the transport-scoped view the TCP handshake uses.
+//
+// It is built on demand so the view always reflects the current shared config -
+// the view's STDConfig is derived per call - while its ALPN stays fixed at the
+// list resolved for TCP.
+func (h *Inbound) tcpTLSConfig() tls.ServerConfig {
+	if h.tlsConfig == nil {
+		return nil
+	}
+	return tls.TransportALPNView(h.tlsConfig, h.tcpNextProtos)
 }
