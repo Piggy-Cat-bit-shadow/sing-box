@@ -177,9 +177,22 @@ func FuzzNaivePaddingFrameRoundTrip(fuzz *testing.F) {
 		}
 
 		// And it must decode back to the original payload.
+		//
+		// A zero-length payload is the exception, and deliberately so: the
+		// encoder emits a frame declaring originalDataSize == 0, and the decoder
+		// CONSUMES that frame and continues rather than returning a zero-byte
+		// read. That is the hardening that stops a zero-length frame from being a
+		// no-progress read, so for an empty payload the round trip yields EOF and
+		// no data - which is the correct outcome, not a failure.
 		decoder := &paddingConn{enabled: true}
 		out := make([]byte, len(payload)+1)
 		n, err := decoder.readWithPadding(bytes.NewReader(written), out)
+		if len(payload) == 0 {
+			if n != 0 {
+				t.Fatalf("an empty frame must decode to no data, got %d bytes", n)
+			}
+			return
+		}
 		if err != nil {
 			t.Fatalf("decoding a frame this encoder produced failed: %v", err)
 		}

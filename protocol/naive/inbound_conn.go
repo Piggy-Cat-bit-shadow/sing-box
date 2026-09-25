@@ -89,25 +89,50 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 	if !p.enabled {
 		return reader.Read(buffer)
 	}
-	if p.readRemaining > 0 {
-		if len(buffer) > p.readRemaining {
-			buffer = buffer[:p.readRemaining]
+	// The loop exists so a frame that carries no payload cannot become a
+	// no-progress read.
+	//
+	// A Naive frame may declare originalDataSize == 0 while still carrying
+	// padding. Returning (0, nil) for such a frame violates the io.Reader
+	// contract - callers may loop forever on it, and bufio copy loops treat a
+	// zero-byte nil-error read as "try again" - so the frame is consumed here and
+	// the read continues to the next frame or to EOF.
+	//
+	// HARDENING, not parity. The reference has the same no-progress behaviour and
+	// also worse: with nr == 0 it skips its padding read entirely
+	// (klzgrad/forwardproxy flushingIoCopy: `if nr > 0 { ... io.ReadFull(src,
+	// junk[0:paddingSize]) }`), so the padding bytes stay in the stream and every
+	// later frame is misaligned. Reproducing that would be reproducing a defect.
+	// A peer that sends such a frame gets its frame consumed and skipped rather
+	// than a hang.
+	for {
+		if p.readRemaining > 0 {
+			if len(buffer) > p.readRemaining {
+				buffer = buffer[:p.readRemaining]
+			}
+			n, err = reader.Read(buffer)
+			if err != nil {
+				return
+			}
+			p.readRemaining -= n
+			if n > 0 {
+				return
+			}
+			// A short read that produced nothing: keep draining rather than
+			// reporting a zero-byte success.
+			continue
 		}
-		n, err = reader.Read(buffer)
-		if err != nil {
-			return
+		if p.paddingRemaining > 0 {
+			err = rw.SkipN(reader, p.paddingRemaining)
+			if err != nil {
+				return
+			}
+			p.paddingRemaining = 0
 		}
-		p.readRemaining -= n
-		return
-	}
-	if p.paddingRemaining > 0 {
-		err = rw.SkipN(reader, p.paddingRemaining)
-		if err != nil {
-			return
+		if p.readPadding >= paddingCount {
+			// Padding window closed; the remainder of the stream is raw.
+			return reader.Read(buffer)
 		}
-		p.paddingRemaining = 0
-	}
-	if p.readPadding < paddingCount {
 		var paddingHeader []byte
 		if len(buffer) >= 3 {
 			paddingHeader = buffer[:3]
@@ -120,6 +145,13 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 		}
 		originalDataSize := int(binary.BigEndian.Uint16(paddingHeader[:2]))
 		paddingSize := int(paddingHeader[2])
+		p.readPadding++
+		p.paddingRemaining = paddingSize
+		if originalDataSize == 0 {
+			// Empty frame: consume its padding and go around again instead of
+			// handing the caller a zero-byte read.
+			continue
+		}
 		if len(buffer) > originalDataSize {
 			buffer = buffer[:originalDataSize]
 		}
@@ -127,12 +159,9 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 		if err != nil {
 			return
 		}
-		p.readPadding++
 		p.readRemaining = originalDataSize - n
-		p.paddingRemaining = paddingSize
 		return
 	}
-	return reader.Read(buffer)
 }
 
 // writeFrame emits one padded Naive frame with an explicitly chosen padding
