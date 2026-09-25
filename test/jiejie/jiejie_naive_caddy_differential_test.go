@@ -71,14 +71,24 @@ type parityProbe struct {
 	name string
 	run  func(t *testing.T, address string) parityObservation
 
-	// knownDivergence, when set, marks a difference that has been investigated
-	// and is INTENTIONAL on our side. The probe is still run and its two results
-	// are still printed, and the verdict becomes KNOWN-DIFF rather than PASS or
-	// DIFF. Leaving it unset means the probe is expected to match exactly.
+	// knownDivergence, when set, marks a difference that has been investigated and
+	// is INTENTIONAL on our side. The probe is still run and its two results are
+	// still printed, and the verdict becomes KNOWN-DIFF rather than PASS or DIFF.
+	// Leaving it unset means the probe is expected to match exactly.
 	//
-	// This exists so a deliberate design decision is reported as such, with its
-	// evidence, instead of either being hidden by a loosened assertion or
-	// showing up as an unexplained failure forever.
+	// This is NOT an escape hatch for an unexplained failure. The bar is that all
+	// four of these exist and are recorded in the string:
+	//
+	//   1. pinned-source evidence for what the reference does;
+	//   2. runtime reproduction through this harness;
+	//   3. the exact observed values (filled in automatically below);
+	//   4. an explicit product decision that this fork intends to differ.
+	//
+	// A difference that cannot meet that bar is a DIFF and fails CI. An earlier
+	// version of this harness labelled the H1 raw-passthrough case as a divergence
+	// on the strength of a misread probe; it has since been proven by byte
+	// comparison that both implementations agree, and the label was removed rather
+	// than kept.
 	knownDivergence string
 }
 
@@ -224,7 +234,8 @@ func startCaddyReference(t *testing.T, binary, certPem, keyPem string) (port uin
 					"routes": [{
 						"handle": [{
 							"handler": "forward_proxy",
-							"auth_credentials": [%q]
+							"auth_credentials": [%q],
+							"acl": [{"subjects": ["127.0.0.1/32", "::1/128"], "allow": true}]
 						}]
 					}],
 					"tls_connection_policies": [{}]
@@ -507,17 +518,26 @@ func parityProbes(originAddr, unreachableAddr string, validAuth string) []parity
 			// a proxy. It is recorded here rather than "fixed", because changing
 			// it would change the fork's security posture and is a product
 			// decision, not a compatibility bug.
-			knownDivergence: "unauthenticated CONNECT: reference returns 407 + " +
-				"Proxy-Authenticate; this fork resets the connection with no " +
-				"response (deliberate anti-probing behaviour, rejectHTTP)",
+			knownDivergence: "unauthenticated CONNECT: reference " +
+				CaddyReferenceCommit + " returns 407 + Proxy-Authenticate " +
+				"(forwardproxy.go sets the header then returns " +
+				"caddyhttp.Error(StatusProxyAuthRequired)); this fork hijacks the " +
+				"connection, sets SO_LINGER to 0 and closes it with no response " +
+				"(protocol/naive/inbound.go rejectHTTP). INTENTIONAL: challenging " +
+				"advertises the port as a proxy, which this deployment does not " +
+				"do. Verified by runtime reproduction in this harness and by " +
+				"reading the pinned source.",
 		},
 		{
 			name: "H1 CONNECT wrong auth",
 			run: probeH1Connect(originAddr, map[string]string{
 				"Proxy-Authorization": "Basic " + basicAuthValueOf(naiveParityUser, "definitely-wrong"),
 			}, nil),
-			knownDivergence: "wrong credentials: same as the no-auth case - the " +
-				"reference challenges with 407, this fork resets without a response",
+			knownDivergence: "wrong credentials: same behaviour as the no-auth " +
+				"case at reference " + CaddyReferenceCommit + " (reference " +
+				"challenges with 407 + Proxy-Authenticate, this fork resets with no " +
+				"response via rejectHTTP). INTENTIONAL for the same reason: a " +
+				"challenge would advertise the proxy.",
 		},
 		{
 			name: "H1 CONNECT unreachable target",
@@ -536,21 +556,23 @@ func parityProbes(originAddr, unreachableAddr string, validAuth string) []parity
 			run: probeH1Connect(originAddr, map[string]string{
 				"Proxy-Authorization": "Basic " + validAuth,
 			}, []byte("GET / HTTP/1.1\r\nHost: "+originAddr+"\r\nConnection: close\r\n\r\n")),
-			// INVESTIGATED, INTENTIONAL, and verified against the reference by
-			// hand as well as through this harness. After answering 200 the
-			// reference does NOT treat subsequent bytes as tunnel payload on
-			// HTTP/1.1 in this Caddy version: writing a raw request after the
-			// CONNECT makes Caddy parse it as the *next* HTTP request and reply
-			// 407. This fork instead hands those bytes to the tunnel, which is
-			// what makes a plain HTTP CONNECT client and a pipelined Naive
-			// prologue work.
+			// This was previously recorded as a KNOWN-DIFF claiming the
+			// reference parses tunnelled bytes as a new HTTP request and answers
+			// 407. That claim was WRONG and has been removed.
 			//
-			// The framed probe PASSES, which is the case that matters for Naive
-			// clients: when the client negotiated Padding, both implementations
-			// carry the frame through identically.
-			knownDivergence: "raw (unframed) bytes written immediately after H1 " +
-				"CONNECT: this fork forwards them into the tunnel; the reference " +
-				"parses them as a new HTTP request and answers 407",
+			// It was a probe artifact. The reference enforces
+			// dialContextCheckACL, which denies loopback by default: it flushed
+			// 200 (CONNECT fast open), then refused the dial with 403, and the
+			// probe misread the following stream as a fresh HTTP response. The
+			// reference is now started with loopback allowed, and
+			// TestJiejieNaiveH1RawDifferentialAgainstReference compares the bytes
+			// the origin actually receives: both implementations deliver an
+			// arbitrary binary payload AND a literal Naive frame VERBATIM. HTTP/1
+			// is raw in both, exactly as the pinned source says
+			// (serveHijack -> dualStream(..., false)).
+			//
+			// No divergence is claimed here any more, so this probe is a plain
+			// parity probe and must match.
 		},
 		{
 			name: "H1 CONNECT framed passthrough reaches origin",
@@ -612,6 +634,12 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 		case referenceObservation.equal(singBoxObservation):
 			result.Verdict = "PASS"
 		case probe.knownDivergence != "":
+			// The evidence bar is enforced, not merely documented: a divergence
+			// label that does not state the reference commit and the observed
+			// values is not accepted.
+			require.Contains(t, probe.knownDivergence, CaddyReferenceCommit,
+				"probe %q claims an intentional divergence but does not name the "+
+					"pinned reference commit it was verified against", probe.name)
 			result.Verdict = "KNOWN-DIFF"
 			result.Detail = probe.knownDivergence + " | observed: " +
 				referenceObservation.difference(singBoxObservation)
