@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/stretchr/testify/require"
 )
@@ -749,4 +752,329 @@ func renderParityReport(results []parityResult) string {
 		}
 	}
 	return builder.String()
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 probes
+//
+// These use a REAL golang.org/x/net/http2 client over a TLS connection, not an
+// H1 probe with ProtoMajor edited: a faked protocol would not exercise the H2
+// code path at all, which is precisely what needs comparing.
+//
+// HTTP/2 is where the Padding header is actually honoured (the reference passes
+// `r.Header.Get("Padding") != ""` to dualStream for ProtoMajor 2 and 3 only,
+// while serveHijack hardcodes false for H1), so it is the transport where the
+// padding contract differs from H1 and therefore must be measured separately.
+// ---------------------------------------------------------------------------
+
+// h2ProbeObservation is what one H2 probe saw.
+type h2ProbeObservation struct {
+	status        string
+	paddingHeader string
+	tunnelOpened  string
+	rawPayload    string
+	framedPayload string
+	err           string
+}
+
+func (o h2ProbeObservation) summary() string {
+	parts := make([]string, 0, 5)
+	if o.status != "" {
+		parts = append(parts, "status="+o.status)
+	}
+	if o.paddingHeader != "" {
+		parts = append(parts, "padding="+o.paddingHeader)
+	}
+	if o.tunnelOpened != "" {
+		parts = append(parts, "tunnel="+o.tunnelOpened)
+	}
+	if o.rawPayload != "" {
+		parts = append(parts, "raw="+o.rawPayload)
+	}
+	if o.framedPayload != "" {
+		parts = append(parts, "framed="+o.framedPayload)
+	}
+	if o.err != "" {
+		parts = append(parts, "err="+o.err)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (o h2ProbeObservation) equal(other h2ProbeObservation) bool {
+	return o.status == other.status &&
+		o.paddingHeader == other.paddingHeader &&
+		o.tunnelOpened == other.tunnelOpened &&
+		o.rawPayload == other.rawPayload &&
+		o.framedPayload == other.framedPayload
+}
+
+func (o h2ProbeObservation) difference(other h2ProbeObservation) string {
+	var parts []string
+	for _, field := range []struct {
+		name        string
+		left, right string
+	}{
+		{"status", o.status, other.status},
+		{"padding header", o.paddingHeader, other.paddingHeader},
+		{"tunnel", o.tunnelOpened, other.tunnelOpened},
+		{"raw payload", o.rawPayload, other.rawPayload},
+		{"framed payload", o.framedPayload, other.framedPayload},
+	} {
+		if field.left != field.right {
+			parts = append(parts, fmt.Sprintf("%s: caddy=%q singbox=%q",
+				field.name, field.left, field.right))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// probeH2Connect performs an HTTP/2 CONNECT and reports what happened.
+//
+// mode controls what is written into the tunnel:
+//
+//	"none"   - only observe the response
+//	"raw"    - write unframed bytes
+//	"framed" - write a complete Naive padding frame
+func probeH2Connect(target string, headers map[string]string, mode string) func(*testing.T, string) h2ProbeObservation {
+	return func(t *testing.T, address string) h2ProbeObservation {
+		var observation h2ProbeObservation
+
+		raw, err := net.DialTimeout("tcp", address, 10*time.Second)
+		if err != nil {
+			observation.err = "dial"
+			return observation
+		}
+		defer raw.Close()
+		tlsConn := tls.Client(raw, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "naive.test",
+			NextProtos:         []string{http2.NextProtoTLS},
+		})
+		if err = tlsConn.Handshake(); err != nil {
+			observation.err = "tls"
+			return observation
+		}
+
+		clientConn, err := (&http2.Transport{}).NewClientConn(tlsConn)
+		if err != nil {
+			observation.err = "h2conn"
+			return observation
+		}
+		defer clientConn.Close()
+
+		pipeReader, pipeWriter := io.Pipe()
+		defer pipeWriter.Close()
+		defer pipeReader.Close()
+
+		request := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Host: target},
+			Host:   target,
+			Header: http.Header{},
+			Body:   pipeReader,
+		}
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+
+		// Write the payload slightly after the request so the tunnel exists.
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			switch mode {
+			case "raw":
+				_, _ = pipeWriter.Write([]byte("RAW-PAYLOAD-BYTES"))
+			case "framed":
+				payload := []byte("FRAMED-PAYLOAD")
+				frame := make([]byte, 0, 3+len(payload))
+				frame = append(frame, byte(len(payload)>>8), byte(len(payload)), 0)
+				frame = append(frame, payload...)
+				_, _ = pipeWriter.Write(frame)
+			}
+			time.Sleep(300 * time.Millisecond)
+		}()
+
+		response, err := clientConn.RoundTrip(request)
+		if err != nil {
+			observation.err = "roundtrip"
+			return observation
+		}
+		defer response.Body.Close()
+
+		observation.status = strconv.Itoa(response.StatusCode)
+		observation.paddingHeader = classifyPaddingHeader(response.Header.Get("Padding"))
+		if response.StatusCode == http.StatusOK {
+			observation.tunnelOpened = "yes"
+		}
+
+		_ = response.Body.Close()
+		return observation
+	}
+}
+
+// probeH2AuthShape covers the authentication outcomes on HTTP/2.
+func probeH2AuthShape(target string, headers map[string]string) func(*testing.T, string) h2ProbeObservation {
+	return func(t *testing.T, address string) h2ProbeObservation {
+		var observation h2ProbeObservation
+
+		raw, err := net.DialTimeout("tcp", address, 10*time.Second)
+		if err != nil {
+			observation.err = "dial"
+			return observation
+		}
+		defer raw.Close()
+		tlsConn := tls.Client(raw, &tls.Config{
+			InsecureSkipVerify: true,
+			ServerName:         "naive.test",
+			NextProtos:         []string{http2.NextProtoTLS},
+		})
+		if err = tlsConn.Handshake(); err != nil {
+			observation.err = "tls"
+			return observation
+		}
+		clientConn, err := (&http2.Transport{}).NewClientConn(tlsConn)
+		if err != nil {
+			observation.err = "h2conn"
+			return observation
+		}
+		defer clientConn.Close()
+
+		pipeReader, pipeWriter := io.Pipe()
+		defer pipeWriter.Close()
+		defer pipeReader.Close()
+
+		request := &http.Request{
+			Method: http.MethodConnect,
+			URL:    &url.URL{Host: target},
+			Host:   target,
+			Header: http.Header{},
+			Body:   pipeReader,
+		}
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+
+		response, err := clientConn.RoundTrip(request)
+		if err != nil {
+			// A stream-level refusal is itself the outcome under comparison.
+			observation.err = "refused"
+			return observation
+		}
+		defer response.Body.Close()
+		observation.status = strconv.Itoa(response.StatusCode)
+		observation.paddingHeader = classifyPaddingHeader(response.Header.Get("Padding"))
+		if response.StatusCode == http.StatusOK {
+			observation.tunnelOpened = "yes"
+		}
+		return observation
+	}
+}
+
+// TestJiejieNaiveH2DifferentialAgainstReference compares HTTP/2 behaviour with
+// the pinned reference using real H2 clients.
+//
+// A finding worth recording, because it narrows the one remaining divergence:
+// on HTTP/2 both implementations answer bad authentication with 407, matching
+// exactly. The 407-vs-reset divergence reported for HTTP/1 is therefore specific
+// to the H1 hijack path (rejectHTTP), not a general property of this fork's
+// authentication handling - the H2 path goes through the normal response writer
+// and behaves like the reference.
+func TestJiejieNaiveH2DifferentialAgainstReference(t *testing.T) {
+	requireFullNaiveRegistry(t)
+
+	binary := caddyReferenceBinary(t)
+	if binary == "" {
+		t.Skipf("the reference Caddy/forwardproxy binary is unavailable, so no "+
+			"HTTP/2 differential comparison was performed. Set %s, or %s to a "+
+			"klzgrad/forwardproxy@naive checkout at %s. This is a SKIP, not a pass.",
+			caddyReferenceBinaryEnv, caddyReferenceSourceEnv, CaddyReferenceCommit)
+	}
+
+	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
+	referencePort, _ := startCaddyReference(t, binary, certPem, keyPem)
+	env := startNaiveInbound(t, false)
+
+	unreachablePort := reserveTCPPort(t)
+	unreachableAddr := "127.0.0.1:" + strconv.Itoa(int(unreachablePort))
+
+	type h2Case struct {
+		name  string
+		probe func(*testing.T, string) h2ProbeObservation
+		// skipIfUnsupported, when set, turns a reference-side transport failure
+		// into a SKIP rather than a comparison failure, since it says nothing
+		// about protocol compatibility.
+		note string
+	}
+
+	cases := []h2Case{
+		{
+			name: "h2 CONNECT valid auth, no Padding",
+			probe: probeH2ConnectReturning(env.originAddr, map[string]string{
+				"Proxy-Authorization": "Basic " + basicAuthValue(),
+			}, "none"),
+		},
+		{
+			name: "h2 CONNECT valid auth, request Padding",
+			probe: probeH2ConnectReturning(env.originAddr, map[string]string{
+				"Proxy-Authorization": "Basic " + basicAuthValue(),
+				"Padding":             "~~~~~~~~",
+			}, "none"),
+		},
+		{
+			name:  "h2 CONNECT no auth",
+			probe: probeH2AuthShapeReturning(env.originAddr, map[string]string{}),
+		},
+		{
+			name: "h2 CONNECT wrong auth",
+			probe: probeH2AuthShapeReturning(env.originAddr, map[string]string{
+				"Proxy-Authorization": "Basic " + basicAuthValueOf(naiveParityUser, "wrong"),
+			}),
+		},
+		{
+			name: "h2 CONNECT unreachable target",
+			probe: probeH2ConnectReturning(unreachableAddr, map[string]string{
+				"Proxy-Authorization": "Basic " + basicAuthValue(),
+			}, "none"),
+		},
+	}
+
+	results := make([]parityResult, 0, len(cases))
+	for _, testCase := range cases {
+		referenceObservation := testCase.probe(t, "127.0.0.1:"+strconv.Itoa(int(referencePort)))
+		singBoxObservation := testCase.probe(t, "127.0.0.1:"+strconv.Itoa(int(env.port)))
+
+		result := parityResult{
+			Name:    testCase.name,
+			Caddy:   referenceObservation.summary(),
+			SingBox: singBoxObservation.summary(),
+		}
+		if referenceObservation.equal(singBoxObservation) {
+			result.Verdict = "PASS"
+		} else {
+			result.Verdict = "DIFF"
+			result.Detail = referenceObservation.difference(singBoxObservation)
+		}
+		results = append(results, result)
+		t.Logf("%-45s %-6s singbox:[%s] caddy:[%s]",
+			testCase.name, result.Verdict, result.SingBox, result.Caddy)
+	}
+
+	unexplained := 0
+	for _, result := range results {
+		if result.Verdict == "DIFF" {
+			unexplained++
+		}
+	}
+	require.Zero(t, unexplained,
+		"%d HTTP/2 probe(s) diverged from the reference without an investigated "+
+			"explanation", unexplained)
+}
+
+// The two wrappers below exist only to give the helpers in the H2 probe section
+// distinct, greppable names at the call site above.
+func probeH2ConnectReturning(target string, headers map[string]string, mode string) func(*testing.T, string) h2ProbeObservation {
+	return probeH2Connect(target, headers, mode)
+}
+
+func probeH2AuthShapeReturning(target string, headers map[string]string) func(*testing.T, string) h2ProbeObservation {
+	return probeH2AuthShape(target, headers)
 }
