@@ -44,12 +44,16 @@ func (discardStream) Close() error                { return nil }
 
 // noopSession builds a serverSession that owns the given addresses and routes
 // and does nothing else, which is enough to exercise the ownership maps.
+// noopSession builds a session through the REAL constructor.
+//
+// It must not assemble &session{} by hand: newSession is what installs the cancel
+// function, and a hand-built session leaves it nil. That is not a theoretical
+// concern - Server.Close calls cancel on every registered session, so a nil here
+// panics inside Close. Going through the constructor keeps the test honest about
+// the invariants production relies on.
 func noopSession(server *Server, addresses []netip.Addr, peerRoutes []AddressRange) *serverSession {
 	return &serverSession{
-		session: &session{
-			ctx:    context.Background(),
-			stream: discardStream{},
-		},
+		session:    newSession(context.Background(), discardStream{}, &shutdownProbeHandler{}, false),
 		server:     server,
 		ctx:        context.Background(),
 		addresses:  addresses,
