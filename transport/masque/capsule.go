@@ -31,6 +31,26 @@ func (r AddressRange) Contains(address netip.Addr) bool {
 	return address.BitLen() == r.Start.BitLen() && r.Start.Compare(address) <= 0 && address.Compare(r.End) <= 0
 }
 
+// OverlapsProtocol reports whether two ranges describe any of the same traffic.
+//
+// Two ranges conflict when their ADDRESS ranges intersect AND their protocols
+// can both match the same packet. Protocol 0 matches every protocol in
+// RoutesContain, so it conflicts with any other protocol over an intersecting
+// range - that is the case the ordering-based check used to miss.
+//
+// Ranges of different IP versions never conflict, because Contains requires the
+// address length to match.
+func (r AddressRange) OverlapsProtocol(other AddressRange) bool {
+	if r.Start.BitLen() != other.Start.BitLen() {
+		return false
+	}
+	if r.End.Compare(other.Start) < 0 || other.End.Compare(r.Start) < 0 {
+		return false
+	}
+	// Protocol 0 is "all protocols", so it conflicts with anything.
+	return r.Protocol == 0 || other.Protocol == 0 || r.Protocol == other.Protocol
+}
+
 func parseAddresses(payload []byte) ([]AssignedAddress, error) {
 	var addresses []AssignedAddress
 	for len(payload) > 0 {
@@ -100,9 +120,35 @@ func parseRoutes(payload []byte) ([]AddressRange, error) {
 			case previous.Start.BitLen() < start.BitLen():
 			case previous.Protocol > route.Protocol:
 				return nil, E.New("address ranges are not ordered by IP protocol")
-			case previous.Protocol < route.Protocol:
-			case previous.End.Compare(start) >= 0:
-				return nil, E.New("address ranges overlap: ", previous.End, " and ", start)
+			}
+			// Overlap is checked against EVERY earlier range, not only the
+			// immediately preceding one.
+			//
+			// RFC 9484 section 4.2.1 requires the ranges in a
+			// ROUTE_ADVERTISEMENT to be non-overlapping, and specifies the
+			// ordering as a separate requirement. Deriving non-overlap FROM the
+			// ordering does not work: the ordering rule compares the previous
+			// range's protocol with the current one, so whenever the protocols
+			// differ the pair was accepted without the ranges being tested.
+			//
+			// That is not a theoretical gap, because protocol 0 means ALL
+			// protocols rather than "no protocol" - RoutesContain matches with
+			// `route.Protocol == 0 || route.Protocol == protocol`. So
+			// "192.0.2.0-192.0.2.255 protocol=0" followed by the same range at
+			// protocol=6 describes the same traffic twice, and the advertised
+			// policy becomes ambiguous: whichever entry the lookup happened to
+			// reach first would decide.
+			//
+			// The cost is O(n^2) over the number of ranges, which is acceptable
+			// because a ROUTE_ADVERTISEMENT is bounded by the capsule size limit
+			// and the lists are small; the alternative, sweeping per protocol,
+			// would add bookkeeping for no practical gain here.
+			for _, earlier := range routes {
+				if earlier.OverlapsProtocol(route) {
+					return nil, E.New("address ranges overlap: ", earlier.Start, "-",
+						earlier.End, " protocol ", earlier.Protocol, " and ",
+						start, "-", end, " protocol ", route.Protocol)
+				}
 			}
 		}
 		routes = append(routes, route)
