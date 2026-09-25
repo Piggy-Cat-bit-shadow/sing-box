@@ -65,6 +65,12 @@ func h3QUICVersions(t *testing.T, address string) []quic.Version {
 // dependency bump that changed that default would silently drop v2 support with
 // no test failing, so the versions are asserted rather than inherited.
 func TestJiejieNaiveH3QUICVersionsMatchTheReference(t *testing.T) {
+	if !http3SupportLinked() {
+		t.Skipf("this build does not link HTTP/3 support (the production tag set " +
+			"omits protocol/naive/quic), so the QUIC version sets cannot be " +
+			"compared. Run under with_quic without jiejie_server_minimal. This is " +
+			"a SKIP, not a pass.")
+	}
 	binary := caddyReferenceBinary(t)
 	if binary == "" {
 		t.Skipf("the reference binary is unavailable, so the QUIC versions could "+
@@ -96,6 +102,10 @@ func TestJiejieNaiveH3QUICVersionsMatchTheReference(t *testing.T) {
 // rather than treated as a pass, because a server with no header limit accepts
 // arbitrary header bytes from an unauthenticated peer.
 func TestJiejieNaiveH3HeaderLimitIsEnforced(t *testing.T) {
+	if !http3SupportLinked() {
+		t.Skipf("this build does not link HTTP/3 support, so the header limit " +
+			"cannot be measured. This is a SKIP, not a pass.")
+	}
 	binary := caddyReferenceBinary(t)
 	if binary == "" {
 		t.Skipf("the reference binary is unavailable; set %s or %s. This is a "+
@@ -176,6 +186,10 @@ func h3ProbeOversizedHeader(t *testing.T, address, authority, headerValue string
 // prove a bound is a multi-minute wait, which is not worth the CI cost for a
 // property the quic-go default already provides; the finding is recorded instead.
 func TestJiejieNaiveH3IdleTimeoutIsBounded(t *testing.T) {
+	if !http3SupportLinked() {
+		t.Skipf("this build does not link HTTP/3 support, so idle behaviour " +
+			"cannot be measured. This is a SKIP, not a pass.")
+	}
 	forkPort := startNaiveInboundH3(t)
 	address := "127.0.0.1:" + strconv.Itoa(int(forkPort))
 	origin := startCountingTCPOrigin(t)
