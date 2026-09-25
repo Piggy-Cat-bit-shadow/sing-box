@@ -244,17 +244,28 @@ jobs:
           # masque-server endpoint), and failed with a QUIC handshake timeout
           # that reads like a protocol bug. The flag means "this binary has the
           # full registry", so it must only be set for the full binary.
+          # The run filter and the assertion list below must together cover EVERY
+          # TestReference case. Phase 3 added migration, capsule-fallback and
+          # Proxy-Status tests AFTER this step was written, and they were neither
+          # matched by the filter nor named in the assertion - so they would have
+          # passed locally and never executed in CI. A test that is not in the
+          # filter is a false green, which is the exact failure mode this step
+          # exists to prevent. When adding a TestReference case, add it in BOTH
+          # places.
+          #
+          # CONNECT-UDP, migration and Proxy-Status run against the production
+          # minimal binary.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
-            go test -v -count=1 -timeout 15m \
-            -run 'TestReferenceMasqueGo|TestReferenceHarness' . \
+            go test -v -count=1 -timeout 20m \
+            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceUnvalidatedSpoof|TestReferenceSourceIdentity' . \
             2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
           # The CONNECT-IP cases run against the full-registry binary, which is
           # the only one that can serve them.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
           JIEJIE_FULL_REGISTRY_BINARY=1 \
-            go test -v -count=1 -timeout 15m \
-            -run 'TestReferenceConnectIP' . \
+            go test -v -count=1 -timeout 20m \
+            -run 'TestReferenceConnectIP|TestProxyStatus' . \
             2>&1 | tee -a "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
       # A skipped reference test is invisible in a green workflow, which is how
@@ -292,9 +303,20 @@ jobs:
             TestReferenceMasqueGoConnectUDPRejectedWithoutAuth \
             TestReferenceMasqueGoRequiresServerDatagramSupport \
             TestReferenceHarnessDetectsAStoppedServer \
+            TestReferenceConnectUDPSurvivesNATRebinding \
+            TestReferenceConnectUDPNewTunnelAfterRebinding \
+            TestReferenceUnvalidatedSpoofDoesNotChangeIdentity \
+            TestReferenceSourceIdentityIsStableAcrossMigration \
             TestReferenceConnectIPHandshakeAndAssignment \
             TestReferenceConnectIPRejectsWithoutAuth \
-            TestReferenceConnectIPICMPEchoDifferential
+            TestReferenceConnectIPICMPEchoDifferential \
+            TestReferenceConnectIPSurvivesNATRebinding \
+            TestReferenceConnectIPDatagramFallbackKeepsTheTunnelAlive \
+            TestReferenceConnectIPDatagramFallbackDoesNotSendDatagrams \
+            TestProxyStatusIsAbsentForUnauthenticatedRequests \
+            TestProxyStatusIsPresentForAnAuthenticatedDNSFailure \
+            TestProxyStatusUsesTheRFC9209Shape \
+            TestProxyStatusIsAbsentOnSuccessAndOnLocalRejections
           do
             if ! grep -q -- "--- PASS: $TEST" "$LOG"; then
               echo "::error::$TEST did not report a pass; the reference client never"
@@ -302,6 +324,31 @@ jobs:
               exit 1
             fi
           done
+
+          # Every TestReference case that EXISTS must have been run. The explicit
+          # list above is what caught the Phase 3 gap, but a list can go stale the
+          # same way a filter can: adding a test without adding it here would mean
+          # it never runs and nothing says so. This compares the tests present in
+          # the source against the ones the log reports having run, so a new test
+          # that is not covered fails the build instead of passing silently.
+          echo ""
+          echo "=== reference test coverage check ==="
+          DEFINED=$(grep -rhoE '^func (TestReference[A-Za-z0-9_]*)' \
+            test/jiejie/reference/*_test.go | sed 's/^func //' | sort -u)
+          MISSING=0
+          for TEST in $DEFINED; do
+            if ! grep -qE -- "--- (PASS|FAIL|SKIP): ${TEST}( |\$)" "$LOG"; then
+              echo "::error::$TEST is defined in test/jiejie/reference but the run"
+              echo "::error::never reported it. It is not in the -run filter, so it"
+              echo "::error::never executed. A test that does not run is NOT a pass."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" != "0" ]; then
+            echo "::error::the reference suite has tests outside the CI filter."
+            exit 1
+          fi
+          echo "all $(echo "$DEFINED" | wc -l | tr -d ' ') defined reference tests reported a result"
 
           # And the positive evidence must be in the log, not merely implied by an
           # exit status.
