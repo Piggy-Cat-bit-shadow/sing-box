@@ -29,8 +29,16 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
+		// ALPN is deliberately NOT set here. The inbound resolves the complete
+		// list once, before any listener starts, precisely so that the TLS config
+		// this function SHARES with the TCP listener cannot be changed after TCP
+		// has begun handshaking. Setting h3 here would leak a QUIC-only protocol
+		// into the TCP ALPN list, and the object cannot be cloned safely
+		// (STDServerConfig.Clone drops the certificate provider, ACME service and
+		// watcher).
 		if !common.Contains(tlsConfig.NextProtos(), http3.NextProtoH3) {
-			tlsConfig.SetNextProtos(append(append([]string{}, tlsConfig.NextProtos()...), http3.NextProtoH3))
+			return nil, E.New("HTTP/3 requires h3 in the TLS ALPN list, but it is ",
+				"absent; the inbound must resolve ALPN before starting listeners")
 		}
 
 		udpConn, err := listener.ListenUDP()
