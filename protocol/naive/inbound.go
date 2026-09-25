@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
+	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -83,6 +85,15 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if len(options.Users) == 0 {
 		return nil, E.New("missing users")
+	}
+	// The HTTP/2 resource fields are cast to fixed-width types when the server is
+	// built, so an out-of-range value must be rejected HERE rather than wrapped
+	// silently. A wrapped value is worse than a rejected one: a huge
+	// max_concurrent_streams would become a small or negative number and the
+	// operator would get a limit they never asked for, with no error to explain
+	// it.
+	if err := validateHTTP2Options(options.HTTP2Options); err != nil {
+		return nil, err
 	}
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
@@ -172,6 +183,49 @@ func (n *Inbound) Close() error {
 // peer may have in flight toward this server -- it is an admission control, not a
 // client tuning knob, and a large value works against the 1 GiB target host
 // rather than for it.
+// validateHTTP2Options range-checks the values that are later narrowed to
+// fixed-width types, so an out-of-range option is a configuration error instead
+// of a silent wrap.
+//
+// The bounds are the ones the target types can represent:
+//
+//	MaxConcurrentStreams    -> uint32  : 0 .. MaxUint32
+//	StreamReceiveWindow     -> int32   : 0 .. MaxInt32
+//	ConnectionReceiveWindow -> int32   : 0 .. MaxInt32
+//
+// Zero always means "unset, use the upstream default" and is accepted for all
+// three.
+func validateHTTP2Options(options option.HTTP2Options) error {
+	if options.MaxConcurrentStreams < 0 {
+		return E.New("max_concurrent_streams must not be negative, got ",
+			options.MaxConcurrentStreams)
+	}
+	if uint64(options.MaxConcurrentStreams) > math.MaxUint32 {
+		return E.New("max_concurrent_streams must not exceed ", uint64(math.MaxUint32),
+			", got ", options.MaxConcurrentStreams,
+			"; a larger value would wrap when narrowed to the HTTP/2 stream limit")
+	}
+	for _, window := range []struct {
+		name  string
+		value *byteformats.MemoryBytes
+	}{
+		{"stream_receive_window", options.StreamReceiveWindow},
+		{"connection_receive_window", options.ConnectionReceiveWindow},
+	} {
+		if window.value == nil {
+			continue
+		}
+		// Value() returns uint64, so only the upper bound is meaningful; there
+		// is no negative case to check.
+		if window.value.Value() > math.MaxInt32 {
+			return E.New(window.name, " must not exceed ", int64(math.MaxInt32),
+				", got ", window.value.Value(),
+				"; a larger value would wrap when narrowed to the HTTP/2 window")
+		}
+	}
+	return nil
+}
+
 func (n *Inbound) http2Server() *http2.Server {
 	options := n.options.HTTP2Options
 	server := &http2.Server{}
@@ -179,6 +233,7 @@ func (n *Inbound) http2Server() *http2.Server {
 		// Bounds how many concurrent tunnels one HTTP/2 connection may open. A
 		// Naive CONNECT is one stream per tunnel, so this is the per-connection
 		// tunnel limit.
+		// In range: validateHTTP2Options rejected anything above MaxUint32.
 		server.MaxConcurrentStreams = uint32(options.MaxConcurrentStreams)
 	}
 	if options.IdleTimeout > 0 {
@@ -190,11 +245,13 @@ func (n *Inbound) http2Server() *http2.Server {
 		// SERVER-side per-stream upload buffer: how much data the peer may push
 		// toward this server on one stream before it must wait for the server to
 		// consume. Lowering it is the memory-conservative direction.
+		// In range: validateHTTP2Options rejected anything above MaxInt32.
 		server.MaxUploadBufferPerStream = int32(options.StreamReceiveWindow.Value())
 	}
 	if options.ConnectionReceiveWindow != nil {
 		// The connection-wide counterpart, shared by all streams on the
 		// connection.
+		// In range: validateHTTP2Options rejected anything above MaxInt32.
 		server.MaxUploadBufferPerConnection = int32(options.ConnectionReceiveWindow.Value())
 	}
 	return server

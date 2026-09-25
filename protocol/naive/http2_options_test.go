@@ -167,3 +167,84 @@ func TestDocumentedInboundExampleDecodes(t *testing.T) {
 	require.Equal(t, "http://127.0.0.1:28437", options.Masquerade.ProxyOptions.URL)
 	require.True(t, options.Masquerade.ProxyOptions.RewriteHost)
 }
+
+// TestHTTP2OptionsRejectOutOfRangeValues proves the resource options cannot
+// silently wrap.
+//
+// The values are narrowed to fixed-width types when the HTTP/2 server is built
+// (uint32 for the stream limit, int32 for the receive windows). Without a range
+// check an out-of-range option would wrap into a small or negative number, and
+// the operator would get a limit they never configured with no error to explain
+// it - which is worse than a rejected configuration.
+//
+// Each case below is one step past the representable maximum, which is exactly
+// where a silent cast would produce a plausible-looking small value.
+func TestHTTP2OptionsRejectOutOfRangeValues(t *testing.T) {
+	maxUint32 := int64(1)<<32 - 1
+	// The byte-size literals that sit exactly at and one past MaxInt32.
+	const (
+		atMaxInt32   = "2147483647"
+		overMaxInt32 = "2147483648"
+	)
+
+	// MemoryBytes has no exported literal constructor; JSON is its public input
+	// path, so the test builds values the same way a configuration would.
+	bytesOf := func(t *testing.T, literal string) *byteformats.MemoryBytes {
+		t.Helper()
+		var memory byteformats.MemoryBytes
+		require.NoError(t, memory.UnmarshalJSON([]byte(literal)),
+			"test fixture must be a valid byte size literal")
+		return &memory
+	}
+
+	t.Run("max_concurrent_streams", func(t *testing.T) {
+		// The largest value MaxUint32 can hold must be accepted.
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: int(maxUint32),
+		}), "the largest representable stream limit must be accepted")
+
+		// One past it must be refused rather than wrapping to 0.
+		err := validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: int(maxUint32) + 1,
+		})
+		require.Error(t, err, "a stream limit above MaxUint32 must be refused")
+		require.Contains(t, err.Error(), "max_concurrent_streams")
+
+		// A negative value is meaningless and must be refused.
+		require.Error(t, validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: -1,
+		}), "a negative stream limit must be refused")
+	})
+
+	t.Run("stream_receive_window", func(t *testing.T) {
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			StreamReceiveWindow: bytesOf(t, atMaxInt32),
+		}), "the largest representable window must be accepted")
+
+		err := validateHTTP2Options(option.HTTP2Options{
+			StreamReceiveWindow: bytesOf(t, overMaxInt32),
+		})
+		require.Error(t, err, "a window above MaxInt32 must be refused")
+		require.Contains(t, err.Error(), "stream_receive_window",
+			"the error must name the offending option")
+	})
+
+	t.Run("connection_receive_window", func(t *testing.T) {
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			ConnectionReceiveWindow: bytesOf(t, atMaxInt32),
+		}))
+
+		err := validateHTTP2Options(option.HTTP2Options{
+			ConnectionReceiveWindow: bytesOf(t, overMaxInt32),
+		})
+		require.Error(t, err, "a window above MaxInt32 must be refused")
+		require.Contains(t, err.Error(), "connection_receive_window")
+	})
+
+	t.Run("unset stays unset", func(t *testing.T) {
+		// Zero for all three means "use the upstream default" and must never be
+		// turned into an error, or every existing configuration would break.
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{}),
+			"an unconfigured inbound must validate: zero means upstream default")
+	})
+}
