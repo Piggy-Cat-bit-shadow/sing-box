@@ -150,6 +150,21 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 	}
 
 	if common.Contains(n.network, N.NetworkUDP) {
+		// ConfigureHTTP3ListenerFunc is installed by the QUIC support package and
+		// is simply left nil by builds that do not include it. Under the
+		// production tag set (with_quic,jiejie_server_minimal) no file assigns
+		// it, so calling it unconditionally panics with a nil dereference the
+		// moment a configuration enables UDP on this inbound.
+		switch decideHTTP3Availability(ConfigureHTTP3ListenerFunc != nil, n.network) {
+		case http3UnavailableFatal:
+			return E.New("HTTP/3 is not available in this build: ",
+				"the QUIC support package was not linked in")
+		case http3UnavailableNonFatal:
+			// A missing optional transport must not take down TCP CONNECT, which
+			// is this server's production data path.
+			n.logger.Warn("naive http3 disabled: HTTP/3 is not available in this build")
+			return nil
+		}
 		http3Server, err := ConfigureHTTP3ListenerFunc(n.ctx, n.logger, n.listener, n, n.tlsConfig, n.options)
 		if err == nil {
 			n.h3Server = http3Server
@@ -161,6 +176,50 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 	}
 
 	return nil
+}
+
+// http3Availability is the decision the inbound makes before calling the HTTP/3
+// listener constructor.
+type http3Availability int
+
+const (
+	// http3Available means a constructor exists and must be used.
+	http3Available http3Availability = iota
+	// http3UnavailableFatal means there is nothing else to serve, so the inbound
+	// must fail rather than start with no transport.
+	http3UnavailableFatal
+	// http3UnavailableNonFatal means HTTP/3 is missing but other transports are
+	// being served, so the failure is downgraded to a warning.
+	http3UnavailableNonFatal
+)
+
+// decideHTTP3Availability reports what the inbound should do about HTTP/3.
+//
+// A missing implementation is a configuration problem, not a crash. Where the
+// inbound also serves TCP the failure is non-fatal, matching how a
+// present-but-failing HTTP/3 listener is already handled: TCP CONNECT is the
+// server's production data path and must not be taken down by a missing optional
+// transport. A UDP-only inbound has nothing left to serve, so it fails.
+func decideHTTP3Availability(constructorPresent bool, network []string) http3Availability {
+	if constructorPresent {
+		return http3Available
+	}
+	if len(network) > 1 {
+		return http3UnavailableNonFatal
+	}
+	return http3UnavailableFatal
+}
+
+// decideHTTP3AvailabilityForOptions applies decideHTTP3Availability to a
+// configured NetworkList.
+//
+// It exists because option.NetworkList is a STRING, not a slice: len() on it
+// counts characters, and the empty value means "both tcp and udp" rather than
+// "nothing". Passing the raw value through would therefore make an unset network
+// look like neither, and a tcp+udp default would be misread. Build() is the
+// accessor that resolves both cases.
+func decideHTTP3AvailabilityForOptions(constructorPresent bool, network option.NetworkList) http3Availability {
+	return decideHTTP3Availability(constructorPresent, network.Build())
 }
 
 func (n *Inbound) Close() error {
