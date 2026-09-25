@@ -31,9 +31,31 @@ import (
 
 // startNaiveInboundTCPAndUDP starts an inbound serving both transports, which is
 // the configuration under test.
-func startNaiveInboundTCPAndUDP(t *testing.T) uint16 {
+//
+// It returns the port and whether the process can actually serve HTTP/3. Under
+// the production tag set the QUIC package is deliberately not linked, so a udp
+// inbound starts TCP and warns that HTTP/3 is disabled; the isolation question
+// cannot be asked there and the caller must SKIP rather than fail. When QUIC IS
+// linked, a failure to establish HTTP/3 is a real defect and must not be skipped -
+// the previous version of the h3 suite treated exactly that condition as an
+// environment SKIP, which is how a broken QUIC path stayed invisible.
+func startNaiveInboundTCPAndUDP(t *testing.T) (uint16, bool) {
 	t.Helper()
-	return startNaiveInboundWithNetwork(t, "tcp\nudp")
+	port := startNaiveInboundWithNetwork(t, "tcp\nudp")
+	if !http3SupportLinked() {
+		return port, false
+	}
+	return port, true
+}
+
+// http3SupportLinked reports whether this build links protocol/naive/quic.
+//
+// The check is build-tag-based rather than behavioural: asking whether a
+// handshake happens to succeed cannot distinguish "QUIC is not in this build"
+// from "QUIC is in this build and is broken", and those two must not be treated
+// the same way.
+func http3SupportLinked() bool {
+	return naiveHTTP3Included
 }
 
 // negotiateQUICALPN performs a real QUIC handshake and reports the negotiated
@@ -65,15 +87,25 @@ func negotiateQUICALPN(t *testing.T, port uint16, offered []string) (string, err
 // because a config object that lists the right protocols proves nothing about
 // what a handshake actually negotiates.
 func TestJiejieNaiveTCPAndUDPALPNIsolation(t *testing.T) {
-	port := startNaiveInboundTCPAndUDP(t)
+	port, quicLinked := startNaiveInboundTCPAndUDP(t)
+	if !quicLinked {
+		t.Skipf("this build does not link HTTP/3 support (the production tag set " +
+			"omits protocol/naive/quic), so the TCP/QUIC isolation question cannot " +
+			"be asked. Run under with_quic without jiejie_server_minimal. This is a " +
+			"SKIP, not a pass.")
+	}
 
 	// Establish the QUIC listener first. On a tcp+udp inbound the HTTP/3
 	// initialiser runs after the TCP listener starts, so a test that only
 	// handshook before H3 existed would miss anything the initialiser changed.
+	//
+	// A failure HERE is fatal rather than a skip: QUIC support is linked, so an
+	// unreachable HTTP/3 listener is a defect.
 	_, quicErr := negotiateQUICALPN(t, port, []string{http3.NextProtoH3})
 	require.NoError(t, quicErr,
-		"the HTTP/3 listener must be reachable on a tcp+udp inbound, otherwise "+
-			"the isolation question is moot and the test proves nothing")
+		"HTTP/3 support is linked but the listener is unreachable: that is a "+
+			"defect, not an environment limitation. Without this the isolation "+
+			"question is moot and the test would prove nothing")
 	t.Logf("QUIC listener established on port %d", port)
 
 	t.Run("TCP offering h3 alone must not negotiate h3", func(t *testing.T) {
@@ -153,7 +185,11 @@ func TestJiejieNaiveTCPAndUDPALPNIsolation(t *testing.T) {
 // produce that, so this test is what distinguishes isolation from a timing
 // coincidence.
 func TestJiejieNaiveTCPAndUDPALPNIsolationUnderConcurrency(t *testing.T) {
-	port := startNaiveInboundTCPAndUDP(t)
+	port, quicLinked := startNaiveInboundTCPAndUDP(t)
+	if !quicLinked {
+		t.Skipf("this build does not link HTTP/3 support, so a TCP/QUIC race " +
+			"cannot be exercised. This is a SKIP, not a pass.")
+	}
 
 	_, err := negotiateQUICALPN(t, port, []string{http3.NextProtoH3})
 	require.NoError(t, err, "the QUIC listener must be up before the race begins")

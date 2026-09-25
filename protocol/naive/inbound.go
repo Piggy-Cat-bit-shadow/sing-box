@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -152,7 +151,6 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			// and Close to the single shared config, so that object is still
 			// created, started and closed exactly once.
 			tcpTLSConfig := tls.TransportALPNView(n.tlsConfig, n.tcpNextProtos())
-			n.logger.Warn("DIAG tcpALPN=", strings.Join(tcpTLSConfig.NextProtos(), ","), " sharedALPN=", strings.Join(n.tlsConfig.NextProtos(), ","))
 			listener = aTLS.NewListener(tcpListener, tcpTLSConfig)
 		}
 		go func() {
