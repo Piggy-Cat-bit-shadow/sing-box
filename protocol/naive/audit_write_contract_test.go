@@ -82,7 +82,7 @@ func TestAuditWriteContractMatrix(t *testing.T) {
 			writer := &scriptedWriter{allow: testCase.allow, err: testCase.writeErr}
 			connection := &paddingConn{enabled: true}
 
-			n, err := connection.writeWithPadding(writer, payload)
+			n, err := connection.writeFrameForTest(writer, payload)
 
 			if testCase.wantError {
 				require.Error(t, err,
@@ -108,14 +108,14 @@ func TestAuditUnpaddedWriteContract(t *testing.T) {
 	// Full write succeeds and reports the true length.
 	full := &scriptedWriter{allow: 1 << 20}
 	connection := &paddingConn{enabled: false}
-	n, err := connection.writeWithPadding(full, payload)
+	n, err := connection.writeFrameForTest(full, payload)
 	require.NoError(t, err)
 	require.Equal(t, len(payload), n)
 
 	// A short write is an error, not a silent truncation.
 	short := &scriptedWriter{allow: 3}
 	shortConn := &paddingConn{enabled: false}
-	n, err = shortConn.writeWithPadding(short, payload)
+	n, err = shortConn.writeFrameForTest(short, payload)
 	require.ErrorIs(t, err, io.ErrShortWrite)
 	require.Less(t, n, len(payload),
 		"a failed unpadded write must not be reported as a complete payload write")
@@ -205,7 +205,7 @@ func TestAuditWriterThatLiesAboutLengthIsStillCaught(t *testing.T) {
 	// later mistakes this layer for a data-integrity guarantee.
 	liar := &lyingWriter{}
 	connection := &paddingConn{enabled: true}
-	n, err := connection.writeWithPadding(liar, []byte("data"))
+	n, err := connection.writeFrameForTest(liar, []byte("data"))
 	require.NoError(t, err, "a writer claiming success is trusted, by contract")
 	require.Equal(t, 4, n)
 }

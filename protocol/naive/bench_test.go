@@ -37,7 +37,7 @@ func BenchmarkPaddingWriteFramed(b *testing.B) {
 		writer := io.Discard
 		connection := &paddingConn{enabled: true}
 		b.StartTimer()
-		if _, err := connection.writeWithPadding(writer, benchmarkPayload); err != nil {
+		if _, err := connection.writeFrameForTest(writer, benchmarkPayload); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -51,7 +51,7 @@ func BenchmarkPaddingWriteRaw(b *testing.B) {
 	connection := &paddingConn{enabled: true, writePadding: paddingCount}
 	b.ResetTimer()
 	for range b.N {
-		if _, err := connection.writeWithPadding(io.Discard, benchmarkPayload); err != nil {
+		if _, err := connection.writeFrameForTest(io.Discard, benchmarkPayload); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -65,7 +65,7 @@ func BenchmarkPaddingWriteUnpadded(b *testing.B) {
 	connection := &paddingConn{enabled: false}
 	b.ResetTimer()
 	for range b.N {
-		if _, err := connection.writeWithPadding(io.Discard, benchmarkPayload); err != nil {
+		if _, err := connection.writeFrameForTest(io.Discard, benchmarkPayload); err != nil {
 			b.Fatal(err)
 		}
 	}

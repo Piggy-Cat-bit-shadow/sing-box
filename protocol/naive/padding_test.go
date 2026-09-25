@@ -34,7 +34,7 @@ func TestPaddingFrameRoundTrips(t *testing.T) {
 		var buffer bytes.Buffer
 		writer := &paddingConn{enabled: true}
 		payload := bytes.Repeat([]byte{'x'}, dataSize)
-		n, err := writer.writeWithPadding(&buffer, payload)
+		n, err := writer.writeFrameForTest(&buffer, payload)
 		require.NoError(t, err)
 		require.Equal(t, dataSize, n, "a write reports the DATA length, not the frame length")
 
@@ -62,7 +62,7 @@ func TestPaddingIsOptional(t *testing.T) {
 	var buffer bytes.Buffer
 	writer := &paddingConn{enabled: false}
 	payload := []byte("plain proxy bytes with no frame header")
-	n, err := writer.writeWithPadding(&buffer, payload)
+	n, err := writer.writeFrameForTest(&buffer, payload)
 	require.NoError(t, err)
 	require.Equal(t, len(payload), n)
 	require.Equal(t, payload, buffer.Bytes(),
@@ -83,11 +83,13 @@ func TestPaddingAppliesOnlyToTheFirstFrames(t *testing.T) {
 	writer := &paddingConn{enabled: true}
 	payload := []byte("payload")
 
-	for index := range paddingCount + 3 {
-		_, err := writer.writeWithPadding(&buffer, payload)
-		require.NoError(t, err)
-		if index < paddingCount {
-			require.Less(t, writer.writePadding, paddingCount+1)
+	// writeChunked is the entry point that owns the window rule: it pads the
+	// first paddingCount frames and then writes the remainder raw. Driving
+	// writeFrame directly would bypass that rule and count every call, which is
+	// not what the production copy path does.
+	for range paddingCount + 3 {
+		if _, err := writer.writeChunked(&buffer, payload); err != nil {
+			require.NoError(t, err)
 		}
 	}
 	require.Equal(t, paddingCount, writer.writePadding,
@@ -114,8 +116,11 @@ func TestPaddedConnectionReservesHeadroom(t *testing.T) {
 	require.Equal(t, 3, connection.frontHeadroom())
 	require.Equal(t, 255, connection.rearHeadroom(),
 		"the maximum padding is one byte's worth, 255")
-	require.Equal(t, 65535, connection.writerMTU(),
-		"the frame length field is 16-bit, so the MTU is 65535")
+	require.Equal(t, 65278, connection.writerMTU(),
+		"the advertised MTU must be the WORST-CASE payload for the reference "+
+			"frame ceiling: 65536 - 3 header - 255 max padding. Advertising 65535 "+
+			"(the 16-bit length field's maximum) ignored padding entirely and let "+
+			"a caller hand over a payload that framed to 65793 bytes")
 	require.False(t, connection.readerReplaceable())
 	require.False(t, connection.writerReplaceable())
 }

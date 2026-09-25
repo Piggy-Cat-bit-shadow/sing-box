@@ -148,7 +148,7 @@ func FuzzNaivePaddingFrameRoundTrip(fuzz *testing.F) {
 
 		var encoded bytes.Buffer
 		writer := &recordingWriter{}
-		if err := connection.writeWithPaddingSpy(writer, payload); err != nil {
+		if err := connection.writeFrameForTestErr(writer, payload); err != nil {
 			t.Fatalf("encoding a valid frame failed: %v", err)
 		}
 		encoded.Write(writer.data)
@@ -202,8 +202,8 @@ func (w *recordingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// writeWithPaddingSpy exposes the unexported padded write path to the fuzzer.
-func (p *paddingConn) writeWithPaddingSpy(writer io.Writer, data []byte) error {
-	_, err := p.writeWithPadding(writer, data)
+// writeFrameForTestErr exposes the unexported padded write path to the fuzzer.
+func (p *paddingConn) writeFrameForTestErr(writer io.Writer, data []byte) error {
+	_, err := p.writeFrameForTest(writer, data)
 	return err
 }

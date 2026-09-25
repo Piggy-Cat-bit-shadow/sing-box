@@ -167,7 +167,7 @@ func TestAuditPaddingShortWriteIsDetected(t *testing.T) {
 	writer := &shortWriter{limit: 4}
 	connection := &paddingConn{enabled: true}
 
-	_, err := connection.writeWithPadding(writer, []byte("0123456789"))
+	_, err := connection.writeFrameForTest(writer, []byte("0123456789"))
 	if err == nil {
 		t.Log("NOTE: a short write without an error was accepted; the caller must " +
 			"still not treat the frame as complete")
@@ -194,7 +194,7 @@ func (w *shortWriter) Write(p []byte) (int, error) {
 func TestAuditPaddingWriteErrorPropagates(t *testing.T) {
 	sentinel := errors.New("write failed")
 	connection := &paddingConn{enabled: true}
-	_, err := connection.writeWithPadding(&errorWriter{err: sentinel}, []byte("data"))
+	_, err := connection.writeFrameForTest(&errorWriter{err: sentinel}, []byte("data"))
 	require.ErrorIs(t, err, sentinel, "a write error must propagate")
 }
 
@@ -249,7 +249,7 @@ func TestAuditUnpaddedNeverInsertsFrames(t *testing.T) {
 	connection := &paddingConn{enabled: false}
 	for i := range paddingCount + 2 {
 		payload := []byte("plain")
-		n, err := connection.writeWithPadding(&buffer, payload)
+		n, err := connection.writeFrameForTest(&buffer, payload)
 		require.NoError(t, err)
 		require.Equal(t, len(payload), n, "write %d", i)
 	}

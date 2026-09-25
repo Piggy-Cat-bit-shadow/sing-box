@@ -135,33 +135,34 @@ func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, e
 	return reader.Read(buffer)
 }
 
-func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, err error) {
+// writeFrame emits one padded Naive frame with an explicitly chosen padding
+// length.
+//
+// The padding size is a parameter rather than drawn here, because the caller must
+// size the payload against the SAME draw. Drawing it twice would reintroduce the
+// mismatch this change removes.
+func (p *paddingConn) writeFrame(writer io.Writer, data []byte, paddingSize int) (n int, err error) {
 	if !p.enabled {
 		return writeFull(writer, data)
 	}
-	if p.writePadding < paddingCount {
-		paddingSize := p.nextPaddingSize()
-		// This path allocates its own buffer, so it always has room for the full
-		// 0..255 range; nothing needs clamping and nothing can fail here.
-		buffer := buf.NewSize(3 + len(data) + paddingSize)
-		defer buffer.Release()
-		header := buffer.Extend(3)
-		binary.BigEndian.PutUint16(header, uint16(len(data)))
-		header[2] = byte(paddingSize)
-		common.Must1(buffer.Write(data))
-		common.Must(buffer.WriteZeroN(paddingSize))
-		// A frame header is already on the wire once ANY byte of the frame is
-		// written, so the write must complete or the stream is corrupt.
-		if _, writeErr := writeFull(writer, buffer.Bytes()); writeErr != nil {
-			// Deliberately do NOT advance the frame counter: the peer never
-			// received a complete frame, so it must not expect the padding
-			// accounting to move.
-			return 0, writeErr
-		}
-		p.writePadding++
-		return len(data), nil
+	// This path allocates its own buffer, so it always has room for the full
+	// 0..255 range; nothing needs clamping and nothing can fail here.
+	buffer := buf.NewSize(3 + len(data) + paddingSize)
+	defer buffer.Release()
+	header := buffer.Extend(3)
+	binary.BigEndian.PutUint16(header, uint16(len(data)))
+	header[2] = byte(paddingSize)
+	common.Must1(buffer.Write(data))
+	common.Must(buffer.WriteZeroN(paddingSize))
+	// A frame header is already on the wire once ANY byte of the frame is
+	// written, so the write must complete or the stream is corrupt.
+	if _, writeErr := writeFull(writer, buffer.Bytes()); writeErr != nil {
+		// Deliberately do NOT advance the frame counter: the peer never received
+		// a complete frame, so it must not expect the padding accounting to move.
+		return 0, writeErr
 	}
-	return writeFull(writer, data)
+	p.writePadding++
+	return len(data), nil
 }
 
 // writeFull writes all of data and returns the byte count io.Writer reported.
@@ -188,7 +189,15 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 	framed := false
 	if p.enabled && p.writePadding < paddingCount {
 		bufferLen := buffer.Len()
-		if bufferLen > 65535 {
+		// A payload this large cannot be framed in place, because the in-place
+		// path reserves exactly three bytes of header and then appends padding:
+		// 3 + 65535 + 255 exceeds the reference ceiling. Hand it to writeChunked,
+		// which sizes each frame against its own padding draw.
+		//
+		// The threshold is the reference ceiling minus the header and the maximum
+		// padding, not 65535: a payload of 65535 would pass a `> 65535` test and
+		// then be framed to 65793 bytes once padding was appended.
+		if bufferLen > maxFrameSize-3-255 {
 			_, err := p.writeChunked(writer, buffer.Bytes())
 			return err
 		}
@@ -231,27 +240,60 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 	return nil
 }
 
+// maxFrameSize is the largest total frame the reference emits.
+//
+// The reference reads into buf[3:maxRead] with maxRead = 65536 - 3 - paddingSize,
+// so the frame header plus payload plus padding occupies at most 65536 bytes.
+const maxFrameSize = 65536
+
+// writeChunked writes data as Naive frames while the padding window is open.
+//
+// REFERENCE PARITY. The segmentation follows klzgrad/forwardproxy's
+// flushingIoCopy exactly:
+//
+//	paddingSize := rand.Intn(256)
+//	maxRead     := 65536 - 3 - paddingSize
+//	nr, er      := src.Read(buf[3:maxRead])
+//
+// The padding size is drawn FIRST and the payload budget is then reduced by it,
+// so a frame's total length is at most 65536 regardless of the draw.
+//
+// This is not equivalent to chunking the payload at 65535 and adding padding
+// afterwards, which is what this function previously did: that produced frames
+// of up to 3 + 65535 + 255 = 65793 bytes, 257 more than the reference's ceiling,
+// and it disagreed with the reference about where every frame boundary falls
+// once the reader returned a large block.
 func (p *paddingConn) writeChunked(writer io.Writer, data []byte) (n int, err error) {
 	if !p.enabled {
 		// Without padding there is no 2-byte frame length, so there is no
-		// 65535-byte frame limit to respect. Write straight through.
+		// frame-size limit to respect. Write straight through.
 		return writeFull(writer, data)
 	}
 	for len(data) > 0 {
-		var chunk []byte
-		if len(data) > 65535 {
-			chunk = data[:65535]
-			data = data[65535:]
-		} else {
-			chunk = data
-			data = nil
+		chunk := data
+		if p.writePadding < paddingCount {
+			// Padding window still open: size the payload for THIS frame's draw
+			// so header + payload + padding fits the reference ceiling.
+			paddingSize := p.nextPaddingSize()
+			maxPayload := maxFrameSize - 3 - paddingSize
+			if len(chunk) > maxPayload {
+				chunk = chunk[:maxPayload]
+			}
+			var written int
+			written, err = p.writeFrame(writer, chunk, paddingSize)
+			n += written
+			if err != nil {
+				return
+			}
+			data = data[len(chunk):]
+			continue
 		}
+		// Padding window closed: the rest is raw. The 2-byte length field is gone
+		// from this point on, so the remainder is written in one call.
 		var written int
-		written, err = p.writeWithPadding(writer, chunk)
+		written, err = writeFull(writer, chunk)
 		n += written
-		if err != nil {
-			return
-		}
+		return
 	}
 	return
 }
@@ -270,9 +312,21 @@ func (p *paddingConn) rearHeadroom() int {
 	return 0
 }
 
+// writerMTU reports the payload size the copy path may hand this writer in one
+// call while the padding window is open.
+//
+// REFERENCE PARITY, and deliberately conservative. A padded frame's payload
+// budget is 65536 - 3 - paddingSize, which depends on a padding draw the copy
+// path cannot know in advance, so no single value is correct for every frame.
+// Advertising the WORST CASE (paddingSize == 255) is what makes the advertised
+// MTU always safe: a caller that respects it can never make writeChunked emit an
+// oversized frame, and writeChunked still splits further for any smaller draw.
+//
+// The previous value, 65535, came from the old order of operations and was too
+// large for every draw except paddingSize == 0.
 func (p *paddingConn) writerMTU() int {
 	if p.enabled && p.writePadding < paddingCount {
-		return 65535
+		return maxFrameSize - 3 - 255
 	}
 	return 0
 }
@@ -438,3 +492,12 @@ func (c *hijackedConn) Read(p []byte) (int, error) {
 // deadline helpers, common.Cast) still reach the real socket rather than
 // stopping at this adapter.
 func (c *hijackedConn) Upstream() any { return c.Conn }
+
+// writeFrameForTest draws a padding size and emits one frame.
+//
+// It exists so the writer-contract tests can exercise a single frame with a
+// drawn padding length, which is what writeChunked does internally. Production
+// code calls writeChunked; nothing outside tests uses this.
+func (p *paddingConn) writeFrameForTest(writer io.Writer, data []byte) (int, error) {
+	return p.writeFrame(writer, data, p.nextPaddingSize())
+}
