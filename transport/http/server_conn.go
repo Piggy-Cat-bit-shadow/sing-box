@@ -76,7 +76,9 @@ func (c *serverConn) serveRequest() (requestResult, error) {
 			c.server.logger.ErrorContext(c.ctx, E.Cause(tunnelAuthErr, "process connection from ", c.source))
 			return c.reject(request, requestKeepAlive(request), http.StatusUnauthorized, nil, tunnelAuthErr)
 		}
-		return c.serveTunnel(tunnelCtx, request, badhttp.ForwardedSource(request, c.source), tunnelProtocol, tunnelHandler)
+		// c.source is the transport peer. X-Forwarded-For is deliberately not
+		// consulted: it is client-controlled and must not decide metadata.Source.
+		return c.serveTunnel(tunnelCtx, request, c.source, tunnelProtocol, tunnelHandler)
 	}
 	if c.handler == nil {
 		return c.reject(request, requestKeepAlive(request), http.StatusNotFound, nil, E.New("unexpected request: ", request.Method, " ", request.URL))
@@ -86,7 +88,8 @@ func (c *serverConn) serveRequest() (requestResult, error) {
 		c.server.logger.ErrorContext(c.ctx, E.Cause(authErr, "process connection from ", c.source))
 		return c.reject(request, requestKeepAlive(request), http.StatusProxyAuthRequired, nil, authErr)
 	}
-	source := badhttp.ForwardedSource(request, c.source)
+	// The transport peer, not a client-supplied header.
+	source := c.source
 	switch {
 	case request.Method == http.MethodConnect:
 		return c.serveConnect(ctx, request, source)

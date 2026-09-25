@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common/bufio"
@@ -104,7 +103,12 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		// abuse.
 		authCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
 		if authErr == nil {
-			h.serveTunnel(authCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
+			// connectionSource is the transport peer (the QUIC peer on H3, otherwise
+			// request.RemoteAddr). It is NOT passed through ForwardedSource: an
+			// X-Forwarded-For header is client-controlled and must not decide
+			// metadata.Source, which feeds source_ip_cidr rules, the limiter, the
+			// logs and the audit trail.
+			h.serveTunnel(authCtx, writer, request, connectionSource, tunnelHandler)
 			return
 		}
 		h.serveUnauthenticatedFailure(ctx, writer, request, connectionSource, authErr, false)
@@ -128,7 +132,9 @@ func (h *httpHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	ctx = proxyCtx
-	source := badhttp.ForwardedSource(request, connectionSource)
+	// The transport peer, not a client-supplied header. See the note on the
+	// tunnel path above.
+	source := connectionSource
 	if request.Method == http.MethodConnect {
 		switch {
 		case protocol == "":

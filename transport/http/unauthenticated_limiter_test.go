@@ -770,9 +770,10 @@ func TestFailedAuthenticationIsAccounted(t *testing.T) {
 
 	request := httptest.NewRequest(http.MethodConnect, "http://203.0.113.77:8080", nil)
 	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("user:wrong")))
-	// httptest.NewRequest overwrites RemoteAddr with the real peer address, so the
-	// source is attributed the way it is in production behind the Nginx stream
-	// front end: via X-Forwarded-For (see badhttp.ForwardedSource).
+	// The limiter is keyed on the TRANSPORT PEER, not on X-Forwarded-For. The
+	// header is set here to prove it is ignored: if it were trusted, a client
+	// could rotate it to obtain a fresh budget for every request and the limiter
+	// would never engage.
 	request.Header.Set("X-Forwarded-For", "203.0.113.9")
 
 	recorder := httptest.NewRecorder()
