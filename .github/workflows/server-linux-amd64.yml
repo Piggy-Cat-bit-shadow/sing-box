@@ -103,6 +103,27 @@ jobs:
           # exists for.
           go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./transport/masque ./protocol/naive ./route ./option ./common/tls
 
+      # Bounded fuzzing for the parsers that consume peer-controlled bytes.
+      #
+      # Running the seed corpus (which the normal `go test` above already does) only
+      # proves the parser survives inputs someone thought of. A short real fuzz run
+      # is what explores the space around them, and it is the only step here that
+      # can find a crash nobody wrote a case for.
+      #
+      # The time budget is deliberately small: this is a regression gate, not a
+      # long fuzzing campaign. Each target gets its own run so a crash names the
+      # parser directly instead of leaving one opaque failure.
+      - name: Fuzz the MASQUE parsers (bounded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          for TARGET in FuzzCapsuleParser FuzzRouteAdvertisement FuzzConnectIPAddresses FuzzConnectUDPTemplatePath; do
+            echo "=== $TARGET ==="
+            go test -tags "$TAGS" -count=1 -run "^${TARGET}$" -fuzz "^${TARGET}$" \
+              -fuzztime 20s ./transport/masque/
+          done
+
   production-minimal-integration:
     runs-on: ubuntu-latest
     steps:
