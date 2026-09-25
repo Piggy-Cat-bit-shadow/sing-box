@@ -3,7 +3,6 @@ package http
 import (
 	"context"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"slices"
@@ -103,13 +102,19 @@ func NewServer(options ServerOptions) *Server {
 		server.maxHeaderBytes = maxHeaderBytes
 	}
 	if options.HTTP2 {
+		// The casts below are safe because the option values were range-checked
+		// in option.validateHTTPResourceBounds before reaching the server:
+		// MaxConcurrentStreams is within MaxUint32 and both windows are within
+		// MaxInt32. The previous min/max clamps silently repaired out-of-range
+		// values, which meant a nonsensical configuration produced a working
+		// server with a limit nobody chose.
 		server.http2Server = &http2.Server{
 			IdleTimeout:                  idleTimeout,
 			ReadIdleTimeout:              time.Duration(options.HTTP2Options.KeepAlivePeriod),
 			PingTimeout:                  time.Duration(options.HTTP2Options.IdleTimeout),
-			MaxConcurrentStreams:         uint32(max(options.HTTP2Options.MaxConcurrentStreams, 0)),
-			MaxUploadBufferPerConnection: int32(min(options.HTTP2Options.ConnectionReceiveWindow.Value(), math.MaxInt32)),
-			MaxUploadBufferPerStream:     int32(min(options.HTTP2Options.StreamReceiveWindow.Value(), math.MaxInt32)),
+			MaxConcurrentStreams:         uint32(options.HTTP2Options.MaxConcurrentStreams),
+			MaxUploadBufferPerConnection: int32(options.HTTP2Options.ConnectionReceiveWindow.Value()),
+			MaxUploadBufferPerStream:     int32(options.HTTP2Options.StreamReceiveWindow.Value()),
 		}
 		if options.HTTP2Options.IdleTimeout > 0 {
 			server.http2Server.IdleTimeout = time.Duration(options.HTTP2Options.IdleTimeout)
