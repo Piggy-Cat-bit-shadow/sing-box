@@ -289,16 +289,14 @@ func TestManyControlCapsulesDoNotAccumulateUnboundedState(t *testing.T) {
 	const perWriter = 64
 
 	for range writersCount {
-		writers.Add(1)
-		go func() {
-			defer writers.Done()
+		writers.Go(func() {
 			for range perWriter {
 				capsule := newCapsule(capsuleTypeAddressAssign, []byte{0x00})
 				if err := current.writeCapsule(capsule); err != nil {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	// Unblock the writer so the goroutines can finish, then wait.
