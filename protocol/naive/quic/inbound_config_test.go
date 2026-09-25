@@ -5,6 +5,8 @@ package quic
 import (
 	"testing"
 
+	"github.com/sagernet/quic-go"
+
 	"github.com/sagernet/sing-box/option"
 )
 
@@ -157,5 +159,25 @@ func TestNativeNaiveQUICCongestionControlValuesAreAccepted(t *testing.T) {
 	const unknownValueError = "unknown quic congestion control"
 	if unknownValueError == "" {
 		t.Fatal("the refusal message is part of the contract")
+	}
+}
+
+// TestNativeNaiveQUICConfigPinsReferenceVersions asserts the QUIC version list is
+// an explicit decision rather than an inherited library default.
+//
+// Caddy v2.10 pins Version1 and Version2 in its quic.Config. This fork previously
+// left the field unset, which happened to produce the same set because quic-go's
+// default is both - a dependency property, not a decision. The differential test
+// compares the accepted version sets at runtime; this test pins the configured
+// list, so a change to either is visible in a unit test as well.
+func TestNativeNaiveQUICConfigPinsReferenceVersions(t *testing.T) {
+	config := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
+
+	if len(config.Versions) != 2 {
+		t.Fatalf("expected exactly two pinned QUIC versions, got %v", config.Versions)
+	}
+	if config.Versions[0] != quic.Version1 || config.Versions[1] != quic.Version2 {
+		t.Fatalf("QUIC versions must be [v1 v2] to match the reference, got %v",
+			config.Versions)
 	}
 }

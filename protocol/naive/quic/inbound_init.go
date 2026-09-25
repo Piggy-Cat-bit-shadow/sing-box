@@ -57,6 +57,19 @@ import (
 // back to reference-like without discarding the production choice.
 func nativeNaiveQUICConfig(options option.NaiveInboundOptions) *quic.Config {
 	return &quic.Config{
+		// QUIC versions are pinned EXPLICITLY, matching the reference.
+		//
+		// Caddy v2.10's startHTTP3 builds
+		// &quic.Config{Versions: []quic.Version{quic.Version1, quic.Version2}},
+		// so v1 and v2 are a stated decision there, not an inherited default.
+		//
+		// Measured: this listener accepts exactly [v1 v2] and so does the
+		// reference. They agreed only because quic-go's default happens to be
+		// both, which is a dependency property - a dependency bump that changed
+		// it would silently drop v2 support here with nothing failing. Pinning
+		// makes the set a decision this repository owns, and the differential
+		// test compares the two sets so a divergence is visible.
+		Versions: []quic.Version{quic.Version1, quic.Version2},
 		// MaxIncomingStreams is deliberately NOT set, so it takes the quic-go
 		// default of 100 (internal/protocol.DefaultMaxIncomingStreams).
 		//
