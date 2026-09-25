@@ -69,12 +69,16 @@ Congestion control is set per connection in `ConnContext`, not in `quic.Config`:
 | `MaxIncomingStreams` | unset (default 100) | unset (default 100) | **PASS / ALIGNED** |
 | `DisablePathManager` | unset (false) | unset (false); opt-in via `quic_disable_path_manager` | **PASS / ALIGNED BY DEFAULT** |
 | Congestion control | quic-go default (CUBIC) | library default (CUBIC); opt-in via `quic_congestion_control` | **PASS / ALIGNED BY DEFAULT** |
-| `IdleTimeout` | from Caddy server config | library default | **DIFF / NOT-MEASURED** |
-| `MaxHeaderBytes` | from Caddy server config | unset/default | **DIFF / NOT-MEASURED** |
+| `IdleTimeout` | from Caddy server config (default 5 min) | library default | **DIFF / PARTIALLY MEASURED** - an idle connection survives 3s; a multi-minute bound was not measured |
+| `MaxHeaderBytes` | from Caddy server config | unset/default | **PASS (measured)** - a 2 MiB header is rejected by reset on BOTH sides |
 | Receive windows | unset/default | unset/default | **PASS** |
-| QUIC versions | explicit v1, v2 | library default v1, v2 | **DEPENDENCY-EQUIVALENT** |
-| H3 SETTINGS frame | library generated | library generated | **NOT-VERIFIED** |
+| QUIC versions | explicit v1, v2 | **explicit v1, v2 (pinned)** | **PASS / ALIGNED** |
+| H3 SETTINGS frame | library generated | library generated | **NOT-VERIFIED** (no packet capture) |
 | Connection migration | enabled (default) | enabled (default); disableable by configuration | **NOT-VERIFIED** (behaviour unmeasured either way) |
+| Padded response segmentation | `3 + payload + padding <= 65536`, padding drawn first | **aligned** (was `65535 + padding`, up to 65793) | **PASS / ALIGNED** |
+| Malformed CONNECT `:scheme`/`:path` | rejected | rejected, verified at runtime via extended CONNECT | **PASS** |
+| Half-close, client-first | upload reaches origin, reply survives | MATCH, padded and raw | **PASS** |
+| Half-close, origin-first | in-flight client bytes dropped | same | **SHARED BEHAVIOUR** (fork and reference agree) |
 
 ### The two rows that were previously reported differently
 
@@ -126,6 +130,35 @@ Verified by `TestNativeNaiveQUICConfigRefuses0RTT`, and the real HTTP/3 probes i
 reaches the origin with 0-RTT off.
 
 ---
+
+### What the differential actually runs
+
+`TestJiejieNaiveH3DifferentialAgainstReference` compares six cases against the
+pinned reference with BOTH sides measured, not assumed:
+
+| Case | Fork | Reference | Verdict |
+| --- | --- | --- | --- |
+| authenticated CONNECT | 200 + origin payload | 200 + origin payload | PASS |
+| CONNECT without credentials | 407 + challenge | 407 + challenge | PASS |
+| CONNECT with wrong credentials | 407 + challenge | 407 + challenge | PASS |
+| Padding negotiated | 200 + payload | 200 + payload | PASS |
+| no Padding header | 200 + payload | 200 + payload | PASS |
+| target dial failure | no tunnel data | no tunnel data | PASS |
+
+The dial-failure case writes into the tunnel before judging: a bare CONNECT to an
+unreachable target returns 200 on BOTH implementations because CONNECT is
+fast-open and the status is flushed before the dial, so comparing the status alone
+would have compared a value that does not reflect the dial.
+
+This differential runs in CI under `with_quic` (without `jiejie_server_minimal`),
+which is the only tag set that links `protocol/naive/quic`. A step fails the job if
+it SKIPPED, because a skip inside a green workflow is how this comparison went
+unmeasured before.
+
+QUIC versions are compared as SETS: the fork accepts exactly `[v1 v2]` and the
+reference accepts exactly `[v1 v2]`. They agreed previously only because quic-go's
+default happened to be both, so the list is now pinned explicitly and the test
+compares the two.
 
 ## 3. Behaviour differences that are now opt-in
 
