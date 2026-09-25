@@ -42,12 +42,20 @@ import (
 //     enable 0-RTT either: its quic.Config sets only Versions and Tracer. This
 //     fork prefers reference-like defaults.
 //
-// MaxIncomingStreams is intentionally left unset so the quic-go default applies.
-// DisablePathManager remains explicit. The latter is recorded in
-// docs/JIEJIE-NAIVE-H3-AUDIT.md as a difference from the reference that has NOT
-// been aligned, because aligning it needs runtime evidence rather than a config
-// diff.
-func nativeNaiveQUICConfig() *quic.Config {
+// The protocol default is reference-like: nothing that changes wire behaviour is
+// hardcoded. Properties Caddy leaves to quic-go - the path manager among them -
+// are left to quic-go here too, and the fork's production tuning is opt-in
+// through the inbound options.
+//
+// Rationale, matching how the rest of this fork treats retained differences: a
+// protocol implementation should not silently disagree with the reference. Where
+// this deployment WANTS different behaviour, that is stated in configuration,
+// where it can be seen, tested and reverted, rather than compiled in.
+//
+// See docs/JIEJIE-NAIVE-H3-AUDIT.md. DisablePathManager is recorded there as a
+// retained difference; making it configurable is what allows the default to go
+// back to reference-like without discarding the production choice.
+func nativeNaiveQUICConfig(options option.NaiveInboundOptions) *quic.Config {
 	return &quic.Config{
 		// MaxIncomingStreams is deliberately NOT set, so it takes the quic-go
 		// default of 100 (internal/protocol.DefaultMaxIncomingStreams).
@@ -75,7 +83,14 @@ func nativeNaiveQUICConfig() *quic.Config {
 		// removed the only server-side bound on concurrent HTTP/3 work on a
 		// ~1 GiB host. This aligns with the reference, whose quic.Config does not
 		// set the field either.
-		DisablePathManager: true,
+		//
+		// DisablePathManager is NOT set by default, so quic-go's default (path
+		// manager enabled) applies and the protocol default matches the
+		// reference. Caddy sets only Versions and Tracer on its quic.Config, so
+		// leaving the field unset is what "reference-like" means here. A
+		// deployment that wants migration disabled opts in explicitly through
+		// quic_disable_path_manager.
+		DisablePathManager: options.QUICDisablePathManager,
 	}
 }
 
@@ -107,8 +122,19 @@ func init() {
 		if timeFunc == nil {
 			timeFunc = time.Now
 		}
+		// Unset means "use the library default", which is CUBIC in quic-go and
+		// is therefore what the reference gets. The fork's BBR preference is a
+		// performance choice, so it is opted into by name rather than being what
+		// an unset field silently selects.
+		//
+		// This is why an empty value no longer maps to BBR: a protocol default
+		// that silently differs from the reference is exactly the kind of
+		// difference this audit exists to remove.
 		switch options.QUICCongestionControl {
-		case "", "bbr":
+		case "", "default":
+			// nil leaves quic-go's own default sender in place.
+			congestionControl = nil
+		case "bbr":
 			congestionControl = func(conn *quic.Conn) congestion.CongestionControl {
 				return congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard)
 			}
@@ -132,7 +158,7 @@ func init() {
 			return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 		}
 
-		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, nativeNaiveQUICConfig())
+		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, nativeNaiveQUICConfig(options))
 		if err != nil {
 			udpConn.Close()
 			return nil, err
@@ -141,7 +167,12 @@ func init() {
 		h3Server := &http3.Server{
 			Handler: handler,
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
-				conn.SetCongestionControl(congestionControl(conn))
+				// A nil selector means "keep quic-go's default congestion
+				// control". Calling SetCongestionControl with a nil would be a
+				// nil dereference, so it is skipped rather than guarded.
+				if congestionControl != nil {
+					conn.SetCongestionControl(congestionControl(conn))
+				}
 				return log.ContextWithNewID(ctx)
 			},
 		}

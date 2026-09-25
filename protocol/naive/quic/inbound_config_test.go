@@ -4,6 +4,8 @@ package quic
 
 import (
 	"testing"
+
+	"github.com/sagernet/sing-box/option"
 )
 
 // The Native Naive HTTP/3 listener must not accept 0-RTT.
@@ -21,7 +23,7 @@ import (
 // The pinned reference (Caddy v2.10.0 + forwardproxy@d62c80d3) does not enable it
 // either.
 func TestNativeNaiveQUICConfigRefuses0RTT(t *testing.T) {
-	config := nativeNaiveQUICConfig()
+	config := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
 
 	if config.Allow0RTT {
 		t.Fatal("Allow0RTT must be false: an early-data CONNECT is replayable, " +
@@ -37,13 +39,13 @@ func TestNativeNaiveQUICConfigRefuses0RTT(t *testing.T) {
 // TestNativeNaiveQUICConfigKeepsDocumentedSettings pins the settings that ARE
 // set, so the 0-RTT fix cannot be mistaken for a general reset of this config.
 //
-// MaxIncomingStreams is asserted to stay UNSET, which keeps it aligned with the
-// reference's library default. DisablePathManager remains a deliberate
-// difference from the reference and is recorded as such in
-// docs/JIEJIE-NAIVE-H3-AUDIT.md; it is asserted here so a change to it is a
-// visible decision rather than an accident.
+// The protocol default must be reference-like: MaxIncomingStreams stays UNSET so
+// the quic-go default applies, and DisablePathManager stays UNSET so the path
+// manager is enabled, which is what Caddy's quic.Config produces. Disabling
+// migration is a production choice that is now opted into through the inbound
+// options, so the default no longer carries it.
 func TestNativeNaiveQUICConfigKeepsDocumentedSettings(t *testing.T) {
-	config := nativeNaiveQUICConfig()
+	config := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
 
 	// MaxIncomingStreams must stay UNSET so the library default (100) applies.
 	// It was 1 << 60, which is quic-go's own internal "unlimited" sentinel rather
@@ -55,9 +57,10 @@ func TestNativeNaiveQUICConfigKeepsDocumentedSettings(t *testing.T) {
 		t.Fatalf("MaxIncomingStreams must be left unset so the library default "+
 			"applies, got %d", config.MaxIncomingStreams)
 	}
-	if !config.DisablePathManager {
-		t.Fatal("DisablePathManager changed; connection migration behaviour is " +
-			"recorded in the H3 audit and needs a migration test before changing")
+	if config.DisablePathManager {
+		t.Fatal("DisablePathManager must default to the reference's behaviour " +
+			"(path manager enabled); disabling migration is an explicit opt-in, " +
+			"not a protocol default")
 	}
 }
 
@@ -68,8 +71,8 @@ func TestNativeNaiveQUICConfigKeepsDocumentedSettings(t *testing.T) {
 // same class of cross-contamination that the TLS ALPN work fixed for the TLS
 // config. Returning a fresh value keeps each listener independent.
 func TestNativeNaiveQUICConfigIsNotShared(t *testing.T) {
-	first := nativeNaiveQUICConfig()
-	second := nativeNaiveQUICConfig()
+	first := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
+	second := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
 	if first == second {
 		t.Fatal("nativeNaiveQUICConfig must return a fresh config per call, not a " +
 			"shared package-level pointer")
@@ -77,5 +80,43 @@ func TestNativeNaiveQUICConfigIsNotShared(t *testing.T) {
 	first.Allow0RTT = true
 	if second.Allow0RTT {
 		t.Fatal("mutating one config must not affect another")
+	}
+}
+
+// TestNativeNaiveQUICConfigDisablesPathManagerOnlyWhenAsked pins the opt-in.
+//
+// The fork's production deployment disables connection migration, which is a
+// legitimate choice but a behaviour difference from the reference. It must
+// therefore be reachable by configuration and absent by default, so the two
+// states are both assertable rather than one being compiled in.
+func TestNativeNaiveQUICConfigDisablesPathManagerOnlyWhenAsked(t *testing.T) {
+	enabled := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
+	if enabled.DisablePathManager {
+		t.Fatal("the default must leave the path manager enabled, matching the reference")
+	}
+
+	optedIn := nativeNaiveQUICConfig(option.NaiveInboundOptions{QUICDisablePathManager: true})
+	if !optedIn.DisablePathManager {
+		t.Fatal("quic_disable_path_manager must actually disable it when set")
+	}
+}
+
+// TestNativeNaiveQUICConfigLeavesUnsetFieldsToTheLibrary asserts that nothing
+// which changes wire behaviour is hardcoded.
+//
+// This is the property that makes the default reference-like: the config carries
+// no opinion where Caddy carries none either. A future addition that hardcodes a
+// protocol-visible field fails here and has to be argued for.
+func TestNativeNaiveQUICConfigLeavesUnsetFieldsToTheLibrary(t *testing.T) {
+	config := nativeNaiveQUICConfig(option.NaiveInboundOptions{})
+
+	if config.MaxIncomingStreams != 0 {
+		t.Fatalf("MaxIncomingStreams must stay unset, got %d", config.MaxIncomingStreams)
+	}
+	if config.Allow0RTT {
+		t.Fatal("Allow0RTT must stay false")
+	}
+	if config.DisablePathManager {
+		t.Fatal("DisablePathManager must stay unset by default")
 	}
 }

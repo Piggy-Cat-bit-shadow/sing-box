@@ -67,14 +67,14 @@ Congestion control is set per connection in `ConnContext`, not in `quic.Config`:
 | --- | --- | --- | --- |
 | `Allow0RTT` | unset (false) | unset (false) | **PASS / ALIGNED** |
 | `MaxIncomingStreams` | unset (default 100) | unset (default 100) | **PASS / ALIGNED** |
-| `DisablePathManager` | unset (false) | `true` | **RETAINED-DIFF / UNVERIFIED** |
-| Congestion control | quic-go default (CUBIC) | **BBR** default | **RETAINED-PERFORMANCE-DIFF** |
+| `DisablePathManager` | unset (false) | unset (false); opt-in via `quic_disable_path_manager` | **PASS / ALIGNED BY DEFAULT** |
+| Congestion control | quic-go default (CUBIC) | library default (CUBIC); opt-in via `quic_congestion_control` | **PASS / ALIGNED BY DEFAULT** |
 | `IdleTimeout` | from Caddy server config | library default | **DIFF / NOT-MEASURED** |
 | `MaxHeaderBytes` | from Caddy server config | unset/default | **DIFF / NOT-MEASURED** |
 | Receive windows | unset/default | unset/default | **PASS** |
 | QUIC versions | explicit v1, v2 | library default v1, v2 | **DEPENDENCY-EQUIVALENT** |
 | H3 SETTINGS frame | library generated | library generated | **NOT-VERIFIED** |
-| Connection migration | enabled (default) | disabled | **NOT-VERIFIED** |
+| Connection migration | enabled (default) | enabled (default); disableable by configuration | **NOT-VERIFIED** (behaviour unmeasured either way) |
 
 ### The two rows that were previously reported differently
 
@@ -127,22 +127,25 @@ reaches the origin with 0-RTT off.
 
 ---
 
-## 3. The two retained differences
+## 3. Behaviour differences that are now opt-in
 
-Neither is called "parity", and neither is called intentional in the strong sense
-(source + runtime + product decision). Both rest on source evidence and an
-explicit product decision, with **no runtime measurement**.
+Both of the differences this audit previously carried as hardcoded are now
+configuration, so the protocol default matches the reference and the fork's
+preference is an explicit choice.
 
-**`DisablePathManager: true`** - a client that changes its network path (for
-example Wi-Fi to cellular) will not have its connection migrated; it must
-reconnect. Caddy leaves the path manager on. The current product choice is to
-retain this. **Migration behaviour has not been measured**, so this is recorded as
-retained and unverified, not as a verified intentional difference.
+**Connection migration (`quic_disable_path_manager`)** - the default leaves the
+path manager enabled, which is what Caddy's `quic.Config` produces (it sets only
+`Versions` and `Tracer`). A deployment that wants a client changing network path
+to reconnect instead of migrating sets the option. The production topology does
+not set it, so the default applies there too.
 
-**BBR congestion control** - kept as an explicit performance choice. There is **no
-controlled BBR-vs-CUBIC benchmark** (RTT and loss held constant) in this audit, so
-this is a retained performance difference **by policy, not benchmark-validated**.
-It is not claimed to be the more correct choice, only the current one.
+**Congestion control (`quic_congestion_control`)** - an unset value now means the
+library default (CUBIC in quic-go), not BBR. The fork's BBR preference is selected
+by name. There is still **no controlled BBR-vs-CUBIC benchmark** (RTT and loss held
+constant), so BBR is not claimed to be the better choice, only an available one.
+
+Neither difference is called "parity": the defaults are aligned and asserted,
+while the behaviours themselves remain unmeasured.
 
 ---
 

@@ -17,6 +17,17 @@ type NaiveInboundOptions struct {
 	Users                 []auth.User `json:"users,omitempty"`
 	Network               NetworkList `json:"network,omitempty"`
 	QUICCongestionControl string      `json:"quic_congestion_control,omitempty" enum:"bbr,cubic,reno"`
+	// QUICDisablePathManager turns off QUIC connection migration.
+	//
+	// Unset (the default) leaves quic-go's default, which has the path manager
+	// ENABLED. That is what the reference does: Caddy sets only Versions and
+	// Tracer on its quic.Config, so an unset field is reference-like.
+	//
+	// Disabling migration is a legitimate production choice - a client that
+	// changes network path reconnects instead of migrating - but it is a
+	// BEHAVIOUR difference from the reference, so it must be opted into rather
+	// than compiled into the protocol default.
+	QUICDisablePathManager bool `json:"quic_disable_path_manager,omitempty"`
 	// Masquerade handles requests that are NOT authenticated Naive proxy
 	// requests -- ordinary browser traffic, probes, and proxy attempts with no
 	// or wrong credentials. It uses the same schema and semantics as the
