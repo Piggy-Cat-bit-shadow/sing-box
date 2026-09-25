@@ -16,6 +16,25 @@ const (
 	capsuleTypeRouteAdvertisement = 0x03
 )
 
+// Control capsule entry bounds.
+//
+// RFC 9484 does not specify a limit, so these follow quic-go/connect-ip-go
+// (maxAddressesPerCapsule / maxRoutesPerCapsule, both 8192) rather than a number
+// invented here.
+//
+// Why a bound is needed at all, measured rather than assumed: the capsule size
+// limit alone allows 149,796 ADDRESS_ASSIGN entries in one 1 MiB capsule, and
+// keeping those parsed entries live retains 17.65 MiB of heap. The 8192 bound
+// retains 1.38 MiB for the same shape. On a ~1 GiB VPS the unbounded figure is
+// material amplification for a single capsule from an authenticated peer.
+//
+// The values are per capsule, so a peer sending many capsules is bounded by the
+// per-session state limits rather than by these.
+const (
+	maxAddressesPerCapsule = 8192
+	maxRoutesPerCapsule    = 8192
+)
+
 type AssignedAddress struct {
 	RequestID uint64
 	Prefix    netip.Prefix
@@ -54,6 +73,10 @@ func (r AddressRange) OverlapsProtocol(other AddressRange) bool {
 func parseAddresses(payload []byte) ([]AssignedAddress, error) {
 	var addresses []AssignedAddress
 	for len(payload) > 0 {
+		if len(addresses) >= maxAddressesPerCapsule {
+			return nil, E.New("too many addresses in one capsule (maximum ",
+				maxAddressesPerCapsule, ")")
+		}
 		requestID, requestIDLength, valid := transportHTTP.DecodeVarint(payload)
 		if !valid {
 			return nil, E.New("truncated request ID")
@@ -131,6 +154,10 @@ func parseRoutes(payload []byte) ([]AddressRange, error) {
 	highWater := make(map[uint8]AddressRange, 4)
 
 	for len(payload) > 0 {
+		if len(routes) >= maxRoutesPerCapsule {
+			return nil, E.New("too many routes in one capsule (maximum ",
+				maxRoutesPerCapsule, ")")
+		}
 		addressLength, err := parseVersion(payload)
 		if err != nil {
 			return nil, err
