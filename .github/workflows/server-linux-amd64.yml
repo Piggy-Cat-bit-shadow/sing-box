@@ -134,6 +134,53 @@ jobs:
           cd test/jiejie
           go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../../integration-production.log
 
+      # Differential compatibility against the REFERENCE implementation
+      # (klzgrad/forwardproxy@naive behind Caddy), which is what the Naive
+      # protocol is defined by. The reference is pinned here, never @latest, so
+      # the comparison cannot drift underneath the suite.
+      #
+      # The reference checkout is cached by commit, because building Caddy takes
+      # several minutes. A cache miss rebuilds; it does not fail the job, and the
+      # harness SKIPs with an explicit message if the binary cannot be produced -
+      # "not compared" is reported as SKIP, never as a pass.
+      - name: Differential test against the reference Caddy/forwardproxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          REF_COMMIT=d62c80d3dd2c706b6b87579844d2397bddd18317
+          REF_DIR="$RUNNER_TEMP/forwardproxy-ref"
+
+          git init -q "$REF_DIR"
+          git -C "$REF_DIR" remote add origin https://github.com/klzgrad/forwardproxy.git
+          if ! git -C "$REF_DIR" fetch -q --depth 1 origin "$REF_COMMIT"; then
+            echo "::warning::could not fetch the reference; the differential test will SKIP"
+          else
+            git -C "$REF_DIR" checkout -q FETCH_HEAD
+            ACTUAL=$(git -C "$REF_DIR" rev-parse HEAD)
+            if [ "$ACTUAL" != "$REF_COMMIT" ]; then
+              echo "::error::reference checkout is $ACTUAL, expected $REF_COMMIT"
+              exit 1
+            fi
+          fi
+
+          cd test/jiejie
+          JIEJIE_CADDY_REFERENCE_SOURCE="$REF_DIR" \
+          JIEJIE_PARITY_REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json" \
+            go test -tags "$TAGS" -v -count=1 -timeout 25m \
+              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity' . \
+            2>&1 | tee ../../naive-parity.log
+
+      - name: Publish the Naive compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: naive-caddy-parity-${{ github.sha }}
+          path: |
+            naive-caddy-parity.json
+            naive-parity.log
+          if-no-files-found: warn
+
       # Runs the REAL cmd/sing-box binary as a separate process and drives traffic
       # at it from the test process. Everything above this uses include.Context +
       # box.New + Start, which is in-process integration and never exercises
