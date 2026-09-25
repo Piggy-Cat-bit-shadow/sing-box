@@ -348,14 +348,28 @@ func TestJiejieNaiveSelfHostedWebRoute(t *testing.T) {
 
 		sshEnv := startSelfACLInstance(t, selfAddress, sshPort, 0)
 		conn := naiveTLSConn(t, sshEnv.port)
+		// The tunnel must stay open until the dial has been observed. The server
+		// flushes 200 BEFORE dialling the origin (CONNECT fast open, matching the
+		// reference), so closing the connection right after reading the response
+		// cancels the server's in-flight dial context and the origin is never
+		// reached. That is a race, not a rejection: it passed whenever the dial
+		// happened to win. Closing here is deferred rather than done inline, and
+		// the body is deliberately not closed either, because for a hijacked
+		// HTTP/1.1 tunnel the body IS the tunnel.
+		defer conn.Close()
+
 		response, err := naiveWriteConnect(t, conn, ssh.addr, map[string]string{
 			"Proxy-Authorization": naiveBasicAuth(),
+			"Padding":             "~~~~~~~~",
 		})
 		require.NoError(t, err, "the SSH exception must still be answered")
 		require.Equal(t, http.StatusOK, response.StatusCode)
-		naiveCloseResponse(conn)
+
+		// A bounded poll, not an instant read: the connection lands slightly after
+		// the response, so an immediate assertion would fail on a correct server.
 		require.True(t, waitForDial(&ssh.conns, 0),
-			"the SSH exception must survive the self-hosted web routing change")
+			"the SSH exception must survive the self-hosted web routing change; "+
+				"the origin saw %d connections after the poll deadline", ssh.conns.Load())
 	})
 }
 
