@@ -61,12 +61,88 @@ const (
 )
 
 // parityResult is one row of the compatibility report.
+//
+// The JSON shape is the machine-readable artifact contract: consumers key on
+// `verdict`, and every row states which reference it was compared against so a
+// report cannot be read without knowing that.
 type parityResult struct {
-	Name    string `json:"name"`
-	Caddy   string `json:"caddy"`
-	SingBox string `json:"sing_box"`
+	Protocol  string `json:"protocol"`
+	Name      string `json:"case"`
+	Reference string `json:"reference"`
+	SingBox   string `json:"sing_box"`
+	// Verdict is one of PASS, DIFF, INTENTIONAL-DIFF, NOT-TESTED.
 	Verdict string `json:"verdict"`
-	Detail  string `json:"detail,omitempty"`
+	Reason  string `json:"reason,omitempty"`
+	// ReferenceCommit and CaddyVersion identify what the comparison was against.
+	ReferenceCommit string `json:"reference_commit"`
+	CaddyVersion    string `json:"caddy_version"`
+}
+
+// parityReport is the top-level artifact.
+type parityReport struct {
+	GeneratedAt     string         `json:"generated_at"`
+	ReferenceCommit string         `json:"reference_commit"`
+	CaddyVersion    string         `json:"caddy_version"`
+	Summary         map[string]int `json:"summary"`
+	Cases           []parityResult `json:"cases"`
+}
+
+// writeParityReport emits the machine-readable report.
+//
+// The summary counts every verdict, and any NOT-TESTED case is called out
+// explicitly so a reader cannot mistake "the comparison did not run" for "the
+// comparison passed".
+func writeParityReport(t *testing.T, results []parityResult) {
+	t.Helper()
+	path := os.Getenv("JIEJIE_PARITY_REPORT")
+	if path == "" {
+		return
+	}
+
+	summary := make(map[string]int)
+	for _, result := range results {
+		summary[result.Verdict]++
+	}
+
+	report := parityReport{
+		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
+		ReferenceCommit: CaddyReferenceCommit,
+		CaddyVersion:    CaddyReferenceVersion,
+		Summary:         summary,
+		Cases:           results,
+	}
+
+	// MERGE rather than clobber. The H1 and H2 differentials are separate tests
+	// writing to the same artifact path, so writing outright would leave a report
+	// containing whichever ran last - a report that silently omits a protocol is
+	// worse than no report, because it reads as full coverage.
+	if existing, readErr := os.ReadFile(path); readErr == nil {
+		var previous parityReport
+		if json.Unmarshal(existing, &previous) == nil {
+			report.Cases = append(previous.Cases, report.Cases...)
+			merged := make(map[string]int)
+			for _, one := range report.Cases {
+				merged[one.Verdict]++
+			}
+			report.Summary = merged
+		}
+	}
+
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		t.Logf("could not encode the parity report: %v", err)
+		return
+	}
+	if err = os.WriteFile(path, encoded, 0o644); err != nil {
+		t.Logf("could not write the parity report to %s: %v", path, err)
+		return
+	}
+	t.Logf("machine-readable report written to %s: %v", path, report.Summary)
+
+	if notTested := report.Summary["NOT-TESTED"]; notTested > 0 {
+		t.Logf("REFERENCE COMPARISON: NOT-TESTED for %d case(s) - see the report",
+			notTested)
+	}
 }
 
 // parityProbe is one observable interaction, run against both servers.
@@ -76,11 +152,12 @@ type parityProbe struct {
 
 	// knownDivergence, when set, marks a difference that has been investigated and
 	// is INTENTIONAL on our side. The probe is still run and its two results are
-	// still printed, and the verdict becomes KNOWN-DIFF rather than PASS or DIFF.
+	// still printed, and the verdict becomes INTENTIONAL-DIFF rather than PASS or DIFF.
 	// Leaving it unset means the probe is expected to match exactly.
 	//
-	// This is NOT an escape hatch for an unexplained failure. The bar is that all
-	// four of these exist and are recorded in the string:
+	// The label is INTENTIONAL-DIFF, and it is NOT an escape hatch for an
+	// unexplained failure. The bar is that all four of these exist and are
+	// recorded in the string:
 	//
 	//   1. pinned-source evidence for what the reference does;
 	//   2. runtime reproduction through this harness;
@@ -559,7 +636,7 @@ func parityProbes(originAddr, unreachableAddr string, validAuth string) []parity
 			run: probeH1Connect(originAddr, map[string]string{
 				"Proxy-Authorization": "Basic " + validAuth,
 			}, []byte("GET / HTTP/1.1\r\nHost: "+originAddr+"\r\nConnection: close\r\n\r\n")),
-			// This was previously recorded as a KNOWN-DIFF claiming the
+			// This was previously recorded as a INTENTIONAL-DIFF claiming the
 			// reference parses tunnelled bytes as a new HTTP request and answers
 			// 407. That claim was WRONG and has been removed.
 			//
@@ -629,9 +706,12 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 		singBoxObservation := probe.run(t, "127.0.0.1:"+strconv.Itoa(int(singBoxEnv.port)))
 
 		result := parityResult{
-			Name:    probe.name,
-			Caddy:   referenceObservation.summary(),
-			SingBox: singBoxObservation.summary(),
+			Protocol:        "h1",
+			Name:            probe.name,
+			Reference:       referenceObservation.summary(),
+			SingBox:         singBoxObservation.summary(),
+			ReferenceCommit: CaddyReferenceCommit,
+			CaddyVersion:    CaddyReferenceVersion,
 		}
 		switch {
 		case referenceObservation.equal(singBoxObservation):
@@ -643,12 +723,12 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 			require.Contains(t, probe.knownDivergence, CaddyReferenceCommit,
 				"probe %q claims an intentional divergence but does not name the "+
 					"pinned reference commit it was verified against", probe.name)
-			result.Verdict = "KNOWN-DIFF"
-			result.Detail = probe.knownDivergence + " | observed: " +
+			result.Verdict = "INTENTIONAL-DIFF"
+			result.Reason = probe.knownDivergence + " | observed: " +
 				referenceObservation.difference(singBoxObservation)
 		default:
 			result.Verdict = "DIFF"
-			result.Detail = referenceObservation.difference(singBoxObservation)
+			result.Reason = referenceObservation.difference(singBoxObservation)
 		}
 		results = append(results, result)
 	}
@@ -656,15 +736,9 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 	report := renderParityReport(results)
 	t.Logf("\n%s", report)
 
-	// The report is also written out so CI can publish it as an artifact
-	// without parsing test logs.
-	if path := os.Getenv("JIEJIE_PARITY_REPORT"); path != "" {
-		encoded, err := json.MarshalIndent(results, "", "  ")
-		if err == nil {
-			_ = os.WriteFile(path, encoded, 0o644)
-			t.Logf("machine-readable report written to %s", path)
-		}
-	}
+	// The report is also written out so CI can publish it as an artifact without
+	// parsing test logs.
+	writeParityReport(t, results)
 
 	unexplained := 0
 	known := 0
@@ -672,7 +746,7 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 		switch result.Verdict {
 		case "DIFF":
 			unexplained++
-		case "KNOWN-DIFF":
+		case "INTENTIONAL-DIFF":
 			known++
 		}
 	}
@@ -742,13 +816,14 @@ func renderParityReport(results []parityResult) string {
 	builder.WriteString("\nNaive Caddy Compatibility Report\n")
 	builder.WriteString("reference: caddy " + CaddyReferenceVersion +
 		" + forwardproxy@" + CaddyReferenceCommit + "\n\n")
-	builder.WriteString(fmt.Sprintf("%-52s %-6s %s\n", "PROBE", "VERDICT", "OBSERVATION"))
+	builder.WriteString(fmt.Sprintf("%-6s %-52s %-6s %s\n", "PROTO", "CASE", "VERDICT", "OBSERVATION"))
 	builder.WriteString(strings.Repeat("-", 110) + "\n")
 	for _, result := range results {
-		builder.WriteString(fmt.Sprintf("%-52s %-6s %s\n", result.Name, result.Verdict, result.SingBox))
+		builder.WriteString(fmt.Sprintf("%-6s %-52s %-6s %s\n",
+			result.Protocol, result.Name, result.Verdict, result.SingBox))
 		if result.Verdict != "PASS" {
-			builder.WriteString(fmt.Sprintf("%-52s %-6s %s\n", "", "", "  caddy:   "+result.Caddy))
-			builder.WriteString(fmt.Sprintf("%-52s %-6s %s\n", "", "", "  detail:  "+result.Detail))
+			builder.WriteString(fmt.Sprintf("%-6s %-52s %-6s %s\n", "", "", "", "  reference: "+result.Reference))
+			builder.WriteString(fmt.Sprintf("%-6s %-52s %-6s %s\n", "", "", "", "  reason:    "+result.Reason))
 		}
 	}
 	return builder.String()
@@ -1043,20 +1118,26 @@ func TestJiejieNaiveH2DifferentialAgainstReference(t *testing.T) {
 		singBoxObservation := testCase.probe(t, "127.0.0.1:"+strconv.Itoa(int(env.port)))
 
 		result := parityResult{
-			Name:    testCase.name,
-			Caddy:   referenceObservation.summary(),
-			SingBox: singBoxObservation.summary(),
+			Protocol:        "h2",
+			Name:            testCase.name,
+			Reference:       referenceObservation.summary(),
+			SingBox:         singBoxObservation.summary(),
+			ReferenceCommit: CaddyReferenceCommit,
+			CaddyVersion:    CaddyReferenceVersion,
 		}
 		if referenceObservation.equal(singBoxObservation) {
 			result.Verdict = "PASS"
 		} else {
 			result.Verdict = "DIFF"
-			result.Detail = referenceObservation.difference(singBoxObservation)
+			result.Reason = referenceObservation.difference(singBoxObservation)
 		}
 		results = append(results, result)
-		t.Logf("%-45s %-6s singbox:[%s] caddy:[%s]",
-			testCase.name, result.Verdict, result.SingBox, result.Caddy)
+		t.Logf("%-6s %-45s %-6s singbox:[%s] reference:[%s]",
+			result.Protocol, testCase.name, result.Verdict,
+			result.SingBox, result.Reference)
 	}
+
+	writeParityReport(t, results)
 
 	unexplained := 0
 	for _, result := range results {

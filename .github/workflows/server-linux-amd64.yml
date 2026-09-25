@@ -194,6 +194,52 @@ jobs:
               -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity' . \
             2>&1 | tee ../../naive-parity.log
 
+      - name: Summarise the Naive compatibility report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json"
+          {
+            echo "## Naive / Caddy differential"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ! -s "$REPORT" ]; then
+            # The distinction this whole step exists for: a report that is absent
+            # means the comparison did NOT run, which must never read as parity.
+            {
+              echo "**REFERENCE COMPARISON: NOT-TESTED**"
+              echo ""
+              echo "No parity report was produced, so no case was compared against"
+              echo "the reference. This is \`NOT-TESTED\`, not \`PASS\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          python3 - "$REPORT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          summary = report.get("summary", {})
+          print(f"reference: caddy {report.get('caddy_version')} + "
+                f"forwardproxy@{report.get('reference_commit')}")
+          print("")
+          print("| verdict | count |")
+          print("| --- | --- |")
+          for verdict in ("PASS", "INTENTIONAL-DIFF", "DIFF", "NOT-TESTED"):
+              if verdict in summary:
+                  print(f"| {verdict} | {summary[verdict]} |")
+          print("")
+          if summary.get("NOT-TESTED"):
+              print(f"**REFERENCE COMPARISON: NOT-TESTED for "
+                    f"{summary['NOT-TESTED']} case(s)** - these were not compared "
+                    f"against the reference and must not be read as passing.")
+          for case in report.get("cases", []):
+              if case.get("verdict") != "PASS":
+                  print(f"- `{case.get('protocol')}` {case.get('verdict')}: "
+                        f"{case.get('case')}")
+          PY
+
       - name: Publish the Naive compatibility report
         if: always()
         uses: actions/upload-artifact@v4
