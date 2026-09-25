@@ -67,6 +67,21 @@ func requireFullNaiveRegistry(t *testing.T) {
 // masquerade pointing at a decoy web backend.
 func startNaiveInbound(t *testing.T, withMasquerade bool) *naiveTestEnv {
 	t.Helper()
+	// tcp is the shipped production topology; the network list is a parameter
+	// only for the ALPN isolation tests, which need a tcp+udp inbound so the
+	// HTTP/3 initialiser actually runs.
+	return startNaiveInboundWithNetworkAndMasquerade(t, "tcp", withMasquerade)
+}
+
+// startNaiveInboundWithNetwork starts a Naive inbound with an explicit network
+// list. Used to compare a tcp-only inbound against a tcp+udp one.
+func startNaiveInboundWithNetwork(t *testing.T, network string) uint16 {
+	t.Helper()
+	return startNaiveInboundWithNetworkAndMasquerade(t, network, false).port
+}
+
+func startNaiveInboundWithNetworkAndMasquerade(t *testing.T, network string, withMasquerade bool) *naiveTestEnv {
+	t.Helper()
 	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
@@ -82,7 +97,7 @@ func startNaiveInbound(t *testing.T, withMasquerade bool) *naiveTestEnv {
 			Listen:     minimalLoopback(),
 			ListenPort: port,
 		},
-		Network: option.NetworkList("tcp"),
+		Network: option.NetworkList(network),
 		Users: []auth.User{{
 			Username: naiveTestUser,
 			Password: naiveTestPassword,
