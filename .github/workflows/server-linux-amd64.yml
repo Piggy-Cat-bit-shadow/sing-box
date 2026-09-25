@@ -212,7 +212,10 @@ jobs:
           # build-tagged on with_quic.
           echo ""
           echo "=== transport/http unit tests (QUIC linked) ==="
-          go test -tags "$H3_TAGS" -count=1 -timeout 10m ./transport/http/ \
+          # Run from the repository root: this step has already cd'd into
+          # test/jiejie, which is a SEPARATE Go module, so ./transport/... does
+          # not resolve there.
+          (cd ../.. && go test -tags "$H3_TAGS" -count=1 -timeout 10m ./transport/http/) \
             2>&1 | tee -a ../../naive-h3-integration.log
           echo ""
           echo "=== protocol/naive/quic unit tests (QUIC linked) ==="
