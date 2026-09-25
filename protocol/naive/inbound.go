@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -441,6 +442,31 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	hostPort := request.URL.Host
 	if hostPort == "" {
 		hostPort = request.Host
+	}
+	// A malformed PORT must be refused rather than silently coerced.
+	//
+	// M.ParseSocksaddr tolerates a port it cannot parse: it falls back to
+	// treating the whole value as a host and leaves the port at 0, and the result
+	// still reports IsValid. So "example.com:44a" became example.com with port 0,
+	// and the tunnel would connect somewhere the client never asked for - with
+	// port 0 meaning "any port" to some dialers rather than "no port" - while the
+	// routed and logged destination disagreed with the requested one.
+	//
+	// The reference refuses all of these with 400 Bad Request. Measured against
+	// the pinned build, these each receive 400:
+	//
+	//	example.com:44a     example.com:443     example.com:443#frag
+	//	example.com:44 3    [2001:db8::1:443
+	//
+	// The check is deliberately narrow: only the PORT is validated. A missing
+	// port is legitimate (the reference accepts a bare host), and a host that is
+	// not an address is a perfectly valid FQDN.
+	if _, portText, splitErr := net.SplitHostPort(hostPort); splitErr == nil && portText != "" {
+		if _, portErr := strconv.ParseUint(portText, 10, 16); portErr != nil {
+			n.serveWebOrReject(ctx, writer, request, http.StatusBadRequest,
+				E.New("invalid CONNECT port: ", hostPort))
+			return
+		}
 	}
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 	if !destination.IsValid() {
