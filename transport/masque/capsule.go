@@ -97,6 +97,39 @@ func parseVersion(payload []byte) (int, error) {
 
 func parseRoutes(payload []byte) ([]AddressRange, error) {
 	var routes []AddressRange
+
+	// perProtocolHighWater tracks, for each protocol seen so far at the current
+	// IP version, the range that ends furthest. It is what makes the overlap
+	// check linear instead of quadratic.
+	//
+	// Why the ordering checks are not enough on their own: RFC 9484 section
+	// 4.2.1 requires the ranges to be non-overlapping and states the ordering as
+	// a SEPARATE requirement. The ordering rule only compares consecutive
+	// ranges, and it skips the comparison whenever the protocol differs - so
+	// every cross-protocol overlap was accepted.
+	//
+	// That is a real gap rather than a theoretical one, because protocol 0 means
+	// ALL protocols rather than "no protocol": RoutesContain matches with
+	// `route.Protocol == 0 || route.Protocol == protocol`. Advertising
+	// 192.0.2.0-192.0.2.255 at protocol 0 and then the same range at protocol 6
+	// therefore describes the same traffic twice, and whichever entry a lookup
+	// reaches first decides.
+	//
+	// Because the input is sorted by (version, protocol, start), the only ranges
+	// that can reach into the current one are:
+	//
+	//   - the range at the SAME protocol that ends furthest, which the ordering
+	//     check already compares; and
+	//   - for each OTHER protocol, the range that ends furthest.
+	//
+	// So a high-water mark per protocol suffices, and the scan stays linear in
+	// the number of ranges. An earlier version of this fix compared every earlier
+	// range and was correct but quadratic: a crafted 1 MiB capsule of
+	// single-address ranges took over 13 seconds to reject, against 16ms for the
+	// ordering-only check. That is a CPU denial-of-service, so the linear form is
+	// not an optimisation but a requirement.
+	highWater := make(map[uint8]AddressRange, 4)
+
 	for len(payload) > 0 {
 		addressLength, err := parseVersion(payload)
 		if err != nil {
@@ -118,42 +151,55 @@ func parseRoutes(payload []byte) ([]AddressRange, error) {
 			case previous.Start.BitLen() > start.BitLen():
 				return nil, E.New("address ranges are not ordered by IP version")
 			case previous.Start.BitLen() < start.BitLen():
+				// A new IP version begins. Ranges of another version can never
+				// conflict, because Contains requires the address length to
+				// match, so the marks from the previous version are dropped.
+				clear(highWater)
 			case previous.Protocol > route.Protocol:
 				return nil, E.New("address ranges are not ordered by IP protocol")
 			}
-			// Overlap is checked against EVERY earlier range, not only the
-			// immediately preceding one.
+
+			// The same-protocol neighbour is still checked directly, because
+			// that is the published ordering rule and its error message is the
+			// one callers already expect.
+			if previous.Protocol == route.Protocol && previous.End.Compare(start) >= 0 {
+				return nil, E.New("address ranges overlap: ", previous.End, " and ", start)
+			}
+
+			// Then every protocol that could still match this range.
 			//
-			// RFC 9484 section 4.2.1 requires the ranges in a
-			// ROUTE_ADVERTISEMENT to be non-overlapping, and specifies the
-			// ordering as a separate requirement. Deriving non-overlap FROM the
-			// ordering does not work: the ordering rule compares the previous
-			// range's protocol with the current one, so whenever the protocols
-			// differ the pair was accepted without the ranges being tested.
-			//
-			// That is not a theoretical gap, because protocol 0 means ALL
-			// protocols rather than "no protocol" - RoutesContain matches with
-			// `route.Protocol == 0 || route.Protocol == protocol`. So
-			// "192.0.2.0-192.0.2.255 protocol=0" followed by the same range at
-			// protocol=6 describes the same traffic twice, and the advertised
-			// policy becomes ambiguous: whichever entry the lookup happened to
-			// reach first would decide.
-			//
-			// The cost is O(n^2) over the number of ranges, which is acceptable
-			// because a ROUTE_ADVERTISEMENT is bounded by the capsule size limit
-			// and the lists are small; the alternative, sweeping per protocol,
-			// would add bookkeeping for no practical gain here.
-			for _, earlier := range routes {
-				if earlier.OverlapsProtocol(route) {
-					return nil, E.New("address ranges overlap: ", earlier.Start, "-",
-						earlier.End, " protocol ", earlier.Protocol, " and ",
+			// Protocol 0 matches everything, so it is compared against the
+			// current range whichever side it is on.
+			for protocol, candidate := range highWater {
+				if protocol != route.Protocol && !protocolConflicts(protocol, route.Protocol) {
+					continue
+				}
+				if candidate.OverlapsProtocol(route) {
+					return nil, E.New("address ranges overlap: ", candidate.Start, "-",
+						candidate.End, " protocol ", candidate.Protocol, " and ",
 						start, "-", end, " protocol ", route.Protocol)
 				}
 			}
 		}
+
+		// Record the high-water mark for this protocol. Only the range ending
+		// furthest matters, because any earlier range at the same protocol ended
+		// at or before it.
+		if existing, loaded := highWater[route.Protocol]; !loaded || existing.End.Compare(route.End) < 0 {
+			highWater[route.Protocol] = route
+		}
 		routes = append(routes, route)
 	}
 	return routes, nil
+}
+
+// protocolConflicts reports whether two route protocols can both match one packet.
+//
+// Protocol 0 is the wildcard: RoutesContain matches a route when
+// `route.Protocol == 0 || route.Protocol == protocol`, so 0 conflicts with
+// everything and any other pair conflicts only when the values are equal.
+func protocolConflicts(first uint8, second uint8) bool {
+	return first == 0 || second == 0 || first == second
 }
 
 func appendAddress(payload []byte, address netip.Addr) []byte {

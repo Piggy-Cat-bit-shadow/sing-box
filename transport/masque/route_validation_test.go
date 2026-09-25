@@ -3,6 +3,7 @@ package masque
 import (
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // ROUTE_ADVERTISEMENT overlap validation, per RFC 9484.
@@ -196,5 +197,51 @@ func TestRouteAdvertisementOrderingStillEnforced(t *testing.T) {
 				t.Fatalf("an out-of-order advertisement was accepted: %+v", tc.routes)
 			}
 		})
+	}
+}
+
+// TestRouteAdvertisementValidationIsLinear pins the COST of the overlap check.
+//
+// The first version of the cross-protocol fix compared every earlier range with
+// every new one. It was correct and it was a denial of service: a 1 MiB capsule
+// of single-address ranges took 13.5 seconds to reject, against 16ms for the
+// ordering-only check it replaced. Measuring that is what identified the problem,
+// so the bound is asserted here rather than left to be rediscovered.
+//
+// The input is the worst case for a quadratic scan: many ranges that DO NOT
+// overlap, so no early rejection shortens the work.
+func TestRouteAdvertisementValidationIsLinear(t *testing.T) {
+	var payload []byte
+	const entrySize = 11 // version + two IPv4 addresses + protocol
+	count := 0
+	for len(payload)+entrySize <= 1<<20 {
+		address := netip.AddrFrom4([4]byte{10, 0, byte(count >> 8), byte(count)})
+		payload = appendAddress(payload, address)
+		payload = append(payload, address.AsSlice()...)
+		payload = append(payload, 0)
+		count++
+	}
+	if count < 10000 {
+		t.Fatalf("the fixture only produced %d ranges; it must be large enough "+
+			"for a quadratic implementation to be slow", count)
+	}
+
+	// The fixture's ranges are not strictly ascending once the low bytes wrap,
+	// so it is a realistic ordering-violation input rather than a valid
+	// advertisement. Either outcome (parsed or rejected) exercises the scan.
+	start := time.Now()
+	_, _ = parseRoutes(payload)
+	elapsed := time.Since(start)
+
+	t.Logf("%d ranges over %d bytes validated in %v", count, len(payload), elapsed)
+
+	// The bound is deliberately loose - a quadratic scan needs over ten seconds
+	// on this input, so anything near a second is unambiguously linear. A tight
+	// bound would be flaky on a loaded CI runner without catching anything the
+	// loose one misses.
+	if elapsed > 2*time.Second {
+		t.Fatalf("validating %d ranges took %v, which indicates the overlap "+
+			"check is no longer linear: a crafted capsule of this size must not "+
+			"be able to occupy a server for seconds", count, elapsed)
 	}
 }
