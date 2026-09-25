@@ -302,7 +302,24 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 	flusher.Flush()
 
-	source := badhttp.SourceAddress(request)
+	// The source is the real socket peer, NOT a forwarded header.
+	//
+	// badhttp.SourceAddress returns request.RemoteAddr but then overwrites it
+	// with the first valid entry of X-Forwarded-For when that header is present
+	// (sing/protocol/http/addr.go). Any client can therefore choose the source
+	// address this server records and routes on, simply by sending the header.
+	// That matters because metadata.Source feeds routing rules and the logs.
+	//
+	// There is no way for this deployment to validate such a header. The Naive
+	// listener sits behind Nginx Stream, which forwards at layer 4 and does not
+	// add X-Forwarded-For; if the real client address is ever needed in the
+	// future it must come from PROXY protocol, which the front end would have to
+	// emit deliberately. Until then the only trustworthy value is RemoteAddr.
+	//
+	// This is a Naive-local decision on purpose: badhttp.SourceAddress has no
+	// other caller in this repository, so changing behaviour here cannot affect
+	// another protocol, and no shared trusted-proxy mechanism exists to reuse.
+	source := M.ParseSocksaddr(request.RemoteAddr).Unwrap()
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
 		conn, bufferedReadWriter, err := hijacker.Hijack()

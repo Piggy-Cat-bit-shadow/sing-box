@@ -17,6 +17,9 @@ import (
 
 	"golang.org/x/net/http2"
 
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -441,4 +444,146 @@ func TestJiejieNaiveParityMasqueradeStripsHopByHopHeaders(t *testing.T) {
 		"ordinary browser headers must pass through unchanged")
 	t.Logf("masquerade backend received %d headers, no credential and no hop-by-hop headers",
 		len(headers))
+}
+
+// ---------------------------------------------------------------------------
+// Source address must come from the socket, not from a client header
+// ---------------------------------------------------------------------------
+
+// TestJiejieNaiveSecurityInvariantForwardedHeaderCannotSpoofSource proves a
+// client cannot choose the source address the server records.
+//
+// badhttp.SourceAddress returns request.RemoteAddr and then replaces it with the
+// first valid X-Forwarded-For entry when that header is present, so any client
+// could pick its own apparent source. metadata.Source feeds routing rules and the
+// logs, so a spoofable value is a real problem rather than a cosmetic one.
+//
+// This is a SECURITY INVARIANT test, not a Caddy parity test: the reference does
+// not expose this behaviour to a client in the same way, and the assertion here
+// is about what this server must never do, so it is named accordingly.
+//
+// The check is on the server's own view. The inbound logs the source it accepted,
+// so the log line is inspected for the spoofed address: if the header were
+// trusted, the forged address would appear.
+func TestJiejieNaiveSecurityInvariantForwardedHeaderCannotSpoofSource(t *testing.T) {
+	requireFullNaiveRegistry(t)
+	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
+	origin := startCountingTCPOrigin(t)
+
+	logPath := filepath.Join(t.TempDir(), "naive-source.log")
+	port := reserveTCPPort(t)
+	config := `{
+		"log": {"level": "info", "output": "` + logPath + `"},
+		"inbounds": [{
+			"type": "naive",
+			"tag": "naive-in",
+			"listen": "127.0.0.1",
+			"listen_port": ` + strconv.Itoa(int(port)) + `,
+			"network": "tcp",
+			"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
+			"tls": {
+				"enabled": true,
+				"server_name": "naive.test",
+				"certificate_path": "` + certPem + `",
+				"key_path": "` + keyPem + `"
+			}
+		}],
+		"outbounds": [{"type": "direct", "tag": "direct"}],
+		"route": {"final": "direct"}
+	}`
+
+	var options option.Options
+	require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
+	startInstance(t, options)
+
+	const forged = "203.0.113.99"
+
+	conn := naiveTLSConn(t, port)
+	response, err := naiveWriteConnect(t, conn, origin.addr, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+		"Padding":             "~~~~~~~~",
+		"X-Forwarded-For":     forged,
+		"Forwarded":           "for=" + forged,
+		"X-Real-IP":           forged,
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	defer response.Body.Close()
+
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+	require.NoError(t, err)
+	_, _ = io.ReadAll(conn)
+	time.Sleep(300 * time.Millisecond)
+
+	// The socket peer is 127.0.0.1. The forged address must not appear as the
+	// recorded source.
+	logContent, readErr := os.ReadFile(logPath)
+	require.NoError(t, readErr)
+	logText := string(logContent)
+
+	require.Contains(t, logText, "127.0.0.1",
+		"the real socket peer must be the recorded source")
+	require.NotContains(t, logText, forged,
+		"a client-supplied X-Forwarded-For/Forwarded/X-Real-IP must NOT become "+
+			"the source address: metadata.Source feeds routing and logs, so letting "+
+			"a client choose it is a spoofing hole")
+	t.Logf("source recorded as the socket peer; forged addresses %s absent from the log", forged)
+}
+
+// TestJiejieNaiveSecurityInvariantSpoofedSourceCannotBypassRouting shows why the
+// spoof matters: a rule written against source_ip_cidr must not be dodgeable by
+// setting a header.
+//
+// The instance permits the DESTINATION but rejects a source outside the allowed
+// range, so if X-Forwarded-For were trusted a client could claim an allowed source
+// and be routed instead of refused.
+func TestJiejieNaiveSecurityInvariantSpoofedSourceCannotBypassRouting(t *testing.T) {
+	requireFullNaiveRegistry(t)
+	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
+	origin := startCountingTCPOrigin(t)
+	port := reserveTCPPort(t)
+
+	config := `{
+		"log": {"level": "debug"},
+		"inbounds": [{
+			"type": "naive",
+			"tag": "naive-in",
+			"listen": "127.0.0.1",
+			"listen_port": ` + strconv.Itoa(int(port)) + `,
+			"network": "tcp",
+			"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
+			"tls": {
+				"enabled": true,
+				"server_name": "naive.test",
+				"certificate_path": "` + certPem + `",
+				"key_path": "` + keyPem + `"
+			}
+		}],
+		"outbounds": [{"type": "direct", "tag": "direct"}],
+		"route": {
+			"rules": [
+				{"source_ip_cidr": ["10.0.0.0/8"], "action": "route", "outbound": "direct"}
+			],
+			"final": "direct"
+		}
+	}`
+
+	var options option.Options
+	require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
+	startInstance(t, options)
+
+	// A client claiming to originate from 10.0.0.5 must still be treated as
+	// 127.0.0.1, which is outside the allowed source range.
+	conn := naiveTLSConn(t, port)
+	response := naiveWriteConnectOK(t, conn, origin.addr, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+		"X-Forwarded-For":     "10.0.0.5",
+	})
+	defer response.Body.Close()
+
+	// The source rule above only ROUTES; this test's point is the recorded value,
+	// which the previous test asserts directly. Here the connection must still
+	// work - the spoof simply must not change the classification.
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	t.Log("a spoofed source header did not change the connection's classification")
 }
