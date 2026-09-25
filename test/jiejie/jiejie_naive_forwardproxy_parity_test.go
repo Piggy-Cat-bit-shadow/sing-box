@@ -458,76 +458,128 @@ func TestJiejieNaiveParityMasqueradeStripsHopByHopHeaders(t *testing.T) {
 // could pick its own apparent source. metadata.Source feeds routing rules and the
 // logs, so a spoofable value is a real problem rather than a cosmetic one.
 //
-// This is a SECURITY INVARIANT test, not a Caddy parity test: the reference does
-// not expose this behaviour to a client in the same way, and the assertion here
-// is about what this server must never do, so it is named accordingly.
+// This is a SECURITY INVARIANT test, not a Caddy parity test: the assertion is
+// about what this server must never do, so it is named accordingly.
 //
 // The check is on the server's own view. The inbound logs the source it accepted,
-// so the log line is inspected for the spoofed address: if the header were
-// trusted, the forged address would appear.
+// so the log is inspected for the forged address: if the header were trusted, the
+// forged value would appear. Every shape a client could send is covered, because
+// a fix that only handled one of them would still be a hole.
 func TestJiejieNaiveSecurityInvariantForwardedHeaderCannotSpoofSource(t *testing.T) {
-	requireFullNaiveRegistry(t)
-	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
-	origin := startCountingTCPOrigin(t)
+	// Each case is one shape of the header set. The forged value differs per case
+	// so a failure names which shape leaked.
+	cases := []struct {
+		name    string
+		headers map[string]string
+		forged  string
+	}{
+		{
+			name:    "single X-Forwarded-For",
+			headers: map[string]string{"X-Forwarded-For": "203.0.113.99"},
+			forged:  "203.0.113.99",
+		},
+		{
+			// A proxy chain: the FIRST entry is what SourceAddress takes, so the
+			// spoof is the first element.
+			name:    "multiple X-Forwarded-For entries",
+			headers: map[string]string{"X-Forwarded-For": "203.0.113.98, 203.0.113.99, 10.0.0.5"},
+			forged:  "203.0.113.98",
+		},
+		{
+			// Malformed entries must not be skipped in favour of a later valid
+			// one either: the header as a whole is untrusted.
+			name:    "malformed X-Forwarded-For with a valid tail",
+			headers: map[string]string{"X-Forwarded-For": "not-an-address, 203.0.113.97"},
+			forged:  "203.0.113.97",
+		},
+		{
+			name:    "Forwarded (RFC 7239)",
+			headers: map[string]string{"Forwarded": "for=203.0.113.96;proto=https"},
+			forged:  "203.0.113.96",
+		},
+		{
+			name:    "X-Real-IP",
+			headers: map[string]string{"X-Real-IP": "203.0.113.95"},
+			forged:  "203.0.113.95",
+		},
+		{
+			// All of them at once, which is what a determined client would send.
+			name: "every forwarded header together",
+			headers: map[string]string{
+				"X-Forwarded-For": "203.0.113.94, 203.0.113.93",
+				"Forwarded":       "for=203.0.113.92",
+				"X-Real-IP":       "203.0.113.91",
+				"X-Client-IP":     "203.0.113.90",
+			},
+			forged: "203.0.113.94",
+		},
+	}
 
-	logPath := filepath.Join(t.TempDir(), "naive-source.log")
-	port := reserveTCPPort(t)
-	config := `{
-		"log": {"level": "info", "output": "` + logPath + `"},
-		"inbounds": [{
-			"type": "naive",
-			"tag": "naive-in",
-			"listen": "127.0.0.1",
-			"listen_port": ` + strconv.Itoa(int(port)) + `,
-			"network": "tcp",
-			"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
-			"tls": {
-				"enabled": true,
-				"server_name": "naive.test",
-				"certificate_path": "` + certPem + `",
-				"key_path": "` + keyPem + `"
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			requireFullNaiveRegistry(t)
+			_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
+			origin := startCountingTCPOrigin(t)
+
+			logPath := filepath.Join(t.TempDir(), "naive-source.log")
+			port := reserveTCPPort(t)
+			config := `{
+				"log": {"level": "info", "output": "` + logPath + `"},
+				"inbounds": [{
+					"type": "naive",
+					"tag": "naive-in",
+					"listen": "127.0.0.1",
+					"listen_port": ` + strconv.Itoa(int(port)) + `,
+					"network": "tcp",
+					"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
+					"tls": {
+						"enabled": true,
+						"server_name": "naive.test",
+						"certificate_path": "` + certPem + `",
+						"key_path": "` + keyPem + `"
+					}
+				}],
+				"outbounds": [{"type": "direct", "tag": "direct"}],
+				"route": {"final": "direct"}
+			}`
+
+			var options option.Options
+			require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
+			startInstance(t, options)
+
+			headers := map[string]string{
+				"Proxy-Authorization": naiveBasicAuth(),
+				"Padding":             "~~~~~~~~",
 			}
-		}],
-		"outbounds": [{"type": "direct", "tag": "direct"}],
-		"route": {"final": "direct"}
-	}`
+			for name, value := range testCase.headers {
+				headers[name] = value
+			}
 
-	var options option.Options
-	require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
-	startInstance(t, options)
+			conn := naiveTLSConn(t, port)
+			response, err := naiveWriteConnect(t, conn, origin.addr, headers)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, response.StatusCode)
+			defer response.Body.Close()
 
-	const forged = "203.0.113.99"
+			_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+			require.NoError(t, err)
+			_, _ = io.ReadAll(conn)
+			time.Sleep(200 * time.Millisecond)
 
-	conn := naiveTLSConn(t, port)
-	response, err := naiveWriteConnect(t, conn, origin.addr, map[string]string{
-		"Proxy-Authorization": naiveBasicAuth(),
-		"Padding":             "~~~~~~~~",
-		"X-Forwarded-For":     forged,
-		"Forwarded":           "for=" + forged,
-		"X-Real-IP":           forged,
-	})
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	defer response.Body.Close()
+			logContent, readErr := os.ReadFile(logPath)
+			require.NoError(t, readErr)
+			logText := string(logContent)
 
-	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
-	require.NoError(t, err)
-	_, _ = io.ReadAll(conn)
-	time.Sleep(300 * time.Millisecond)
-
-	// The socket peer is 127.0.0.1. The forged address must not appear as the
-	// recorded source.
-	logContent, readErr := os.ReadFile(logPath)
-	require.NoError(t, readErr)
-	logText := string(logContent)
-
-	require.Contains(t, logText, "127.0.0.1",
-		"the real socket peer must be the recorded source")
-	require.NotContains(t, logText, forged,
-		"a client-supplied X-Forwarded-For/Forwarded/X-Real-IP must NOT become "+
-			"the source address: metadata.Source feeds routing and logs, so letting "+
-			"a client choose it is a spoofing hole")
-	t.Logf("source recorded as the socket peer; forged addresses %s absent from the log", forged)
+			require.Contains(t, logText, "127.0.0.1",
+				"the real socket peer must be the recorded source")
+			require.NotContains(t, logText, testCase.forged,
+				"the client-supplied header value must NOT become the source "+
+					"address; metadata.Source feeds routing and logs, so letting a "+
+					"client choose it is a spoofing hole")
+			t.Logf("recorded the socket peer; forged %s absent from the log",
+				testCase.forged)
+		})
+	}
 }
 
 // TestJiejieNaiveSecurityInvariantSpoofedSourceCannotBypassRouting shows why the
