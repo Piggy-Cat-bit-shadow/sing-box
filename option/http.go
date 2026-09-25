@@ -29,6 +29,16 @@ type QUICOptions struct {
 	// resolved from the http inbound `bbr_profile` option. This fork is
 	// VPS-only, so the only HTTP/3 options here are the server's.
 	BBRProfile ServerBBRProfile `json:"-"`
+	// DisablePathManager turns off QUIC connection migration on the HTTP/3
+	// server.
+	//
+	// Unset leaves quic-go's default, which has the path manager ENABLED. That is
+	// what the references get: quic-go/masque-go and quic-go/connect-ip-go both
+	// build their server without setting the field. Disabling migration is a
+	// legitimate production choice, but it is a behaviour difference from both
+	// the references and the library default, so it is opted into rather than
+	// compiled in.
+	DisablePathManager bool `json:"-"`
 }
 
 type _HTTPClientOptions struct {

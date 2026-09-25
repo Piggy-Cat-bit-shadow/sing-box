@@ -72,8 +72,8 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           echo "production tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
-          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go vet -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go test -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
 
       # ---------------------------------------------------------------------
       # Upstream compatibility. The full upstream tag set must keep building and
@@ -86,8 +86,8 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           echo "upstream tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
-          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go vet -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go test -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
 
       - name: Race tests for new concurrent state (production / minimal tags)
         shell: bash
@@ -98,7 +98,31 @@ jobs:
           # UDP data path for every non-connect UoT session.
           # ./common/tls carries the transport-scoped ALPN views, whose whole point
           # is that two transports share one lifecycle without racing.
-          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./protocol/naive ./route ./option ./common/tls
+          # ./transport/masque carries the server-side session, capsule and
+          # address-pool state, which is exactly the concurrent state this step
+          # exists for.
+          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./transport/masque ./protocol/naive ./route ./option ./common/tls
+
+      # Bounded fuzzing for the parsers that consume peer-controlled bytes.
+      #
+      # Running the seed corpus (which the normal `go test` above already does) only
+      # proves the parser survives inputs someone thought of. A short real fuzz run
+      # is what explores the space around them, and it is the only step here that
+      # can find a crash nobody wrote a case for.
+      #
+      # The time budget is deliberately small: this is a regression gate, not a
+      # long fuzzing campaign. Each target gets its own run so a crash names the
+      # parser directly instead of leaving one opaque failure.
+      - name: Fuzz the MASQUE parsers (bounded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          for TARGET in FuzzCapsuleParser FuzzRouteAdvertisement FuzzConnectIPAddresses FuzzConnectUDPTemplatePath; do
+            echo "=== $TARGET ==="
+            go test -tags "$TAGS" -count=1 -run "^${TARGET}$" -fuzz "^${TARGET}$" \
+              -fuzztime 20s ./transport/masque/
+          done
 
   production-minimal-integration:
     runs-on: ubuntu-latest
@@ -184,6 +208,160 @@ jobs:
           echo "JIEJIE_CADDY_REFERENCE_SOURCE=$REF_DIR" >> "$GITHUB_ENV"
           echo "JIEJIE_REFERENCE_READY=1" >> "$GITHUB_ENV"
 
+      # The MASQUE reference interop runs against a REAL sing-box process. It
+      # needs two binaries:
+      #
+      #   - the production minimal one, for the CONNECT-UDP (http inbound) cases;
+      #   - a FULL-registry one, because masque-server is registered only by
+      #     include/registry.go and the production minimal registry registers no
+      #     endpoints at all. Without the second binary the CONNECT-IP cases
+      #     SKIP, which is exactly the "present but never executed" gap this
+      #     workflow already had to fix once for the HTTP/3 differential.
+      #
+      # The reference clients (masque-go, connect-ip-go) live in their own Go
+      # module under test/jiejie/reference, so they are never imported by the
+      # root or `test` module and cannot reach the shipped binary.
+      - name: MASQUE reference interop (quic-go/masque-go and connect-ip-go)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          go build -tags "$TAGS" -o "$RUNNER_TEMP/sing-box-minimal" ./cmd/sing-box
+          # Full registry: same QUIC support, no jiejie_server_minimal.
+          FULL_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
+          go build -tags "$FULL_TAGS" -o "$RUNNER_TEMP/sing-box-full" ./cmd/sing-box
+
+          cd test/jiejie/reference
+          # The CONNECT-UDP cases run against the PRODUCTION MINIMAL binary, and
+          # JIEJIE_FULL_REGISTRY_BINARY is deliberately NOT set: the minimal
+          # registry registers no endpoints, so the CONNECT-IP tests must SKIP
+          # here rather than run against a binary that cannot serve them.
+          #
+          # Setting the flag for this invocation was the first version of this
+          # step and it failed in CI exactly as it should have: the CONNECT-IP
+          # tests stopped skipping, dialled the minimal binary's UDP port (which
+          # is not listening, because the minimal registry registers no
+          # masque-server endpoint), and failed with a QUIC handshake timeout
+          # that reads like a protocol bug. The flag means "this binary has the
+          # full registry", so it must only be set for the full binary.
+          # The run filter and the assertion list below must together cover EVERY
+          # TestReference case. Phase 3 added migration, capsule-fallback and
+          # Proxy-Status tests AFTER this step was written, and they were neither
+          # matched by the filter nor named in the assertion - so they would have
+          # passed locally and never executed in CI. A test that is not in the
+          # filter is a false green, which is the exact failure mode this step
+          # exists to prevent. When adding a TestReference case, add it in BOTH
+          # places.
+          #
+          # CONNECT-UDP, migration and Proxy-Status run against the production
+          # minimal binary.
+          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
+            go test -v -count=1 -timeout 20m \
+            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceUnvalidatedSpoof|TestReferenceSourceIdentity' . \
+            2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
+
+          # The CONNECT-IP cases run against the full-registry binary, which is
+          # the only one that can serve them.
+          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
+          JIEJIE_FULL_REGISTRY_BINARY=1 \
+            go test -v -count=1 -timeout 20m \
+            -run 'TestReferenceConnectIP|TestProxyStatus' . \
+            2>&1 | tee -a "$GITHUB_WORKSPACE/masque-reference-interop.log"
+
+      # A skipped reference test is invisible in a green workflow, which is how
+      # the HTTP/3 differential was once reported as covered while never having
+      # run. Assert explicitly that the reference clients actually connected.
+      - name: Assert the reference interop actually ran
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=masque-reference-interop.log
+
+          # Every reference test that RAN must have passed. A SKIP is expected for
+          # exactly one group - the CONNECT-IP cases under the minimal binary,
+          # whose registry has no endpoints - so the check is that no test FAILED
+          # and that the tests which must run did run.
+          #
+          # A blanket "no SKIP allowed" rule was the first version of this step and
+          # it is wrong here for the same reason it is right for the HTTP/3
+          # differential: there, a skip meant the only comparison never executed;
+          # here, one group's skip is the correct outcome for that binary, and
+          # demanding a pass would force the test to run against a binary that
+          # cannot serve it - which is precisely the CI failure this step was
+          # rewritten to stop.
+          if grep -qE '^\s*--- FAIL: TestReference' "$LOG"; then
+            echo "::error::a MASQUE reference interop test FAILED."
+            grep -E '^\s*--- FAIL: TestReference' "$LOG" || true
+            exit 1
+          fi
+
+          # These must PASS. They are the external-interoperability evidence: the
+          # pinned third-party clients completing a real round trip against
+          # sing-box.
+          for TEST in \
+            TestReferenceMasqueGoConnectUDP \
+            TestReferenceMasqueGoConnectUDPRejectedWithoutAuth \
+            TestReferenceMasqueGoRequiresServerDatagramSupport \
+            TestReferenceHarnessDetectsAStoppedServer \
+            TestReferenceConnectUDPSurvivesNATRebinding \
+            TestReferenceConnectUDPNewTunnelAfterRebinding \
+            TestReferenceUnvalidatedSpoofDoesNotChangeIdentity \
+            TestReferenceSourceIdentityIsStableAcrossMigration \
+            TestReferenceConnectIPHandshakeAndAssignment \
+            TestReferenceConnectIPRejectsWithoutAuth \
+            TestReferenceConnectIPICMPEchoDifferential \
+            TestReferenceConnectIPSurvivesNATRebinding \
+            TestReferenceConnectIPDatagramFallbackKeepsTheTunnelAlive \
+            TestReferenceConnectIPDatagramFallbackDoesNotSendDatagrams \
+            TestProxyStatusIsAbsentForUnauthenticatedRequests \
+            TestProxyStatusIsPresentForAnAuthenticatedDNSFailure \
+            TestProxyStatusUsesTheRFC9209Shape \
+            TestProxyStatusIsAbsentOnSuccessAndOnLocalRejections
+          do
+            if ! grep -q -- "--- PASS: $TEST" "$LOG"; then
+              echo "::error::$TEST did not report a pass; the reference client never"
+              echo "::error::completed a round trip against sing-box."
+              exit 1
+            fi
+          done
+
+          # Every TestReference case that EXISTS must have been run. The explicit
+          # list above is what caught the Phase 3 gap, but a list can go stale the
+          # same way a filter can: adding a test without adding it here would mean
+          # it never runs and nothing says so. This compares the tests present in
+          # the source against the ones the log reports having run, so a new test
+          # that is not covered fails the build instead of passing silently.
+          echo ""
+          echo "=== reference test coverage check ==="
+          DEFINED=$(grep -rhoE '^func (TestReference[A-Za-z0-9_]*)' \
+            test/jiejie/reference/*_test.go | sed 's/^func //' | sort -u)
+          MISSING=0
+          for TEST in $DEFINED; do
+            if ! grep -qE -- "--- (PASS|FAIL|SKIP): ${TEST}( |\$)" "$LOG"; then
+              echo "::error::$TEST is defined in test/jiejie/reference but the run"
+              echo "::error::never reported it. It is not in the -run filter, so it"
+              echo "::error::never executed. A test that does not run is NOT a pass."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" != "0" ]; then
+            echo "::error::the reference suite has tests outside the CI filter."
+            exit 1
+          fi
+          echo "all $(echo "$DEFINED" | wc -l | tr -d ' ') defined reference tests reported a result"
+
+          # And the positive evidence must be in the log, not merely implied by an
+          # exit status.
+          grep -E 'interop: assigned=' "$LOG" || {
+            echo "::error::the CONNECT-IP interop did not report its measured"
+            echo "::error::assignment and routes, so the comparison produced no"
+            echo "::error::observable result."
+            exit 1
+          }
+          grep -E 'interop: assigned=|PASS: TestReferenceMasqueGoConnectUDP' "$LOG" || true
+          echo "MASQUE reference interop executed: masque-go against the production"
+          echo "minimal binary, connect-ip-go against the full-registry binary."
+
       - name: Naive HTTP/3 integration (QUIC support linked)
         shell: bash
         run: |
@@ -200,10 +378,20 @@ jobs:
           go test -tags "$H3_TAGS" -v -count=1 -timeout 25m \
             -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN|TestJiejieNaiveTCPAndUDPALPN|TestJiejieNaiveH3DifferentialAgainstReference' . \
             2>&1 | tee ../../naive-h3-integration.log
-          # The protocol/naive/quic unit tests, including the congestion-control
-          # validation and the QUIC config assertions. They need QUIC linked, so
-          # this step is the only place they can run; without this they would
-          # exist and never execute.
+          # The QUIC-dependent unit tests. They need QUIC linked, so this step is
+          # the only place they can run; without this they would exist and never
+          # execute - the same "present but permanently skipped" gap that hid the
+          # HTTP/3 differential.
+          #
+          # transport/http carries the MASQUE HTTP/3 server defaults, which are
+          # build-tagged on with_quic.
+          echo ""
+          echo "=== transport/http unit tests (QUIC linked) ==="
+          # Run from the repository root: this step has already cd'd into
+          # test/jiejie, which is a SEPARATE Go module, so ./transport/... does
+          # not resolve there.
+          (cd ../.. && go test -tags "$H3_TAGS" -count=1 -timeout 10m ./transport/http/) \
+            2>&1 | tee -a ../../naive-h3-integration.log
           echo ""
           echo "=== protocol/naive/quic unit tests (QUIC linked) ==="
           # Run from the repository root: this step has already cd'd into

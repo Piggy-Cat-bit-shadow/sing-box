@@ -179,6 +179,24 @@ func TestJiejieRegistryResolvesEveryInboundDetour(t *testing.T) {
 // avoid that. A new registration must be a deliberate decision, so it fails here
 // first.
 func TestJiejieRegistryAuditFindsTheExpectedSet(t *testing.T) {
+	// THIS TEST IS ONLY VALID UNDER THE PRODUCTION MINIMAL TAG SET.
+	//
+	// It asserts that the registry contains nothing the production topology does
+	// not use, which is a statement about the jiejie_server_minimal registry. The
+	// QUIC/H3 tag set deliberately omits that tag so protocol/naive/quic is
+	// linked, so under those tags the full registry is present and this test
+	// fails on types like "cloudflared" that the minimal registry correctly
+	// excludes. Measured: it passes under
+	// with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0 and fails
+	// under with_quic,badlinkname,tfogo_checklinkname0.
+	//
+	// That failure is a property of the tag set, not a regression, and it is
+	// worth stating because combining the two tag sets in one `go test` run looks
+	// like a full-coverage idea and is not one: the registry audit and the H3
+	// tests are mutually exclusive. CI runs them in separate steps for this
+	// reason.
+	requireJiejieMinimalRegistry(t)
+
 	topology := loadProductionTopology(t)
 
 	// Every registered inbound type must be one the fixture actually uses.
@@ -264,4 +282,32 @@ func isBootDependencyDNSType(t *testing.T, dnsType string) bool {
 	t.Log("dns transport \"local\" is present as a BOOT DEPENDENCY: box.go " +
 		"unconditionally creates it as the DNS fallback")
 	return true
+}
+
+// registryIsJiejieMinimal reports whether the jiejie_server_minimal tag was used
+// for this build.
+//
+// It is detected through the registry itself rather than through build tags,
+// because Go does not expose the tag set to a test at run time. The cloudflared
+// inbound is registered only by the full registry, so its presence proves the
+// minimal tag was NOT used.
+func registryIsJiejieMinimal() bool {
+	for _, inboundType := range include.InboundRegistry().OptionTypes() {
+		if inboundType == "cloudflared" {
+			return false
+		}
+	}
+	return true
+}
+
+// requireJiejieMinimalRegistry skips a test that is only meaningful under the
+// production minimal tag set, and says why.
+func requireJiejieMinimalRegistry(t *testing.T) {
+	t.Helper()
+	if !registryIsJiejieMinimal() {
+		t.Skip("this audit is only valid under the production minimal tag set " +
+			"(jiejie_server_minimal). Under the QUIC/H3 tag set the full registry is " +
+			"linked on purpose, so the assertion that nothing unexpected is " +
+			"registered does not apply and would fail for the wrong reason.")
+	}
 }

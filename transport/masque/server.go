@@ -255,11 +255,35 @@ func (s *Server) lookup(destination netip.Addr, protocol uint8) *serverSession {
 	return nil
 }
 
+// Contains reports whether this server would route traffic for an address into
+// one of its tunnels.
+//
+// It must agree with lookup(). lookup() refuses the server's own address inside
+// the tunnel prefix before it consults any route advertisement, because that
+// address is the server's, not a client's. Contains() did NOT apply the same
+// guard, so it reported the server's own address as tunnel-owned as soon as any
+// session advertised a route covering it - which is the normal case, since a
+// client advertises the tunnel network.
+//
+// The consequence is a routing decision, not a misdelivery: Contains() backs
+// PreferredAddress, which lets a `preferred_by` rule select this outbound for a
+// destination. With the guard missing, the server's own address was advertised
+// as preferred by this endpoint, the packet was routed into the MASQUE path, and
+// lookup() then returned no session for it. That is wasted work and an
+// inconsistency between the two answers, so the guard is applied here as well
+// rather than left to lookup() to absorb.
 func (s *Server) Contains(address netip.Addr) bool {
 	s.access.RLock()
 	defer s.access.RUnlock()
-	_, loaded := s.addresses[address]
-	return loaded || slices.ContainsFunc(s.advertisements, func(it *serverSession) bool {
+	if _, loaded := s.addresses[address]; loaded {
+		return true
+	}
+	// The server's own address is never tunnel-owned, however wide a session's
+	// advertisement is. See lookup() for the same guard.
+	if address == s.inet4Address || address == s.inet6Address {
+		return false
+	}
+	return slices.ContainsFunc(s.advertisements, func(it *serverSession) bool {
 		return rangesContain(it.peerRoutes, address)
 	})
 }

@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"slices"
 	"time"
 
 	"github.com/sagernet/sing-box/common/listener"
@@ -154,9 +153,22 @@ func (s *Server) ServeConnection(ctx context.Context, conn net.Conn, reader *Rea
 	connection.serve()
 }
 
-func (s *Server) ConfigureTLS(tlsConfig tls.ServerConfig) {
-	if len(tlsConfig.NextProtos()) > 0 {
-		return
+// ConfigureTLS resolves the ALPN list this server's TCP listener may negotiate.
+//
+// It used to write h2/http1.1 into the SHARED config, and ListenHTTP3 then
+// prepended h3 to that same object. Both listeners therefore negotiated from one
+// union, which was measured to leak in both directions: a TCP client offering h3
+// was told to speak h3, a QUIC-only protocol, and a QUIC client offering h2 was
+// told to speak h2. Native Naive had the identical defect and it is fixed the same
+// way here - by giving each transport its OWN view of the shared config rather
+// than mutating it.
+//
+// The list is returned rather than applied so the caller can wrap the config in a
+// transport-scoped view; see tls.TransportALPNView. Operators who configured ALPN
+// explicitly keep it, because their value is used verbatim.
+func (s *Server) ConfigureTLS(tlsConfig tls.ServerConfig) []string {
+	if configured := tlsConfig.NextProtos(); len(configured) > 0 {
+		return configured
 	}
 	var nextProtos []string
 	if s.http2Server != nil {
@@ -165,20 +177,39 @@ func (s *Server) ConfigureTLS(tlsConfig tls.ServerConfig) {
 	if s.http1 {
 		nextProtos = append(nextProtos, "http/1.1")
 	}
-	tlsConfig.SetNextProtos(nextProtos)
+	return nextProtos
+}
+
+// HTTP3NextProtos returns the ALPN list for this server's HTTP/3 listener.
+//
+// h3 and nothing else: the QUIC transport speaks HTTP/3, and offering a
+// TCP-oriented protocol there is what let a QUIC client negotiate h2.
+//
+// An operator-configured list is still honoured for any protocol the server does
+// not own, but h3 is always present, because without it the QUIC listener could
+// not complete a handshake at all.
+func (s *Server) HTTP3NextProtos(tlsConfig tls.ServerConfig) []string {
+	protos := []string{"h3"}
+	for _, configured := range tlsConfig.NextProtos() {
+		if configured == "h3" || configured == http2.NextProtoTLS || configured == "http/1.1" {
+			continue
+		}
+		protos = append(protos, configured)
+	}
+	return protos
 }
 
 func (s *Server) ListenHTTP3(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler Handler, tlsConfig tls.ServerConfig, options option.QUICOptions) (io.Closer, error) {
 	if ConfigureHTTP3ListenerFunc == nil {
 		return nil, C.ErrQUICNotIncluded
 	}
-	if !slices.Contains(tlsConfig.NextProtos(), "h3") {
-		tlsConfig.SetNextProtos(append([]string{"h3"}, tlsConfig.NextProtos()...))
-	}
+	// The QUIC listener gets its OWN ALPN view, so the shared config is never
+	// mutated and the TCP listener cannot inherit h3.
+	quicTLSConfig := tls.TransportALPNView(tlsConfig, s.HTTP3NextProtos(tlsConfig))
 	return ConfigureHTTP3ListenerFunc(ctx, logger, listener, &httpHandler{
 		server:  s,
 		handler: handler,
-	}, tlsConfig, options, s.maxHeaderBytes)
+	}, quicTLSConfig, options, s.maxHeaderBytes)
 }
 
 func (s *Server) finishConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc, err error) {

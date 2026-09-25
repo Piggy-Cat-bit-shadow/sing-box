@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/listener"
@@ -33,9 +34,20 @@ func init() {
 			return nil, err
 		}
 		quicConfig := httpclient.NewQUICConfig(options)
-		if quicConfig.MaxIncomingStreams == 0 {
-			quicConfig.MaxIncomingStreams = 1 << 60
-		}
+		// MaxIncomingStreams is deliberately NOT forced to 1 << 60 here.
+		//
+		// 1 << 60 is quic-go's INTERNAL "effectively unlimited" clamp
+		// (config.go validateConfig caps the field at that value), so setting it
+		// explicitly disabled the only server-side bound on concurrent streams
+		// this listener had. Neither reference does that: quic-go/masque-go and
+		// quic-go/connect-ip-go both construct their server without touching the
+		// field, which leaves quic-go's default of 100
+		// (protocol.DefaultMaxIncomingStreams).
+		//
+		// An operator who genuinely needs more sets max_concurrent_streams, which
+		// NewQUICConfig already honours above; the production topology does
+		// exactly that through server_profile. So the default is bounded and the
+		// override is explicit, rather than the default being unbounded.
 		// 0-RTT is disabled on the proxy inbound.
 		//
 		// Why: a CONNECT is not a safe, idempotent request. It creates a tunnel,
@@ -56,15 +68,30 @@ func init() {
 		// connection. That is a fair trade for removing a replay vector on a
 		// production inbound.
 		quicConfig.Allow0RTT = false
-		quicConfig.DisablePathManager = true
+		// The path manager is left at quic-go's default (enabled), which is what
+		// both references get: neither masque-go nor connect-ip-go sets
+		// DisablePathManager. Disabling migration is a production choice, so it
+		// is opted into through quic_disable_path_manager rather than compiled
+		// into the protocol default.
+		quicConfig.DisablePathManager = options.DisablePathManager
 		quicConfig.EnableDatagrams = true
 		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, quicConfig)
 		if err != nil {
 			udpConn.Close()
 			return nil, err
 		}
-		// bbr_profile is validated at configuration load; an unset value
-		// resolves to standard, which is exactly the previous behaviour.
+		// bbr_profile is validated at configuration load. An UNSET value now means
+		// "leave quic-go's own congestion control", not "BBR standard".
+		//
+		// The reason is reference parity: quic-go/masque-go and
+		// quic-go/connect-ip-go both construct their server without setting a
+		// congestion control, so they get the library default (CUBIC). Forcing
+		// BBR here made the protocol default a production tuning choice, which is
+		// the same class of silent divergence the HTTP/3 audit removed from the
+		// Native Naive listener.
+		//
+		// A deployment that wants BBR names it, and the production topology does
+		// that through server_profile.
 		congestionProfile, profileErr := parseBBRProfile(options.BBRProfile.BBRProfileValue())
 		if profileErr != nil {
 			quicListener.Close()
@@ -114,7 +141,12 @@ func init() {
 			// preserved when no profile is configured.
 			IdleTimeout: time.Duration(options.IdleTimeout),
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
-				conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestionProfile))
+				// A nil profile means "keep quic-go's default sender". Calling
+				// SetCongestionControl with a nil cannot be expressed, so the
+				// call is skipped rather than guarded.
+				if congestionProfile != nil {
+					conn.SetCongestionControl(congestionProfile(conn))
+				}
 				return log.ContextWithNewID(ctx)
 			},
 		}
@@ -155,6 +187,16 @@ type datagramStream struct {
 	datagramsEnabled bool
 }
 
+// DatagramsEnabled reports whether the peer negotiated HTTP Datagrams.
+//
+// This is the answer the session must use instead of a type assertion: the stream
+// implements the interface either way, so the type says nothing about the
+// capability. Reading it from the peer's SETTINGS is what makes the fallback
+// decision correct.
+func (s *datagramStream) DatagramsEnabled() bool {
+	return s.datagramsEnabled
+}
+
 func (s *datagramStream) SendDatagram(payload []byte) error {
 	if !s.datagramsEnabled {
 		return ErrDatagramUnsupported
@@ -178,15 +220,26 @@ func (s *datagramStream) Close() error {
 
 // parseBBRProfile maps an option name onto a profile that actually exists in
 // congestion_meta2. Only these three are accepted; nothing is invented here.
-func parseBBRProfile(name string) (congestion_meta2.Profile, error) {
-	switch name {
-	case "", option.BBRProfileStandard:
-		return congestion_meta2.ProfileStandard, nil
-	case option.BBRProfileConservative:
-		return congestion_meta2.ProfileConservative, nil
-	case option.BBRProfileAggressive:
-		return congestion_meta2.ProfileAggressive, nil
-	default:
-		return congestion_meta2.ProfileStandard, E.New("unsupported bbr_profile: ", name)
+func parseBBRProfile(name string) (func(conn *quic.Conn) congestion.CongestionControl, error) {
+	// "" means "leave the library default", which is what an unconfigured
+	// HTTP/3 server gets. It used to resolve to ProfileStandard, which made BBR
+	// the protocol default rather than an explicit choice; the references set no
+	// congestion control at all.
+	if name == "" {
+		return nil, nil
 	}
+	var profile congestion_meta2.Profile
+	switch name {
+	case option.BBRProfileStandard:
+		profile = congestion_meta2.ProfileStandard
+	case option.BBRProfileConservative:
+		profile = congestion_meta2.ProfileConservative
+	case option.BBRProfileAggressive:
+		profile = congestion_meta2.ProfileAggressive
+	default:
+		return nil, E.New("unsupported bbr_profile: ", name)
+	}
+	return func(conn *quic.Conn) congestion.CongestionControl {
+		return congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), profile)
+	}, nil
 }

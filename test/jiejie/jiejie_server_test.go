@@ -242,6 +242,54 @@ func startJiejieMASQUEH2(t *testing.T, decoyAddr string) uint16 {
 	return port
 }
 
+// startJiejieMASQUEH1 starts an HTTP/1.1-only MASQUE inbound on TCP.
+//
+// It exists so the RFC 9931 CONNECT-rejection requirements can be driven over
+// HTTP/1.1, which is the only HTTP version those requirements apply to: HTTP/2
+// and HTTP/3 have explicit stream boundaries and are not vulnerable to the
+// request-smuggling shape the RFC describes. Tests against this listener send
+// raw bytes, because what they must observe is how many requests the server
+// processes after rejecting one.
+func startJiejieMASQUEH1(t *testing.T, decoyAddr string) uint16 {
+	t.Helper()
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	port := reserveTCPPort(t)
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{{
+			Type: C.TypeHTTP,
+			Options: &option.HTTPInboundOptions{
+				ListenOptions: option.ListenOptions{
+					Listen:     common.Ptr(badoption.Addr(netip.MustParseAddr("127.0.0.1"))),
+					ListenPort: port,
+				},
+				// HTTP/1.1 only. Version 2 would multiplex, and an HTTP/2
+				// rejection cannot leave a second request half-read on the same
+				// connection, so including it would stop the test from
+				// exercising the HTTP/1.1 semantics at all.
+				Version: []int{1},
+				Users:   []auth.User{{Username: jiejieTestUser, Password: jiejieTestPassword}},
+				InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+					TLS: &option.InboundTLSOptions{
+						Enabled:         true,
+						ServerName:      "example.org",
+						CertificatePath: certPem,
+						KeyPath:         keyPem,
+					},
+				},
+				Masquerade: &option.Hysteria2Masquerade{
+					Type: C.Hysterai2MasqueradeTypeProxy,
+					ProxyOptions: option.Hysteria2MasqueradeProxy{
+						URL:         "http://" + decoyAddr,
+						RewriteHost: true,
+					},
+				},
+			},
+		}},
+		Outbounds: []option.Outbound{{Type: C.TypeDirect}},
+	})
+	return port
+}
+
 func dialJiejieH2(t *testing.T, port uint16) *http2.ClientConn {
 	t.Helper()
 	tlsConn, err := tls.Dial("tcp", "127.0.0.1:"+strconv.Itoa(int(port)), &tls.Config{

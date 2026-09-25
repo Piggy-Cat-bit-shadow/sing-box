@@ -86,7 +86,7 @@ func (c *serverConn) serveRequest() (requestResult, error) {
 	ctx, authErr := c.server.authenticate(c.ctx, request, "Proxy-Authorization")
 	if authErr != nil {
 		c.server.logger.ErrorContext(c.ctx, E.Cause(authErr, "process connection from ", c.source))
-		return c.reject(request, requestKeepAlive(request), http.StatusProxyAuthRequired, nil, authErr)
+		return c.reject(request, c.rejectionKeepAlive(request), http.StatusProxyAuthRequired, nil, authErr)
 	}
 	// The transport peer, not a client-supplied header.
 	source := c.source
@@ -105,7 +105,7 @@ func (c *serverConn) serveRequest() (requestResult, error) {
 func (c *serverConn) serveConnect(ctx context.Context, request *http.Request, source M.Socksaddr) (requestResult, error) {
 	destination := connectDestination(request)
 	if !destination.IsValid() {
-		return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid CONNECT target: ", request.URL.Host))
+		return c.reject(request, c.rejectionKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid CONNECT target: ", request.URL.Host))
 	}
 	_, err := c.conn.Write([]byte(F.ToString("HTTP/", request.ProtoMajor, ".", request.ProtoMinor, " 200 Connection established\r\n\r\n")))
 	if err != nil {
@@ -113,6 +113,61 @@ func (c *serverConn) serveConnect(ctx context.Context, request *http.Request, so
 	}
 	c.handler.NewConnectionEx(ctx, c.reader.cachedConn(c.conn), source, destination, c.onClose)
 	return requestHandedOff, nil
+}
+
+// rejectionKeepAlive decides whether a REJECTED request may leave the HTTP/1.1
+// connection open.
+//
+// RFC 9931 section 8 ("Requirements for HTTP CONNECT") makes this a MUST, not a
+// preference:
+//
+//	"As a mitigation, proxy servers MUST close the underlying connection when
+//	 rejecting a CONNECT request without processing any further requests on
+//	 that connection.  This requirement applies whether or not the request
+//	 includes a 'close' connection option."
+//
+// The attack it closes: a proxy CLIENT that forwards untrusted TCP payload
+// optimistically, before it has seen the 2xx, cannot know whether the server
+// accepted the tunnel. If the server REJECTS the CONNECT it returns to reading
+// HTTP/1.1 on the same connection, so the optimistically forwarded bytes are
+// parsed as a further request -- a request the client is then deemed to have
+// made. Answering it is a request-smuggling primitive.
+//
+// The RFC also updates CONNECT-UDP (section 6.3) for the same reason: an
+// HTTP/1.x CONNECT-UDP upgrade "is likely to be rejected in certain
+// circumstances, such as when the UDP destination address (which is
+// attacker-controlled) is invalid", and the tunnel content can be untrusted
+// material from other applications on the client device. So an HTTP/1.1
+// CONNECT-UDP rejected before the 101 must close too.
+//
+// This applies only to HTTP/1.1. HTTP/2 and HTTP/3 give every request an
+// explicit stream, so a rejected request cannot leave a second one half-read on
+// a shared byte stream; the RFC says so and recommends them as the way to avoid
+// the cost below.
+//
+// The cost is real and is accepted deliberately: the RFC notes the mitigation
+// "will frequently cause slower connection establishment ... especially when
+// returning a 407", because a compliant client must reconnect and renegotiate
+// TLS. That is the price of not being a smuggling vector, and it is paid only
+// on the rejection path -- an accepted CONNECT still hands the connection to the
+// tunnel and is unaffected.
+//
+// Note the deliberate asymmetry with requestKeepAlive: an ordinary rejected
+// request (a bad GET, say) still honours keep-alive, because no protocol
+// transition was requested and the smuggling shape does not arise. Only the
+// CONNECT and CONNECT-UDP rejection paths use this.
+func (c *serverConn) rejectionKeepAlive(request *http.Request) bool {
+	// Always false. It is a function rather than a constant so each rejection
+	// site reads as a deliberate decision, and so the HTTP-version condition the
+	// RFC scopes this to can be expressed if a future HTTP/1.x version ever
+	// makes a difference here.
+	if request.ProtoAtLeast(2, 0) {
+		// Not reachable from the HTTP/1.1 server connection, which is the only
+		// caller. If that ever changes, an HTTP/2 or HTTP/3 request has an
+		// explicit stream and must NOT be closed for this reason.
+		return true
+	}
+	return false
 }
 
 func (c *serverConn) reject(request *http.Request, keepAlive bool, statusCode int, header http.Header, cause error) (requestResult, error) {
