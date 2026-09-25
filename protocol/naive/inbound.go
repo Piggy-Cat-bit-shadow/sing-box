@@ -216,6 +216,25 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
+	// HTTP/2 and HTTP/3 CONNECT must not carry :scheme or :path. Those
+	// pseudo-headers describe a request to a resource, which CONNECT is not:
+	// its authority is the whole request. Accepting them would mean two
+	// different notions of the target can disagree inside one request.
+	//
+	// This mirrors klzgrad/forwardproxy exactly (forwardproxy.go, the
+	// `r.ProtoMajor == 2 || r.ProtoMajor == 3` branch at the top of the CONNECT
+	// handling), including rejecting before authentication is even considered.
+	//
+	// It is deliberately scoped to H2/H3: HTTP/1.1 CONNECT has no pseudo-headers
+	// and an absolute-form request target is normal for a proxy, so applying the
+	// same rule there would break standard H1 proxy clients.
+	if request.ProtoMajor == 2 || request.ProtoMajor == 3 {
+		if len(request.URL.Scheme) > 0 || len(request.URL.Path) > 0 {
+			n.badRequest(ctx, request, E.New("CONNECT request has :scheme and/or :path pseudo-header fields"))
+			return
+		}
+	}
+
 	userName, password, authOk := badhttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
 		authOk = n.authenticator.Verify(userName, password)
@@ -235,9 +254,9 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// without it as a standard HTTP proxy request. Rejecting it here broke
 	// plain HTTP CONNECT clients and every Naive client that does not pad.
 	//
-	// The response Padding header is still emitted for a padding client so the
-	// negotiation completes, and padding frames are then read/written on the
-	// tunnel exactly as before.
+	// Padding FRAMING is enabled solely by the request header, matching the
+	// reference's `r.Header.Get("Padding") != ""` argument to dualStream. The
+	// response Padding header is independent and always sent; see below.
 	usePadding := request.Header.Get("Padding") != ""
 
 	// The tunnel target comes from the CONNECT request itself: URL.Host, falling
@@ -261,9 +280,20 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if usePadding {
-		writer.Header().Set("Padding", generatePaddingHeader())
-	}
+	// The response Padding header is sent for EVERY authenticated CONNECT, not
+	// only when the client asked for padding. klzgrad/forwardproxy sets it
+	// unconditionally (forwardproxy.go: `w.Header().Set("Padding", ...)` runs
+	// before `w.WriteHeader(http.StatusOK)` with no condition), and the two
+	// concerns are independent there:
+	//
+	//   response Padding header -> always present
+	//   payload framing enabled  -> request.Header.Get("Padding") != ""
+	//
+	// Gating the header on the request header made sing-box answer a
+	// non-padding client with no Padding header at all, which is an observable
+	// difference from the reference. Emitting it does not force such a client to
+	// parse frames: framing is still driven solely by usePadding below.
+	writer.Header().Set("Padding", generatePaddingHeader())
 	writer.WriteHeader(http.StatusOK)
 	flusher, isFlusher := writer.(http.Flusher)
 	if !isFlusher {
