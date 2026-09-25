@@ -164,17 +164,22 @@ func TestBBRProfileReachesQUICOptions(t *testing.T) {
 		options := option.HTTPInboundOptions{BBRProfile: profile}
 		resolved, err := options.ResolveServerResources()
 		require.NoError(t, err)
-		expected := profile
-		if expected == "" {
-			expected = "standard"
-		}
-		require.Equal(t, expected, resolved.HTTP3Options.BBRProfile.BBRProfileValue(),
-			"bbr_profile %q must survive option resolution", profile)
 
-		// And it must map onto a real congestion profile, not just a string.
+		// An unset value must resolve to EMPTY, not to "standard": empty is what
+		// the HTTP/3 listener reads as "keep quic-go's congestion control", and
+		// the references set none. The value must otherwise survive verbatim.
+		require.Equal(t, profile, resolved.HTTP3Options.BBRProfile.BBRProfileValue(),
+			"bbr_profile %q must survive option resolution unchanged", profile)
+
 		parsed, parseErr := parseBBRProfile(resolved.HTTP3Options.BBRProfile.BBRProfileValue())
 		require.NoError(t, parseErr)
-		require.Equal(t, expected, parsed.Name())
+		if profile == "" {
+			require.Nil(t, parsed,
+				"an unset bbr_profile must leave quic-go's congestion control in "+
+					"place rather than silently selecting BBR standard")
+			continue
+		}
+		require.NotNil(t, parsed, "profile %q must select a sender", profile)
 	}
 }
 

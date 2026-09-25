@@ -166,12 +166,17 @@ type ServerBBRProfile struct {
 	Name string
 }
 
-// BBRProfileValue resolves the configured name, defaulting to standard. It
-// never returns a name the dependency does not define.
+// BBRProfileValue resolves the configured name.
+//
+// An unset name stays EMPTY, and the HTTP/3 listener reads that as "leave
+// quic-go's congestion control in place". It previously returned
+// BBRProfileStandard, which made BBR the protocol default rather than an explicit
+// choice - and neither quic-go/masque-go nor quic-go/connect-ip-go sets a
+// congestion control, so the library default is what the references get.
+//
+// The returned value is always either empty or a name the dependency defines, so
+// a caller can validate it without a second compatibility check.
 func (o ServerBBRProfile) BBRProfileValue() string {
-	if o.Name == "" {
-		return BBRProfileStandard
-	}
 	return o.Name
 }
 

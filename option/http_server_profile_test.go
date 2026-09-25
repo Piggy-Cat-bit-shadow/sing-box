@@ -189,9 +189,21 @@ func TestHTTPInboundServerProfileResolution(t *testing.T) {
 		t.Fatalf("the effective HTTP/2 options must carry the profile, got %d streams",
 			resolved.HTTP2Options.MaxConcurrentStreams)
 	}
-	if resolved.HTTP3Options.BBRProfile.BBRProfileValue() != "standard" {
-		t.Fatalf("the effective QUIC options must carry the BBR profile, got %q",
-			resolved.HTTP3Options.BBRProfile.BBRProfileValue())
+	// The QUIC options must carry an EXPLICIT bbr_profile through resolution.
+	// The profile itself sets none, and an unset value now stays empty so the
+	// HTTP/3 listener keeps quic-go's default congestion control.
+	if got := resolved.HTTP3Options.BBRProfile.BBRProfileValue(); got != "" {
+		t.Fatalf("an unset bbr_profile must resolve to empty (library default), got %q", got)
+	}
+
+	// And when the operator does set one, it must survive.
+	explicit := HTTPInboundOptions{ServerProfile: HTTPServerProfileNameJiejieBalanced1G, BBRProfile: "aggressive"}
+	explicitResolved, err := explicit.ResolveServerResources()
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := explicitResolved.HTTP3Options.BBRProfile.BBRProfileValue(); got != "aggressive" {
+		t.Fatalf("an explicit bbr_profile must survive resolution, got %q", got)
 	}
 }
 
