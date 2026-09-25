@@ -136,7 +136,23 @@ func TestAuditBufferWriteContract(t *testing.T) {
 	// exactly as the production path does.
 	makeBuffer := func(content []byte) *buf.Buffer {
 		b := buf.NewSize(3 + 255 + len(content))
-		b.Resize(3, 3+len(content))
+		// Resize takes (start, END-IN-BUFFER-LENGTH), not (start, end). Passing
+		// 3+len(content) therefore sets end = 3 + 3 + len(content) and
+		// DOUBLE-COUNTS the three bytes of front headroom, leaving FreeLen() at
+		// 252 instead of 255.
+		//
+		// That is not a harmless off-by-three: writeBufferWithPadding draws a
+		// padding size from the protocol's full 0..255 range and requires
+		// FreeLen() >= paddingSize, so a draw of 253..255 fails. The draw is
+		// random, which made this test flaky rather than consistently broken -
+		// measured at roughly 1 failure in 10 runs under -race, and only when the
+		// padding happened to land in the top three values.
+		//
+		// It surfaced in CI on a merge that touches NOTHING under protocol/naive
+		// (verified: `git diff --stat <pre-merge> HEAD -- protocol/naive/` is
+		// empty), which is what a random draw exposed by a different pool state
+		// looks like. It was NOT caused by the merge.
+		b.Resize(3, len(content))
 		copy(b.Bytes(), content)
 		return b
 	}
