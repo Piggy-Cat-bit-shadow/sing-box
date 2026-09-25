@@ -1244,3 +1244,155 @@ func lanAddress(t *testing.T) net.IP {
 	t.Skip("no non-loopback IPv4 address is available")
 	return nil
 }
+
+// TestJiejieTargetACLUoTLegacySessionCannotUseUnspecifiedTarget covers the one
+// destination the guard treats as pre-authorised.
+//
+// For legacy UoT v1 the router sets the session destination to 0.0.0.0:0,
+// because that form carries no request destination at all. The guard short-
+// circuits a datagram whose destination equals the session destination, on the
+// grounds that the session-level rule match already approved it - and
+// 0.0.0.0/8 is in the shipped reject list, so 0.0.0.0:0 is refused there.
+//
+// That reasoning only holds if the session was in fact rejected. This test
+// pins the observable outcome instead of the reasoning: a legacy v1 session
+// must not be able to deliver a datagram to an unspecified address.
+func TestJiejieTargetACLUoTLegacySessionCannotUseUnspecifiedTarget(t *testing.T) {
+	env := startACLInstance(t, []string{"0.0.0.0/8", "127.0.0.0/8"}, true)
+
+	conn := naiveTLSConn(t, env.port)
+	legacyMagic := uot.RequestDestination(uot.LegacyVersion).String()
+	response, err := naiveWriteConnect(t, conn, legacyMagic, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+		"Padding":             "~~~~~~~~",
+	})
+	if err != nil || response == nil || response.StatusCode != http.StatusOK {
+		t.Logf("legacy UoT session refused at CONNECT (status/err: %v/%v)", response, err)
+		return
+	}
+	defer response.Body.Close()
+
+	// The legacy form sends per-datagram addresses from the first datagram.
+	sentinel := startCountingUDPOrigin(t)
+	targets := []metadata.Socksaddr{
+		{Addr: netip.IPv4Unspecified()},
+		{Addr: netip.IPv4Unspecified(), Port: uint16(sentinel.port())},
+	}
+
+	// The session destination for legacy UoT v1 is 0.0.0.0:0, and 0.0.0.0/8 is
+	// rejected by the rules, so the server REFUSES the session and closes it.
+	// A write into the closed tunnel therefore fails with a broken pipe, which
+	// is the rejection working, not a test failure. Both outcomes are recorded:
+	// what must never happen is a datagram reaching the sentinel.
+	closedByPolicy := false
+	for _, target := range targets {
+		if err = writeUoTDatagramRaw(conn, target, []byte("unspecified")); err != nil {
+			closedByPolicy = true
+			t.Logf("write into the refused legacy tunnel failed as expected: %v", err)
+			break
+		}
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	t.Logf("legacy UoT v1: sentinel received %d packets (tunnel closed by policy: %v)",
+		sentinel.packets.Load(), closedByPolicy)
+	require.EqualValues(t, 0, sentinel.packets.Load(),
+		"an unspecified destination must not be delivered")
+}
+
+// TestJiejieTargetACLPerDatagramHitsRulesTheSessionDidNot covers the case where
+// a datagram's target should trigger a rule the session would never have hit.
+//
+// The UoT session is authorised once, from its header destination. If the guard
+// only re-checked "is this address still allowed" it could still miss rules
+// that exist for a DIFFERENT reason - here, a rule that rejects a port range
+// outright. The datagram path must see the same rule set, evaluated for the
+// datagram's own target, not just a narrowed ip_cidr check.
+func TestJiejieTargetACLPerDatagramHitsRulesTheSessionDidNot(t *testing.T) {
+	requireFullNaiveRegistry(t)
+	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
+
+	allowedOrigin := startUDPOriginOn(t, "127.0.0.1:0")
+	forbiddenOrigin := startUDPOriginOn(t, "127.0.0.1:0")
+
+	port := reserveTCPPort(t)
+	// The reject is by PORT, not by address: both origins are on loopback, so an
+	// address-only check would treat them identically and let the forbidden one
+	// through. The session target is an address the rules allow.
+	config := `{
+		"log": {"level": "debug"},
+		"inbounds": [{
+			"type": "naive",
+			"tag": "naive-in",
+			"listen": "127.0.0.1",
+			"listen_port": ` + strconv.Itoa(int(port)) + `,
+			"network": "tcp",
+			"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
+			"tls": {
+				"enabled": true,
+				"server_name": "naive.test",
+				"certificate_path": "` + certPem + `",
+				"key_path": "` + keyPem + `"
+			}
+		}],
+		"outbounds": [{"type": "direct", "tag": "direct"}],
+		"route": {
+			"rules": [
+				{"inbound": ["naive-in"], "network": ["udp"], "port": [` + strconv.Itoa(int(forbiddenOrigin.port())) + `], "action": "reject"}
+			],
+			"final": "direct"
+		}
+	}`
+
+	var options option.Options
+	require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
+	startInstance(t, options)
+
+	conn := naiveTLSConn(t, port)
+	magic := uot.RequestDestination(uot.Version).String()
+	response := naiveWriteConnectOK(t, conn, magic, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+		"Padding":             "~~~~~~~~",
+	})
+	defer response.Body.Close()
+
+	// Non-connect session, so each datagram carries its own destination.
+	writer := &sliceWriter{}
+	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, metadata.ParseSocksaddr("93.184.216.34:443")))
+	_, err := conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	require.NoError(t, err)
+
+	// Datagram 1: an allowed port on loopback must be delivered.
+	writeUoTDatagramToLoopback(t, conn, metadata.ParseSocksaddr(allowedOrigin.addr), []byte("ok"))
+	time.Sleep(300 * time.Millisecond)
+	require.EqualValues(t, 1, allowedOrigin.packets.Load(),
+		"the datagram to a permitted port must be delivered, proving the session works")
+
+	// Datagram 2: the port the rules reject, same session, same address family.
+	writeUoTDatagramToLoopback(t, conn, metadata.ParseSocksaddr(forbiddenOrigin.addr), []byte("denied"))
+	time.Sleep(400 * time.Millisecond)
+
+	t.Logf("per-datagram port rule: allowed=%d forbidden=%d",
+		allowedOrigin.packets.Load(), forbiddenOrigin.packets.Load())
+	require.EqualValues(t, 0, forbiddenOrigin.packets.Load(),
+		"a datagram to a port the rules reject must not be delivered, even though "+
+			"the session target itself was allowed")
+}
+
+// writeUoTDatagramRaw frames one v1-style datagram and RETURNS the write error
+// instead of failing the test, for cases where the tunnel may legitimately have
+// been closed by the server's own access control.
+func writeUoTDatagramRaw(conn net.Conn, target metadata.Socksaddr, payload []byte) error {
+	body := make([]byte, 0, 32)
+	var buffer bytes.Buffer
+	if err := uot.AddrParser.WriteAddrPort(&buffer, target); err != nil {
+		return err
+	}
+	body = append(body, buffer.Bytes()...)
+	length := make([]byte, 2)
+	binary.BigEndian.PutUint16(length, uint16(len(payload)))
+	body = append(body, length...)
+	body = append(body, payload...)
+	_, err := conn.Write(naivePaddingFrame(body, 0))
+	return err
+}

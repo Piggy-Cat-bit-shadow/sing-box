@@ -4,6 +4,7 @@ import (
 	"bufio"
 	stdTLS "crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -202,6 +203,47 @@ type uotTraceSession struct {
 	// closeFn releases the session's transport. Using a function keeps the
 	// HTTP/1.1 and HTTP/2 lifetimes together without a type switch at each call.
 	closeFn func()
+
+	// replies carries decoded reply payloads from a single background reader.
+	//
+	// awaitReply must NOT start a fresh read per call: on a timeout the old
+	// reader stays blocked on the stream, and a second call would race it for
+	// the same bytes, so a reply that DID arrive could be swallowed by the
+	// abandoned goroutine and reported as a timeout. One reader owns the stream
+	// and hands payloads over by channel.
+	replies     chan []byte
+	readerOnce  sync.Once
+	readerErr   error
+	readerErrMu sync.Mutex
+}
+
+// startReplyReader launches the single background reader for this session.
+func (s *uotTraceSession) startReplyReader() {
+	s.readerOnce.Do(func() {
+		s.replies = make(chan []byte, 16)
+		go func() {
+			defer close(s.replies)
+			for {
+				payload, err := s.readFrame()
+				if err != nil {
+					s.readerErrMu.Lock()
+					if s.readerErr == nil {
+						s.readerErr = err
+					}
+					s.readerErrMu.Unlock()
+					return
+				}
+				s.replies <- payload
+			}
+		}()
+	})
+}
+
+// replyReaderError returns the terminal reader error, if any.
+func (s *uotTraceSession) replyReaderError() error {
+	s.readerErrMu.Lock()
+	defer s.readerErrMu.Unlock()
+	return s.readerErr
 }
 
 // close releases the session.
@@ -449,37 +491,38 @@ func (s *uotTraceSession) sendDatagram(t *testing.T, packetID uint32) error {
 // specific Packet ID rather than hanging the whole run.
 func (s *uotTraceSession) awaitReply(t *testing.T, packetID uint32, timeout time.Duration) error {
 	t.Helper()
-	type outcome struct {
-		payload []byte
-		err     error
-	}
-	result := make(chan outcome, 1)
-	go func() {
-		payload, err := s.readFrame()
-		result <- outcome{payload: payload, err: err}
-	}()
+	s.startReplyReader()
 
-	select {
-	case got := <-result:
-		if got.err != nil {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case payload, open := <-s.replies:
+			if !open {
+				err := fmt.Errorf("session closed before a reply to packet %d arrived: %w",
+					packetID, s.replyReaderError())
+				s.trace.record(s.sessionID, packetID, StageClientReceived,
+					"stream ended", err)
+				return err
+			}
+			receivedID := payloadPacketID(payload)
+			if receivedID != packetID {
+				// A reply for another Packet ID is recorded and skipped rather
+				// than mistaken for this one. This is what makes the withheld-
+				// reply scenario observable: the first datagram's reply never
+				// comes, so any payload arriving must belong to a later packet.
+				s.trace.record(s.sessionID, receivedID, StageClientReceived,
+					fmt.Sprintf("reply for a different packet id=%d (skipped while waiting for %d)",
+						receivedID, packetID), nil)
+				continue
+			}
 			s.trace.record(s.sessionID, packetID, StageClientReceived,
-				"reply read failed", got.err)
-			return got.err
-		}
-		receivedID := payloadPacketID(got.payload)
-		if receivedID != packetID {
-			err := fmt.Errorf("reply Packet ID mismatch: got %d, want %d", receivedID, packetID)
-			s.trace.record(s.sessionID, packetID, StageClientReceived,
-				fmt.Sprintf("WRONG PACKET: got id=%d", receivedID), err)
+				fmt.Sprintf("received %d bytes, id matches", len(payload)), nil)
+			return nil
+		case <-deadline:
+			err := fmt.Errorf("timeout after %v waiting for reply to packet %d", timeout, packetID)
+			s.trace.record(s.sessionID, packetID, StageClientReceived, "TIMEOUT", err)
 			return err
 		}
-		s.trace.record(s.sessionID, packetID, StageClientReceived,
-			fmt.Sprintf("received %d bytes, id matches", len(got.payload)), nil)
-		return nil
-	case <-time.After(timeout):
-		err := fmt.Errorf("timeout after %v waiting for reply to packet %d", timeout, packetID)
-		s.trace.record(s.sessionID, packetID, StageClientReceived, "TIMEOUT", err)
-		return err
 	}
 }
 
@@ -521,4 +564,91 @@ func (s *uotTraceSession) readFrame() ([]byte, error) {
 		return nil, err
 	}
 	return payload, nil
+}
+
+// FaultInjectingEcho is an echo server that deliberately withholds the reply for
+// chosen Packet IDs, so a lost reply can be produced ON DEMAND instead of being
+// waited for.
+//
+// Why this exists: the same-session resend behaviour used to be tested by
+// churning thousands of sessions until one happened to fail, which SKIPPED on
+// any machine where the loss did not reproduce - so the behaviour was usually
+// unverified. Injecting the loss makes the scenario deterministic and keeps the
+// session open by construction, which is exactly the state the test needs.
+//
+// It is an ORIGIN-SIDE fault, not a client-side shortcut: the request still
+// travels the real Naive UoT path and the echo still records that it received
+// it. Only the reply is withheld.
+type FaultInjectingEcho struct {
+	conn    *net.UDPConn
+	address string
+	trace   *Trace
+
+	mu       sync.Mutex
+	suppress map[uint32]int // packet ID -> number of replies still to withhold
+	observed map[uint32]int // packet ID -> times the echo received it
+}
+
+func startFaultInjectingEcho(t *testing.T, trace *Trace) *FaultInjectingEcho {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	echo := &FaultInjectingEcho{
+		conn:     conn,
+		address:  conn.LocalAddr().String(),
+		trace:    trace,
+		suppress: make(map[uint32]int),
+		observed: make(map[uint32]int),
+	}
+	go func() {
+		buffer := make([]byte, 64*1024)
+		for {
+			n, from, readErr := conn.ReadFromUDP(buffer)
+			if readErr != nil {
+				return
+			}
+			packetID := payloadPacketID(buffer[:n])
+
+			echo.mu.Lock()
+			echo.observed[packetID]++
+			remaining := echo.suppress[packetID]
+			if remaining > 0 {
+				echo.suppress[packetID] = remaining - 1
+			}
+			echo.mu.Unlock()
+
+			echo.trace.record(0, packetID, StageEchoReadFromUDP,
+				fmt.Sprintf("n=%d from=%s", n, from), nil)
+
+			if remaining > 0 {
+				// The reply is withheld on purpose. The request DID arrive, so
+				// this is a lost REPLY, not a lost datagram.
+				echo.trace.record(0, packetID, StageEchoWriteToUDP,
+					fmt.Sprintf("WITHHELD on purpose (%d more)", remaining-1),
+					errors.New("reply withheld by fault injection"))
+				continue
+			}
+
+			written, writeErr := conn.WriteToUDP(buffer[:n], from)
+			echo.trace.record(0, packetID, StageEchoWriteToUDP,
+				fmt.Sprintf("n=%d to=%s", written, from), writeErr)
+		}
+	}()
+	return echo
+}
+
+// withholdReplies makes the echo drop the next `count` replies for packetID.
+func (e *FaultInjectingEcho) withholdReplies(packetID uint32, count int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.suppress[packetID] = count
+}
+
+// receivedCount reports how many times the echo actually received packetID.
+func (e *FaultInjectingEcho) receivedCount(packetID uint32) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.observed[packetID]
 }
