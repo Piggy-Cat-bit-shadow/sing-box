@@ -60,7 +60,7 @@ func requestIsConnectUDP(request *http.Request) bool {
 func (c *serverConn) serveConnectUDP(ctx context.Context, request *http.Request, source M.Socksaddr) (requestResult, error) {
 	destination, valid := parseConnectUDPTarget(request.URL.EscapedPath())
 	if !valid || !request.ProtoAtLeast(1, 1) {
-		return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid connect-udp request: ", request.URL.Path))
+		return c.reject(request, c.rejectionKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid connect-udp request: ", request.URL.Path))
 	}
 	_, err := c.conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n"))
 	if err != nil {
