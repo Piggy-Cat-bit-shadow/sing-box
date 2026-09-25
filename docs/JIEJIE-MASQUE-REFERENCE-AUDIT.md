@@ -215,15 +215,49 @@ that neither package appears in the production dependency graph
 Measured values from the CONNECT-IP run: the client is assigned `198.18.0.2/32`
 and the server advertises `198.18.0.0/24` with protocol 0.
 
-### A measured behaviour, recorded rather than assumed
+### CORRECTED in Phase 3: the gateway ICMP result was a fixture bug
 
-sing-box's internal IP stack answers an echo request sent to the tunnel gateway by
-**echoing the request back** (ICMP type 8, the request type) rather than emitting a
-type-0 echo reply. The source address, the echo identifier, the sequence number and
-the payload are all the ones the test sent, so the tunnel is demonstrably
-bidirectional. The test pins the observed type rather than accepting any ICMP: a
-destination-unreachable or packet-too-big answer carries no echo identifier and
-still fails.
+Phase 2 recorded this claim:
+
+> sing-box's internal IP stack answers an echo request sent to the tunnel gateway
+> by echoing the request back (ICMP type 8, the request type) rather than emitting
+> a type-0 echo reply.
+
+**That claim was wrong, and the ICMP data-path test was wrong with it.** The
+fixture derived its destination as
+
+```go
+gateway := source.Masked().Addr()
+```
+
+where `source` was the assigned prefix. The server assigns a **/32**
+(`198.18.0.2/32`), so `Masked()` returns `198.18.0.2` - the **client's own
+address**. The echo request was therefore addressed to the client itself and never
+reached the gateway. The stack echoed it back as type 8, and that artifact was
+recorded as server behaviour.
+
+Measured on the wire in Phase 3, both destinations side by side:
+
+| Destination | Reply |
+| --- | --- |
+| `198.18.0.2` (client's own /32) | ICMP type **8** echoed back, `src == dst == 198.18.0.2` |
+| `198.18.0.1` (the real gateway) | ICMP type **0** echo reply, `src=198.18.0.1`, `dst=198.18.0.2` |
+
+So nothing was wrong with the server. It answers a gateway echo request in the
+conventional way; Phase 2 simply never asked it to.
+
+What the Phase 2 test did prove, and what it did not:
+
+- **It proved** HTTP Datagram framing, the context-ID-0 path, the session return
+  path and that the client can read what the server writes back.
+- **It did not prove** a server-side IP round trip, because no packet ever reached
+  the server's IP stack as a destination.
+
+The destination now comes from a single named constant
+(`connectIPServerGateway`) shared by the driver and the assertion, and the test
+asserts `source.Addr() != gateway` explicitly, because deriving a /24 gateway from
+a /32 assignment is the mistake being locked out. A destination-unreachable or
+packet-too-big answer still fails, since those carry no echo identifier.
 
 ### The interop tests fail when the implementation is broken
 
