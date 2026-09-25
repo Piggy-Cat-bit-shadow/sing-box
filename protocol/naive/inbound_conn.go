@@ -19,6 +19,11 @@ import (
 
 const paddingCount = 8
 
+// forcedPadding, when non-nil, overrides the random padding size. It exists so a
+// test can exercise every value in 0..255 deterministically instead of relying on
+// the random draw to reach a boundary case; production always leaves it nil.
+var forcedPadding *int
+
 func generatePaddingHeader() string {
 	paddingLen := rand.Intn(32) + 30
 	padding := make([]byte, paddingLen)
@@ -162,8 +167,25 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 			return err
 		}
 		paddingSize := rand.Intn(256)
+		if forcedPadding != nil {
+			paddingSize = *forcedPadding
+		}
 		header := buffer.ExtendHeader(3)
 		binary.BigEndian.PutUint16(header, uint16(bufferLen))
+		// The header has already consumed 3 bytes of the buffer's free space, so
+		// the padding must fit in what is LEFT. Callers size a buffer from
+		// rearHeadroom(), which reserves 255 bytes for padding alone; after the
+		// header only 252 remain, so a padding size in 253..255 used to reach
+		// WriteZeroN, fail with io.ErrShortBuffer and panic through common.Must -
+		// crashing the whole server process on roughly 1 write in 85.
+		//
+		// Clamping is safe and does not change the protocol: the padding length
+		// is an arbitrary 0..255 chosen by the sender and its only requirement
+		// is that the receiver skip exactly that many bytes, which it does from
+		// the header byte written below.
+		if available := buffer.FreeLen(); paddingSize > available {
+			paddingSize = available
+		}
 		header[2] = byte(paddingSize)
 		common.Must(buffer.WriteZeroN(paddingSize))
 		framed = true

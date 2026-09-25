@@ -26,6 +26,21 @@ import (
 // These tests pin the corrected behaviour for every short-write shape the audit
 // asks about.
 
+// capturingWriter records everything written so a test can inspect the actual
+// frame bytes, while still failing a short write when asked to.
+type capturingWriter struct {
+	allow int
+	buf   []byte
+}
+
+func (w *capturingWriter) Write(p []byte) (int, error) {
+	n := min(w.allow, len(p))
+	w.buf = append(w.buf, p[:n]...)
+	return n, nil
+}
+
+func (w *capturingWriter) data() []byte { return w.buf }
+
 // scriptedWriter returns a fixed number of bytes and an optional error.
 type scriptedWriter struct {
 	allow int
@@ -198,3 +213,62 @@ func TestAuditWriterThatLiesAboutLengthIsStillCaught(t *testing.T) {
 type lyingWriter struct{}
 
 func (w *lyingWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestAuditPaddingNeverOverflowsTheBuffer is the regression for a process crash.
+//
+// writeBufferWithPadding picks a padding size of rand.Intn(256) - up to 255 -
+// but it first calls ExtendHeader(3), which consumes 3 bytes of the buffer's
+// free space. A caller that sized the buffer from rearHeadroom(), which
+// advertises 255 bytes for padding, therefore had only 252 left when the padding
+// was written. Whenever the random size landed in 253..255 the write asked
+// WriteZeroN for more room than existed, got io.ErrShortBuffer, and common.Must
+// turned that into a PANIC that took the whole server process down - on roughly
+// 1 write in 85.
+//
+// The padding size is forced through the whole 0..255 range here so the boundary
+// is exercised deterministically instead of depending on the random draw.
+func TestAuditPaddingNeverOverflowsTheBuffer(t *testing.T) {
+	// Sized exactly as the production path sizes a buffer: 3 for the frame
+	// header, 255 for padding, plus the content.
+	content := []byte("hello")
+	// Resize takes (start, end) and sets end = start + end, so this yields a
+	// buffer whose Len() is 3+len(content). The payload the frame declares must
+	// therefore be that Len(), which is what the assertions below compare
+	// against - the buffer's real length, not the literal content slice.
+	makeBuffer := func() *buf.Buffer {
+		b := buf.NewSize(3 + 255 + len(content))
+		b.Resize(3, 3+len(content))
+		copy(b.Bytes(), content)
+		return b
+	}
+	expectedDataSize := 3 + len(content)
+
+	// Force every padding size, including the 253..255 range that used to panic.
+	for padding := range 256 {
+		t.Run(itoa(padding), func(t *testing.T) {
+			writer := &capturingWriter{allow: 1 << 20}
+			connection := &paddingConn{enabled: true}
+			forcedPadding = &padding
+			defer func() { forcedPadding = nil }()
+
+			err := connection.writeBufferWithPadding(writer, makeBuffer())
+			require.NoError(t, err,
+				"padding size %d must not overflow the buffer", padding)
+			require.Equal(t, 1, connection.writePadding,
+				"a completed frame advances the counter exactly once")
+
+			// The frame the writer received must be self-consistent: the header's
+			// declared padding must match the bytes actually appended, because the
+			// peer skips exactly that many.
+			written := writer.data()
+			require.GreaterOrEqual(t, len(written), 3)
+			declaredPadding := int(written[2])
+			declaredDataSize := int(written[0])<<8 | int(written[1])
+			require.Equal(t, expectedDataSize, declaredDataSize,
+				"the frame must declare the buffer's real payload length")
+			require.Equal(t, len(written), 3+declaredDataSize+declaredPadding,
+				"the frame length must equal header + data + the padding it "+
+					"declares; a mismatch desynchronises the peer's framing")
+		})
+	}
+}
