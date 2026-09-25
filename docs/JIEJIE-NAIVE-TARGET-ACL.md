@@ -37,13 +37,38 @@ without a resolve action, CONNECT forbidden.test reached=true,
 
 ## 2. 推荐的生产配置
 
-正式结构是**三段式**：先 `resolve`，再**显式的最小自身服务例外**，最后
-`ip_cidr` 拒绝。
+正式结构是**四段式**，顺序本身就是安全属性：
+
+```
+1. 代理入口名 reject      （必须先于后缀改写，否则入口名会被改写成 Web）
+2. 自建 Web 目标改写       （必须早于 resolve，域名匹配需要目标仍是域名）
+3. resolve
+4. 自身服务最小例外 → ip_cidr 拒绝
+```
 
 ```json
 {
   "route": {
     "rules": [
+      {
+        "inbound": ["naive-in"],
+        "network": ["tcp"],
+        "domain": ["riri.zhuzhu.jiejie12131.top", "api.zhuzhu.jiejie12131.top"],
+        "port": [443],
+        "action": "reject"
+      },
+
+      {
+        "inbound": ["naive-in"],
+        "network": ["tcp"],
+        "domain_suffix": ["zhuzhu.jiejie12131.top"],
+        "port": [443],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1",
+        "override_port": 28439
+      },
+
       { "inbound": ["naive-in"], "action": "resolve" },
 
       {
@@ -77,12 +102,12 @@ without a resolve action, CONNECT forbidden.test reached=true,
 
 ```
 default deny self
-+
-minimal explicit self-service allow
++ minimal explicit self-service allow
++ named self-hosted web rewritten to an isolated loopback ingress
 ```
 
-**不要**整体删除 VPS self IP 的 deny。自身地址默认拒绝，只把**确实需要**的
-服务用最小例外放行。
+**不要**整体删除 VPS self IP 的 deny。自身地址**默认拒绝**；需要放行的服务只
+用最小例外，自建 Web 则用**目标改写**（见 2.1.1）而不是放开自身地址。
 
 ### 2.1 VPS 自身服务的最小例外
 
@@ -103,7 +128,7 @@ minimal explicit self-service allow
 
 | 目标 | 结果 | 原因 |
 | --- | --- | --- |
-| `<VPS_SELF_IP>:443` | **拒绝** | 见 2.2，必须永久拒绝 |
+| `<VPS_SELF_IP>:443`（公网自身地址） | **拒绝** | 见 2.2，必须永久拒绝 |
 | `<VPS_SELF_IP>:<其他端口>` | 拒绝 | 例外只限 2222 |
 | `127.0.0.1:2222` | 拒绝 | 例外绑定自身地址，不是端口 |
 | `10.x.x.x:2222` / `172.16/12:2222` / `192.168/16:2222` | 拒绝 | 私网一律拒绝 |
@@ -113,7 +138,53 @@ minimal explicit self-service allow
 那会同时放行 `127.0.0.1:2222`、私网 `:2222` 和 link-local `:2222`，
 把例外变成一次访问面扩大。
 
-### 2.2 为什么 `<VPS_SELF_IP>:443` 必须永久拒绝
+### 2.1.1 自建 Web 服务：改写目标，而不是放开自身 443
+
+`*.zhuzhu.jiejie12131.top` 这类**自建 Web 服务**解析到 VPS 自身公网地址，
+因此会被上面的自身地址规则一并拒绝，表现为 Naive 客户端打不开自己的站点
+（典型症状：`https://push.zhuzhu.jiejie12131.top/creator-login` 失败）。
+
+修法**不是**给 `<VPS_SELF_IP>:443` 开口子，而是把目标**改写到一条本机
+Web 专用的内部入口**：
+
+```jsonc
+// 必须排在 domain_suffix 规则之前：这两个名字是代理入口的 TLS server_name，
+// 若先命中后缀规则就会被改写进 Web 入口。
+{
+  "inbound": ["naive-in"], "network": ["tcp"],
+  "domain": ["riri.zhuzhu.jiejie12131.top", "api.zhuzhu.jiejie12131.top"],
+  "port": [443], "action": "reject"
+},
+{
+  "inbound": ["naive-in"], "network": ["tcp"],
+  "domain_suffix": ["zhuzhu.jiejie12131.top"],
+  "port": [443], "action": "route", "outbound": "direct",
+  "override_address": "127.0.0.1", "override_port": 28439
+}
+```
+
+| 项目 | 值 | 说明 |
+| --- | --- | --- |
+| 入口地址 | `127.0.0.1:28439` | **仅回环**，不得监听 `0.0.0.0` / `[::]` |
+| 入口性质 | Web-only HTTPS | 只服务自建 Web，不承载任何代理协议 |
+| `domain_suffix` 写法 | 裸后缀 `zhuzhu.jiejie12131.top` | sing-box 的 `domain_suffix` 是原始后缀匹配，**不要**写 `*.` 前缀 |
+| 匹配范围 | `tcp` + `port 443` | 不产生任何 UDP / UoT 路径 |
+
+**为什么这样是安全的。** `override_address` 会把
+`metadata.DestinationAddresses` 清空（`route/route.go`），拨号目标是那条回环
+入口，**永远不是解析出来的公网地址**。因此即使客户端先 `CONNECT` 一个自建域名
+、再在隧道内换一个**不相关的 TLS SNI**（例如代理入口名），连接依然终止在
+`127.0.0.1:28439`，公网 443 前端根本到不了，递归路径被切断而不是被劝阻。
+回归测试 `TestJiejieNaiveSelfHostedWebSNIMismatchCannotReenterProxy` 断言
+代理监听器与前端监听器收到连接数**都为 0**。
+
+**注意 `domain_suffix` 与 `ip_cidr` 的语义。** 同一条规则的「目标地址组」内，
+`domain` / `domain_suffix` 与 `ip_cidr` 之间是 **OR**，不是 AND。因此不要试图
+用 `domain_suffix` + `ip_cidr` 组合出「只在这个域名解析到自身地址时才放行」的
+效果——那种写法会退化成两条独立的放行条件。本次的写法不使用 `ip_cidr`，
+从而绕开了这个陷阱。
+
+### 2.2 为什么公网 `<VPS_SELF_IP>:443` 必须永久拒绝
 
 生产公网 TCP/443 由 **Nginx Stream** 持有，按 SNI 转发进 Native Naive。
 如果允许客户端重新 `CONNECT <VPS_SELF_IP>:443`，这个请求会**再次进入同一个
@@ -123,24 +194,48 @@ minimal explicit self-service allow
 Naive -> <VPS_SELF_IP>:443 -> Nginx Stream -> Native Naive -> <VPS_SELF_IP>:443 -> ...
 ```
 
-因此 443 必须在拒绝列表中，永久保留。已有回归测试
+因此公网自身地址的 443 必须在拒绝列表中，永久保留。已有回归测试
 `TestJiejieTargetACLSelfIP443CannotRecurse` 同时验证字面地址与域名两种写法，
 并断言前端监听器收到连接数为 **0**。
+
+需要强调：`CONNECT` 里的主机名与隧道内 TLS 的 SNI **并不绑定**，所以
+「按域名放行自身 443」是不可靠的递归防护——客户端完全可以用一个被放行的域名
+发起 `CONNECT`，再在隧道内换成别的 SNI。这正是 2.1.1 采用**目标改写**而不是
+自身地址放行的原因：改写发生在拨号之前，SNI 无法把它改回去。
+
+2.1.1 的改写**只**覆盖 `*.zhuzhu.jiejie12131.top` 这一个区域。任何其他解析到
+自身地址的域名（例如第三方域名被解析到本机）依然落到下面的拒绝规则，行为与
+改动前完全一致。
 
 ### 2.3 要点
 
 | 项目 | 说明 |
 | --- | --- |
 | 插入位置 | 放在其他规则**之后**，不要插到 `residential` 用户规则之前 |
-| 规则顺序 | `resolve` → **自身服务例外** → `ip_cidr` 拒绝；顺序不能错 |
+| 规则顺序 | `proxy 入口名 reject` → `自建 Web 改写` → `resolve` → **自身服务例外** → `ip_cidr` 拒绝；顺序不能错 |
+| 改写在 `resolve` 之前 | `domain` / `domain_suffix` 需要目标仍是域名；`resolve` 之后目标会变成 IP |
 | 例外的位置 | 必须在自身地址 reject **之前**，否则永远不会命中 |
 | `inbound` 限定 | 全部限定 `naive-in`，因此**不影响** AnyTLS / MASQUE / ShadowTLS / SS2022 |
 | 无需删除旧规则 | 既有的 `{"ip_is_private": true, "outbound": "direct"}` 保持原样即可 |
-| UDP | 同一组规则同时约束 UoT v1/v2 的**每包真实目标**（见第 4 节）；例外是 TCP-only |
+| UDP | 同一组规则同时约束 UoT v1/v2 的**每包真实目标**（见第 4 节）；例外与 Web 改写都是 TCP-only |
 | 域名目标 | 例外同样适用于解析到自身地址的域名，因为规则匹配的是解析后的地址 |
 
 `release/jiejie-production-topology.json` 已按上述形式更新（自身地址使用
-RFC 5737 文档地址占位），并通过 `sing-box check` 校验。
+RFC 5737 文档地址占位），并通过生产 tag 集下的 `sing-box check` 校验。
+
+### 2.4 内部 Web 入口的部署（VPS 侧，不在仓库内）
+
+`127.0.0.1:28439` 是 **VPS 上的部署状态**，仓库只提供配置片段。Nginx 必须：
+
+| 要求 | 原因 |
+| --- | --- |
+| `listen 127.0.0.1:28439 ssl;` | 仅回环；**不得**写 `0.0.0.0` / `[::]` |
+| 只提供自建 Web 的站点 | 这是 Web-only 入口，不是第二条代理入口 |
+| **不得** `proxy_pass https://<VPS_SELF_IP>:443` | 那会把递归重新引回来 |
+| **不得**把该入口 Stream 转发到任何代理入口 | 同上 |
+| 代理入口 SNI（`riri`、`api`）在该入口上应被拒绝或关闭 | 它们不是 Web 站点 |
+
+部署与验证命令见 `docs/JIEJIE-NAIVE-MIGRATION.md` 第 6 节。
 
 ---
 
@@ -247,6 +342,29 @@ v2 non-connect: allowed datagram delivered=1, forbidden received 0
 | STUN 指向被拒 loopback | 收包 0（STUN 不豁免 ACL） |
 | IPv6 UDP 往返（UoT v1/v2） | 成功，源地址为 IPv6 |
 
+自建 Web 改写的验收矩阵（`TestJiejieNaiveSelfHostedWebRoute` 及同文件的回归），
+断言的是**源站实际观察到的连接**，不是路由器的判定结果：
+
+| 场景 | 结果 |
+| --- | --- |
+| `CONNECT push.zhuzhu.jiejie12131.top:443` | 可达，内部入口收到连接并**实际服务** |
+| `CONNECT files.zhuzhu.jiejie12131.top:443`（同区域其他子域） | 可达同一内部入口（证明是后缀规则而非单域名特判） |
+| `CONNECT riri.zhuzhu.jiejie12131.top:443` | 拒绝；内部入口 / 前端 / 代理监听器连接数均为 0 |
+| `CONNECT api.zhuzhu.jiejie12131.top:443` | 拒绝；内部入口连接数 0 |
+| `CONNECT <SELF_IP>:443`（字面地址） | 拒绝；内部入口连接数 0 |
+| 第三方域名解析到自身地址 | 拒绝；改写只覆盖本区域 |
+| `127.0.0.1:443` / 私网 `:443` | 拒绝 |
+| `CONNECT <SELF_IP>:2222`（SSH 例外） | 可达，未受本次改动影响 |
+| **SNI 不匹配**：`CONNECT push.<区域>:443` + 隧道内 SNI `riri.<区域>` | 连接仍终止于内部入口；**代理监听器与前端连接数均为 0** |
+| 内部 HTTPS 入口（真实 TLS 监听）端到端 | TLS 握手与 HTTP 请求均成功 |
+
+> 验收方法上有一个必须记录的细节：**Naive inbound 在接受 CONNECT 时就返回
+> `200 OK`，路由器层面的 `reject` 只是随后关闭连接。** 已在 Linux 上实测：
+> `CONNECT 127.0.0.1:443`、`CONNECT <SELF_IP>:443`、`CONNECT riri.<区域>:443`
+> 三种情况**全部返回 `200 OK`，然后不传输任何数据**。因此**不能**用状态码判断
+> 是否被拒绝，否则每一次拒绝都会被误判为成功；测试改为向隧道内写入并观察源站
+> 是否应答。
+
 ---
 
 ## 6.1 Guard 的作用范围与已知限制
@@ -323,3 +441,22 @@ http、socks、tuic、vless、vmess 等）。标记逐包会话后 Guard 对这�
 - 生产构建标签构建 + `sing-box check`；
 - UoT 正常多目标用例 `TestJiejieNaiveUoTV1MultipleTargets`（**无规则时应放行多个不同目标**），
   确认逐包检查引入了**零**功能回归。
+
+自建 Web 改写（`release/jiejie-production-topology.json`）另由
+`test/jiejie/jiejie_naive_self_hosted_web_test.go` 覆盖：
+
+- `TestJiejieNaiveSelfHostedWebRoute` —— 上文验收矩阵，断言源站实际观察到的
+  连接，而不是路由器的判定结果；
+- `TestJiejieNaiveSelfHostedWebSNIMismatchCannotReenterProxy` —— **本设计的关键
+  回归**：`CONNECT` 自建域名、隧道内换成代理入口 SNI，代理监听器与前端监听器
+  连接数必须**都为 0**；
+- `TestJiejieNaiveSelfHostedWebEndToEndTLS` —— 对照真实内部 HTTPS 监听完成
+  TLS 握手与 HTTP 请求；
+- `TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction` —— 钉住生产配置里
+  规则的顺序、作用域与改写目标，防止运行时测试与线上配置漂移。
+
+回归测试**不重开** `SELF_IP:443`：字面自身地址、第三方域名解析到自身地址、
+`127.0.0.1:443` 与私网 `:443` 全部由上述矩阵断言为拒绝，且内部入口收到连接数为 0。
+
+> 运行环境说明：`127.0.0.2` 在 macOS 上不可绑定，因此上述三个运行时测试在 macOS
+> 上 **SKIP**（不是 PASS），在 Linux CI runner 上实际执行。

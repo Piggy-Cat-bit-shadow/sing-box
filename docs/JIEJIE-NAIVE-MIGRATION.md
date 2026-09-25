@@ -18,7 +18,24 @@ TCP/443   Nginx Stream 持有，按 SNI 分发
             └─ (其他)            -> 现有 Web 后端
 UDP/443   sing-box MASQUE H3 持有（masque-h3）
             切换不影响该监听
+
+内部（仅回环，不在 TCP/443 分发链路上）
+          127.0.0.1:28439     自建 Web 专用 HTTPS 入口（Web-only）
+                                由 Naive 规则把 *.zhuzhu... 改写到这里
 ```
+
+自建 Web 的访问链路（本次新增）：
+
+```
+Naive 客户端
+  └─ CONNECT push.zhuzhu.jiejie12131.top:443
+       └─ route 规则命中 domain_suffix zhuzhu.jiejie12131.top, tcp, 443
+            └─ override_address=127.0.0.1 override_port=28439   ← 拨号前改写
+                 └─ 127.0.0.1:28439  (Web-only HTTPS 入口)
+```
+
+关键在于改写发生在**拨号之前**：`override_address` 会清空解析出的目标地址，
+所以隧道内无论换成什么 TLS SNI，都不会把连接引回公网 443 前端。
 
 关键约束：
 
@@ -26,6 +43,8 @@ UDP/443   sing-box MASQUE H3 持有（masque-h3）
 - UDP/443 始终归 sing-box MASQUE H3，切换 Naive 不影响它。
 - Naive 的 UDP（UoT v1/v2）在 **TCP CONNECT 隧道内**承载，不占用 UDP 端口。
 - Nginx Stream 继续持有 TCP/443；**不要**用 sing-box 的 SNI 分发取代它。
+- `127.0.0.1:28439` 是**仅回环**的 Web 专用入口，**不参与** TCP/443 的 SNI
+  分发，也**不得**转发回 `<VPS_SELF_IP>:443`。
 
 ---
 
@@ -295,9 +314,13 @@ ss -lunp | grep -v '127.0.0.1\|\[::1\]'
 目标=自身地址、port=2222）。**不要**只写 `{"port":[2222],...}` —— 那会同时
 放行 loopback、私网与 link-local 的 2222。
 
-**`<VPS_SELF_IP>:443` 必须保持在拒绝列表中。** 生产公网 TCP/443 由 Nginx
+**公网 `<VPS_SELF_IP>:443` 必须保持在拒绝列表中。** 生产公网 TCP/443 由 Nginx
 Stream 持有并转发回本 listener，放行它会形成自代理递归
 （Naive → 自身:443 → Nginx Stream → Native Naive → 自身:443 → …）。
+
+**自建 Web 服务不走「放开自身 443」这条路。** 它们由两条规则改写到一个仅回环的
+Web 专用入口（见 5.1）。理由同上：`CONNECT` 的主机名与隧道内 TLS SNI 不绑定，
+所以「按域名放行自身 443」挡不住换成别的 SNI 的客户端。
 
 注意事项：
 
@@ -308,6 +331,91 @@ Stream 持有并转发回本 listener，放行它会形成自代理递归
   自身地址 + 具体端口）为该服务单独加一条例外，而不是放宽整条 ACL，
   也不要退化成只有端口的规则。
 - 修改后重新 `sing-box check` 并 reload，再重复第 2 节的验证。
+
+### 5.1 自建 Web 的仅回环入口（`127.0.0.1:28439`）
+
+自建 Web 服务（`*.zhuzhu.jiejie12131.top`）解析到 VPS 自身公网地址，会被上面的
+自身地址规则一并拒绝，表现为 Naive 客户端打不开自己的站点。修法是**改写目标**：
+
+```jsonc
+// 顺序不能颠倒：代理入口的 TLS server_name 必须先被拒绝，
+// 否则会被下面的后缀规则改写进 Web 入口。
+{
+  "inbound": ["naive-in"], "network": ["tcp"],
+  "domain": ["riri.zhuzhu.jiejie12131.top", "api.zhuzhu.jiejie12131.top"],
+  "port": [443], "action": "reject"
+},
+{
+  "inbound": ["naive-in"], "network": ["tcp"],
+  "domain_suffix": ["zhuzhu.jiejie12131.top"],
+  "port": [443], "action": "route", "outbound": "direct",
+  "override_address": "127.0.0.1", "override_port": 28439
+}
+```
+
+两条规则都必须排在 `naive-in` 的 `resolve` 动作**之前**——域名匹配需要目标
+仍然是域名。
+
+**VPS 侧需要部署的 Nginx 入口**（仓库不保存 Nginx 配置，这里是交付片段）：
+
+```nginx
+# Web-only 内部入口：只服务自建 Web，不承载任何代理协议。
+# 必须 listen 在回环上，绝不能是 0.0.0.0 / [::]。
+server {
+    listen 127.0.0.1:28439 ssl;
+    http2 on;
+    server_name push.zhuzhu.jiejie12131.top files.zhuzhu.jiejie12131.top;
+
+    ssl_certificate     /path/to/fullchain.pem;
+    ssl_certificate_key /path/to/privkey.pem;
+
+    # 代理入口名不是 Web 站点，直接拒绝，避免被当作普通 Web 访问。
+    if ($ssl_server_name ~ ^(riri|api)\.zhuzhu\.jiejie12131\.top$) {
+        return 421;
+    }
+
+    location / {
+        # 只反代到自建 Web 后端。
+        # 绝对不要 proxy_pass https://<VPS_SELF_IP>:443 —— 那会把递归引回来。
+        proxy_pass http://127.0.0.1:28437;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+硬性要求：
+
+| 要求 | 原因 |
+| --- | --- |
+| `listen 127.0.0.1:28439 ssl;` | 仅回环；写成 `0.0.0.0` / `[::]` 等于新增一个公网入口 |
+| 只提供自建 Web | 这是 Web-only 入口，不是第二条代理入口 |
+| **不得** `proxy_pass https://<VPS_SELF_IP>:443` | 会把自代理递归重新引回来 |
+| **不得** Stream 转发到任何代理入口 | 同上（28436 / 28438 / 28440） |
+| 代理 SNI（`riri`、`api`）应被拒绝 | 它们不是 Web 站点 |
+
+**部署后必须验证**：
+
+```bash
+# 1) 必须只监听回环。出现 0.0.0.0:28439 或 [::]:28439 即为配置错误。
+ss -lntp | grep 28439
+# 期望：127.0.0.1:28439
+
+# 2) 入口本身可用（直接打内部入口，绕过代理）
+curl -vk --resolve push.zhuzhu.jiejie12131.top:28439:127.0.0.1 \
+  https://push.zhuzhu.jiejie12131.top:28439/
+# 期望：TLS 握手成功并返回自建 Web 响应
+
+# 3) 公网自身 443 仍然拒绝（不得出现 200）
+curl -vk --resolve push.zhuzhu.jiejie12131.top:443:<VPS_SELF_IP> \
+  https://push.zhuzhu.jiejie12131.top:443/ --max-time 5
+# 期望：失败（连接被关闭 / 超时），而不是正常的 Web 响应
+
+# 4) 端到端：客户端经 Naive 访问自建 Web
+#    期望与原症状相反：页面能打开（原先 creator-login 失败）
+```
 - **不要**把真实地址写进本仓库；生产地址只应存在于生产配置中。
 
 ---
