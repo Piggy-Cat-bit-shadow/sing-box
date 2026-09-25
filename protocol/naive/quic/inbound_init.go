@@ -42,10 +42,11 @@ import (
 //     enable 0-RTT either: its quic.Config sets only Versions and Tracer. This
 //     fork prefers reference-like defaults.
 //
-// MaxIncomingStreams and DisablePathManager remain explicit. They are recorded
-// in docs/JIEJIE-NAIVE-H3-AUDIT.md as differences from the reference that have
-// NOT been aligned, because aligning them needs runtime evidence rather than a
-// config diff.
+// MaxIncomingStreams is intentionally left unset so the quic-go default applies.
+// DisablePathManager remains explicit. The latter is recorded in
+// docs/JIEJIE-NAIVE-H3-AUDIT.md as a difference from the reference that has NOT
+// been aligned, because aligning it needs runtime evidence rather than a config
+// diff.
 func nativeNaiveQUICConfig() *quic.Config {
 	return &quic.Config{
 		// MaxIncomingStreams is deliberately NOT set, so it takes the quic-go

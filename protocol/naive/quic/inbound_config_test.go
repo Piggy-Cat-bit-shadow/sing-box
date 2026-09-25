@@ -37,9 +37,11 @@ func TestNativeNaiveQUICConfigRefuses0RTT(t *testing.T) {
 // TestNativeNaiveQUICConfigKeepsDocumentedSettings pins the settings that ARE
 // set, so the 0-RTT fix cannot be mistaken for a general reset of this config.
 //
-// These two remain deliberate differences from the reference and are recorded as
-// such in docs/JIEJIE-NAIVE-H3-AUDIT.md; they are asserted here so a change to
-// them is a visible decision rather than an accident.
+// MaxIncomingStreams is asserted to stay UNSET, which keeps it aligned with the
+// reference's library default. DisablePathManager remains a deliberate
+// difference from the reference and is recorded as such in
+// docs/JIEJIE-NAIVE-H3-AUDIT.md; it is asserted here so a change to it is a
+// visible decision rather than an accident.
 func TestNativeNaiveQUICConfigKeepsDocumentedSettings(t *testing.T) {
 	config := nativeNaiveQUICConfig()
 

@@ -1,9 +1,8 @@
 # Naive HTTP/3 / QUIC differential audit
 
-This documents how sing-box's Native Naive HTTP/3 configuration compares with
-the reference deployment, **without changing any parameter**. It exists because
-the two differ visibly and the difference needs to be understood before it is
-"aligned", not after.
+This documents how sing-box's Native Naive HTTP/3 configuration compares with the
+reference deployment. It records what was **measured**, what was **changed as a
+result**, and what remains **unmeasured**.
 
 Reference, pinned:
 
@@ -36,17 +35,23 @@ Caddy sets **only** `Versions` and `Tracer` on `quic.Config`. Everything else -
 stream limits, flow control, 0-RTT, path manager, congestion control - is left at
 the quic-go defaults for the version Caddy vendors.
 
-### sing-box (`protocol/naive/quic/inbound_init.go`)
+### Native Naive (`protocol/naive/quic/inbound_init.go`, `nativeNaiveQUICConfig`)
 
 ```go
-quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, &quic.Config{
-    MaxIncomingStreams: 1 << 60,
-    Allow0RTT:          true,
+return &quic.Config{
     DisablePathManager: true,
-})
+}
 ```
 
-with congestion control set per connection in `ConnContext`:
+Only `DisablePathManager` is set. `Allow0RTT` and `MaxIncomingStreams` are
+deliberately **left unset**, so the quic-go defaults apply - `false` and `100`
+respectively. This is asserted by
+
+- `TestNativeNaiveQUICConfigRefuses0RTT` (Allow0RTT)
+- `TestNativeNaiveQUICConfigKeepsDocumentedSettings` (MaxIncomingStreams unset,
+  DisablePathManager retained)
+
+Congestion control is set per connection in `ConnContext`, not in `quic.Config`:
 
 | `QUICCongestionControl` | Implementation |
 | --- | --- |
@@ -58,130 +63,131 @@ with congestion control set per connection in `ConnContext`:
 
 ## 2. Item-by-item comparison
 
-| Item | Caddy | sing-box | Comparable without packet capture? |
+| Item | Caddy | Native Naive | Status |
 | --- | --- | --- | --- |
-| QUIC versions | v1, v2 explicit | library default (v1, v2) | Yes (API) |
-| `MaxIncomingStreams` | unset (library default) | `1 << 60` | Yes (API) |
-| `Allow0RTT` | unset (false) | **`false` (aligned)** | Yes (API) |
-| `DisablePathManager` | unset (false, path manager on) | `true` | Yes (API) |
-| Congestion control | library default (CUBIC in quic-go) | **BBR** by default | Yes (API) |
-| `IdleTimeout` | from Caddy server config | library default | Yes (API) |
-| `MaxHeaderBytes` | from Caddy server config | unset | Yes (API) |
-| Flow-control windows | library default | library default | Yes (API) - both leave unset |
-| HTTP/3 SETTINGS frame contents | library default | library default | **requires packet-level verification** |
-| `Alt-Svc` advertisement | set by Caddy | not set by sing-box | Yes (API) |
-| 0-RTT acceptance on the wire | unknown (0-RTT not enabled) | expected, `Allow0RTT: true` | **requires packet-level verification** |
-| Connection migration | path manager on | path manager off | **requires packet-level verification** |
+| `Allow0RTT` | unset (false) | unset (false) | **PASS / ALIGNED** |
+| `MaxIncomingStreams` | unset (default 100) | unset (default 100) | **PASS / ALIGNED** |
+| `DisablePathManager` | unset (false) | `true` | **RETAINED-DIFF / UNVERIFIED** |
+| Congestion control | quic-go default (CUBIC) | **BBR** default | **RETAINED-PERFORMANCE-DIFF** |
+| `IdleTimeout` | from Caddy server config | library default | **DIFF / NOT-MEASURED** |
+| `MaxHeaderBytes` | from Caddy server config | unset/default | **DIFF / NOT-MEASURED** |
+| Receive windows | unset/default | unset/default | **PASS** |
+| QUIC versions | explicit v1, v2 | library default v1, v2 | **DEPENDENCY-EQUIVALENT** |
+| H3 SETTINGS frame | library generated | library generated | **NOT-VERIFIED** |
+| Connection migration | enabled (default) | disabled | **NOT-VERIFIED** |
 
-`MaxIncomingStreams: 1 << 60` deserves a note. It is effectively "no limit", and
-it is a *server-side admission* value: it bounds how many streams a peer may open
-toward this server. It is not itself a vulnerability, but on a ~1 GiB host it
-means the connection-count bound must come from somewhere else (the listener
-backlog, the OS, or a fronting proxy).
+### The two rows that were previously reported differently
 
-`Allow0RTT` is now **false**, matching the reference.
+**`MaxIncomingStreams` is no longer `1 << 60`.** It is now unset, so the quic-go
+default of `100` applies, which matches the reference. The old value was quic-go's
+own internal "effectively unlimited" clamp (`config.go` `validateConfig` caps the
+field at `1 << 60`), so it was the library's no-limit sentinel rather than a
+considered limit - it matched neither the library default nor the reference.
 
-It was `true`; it is no longer set, so it takes the quic-go default of false.
-`Allow0RTT` is the only server-side gate for early data (quic-go documents it as
-"only valid for the server" and consumes it when deciding whether to accept a
-0-RTT attempt), so removing the field is what actually refuses 0-RTT -
-`ListenEarly` is merely the listener API and does not enable early data by itself.
+Measured before removing it, on Linux, with concurrent HTTP/3 request streams from
+one connection:
 
-Resolved, not merely audited:
+```
+streams  accepted  refused  RSS+KiB  goroutines  fds
+1        1         0        344      0           0
+8        8         0        520      0           0
+32       32        0        848      0           0
+64       64        0        1732     0           0
+128      128       0        1728     0           0
+256      256       0        2504     0           0
+```
 
-- HTTP/3 does not depend on 0-RTT. It is a latency optimisation for RESUMED
+256 concurrent streams cost ~2.5 MiB with no extra goroutines or descriptors, so
+the default of 100 covers the observed workload comfortably. The old value removed
+the only server-side bound on concurrent HTTP/3 work on a ~1 GiB host; removing it
+restores that bound and aligns with the reference.
+
+`TestNativeNaiveQUICConfigKeepsDocumentedSettings` asserts the field stays unset,
+so a future re-introduction is a visible decision rather than an accident.
+
+**`Allow0RTT` is no longer `true`.** It is unset, so the quic-go default of
+`false` applies, matching the reference. `Allow0RTT` is the **only** server-side
+gate for early data - quic-go documents it as "only valid for the server" and
+consumes it when deciding whether to accept a 0-RTT attempt. `ListenEarly` is
+merely the listener API and does not enable early data by itself.
+
+Why this was changed rather than merely recorded:
+
+- HTTP/3 does not depend on 0-RTT. It is a latency optimisation for **resumed**
   connections, not a prerequisite for establishing one, so refusing it costs one
   round trip on a resumption.
-- 0-RTT payloads are replayable by anyone who captures them. An early-data
-  CONNECT could therefore be replayed against this server, which is a poor trade
-  for a proxy that authenticates its tunnel request.
+- 0-RTT payloads are replayable by anyone who captures them. An early-data CONNECT
+  could therefore be replayed against this server, which is a poor trade for a
+  proxy that authenticates its tunnel request.
 - The pinned reference does not enable it either.
 
-Verified: `TestNativeNaiveQUICConfigRefuses0RTT` pins the value, and the real
-HTTP/3 probes in `test/jiejie/jiejie_naive_h3_test.go` confirm an authenticated H3
-CONNECT still reaches the origin with 0-RTT off.
+Verified by `TestNativeNaiveQUICConfigRefuses0RTT`, and the real HTTP/3 probes in
+`test/jiejie/jiejie_naive_h3_test.go` confirm an authenticated H3 CONNECT still
+reaches the origin with 0-RTT off.
 
-`MaxIncomingStreams: 1 << 60` remains, and is now **measured** rather than
-guessed: `test/jiejie/jiejie_naive_h3_stream_limit_test.go` records that 64 of 64
-concurrent HTTP/3 request streams were accepted with none refused, and that the
-listener survives a stream burst and abrupt client aborts. It is effectively
-unbounded, so on a ~1 GiB host the connection bound has to come from somewhere
-else (the front end, the OS, or a limiter). Aligning it to the library default
-needs a decision about where that bound should live - the test asserts the
-property that matters either way (streams are accepted, the listener stays
-healthy), so a future change is measured rather than assumed.
+---
 
-`DisablePathManager: true` and the BBR congestion control default are **not**
-changed this round. Both are recorded below as deliberate differences.
+## 3. The two retained differences
 
-`DisablePathManager: true` means a client that changes its network path (for
+Neither is called "parity", and neither is called intentional in the strong sense
+(source + runtime + product decision). Both rest on source evidence and an
+explicit product decision, with **no runtime measurement**.
+
+**`DisablePathManager: true`** - a client that changes its network path (for
 example Wi-Fi to cellular) will not have its connection migrated; it must
-reconnect. Caddy leaves the path manager on.
+reconnect. Caddy leaves the path manager on. The current product choice is to
+retain this. **Migration behaviour has not been measured**, so this is recorded as
+retained and unverified, not as a verified intentional difference.
+
+**BBR congestion control** - kept as an explicit performance choice. There is **no
+controlled BBR-vs-CUBIC benchmark** (RTT and loss held constant) in this audit, so
+this is a retained performance difference **by policy, not benchmark-validated**.
+It is not claimed to be the more correct choice, only the current one.
 
 ---
 
-## 3. What this audit does NOT establish
+## 4. What this audit does NOT establish
 
-- It does not establish that any of these differences is a defect. It records
-  them.
 - It does not compare HTTP/3 SETTINGS, 0-RTT acceptance, or connection migration
-  as observed on the wire. Those are marked `requires packet-level verification`
-  above and were **not** measured.
-- No parameter was changed. In particular `MaxIncomingStreams`, `Allow0RTT` and
-  `DisablePathManager` are unchanged, because changing them on the basis of a
-  config diff alone would be guessing at intent: sing-box's values are plausible
-  deliberate choices for a server behind an SNI-routing front end, and the
-  reference's values are quic-go defaults rather than explicit decisions.
+  as observed on the wire. Those rows are **NOT-VERIFIED**.
+- It does not measure `IdleTimeout` or `MaxHeaderBytes` behaviour.
+- It does not establish a Caddy differential for HTTP/3 at all: the H1 and H2
+  differentials exist and pass, the H3 one does not exist.
+- It does not benchmark BBR against CUBIC.
 
 ---
 
-## 4. Why the H2/H3 CONNECT guard still matters here
+## 5. Why the H2/H3 CONNECT guard still matters here
 
 `protocol/naive/inbound.go` performs the reference's `:scheme`/`:path` check for
-`ProtoMajor == 2 || ProtoMajor == 3`. On HTTP/2 that check is unreachable in
-practice because `x/net/http2` rejects such a stream first. HTTP/3 does **not**
-share that stack - it runs on sing-box's own QUIC + `http3.Server` - so the
-explicit check is what actually enforces the rule for H3. Removing it would
-silently drop H3 protection, which is why a source-level test pins it
-(`TestJiejieNaiveParityH3ConnectValidationIsPresent`).
+`ProtoMajor == 2 || ProtoMajor == 3`.
+
+On HTTP/2 that check is unreachable in practice because `x/net/http2` rejects such
+a stream first. HTTP/3 does **not** share that stack - it runs on sing-box's own
+QUIC + `http3.Server` - so the explicit check is what enforces the rule for H3.
+
+However: the guard is verified **at source level only**. No malformed HTTP/3
+request has been sent on the wire to observe the rejection.
+
+| Aspect | Status |
+| --- | --- |
+| Handler rejects non-empty `URL.Scheme` / `URL.Path` for `ProtoMajor == 3` | **SOURCE-GUARDED** |
+| Observed rejection of a real malformed H3 CONNECT | **RUNTIME NOT-TESTED** |
+
+`TestJiejieNaiveParityH3ConnectValidationIsPresent` reads the source and pins the
+check. It does not exercise it.
 
 ---
 
-## 5. Follow-up work, if the differences are to be resolved
+## 6. Follow-up work
 
 Not done here. In rough order of value:
 
 1. Capture an H3 handshake from both servers and diff the HTTP/3 SETTINGS and the
-   transport parameters. This is the only way to close the three
-   `requires packet-level verification` rows.
-2. Decide whether `Allow0RTT` is intended for a Naive CONNECT endpoint given the
-   replay property above. This is a product decision, not a compatibility one.
-3. Decide whether `1 << 60` incoming streams is intended, and if so where the
-   connection bound is expected to come from on a 1 GiB host.
-4. Only then consider aligning values - and if aligned, do it behind tests that
-   assert the intended behaviour rather than merely matching a number.
-
----
-
-## 6. Difference status after this round
-
-Each remaining difference is labelled with what is actually known. Only
-differences with source evidence, runtime evidence and an explicit product
-decision are called INTENTIONAL.
-
-| Item | Caddy | Native Naive | Status | Evidence |
-| --- | --- | --- | --- | --- |
-| 0-RTT acceptance | off | **off** | **PASS (aligned)** | `TestNativeNaiveQUICConfigRefuses0RTT`; real H3 CONNECT probes |
-| Receive windows | unset | unset | **PASS** | both leave the library default |
-| `IdleTimeout` | from Caddy server config | library default | **DIFF** | configuration surface differs; not measured |
-| `MaxHeaderBytes` | from Caddy server config | unset | **DIFF** | same |
-| `MaxIncomingStreams` | library default | `1 << 60` | **INTENTIONAL-DIFF** | carried over from the original implementation; measured at 64/64 accepted (`jiejie_naive_h3_stream_limit_test.go`). Not aligned because where the connection bound *should* live on a 1 GiB host is a product decision, not a config value. |
-| `DisablePathManager` | off (path manager on) | `true` (off) | **INTENTIONAL-DIFF** | a client that changes network path is not migrated and must reconnect. Deliberate for a server behind a front end; **no migration test has been run**, so this is recorded as intended rather than verified. |
-| Congestion control | library default (CUBIC in quic-go) | **BBR** by default | **INTENTIONAL PERF DIFF** | kept as an explicit performance choice. No benchmark or compatibility evidence supports changing it, and the task's rule is not to change it on a config diff alone. |
-| HTTP/3 SETTINGS contents | library default | library default | requires packet-level verification | not measured |
-| 0-RTT behaviour on the wire | n/a (0-RTT off) | n/a (0-RTT off) | n/a | both refuse, so there is no wire behaviour to compare |
-| Connection migration on the wire | path manager on | path manager off | requires packet-level verification | not measured |
-
-What is **not** claimed: no row above is called "Caddy parity". The aligned rows
-are parity; the INTENTIONAL rows are decisions; the remaining rows are unmeasured
-and are labelled as such rather than as PASS.
+   transport parameters. This is the only way to close the two `NOT-VERIFIED` rows.
+2. Send a malformed HTTP/3 CONNECT (`:scheme`/`:path` set) and observe the
+   rejection, closing the runtime half of the pseudo-header guard.
+3. Measure connection migration with and without the path manager.
+4. Run a controlled BBR-vs-CUBIC benchmark before calling the congestion choice
+   validated.
+5. Measure `IdleTimeout` and `MaxHeaderBytes` behaviour.

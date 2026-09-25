@@ -103,16 +103,28 @@ resistance does not become a denial-of-service vector.
 | Tracked IPs | 4096 | bounded map; new sources fail closed at the cap |
 | H3 application idle timeout | 60s | `http3.Server.IdleTimeout`; armed at connection creation, stopped while a request stream is open, reset when the last stream closes |
 | H3 QUIC transport idle timeout | 60s | `quic.Config.MaxIdleTimeout` |
-| H3 stream cap | 256 per connection | `max_concurrent_streams` |
+| H2 stream cap | 256 per connection | `max_concurrent_streams`, applied to `http2.Server.MaxConcurrentStreams` |
+| H3 stream cap | **NOT BOUNDED** | the QUIC layer's `MaxIncomingStreams` is set to `1 << 60` when unset, which is quic-go's internal "effectively unlimited" clamp. `max_concurrent_streams` does **not** apply to HTTP/3 |
 | 0-RTT | disabled | `quic.Config.Allow0RTT = false` on the proxy inbound |
 | H3 connection-count cap | **NOT IMPLEMENTED** | see below |
 
+> **The H3 stream cap row was previously wrong.** It claimed "256 per connection"
+> via `max_concurrent_streams`, but that option is only ever assigned to
+> `http2.Server.MaxConcurrentStreams` (`transport/http/server.go`). The HTTP/3
+> listener's stream limit is a QUIC transport parameter set in
+> `transport/http/server_h3.go`, which forces `1 << 60` when the option is unset.
+> So H2 is bounded at 256 and H3 is effectively unbounded. This is recorded rather
+> than changed: aligning the H3 value is a behaviour change that needs its own
+> measurement, in the same way the Native Naive listener's value was measured
+> before it was removed (see `docs/JIEJIE-NAIVE-H3-AUDIT.md`).
+
 ### The H3 connection-count gap
 
-`max_concurrent_streams` bounds streams *within* a connection, and the
-unauthenticated limiter counts HTTP requests. Neither bounds the **number of
-established connections**, so there is no per-source cap on how many QUIC
-connections a peer may hold open.
+Neither `max_concurrent_streams` (which is HTTP/2-only) nor the unauthenticated
+limiter (which counts HTTP requests) bounds the **number of
+established connections**, and the H3 stream limit is effectively unbounded, so
+there is no per-source cap on how many QUIC connections or streams a peer may
+hold open.
 
 The `http3.Server.IdleTimeout` fix closes the most obvious exploit of that gap: a
 connection that completes the QUIC handshake and then never opens a request

@@ -9,37 +9,64 @@ protocol chain works end to end, and neither says what was deliberately left out
 topology (`release/jiejie-production-topology.json`) and deliberately excludes
 everything that topology does not need. See "Intentional pruning" below.
 
+Labels are calibrated to evidence strength, not to how good the result sounds. A
+row is `PASS` only when a runtime test actually measured the property. Where only
+part of a property was measured the row says `PARTIAL`, and where nothing was
+measured it says `NOT-TESTED` even if the code is believed correct.
+
 ---
 
 ## 1. Components
 
-| Component | Implementation | Wire E2E | Security | Resource | Minimal pruning |
+| Component | Implementation | Wire E2E | Security evidence | Resource evidence | Minimal pruning |
 | --- | --- | --- | --- | --- | --- |
-| AnyTLS | UPSTREAM (pinned `sing-anytls`) | PASS | PASS | PASS | OK |
-| MASQUE HTTP/2 | UPSTREAM (`transport/http`) | PASS | PASS | PASS | OK |
-| MASQUE HTTP/3 | UPSTREAM (`transport/http` + `server_h3.go`) | PASS | PASS | PASS | OK |
-| ShadowTLS v3 | UPSTREAM (`protocol/shadowtls`) | **NOT-TESTED** (chain) | PASS | NOT-TESTED | OK |
-| Shadowsocks 2022 | UPSTREAM (`protocol/shadowsocks`) | **NOT-TESTED** (chain) | NOT-TESTED | NOT-TESTED | OK |
-| DNS (AGH over UDP) | UPSTREAM (`dns/transport/udp`) | PASS | PASS | NOT-TESTED | OK |
-| direct outbound | UPSTREAM | PASS | PASS | NOT-TESTED | OK |
-| residential SOCKS5 outbound | UPSTREAM | PASS | PASS | NOT-TESTED | OK |
-| minimal registry | FORK-MODIFIED (`include/`) | PASS | PASS | NOT-TESTED | OK |
+| AnyTLS | UPSTREAM CORE + FORK HARDENING | **PARTIAL** | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| MASQUE HTTP/2 | UPSTREAM CORE + FORK-MODIFIED SERVER/HARDENING | PASS | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| MASQUE HTTP/3 | UPSTREAM CORE + FORK-MODIFIED SERVER/HARDENING | PASS | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| ShadowTLS v3 | UPSTREAM CORE + FORK HARDENING | **NOT-TESTED** (chain) | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| Shadowsocks 2022 | UPSTREAM CORE | **PARTIAL** | **NOT-TESTED** | **NOT-TESTED** | OK |
+| DNS (AGH over UDP) | UPSTREAM | PASS | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| direct outbound | UPSTREAM | PASS | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| residential SOCKS5 outbound | UPSTREAM | PASS | TARGETED CHECKS PASS | **NOT-TESTED** | OK |
+| minimal registry | FORK-MODIFIED (`include/`) | **N/A** | INDIRECTLY VERIFIED | **NOT-TESTED** | OK |
 
-"UPSTREAM" means this fork carries no modification to the protocol implementation.
-"FORK-MODIFIED" means the file is fork-specific and is listed with what it does.
+### Implementation labels
+
+| Label | Meaning |
+| --- | --- |
+| `UPSTREAM CORE` | the protocol implementation is not modified by this fork |
+| `UPSTREAM CORE + FORK HARDENING` | upstream core, plus fork-added error classification / timeout / logging files |
+| `UPSTREAM CORE + FORK-MODIFIED SERVER/HARDENING` | upstream core, plus fork changes to the server and hardening layers |
+| `FORK-MODIFIED` | the file is fork-specific |
+
+Why the labels are split this way:
+
+- **AnyTLS** carries fork files `first_read_timeout.go` and `preauth_log.go`, plus
+  inbound integration and fallback hardening. Its core wire protocol is upstream,
+  so it is `UPSTREAM CORE + FORK HARDENING` rather than plain `UPSTREAM`.
+- **ShadowTLS** carries `probe_log.go` and handshake-target failure
+  classification, so it is labelled the same way.
+- **MASQUE / generic HTTP** carries fork changes across `transport/http/*`,
+  `common/badhttp/*`, `option/simple.go` (resource bounds) and the
+  forwarded-source policy, so it is
+  `UPSTREAM CORE + FORK-MODIFIED SERVER/HARDENING`.
+- **SS2022** core is unmodified, so it stays `UPSTREAM CORE` - but that label says
+  nothing about testing, and its rows below remain NOT-TESTED.
+- **minimal registry** is not a wire protocol at all. `Wire E2E` is `N/A` for it;
+  calling it PASS would be a category error.
 
 ### Verification strength, stated per row
-
-The table above distinguishes what was measured from what was assumed:
 
 - **Wire E2E** means a real protocol client exchanged real bytes with the server
   through the actual chain and the payload was checked. "The server starts" and
   "the port listens" are NOT E2E and are not counted as such.
-- **Security** means the specific properties were tested: authentication is
-  required, a failed authentication cannot reach a backend, and the source address
-  cannot be chosen by the client.
-- **Resource** means goroutine, file-descriptor and connection counts were
-  observed to return to baseline under churn.
+- **Security evidence**, where it says `TARGETED CHECKS PASS`, means the *specific*
+  properties listed for that component were tested. It does **not** mean the
+  protocol's security has been validated as a whole.
+- **Resource evidence** means goroutine, file-descriptor and connection counts
+  were observed to return to baseline under churn. **No component currently has
+  this**, because no churn-baseline measurement exists outside Native Naive. A
+  `-race` pass is not a resource measurement.
 
 ---
 
@@ -52,12 +79,92 @@ The table above distinguishes what was measured from what was assumed:
 | Port listening | a listener was created | that a handshake or a tunnel succeeds |
 | In-process integration | the chain works with the built-in registries | that the shipped binary does |
 | Real-binary integration | the shipped binary serves the chain as a separate process | behaviour under production load |
+| Source read | a guard or dependency is present in the code | that the guard fires at runtime |
 
 Each claim in this document names which shape supports it.
 
 ---
 
-## 3. Intentional pruning
+## 3. Per-component evidence
+
+### AnyTLS
+
+| Aspect | Status | Evidence |
+| --- | --- | --- |
+| TLS handshake | PASS | `jiejie_anytls_alpn_*_test.go`, `jiejie_server_test.go` |
+| Fallback (non-client) | PASS | `TestJiejieAnyTLSNonClientFallsBackToWeb` |
+| Wrong-password fallback | PASS | `TestJiejieAnyTLSWrongPasswordFallsBack` |
+| ALPN routing | PASS | `TestJiejieAnyTLSALPNMatrix`, `...FallbackForALPN*` |
+| Pre-auth silent-peer timeout | PASS | `TestJiejieAnyTLSSilentPeerIsClosedAfterHandshake` |
+| Pre-auth error classification | PASS | `preauth_log_test.go` |
+| **Authenticated tunnel E2E** | **NOT-TESTED** | no test drives a real authenticated AnyTLS session through router to origin with byte-for-byte payload |
+| **Fragmented authentication prologue** | **NOT-TESTED** | `sing-anytls` `ReadOnceFrom` behaviour with a split prologue is unassessed |
+| **Resource churn / baseline** | **NOT-TESTED** | no goroutine/FD/connection baseline measurement |
+
+`Wire E2E` is therefore **PARTIAL**: several real paths were exercised, but the
+central authenticated tunnel was not.
+
+### MASQUE HTTP/2 and HTTP/3
+
+| Aspect | Status | Evidence |
+| --- | --- | --- |
+| Authenticated CONNECT to origin, payload checked | PASS | `authenticated CONNECT works` in `jiejie_server_test.go` (H2 and H3) |
+| Unauthorised matrix (GET / CONNECT / CONNECT-UDP, no-auth and wrong-auth) | PASS | `TestJiejieMASQUEH2ProbeMatrix`, `TestJiejieMASQUEH3ProbeMatrix` |
+| Unauthenticated limiter, no auth-surface leak | PASS | `TestJiejieMASQUEH3UnauthenticatedLimits`, `...LimiterDoesNotRevealProxyAuthWhenExhausted` |
+| Authenticated traffic not limited | PASS | `TestJiejieMASQUEH3AuthenticatedTrafficNotLimited` |
+| **Resource churn / baseline** | **NOT-TESTED** | the probe matrix makes no resource measurement (`NumGoroutine` appears zero times). The stream-churn and abort tests in `jiejie_naive_h3_stream_limit_test.go` exercise the **Native Naive** H3 listener, not this one, so they are not counted here |
+| **H3 stream limit** | **NOT BOUNDED** | `transport/http/server_h3.go` forces `MaxIncomingStreams = 1 << 60` when unset; `max_concurrent_streams` is HTTP/2-only |
+| **IPv6 differential** | **NOT-TESTED** | not measured |
+| **Half-close matrix** | **NOT-TESTED** | not measured |
+
+### ShadowTLS v3
+
+| Aspect | Status | Evidence |
+| --- | --- | --- |
+| Server-side fault classification (ECONNREFUSED, ENETUNREACH, EHOSTUNREACH stay visible; peer reset classified correctly) | PASS | `probe_log_test.go`, `handshake_target_failure_test.go` |
+| Inbound registration in the minimal build | PASS | `TestJiejieMinimalShadowTLSInboundRegisters` (listening only) |
+| **ShadowTLS -> SS2022 wire E2E** | **NOT-TESTED** | no ShadowTLS client is linked into the production build |
+| **UID/auth propagation through the chain** | **NOT-TESTED** | not measured |
+| **Resource churn / baseline** | **NOT-TESTED** | not measured |
+
+`Security evidence` is `TARGETED CHECKS PASS`: error classification and
+auth-related checks only. The full wire/security E2E remains NOT-TESTED.
+
+### SS2022
+
+| Aspect | Status | Evidence |
+| --- | --- | --- |
+| Implementation | UPSTREAM CORE, unmodified | - |
+| SS2022 session carrying TCP to an origin | **PASS** | `TestJiejieMinimalResidentialSOCKSOutbound` drives a real `shadowaead_2022` client into a production-style SS2022 inbound and reads a real HTTP response back |
+| SS2022 -> ShadowTLS chain | **NOT-TESTED** | no test links the two |
+| SS2022 standalone against the shipped binary | **NOT-TESTED** | the existing test constructs the inbound in-process, not from the shipped binary |
+| Security | **NOT-TESTED** | authentication properties were not probed |
+| Resource | **NOT-TESTED** | no churn measurement |
+
+`Wire E2E` is **PARTIAL**: a real SS2022 client does carry real TCP payload
+through a real SS2022 inbound to an origin, which is genuine wire coverage - but
+it is in-process, not the shipped binary, and it does not cover the ShadowTLS
+chain or any UDP path.
+
+Note that the earlier claim "no Shadowsocks client is linked into the production
+build" was true of the *server binary* but misleading as a statement about test
+coverage: the test module links `sing-shadowsocks` directly and drives the
+protocol with a real client.
+
+---
+
+## 4. Minimal registry is not a wire protocol
+
+| Aspect | Status |
+| --- | --- |
+| Implementation | FORK-MODIFIED (`include/`) |
+| Registry coverage | PASS |
+| Construction / config audit | PASS |
+| Wire E2E | **N/A** - it is a registry, not a protocol |
+| Security | INDIRECTLY VERIFIED (it determines what is *not* reachable) |
+| Resource | **NOT-TESTED** |
+
+### Intentional pruning
 
 Excluded on purpose, because the production topology does not use them. Their
 absence is **not** a defect and is asserted by the CI dependency audit.
@@ -78,7 +185,7 @@ build cannot compile it in.
 
 ---
 
-## 4. DNS transports: why `local` is registered
+## 5. DNS transports: why `local` is registered
 
 The topology configures one DNS server (`local-agh`, `type: udp`, AdGuard Home at
 `127.0.0.1:53`), but the registry also provides `local`, which looks like dead
@@ -103,7 +210,7 @@ ever removed the test fails and reports that `local` has become prunable.
 
 ---
 
-## 5. Minimal tag scope
+## 6. Minimal tag scope
 
 The `jiejie_server_minimal` build tag selects between whole registration files.
 It does **not** compile out protocol internals:
@@ -123,30 +230,80 @@ integration tests run under a separate tag set in CI rather than silently skippi
 
 ---
 
-## 6. Known gaps
+## 7. Dependency risks
 
-Listed so this document is not read as stronger than it is:
+`CONFIRMED DEPENDENCY BUGS: none.`
 
-- **DNS, direct and SOCKS outbound have no resource tests.** They are exercised
-  functionally by the integration suite, but goroutine/fd behaviour under churn was
-  not measured.
-- **No IPv6 differential** for the MASQUE or AnyTLS paths.
-- **No half-close matrix** for MASQUE or AnyTLS.
-- **The ShadowTLS to SS2022 chain has no wire E2E.** The existing minimal test
-  (`TestJiejieMinimalShadowTLSInboundRegisters`) asserts that both ports LISTEN,
-  which proves the registry constructed the inbounds and the detour resolved - it
-  does not prove a ShadowTLS client can hand off to SS2022 and reach an origin.
-  Reaching that chain needs a full ShadowTLS client, and the server build
-  deliberately does not link one. Claiming E2E from a listening port is exactly
-  the conflation this document exists to prevent, so the row says NOT-TESTED.
-- **SS2022 has no wire E2E at all.** No Shadowsocks client is linked into the
-  production build, and no test drives a real SS2022 session against the minimal
-  binary.
-- **ShadowTLS to SS2022 UDP capability is untested.** The production `ss2022-in` is
-  `network: tcp`, so no native Shadowsocks UDP listener exists; UDP would have to
-  travel as UoT inside the TCP tunnel. That path is not covered by a test, so it is
-  not claimed.
-- **UID/auth propagation through the chain is untested** for ShadowTLS.
-- **`local` boot dependency verified by source, not by removing it.** The claim
-  that omission breaks startup is read from `box.go` rather than reproduced by
-  building without it.
+`UNASSESSED DEPENDENCY RISKS:`
+
+- `sing-anytls` `ReadOnceFrom` behaviour with a fragmented authentication prologue
+  is **NOT-TESTED**.
+- `quic-go` HTTP/3 SETTINGS and transport-parameter contents are **NOT-VERIFIED**
+  (no packet-level capture).
+
+No confirmed dependency defect was found. Several dependency behaviours remain
+unassessed; this is not a statement that the dependencies are risk-free.
+
+---
+
+## 8. Upstream tests are not production-minimal E2E
+
+The repository contains upstream protocol tests (for example `test/shadowtls_test.go`)
+that pass under the **full** registry. Those are not counted here as
+production-minimal E2E, because:
+
+```
+full test topology  !=  shipped minimal server binary
+```
+
+Upstream/full-build protocol tests exist and are useful; the production matrix
+rows stay `NOT-TESTED` until the minimal binary itself is driven end to end.
+
+---
+
+## 9. Known gaps: REMAINING / NOT-VERIFIED
+
+### Native Naive
+
+- H3 Caddy differential
+- H1 / H2 / H3 half-close matrix
+- IPv6 differential
+- H3 dial-failure comparison against the reference
+- `DisablePathManager` connection-migration behaviour
+- BBR vs CUBIC controlled benchmark
+- H3 `IdleTimeout` / `MaxHeaderBytes`
+- Packet-level HTTP/3 SETTINGS and transport parameters
+- Malformed H3 CONNECT pseudo-header rejection observed at runtime
+  (currently SOURCE-GUARDED only)
+
+### AnyTLS
+
+- Authenticated tunnel production-minimal E2E
+- Fragmented authentication prologue
+- Full resource churn
+- IPv6 / half-close
+
+### ShadowTLS / SS2022
+
+- Production-minimal ShadowTLS -> SS2022 wire E2E
+- SS2022 standalone wire E2E against the **shipped binary** (in-process SS2022 TCP
+  is covered; the binary and the chain are not)
+- SS2022 authentication probing
+- UDP / UoT chain
+- Resource churn
+
+### MASQUE
+
+- IPv6 differential
+- Half-close matrix
+- Resource churn / baseline
+- **H3 stream limit is effectively unbounded.** `transport/http/server_h3.go`
+  forces `MaxIncomingStreams = 1 << 60` when the option is unset (quic-go's
+  internal "unlimited" clamp). `max_concurrent_streams` is HTTP/2-only and does
+  **not** apply here. This is the same pattern that was measured and removed from
+  the Native Naive listener; the MASQUE path retains it and has not been measured.
+
+### Cross-cutting
+
+- No component other than Native Naive has a resource baseline measurement.
+- `local` boot dependency is verified by source, not by removing it.

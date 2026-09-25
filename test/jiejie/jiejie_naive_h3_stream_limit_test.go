@@ -16,17 +16,18 @@ import (
 
 // Resource behaviour of the HTTP/3 listener's stream limit.
 //
-// The Native Naive QUIC config sets MaxIncomingStreams to 1 << 60, which is
-// effectively "no limit". That is a deliberate value carried over from the
-// original implementation, and docs/JIEJIE-NAIVE-H3-AUDIT.md records it as a
-// difference from the reference that has NOT been aligned - aligning it needs
-// runtime evidence about what the limit is actually for, not a config diff.
+// The Native Naive QUIC config leaves MaxIncomingStreams UNSET, so the quic-go
+// default of 100 applies. It used to be 1 << 60, which is quic-go's internal
+// "effectively unlimited" clamp rather than a considered limit; that value was
+// removed so the listener keeps a server-side bound on concurrent HTTP/3 work
+// and matches the reference's library-default behaviour. See
+// docs/JIEJIE-NAIVE-H3-AUDIT.md.
 //
-// These tests record what the setting DOES, so a later decision to change it can
-// be made against measurements rather than guesses. They do not assert that
-// 1 << 60 is correct, and they are written to pass either way, so they double as
-// the acceptance test for a future change: if the limit becomes bounded, the
-// "bounded" branch below is what runs.
+// These tests record what the setting DOES, so the behaviour stays measured
+// rather than assumed. They do not assert a specific number, and they are written
+// to pass either way, so they double as the acceptance test for a future change:
+// if the limit is raised or removed again, the "unbounded" branch below is what
+// runs and the log line shows the new number.
 
 // h3StreamLimitProbe reports how many concurrent HTTP/3 request streams this
 // server let through before refusing one.
@@ -81,16 +82,16 @@ func h3StreamLimitProbe(t *testing.T, port uint16, attempts int) (accepted int, 
 //
 // The assertion is deliberately weak - that the server accepts more than a
 // handful of concurrent streams and stays healthy - because the point is to have
-// a measurement and a liveness check, not to enshrine 1 << 60. A future change to
-// a bounded limit will keep this test meaningful while the log line shows the new
-// number.
+// a measurement and a liveness check, not to enshrine a particular limit. The
+// configured value is now the quic-go default of 100, and the log line records
+// what the server actually accepted so a future change stays visible.
 func TestJiejieNaiveH3StreamLimitIsMeasured(t *testing.T) {
 	port := startNaiveInboundH3(t)
 
 	const attempts = 64
 	accepted, refused := h3StreamLimitProbe(t, port, attempts)
 	t.Logf("HTTP/3 stream limit probe: %d attempted, %d accepted, %d refused "+
-		"(configured MaxIncomingStreams = 1 << 60, i.e. effectively unbounded)",
+		"(MaxIncomingStreams unset, so the quic-go default 100 applies)",
 		attempts, accepted, refused)
 
 	require.Positive(t, accepted,
