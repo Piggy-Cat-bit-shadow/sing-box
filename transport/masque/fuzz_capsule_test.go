@@ -130,10 +130,12 @@ func FuzzRouteAdvertisement(fuzz *testing.F) {
 	// A truncated route.
 	fuzz.Add([]byte{0x01, 0, 0, 0, 0})
 	// An IPv6-shaped route.
-	fuzz.Add([]byte{0x01,
+	fuzz.Add([]byte{
+		0x01,
 		16, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 		16, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-		0})
+		0,
+	})
 	// A route count claiming far more routes than the bytes support.
 	fuzz.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01})
 
