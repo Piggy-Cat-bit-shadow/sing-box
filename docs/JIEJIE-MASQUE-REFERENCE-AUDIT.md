@@ -133,6 +133,26 @@ connection establishment ... especially when returning a 407", because a
 compliant client must reconnect and redo the TLS handshake. That is paid only on
 the rejection path.
 
+### Contains() disagreed with lookup() about the server's own address
+
+`Contains()` backs `PreferredAddress`, which a `preferred_by` routing rule uses to
+decide whether this MASQUE endpoint should carry a destination. `lookup()` already
+refused the server's own address inside the tunnel prefix before consulting any
+route advertisement - that address belongs to the server, not to a client.
+`Contains()` did not apply the same guard, so it reported the server's own address
+as tunnel-owned as soon as any session advertised a route covering it, which is
+the normal case because a client advertises the tunnel network.
+
+Found by asserting the two answers against each other rather than by reading
+either one. The impact is a routing decision, not a misdelivery, and the
+distinction matters: `lookup()`'s guard still stopped the packet from reaching a
+session, so no client received traffic addressed to the server. What went wrong is
+that the destination was advertised as preferred by this endpoint, the packet was
+routed into the MASQUE path, and `lookup()` then found no session for it.
+
+Fixed, and reverting just this guard fails the test, so it is load-bearing rather
+than defensive decoration.
+
 ## Verified without change
 
 - The capsule size limit fires correctly: a declared length above
@@ -155,6 +175,12 @@ a real socket.
 | RFC 9931 section 8: a rejected HTTP/1.1 CONNECT closes the connection and the following request is NOT processed | PASS (was FAIL) |
 | RFC 9931: the same for a rejected HTTP/1.x CONNECT-UDP upgrade | PASS |
 | RFC 9931: HTTP/2 is unaffected, so a rejected CONNECT leaves the connection usable | PASS |
+| The address pool never assigns the network, server or broadcast address, and reports exhaustion instead of wrapping | PASS |
+| 1000 sequential allocate/release cycles over a /24 all succeed (the leak case) | PASS |
+| An address ASSIGNED to one session beats a route another session merely ADVERTISED, even when the interloper registered second | PASS |
+| A late teardown of a closed session cannot delete the ownership entry of the session holding the recycled address | PASS |
+| Route advertisements respect the protocol number | PASS |
+| Four fuzz targets (capsule framer, ROUTE_ADVERTISEMENT, ADDRESS_ASSIGN, URI-template matcher) survive a bounded real fuzz run | PASS, ~3.3M inputs, no crash |
 
 The DATAGRAM fallback tests were checked against an injected regression:
 disabling the fallback in `transport/http/capsule.go` makes the fallback test fail
@@ -229,24 +255,40 @@ and none is claimed as PASS:
   masque-server endpoint, which is not. The reference interop exercises the
   CONNECT-IP data path with datagrams negotiated, so it does not reach that
   fallback.
-- **DATAGRAM context IDs other than 0, and datagram size boundaries.**
+- **DATAGRAM context IDs other than 0, and datagram size boundaries.** The framer
+  and the zero-context-ID path are covered by fuzzing and by the fallback tests;
+  non-zero context IDs and the exact size at which a datagram is rejected in favour
+  of an ICMP Packet Too Big are not.
+- **The IP packet parser and IPv6 extension-header protocol resolution.** The three
+  control parsers and the path matcher are fuzzed; the packet parser that decides
+  the protocol number of an inner packet is not, so a route rule keyed on protocol
+  is untested for IPv6 with extension headers.
 - **Proxy-Status reporting.** Not implemented and not tested.
-- **Cross-session isolation, resource churn, send-queue backpressure, capsule write
-  backpressure, shutdown with active tunnels.** Audited by reading, not tested.
+- **Send-queue backpressure, capsule write backpressure, and shutdown with active
+  tunnels.** Cross-session isolation and address-pool lifecycle are now tested (see
+  the table above); these three are not, and are not the same thing. A tunnel that
+  stops reading, a peer that stops reading the capsule stream, and a server
+  shutting down while tunnels are open all exercise the write paths rather than the
+  ownership maps.
 - **QUIC migration behaviour and source identity after a path change.** The path
   manager is now enabled by default, so this matters more than before and is
   unmeasured.
 - **Loss, reordering and duplication for DATAGRAM versus capsule ordering.**
-- **IPv6 extension-header protocol resolution for route policy.**
-- **Fuzz targets for the capsule parser, the path parser and the IP packet
-  parser.**
 - **Google QUICHE interop.**
 
 Gaps that were listed here previously and are now closed, removed from this list:
 the CONNECT-UDP differential against masque-go and CONNECT-IP against
 connect-ip-go (both recorded in the table above with the reference client that was
-actually driven), the H3 DATAGRAM to Capsule fallback, and the RFC 9931 HTTP/1.1
-CONNECT rejection requirement.
+actually driven), the H3 DATAGRAM to Capsule fallback, the RFC 9931 HTTP/1.1
+CONNECT rejection requirement, cross-session isolation and address-pool
+lifecycle, and fuzz targets for the capsule, route, address and path parsers.
+
+One narrowing to be explicit about: the fuzz targets cover the capsule framer,
+ROUTE_ADVERTISEMENT, ADDRESS_ASSIGN and the URI-template matcher. The IP packet
+parser and IPv6 extension-header protocol resolution are NOT covered, so they stay
+on the list above rather than being closed with the others. Cross-session
+isolation and address-pool lifecycle are closed as ownership-map coverage, but the
+three write-path items that were listed alongside them are not.
 
 One RFC 9931 item remains open and is narrowed rather than dropped: the RFC's
 client-side half is not tested here. Section 8 tells proxy CLIENTS to wait for a
