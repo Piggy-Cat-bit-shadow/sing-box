@@ -43,10 +43,15 @@ func TestNativeNaiveQUICConfigRefuses0RTT(t *testing.T) {
 func TestNativeNaiveQUICConfigKeepsDocumentedSettings(t *testing.T) {
 	config := nativeNaiveQUICConfig()
 
-	if config.MaxIncomingStreams != 1<<60 {
-		t.Fatalf("MaxIncomingStreams changed to %d; this is a documented "+
-			"difference from the reference and changing it needs evidence, not "+
-			"an edit", config.MaxIncomingStreams)
+	// MaxIncomingStreams must stay UNSET so the library default (100) applies.
+	// It was 1 << 60, which is quic-go's own internal "unlimited" sentinel rather
+	// than a considered limit: it matched neither the library default nor the
+	// reference, and it removed the only server-side bound on concurrent HTTP/3
+	// work. Measurement before removal: 256 concurrent streams cost ~2.5 MiB with
+	// no extra goroutines or descriptors.
+	if config.MaxIncomingStreams != 0 {
+		t.Fatalf("MaxIncomingStreams must be left unset so the library default "+
+			"applies, got %d", config.MaxIncomingStreams)
 	}
 	if !config.DisablePathManager {
 		t.Fatal("DisablePathManager changed; connection migration behaviour is " +

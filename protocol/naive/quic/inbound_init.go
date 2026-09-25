@@ -48,7 +48,32 @@ import (
 // config diff.
 func nativeNaiveQUICConfig() *quic.Config {
 	return &quic.Config{
-		MaxIncomingStreams: 1 << 60,
+		// MaxIncomingStreams is deliberately NOT set, so it takes the quic-go
+		// default of 100 (internal/protocol.DefaultMaxIncomingStreams).
+		//
+		// It used to be 1 << 60, which is literally the value quic-go uses
+		// INTERNALLY as its "effectively unlimited" clamp (config.go validateConfig
+		// caps MaxIncomingStreams at 1 << 60). So the old setting was the
+		// library's own no-limit sentinel, not a considered limit, and it matched
+		// neither the library default nor the reference.
+		//
+		// Measured before removing it, on Linux, with concurrent HTTP/3 request
+		// streams from one connection:
+		//
+		//	streams  accepted  refused  RSS+KiB  goroutines  fds
+		//	1        1         0        344      0           0
+		//	8        8         0        520      0           0
+		//	32       32        0        848      0           0
+		//	64       64        0        1732     0           0
+		//	128      128       0        1728     0           0
+		//	256      256       0        2504     0           0
+		//
+		// So 256 concurrent streams cost only ~2.5 MiB with no extra goroutines or
+		// descriptors, and the default of 100 covers that comfortably. There is no
+		// compatibility evidence that a Naive client needs more, and the old value
+		// removed the only server-side bound on concurrent HTTP/3 work on a
+		// ~1 GiB host. This aligns with the reference, whose quic.Config does not
+		// set the field either.
 		DisablePathManager: true,
 	}
 }
