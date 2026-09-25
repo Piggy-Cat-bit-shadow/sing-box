@@ -37,22 +37,33 @@ without a resolve action, CONNECT forbidden.test reached=true,
 
 ## 2. 推荐的生产配置
 
-在 `route.rules` 中，为 Naive inbound **成对**添加 `resolve` 与 `ip_cidr` 拒绝规则，
-并且 **`resolve` 必须排在 IP 规则之前**：
+正式结构是**三段式**：先 `resolve`，再**显式的最小自身服务例外**，最后
+`ip_cidr` 拒绝。
 
 ```json
 {
   "route": {
     "rules": [
       { "inbound": ["naive-in"], "action": "resolve" },
+
+      {
+        "inbound": ["naive-in"],
+        "network": ["tcp"],
+        "ip_cidr": ["<VPS_SELF_IPV4>/32", "<VPS_SELF_IPV6>/128"],
+        "port": [2222],
+        "action": "route",
+        "outbound": "direct"
+      },
+
       {
         "inbound": ["naive-in"],
         "ip_cidr": [
           "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
           "169.254.0.0/16", "0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24",
-          "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
+          "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
           "240.0.0.0/4",
-          "::1/128", "::/128", "fc00::/7", "fe80::/10", "ff00::/8", "2001:db8::/32"
+          "::1/128", "::/128", "fc00::/7", "fe80::/10", "ff00::/8",
+          "<VPS_SELF_IPV4>/32", "<VPS_SELF_IPV6>/128"
         ],
         "action": "reject"
       }
@@ -62,18 +73,74 @@ without a resolve action, CONNECT forbidden.test reached=true,
 }
 ```
 
-要点：
+原则是：
+
+```
+default deny self
++
+minimal explicit self-service allow
+```
+
+**不要**整体删除 VPS self IP 的 deny。自身地址默认拒绝，只把**确实需要**的
+服务用最小例外放行。
+
+### 2.1 VPS 自身服务的最小例外
+
+`<VPS_SELF_IPV4>` / `<VPS_SELF_IPV6>` 是占位符，**不要把真实地址提交到仓库**。
+真实地址只应存在于 VPS 的实际配置中（确认方法见
+`docs/JIEJIE-NAIVE-MIGRATION.md` 第 5 节）。
+
+上面这个例外允许的是**唯一一种**连接：
+
+| 条件 | 值 |
+| --- | --- |
+| inbound | `naive-in` |
+| network | `tcp`（**仅 TCP**） |
+| 目标 IP | VPS 自身地址 |
+| 目标端口 | `2222` |
+
+四个条件必须**同时**满足。以下全部仍然**拒绝**：
+
+| 目标 | 结果 | 原因 |
+| --- | --- | --- |
+| `<VPS_SELF_IP>:443` | **拒绝** | 见 2.2，必须永久拒绝 |
+| `<VPS_SELF_IP>:<其他端口>` | 拒绝 | 例外只限 2222 |
+| `127.0.0.1:2222` | 拒绝 | 例外绑定自身地址，不是端口 |
+| `10.x.x.x:2222` / `172.16/12:2222` / `192.168/16:2222` | 拒绝 | 私网一律拒绝 |
+| `<VPS_SELF_IP>:2222` 且为 **UDP** | 拒绝 | 例外限定 `network: tcp` |
+
+**不要**写成 `{"port": [2222], "action": "route"}` 这种只有端口的规则。
+那会同时放行 `127.0.0.1:2222`、私网 `:2222` 和 link-local `:2222`，
+把例外变成一次访问面扩大。
+
+### 2.2 为什么 `<VPS_SELF_IP>:443` 必须永久拒绝
+
+生产公网 TCP/443 由 **Nginx Stream** 持有，按 SNI 转发进 Native Naive。
+如果允许客户端重新 `CONNECT <VPS_SELF_IP>:443`，这个请求会**再次进入同一个
+前端**，形成自代理递归：
+
+```
+Naive -> <VPS_SELF_IP>:443 -> Nginx Stream -> Native Naive -> <VPS_SELF_IP>:443 -> ...
+```
+
+因此 443 必须在拒绝列表中，永久保留。已有回归测试
+`TestJiejieTargetACLSelfIP443CannotRecurse` 同时验证字面地址与域名两种写法，
+并断言前端监听器收到连接数为 **0**。
+
+### 2.3 要点
 
 | 项目 | 说明 |
 | --- | --- |
 | 插入位置 | 放在其他规则**之后**，不要插到 `residential` 用户规则之前 |
-| 规则顺序 | `resolve` 必须在 `ip_cidr` 拒绝规则**之前**，否则 IP 条件拿不到地址 |
-| `inbound` 限定 | 两条规则都限定 `naive-in`，因此**不影响** AnyTLS / MASQUE / ShadowTLS / SS2022 |
-| 无需删除旧规则 | 既有的 `{"ip_is_private": true, "outbound": "direct"}` 保持原样即可，它作用于其他 inbound |
-| UDP | 同一组规则同时约束 UoT v1/v2 的**每包真实目标**（见第 4 节） |
+| 规则顺序 | `resolve` → **自身服务例外** → `ip_cidr` 拒绝；顺序不能错 |
+| 例外的位置 | 必须在自身地址 reject **之前**，否则永远不会命中 |
+| `inbound` 限定 | 全部限定 `naive-in`，因此**不影响** AnyTLS / MASQUE / ShadowTLS / SS2022 |
+| 无需删除旧规则 | 既有的 `{"ip_is_private": true, "outbound": "direct"}` 保持原样即可 |
+| UDP | 同一组规则同时约束 UoT v1/v2 的**每包真实目标**（见第 4 节）；例外是 TCP-only |
+| 域名目标 | 例外同样适用于解析到自身地址的域名，因为规则匹配的是解析后的地址 |
 
-`release/jiejie-production-topology.json` 已按上述形式更新，并通过
-`sing-box check` 校验。
+`release/jiejie-production-topology.json` 已按上述形式更新（自身地址使用
+RFC 5737 文档地址占位），并通过 `sing-box check` 校验。
 
 ---
 
