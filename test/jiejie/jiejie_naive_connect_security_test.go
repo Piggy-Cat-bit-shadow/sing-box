@@ -330,11 +330,19 @@ func TestJiejieNaiveAuthorisedConnectStillDials(t *testing.T) {
 	})
 	require.Equal(t, http.StatusOK, response.StatusCode)
 
-	_, err := conn.Write(naivePaddingFrame(
-		[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+	// HTTP/1 tunnels are RAW even when the request carried Padding: the
+	// reference ends serveHijack in dualStream(..., false). Sending a Naive
+	// frame here would desynchronise the server from the client's first byte.
+	_, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 	require.NoError(t, err)
-	body := naiveReadPaddingFrame(t, bufio.NewReader(conn))
-	require.Contains(t, string(body), "RECORDING-TARGET-CONTENT",
+	// Read the first chunk rather than io.ReadAll: the recording target echoes
+	// on every read and never closes its side, so ReadAll would block until the
+	// connection deadline and report a timeout on an otherwise correct tunnel.
+	body := make([]byte, 256)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, readErr := conn.Read(body)
+	require.NoError(t, readErr)
+	require.Contains(t, string(body[:n]), "RECORDING-TARGET-CONTENT",
 		"an AUTHORISED CONNECT must reach the recording target")
 
 	require.Positive(t, env.tcpTarget.connections.Load(),

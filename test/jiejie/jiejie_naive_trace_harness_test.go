@@ -429,10 +429,20 @@ func dialTracedUoTH1(t *testing.T, port uint16, echoAddress string, sessionID in
 		return nil, fmt.Errorf("CONNECT status %d", status)
 	}
 
+	// `padded` controls only whether the CONNECT REQUEST carries a Padding
+	// header. It must NOT control payload framing on this transport: HTTP/1 is a
+	// raw tunnel in the reference (serveHijack -> dualStream(..., false)), so the
+	// header is accepted and answered but never enables Naive framing. Sending
+	// frames here would make the server read the client's first data byte as a
+	// frame length.
+	//
+	// The `padded` argument is kept so callers can still exercise "request with
+	// Padding" versus "request without", which is a real behavioural axis; only
+	// the framing consequence is removed.
 	session := &uotTraceSession{
 		conn:        tlsConn,
 		reader:      reader,
-		padding:     padded,
+		padding:     false,
 		sessionID:   sessionID,
 		trace:       trace,
 		echoAddress: echoAddress,
@@ -445,14 +455,9 @@ func dialTracedUoTH1(t *testing.T, port uint16, echoAddress string, sessionID in
 		return nil, err
 	}
 	requestPayload := append([]byte{1}, writer.data...)
-	var frame []byte
-	if padded {
-		frame = naivePaddingFrame(requestPayload, 0)
-		session.framesSent++
-	} else {
-		frame = requestPayload
-	}
-	if _, err = tlsConn.Write(frame); err != nil {
+	// Written unwrapped: HTTP/1 carries no Naive frames. The UoT request header
+	// is part of the tunnel payload, not of the Naive padding layer.
+	if _, err = tlsConn.Write(requestPayload); err != nil {
 		session.close()
 		return nil, err
 	}

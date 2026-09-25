@@ -325,7 +325,38 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		if bufferedReadWriter != nil && bufferedReadWriter.Reader != nil {
 			conn = &hijackedConn{Conn: conn, reader: bufferedReadWriter.Reader}
 		}
-		n.newConnection(ctx, false, &naiveConn{Conn: conn, paddingConn: paddingConn{enabled: usePadding}}, userName, source, destination)
+		// HTTP/1 is a RAW tunnel: padding framing is NOT enabled here even when
+		// the request carried a Padding header.
+		//
+		// The reference is explicit about this. Its CONNECT branch reads
+		//
+		//	switch r.ProtoMajor {
+		//	case 1:
+		//	    return serveHijack(w, targetConn)
+		//	case 2:
+		//	    fallthrough
+		//	case 3:
+		//	    return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+		//	}
+		//
+		// and serveHijack ends in
+		//
+		//	return dualStream(targetConn, clientConn, clientConn, false)
+		//
+		// — a literal false. The Padding header is therefore consulted ONLY on
+		// HTTP/2 and HTTP/3; over HTTP/1 the byte stream is copied verbatim in
+		// both directions.
+		//
+		// Treating H1 as padded broke the wire format in a way that is invisible
+		// until a client actually sends a Padding header over HTTP/1: the server
+		// would then interpret the client's first data bytes as a Naive frame
+		// header. A plain HTTP CONNECT client that happened to send Padding (or a
+		// proxy that forwards headers verbatim) would be desynchronised from its
+		// first byte.
+		n.newConnection(ctx, false, &naiveConn{
+			Conn:        conn,
+			paddingConn: paddingConn{enabled: false},
+		}, userName, source, destination)
 	} else {
 		n.newConnection(ctx, true, &naiveH2Conn{
 			reader:        request.Body,

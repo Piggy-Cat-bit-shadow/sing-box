@@ -115,21 +115,35 @@ func TestJiejieNaiveParityPayloadFramingFollowsRequestOnly(t *testing.T) {
 				"Padding header must not enable payload framing")
 	})
 
-	t.Run("request Padding means frames are expected", func(t *testing.T) {
+	t.Run("request Padding does NOT enable framing on HTTP/1", func(t *testing.T) {
+		// This is the case that distinguishes the two concepts. The request
+		// carries Padding, so the RESPONSE header is present - but HTTP/1 is a
+		// raw tunnel in the reference, because serveHijack ends in
+		// dualStream(targetConn, clientConn, clientConn, false). Framing is
+		// enabled only on HTTP/2 and HTTP/3.
+		//
+		// Sending a Naive frame here is what the previous implementation
+		// expected, and it desynchronised the server from the client's first
+		// data byte. The assertion is therefore RAW in both directions.
 		conn := naiveTLSConn(t, env.port)
 		response := naiveWriteConnectOK(t, conn, env.originAddr, map[string]string{
 			"Proxy-Authorization": naiveBasicAuth(),
 			"Padding":             "~~~~~~~~",
 		})
 		defer response.Body.Close()
+		require.NotEmpty(t, response.Header.Get("Padding"),
+			"precondition: the response header is present, so this test proves "+
+				"the header alone does not enable framing")
 
-		_, err := conn.Write(naivePaddingFrame(
-			[]byte("GET / HTTP/1.1\r\nHost: "+env.originAddr+"\r\nConnection: close\r\n\r\n"), 3))
+		requestBytes := []byte("GET / HTTP/1.1\r\nHost: " + env.originAddr + "\r\nConnection: close\r\n\r\n")
+		_, err := conn.Write(requestBytes)
 		require.NoError(t, err)
 
-		body := naiveReadPaddingFrame(t, conn)
+		body, readErr := io.ReadAll(conn)
+		require.NoError(t, readErr)
 		require.Contains(t, string(body), "origin-ok",
-			"a framed request must reach the origin and come back framed")
+			"a RAW request must reach the origin over HTTP/1 even though the "+
+				"request carried a Padding header")
 	})
 }
 

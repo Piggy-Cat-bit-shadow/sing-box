@@ -278,10 +278,14 @@ func TestJiejieNaiveMasqueradeAuthenticatedConnectStillWorks(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.StatusCode,
 		"an authenticated CONNECT must still open a tunnel when a masquerade is configured")
 
-	_, err := conn.Write(naivePaddingFrame(
-		[]byte("GET / HTTP/1.1\r\nHost: "+originAddr+"\r\nConnection: close\r\n\r\n"), 0))
+	// RAW over HTTP/1: the tunnel is unframed even when the CONNECT request
+	// carried a Padding header, matching the reference's serveHijack ->
+	// dualStream(..., false).
+	_, err := conn.Write(
+		[]byte("GET / HTTP/1.1\r\nHost: " + originAddr + "\r\nConnection: close\r\n\r\n"))
 	require.NoError(t, err)
-	body := naiveReadPaddingFrame(t, bufio.NewReader(conn))
+	body, readErr := io.ReadAll(conn)
+	require.NoError(t, readErr)
 	require.Contains(t, string(body), "origin-ok",
 		"the authenticated tunnel must still reach the origin")
 }

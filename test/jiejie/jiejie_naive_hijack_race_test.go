@@ -125,7 +125,11 @@ func raceOneSession(port uint16, echoAddress string, packetID uint32, trace *Tra
 		metadata.ParseSocksaddr(echoAddress)); err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
-	if _, err = tlsConn.Write(naivePaddingFrame(append([]byte{1}, writer.data...), 0)); err != nil {
+	// Raw, not framed: this session is HTTP/1, which is an unframed tunnel in the
+	// reference (serveHijack -> dualStream(..., false)). The Padding header in the
+	// request still causes a response Padding header, but it does not enable
+	// Naive framing on this transport.
+	if _, err = tlsConn.Write(append([]byte{1}, writer.data...)); err != nil {
 		return fmt.Errorf("write uot header: %w", err)
 	}
 
@@ -140,13 +144,14 @@ func raceOneSession(port uint16, echoAddress string, packetID uint32, trace *Tra
 	payload := encodePacketWithID(packetID, "race")
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
-	if _, err = tlsConn.Write(naivePaddingFrame(append(length, payload...), 0)); err != nil {
+	if _, err = tlsConn.Write(append(length, payload...)); err != nil {
 		return fmt.Errorf("write datagram: %w", err)
 	}
 
-	// The reply must carry the SAME Packet ID.
-	body, err := readPaddingFrameRaw2(reader)
-	if err != nil {
+	// The reply must carry the SAME Packet ID. Raw tunnel, so the reply is the
+	// UoT datagram itself: a 2-byte length prefix followed by the payload.
+	body := make([]byte, 2+len(payload))
+	if _, err = io.ReadFull(reader, body); err != nil {
 		return fmt.Errorf("read reply: %w", err)
 	}
 	if len(body) < 2 {

@@ -127,7 +127,21 @@ func dialUoT(t *testing.T, port uint16, version uint8, udpTarget string, usePadd
 	require.Equal(t, http.StatusOK, response.StatusCode,
 		"an authenticated UoT CONNECT to %s must be accepted", magic)
 
-	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: usePadding, version: version}
+	// This helper drives the tunnel over HTTP/1, and HTTP/1 is a RAW tunnel in
+	// the reference: its CONNECT branch ends in
+	//
+	//	serveHijack -> dualStream(targetConn, clientConn, clientConn, false)
+	//
+	// with a literal false for padding. The Padding header only takes effect on
+	// HTTP/2 and HTTP/3. So although the request may still CARRY a Padding header
+	// (the response header is unconditional), the payload carries no Naive frame
+	// on this transport, and neither UoT's own header nor its datagrams are
+	// framed here.
+	//
+	// The flag is therefore forced off for HTTP/1 rather than following
+	// usePadding. UoT itself is unaffected: it has its own protocol framing
+	// inside the tunnel, which is independent of Naive's padding layer.
+	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: false, version: version}
 
 	if version == uot.Version {
 		// UoT v2 connect mode: isConnect=1 followed by the destination.
@@ -139,12 +153,10 @@ func dialUoT(t *testing.T, port uint16, version uint8, udpTarget string, usePadd
 		addressBytes, err := encodeV2RequestAddr(t, metadata.ParseSocksaddr(udpTarget))
 		require.NoError(t, err)
 		payload = append(payload, addressBytes...)
-		// The UoT v2 request header travels INSIDE the tunnel, so when padding
-		// was negotiated it must itself be wrapped in a padding frame. Writing it
-		// raw makes the server read the isConnect byte as a frame length.
-		if usePadding {
-			payload = naivePaddingFrame(payload, 0)
-		}
+		// The UoT v2 request header travels INSIDE the tunnel. Over HTTP/1 the
+		// tunnel is raw, so it is written unwrapped - including when the CONNECT
+		// request carried a Padding header, because that header does not enable
+		// framing on HTTP/1.
 		_, err = conn.Write(payload)
 		require.NoError(t, err)
 	}
@@ -441,37 +453,28 @@ func runConcurrentUoTSession(port uint16, echoAddr string, index int) error {
 	if err != nil {
 		return err
 	}
-	// The v2 request header is sent inside the tunnel, so it needs a padding
-	// frame when padding is negotiated.
-	if _, err = tlsConn.Write(naivePaddingFrame(append([]byte{1}, addressBytes...), 0)); err != nil {
+	// This session runs over HTTP/1, which is a RAW tunnel in the reference:
+	// serveHijack ends in dualStream(..., false), so the Padding header does not
+	// enable Naive framing here. The UoT request header and its datagrams are
+	// therefore written unwrapped. UoT's OWN framing (the 2-byte length) is a
+	// different layer and is unaffected.
+	if _, err = tlsConn.Write(append([]byte{1}, addressBytes...)); err != nil {
 		return err
 	}
 
 	want := []byte("session-" + strconv.Itoa(index))
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(want)))
-	frame := append(length, want...)
-	if _, err = tlsConn.Write(naivePaddingFrame(frame, 0)); err != nil {
+	if _, err = tlsConn.Write(append(length, want...)); err != nil {
 		return err
 	}
 
-	// The response arrives inside a padding frame. Its body is the UoT
-	// datagram: a 2-byte length followed by the payload. (This session used
-	// UoT v2 in connect mode, so there is no per-datagram address.)
-	frameHeader := make([]byte, 3)
-	if _, err = io.ReadFull(tunnelReader, frameHeader); err != nil {
-		return err
-	}
-	frameDataSize := int(frameHeader[0])<<8 | int(frameHeader[1])
-	framePaddingSize := int(frameHeader[2])
-	frameData := make([]byte, frameDataSize)
+	// The reply is the UoT datagram itself: a 2-byte length followed by the
+	// payload. (This session used UoT v2 in connect mode, so there is no
+	// per-datagram address.)
+	frameData := make([]byte, 2+len(want))
 	if _, err = io.ReadFull(tunnelReader, frameData); err != nil {
 		return err
-	}
-	if framePaddingSize > 0 {
-		if _, err = io.ReadFull(tunnelReader, make([]byte, framePaddingSize)); err != nil {
-			return err
-		}
 	}
 	if len(frameData) < 2 {
 		return errors.New("short UoT datagram")

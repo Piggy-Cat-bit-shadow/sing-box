@@ -95,28 +95,25 @@ func shortLivedUoTSession(port uint16, echoAddr string, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err = tlsConn.Write(naivePaddingFrame(append([]byte{1}, addressBytes...), 0)); err != nil {
+	// HTTP/1 is a RAW tunnel in the reference (serveHijack ends in
+	// dualStream(..., false)), so neither the UoT request header nor the datagram
+	// is wrapped in a Naive padding frame here. The CONNECT request does carry a
+	// Padding header - see writeConnectWithoutT - which is accepted and answered
+	// but does not enable framing on HTTP/1. UoT's own 2-byte length prefix is a
+	// separate layer and is kept.
+	if _, err = tlsConn.Write(append([]byte{1}, addressBytes...)); err != nil {
 		return err
 	}
 
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
-	if _, err = tlsConn.Write(naivePaddingFrame(append(length, payload...), 0)); err != nil {
+	if _, err = tlsConn.Write(append(length, payload...)); err != nil {
 		return err
 	}
 
-	frameHeader := make([]byte, 3)
-	if _, err = io.ReadFull(tunnelReader, frameHeader); err != nil {
-		return err
-	}
-	frameData := make([]byte, int(frameHeader[0])<<8|int(frameHeader[1]))
+	frameData := make([]byte, 2+len(payload))
 	if _, err = io.ReadFull(tunnelReader, frameData); err != nil {
 		return err
-	}
-	if framePaddingSize := int(frameHeader[2]); framePaddingSize > 0 {
-		if _, err = io.ReadFull(tunnelReader, make([]byte, framePaddingSize)); err != nil {
-			return err
-		}
 	}
 	if len(frameData) < 2 || string(frameData[2:]) != string(payload) {
 		return errors.New("echo mismatch")

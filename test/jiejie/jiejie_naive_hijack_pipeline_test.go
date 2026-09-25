@@ -53,15 +53,22 @@ func TestJiejieHijackPipelinedUoTRequestIsNotLost(t *testing.T) {
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
 
-	// ONE write: CONNECT + UoT v2 request header + first datagram, each already
-	// wrapped in its padding frame. The padding handshake is in its window, so
-	// all frames are framed.
+	// ONE write: CONNECT + UoT v2 request header + first datagram.
+	//
+	// The prologue is sent UNFRAMED even though the CONNECT carries a Padding
+	// header, because HTTP/1 is a raw tunnel in the reference: serveHijack ends
+	// in dualStream(targetConn, clientConn, clientConn, false). What this test
+	// checks is the hijack buffered-reader path - net/http reads past the request
+	// headers, so these bytes are already sitting in the bufio.Reader when the
+	// connection is hijacked, and dropping that reader loses them from the first
+	// byte. Framing is irrelevant to that property, so the pipelined bytes are
+	// raw and the reply is read raw.
 	request := "CONNECT " + magic + " HTTP/1.1\r\n" +
 		"Host: " + magic + "\r\n" +
 		"Proxy-Authorization: " + naiveBasicAuth() + "\r\n" +
 		"Padding: ~~~~~~~~\r\n\r\n"
-	pipelined := append([]byte(request), naivePaddingFrame(append([]byte{1}, addressBytes...), 0)...)
-	pipelined = append(pipelined, naivePaddingFrame(append(length, payload...), 0)...)
+	pipelined := append([]byte(request), append([]byte{1}, addressBytes...)...)
+	pipelined = append(pipelined, append(length, payload...)...)
 
 	_, err = tlsConn.Write(pipelined)
 	require.NoError(t, err, "the pipelined write must succeed")
@@ -75,9 +82,10 @@ func TestJiejieHijackPipelinedUoTRequestIsNotLost(t *testing.T) {
 
 	// The datagram must come back. If the buffered bytes were dropped, the
 	// server never sees the request header and this read fails or returns junk.
-	body := readPaddingFrameGuarded(t, reader)
-	require.GreaterOrEqual(t, len(body), 2,
-		"the server must have read the pipelined UoT request header and datagram")
+	// The tunnel is raw, so the reply is a UoT datagram: 2-byte length + payload.
+	body := make([]byte, 2+len(payload))
+	_, err = io.ReadFull(reader, body)
+	require.NoError(t, err, "reading the reply failed")
 	require.Equal(t, payload, body[2:],
 		"the pipelined first datagram must round trip intact, proving the "+
 			"buffered bytes were consumed rather than discarded")

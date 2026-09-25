@@ -3,8 +3,10 @@ package jiejie_test
 import (
 	"bufio"
 	"encoding/binary"
+	"io"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -90,22 +92,20 @@ func TestJiejieNaiveDegradedTunnelIsClosedNotReused(t *testing.T) {
 	t.Logf("a torn frame on one tunnel did not damage the inbound")
 }
 
-// TestJiejieNaivePaddingStreamStaysInSyncAcrossFrames proves the framing
-// accounting survives repeated exchanges on ONE tunnel.
+// TestJiejieNaiveHTTP1TunnelCarriesRepeatedExchanges proves an HTTP/1 tunnel
+// survives many sequential exchanges.
 //
-// The padding window is bounded (8 frames per direction). If a frame could
-// advance the counter without being fully sent, the server would stop
-// frame-encoding while the peer still expected frames, and payload bytes would be
-// parsed as frame headers. The unit-level write-contract tests in
-// protocol/naive/audit_write_contract_test.go cover the byte accounting for a
-// failing writer; this test covers the end-to-end consequence, that a healthy
-// connection keeps round-tripping frame after frame without drifting.
+// This test previously asserted that the padding FRAME WINDOW stayed in sync
+// across exchanges. That premise no longer holds on HTTP/1: the reference makes
+// HTTP/1 a raw tunnel (serveHijack -> dualStream(..., false)), so no Naive frames
+// exist on this transport and there is no window to drift. Asserting framing here
+// would be asserting the behaviour that was removed.
 //
-// The origin is keep-alive on purpose: the tunnel must carry SEVERAL exchanges,
-// which is the only way a window that is one frame out of step becomes visible.
-// An origin that closes after one reply would end the test at exchange 0 and
-// prove nothing about the counter.
-func TestJiejieNaivePaddingStreamStaysInSyncAcrossFrames(t *testing.T) {
+// What still needs proving - and what this test now proves - is that repeated
+// exchanges over one keep-alive HTTP/1 tunnel work, which is the property a real
+// client depends on. A keep-alive origin is required: an origin that closes after
+// one reply would end the test at exchange 0 and prove nothing about repetition.
+func TestJiejieNaiveHTTP1TunnelCarriesRepeatedExchanges(t *testing.T) {
 	env := startNaiveInboundForUoT(t)
 	origin := startKeepAliveOrigin(t)
 
@@ -123,17 +123,25 @@ func TestJiejieNaivePaddingStreamStaysInSyncAcrossFrames(t *testing.T) {
 	for round := range rounds {
 		request := []byte("GET /r" + strconv.Itoa(round) + " HTTP/1.1\r\nHost: " +
 			origin + "\r\n\r\n")
-		_, err := conn.Write(naivePaddingFrame(request, round))
+		_, err := conn.Write(request)
 		require.NoError(t, err)
 
-		body, err := readPaddingFrameRaw2(reader)
-		require.NoError(t, err,
-			"exchange %d must decode as a valid frame; a decode failure here "+
-				"means the padding window drifted out of sync", round)
-		require.Contains(t, string(body), "origin-ok",
+		// Read one complete HTTP response head plus its body. The tunnel is raw,
+		// so this is ordinary HTTP parsing, not frame decoding.
+		head := make([]byte, 0, 256)
+		for !strings.HasSuffix(string(head), "\r\n\r\n") {
+			b, readErr := reader.ReadByte()
+			require.NoError(t, readErr,
+				"exchange %d must produce a complete response head", round)
+			head = append(head, b)
+		}
+		body := make([]byte, len("origin-ok"))
+		_, err = io.ReadFull(reader, body)
+		require.NoError(t, err, "exchange %d must produce its body", round)
+		require.Equal(t, "origin-ok", string(body),
 			"exchange %d must reach the origin and come back intact", round)
 	}
-	t.Logf("%d framed exchanges round-tripped with the padding window in sync", rounds)
+	t.Logf("%d exchanges round-tripped over one raw HTTP/1 tunnel", rounds)
 }
 
 // startKeepAliveOrigin starts an HTTP origin that answers every request on the

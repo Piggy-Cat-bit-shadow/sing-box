@@ -734,7 +734,7 @@ func TestJiejieTargetACLUoTV1MultiTargetChecksEachDatagram(t *testing.T) {
 	sessionTarget := metadata.ParseSocksaddr("93.184.216.34:443")
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, sessionTarget))
-	_, err := conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	_, err := conn.Write(append([]byte{0}, writer.data...))
 	require.NoError(t, err)
 
 	// Datagram 1: to the allowed loopback-free target. This proves the session
@@ -817,7 +817,8 @@ func TestJiejieTargetACLUoTV2NonConnectMultiTarget(t *testing.T) {
 	// Non-connect v2: isConnect = 0, then a session address the rules allow.
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, metadata.ParseSocksaddr("93.184.216.34:443")))
-	_, err := conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	// Raw over HTTP/1, like the datagrams above.
+	_, err := conn.Write(append([]byte{0}, writer.data...))
 	require.NoError(t, err)
 
 	// Positive control: a datagram to a REACHABLE address must be delivered,
@@ -856,7 +857,10 @@ func writeUoTDatagramToLoopback(t *testing.T, conn net.Conn, target metadata.Soc
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
 	body = append(body, length...)
 	body = append(body, payload...)
-	_, err := conn.Write(naivePaddingFrame(body, 0))
+	// Written unwrapped: this helper drives an HTTP/1 tunnel, which is RAW in the
+	// reference (serveHijack -> dualStream(..., false)). UoT's own address and
+	// length prefixes are a separate layer and are preserved.
+	_, err := conn.Write(body)
 	require.NoError(t, err)
 }
 
@@ -899,13 +903,15 @@ func probeTunnelStillReaches(t *testing.T, conn net.Conn, response *http.Respons
 	}
 
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	_, writeErr := conn.Write(naivePaddingFrame(
-		[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+	// RAW over HTTP/1. This helper drives H1 tunnels, and HTTP/1 is unframed in
+	// the reference (serveHijack -> dualStream(..., false)); a Naive frame here
+	// would be read by the server as arbitrary payload.
+	_, writeErr := conn.Write(
+		[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 	if writeErr != nil {
 		return false
 	}
-	reader := bufio.NewReader(conn)
-	body, readErr := readPaddingFrameRaw2(reader)
+	body, readErr := io.ReadAll(conn)
 	if readErr != nil {
 		return false
 	}
@@ -1062,7 +1068,8 @@ func TestJiejieTargetACLLoopbackIPv6UDPIsRejected(t *testing.T) {
 
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, metadata.ParseSocksaddr("93.184.216.34:443")))
-	_, err := conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	// Raw over HTTP/1, like the datagrams above.
+	_, err := conn.Write(append([]byte{0}, writer.data...))
 	require.NoError(t, err)
 
 	// A reachable allowed target proves the session works, so the IPv6 result
@@ -1359,7 +1366,8 @@ func TestJiejieTargetACLPerDatagramHitsRulesTheSessionDidNot(t *testing.T) {
 	// Non-connect session, so each datagram carries its own destination.
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, metadata.ParseSocksaddr("93.184.216.34:443")))
-	_, err := conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	// Raw over HTTP/1, like the datagrams above.
+	_, err := conn.Write(append([]byte{0}, writer.data...))
 	require.NoError(t, err)
 
 	// Datagram 1: an allowed port on loopback must be delivered.

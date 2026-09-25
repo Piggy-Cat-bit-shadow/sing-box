@@ -37,10 +37,14 @@ func openUoTSessionTo(t *testing.T, port uint16, target string) *uotSession {
 		})
 	require.Equal(t, http.StatusOK, response.StatusCode)
 
-	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: true, version: uot.Version}
+	// The request carries a Padding header, but the tunnel is HTTP/1 and HTTP/1
+	// is RAW in the reference (serveHijack -> dualStream(..., false)). Framing is
+	// therefore off and the UoT request header is written unwrapped; only the
+	// header's presence is exercised, not a framing consequence.
+	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: false, version: uot.Version}
 	addressBytes, err := encodeV2RequestAddr(t, metadata.ParseSocksaddr(target))
 	require.NoError(t, err)
-	_, err = conn.Write(naivePaddingFrame(append([]byte{1}, addressBytes...), 0))
+	_, err = conn.Write(append([]byte{1}, addressBytes...))
 	require.NoError(t, err)
 	return session
 }

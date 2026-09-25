@@ -268,18 +268,27 @@ func TestJiejieNaiveTCPConnectWithPadding(t *testing.T) {
 	})
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode,
-		"an authenticated padded CONNECT must be accepted")
+		"an authenticated CONNECT carrying Padding must be accepted")
 	require.NotEmpty(t, response.Header.Get("Padding"),
-		"the server must return a Padding header so padding negotiation completes")
+		"the response Padding header is sent for every authenticated CONNECT")
 
-	// Send a request inside the tunnel using padding framing.
+	// The tunnel is RAW even though the request carried Padding. The reference
+	// ends its HTTP/1 CONNECT in serveHijack, which calls
+	// dualStream(targetConn, clientConn, clientConn, false) - the padding flag is
+	// a literal false. Padding applies to HTTP/2 and HTTP/3 only, so a client
+	// that offers Padding over HTTP/1 still exchanges unframed bytes.
+	//
+	// Sending a Naive frame here would make the server read the client's first
+	// data bytes as a frame header, which is precisely the desynchronisation the
+	// previous behaviour caused.
 	requestBytes := []byte("GET / HTTP/1.1\r\nHost: " + env.originAddr + "\r\nConnection: close\r\n\r\n")
-	_, err := conn.Write(naivePaddingFrame(requestBytes, 7))
+	_, err := conn.Write(requestBytes)
 	require.NoError(t, err)
 
-	body := naiveReadPaddingFrame(t, bufio.NewReader(conn))
+	body, err := io.ReadAll(conn)
+	require.NoError(t, err)
 	require.Contains(t, string(body), "origin-ok",
-		"data written through the padded tunnel must reach the origin")
+		"data written through an HTTP/1 tunnel must reach the origin as RAW bytes")
 }
 
 // TestJiejieNaiveTCPConnectWithoutPadding is the compatibility case that the
@@ -488,8 +497,11 @@ func TestJiejieNaiveConcurrentConnections(t *testing.T) {
 				if response.StatusCode != http.StatusOK {
 					return fmt.Errorf("status %d", response.StatusCode)
 				}
+				// RAW, because HTTP/1 is a raw tunnel in the reference
+				// (serveHijack -> dualStream(..., false)); the Padding header in
+				// the request above does not enable framing here.
 				payload := []byte("GET / HTTP/1.1\r\nHost: " + env.originAddr + "\r\nConnection: close\r\n\r\n")
-				if _, err = tlsConn.Write(naivePaddingFrame(payload, 3)); err != nil {
+				if _, err = tlsConn.Write(payload); err != nil {
 					return err
 				}
 				body, err := io.ReadAll(tlsConn)
