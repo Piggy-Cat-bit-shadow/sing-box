@@ -282,53 +282,164 @@ masque-server"), which is correct rather than something to work around.
 Listed so the gaps are not mistaken for coverage. None of these has a passing test,
 and none is claimed as PASS:
 
-- **The CONNECT-IP side of the DATAGRAM to Capsule fallback.** There are two
-  fallback sites: `transport/http/capsule.go` (`http3PacketConn.WritePacket`) for
-  CONNECT-UDP on the http inbound, which IS tested end to end, and
-  `transport/masque/session.go` (`session.writePacket`) for CONNECT-IP on the
-  masque-server endpoint, which is not. The reference interop exercises the
-  CONNECT-IP data path with datagrams negotiated, so it does not reach that
-  fallback.
-- **DATAGRAM context IDs other than 0, and datagram size boundaries.** The framer
-  and the zero-context-ID path are covered by fuzzing and by the fallback tests;
-  non-zero context IDs and the exact size at which a datagram is rejected in favour
-  of an ICMP Packet Too Big are not.
-- **The IP packet parser and IPv6 extension-header protocol resolution.** The three
-  control parsers and the path matcher are fuzzed; the packet parser that decides
-  the protocol number of an inner packet is not, so a route rule keyed on protocol
-  is untested for IPv6 with extension headers.
-- **Proxy-Status reporting.** Not implemented and not tested.
-- **Send-queue backpressure, capsule write backpressure, and shutdown with active
-  tunnels.** Cross-session isolation and address-pool lifecycle are now tested (see
-  the table above); these three are not, and are not the same thing. A tunnel that
-  stops reading, a peer that stops reading the capsule stream, and a server
-  shutting down while tunnels are open all exercise the write paths rather than the
-  ownership maps.
-- **QUIC migration behaviour and source identity after a path change.** The path
-  manager is now enabled by default, so this matters more than before and is
-  unmeasured.
-- **Loss, reordering and duplication for DATAGRAM versus capsule ordering.**
-- **Google QUICHE interop.**
+- **DATAGRAM context IDs other than 0.** The framer and the zero-context-ID path are
+  covered by fuzzing and by the fallback tests, and the size accounting is pinned at
+  every varint boundary. What is NOT covered is the receiver's handling of a
+  nonzero context ID arriving on a live tunnel: the code drops unknown contexts by
+  inspection, but no test drives one through and then confirms a subsequent
+  context-0 datagram still works.
+- **Loss, reordering and duplication.** A UDP impairment relay was not built, so the
+  behaviour of a CONNECT-UDP or CONNECT-IP tunnel under packet loss, reordering or
+  duplication is unmeasured. The datagram paths are lossy by design and the capsule
+  fallback is a reliable stream, but neither claim is tested.
+- **ICMP Packet Too Big for oversize IP packets.** The size at which a datagram is
+  rejected in favour of an ICMP error is computed and unit-tested; the ICMPv4
+  Fragmentation Needed and ICMPv6 Packet Too Big packets the endpoint GENERATES for
+  an oversize inner packet were not driven end to end.
+- **Proxy-Status beyond the DNS path.** PARTIAL, not absent: the DNS resolution
+  failure is implemented and tested, while the other rejection paths (address pool
+  exhausted, policy forbidden, internal error) return a bare status code and were
+  not audited against RFC 9209.
+- **Google QUICHE interop.** Not built or run. No interop result is claimed.
+- **RFC 9931's client-side half.** Section 8 tells proxy CLIENTS to wait for a 2xx
+  before forwarding TCP payload or to send `Connection: close`, and section 6.3
+  forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client;
+  this repository's HTTP client was not audited against them.
 
-Gaps that were listed here previously and are now closed, removed from this list:
-the CONNECT-UDP differential against masque-go and CONNECT-IP against
-connect-ip-go (both recorded in the table above with the reference client that was
-actually driven), the H3 DATAGRAM to Capsule fallback, the RFC 9931 HTTP/1.1
-CONNECT rejection requirement, cross-session isolation and address-pool
-lifecycle, and fuzz targets for the capsule, route, address and path parsers.
+Closed in Phase 3, removed from this list: the CONNECT-IP capsule fallback, the IP
+packet parser fuzz target, IPv6 extension-header protocol resolution, send-queue and
+capsule write backpressure, and active-tunnel shutdown. QUIC migration and source
+identity after a path change are CLOSED for CONNECT-UDP and CONNECT-IP as recorded
+above.
 
-One narrowing to be explicit about: the fuzz targets cover the capsule framer,
-ROUTE_ADVERTISEMENT, ADDRESS_ASSIGN and the URI-template matcher. The IP packet
-parser and IPv6 extension-header protocol resolution are NOT covered, so they stay
-on the list above rather than being closed with the others. Cross-session
-isolation and address-pool lifecycle are closed as ownership-map coverage, but the
-three write-path items that were listed alongside them are not.
+Two narrowings stated rather than implied, because collapsing them is how a
+NOT-TESTED item becomes an implied PASS:
 
-One RFC 9931 item remains open and is narrowed rather than dropped: the RFC's
-client-side half is not tested here. Section 8 tells proxy CLIENTS to wait for a
-2xx before forwarding TCP payload or to send `Connection: close`, and section 6.3
-forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client;
-this repository's HTTP client was not audited against them.
+  - the IP packet parser IS fuzzed and IPv6 extension chains ARE regression-tested,
+    but the fragment case reports the base header's protocol rather than a derived
+    one. That behaviour is recorded, not certified correct.
+  - migration is measured against a NAT rebind produced below the QUIC layer. Path
+    validation itself is quic-go's and is not reimplemented or independently
+    verified here.
+
+## Phase 3
+
+Phase 3 continued on `masque-reference-hardening-phase3`, branched from the Phase 2
+head. Its scope was the areas Phase 2 identified as NOT-TESTED, plus a correction to
+a Phase 2 claim that turned out to be wrong.
+
+### The Phase 2 gateway ICMP claim was a fixture bug, now corrected
+
+Phase 2 recorded that sing-box's IP stack "echoes the request back" as ICMP type 8
+for a gateway echo request. That measurement was an artefact of the test, not
+behaviour of the server: the fixture derived its destination as
+`source.Masked().Addr()`, and because the server assigns a **/32** that expression
+returns the CLIENT's own address. No packet ever reached the gateway.
+
+Measured side by side in Phase 3:
+
+| Destination | Reply |
+| --- | --- |
+| `198.18.0.2` (client's own /32) | type 8 echoed back, `src == dst` |
+| `198.18.0.1` (the real gateway) | type 0 echo reply, `src=198.18.0.1`, `dst=198.18.0.2` |
+
+The server implements gateway ping conventionally. The destination now comes from a
+single named constant shared by driver and assertion, and the test asserts
+`source != gateway` explicitly. See the CORRECTED section above for what the old
+test did and did not prove.
+
+### CONNECT-IP carries traffic without HTTP Datagrams
+
+The CONNECT-IP half of the RFC 9297 capsule fallback had never been exercised,
+because every available client negotiated datagrams. A peer built directly on
+quic-go's HTTP/3 API with `EnableDatagrams` false now proves: ADDRESS_ASSIGN and
+ROUTE_ADVERTISEMENT arrive as capsules and parse, an IPv4 + ICMP packet travels
+client to server as a DATAGRAM capsule and reaches the IP stack, the reply returns
+as a capsule, and the tunnel survives a SECOND exchange. A counter-case requires a
+datagram-capable peer to receive its answer over the datagram path, so the fallback
+is proven conditional rather than being the only path.
+
+Three capsule-encoding details were initially guessed wrong and are now documented
+from measurement: ADDRESS_ASSIGN entries have no leading count, the address length
+byte is a BYTE count (4 or 16) rather than a family marker, and
+ROUTE_ADVERTISEMENT writes a length byte before the START address only - the end
+address is raw, and reading a length byte before it shifts every following byte.
+
+### A suspected datagram defect did NOT reproduce
+
+Phase 3 began with a hypothesis that a session inferring datagram capability from a
+type assertion would run a receive loop that consumed capsule bytes and could cancel
+the session. **Measured, it is false.** The CONNECT-IP fallback passes with and
+without the change (5/5 runs unfixed), an active fallback tunnel shows an identical
+goroutine count either way (base 2, during 9), and the server-side implementation is
+quic-go's `StateTrackingStream.ReceiveDatagram`, which reads a dedicated datagram
+queue rather than the DATA stream. The method that reads from the stream is
+`Stream.ReceiveDatagram`, a different type.
+
+The capability method added to `DatagramStream` is therefore HARDENING - the session
+now decides from the peer's SETTINGS rather than from a type - and is committed and
+documented as such, not as a bug fix.
+
+### QUIC migration is live and works
+
+Enabling the path manager in Phase 2 made migration production behaviour. A UDP NAT
+relay (no rebind API exists in quic-go, and patching it was out of scope) changes the
+source address the server observes, below the QUIC layer. Measured: an existing
+CONNECT-UDP tunnel survives a rebind on the same connection object, a NEW tunnel
+opens afterwards while the old one keeps working, a CONNECT-IP tunnel survives and
+still answers real IP packets, and opaque unrelated traffic does not disturb an
+established authenticated tunnel.
+
+One measured behaviour drives the test design: the FIRST exchange after a rebind is
+lost while path validation runs, and the second succeeds. That is RFC 9000 section 9
+behaviour, so the tests retry within a bounded window and log the attempt number.
+A single-attempt test reports "migration is broken" for correct code.
+
+### Malformed IP headers panicked the parser (unreachable, fixed anyway)
+
+Two fuzz targets were added for inputs Phase 2 left unfuzzed: the IP packet parser
+and capsule stream fragmentation. `FuzzMasqueIPPacketParser` crashed on its first
+run, three ways, all in `decrementHopLimit`: a 4-byte IPv4 prefix, a version nibble
+that is neither 4 nor 6 (the code treated "not IPv4" as IPv6), and an IHL declaring
+fewer bytes than the fixed header.
+
+**Not reachable in production**: both call sites are preceded by `packetAddresses`,
+which rejects a short packet and releases the buffer before `decrementHopLimit` runs.
+Verified concretely rather than assumed. It is fixed because the failure mode is a
+panic in a network-facing parser that currently depends on a guard in a different
+function. After the fix, sustained fuzzing is clean: 1.26M executions for the IP
+parser, 770K for fragmentation.
+
+### IPv6 extension headers
+
+Seven chain shapes now resolve correctly to the upper-layer protocol (UDP 17 / TCP
+6), and six malformed shapes are rejected without panicking. The walk is performed
+by sing-tun's `header.IPTransportProtocol`, which is pinned as a dependency; these
+tests lock the behaviour rather than reimplementing the parser.
+
+**One measured result, recorded rather than changed**: a NON-FIRST fragment reports
+protocol 17, the base header's value, because the chain walk stops at the fragment
+header. A non-first fragment genuinely carries no upper-layer header, so no protocol
+can be derived from it - but a route rule keyed on protocol does see the base
+header's value for fragmented traffic. Changing that would mean reimplementing
+sing-tun's parser or diverging from it.
+
+### Proxy-Status is PARTIAL
+
+The audit previously said "Not implemented", which was inaccurate: the DNS
+resolution failure already emits `Proxy-Status: sing-box; error=dns_error`. One of
+six rejection paths carries it. Searched the repository exhaustively rather than
+sampling.
+
+The authentication boundary is now pinned: an authenticated DNS failure carries the
+header, while unauthenticated, wrong-credential, masquerade and over-limit requests
+carry none and no upstream failure status.
+
+One measured difference: an unauthenticated request to the `masque-server`
+**endpoint** is answered with a bare 401 and a `WWW-Authenticate` challenge, NOT with
+a masquerade decoy. The `http` **inbound** has a masquerade option; the endpoint
+defines no such field. An anti-fingerprinting assertion copied from the inbound tests
+does not apply here.
 
 ## Out of scope
 
