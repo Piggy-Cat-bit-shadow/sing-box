@@ -20,7 +20,7 @@ show.
 | RFC 9297 | HTTP Datagrams and the Capsule Protocol |
 | RFC 9298 | CONNECT-UDP |
 | RFC 9484 | CONNECT-IP, including section 4.2.1 / 4.7.3 route rules |
-| RFC 9931 | HTTP/1.1 upgrade and optimistic protocol data |
+| RFC 9931 | HTTP/1.1 optimistic protocol transitions; section 8 adds a server-side MUST that this audit found unmet |
 
 ## Pinned references
 
@@ -99,6 +99,40 @@ One recorded decision: an encoded slash in the host segment decodes into the hos
 which cannot resolve. It is not a traversal, because segments are split before
 unescaping.
 
+### HTTP/1.1 CONNECT rejection and connection reuse (RFC 9931)
+
+RFC 9931 section 8 requires a proxy server to close the underlying connection
+when it rejects a CONNECT, "without processing any further requests on that
+connection", and states the requirement "applies whether or not the request
+includes a 'close' connection option". This was added to RFC 9112 and RFC 9298.
+
+sing-box did not do it. The HTTP/1.1 CONNECT and CONNECT-UDP rejection paths
+passed `requestKeepAlive(request)` to the reject helper, so a client that asked
+for keep-alive kept the connection and the server read the next request off it.
+
+Reproduced before the fix, on the wire, rather than inferred from reading: a
+CONNECT with no credentials followed immediately by a second well-formed request
+produced **two** `407` responses on one connection. That second response is the
+request-smuggling primitive, and it needs no attacker-controlled payload to
+trigger -- the attacker's bytes simply become a request the client is deemed to
+have made.
+
+Fixed by rejecting without keep-alive on the two paths that involve a protocol
+transition. Ordinary rejected requests still honour keep-alive, because no
+transition was requested and the shape does not arise.
+
+HTTP/2 and HTTP/3 are deliberately unaffected. RFC 9931 scopes the requirement to
+HTTP/1.1 and recommends the newer versions as the way to avoid its cost, since a
+rejected request there has an explicit stream and cannot leave a second request
+half-read on a shared byte stream. A control test asserts the opposite outcome for
+HTTP/2: after a rejected CONNECT the same connection still serves a further
+request.
+
+Accepted cost: the RFC notes the mitigation "will frequently cause slower
+connection establishment ... especially when returning a 407", because a
+compliant client must reconnect and redo the TLS handshake. That is paid only on
+the rejection path.
+
 ## Verified without change
 
 - The capsule size limit fires correctly: a declared length above
@@ -106,6 +140,30 @@ unescaping.
 - Malformed capsule framing (truncated type varint, truncated length varint,
   zero-length unknown capsule) returns an error rather than panicking, hanging or
   allocating without bound.
+
+## Verified in process, against a real peer
+
+These results do not need a third-party reference: they drive a purpose-built
+peer whose relevant capability is configurable, and assert on bytes that crossed
+a real socket.
+
+| Case | Result |
+| --- | --- |
+| H3 DATAGRAM to Capsule fallback: a peer that does NOT advertise `SETTINGS_H3_DATAGRAM` receives the payload as a DATAGRAM capsule (type 0x00) on the request stream | PASS |
+| The same payload to a peer that DOES advertise datagram support comes back as a datagram, so the fallback is conditional rather than the only path | PASS |
+| The server always advertises `SETTINGS_H3_DATAGRAM` and extended CONNECT, whatever the client offers | PASS |
+| RFC 9931 section 8: a rejected HTTP/1.1 CONNECT closes the connection and the following request is NOT processed | PASS (was FAIL) |
+| RFC 9931: the same for a rejected HTTP/1.x CONNECT-UDP upgrade | PASS |
+| RFC 9931: HTTP/2 is unaffected, so a rejected CONNECT leaves the connection usable | PASS |
+
+The DATAGRAM fallback tests were checked against an injected regression:
+disabling the fallback in `transport/http/capsule.go` makes the fallback test fail
+immediately and it passes again once restored.
+
+That experiment also showed there are **two** fallback sites serving different
+protocols - `transport/http/capsule.go` for CONNECT-UDP and
+`transport/masque/session.go` for CONNECT-IP - so a test that exercises one says
+nothing about the other. Which one is covered is stated with the result.
 
 ## Verified against the pinned references
 
@@ -164,11 +222,14 @@ masque-server"), which is correct rather than something to work around.
 Listed so the gaps are not mistaken for coverage. None of these has a passing test,
 and none is claimed as PASS:
 
-- **H3 DATAGRAM to Capsule fallback end to end.** The fallback exists in
-  `session.writePacket`; no test drives a peer that disables DATAGRAM and observes
-  the payload arriving as a capsule.
+- **The CONNECT-IP side of the DATAGRAM to Capsule fallback.** There are two
+  fallback sites: `transport/http/capsule.go` (`http3PacketConn.WritePacket`) for
+  CONNECT-UDP on the http inbound, which IS tested end to end, and
+  `transport/masque/session.go` (`session.writePacket`) for CONNECT-IP on the
+  masque-server endpoint, which is not. The reference interop exercises the
+  CONNECT-IP data path with datagrams negotiated, so it does not reach that
+  fallback.
 - **DATAGRAM context IDs other than 0, and datagram size boundaries.**
-- **RFC 9931 HTTP/1.1 optimistic data.** No request-smuggling matrix was run.
 - **Proxy-Status reporting.** Not implemented and not tested.
 - **Cross-session isolation, resource churn, send-queue backpressure, capsule write
   backpressure, shutdown with active tunnels.** Audited by reading, not tested.
@@ -181,10 +242,17 @@ and none is claimed as PASS:
   parser.**
 - **Google QUICHE interop.**
 
-Two gaps that were listed here previously are now closed and have been removed from
-this list: the CONNECT-UDP differential against masque-go, and CONNECT-IP against
-connect-ip-go. Both are recorded in the table above with the reference client that
-was actually driven.
+Gaps that were listed here previously and are now closed, removed from this list:
+the CONNECT-UDP differential against masque-go and CONNECT-IP against
+connect-ip-go (both recorded in the table above with the reference client that was
+actually driven), the H3 DATAGRAM to Capsule fallback, and the RFC 9931 HTTP/1.1
+CONNECT rejection requirement.
+
+One RFC 9931 item remains open and is narrowed rather than dropped: the RFC's
+client-side half is not tested here. Section 8 tells proxy CLIENTS to wait for a
+2xx before forwarding TCP payload or to send `Connection: close`, and section 6.3
+forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client;
+this repository's HTTP client was not audited against them.
 
 ## Out of scope
 
