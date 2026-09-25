@@ -464,12 +464,31 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// parse frames: framing is still driven solely by usePadding below.
 	writer.Header().Set("Padding", generatePaddingHeader())
 	writer.WriteHeader(http.StatusOK)
+
+	// Flush through a ResponseController rather than a bare http.Flusher.
+	//
+	// The reference does the same (forwardproxy.go: http.NewResponseController(w)
+	// .Flush() with the error checked and returned as a 500), and the difference
+	// matters: a bare Flusher.Flush() cannot report failure, so a flush that never
+	// reached the client would leave this server building a tunnel whose 200 the
+	// peer never received. The controller also unwraps wrappers that hide the
+	// underlying flusher, which the type assertion does not.
+	//
+	// The tunnel must NOT be created after a failed flush: the client never saw
+	// the 200, so there is no agreed tunnel to carry data on.
+	responseController := http.NewResponseController(writer)
+	if flushErr := responseController.Flush(); flushErr != nil {
+		n.badRequest(ctx, request, E.Cause(flushErr, "response writer flush"))
+		return
+	}
 	flusher, isFlusher := writer.(http.Flusher)
 	if !isFlusher {
+		// Kept because the HTTP/2 data path below needs a flusher to push each
+		// write; the controller above proves one is reachable, so this is now a
+		// belt-and-braces check rather than the primary mechanism.
 		n.badRequest(ctx, request, E.New("response writer is not a flusher"))
 		return
 	}
-	flusher.Flush()
 
 	// The source is the real socket peer, NOT a forwarded header.
 	//
