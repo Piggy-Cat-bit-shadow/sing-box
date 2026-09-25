@@ -134,6 +134,29 @@ jobs:
           cd test/jiejie
           go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../../integration-production.log
 
+      # The HTTP/3 path needs protocol/naive/quic linked, which the production
+      # minimal registry deliberately does NOT do (quic_minimal.go omits it, and
+      # the nil-guard in the inbound turns that into a clean "http3 disabled"
+      # warning rather than a crash). Under the production tag set the HTTP/3
+      # integration tests therefore SKIP, which would mean the 0-RTT removal and
+      # the H3 CONNECT path were never actually exercised in CI.
+      #
+      # This step runs them under a tag set that DOES link the QUIC support, so
+      # the H3 transport, its ALPN isolation and its stream-limit behaviour are
+      # covered by real probes rather than reported as skipped.
+      - name: Naive HTTP/3 integration (QUIC support linked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same production tag set minus jiejie_server_minimal, which is the
+          # switch that excludes protocol/naive/quic.
+          H3_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
+          echo "h3 tags: $H3_TAGS"
+          cd test/jiejie
+          go test -tags "$H3_TAGS" -v -count=1 -timeout 20m \
+            -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN' . \
+            2>&1 | tee ../../naive-h3-integration.log
+
       # Differential compatibility against the REFERENCE implementation
       # (klzgrad/forwardproxy@naive behind Caddy), which is what the Naive
       # protocol is defined by. The reference is pinned here, never @latest, so
