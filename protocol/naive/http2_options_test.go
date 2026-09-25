@@ -241,6 +241,39 @@ func TestHTTP2OptionsRejectOutOfRangeValues(t *testing.T) {
 		require.Contains(t, err.Error(), "connection_receive_window")
 	})
 
+	t.Run("zero and one are accepted", func(t *testing.T) {
+		// Zero is the documented "unset, use the upstream default" value and must
+		// never become an error. One is the smallest meaningful limit and proves
+		// the check is a bound rather than a floor.
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: 0,
+		}), "zero means upstream default and must be accepted")
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: 1,
+		}), "one is a valid stream limit")
+
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			StreamReceiveWindow:     bytesOf(t, "0"),
+			ConnectionReceiveWindow: bytesOf(t, "0"),
+		}), "zero windows mean upstream default and must be accepted")
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			StreamReceiveWindow:     bytesOf(t, "1"),
+			ConnectionReceiveWindow: bytesOf(t, "1"),
+		}), "one-byte windows are representable and must be accepted")
+	})
+
+	t.Run("one below the limit is accepted", func(t *testing.T) {
+		// The exact boundary from below: MaxInt32-1 and MaxUint32-1 must pass,
+		// so the check is proven to be an upper bound and not off by one.
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			MaxConcurrentStreams: int(maxUint32) - 1,
+		}), "one below the stream-limit maximum must be accepted")
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			StreamReceiveWindow:     bytesOf(t, "2147483646"),
+			ConnectionReceiveWindow: bytesOf(t, "2147483646"),
+		}), "one below the window maximum must be accepted")
+	})
+
 	t.Run("unset stays unset", func(t *testing.T) {
 		// Zero for all three means "use the upstream default" and must never be
 		// turned into an error, or every existing configuration would break.

@@ -168,8 +168,11 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 		// moment a configuration enables UDP on this inbound.
 		switch decideHTTP3Availability(ConfigureHTTP3ListenerFunc != nil, n.network) {
 		case http3UnavailableFatal:
-			return E.New("HTTP/3 is not available in this build: ",
-				"the QUIC support package was not linked in")
+			// The project's canonical error for a QUIC-absent build, so a
+			// configuration that needs HTTP/3 fails with the same message every
+			// other QUIC-dependent path produces, and the operator gets the
+			// "rebuild with -tags with_quic" hint rather than a one-off wording.
+			return C.ErrQUICNotIncluded
 		case http3UnavailableNonFatal:
 			// A missing optional transport must not take down TCP CONNECT, which
 			// is this server's production data path.
