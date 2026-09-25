@@ -144,6 +144,44 @@ jobs:
       # This step runs them under a tag set that DOES link the QUIC support, so
       # the H3 transport, its ALPN isolation and its stream-limit behaviour are
       # covered by real probes rather than reported as skipped.
+      # Build the pinned reference ONCE, before the differential steps, and
+      # export its location.
+      #
+      # It used to be built inside the differential step alone, which is why the
+      # HTTP/3 differential could never run: that step passes the reference env
+      # only to its own `go test`, so the H3 step - which runs under different
+      # build tags - saw no reference and SKIPPED. A SKIP there is invisible in a
+      # green workflow, so the HTTP/3 comparison was reported as covered while
+      # never having executed. Building here and exporting through $GITHUB_ENV
+      # makes the reference available to every later step.
+      - name: Build the pinned Caddy/forwardproxy reference
+        id: reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF_COMMIT=d62c80d3dd2c706b6b87579844d2397bddd18317
+          REF_DIR="$RUNNER_TEMP/forwardproxy-ref"
+
+          git init -q "$REF_DIR"
+          git -C "$REF_DIR" remote add origin https://github.com/klzgrad/forwardproxy.git
+          if ! git -C "$REF_DIR" fetch -q --depth 1 origin "$REF_COMMIT"; then
+            echo "::warning::could not fetch the reference"
+            echo "JIEJIE_REFERENCE_READY=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          git -C "$REF_DIR" checkout -q FETCH_HEAD
+          ACTUAL=$(git -C "$REF_DIR" rev-parse HEAD)
+          if [ "$ACTUAL" != "$REF_COMMIT" ]; then
+            echo "::error::reference checkout is $ACTUAL, expected $REF_COMMIT"
+            exit 1
+          fi
+
+          # The differential harness builds the binary itself from this source
+          # when JIEJIE_CADDY_REFERENCE_SOURCE is set, which keeps the pin in the
+          # repository rather than in a cached artifact.
+          echo "JIEJIE_CADDY_REFERENCE_SOURCE=$REF_DIR" >> "$GITHUB_ENV"
+          echo "JIEJIE_REFERENCE_READY=1" >> "$GITHUB_ENV"
+
       - name: Naive HTTP/3 integration (QUIC support linked)
         shell: bash
         run: |
@@ -153,9 +191,35 @@ jobs:
           H3_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
           echo "h3 tags: $H3_TAGS"
           cd test/jiejie
-          go test -tags "$H3_TAGS" -v -count=1 -timeout 20m \
-            -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN' . \
+          # The H3 differential is included HERE, under the tags that link QUIC.
+          # It cannot run under the production tag set, because that tag set
+          # deliberately omits protocol/naive/quic - so if this step does not run
+          # it, nothing does.
+          go test -tags "$H3_TAGS" -v -count=1 -timeout 25m \
+            -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN|TestJiejieNaiveTCPAndUDPALPN|TestJiejieNaiveH3DifferentialAgainstReference' . \
             2>&1 | tee ../../naive-h3-integration.log
+
+      # The HTTP/3 differential must have actually compared something. A SKIP
+      # produces a green workflow, so the result is checked explicitly rather
+      # than inferred from the exit status.
+      - name: Assert the HTTP/3 differential actually ran
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG=naive-h3-integration.log
+          if grep -q 'SKIP: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG"; then
+            echo "::error::the HTTP/3 reference differential SKIPPED. It is the only"
+            echo "::error::HTTP/3 comparison this project has, so a skip means H3"
+            echo "::error::parity was never measured. This is NOT a pass."
+            grep -A3 'SKIP: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG" || true
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG"; then
+            echo "::error::the HTTP/3 reference differential did not report a pass."
+            exit 1
+          fi
+          grep -E 'H3 differential: ' "$LOG" || true
+          echo "HTTP/3 reference differential executed."
 
       # Differential compatibility against the REFERENCE implementation
       # (klzgrad/forwardproxy@naive behind Caddy), which is what the Naive
@@ -171,27 +235,16 @@ jobs:
         run: |
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          REF_COMMIT=d62c80d3dd2c706b6b87579844d2397bddd18317
-          REF_DIR="$RUNNER_TEMP/forwardproxy-ref"
-
-          git init -q "$REF_DIR"
-          git -C "$REF_DIR" remote add origin https://github.com/klzgrad/forwardproxy.git
-          if ! git -C "$REF_DIR" fetch -q --depth 1 origin "$REF_COMMIT"; then
-            echo "::warning::could not fetch the reference; the differential test will SKIP"
-          else
-            git -C "$REF_DIR" checkout -q FETCH_HEAD
-            ACTUAL=$(git -C "$REF_DIR" rev-parse HEAD)
-            if [ "$ACTUAL" != "$REF_COMMIT" ]; then
-              echo "::error::reference checkout is $ACTUAL, expected $REF_COMMIT"
-              exit 1
-            fi
+          # JIEJIE_CADDY_REFERENCE_SOURCE comes from the build step above, so the
+          # reference is checked out exactly once for the whole job.
+          if [ "${JIEJIE_REFERENCE_READY:-0}" != "1" ]; then
+            echo "::warning::the reference was not built; the differential will SKIP"
           fi
 
           cd test/jiejie
-          JIEJIE_CADDY_REFERENCE_SOURCE="$REF_DIR" \
           JIEJIE_PARITY_REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json" \
             go test -tags "$TAGS" -v -count=1 -timeout 25m \
-              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity|TestJiejieNaiveH2DifferentialAgainstReference|TestJiejieNaiveH1RawDifferentialAgainstReference' . \
+              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity|TestJiejieNaiveH2DifferentialAgainstReference|TestJiejieNaiveH1RawDifferentialAgainstReference|TestJiejieNaivePaddingSegmentationMatchesTheReference|TestJiejieNativeNaiveMatchesTheBareProfileChallenge|TestJiejieReferenceProfilesAreDistinct' . \
             2>&1 | tee ../../naive-parity.log
 
       - name: Summarise the Naive compatibility report

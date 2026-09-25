@@ -324,6 +324,11 @@ func TestJiejieNaiveH3DifferentialAgainstReference(t *testing.T) {
 		"the reference must serve HTTP/3 for this comparison to mean anything")
 
 	counts := map[string]int{}
+	// results feeds the shared parity artifact so the published report covers
+	// H1, H2 AND H3 rather than only the transports whose tests happened to run
+	// under the production tag set. A report missing a protocol reads as full
+	// coverage, which is the failure mode this artifact exists to prevent.
+	var results []parityResult
 	for _, testCase := range h3DifferentialCorpus(origin.addr,
 		"127.0.0.1:"+strconv.Itoa(int(unreachable))) {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -332,6 +337,17 @@ func TestJiejieNaiveH3DifferentialAgainstReference(t *testing.T) {
 
 			verdict := classifyH3Case(testCase, forkObservation, referenceObservation)
 			counts[verdict]++
+
+			results = append(results, parityResult{
+				Protocol:        "H3",
+				Name:            testCase.name,
+				Reference:       referenceObservation.summary(),
+				SingBox:         forkObservation.summary(),
+				Verdict:         verdict,
+				Reason:          h3CaseReason(testCase, forkObservation, referenceObservation, verdict),
+				ReferenceCommit: CaddyReferenceCommit,
+				CaddyVersion:    CaddyReferenceVersion,
+			})
 
 			t.Logf("fork      : %s", forkObservation.summary())
 			t.Logf("reference : %s", referenceObservation.summary())
@@ -347,10 +363,27 @@ func TestJiejieNaiveH3DifferentialAgainstReference(t *testing.T) {
 		})
 	}
 
+	writeParityReport(t, results)
+
 	t.Logf("H3 differential: PASS=%d INTENTIONAL-DIFF=%d DIFF=%d NOT-TESTED=%d",
 		counts["PASS"], counts["INTENTIONAL-DIFF"], counts["DIFF"], counts["NOT-TESTED"])
 	require.Equal(t, 0, counts["DIFF"],
 		"no HTTP/3 case may diverge from the reference without a recorded reason")
+}
+
+// h3CaseReason records why a case was classified as it was, so the published
+// report is auditable without reading the test log.
+func h3CaseReason(testCase h3DifferentialCase, fork, reference h3Observation, verdict string) string {
+	switch verdict {
+	case "PASS":
+		return "the fork and the reference produced the same observation"
+	case "INTENTIONAL-DIFF":
+		return "the fork differs deliberately: " + testCase.expect
+	case "NOT-TESTED":
+		return "the case did not complete on both sides, so it is not a comparison"
+	default:
+		return "unexplained divergence: fork=" + fork.summary() + " reference=" + reference.summary()
+	}
 }
 
 // classifyH3Case compares one case's two observations.
