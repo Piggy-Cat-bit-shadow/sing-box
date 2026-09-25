@@ -300,9 +300,25 @@ func TestJiejieNaiveTCPConnectWithoutPadding(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.StatusCode,
 		"an authenticated CONNECT without a Padding header is a plain proxy request "+
 			"and must be accepted")
-	require.Empty(t, response.Header.Get("Padding"),
-		"no Padding header was negotiated, so none must be advertised")
 
+	// The response Padding header is INDEPENDENT of the request's, and the
+	// reference sends it unconditionally: klzgrad/forwardproxy sets
+	// w.Header().Set("Padding", ...) with no condition before WriteHeader(200),
+	// and only passes `r.Header.Get("Padding") != ""` to dualStream to decide
+	// whether payload FRAMING is enabled.
+	//
+	// An earlier version of this test asserted the header must be ABSENT here.
+	// That assertion came from sing-box's own previous behaviour, not from the
+	// reference, and it is what the differential harness flags as a divergence.
+	require.NotEmpty(t, response.Header.Get("Padding"),
+		"the response Padding header is sent for every authenticated CONNECT, "+
+			"matching klzgrad/forwardproxy; it does not depend on the request header")
+
+	// The header being present must NOT enable payload framing. This is the
+	// half that protects ordinary HTTP CONNECT clients: a client that never
+	// asked for padding must be able to write raw bytes even though the
+	// response advertised a Padding header.
+	//
 	// Without padding there is no frame header: bytes pass straight through.
 	_, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: " + env.originAddr + "\r\nConnection: close\r\n\r\n"))
 	require.NoError(t, err)
