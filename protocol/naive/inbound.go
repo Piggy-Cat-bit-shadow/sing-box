@@ -21,7 +21,6 @@ import (
 	transportHttp "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -51,7 +50,7 @@ type Inbound struct {
 	listener         *listener.Listener
 	network          []string
 	networkIsDefault bool
-	authenticator    *auth.Authenticator
+	authenticator    *naiveAuthenticator
 	tlsConfig        tls.ServerConfig
 	httpServer       *http.Server
 	h3Server         io.Closer
@@ -76,7 +75,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}),
 		networkIsDefault: options.Network == "",
 		network:          options.Network.Build(),
-		authenticator:    auth.NewAuthenticator(options.Users),
+		authenticator:    newNaiveAuthenticator(options.Users),
 	}
 	if common.Contains(inbound.network, N.NetworkUDP) {
 		if options.TLS == nil || !options.TLS.Enabled {
@@ -481,14 +480,6 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		n.badRequest(ctx, request, E.Cause(flushErr, "response writer flush"))
 		return
 	}
-	flusher, isFlusher := writer.(http.Flusher)
-	if !isFlusher {
-		// Kept because the HTTP/2 data path below needs a flusher to push each
-		// write; the controller above proves one is reachable, so this is now a
-		// belt-and-braces check rather than the primary mechanism.
-		n.badRequest(ctx, request, E.New("response writer is not a flusher"))
-		return
-	}
 
 	// The source is the real socket peer, NOT a forwarded header.
 	//
@@ -564,9 +555,12 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}, userName, source, destination)
 	} else {
 		n.newConnection(ctx, true, &naiveH2Conn{
-			reader:        request.Body,
-			writer:        writer,
-			flusher:       flusher,
+			reader: request.Body,
+			writer: writer,
+			// A ResponseController, not the http.Flusher interface: Flush must
+			// be able to report its error so a tunnel write into a failed
+			// stream is not mistaken for a successful one.
+			flusher:       http.NewResponseController(writer),
 			remoteAddress: source,
 			paddingConn:   paddingConn{enabled: usePadding},
 		}, userName, source, destination)
@@ -592,8 +586,48 @@ func (n *Inbound) serveWebOrReject(ctx context.Context, writer http.ResponseWrit
 		n.serveMasquerade(ctx, writer, request)
 		return
 	}
-	rejectHTTP(writer, statusCode)
+	proxyAuthChallenge(writer, statusCode)
 	n.badRequest(ctx, request, err)
+}
+
+// proxyAuthRealm is the realm the reference advertises.
+//
+// It is reproduced verbatim (klzgrad/forwardproxy forwardproxy.go: `Basic
+// realm="Caddy Secure Web Proxy"`) because the challenge is part of the wire
+// behaviour a proxy client sees. A client that inspects the realm, or a test
+// that compares this endpoint against the reference, must observe the same
+// string.
+const proxyAuthRealm = "Caddy Secure Web Proxy"
+
+// proxyAuthChallenge answers an unauthenticated request the way the reference
+// does when probe resistance is NOT configured.
+//
+// Why this is not the hijack-and-close it used to be: a CONNECT that fails
+// authentication is an ordinary HTTP request that happens to be unauthorised, so
+// the reference answers it with a normal response. Measured against the pinned
+// reference (forwardproxy.go: `w.Header().Set("Proxy-Authenticate", ...)` then
+// `caddyhttp.Error(http.StatusProxyAuthRequired, authErr)`):
+//
+//	HTTP/1.1 407 Proxy Authentication Required
+//	Proxy-Authenticate: Basic realm="Caddy Secure Web Proxy"
+//	Content-Length: 0
+//
+// That response is produced for an unauthenticated CONNECT, a wrong-credential
+// CONNECT and even a plain GET. The previous implementation instead hijacked the
+// connection, set SO_LINGER to 0 and closed it, so the client observed a
+// connection reset with NO status line and NO challenge. That is not what the
+// reference does, and it also left the client unable to distinguish "bad
+// credentials" from "the proxy died".
+//
+// Only the 407 gets the challenge header. Other statuses routed through here
+// (a non-CONNECT request, a malformed CONNECT) keep their own semantics, matching
+// the reference, which sets Proxy-Authenticate only on its auth-failure path.
+func proxyAuthChallenge(writer http.ResponseWriter, statusCode int) {
+	if statusCode == http.StatusProxyAuthRequired {
+		writer.Header().Set("Proxy-Authenticate", "Basic realm=\""+proxyAuthRealm+"\"")
+	}
+	writer.Header().Set("Content-Length", "0")
+	writer.WriteHeader(statusCode)
 }
 
 // serveMasquerade serves the decoy web response, with the request sanitised so
@@ -639,21 +673,4 @@ func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net
 
 func (n *Inbound) badRequest(ctx context.Context, request *http.Request, err error) {
 	n.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", request.RemoteAddr))
-}
-
-func rejectHTTP(writer http.ResponseWriter, statusCode int) {
-	hijacker, ok := writer.(http.Hijacker)
-	if !ok {
-		writer.WriteHeader(statusCode)
-		return
-	}
-	conn, _, err := hijacker.Hijack()
-	if err != nil {
-		writer.WriteHeader(statusCode)
-		return
-	}
-	if tcpConn, isTCP := common.Cast[*net.TCPConn](conn); isTCP {
-		tcpConn.SetLinger(0)
-	}
-	conn.Close()
 }
