@@ -167,18 +167,68 @@ func TestNaiveAuthenticatorNilIsSafe(t *testing.T) {
 // the field ever went back to plaintext the length leak would return, and the
 // test would catch the regression.
 func TestNaiveAuthenticatorStoresDigestsNotPlaintext(t *testing.T) {
+	const username = "u"
 	const password = "a-very-distinctive-password"
-	authenticator := newNaiveAuthenticator([]auth.User{{Username: "u", Password: password}})
+	authenticator := newNaiveAuthenticator([]auth.User{{Username: username, Password: password}})
 
-	digests, loaded := authenticator.users["u"]
-	if !loaded || len(digests) != 1 {
-		t.Fatalf("expected one stored digest for the user, got %v", digests)
+	if len(authenticator.credentials) != 1 {
+		t.Fatalf("expected one stored digest, got %d", len(authenticator.credentials))
 	}
-	expected := sha256.Sum256([]byte(password))
-	if digests[0] != expected {
-		t.Fatal("the stored value must be the SHA-256 digest of the password")
+	// The digest covers the PAIR, so a credential is one opaque value rather
+	// than a username key plus a password list. That is what removes the
+	// username-existence timing path.
+	expected := sha256.Sum256([]byte(username + ":" + password))
+	if authenticator.credentials[0] != expected {
+		t.Fatal("the stored value must be the SHA-256 digest of username:password")
 	}
-	if len(digests[0]) != sha256.Size {
-		t.Fatalf("stored digest must be %d bytes, got %d", sha256.Size, len(digests[0]))
+	if len(authenticator.credentials[0]) != sha256.Size {
+		t.Fatalf("stored digest must be %d bytes, got %d",
+			sha256.Size, len(authenticator.credentials[0]))
+	}
+}
+
+// TestNaiveAuthenticatorWalksEveryEntry pins the property that removes the
+// username-existence timing signal.
+//
+// The previous map-based verifier returned immediately for an unknown username
+// and did more work for a known one, so the two were distinguishable from
+// response timing. With a flat list every request performs exactly one digest and
+// len(credentials) comparisons, whatever the input. The count cannot be observed
+// directly without a timing assertion, which would be flaky; what CAN be pinned
+// is the structure that makes the count input-independent, and that is what this
+// test does.
+func TestNaiveAuthenticatorWalksEveryEntry(t *testing.T) {
+	users := []auth.User{
+		{Username: "first", Password: "one"},
+		{Username: "second", Password: "two"},
+		{Username: "third", Password: "three"},
+	}
+	authenticator := newNaiveAuthenticator(users)
+
+	if len(authenticator.credentials) != len(users) {
+		t.Fatalf("every configured pair must be its own entry: got %d, want %d",
+			len(authenticator.credentials), len(users))
+	}
+
+	// A known user, an unknown user, a wrong password and a correct password
+	// must all be verifiable through the same code path. The observable
+	// consequence of the flat structure is that an unknown username is accepted
+	// if and only if its pair was configured - there is no separate lookup that
+	// could short-circuit.
+	for _, user := range users {
+		if !authenticator.Verify(user.Username, user.Password) {
+			t.Fatalf("configured pair %q must verify", user.Username)
+		}
+		if authenticator.Verify(user.Username, "wrong") {
+			t.Fatalf("wrong password for %q must not verify", user.Username)
+		}
+	}
+	if authenticator.Verify("not-configured", "one") {
+		t.Fatal("an unconfigured username must not verify")
+	}
+	// A pair whose halves exist separately must NOT be accepted: the digest
+	// covers the joined pair, so there is no way to combine them.
+	if authenticator.Verify("first", "two") {
+		t.Fatal("credentials must not be combinable across configured pairs")
 	}
 }
