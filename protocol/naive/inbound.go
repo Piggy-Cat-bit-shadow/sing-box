@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -134,23 +135,25 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 		}
 		listener := net.Listener(tcpListener)
 		if n.tlsConfig != nil {
-			// ALPN is resolved ONCE, here, to cover every transport this inbound
-			// serves, and is not mutated again afterwards.
+			// The TCP listener gets its OWN ALPN view.
 			//
-			// The reason is that the TLS config object is SHARED: the same
-			// instance is handed to the HTTP/3 initialiser below, and
-			// STDServerConfig.Server() reads the config at HANDSHAKE time rather
-			// than capturing it. Mutating the shared object once TCP has started
-			// therefore changes what subsequent TCP handshakes negotiate, and a
-			// QUIC-only protocol (h3) would leak into the TCP ALPN list.
+			// A previous revision put every transport's protocol into one shared
+			// list - h2, http/1.1 AND h3 on a tcp+udp inbound - and handed that
+			// same object to both listeners. The result was measured rather than
+			// theorised: a TCP client offering only h3 negotiated h3, a QUIC-only
+			// protocol it cannot speak over TCP, and a QUIC client offering h2
+			// negotiated h2. Neither is a valid combination.
 			//
-			// The mutation cannot be avoided by cloning: STDServerConfig.Clone()
-			// copies only the *tls.Config and the handshake timeout, dropping the
-			// certificate provider, the ACME service and the file watcher, so a
-			// clone could not serve certificates or reload them. Resolving the
-			// union up front needs no clone and no lifecycle risk.
-			n.tlsConfig.SetNextProtos(n.negotiatedNextProtos())
-			listener = aTLS.NewListener(tcpListener, n.tlsConfig)
+			// The union could not simply be split by cloning:
+			// STDServerConfig.Clone drops the certificate provider, the ACME
+			// service and the watcher, so a clone could not serve or reload
+			// certificates. Instead each transport gets a VIEW that overrides
+			// only its ALPN list and delegates the certificate lifecycle, ACME
+			// and Close to the single shared config, so that object is still
+			// created, started and closed exactly once.
+			tcpTLSConfig := tls.TransportALPNView(n.tlsConfig, n.tcpNextProtos())
+			n.logger.Warn("DIAG tcpALPN=", strings.Join(tcpTLSConfig.NextProtos(), ","), " sharedALPN=", strings.Join(n.tlsConfig.NextProtos(), ","))
+			listener = aTLS.NewListener(tcpListener, tcpTLSConfig)
 		}
 		go func() {
 			sErr := n.httpServer.Serve(listener)
@@ -200,31 +203,47 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 // against the library constant by a test.
 const http3ALPN = "h3"
 
-// negotiatedNextProtos returns the complete ALPN list for this inbound.
+// tcpNextProtos returns the ALPN list for the TCP listener.
 //
-// It is computed once and applied to TLS before any listener starts, so no
-// transport can change another's negotiation afterwards.
+// HTTP/2 and HTTP/1.1 only. h3 is a QUIC-only protocol and is deliberately
+// absent: offering it on a TCP socket lets a client negotiate a protocol it
+// cannot speak over that transport, which was observable before this split.
 //
-//   - HTTP/2 and HTTP/1.1 are always offered, because the Naive inbound always
-//     serves CONNECT over TCP and both are legitimate ways to carry it.
-//   - h3 is added only when this inbound actually serves UDP, so a tcp-only
-//     inbound never advertises a QUIC-only protocol on its TCP listener.
-//   - Any ALPN the operator configured explicitly is preserved.
-//
-// The order matters for the client's choice: http/1.1 is listed last so a
-// client that offers both still negotiates h2, matching how the previous
-// prepend behaved.
-func (n *Inbound) negotiatedNextProtos() []string {
+// Any ALPN the operator configured explicitly is preserved, except the three
+// values this inbound owns, so a repeated resolution cannot duplicate entries.
+func (n *Inbound) tcpNextProtos() []string {
 	protos := []string{http2.NextProtoTLS}
 	for _, configured := range n.tlsConfig.NextProtos() {
-		// Skip values this function owns, so a repeated resolution cannot
-		// duplicate entries.
 		if configured == http2.NextProtoTLS || configured == "http/1.1" || configured == http3ALPN {
 			continue
 		}
 		protos = append(protos, configured)
 	}
-	protos = append(protos, "http/1.1")
+	// http/1.1 last, so a client offering both still negotiates h2.
+	return append(protos, "http/1.1")
+}
+
+// quicNextProtos returns the ALPN list for the QUIC listener.
+//
+// h3 only. The QUIC transport for this inbound speaks HTTP/3 and nothing else, so
+// offering h2 there would let a client negotiate an HTTP/2 connection over QUIC -
+// which was also observable before this split.
+//
+// An operator-configured ALPN is NOT carried over: on this transport the only
+// meaningful value is h3, and silently advertising an unrelated protocol over
+// QUIC is the failure mode being fixed.
+func (n *Inbound) quicNextProtos() []string {
+	return []string{http3ALPN}
+}
+
+// negotiatedNextProtos reports every ALPN this inbound offers across all of its
+// transports.
+//
+// It exists for assertions and logging only. Nothing negotiates with this list:
+// each listener is configured from tcpNextProtos or quicNextProtos, because a
+// combined list is exactly what leaked h3 onto TCP.
+func (n *Inbound) negotiatedNextProtos() []string {
+	protos := n.tcpNextProtos()
 	if common.Contains(n.network, N.NetworkUDP) {
 		protos = append(protos, http3ALPN)
 	}
