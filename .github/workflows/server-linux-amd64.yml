@@ -232,15 +232,29 @@ jobs:
           go build -tags "$FULL_TAGS" -o "$RUNNER_TEMP/sing-box-full" ./cmd/sing-box
 
           cd test/jiejie/reference
+          # The CONNECT-UDP cases run against the PRODUCTION MINIMAL binary, and
+          # JIEJIE_FULL_REGISTRY_BINARY is deliberately NOT set: the minimal
+          # registry registers no endpoints, so the CONNECT-IP tests must SKIP
+          # here rather than run against a binary that cannot serve them.
+          #
+          # Setting the flag for this invocation was the first version of this
+          # step and it failed in CI exactly as it should have: the CONNECT-IP
+          # tests stopped skipping, dialled the minimal binary's UDP port (which
+          # is not listening, because the minimal registry registers no
+          # masque-server endpoint), and failed with a QUIC handshake timeout
+          # that reads like a protocol bug. The flag means "this binary has the
+          # full registry", so it must only be set for the full binary.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
-          JIEJIE_FULL_REGISTRY_BINARY=1 \
-            go test -v -count=1 -timeout 15m . 2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
+            go test -v -count=1 -timeout 15m \
+            -run 'TestReferenceMasqueGo|TestReferenceHarness' . \
+            2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
-          # And the CONNECT-IP cases against the full-registry binary, which is
+          # The CONNECT-IP cases run against the full-registry binary, which is
           # the only one that can serve them.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
           JIEJIE_FULL_REGISTRY_BINARY=1 \
-            go test -v -count=1 -timeout 15m -run 'TestReferenceConnectIP' . \
+            go test -v -count=1 -timeout 15m \
+            -run 'TestReferenceConnectIP' . \
             2>&1 | tee -a "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
       # A skipped reference test is invisible in a green workflow, which is how
@@ -251,23 +265,55 @@ jobs:
         run: |
           set -euo pipefail
           LOG=masque-reference-interop.log
-          if grep -qE '^\s*--- SKIP: TestReference' "$LOG"; then
-            echo "::error::a MASQUE reference interop test SKIPPED. The pinned"
-            echo "::error::reference clients are the only external evidence that the"
-            echo "::error::wire format is right, so a skip means interop was never"
-            echo "::error::measured. This is NOT a pass."
-            grep -E '^\s*--- SKIP: TestReference' "$LOG" || true
+
+          # Every reference test that RAN must have passed. A SKIP is expected for
+          # exactly one group - the CONNECT-IP cases under the minimal binary,
+          # whose registry has no endpoints - so the check is that no test FAILED
+          # and that the tests which must run did run.
+          #
+          # A blanket "no SKIP allowed" rule was the first version of this step and
+          # it is wrong here for the same reason it is right for the HTTP/3
+          # differential: there, a skip meant the only comparison never executed;
+          # here, one group's skip is the correct outcome for that binary, and
+          # demanding a pass would force the test to run against a binary that
+          # cannot serve it - which is precisely the CI failure this step was
+          # rewritten to stop.
+          if grep -qE '^\s*--- FAIL: TestReference' "$LOG"; then
+            echo "::error::a MASQUE reference interop test FAILED."
+            grep -E '^\s*--- FAIL: TestReference' "$LOG" || true
             exit 1
           fi
-          for TEST in TestReferenceMasqueGoConnectUDP TestReferenceConnectIPHandshakeAndAssignment; do
+
+          # These must PASS. They are the external-interoperability evidence: the
+          # pinned third-party clients completing a real round trip against
+          # sing-box.
+          for TEST in \
+            TestReferenceMasqueGoConnectUDP \
+            TestReferenceMasqueGoConnectUDPRejectedWithoutAuth \
+            TestReferenceMasqueGoRequiresServerDatagramSupport \
+            TestReferenceHarnessDetectsAStoppedServer \
+            TestReferenceConnectIPHandshakeAndAssignment \
+            TestReferenceConnectIPRejectsWithoutAuth \
+            TestReferenceConnectIPICMPEchoDifferential
+          do
             if ! grep -q -- "--- PASS: $TEST" "$LOG"; then
               echo "::error::$TEST did not report a pass; the reference client never"
               echo "::error::completed a round trip against sing-box."
               exit 1
             fi
           done
-          grep -E 'reference|interop:|assigned=' "$LOG" || true
-          echo "MASQUE reference interop executed against both binaries."
+
+          # And the positive evidence must be in the log, not merely implied by an
+          # exit status.
+          grep -E 'interop: assigned=' "$LOG" || {
+            echo "::error::the CONNECT-IP interop did not report its measured"
+            echo "::error::assignment and routes, so the comparison produced no"
+            echo "::error::observable result."
+            exit 1
+          }
+          grep -E 'interop: assigned=|PASS: TestReferenceMasqueGoConnectUDP' "$LOG" || true
+          echo "MASQUE reference interop executed: masque-go against the production"
+          echo "minimal binary, connect-ip-go against the full-registry binary."
 
       - name: Naive HTTP/3 integration (QUIC support linked)
         shell: bash
