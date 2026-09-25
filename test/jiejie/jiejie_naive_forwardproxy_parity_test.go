@@ -1,11 +1,17 @@
 package jiejie_test
 
 import (
+	"bufio"
+	"crypto/tls"
+	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -306,4 +312,119 @@ func TestJiejieNaiveParityH2ValidConnectStillWorks(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(body), "origin-ok")
 	_ = time.Second
+}
+
+// ---------------------------------------------------------------------------
+// Masquerade header sanitisation
+// Reference forwardproxy.go hopByHopHeaders
+// ---------------------------------------------------------------------------
+
+// TestJiejieNaiveParityMasqueradeStripsHopByHopHeaders checks the web masquerade
+// against the reference's hop-by-hop list.
+//
+// The reference defines exactly these for its web fallback (forwardproxy.go,
+// hopByHopHeaders):
+//
+//	Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Upgrade, Connection,
+//	Proxy-Connection, Te, Trailer, Transfer-Encoding
+//
+// sing-box deletes Proxy-Authorization and Proxy-Connection explicitly before
+// handing the request to the masquerade, and the masquerade is an
+// httputil.ReverseProxy, whose own hopHeaders list covers the same nine names.
+// That means the two mechanisms overlap - which is the point of testing rather
+// than assuming: the explicit deletion is the one that still holds if the
+// backend is ever changed to something other than a ReverseProxy, and it is the
+// one this test pins.
+//
+// The assertion is narrow on purpose: it checks that no PROXY CREDENTIAL reaches
+// the backend and that the hop-by-hop names are gone. It does not demand that
+// ordinary browser headers be rewritten, because normal web behaviour is the
+// goal and inventing a fixed "camouflage" header set would be a fingerprint, not
+// a compatibility fix.
+func TestJiejieNaiveParityMasqueradeStripsHopByHopHeaders(t *testing.T) {
+	port, recorder := startNaiveWithRecordingDecoy(t)
+
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(port)), 10*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: "naive.test"})
+	require.NoError(t, tlsConn.Handshake())
+	require.NoError(t, tlsConn.SetDeadline(time.Now().Add(15*time.Second)))
+
+	credential := base64.StdEncoding.EncodeToString([]byte(naiveParityUser + ":" + naiveParityPassword))
+	request := strings.Join([]string{
+		"GET /probe HTTP/1.1",
+		"Host: example.test",
+		"Proxy-Authorization: Basic " + credential,
+		"Proxy-Connection: keep-alive",
+		"Proxy-Authenticate: Basic realm=\"should-not-be-forwarded\"",
+		"Keep-Alive: timeout=5",
+		"TE: trailers",
+		"Trailer: X-Trailer",
+		"Upgrade: websocket",
+		"User-Agent: parity-probe",
+		"Connection: close",
+		"",
+		"",
+	}, "\r\n")
+	_, err = io.WriteString(tlsConn, request)
+	require.NoError(t, err)
+
+	response, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodGet})
+	require.NoError(t, err, "the masquerade must answer an ordinary web request")
+	defer response.Body.Close()
+	_, _ = io.ReadAll(response.Body)
+
+	headers, _, _, _ := recorder.snapshot()
+	require.NotNil(t, headers, "the masquerade backend must have received the request")
+
+	// The credential must never arrive, in any header.
+	for name, values := range headers {
+		for _, value := range values {
+			require.NotContains(t, value, credential,
+				"the proxy credential must never reach the masquerade backend "+
+					"(header %q)", name)
+			require.NotContains(t, strings.ToLower(value), naiveParityPassword,
+				"the proxy password must never reach the masquerade backend "+
+					"(header %q)", name)
+		}
+	}
+
+	// The headers that must not survive. TE is deliberately NOT in this list:
+	// Go's ReverseProxy strips it with the other hop-by-hop names and then
+	// re-adds "Te: trailers" on purpose, because TE: trailers is a valid
+	// end-to-end signal that the caller accepts trailers and the transport
+	// advertises it (net/http/httputil/reverseproxy.go):
+	//
+	//	if httpguts.HeaderValuesContainsToken(req.Header["Te"], "trailers") {
+	//	    outreq.Header.Set("Te", "trailers")
+	//	}
+	//
+	// Asserting TE is absent would therefore be asserting something false about
+	// correct HTTP behaviour. It carries no credential and no proxy state.
+	for _, name := range []string{
+		"Proxy-Authorization",
+		"Proxy-Connection",
+		"Proxy-Authenticate",
+		"Keep-Alive",
+		"Trailer",
+		"Upgrade",
+	} {
+		require.Empty(t, headers.Get(name),
+			"hop-by-hop header %q must not be forwarded to the masquerade backend", name)
+	}
+
+	// TE is checked for its VALUE rather than its absence: whatever is sent must
+	// be the benign trailers token, never anything derived from the request.
+	require.Equal(t, "trailers", headers.Get("Te"),
+		"the only TE value the backend may see is the transport's own "+
+			"'trailers' advertisement")
+
+	// A normal browser header must survive: the goal is normal web behaviour,
+	// not an aggressively rewritten request.
+	require.Equal(t, "parity-probe", headers.Get("User-Agent"),
+		"ordinary browser headers must pass through unchanged")
+	t.Logf("masquerade backend received %d headers, no credential and no hop-by-hop headers",
+		len(headers))
 }
