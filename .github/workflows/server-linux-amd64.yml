@@ -72,8 +72,8 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           echo "production tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./include
-          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./include
+          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
 
       # ---------------------------------------------------------------------
       # Upstream compatibility. The full upstream tag set must keep building and
@@ -86,8 +86,8 @@ jobs:
           set -euo pipefail
           TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
           echo "upstream tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./include
-          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./include
+          go vet -tags "$TAGS" ./option ./transport/http ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go test -tags "$TAGS" ./option ./transport/http ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
 
       - name: Race tests for new concurrent state (production / minimal tags)
         shell: bash
@@ -96,7 +96,9 @@ jobs:
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
           # ./route carries the per-datagram target guard, which runs on the
           # UDP data path for every non-connect UoT session.
-          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./protocol/naive ./route ./option
+          # ./common/tls carries the transport-scoped ALPN views, whose whole point
+          # is that two transports share one lifecycle without racing.
+          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./protocol/naive ./route ./option ./common/tls
 
   production-minimal-integration:
     runs-on: ubuntu-latest
@@ -198,6 +200,14 @@ jobs:
           go test -tags "$H3_TAGS" -v -count=1 -timeout 25m \
             -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN|TestJiejieNaiveTCPAndUDPALPN|TestJiejieNaiveH3DifferentialAgainstReference' . \
             2>&1 | tee ../../naive-h3-integration.log
+          # The protocol/naive/quic unit tests, including the congestion-control
+          # validation and the QUIC config assertions. They need QUIC linked, so
+          # this step is the only place they can run; without this they would
+          # exist and never execute.
+          echo ""
+          echo "=== protocol/naive/quic unit tests (QUIC linked) ==="
+          go test -tags "$H3_TAGS" -v -count=1 -timeout 10m ./protocol/naive/quic/ \
+            2>&1 | tee -a ../../naive-h3-integration.log
 
       # The HTTP/3 differential must have actually compared something. A SKIP
       # produces a green workflow, so the result is checked explicitly rather
