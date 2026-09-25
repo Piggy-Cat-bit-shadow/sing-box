@@ -298,6 +298,11 @@ func (s *http3RequestDatagramStream) Close() error {
 	return s.stream.Close()
 }
 
+// DatagramsEnabled reports whether the peer negotiated HTTP Datagrams.
+func (s *http3RequestDatagramStream) DatagramsEnabled() bool {
+	return s.datagramsEnabled
+}
+
 func (s *http3RequestDatagramStream) SendDatagram(payload []byte) error {
 	if !s.datagramsEnabled {
 		return ErrDatagramUnsupported

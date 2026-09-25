@@ -227,10 +227,38 @@ func (c *capsuleConn) Upstream() any {
 
 var _ N.PacketConn = (*capsuleConn)(nil)
 
+// DatagramStream is the HTTP/3 request stream surface a MASQUE session uses.
+//
+// DatagramsEnabled makes the negotiated capability explicit. The stream TYPE
+// cannot answer that question: the same concrete type satisfies every method here
+// whether or not the peer negotiated HTTP Datagrams, so a type assertion says
+// nothing about whether datagrams can actually flow.
+//
+// WHAT THIS IS NOT: it is not a fix for a demonstrated defect. An earlier version
+// of this comment claimed that a session which inferred the capability from the
+// type would start a receive loop that consumed bytes from the capsule reader and
+// could cancel the session. That claim was measured and is FALSE:
+//
+//   - the server-side implementation is quic-go's
+//     http3.StateTrackingStream.ReceiveDatagram, which reads from a DEDICATED
+//     datagram queue and blocks on a signal when empty. It does not touch the
+//     HTTP/3 DATA stream that the capsule reader owns. (The method that does read
+//     from the stream is Stream.ReceiveDatagram in stream.go, a different type,
+//     which is what the mistaken claim was based on.)
+//   - the CONNECT-IP capsule-fallback test passes with and without this change,
+//     and an active fallback tunnel shows an identical goroutine count either way
+//     (base 2, during 9).
+//
+// So this is a legibility and correctness-of-intent change: the session now decides
+// from the peer's SETTINGS rather than from a type, and a reader no longer has to
+// reason about quic-go internals to know whether datagrams are usable.
 type DatagramStream interface {
 	io.ReadWriteCloser
 	SendDatagram(payload []byte) error
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
+	// DatagramsEnabled reports whether the PEER negotiated HTTP Datagrams, i.e.
+	// whether SendDatagram can succeed and ReceiveDatagram can ever deliver.
+	DatagramsEnabled() bool
 }
 
 var (

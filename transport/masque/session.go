@@ -31,9 +31,21 @@ type sessionHandler interface {
 }
 
 type session struct {
-	ctx         context.Context
-	cancel      context.CancelCauseFunc
-	stream      io.ReadWriteCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	stream io.ReadWriteCloser
+	// datagrams is the datagram-capable view of the stream, or nil when the peer
+	// did not negotiate HTTP Datagrams.
+	//
+	// The write path uses nil to mean "write a capsule instead", which is why the
+	// distinction is kept here rather than recovered from SendDatagram's error.
+	//
+	// This is NOT a fix for a demonstrated bug. Clearing it does not make the
+	// capsule fallback fail and does not leak a goroutine (measured: the fallback
+	// test passes either way, and an active tunnel shows 9 goroutines both ways).
+	// The reason is that the server-side ReceiveDatagram reads a dedicated datagram
+	// queue rather than the DATA stream, so a datagram loop with no datagrams just
+	// blocks harmlessly. See the note on DatagramStream for the full measurement.
 	datagrams   transportHTTP.DatagramStream
 	reader      *std_bufio.Reader
 	handler     sessionHandler
@@ -41,9 +53,23 @@ type session struct {
 	writeAccess sync.Mutex
 }
 
+// newSession builds a session over a MASQUE request stream.
+//
+// The datagram view is taken only when the peer actually negotiated HTTP
+// Datagrams, so the session records the capability rather than re-deriving it from
+// a type assertion that cannot express it.
+//
+// A stream that does not report the capability at all is treated as incapable,
+// which is the safe default: the capsule path always works for both protocols.
+//
+// This is intent-clarifying rather than defect-fixing; see DatagramStream for the
+// measurement that distinguishes the two.
 func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionHandler, queued bool) *session {
 	sessionCtx, cancel := context.WithCancelCause(ctx)
-	datagrams, _ := stream.(transportHTTP.DatagramStream)
+	var datagrams transportHTTP.DatagramStream
+	if capable, isDatagramStream := stream.(transportHTTP.DatagramStream); isDatagramStream && capable.DatagramsEnabled() {
+		datagrams = capable
+	}
 	current := &session{
 		ctx:       sessionCtx,
 		cancel:    cancel,

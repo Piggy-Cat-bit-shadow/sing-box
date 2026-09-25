@@ -187,6 +187,16 @@ type datagramStream struct {
 	datagramsEnabled bool
 }
 
+// DatagramsEnabled reports whether the peer negotiated HTTP Datagrams.
+//
+// This is the answer the session must use instead of a type assertion: the stream
+// implements the interface either way, so the type says nothing about the
+// capability. Reading it from the peer's SETTINGS is what makes the fallback
+// decision correct.
+func (s *datagramStream) DatagramsEnabled() bool {
+	return s.datagramsEnabled
+}
+
 func (s *datagramStream) SendDatagram(payload []byte) error {
 	if !s.datagramsEnabled {
 		return ErrDatagramUnsupported
