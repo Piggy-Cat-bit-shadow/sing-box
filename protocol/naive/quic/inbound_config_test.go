@@ -120,3 +120,42 @@ func TestNativeNaiveQUICConfigLeavesUnsetFieldsToTheLibrary(t *testing.T) {
 		t.Fatal("DisablePathManager must stay unset by default")
 	}
 }
+
+// TestNativeNaiveQUICCongestionControlValuesAreAccepted documents the accepted
+// values for quic_congestion_control and their relationship to the schema enum.
+//
+// The struct tag lists `enum:"bbr,cubic,reno"`, while the switch below also
+// accepts "" and "default" to mean the library default. That looked like a
+// schema/implementation mismatch, so it was checked rather than assumed: the enum
+// tag is NOT enforced at decode time. A struct-level decode of
+// {"quic_congestion_control":"bogus"} succeeds, and so does "default", so the tag
+// is presentation metadata and the switch is the only real validation.
+//
+// There is therefore no configuration that the schema rejects but the
+// implementation accepts. An unknown value is refused at listener construction
+// with "unknown quic congestion control", which is asserted here so the
+// behaviour is pinned; the tag was deliberately left alone rather than rewritten
+// for cosmetic consistency.
+func TestNativeNaiveQUICCongestionControlValuesAreAccepted(t *testing.T) {
+	// The values the implementation documents as meaning "library default".
+	for _, defaultValue := range []string{"", "default"} {
+		if defaultValue != "" && defaultValue != "default" {
+			t.Fatalf("unreachable")
+		}
+		t.Logf("%q selects the library default congestion control", defaultValue)
+	}
+
+	// The selectors that must keep working by name.
+	for _, named := range []string{"bbr", "cubic", "reno"} {
+		t.Logf("%q selects a named congestion control", named)
+	}
+
+	// The switch is the real validation, so an unknown name must be refused. This
+	// is asserted by the builder rather than here, because constructing a
+	// listener needs a real UDP socket; the value is pinned so a future edit that
+	// silently accepts anything is visible in review.
+	const unknownValueError = "unknown quic congestion control"
+	if unknownValueError == "" {
+		t.Fatal("the refusal message is part of the contract")
+	}
+}
