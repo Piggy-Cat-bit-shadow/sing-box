@@ -53,8 +53,6 @@ const (
 // self-hosted web path.
 type selfHostedWebEnv struct {
 	port uint16
-	// webIngress is the isolated loopback Web-only ingress the rule rewrites to.
-	webIngress *countingOrigin
 	// frontDoor stands in for the public TCP/443 Nginx Stream entry point. It must
 	// receive NOTHING.
 	frontDoor *countingOrigin
@@ -136,7 +134,6 @@ func startSelfHostedWebInstance(t *testing.T, selfAddress net.IP, webIngressPort
 
 	return &selfHostedWebEnv{
 		port:          port,
-		webIngress:    startCountingTCPOrigin(t),
 		frontDoor:     startCountingTCPOrigin(t),
 		proxyListener: startCountingTCPOrigin(t),
 	}
@@ -448,7 +445,7 @@ func TestJiejieNaiveSelfHostedWebEndToEndTLS(t *testing.T) {
 	t.Cleanup(func() { _ = ingressServer.Close() })
 
 	// The instance must name that port; build it with the real listener's port.
-	env := startSelfHostedWebInstanceOnPort(t, selfAddress, ingressPort)
+	env := startSelfHostedWebInstance(t, selfAddress, ingressPort)
 
 	conn, response, err := connectThroughNaive(t, env.port, "push."+selfHostedSuffix+":443")
 	require.NoError(t, err)
@@ -497,59 +494,6 @@ func loadTestCertificate(certPath, keyPath string) (*tls.Config, error) {
 		return nil, err
 	}
 	return &tls.Config{Certificates: []tls.Certificate{certificate}}, nil
-}
-
-// startSelfHostedWebInstanceOnPort is startSelfHostedWebInstance with an explicit
-// ingress port, so a real HTTPS listener can be named in the rule.
-func startSelfHostedWebInstanceOnPort(t *testing.T, selfAddress net.IP, ingressPort uint16) *selfHostedWebEnv {
-	t.Helper()
-	requireFullNaiveRegistry(t)
-	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
-	port := reserveTCPPort(t)
-	selfCIDR := selfAddress.String() + "/32"
-
-	_, dnsPort := startScriptedDNS(t, map[string][]net.IP{
-		"push." + selfHostedSuffix:  {selfAddress},
-		"files." + selfHostedSuffix: {selfAddress},
-		proxyIngressRIRI:            {selfAddress},
-		proxyIngressAPI:             {selfAddress},
-		"evil.test":                 {selfAddress},
-	})
-
-	config := `{
-		"log": {"level": "debug"},
-		"dns": {
-			"servers": [{"tag": "scripted", "type": "udp", "server": "127.0.0.1", "server_port": ` + dnsPort + `}],
-			"final": "scripted",
-			"strategy": "ipv4_only",
-			"independent_cache": true
-		},
-		"inbounds": [{
-			"type": "naive",
-			"tag": "naive-in",
-			"listen": "127.0.0.1",
-			"listen_port": ` + strconv.Itoa(int(port)) + `,
-			"network": "tcp",
-			"users": [{"username": "` + naiveTestUser + `", "password": "` + naiveTestPassword + `"}],
-			"tls": {"enabled": true, "server_name": "naive.test", "certificate_path": "` + certPem + `", "key_path": "` + keyPem + `"}
-		}],
-		"outbounds": [{"type": "direct", "tag": "direct", "domain_resolver": "scripted"}],
-		"route": {
-			"rules": [
-				{"inbound": ["naive-in"], "network": ["tcp"], "domain": ["` + proxyIngressRIRI + `", "` + proxyIngressAPI + `"], "port": [443], "action": "reject"},
-				{"inbound": ["naive-in"], "network": ["tcp"], "domain_suffix": ["` + selfHostedSuffix + `"], "port": [443], "action": "route", "outbound": "direct", "override_address": "127.0.0.1", "override_port": ` + strconv.Itoa(int(ingressPort)) + `},
-				{"inbound": ["naive-in"], "action": "resolve"},
-				{"inbound": ["naive-in"], "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "0.0.0.0/8", "` + selfCIDR + `"], "action": "reject"}
-			],
-			"final": "direct"
-		}
-	}`
-
-	var options option.Options
-	require.NoError(t, json.UnmarshalContext(globalCtx, []byte(config), &options))
-	startInstance(t, options)
-
-	return &selfHostedWebEnv{port: port}
 }
 
 // TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction pins the shipped rule
