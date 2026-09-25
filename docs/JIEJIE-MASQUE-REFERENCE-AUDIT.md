@@ -27,11 +27,23 @@ show.
 Reference sources are pinned by commit so the comparison cannot drift. Both were
 cloned at these revisions during this audit:
 
-| Reference | Commit |
-| --- | --- |
-| quic-go/masque-go | `c1cf0e4dd6439aea94d5491b27439a4736f00246` |
-| quic-go/connect-ip-go | `fdd945e3d6009b3cee1b1a66493776d315727549` |
-| Google QUICHE | NOT-TESTED (see below) |
+| Reference | Commit | Module pin actually used |
+| --- | --- | --- |
+| quic-go/masque-go | `c1cf0e4dd6439aea94d5491b27439a4736f00246` | `v0.6.0` |
+| quic-go/connect-ip-go | `fdd945e3d6009b3cee1b1a66493776d315727549` | `v0.4.1-0.20260924175820-fdd945e3d600` |
+| Google QUICHE | NOT-TESTED (see below) | - |
+
+The two pins are not the same kind of pin, and the difference was measured rather
+than assumed:
+
+- For masque-go the audited commit **is** the `v0.6.0` tag. `go list -m -json
+  github.com/quic-go/masque-go@c1cf0e4dd…` reports version `v0.6.0` with
+  `Origin.Ref refs/tags/v0.6.0`, so requiring the tag pins that exact revision and
+  no pseudo-version is needed.
+- For connect-ip-go the audited commit is untagged, so it is pinned through a
+  `replace` to its pseudo-version. A plain `require` was tried first and `go mod
+  tidy` silently replaced it with `v0.4.0`, which is **not** the audited revision;
+  `replace` cannot be dropped that way.
 
 Google QUICHE was **not** built or run. No interop result is claimed for it.
 
@@ -95,24 +107,71 @@ unescaping.
   zero-length unknown capsule) returns an error rather than panicking, hanging or
   allocating without bound.
 
+## Verified against the pinned references
+
+These are the external-interoperability results. "External" means the client on
+the wire is the pinned third-party library, not sing-box's own client: running
+sing-box against itself would only prove that sing-box agrees with sing-box.
+
+The tests live in `test/jiejie/reference`, a **separate Go module**. Verified
+that neither package appears in the production dependency graph
+(`go list -tags $PRODUCTION_TAGS -deps ./cmd/sing-box` names neither
+`quic-go/masque-go` nor `quic-go/connect-ip-go`), and that neither the root
+`go.mod` nor `test/go.mod` changed.
+
+| Case | Reference client | Result |
+| --- | --- | --- |
+| CONNECT-UDP over HTTP/3, real datagram to a loopback origin and the origin's reply read back | masque-go | PASS |
+| CONNECT-UDP with no credentials is refused | masque-go | PASS |
+| HTTP/3 settings carry Extended CONNECT and datagram support | masque-go | PASS |
+| CONNECT-IP tunnel established; ADDRESS_ASSIGN and ROUTE_ADVERTISEMENT parsed | connect-ip-go | PASS |
+| CONNECT-IP with no credentials is refused | connect-ip-go | PASS |
+| CONNECT-IP carries a real IPv4 + ICMP packet and returns the matching answer | connect-ip-go | PASS |
+
+Measured values from the CONNECT-IP run: the client is assigned `198.18.0.2/32`
+and the server advertises `198.18.0.0/24` with protocol 0.
+
+### A measured behaviour, recorded rather than assumed
+
+sing-box's internal IP stack answers an echo request sent to the tunnel gateway by
+**echoing the request back** (ICMP type 8, the request type) rather than emitting a
+type-0 echo reply. The source address, the echo identifier, the sequence number and
+the payload are all the ones the test sent, so the tunnel is demonstrably
+bidirectional. The test pins the observed type rather than accepting any ICMP: a
+destination-unreachable or packet-too-big answer carries no echo identifier and
+still fails.
+
+### The interop tests fail when the implementation is broken
+
+A green test that cannot fail is not evidence, so the harness was checked against
+an injected regression: a one-line off-by-one added to the CONNECT-UDP target port
+in `transport/http/connect_udp.go`. The masque-go interop failed on it and passed
+again once the source was restored. Pointing the harness at a binary that is not a
+sing-box server also fails rather than passing.
+
+### CONNECT-IP needs the full registry
+
+`masque-server` is registered only by `include/registry.go`; the production minimal
+registry registers **no** endpoints. A CONNECT-IP test built against the production
+binary therefore fails with a QUIC handshake timeout that reads like a protocol
+bug, so the fixture requires a full-registry binary and reports NOT-TESTED with a
+reason otherwise. It also declares `masque-server` as an **endpoint**: the
+configuration decoder rejects it as an inbound ("unknown inbound type:
+masque-server"), which is correct rather than something to work around.
+
 ## Remaining NOT-TESTED
 
-Listed so the gaps are not mistaken for coverage. None of these has a passing
-test, and none is claimed as PASS:
+Listed so the gaps are not mistaken for coverage. None of these has a passing test,
+and none is claimed as PASS:
 
-- **CONNECT-UDP differential against masque-go.** The path corpus and the capsule
-  tests are in-process; no cross-implementation run was performed.
-- **CONNECT-IP against connect-ip-go.** ADDRESS_ASSIGN, ADDRESS_REQUEST,
-  ROUTE_ADVERTISEMENT semantics, ICMP, MTU and hop-limit handling were not
-  differentially tested.
 - **H3 DATAGRAM to Capsule fallback end to end.** The fallback exists in
-  `session.writePacket`; no test drives a peer that disables DATAGRAM and
-  observes the payload arriving as a capsule.
+  `session.writePacket`; no test drives a peer that disables DATAGRAM and observes
+  the payload arriving as a capsule.
+- **DATAGRAM context IDs other than 0, and datagram size boundaries.**
 - **RFC 9931 HTTP/1.1 optimistic data.** No request-smuggling matrix was run.
 - **Proxy-Status reporting.** Not implemented and not tested.
-- **Cross-session isolation, resource churn, send-queue backpressure, capsule
-  write backpressure, shutdown with active tunnels.** Audited by reading, not
-  tested.
+- **Cross-session isolation, resource churn, send-queue backpressure, capsule write
+  backpressure, shutdown with active tunnels.** Audited by reading, not tested.
 - **QUIC migration behaviour and source identity after a path change.** The path
   manager is now enabled by default, so this matters more than before and is
   unmeasured.
@@ -121,6 +180,11 @@ test, and none is claimed as PASS:
 - **Fuzz targets for the capsule parser, the path parser and the IP packet
   parser.**
 - **Google QUICHE interop.**
+
+Two gaps that were listed here previously are now closed and have been removed from
+this list: the CONNECT-UDP differential against masque-go, and CONNECT-IP against
+connect-ip-go. Both are recorded in the table above with the reference client that
+was actually driven.
 
 ## Out of scope
 
