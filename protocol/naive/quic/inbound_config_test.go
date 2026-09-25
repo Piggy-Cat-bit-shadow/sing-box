@@ -3,10 +3,14 @@
 package quic
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json"
 )
 
 // The Native Naive HTTP/3 listener must not accept 0-RTT.
@@ -122,42 +126,109 @@ func TestNativeNaiveQUICConfigLeavesUnsetFieldsToTheLibrary(t *testing.T) {
 	}
 }
 
-// TestNativeNaiveQUICCongestionControlValuesAreAccepted documents the accepted
-// values for quic_congestion_control and their relationship to the schema enum.
+// TestNativeNaiveCongestionControlAcceptsDocumentedValues asserts the values the
+// production resolver accepts.
 //
-// The struct tag lists `enum:"bbr,cubic,reno"`, while the switch below also
-// accepts "" and "default" to mean the library default. That looked like a
-// schema/implementation mismatch, so it was checked rather than assumed: the enum
-// tag is NOT enforced at decode time. A struct-level decode of
-// {"quic_congestion_control":"bogus"} succeeds, and so does "default", so the tag
-// is presentation metadata and the switch is the only real validation.
+// It calls newNaiveCongestionControl, which is the SAME function the listener
+// constructor calls, so there is no second copy of the validation in this test
+// that could drift from production.
+func TestNativeNaiveCongestionControlAcceptsDocumentedValues(t *testing.T) {
+	for _, name := range []string{"", "default", "bbr", "cubic", "reno"} {
+		t.Run("value="+name, func(t *testing.T) {
+			sender, err := newNaiveCongestionControl(name, time.Now)
+			if err != nil {
+				t.Fatalf("the production resolver refused %q, which is documented "+
+					"as accepted: %v", name, err)
+			}
+			// An unset value and the explicit "default" must both mean "keep
+			// quic-go's sender", which the constructor represents as nil. The
+			// named values must produce a sender.
+			if name == "" || name == "default" {
+				if sender != nil {
+					t.Fatalf("%q must select the library default (nil sender), got a "+
+						"sender factory", name)
+				}
+				return
+			}
+			if sender == nil {
+				t.Fatalf("%q must produce a sender factory, got nil", name)
+			}
+		})
+	}
+}
+
+// TestNativeNaiveCongestionControlRejectsUnknownValues is the real validation
+// test, replacing an assertion that compared a string constant to "".
 //
-// There is therefore no configuration that the schema rejects but the
-// implementation accepts. An unknown value is refused at listener construction
-// with "unknown quic congestion control", which is asserted here so the
-// behaviour is pinned; the tag was deliberately left alone rather than rewritten
-// for cosmetic consistency.
-func TestNativeNaiveQUICCongestionControlValuesAreAccepted(t *testing.T) {
-	// The values the implementation documents as meaning "library default".
-	for _, defaultValue := range []string{"", "default"} {
-		if defaultValue != "" && defaultValue != "default" {
-			t.Fatalf("unreachable")
+// The previous version could not fail: it declared the message and checked it was
+// not empty, so a production change to `default: accept anything` would have left
+// it green. This drives the production resolver and requires an actual error.
+func TestNativeNaiveCongestionControlRejectsUnknownValues(t *testing.T) {
+	// Case and whitespace variants are included deliberately: matching is exact,
+	// so "BBR" and " bbr" are configuration errors rather than being silently
+	// normalised into a working value.
+	for _, name := range []string{
+		"bogus", "BBR", "CUBIC", "Reno", " bbr", "bbr ", "none", "auto", "0",
+		"bbr2", "BBRv2",
+	} {
+		t.Run("value="+name, func(t *testing.T) {
+			sender, err := newNaiveCongestionControl(name, time.Now)
+			if err == nil {
+				t.Fatalf("the production resolver accepted %q; an unrecognised "+
+					"congestion control must be refused so a typo does not look "+
+					"like it worked", name)
+			}
+			if sender != nil {
+				t.Fatalf("a rejected value must not also produce a sender (%q)", name)
+			}
+			if !strings.Contains(err.Error(), "unknown quic congestion control") {
+				t.Fatalf("the error must name the problem so it is actionable, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestNativeNaiveCongestionControlDecodeThenValidate records the full chain.
+//
+// The struct tag lists enum:"bbr,cubic,reno", which is presentation metadata: it is
+// NOT enforced at decode time. A JSON document carrying "bogus" therefore decodes
+// successfully and is refused later by the resolver. That sequence is asserted
+// here so the division of responsibility is recorded rather than assumed - the
+// schema describes the values, the resolver is what enforces them.
+func TestNativeNaiveCongestionControlDecodeThenValidate(t *testing.T) {
+	var options option.NaiveInboundOptions
+	raw := []byte(`{"listen":"127.0.0.1","listen_port":1,` +
+		`"users":[{"username":"u","password":"p"}],` +
+		`"quic_congestion_control":"bogus"}`)
+
+	if err := json.UnmarshalContext(context.Background(), raw, &options); err != nil {
+		t.Fatalf("an unknown value must DECODE successfully, because the enum tag "+
+			"is not a decode-time validator: %v", err)
+	}
+	if options.QUICCongestionControl != "bogus" {
+		t.Fatalf("the decoded value is %q, want the raw %q",
+			options.QUICCongestionControl, "bogus")
+	}
+
+	// And the production validation must then refuse it.
+	if _, err := newNaiveCongestionControl(options.QUICCongestionControl, time.Now); err == nil {
+		t.Fatal("a value that decodes successfully must still be refused by the " +
+			"production validation; otherwise an unknown congestion control would " +
+			"reach the listener")
+	}
+
+	// The accepted set must decode too, so the two halves agree on the values.
+	for _, accepted := range []string{"", "default", "bbr", "cubic", "reno"} {
+		var decoded option.NaiveInboundOptions
+		document := []byte(`{"listen":"127.0.0.1","listen_port":1,` +
+			`"users":[{"username":"u","password":"p"}],` +
+			`"quic_congestion_control":"` + accepted + `"}`)
+		if err := json.UnmarshalContext(context.Background(), document, &decoded); err != nil {
+			t.Fatalf("%q must decode: %v", accepted, err)
 		}
-		t.Logf("%q selects the library default congestion control", defaultValue)
-	}
-
-	// The selectors that must keep working by name.
-	for _, named := range []string{"bbr", "cubic", "reno"} {
-		t.Logf("%q selects a named congestion control", named)
-	}
-
-	// The switch is the real validation, so an unknown name must be refused. This
-	// is asserted by the builder rather than here, because constructing a
-	// listener needs a real UDP socket; the value is pinned so a future edit that
-	// silently accepts anything is visible in review.
-	const unknownValueError = "unknown quic congestion control"
-	if unknownValueError == "" {
-		t.Fatal("the refusal message is part of the contract")
+		if _, err := newNaiveCongestionControl(decoded.QUICCongestionControl, time.Now); err != nil {
+			t.Fatalf("%q decoded but was refused by the resolver: %v", accepted, err)
+		}
 	}
 }
 

@@ -107,6 +107,52 @@ func nativeNaiveQUICConfig(options option.NaiveInboundOptions) *quic.Config {
 	}
 }
 
+// newNaiveCongestionControl resolves quic_congestion_control to a sender factory.
+//
+// It is a separate function so the VALUE VALIDATION can be tested without a UDP
+// socket: the listener constructor needs a real socket, so a test that wanted to
+// check "bogus is refused" through the constructor would have to bind a port. The
+// constructor and the test both call this, so there is one validation and no
+// second copy in the test that could drift from it.
+//
+// A nil return with a nil error means "use the library default", which is what an
+// unset value and the explicit "default" both select. The reference sets neither a
+// congestion control nor a path manager, so an unset value staying with quic-go is
+// the reference-like behaviour; BBR is a production choice and must be named.
+//
+// Matching is exact. No whitespace trimming and no case folding: an unrecognised
+// value is a configuration error the operator should see, and silently accepting
+// "BBR" or " bbr" would make a typo look like it worked.
+func newNaiveCongestionControl(name string, timeFunc func() time.Time) (func(conn *quic.Conn) congestion.CongestionControl, error) {
+	switch name {
+	case "", "default":
+		// nil leaves quic-go's own default sender in place.
+		return nil, nil
+	case "bbr":
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard)
+		}, nil
+	case "cubic":
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta1.NewCubicSender(
+				congestion_meta1.DefaultClock{TimeFunc: timeFunc},
+				conn.InitialPacketSize(),
+				false,
+			)
+		}, nil
+	case "reno":
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta1.NewCubicSender(
+				congestion_meta1.DefaultClock{TimeFunc: timeFunc},
+				conn.InitialPacketSize(),
+				true,
+			)
+		}, nil
+	default:
+		return nil, E.New("unknown quic congestion control: ", name)
+	}
+}
+
 func init() {
 	naive.ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.NaiveInboundOptions) (io.Closer, error) {
 		err := qtls.ConfigureHTTP3(tlsConfig)
@@ -130,45 +176,18 @@ func init() {
 			return nil, err
 		}
 
-		var congestionControl func(conn *quic.Conn) congestion.CongestionControl
 		timeFunc := ntp.TimeFuncFromContext(ctx)
 		if timeFunc == nil {
 			timeFunc = time.Now
 		}
-		// Unset means "use the library default", which is CUBIC in quic-go and
-		// is therefore what the reference gets. The fork's BBR preference is a
-		// performance choice, so it is opted into by name rather than being what
-		// an unset field silently selects.
-		//
-		// This is why an empty value no longer maps to BBR: a protocol default
-		// that silently differs from the reference is exactly the kind of
-		// difference this audit exists to remove.
-		switch options.QUICCongestionControl {
-		case "", "default":
-			// nil leaves quic-go's own default sender in place.
-			congestionControl = nil
-		case "bbr":
-			congestionControl = func(conn *quic.Conn) congestion.CongestionControl {
-				return congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard)
-			}
-		case "cubic":
-			congestionControl = func(conn *quic.Conn) congestion.CongestionControl {
-				return congestion_meta1.NewCubicSender(
-					congestion_meta1.DefaultClock{TimeFunc: timeFunc},
-					conn.InitialPacketSize(),
-					false,
-				)
-			}
-		case "reno":
-			congestionControl = func(conn *quic.Conn) congestion.CongestionControl {
-				return congestion_meta1.NewCubicSender(
-					congestion_meta1.DefaultClock{TimeFunc: timeFunc},
-					conn.InitialPacketSize(),
-					true,
-				)
-			}
-		default:
-			return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
+		// Unset means "use the library default", which is CUBIC in quic-go and is
+		// therefore what the reference gets. The fork's BBR preference is a
+		// performance choice, opted into by name rather than being what an unset
+		// field silently selects. The resolution and its validation live in
+		// newNaiveCongestionControl so they can be tested without a socket.
+		congestionControl, err := newNaiveCongestionControl(options.QUICCongestionControl, timeFunc)
+		if err != nil {
+			return nil, err
 		}
 
 		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, nativeNaiveQUICConfig(options))
