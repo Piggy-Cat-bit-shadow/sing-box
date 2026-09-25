@@ -213,6 +213,40 @@
         "inbound": [
           "naive-in"
         ],
+        "network": [
+          "tcp"
+        ],
+        "domain": [
+          "riri.zhuzhu.jiejie12131.top",
+          "api.zhuzhu.jiejie12131.top"
+        ],
+        "port": [
+          443
+        ],
+        "action": "reject"
+      },
+      {
+        "inbound": [
+          "naive-in"
+        ],
+        "network": [
+          "tcp"
+        ],
+        "domain_suffix": [
+          "zhuzhu.jiejie12131.top"
+        ],
+        "port": [
+          443
+        ],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1",
+        "override_port": 28439
+      },
+      {
+        "inbound": [
+          "naive-in"
+        ],
         "action": "resolve"
       },
       {

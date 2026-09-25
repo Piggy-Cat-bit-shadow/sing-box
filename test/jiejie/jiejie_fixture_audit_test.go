@@ -56,18 +56,35 @@ type productionFixture struct {
 	} `json:"outbounds"`
 
 	Route struct {
-		Rules []struct {
-			Outbound string          `json:"outbound"`
-			User     []string        `json:"user"`
-			Network  []string        `json:"network"`
-			Action   string          `json:"action"`
-			Strategy string          `json:"strategy"`
-			Type     string          `json:"type"`
-			RuleSet  json.RawMessage `json:"rule_set"`
-		} `json:"rules"`
-		Final    string          `json:"final"`
-		RuleSets json.RawMessage `json:"rule_set"`
+		Rules []productionRouteRule `json:"rules"`
+		Final string                `json:"final"`
+		// RuleSets and RawRules keep the raw rule list available for assertions on
+		// options this struct does not model (override_address, override_port,
+		// port, domain, domain_suffix). Adding typed fields one at a time would
+		// mean a test cannot check a new rule option until this struct grows it,
+		// which is exactly the kind of gap that lets a fixture drift unnoticed.
+		RuleSets json.RawMessage   `json:"rule_set"`
+		RawRules []json.RawMessage `json:"-"`
 	} `json:"route"`
+}
+
+// productionRouteRule models the route options this fork's fixture uses.
+type productionRouteRule struct {
+	Outbound        string          `json:"outbound"`
+	User            []string        `json:"user"`
+	Inbound         []string        `json:"inbound"`
+	Network         []string        `json:"network"`
+	Domain          []string        `json:"domain"`
+	DomainSuffix    []string        `json:"domain_suffix"`
+	IPCIDR          []string        `json:"ip_cidr"`
+	Port            []uint16        `json:"port"`
+	Action          string          `json:"action"`
+	Strategy        string          `json:"strategy"`
+	Type            string          `json:"type"`
+	OverrideAddress string          `json:"override_address"`
+	OverridePort    uint16          `json:"override_port"`
+	IPIsPrivate     bool            `json:"ip_is_private"`
+	RuleSet         json.RawMessage `json:"rule_set"`
 }
 
 func loadProductionFixture(t *testing.T) (*productionFixture, string) {
@@ -81,6 +98,19 @@ func loadProductionFixture(t *testing.T) (*productionFixture, string) {
 	if err = json.Unmarshal(content, &fixture); err != nil {
 		t.Fatalf("parse production fixture: %v", err)
 	}
+	// Capture the rules twice: once typed, once raw. The raw copy is what
+	// TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction asserts against, so a
+	// rule option that production sets but this struct does not model still shows
+	// up in the test rather than being silently dropped by the decoder.
+	var envelope struct {
+		Route struct {
+			Rules []json.RawMessage `json:"rules"`
+		} `json:"route"`
+	}
+	if err = json.Unmarshal(content, &envelope); err != nil {
+		t.Fatalf("parse production fixture rules: %v", err)
+	}
+	fixture.Route.RawRules = envelope.Route.Rules
 	return &fixture, path
 }
 
