@@ -418,8 +418,17 @@ func h3RoundTrip(t *testing.T, clientConn *http3.ClientConn, headers http.Header
 	if err != nil {
 		return 0, err
 	}
-	if err = stream.Close(); err != nil {
-		return 0, err
+	// Closing the request stream tells the server the request body is complete.
+	//
+	// The error is tolerated when the SERVER has already finished with the
+	// stream: quic-go reports "close called for canceled stream N" when the peer
+	// reset it first, which is a legitimate outcome for a request the server
+	// answered and then stopped reading. Failing the test on it made this test
+	// flaky in CI, where the server can answer and cancel before the client's
+	// close lands. The response below is what the test is actually about.
+	if closeErr := stream.Close(); closeErr != nil &&
+		!strings.Contains(closeErr.Error(), "canceled stream") {
+		return 0, closeErr
 	}
 	response, err := stream.ReadResponse()
 	if err != nil {
