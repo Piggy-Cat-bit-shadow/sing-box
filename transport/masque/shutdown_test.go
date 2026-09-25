@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -172,12 +173,19 @@ func TestSessionShutdownUnblocksABlockedWriter(t *testing.T) {
 type blockingWriteStream struct {
 	writeStarted chan struct{}
 	closed       chan struct{}
-	once         bool
+	// closeOnce guards the close. Close can be called from several places at
+	// once - the session's shutdown path and the test's cleanup - and a bare
+	// "select on closed then close" is a check-then-act race that panics with
+	// "close of closed channel". sync.Once is the correct primitive.
+	closeOnce sync.Once
+	// startedOnce guards the one-shot signal so a second Write does not block on
+	// a full channel.
+	startedOnce sync.Once
 }
 
 func newBlockingWriteStream() *blockingWriteStream {
 	return &blockingWriteStream{
-		writeStarted: make(chan struct{}, 1),
+		writeStarted: make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
 }
@@ -196,13 +204,9 @@ func (s *blockingWriteStream) Read([]byte) (int, error) {
 // Write parks until Close, which is what a full send buffer on a peer that stopped
 // reading looks like from the writer's point of view.
 func (s *blockingWriteStream) Write(p []byte) (int, error) {
-	if !s.once {
-		s.once = true
-		select {
-		case s.writeStarted <- struct{}{}:
-		default:
-		}
-	}
+	s.startedOnce.Do(func() {
+		close(s.writeStarted)
+	})
 	select {
 	case <-s.closed:
 		return 0, context.Canceled
@@ -214,11 +218,7 @@ func (s *blockingWriteStream) Write(p []byte) (int, error) {
 }
 
 func (s *blockingWriteStream) Close() error {
-	select {
-	case <-s.closed:
-	default:
-		close(s.closed)
-	}
+	s.closeOnce.Do(func() { close(s.closed) })
 	return nil
 }
 

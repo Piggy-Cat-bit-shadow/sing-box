@@ -37,6 +37,10 @@ type countingStream struct {
 	// blockOnce ensures only the first write parks, so tests that need the writer
 	// to stay blocked do not depend on timing.
 	blocked atomic.Bool
+	// closeOnce guards the unblock channel: Close can be called from the session's
+	// shutdown path and from the test, and check-then-close races panic with
+	// "close of closed channel".
+	closeOnce sync.Once
 }
 
 func newCountingStream() *countingStream {
@@ -62,11 +66,7 @@ func (s *countingStream) Write(p []byte) (int, error) {
 }
 
 func (s *countingStream) Close() error {
-	select {
-	case <-s.blockWrite:
-	default:
-		close(s.blockWrite)
-	}
+	s.closeOnce.Do(func() { close(s.blockWrite) })
 	return nil
 }
 
