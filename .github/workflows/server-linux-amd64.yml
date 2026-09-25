@@ -206,7 +206,10 @@ jobs:
           # exist and never execute.
           echo ""
           echo "=== protocol/naive/quic unit tests (QUIC linked) ==="
-          go test -tags "$H3_TAGS" -v -count=1 -timeout 10m ./protocol/naive/quic/ \
+          # Run from the repository root: this step has already cd'd into
+          # test/jiejie, which is a SEPARATE Go module, so a ./protocol/... path
+          # does not resolve there.
+          (cd ../.. && go test -tags "$H3_TAGS" -v -count=1 -timeout 10m ./protocol/naive/quic/) \
             2>&1 | tee -a ../../naive-h3-integration.log
 
       # The HTTP/3 differential must have actually compared something. A SKIP
