@@ -23,6 +23,36 @@ import (
 	"github.com/sagernet/sing/common/ntp"
 )
 
+// nativeNaiveQUICConfig builds the QUIC configuration for the Native Naive
+// HTTP/3 listener.
+//
+// It is a function rather than an inline literal so the configuration can be
+// asserted by a test without starting a listener.
+//
+// Allow0RTT is deliberately NOT set, which leaves quic-go's default of false:
+//
+//   - HTTP/3 works without 0-RTT. It is a latency optimisation, not a
+//     prerequisite, so refusing early data costs a round trip on a resumed
+//     connection and nothing else.
+//   - A CONNECT tunnel is precisely the wrong place to accept early data. 0-RTT
+//     data is replayable by anyone who captures it, so an early-data CONNECT can
+//     be replayed against this server. A proxy that authenticates the tunnel
+//     request should not carry that exposure for a latency win.
+//   - The pinned reference (Caddy v2.10.0 + forwardproxy@d62c80d3) does not
+//     enable 0-RTT either: its quic.Config sets only Versions and Tracer. This
+//     fork prefers reference-like defaults.
+//
+// MaxIncomingStreams and DisablePathManager remain explicit. They are recorded
+// in docs/JIEJIE-NAIVE-H3-AUDIT.md as differences from the reference that have
+// NOT been aligned, because aligning them needs runtime evidence rather than a
+// config diff.
+func nativeNaiveQUICConfig() *quic.Config {
+	return &quic.Config{
+		MaxIncomingStreams: 1 << 60,
+		DisablePathManager: true,
+	}
+}
+
 func init() {
 	naive.ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.NaiveInboundOptions) (io.Closer, error) {
 		err := qtls.ConfigureHTTP3(tlsConfig)
@@ -76,11 +106,7 @@ func init() {
 			return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 		}
 
-		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, &quic.Config{
-			MaxIncomingStreams: 1 << 60,
-			Allow0RTT:          true,
-			DisablePathManager: true,
-		})
+		quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, nativeNaiveQUICConfig())
 		if err != nil {
 			udpConn.Close()
 			return nil, err
