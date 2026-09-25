@@ -318,9 +318,19 @@ func (c *naiveConn) ReaderReplaceable() bool { return c.readerReplaceable() }
 func (c *naiveConn) WriterReplaceable() bool { return c.writerReplaceable() }
 
 type naiveH2Conn struct {
-	reader        io.Reader
-	writer        io.Writer
-	flusher       http.Flusher
+	reader io.Reader
+	writer io.Writer
+	// flusher is a ResponseController rather than the ResponseWriter's
+	// http.Flusher interface, because http.Flusher.Flush() returns nothing.
+	//
+	// That signature is why the previous implementation could not tell a
+	// successful flush from a failed one: every tunnel write called Flush() and
+	// discarded the outcome, so a stream that had already failed was treated as
+	// healthy and the connection kept writing into it. The reference uses
+	// http.NewResponseController(w).Flush() and checks its error
+	// (klzgrad/forwardproxy forwardproxy.go), and ResponseController is the
+	// supported way to reach that error from a handler.
+	flusher       *http.ResponseController
 	remoteAddress net.Addr
 	paddingConn
 }
@@ -330,21 +340,40 @@ func (c *naiveH2Conn) Read(p []byte) (n int, err error) {
 	return n, wrapError(err)
 }
 
+// flush propagates a flush failure to the caller.
+//
+// A failed flush means the tunnel's write side is no longer usable: the stream
+// was reset, the connection went away, or the transport rejected the write. The
+// caller must see that as an error on THIS write so it stops producing frames
+// and tears the tunnel down, rather than reporting success and continuing to
+// write into a dead stream.
+func (c *naiveH2Conn) flush() error {
+	return c.flusher.Flush()
+}
+
 func (c *naiveH2Conn) Write(p []byte) (n int, err error) {
 	n, err = c.writeChunked(c.writer, p)
-	if err == nil {
-		c.flusher.Flush()
+	if err != nil {
+		return n, wrapError(err)
 	}
-	return n, wrapError(err)
+	// The write reached the transport buffer but is not delivered until it is
+	// flushed, so a flush failure invalidates the write that just "succeeded".
+	if flushErr := c.flush(); flushErr != nil {
+		return n, wrapError(flushErr)
+	}
+	return n, nil
 }
 
 func (c *naiveH2Conn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
 	err := c.writeBufferWithPadding(c.writer, buffer)
-	if err == nil {
-		c.flusher.Flush()
+	if err != nil {
+		return wrapError(err)
 	}
-	return wrapError(err)
+	if flushErr := c.flush(); flushErr != nil {
+		return wrapError(flushErr)
+	}
+	return nil
 }
 
 func wrapError(err error) error {
