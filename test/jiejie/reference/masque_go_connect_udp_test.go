@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"testing"
 	"time"
@@ -152,6 +153,37 @@ func isUDPPortFree(port uint16) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// connectUDPRequest builds an RFC 9298 extended CONNECT for a target.
+//
+// The target goes in the PATH, which is the form the sing-box inbound parses
+// (/.well-known/masque/udp/<host>/<port>/), with Proxy-Authorization for the
+// proxy authentication surface.
+func connectUDPRequest(target string) http.Request {
+	return http.Request{
+		Method: http.MethodConnect,
+		Proto:  "connect-udp",
+		URL: &url.URL{
+			Scheme: "https",
+			Host:   referenceTestTLSName,
+			Path:   connectUDPPath(target),
+		},
+		Host: referenceTestTLSName,
+		Header: http.Header{
+			"Capsule-Protocol":    []string{"?1"},
+			"Proxy-Authorization": []string{basicProxyAuthorization()},
+		},
+	}
+}
+
+// connectUDPPath renders the RFC 9298 well-known path for a host:port target.
+func connectUDPPath(target string) string {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "/.well-known/masque/udp/" + target + "/"
+	}
+	return "/.well-known/masque/udp/" + host + "/" + port + "/"
 }
 
 // ---------------------------------------------------------------------------
