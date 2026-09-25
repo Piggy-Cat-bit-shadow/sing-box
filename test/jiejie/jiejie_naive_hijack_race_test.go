@@ -37,9 +37,9 @@ import (
 //
 // Without the fix this test fails; with it, every iteration succeeds.
 
-// TestNaiveHijackCoalescedProbeRace drives many sessions where the request and
+// TestJiejieHijackCoalescedProbeRace drives many sessions where the request and
 // the first tunnel frame are separate writes with no delay between them.
-func TestNaiveHijackCoalescedProbeRace(t *testing.T) {
+func TestJiejieHijackCoalescedProbeRace(t *testing.T) {
 	env := startNaiveInboundForUoT(t)
 	trace := newTrace()
 	echo := startInstrumentedEcho(t, trace)

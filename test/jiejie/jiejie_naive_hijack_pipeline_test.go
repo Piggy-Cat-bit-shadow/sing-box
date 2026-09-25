@@ -33,8 +33,8 @@ import (
 // request and the tunnel frames in a SINGLE Write, which guarantees the server's
 // bufio.Reader holds them. No sleep, no retry, no tolerance.
 
-// TestNaiveHijackPipelinedUoTRequestIsNotLost is the primary regression test.
-func TestNaiveHijackPipelinedUoTRequestIsNotLost(t *testing.T) {
+// TestJiejieHijackPipelinedUoTRequestIsNotLost is the primary regression test.
+func TestJiejieHijackPipelinedUoTRequestIsNotLost(t *testing.T) {
 	env := startNaiveInboundForUoT(t)
 
 	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 10*time.Second)
@@ -83,9 +83,9 @@ func TestNaiveHijackPipelinedUoTRequestIsNotLost(t *testing.T) {
 			"buffered bytes were consumed rather than discarded")
 }
 
-// TestNaiveHijackPipelinedPlainConnectRequestIsNotLost covers the same bug on a
+// TestJiejieHijackPipelinedPlainConnectRequestIsNotLost covers the same bug on a
 // plain (unpadded) tunnel: the prologue bytes are pipelined, so they are buffered.
-func TestNaiveHijackPipelinedPlainConnectRequestIsNotLost(t *testing.T) {
+func TestJiejieHijackPipelinedPlainConnectRequestIsNotLost(t *testing.T) {
 	env := startNaiveInbound(t, false)
 	origin := env.originAddr
 

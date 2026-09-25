@@ -90,13 +90,13 @@ func runUoTLossMeasure(t *testing.T, transport string, sessions int) lossRunResu
 	return result
 }
 
-// TestDiagUoTLossByTransport measures the three transports separately.
+// TestJiejieUoTLossByTransport measures the three transports separately.
 //
 // This is a DIAGNOSTIC: it reports the real failure counts and the event
 // timeline for every failed Packet ID. It asserts only that the transports do not
 // collapse entirely, so a partial loss does not turn the suite red while the
 // investigation is open.
-func TestDiagUoTLossByTransport(t *testing.T) {
+func TestJiejieUoTLossByTransport(t *testing.T) {
 	const perTransport = 200
 
 	for _, transport := range []string{"http1-padded", "http1-unpadded", "http2-padded"} {
@@ -114,11 +114,11 @@ func TestDiagUoTLossByTransport(t *testing.T) {
 	}
 }
 
-// TestDiagUoTLossUnderChurn reproduces the ORIGINAL conditions: many sessions
+// TestJiejieUoTLossUnderChurn reproduces the ORIGINAL conditions: many sessions
 // created back to back with concurrency, which is when the earlier ~1% loss was
 // observed. Sequential single sessions did not reproduce it, so the load shape
 // matters and must be measured rather than assumed away.
-func TestDiagUoTLossUnderChurn(t *testing.T) {
+func TestJiejieUoTLossUnderChurn(t *testing.T) {
 	const (
 		totalWorkers = 10
 		perWorker    = 200 // 2000 sessions, above the required 1000
