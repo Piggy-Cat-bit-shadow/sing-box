@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/sagernet/quic-go"
-
 	"github.com/sagernet/sing-box/option"
 )
 
