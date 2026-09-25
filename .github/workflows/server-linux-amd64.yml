@@ -191,7 +191,7 @@ jobs:
           JIEJIE_CADDY_REFERENCE_SOURCE="$REF_DIR" \
           JIEJIE_PARITY_REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json" \
             go test -tags "$TAGS" -v -count=1 -timeout 25m \
-              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity' . \
+              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity|TestJiejieNaiveH2DifferentialAgainstReference|TestJiejieNaiveH1RawDifferentialAgainstReference' . \
             2>&1 | tee ../../naive-parity.log
 
       - name: Summarise the Naive compatibility report
