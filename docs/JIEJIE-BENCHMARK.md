@@ -169,3 +169,62 @@ notes:
 * Prefer the default (upstream-shaped) configuration when results are
   inconclusive.
 * Re-measure after any upstream rebase, kernel upgrade or VPS migration.
+
+## In-process codec benchmarks: what they measure
+
+`protocol/naive/bench_test.go` contains deterministic micro-benchmarks for the
+Padding codec and the headroom helpers. They exist to pin the cost of the codec
+itself, not to predict tunnel throughput.
+
+**Read the byte basis, not just ns/op.** A previous version of
+`BenchmarkPaddingReadFramed` processed 4096 payloads per iteration while
+reporting `SetBytes` for a single payload. The two read benchmarks therefore
+had similar ns/op but MB/s differing by roughly 4096x, and the natural
+conclusion - "framing is nearly free" - was an artefact of the accounting
+rather than a result. The byte basis is now the full stream for both, so they
+are directly comparable:
+
+```
+BenchmarkPaddingReadFramed-8   200  132415 ns/op  43306.13 MB/s  1408 B/op  1 allocs/op
+BenchmarkPaddingReadRaw-8      200  135215 ns/op  42409.51 MB/s  1408 B/op  1 allocs/op
+```
+
+Reading the framed path costs about 2% more per byte than the raw path, which is
+what one would expect: it parses a 3-byte header and copies the padding window.
+The framed benchmark additionally carries 3 header bytes per payload on the wire,
+so equal wall time would not imply equal goodput.
+
+Compare these numbers **only against each other on the same machine**. They are
+not a throughput claim and they say nothing about a real network path.
+
+## Measured resource cost on Linux (loopback)
+
+Measured on Linux 6.8 (arm64 VM), production tag set
+(`with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0`), driving the
+Naive inbound in-process. These are **test-process** figures: the test binary
+also holds the test framework and the echo servers, so they are a budget check on
+the data path, not a measurement of the shipped server.
+
+| Phase | RSS | goroutines | fds | UDP sockets |
+| --- | --- | --- | --- | --- |
+| idle | 23.3 MiB | 12 | 12 | 1 |
+| after 500 churn sessions | 23.8 MiB | 12 | 12 | 1 |
+| 8 concurrent TCP tunnels | 24.3 MiB | 12 | 20 | 1 |
+| after sustained UDP | 23.2 MiB | 12 | 20 | 1 |
+| settled after close | 23.2 MiB | 12 | 12 | 1 |
+
+Over **1000** short-lived sessions: RSS delta -248 KiB, goroutines +0, fds +0,
+UDP sockets +0. Descriptors, sockets and goroutines all return to the idle
+baseline, so the session path does not leak them.
+
+This is a regression bound, not a capacity plan. `TestJiejieNaiveLinuxResourceBudget`
+and `TestJiejieNaiveLinuxSocketAndGoroutineReclaim` enforce it; they SKIP on
+non-Linux because they read `/proc`.
+
+## Not measured
+
+- Native Naive versus Caddy throughput on the same host. No fair A/B was run:
+  it requires a reproducible Caddy Naive deployment and a client path that both
+  can serve identically. **Do not quote a speed-up figure; none was measured.**
+- Production RSS of the shipped binary under real client load.
+- Peak RSS during a sustained saturating transfer.

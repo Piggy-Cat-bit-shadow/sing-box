@@ -81,7 +81,12 @@ func BenchmarkPaddingReadFramed(b *testing.B) {
 	encoded := stream.Bytes()
 
 	b.ReportAllocs()
-	b.SetBytes(int64(len(payload)))
+	// Each iteration de-frames the WHOLE stream, i.e. 4096 payloads. Reporting
+	// only one payload's worth of bytes made this benchmark incomparable with
+	// BenchmarkPaddingReadRaw: the two had similar ns/op while their MB/s
+	// differed by ~4096x, and the apparent "framing is nearly free" result was
+	// an artefact of the byte basis rather than a measurement.
+	b.SetBytes(int64(len(payload) * 4096))
 	b.ResetTimer()
 	for range b.N {
 		b.StopTimer()
@@ -98,6 +103,11 @@ func BenchmarkPaddingReadFramed(b *testing.B) {
 }
 
 // BenchmarkPaddingReadRaw measures the post-window read path.
+//
+// It consumes the same number of payload bytes as BenchmarkPaddingReadFramed
+// (4096 payloads), so the two are directly comparable. Read the MB/s column
+// rather than ns/op when comparing them: framed additionally carries 3 header
+// bytes per payload, so equal wall time would not mean equal throughput.
 func BenchmarkPaddingReadRaw(b *testing.B) {
 	data := make([]byte, 4096*len(benchmarkPayload))
 	b.ReportAllocs()

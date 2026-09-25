@@ -174,6 +174,55 @@ v2 non-connect: allowed datagram delivered=1, forbidden received 0
 | UoT v2 非 Connect 多目标 | 允许目标投递，受限目标 0 包 |
 | 正常公网域名（TCP 与 UDP） | 正常可达 |
 | masquerade 后端 loopback | 正常可达（未被误伤） |
+| 逐包 PORT 规则（会话未命中的规则） | 允许端口投递=1，被拒端口=0 |
+| 传统 v1 会话目标为 0.0.0.0:0 | 会话级即被拒绝，sentinel 收包 0 |
+| 传统 v1/v2 STUN Binding（真实 RFC 5389） | 两端版本均往返成功，事务 ID 匹配 |
+| STUN 指向被拒 loopback | 收包 0（STUN 不豁免 ACL） |
+| IPv6 UDP 往返（UoT v1/v2） | 成功，源地址为 IPv6 |
+
+---
+
+## 6.1 Guard 的作用范围与已知限制
+
+逐包 Guard 的语义需要准确理解，不要高估：
+
+**它做什么**
+
+- 对**每个数据包解码出的目标**重新执行同一套 `route.rules`（顺序、`resolve`
+  动作、`port`、`user`、`inbound` 等条件全部一致）；
+- 命中 `reject` 即丢弃该数据包，命中 `route`/`bypass` 即放行；
+- 无规则命中时**放行**（默认出站），因此对未配置相关规则的协议是惰性的。
+
+**它不做什么**
+
+- **不重新路由到其他出站。** Guard 的判定结果是"允许/拒绝"，不是"改走哪个
+  outbound"。若某条规则基于**逐包目标**选择了与会话不同的出站，该选择**不会**
+  生效——数据包仍走会话建立时选定的出站。当前生产配置不依赖这种用法
+  （唯一选择出站的 `ip_is_private -> direct` 指向的正是默认出站，而
+  `residential-socks` 规则限定 `network: tcp`，UoT 数据包永远不满足）。
+  这一点由 `TestPacketDestinationGuardOutboundSelectionPrecondition` 守护：
+  一旦有人为 UDP 数据包加入"选择不同出站"的规则，该测试会立即失败。
+
+**为什么只在读取侧拦截**
+
+写入侧存在批量写入快速路径，不能保证所有数据包都经过 `WritePacket`；
+实测确认在写入侧拦截时数据包仍会到达目标。读取侧是唯一无法绕过的位置。
+
+**为什么 Guard 不会暴露旁路读接口**
+
+Guard 只嵌入**窄接口** `N.PacketConn`（其唯一读取方法是 `ReadPacket`），
+因此 `ReadFrom`、`ReadCachedPacket`、读等待器、可替换上游等快速路径
+**都不会被提升**。`TestPacketDestinationGuardExposesNoBypassReadPath`
+固定该不变式：若将来有人改为嵌入 `N.NetPacketConn` 或添加
+`ReaderReplaceable`，测试会立即失败，而不是悄悄失去逐包检查。
+
+**跨协议影响**
+
+`common/uot/router.go` 被 12 个协议 inbound 共用（anytls、shadowsocks、
+http、socks、tuic、vless、vmess 等）。标记逐包会话后 Guard 对这些协议同样生效。
+因此 Guard 在无规则时必须放行，这一点由
+`TestPacketDestinationGuardPermitsWhenNoRuleMatches` 守护。
+生产 registry 中受影响的协议为 `anytls` 与 `shadowsocks`（SS2022）。
 
 ---
 
@@ -183,10 +232,11 @@ v2 non-connect: allowed datagram delivered=1, forbidden received 0
    上述列表是建议的默认拒绝范围，其中 `192.0.2.0/24`、`203.0.113.0/24`、
    `2001:db8::/32` 属于文档用地址段，`100.64.0.0/10`、`198.18.0.0/15` 等是否需要在
    生产拒绝，应根据实际业务确认。本次**没有**接触生产 VPS。
-2. **VPS 自身公网 IP 未纳入拒绝范围。**
+2. **VPS 自身公网 IP 仍未纳入拒绝范围 —— 未完成，待生产信息。**
    若客户端 `CONNECT` 到 VPS 自己的公网 IP，仍可能触达只应从特定来源访问的
-   管理入口。本次规则只覆盖私网/特殊用途地址；是否需要额外拒绝 VPS 自身公网 IP
-   取决于该机器上监听公网的管理服务，建议在实际评估后单独添加。
+   管理入口。仓库中**没有**可信来源记录该地址，按任务要求不得猜测、不得用
+   开发机出口 IP 推断。需要执行的确认命令与配置插入位置见
+   `docs/JIEJIE-NAIVE-MIGRATION.md` 第 5 节。**该项不得标记为已完成。**
 3. **UoT 逐包检查为本次新增的共享模块改动。**
    它只在非 Connect 的 UoT 会话上启用，且已通过完整回归（见下），
    但它是 `protocol/naive` 之外的路由层改动，若后续上游合并需要留意。
