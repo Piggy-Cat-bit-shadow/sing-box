@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,8 +58,11 @@ func TestExpectedPreAuthFailuresAreDowngraded(t *testing.T) {
 			),
 		},
 		{
+			// A real reset is a syscall.Errno, not a message string. The previous
+			// version built this from errors.New, so it never exercised the errno
+			// path and passed for the wrong reason.
 			name: "peer reset",
-			err:  &net.OpError{Op: "read", Net: "tcp", Err: &os.SyscallError{Syscall: "read", Err: errors.New("connection reset by peer")}},
+			err:  &net.OpError{Op: "read", Net: "tcp", Err: &os.SyscallError{Syscall: "read", Err: syscall.ECONNRESET}},
 		},
 	}
 	for _, testCase := range testCases {
@@ -146,4 +150,83 @@ func TestPreAuthClassifierCoversTheRuntimeTimeout(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the pre-auth read never timed out")
 	}
+}
+
+// TestAnyTLSErrnoClassification pins the errno matrix.
+//
+// The previous classifier downgraded ANY *os.SyscallError to debug. AnyTLS dials
+// its fallback backend, so a refused or unreachable backend arrives in exactly
+// that shape - *net.OpError -> *os.SyscallError - and was silently logged at
+// debug, hiding the operator's own failing upstream.
+//
+// The matrix is the contract: only errnos that describe the PEER going away are
+// expected outcomes of a public scanner; anything describing a fault stays
+// visible.
+func TestAnyTLSErrnoClassification(t *testing.T) {
+	dialErr := func(errno syscall.Errno) error {
+		return &net.OpError{
+			Op:  "dial",
+			Net: "tcp",
+			Err: &os.SyscallError{Syscall: "connect", Err: errno},
+		}
+	}
+	readErr := func(errno syscall.Errno) error {
+		return &net.OpError{
+			Op:  "read",
+			Net: "tcp",
+			Err: &os.SyscallError{Syscall: "read", Err: errno},
+		}
+	}
+
+	t.Run("server-side faults stay visible", func(t *testing.T) {
+		for _, testCase := range []struct {
+			name  string
+			errno syscall.Errno
+		}{
+			{"ECONNREFUSED", syscall.ECONNREFUSED},
+			{"ENETUNREACH", syscall.ENETUNREACH},
+			{"EHOSTUNREACH", syscall.EHOSTUNREACH},
+			{"EACCES", syscall.EACCES},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				err := E.Cause(dialErr(testCase.errno), "dial fallback")
+				require.False(t, isExpectedPreAuthFailure(err),
+					"%s describes a fault the operator must see, not scanner noise",
+					testCase.name)
+				require.True(t, preAuthFailureIsError(err),
+					"%s must be logged at error level", testCase.name)
+			})
+		}
+	})
+
+	t.Run("peer lifecycle errors are expected", func(t *testing.T) {
+		for _, testCase := range []struct {
+			name  string
+			errno syscall.Errno
+		}{
+			{"ECONNRESET", syscall.ECONNRESET},
+			{"ECONNABORTED", syscall.ECONNABORTED},
+			{"EPIPE", syscall.EPIPE},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				require.True(t, isExpectedPreAuthFailure(readErr(testCase.errno)),
+					"%s is a routine outcome when a public peer disconnects",
+					testCase.name)
+			})
+		}
+	})
+
+	t.Run("a dial timeout is a fault, a read timeout is not", func(t *testing.T) {
+		// A slow prober hitting the pre-auth read deadline is expected. A dial
+		// that times out means the fallback backend did not answer, which is a
+		// fault, so the same errno must be judged on the OPERATION.
+		readTimeout := &net.OpError{Op: "read", Net: "tcp", Err: timeoutError{}}
+		require.True(t, isExpectedPreAuthFailure(readTimeout),
+			"a read timeout is the pre-auth timeout doing its job")
+
+		dialTimeout := &net.OpError{Op: "dial", Net: "tcp", Err: timeoutError{}}
+		require.False(t, isExpectedPreAuthFailure(dialTimeout),
+			"a dial timeout means a configured backend is not answering and must "+
+				"stay visible")
+	})
 }

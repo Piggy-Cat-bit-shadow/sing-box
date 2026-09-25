@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"syscall"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -35,8 +36,12 @@ func isExpectedPreAuthFailure(err error) bool {
 	}
 	// A read deadline expiring is the one-shot pre-auth timeout doing its job:
 	// the peer completed TLS and then sent nothing.
+	//
+	// A timeout on a DIAL is different. AnyTLS dials its fallback backend, and a
+	// dial that times out means that backend did not answer - an operator-visible
+	// fault, not a slow prober - so the direction is checked explicitly.
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if errors.As(err, &netErr) && netErr.Timeout() && !isDialFailure(err) {
 		return true
 	}
 	// The peer went away: orderly close, half-close, or an aborted connection.
@@ -49,14 +54,20 @@ func isExpectedPreAuthFailure(err error) bool {
 	// A connection reset by the peer is a normal TCP outcome on a public port.
 	var opErr *net.OpError
 	if errors.As(err, &opErr) {
-		// Any *net.OpError whose inner error is a syscall reset or a closed
-		// descriptor is peer-driven rather than a server fault.
 		if errors.Is(opErr.Err, os.ErrDeadlineExceeded) {
 			return true
 		}
+		// Classify the errno instead of downgrading every syscall error.
+		//
+		// Treating any *os.SyscallError as peer-driven hid genuine server-side
+		// faults: a refused or unreachable resource (ECONNREFUSED, ENETUNREACH,
+		// EHOSTUNREACH) and a local permission problem (EACCES) all arrive in
+		// this shape, and each of them is something an operator needs to see.
+		// Only errnos that describe the PEER going away are expected outcomes of
+		// a public scanner.
 		var syscallErr *os.SyscallError
 		if errors.As(opErr.Err, &syscallErr) {
-			return true
+			return isPeerLifecycleErrno(syscallErr.Err)
 		}
 	}
 	// Context cancellation during shutdown.
@@ -66,6 +77,46 @@ func isExpectedPreAuthFailure(err error) bool {
 	// sing-box's own closed/cancelled helper, used throughout the codebase.
 	if E.IsClosed(err) {
 		return true
+	}
+	return false
+}
+
+// isDialFailure reports whether the error chain describes an outbound DIAL rather
+// than I/O on an accepted connection.
+//
+// The two mean different things: a read timeout is a slow prober, while a dial
+// timeout is a configured upstream not answering. net.OpError carries the
+// operation, so this is a typed check rather than a string match.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		return false
+	}
+	return opErr.Op == "dial"
+}
+
+// isPeerLifecycleErrno reports whether an errno describes the peer going away,
+// rather than a fault on this server.
+//
+// Only these are expected:
+//
+//	ECONNRESET    the peer closed abruptly (a scanner disconnecting)
+//	ECONNABORTED  the local side aborted the connection
+//	EPIPE         the peer is gone and the write failed
+//
+// Everything else stays at error level. ECONNREFUSED, ENETUNREACH,
+// EHOSTUNREACH, ETIMEDOUT and EACCES all describe something the operator needs
+// to know about, and silently logging them at debug is how a broken upstream
+// goes unnoticed. Comparison is on syscall.Errno values, never on message text.
+func isPeerLifecycleErrno(err error) bool {
+	for _, expected := range []syscall.Errno{
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		syscall.EPIPE,
+	} {
+		if errors.Is(err, expected) {
+			return true
+		}
 	}
 	return false
 }

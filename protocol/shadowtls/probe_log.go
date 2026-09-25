@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"syscall"
 
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -45,9 +46,12 @@ func isExpectedShadowTLSProbeFailure(err error) bool {
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 		return true
 	}
-	// A read deadline or an aborted connection at the TCP layer.
+	// A timeout is expected only when it is about THIS SERVER'S OWN socket with
+	// the public peer - a slow or silent prober hitting a read deadline. A
+	// timeout on a DIAL is different: it means the handshake target the operator
+	// configured did not answer, which is a fault and must stay visible.
 	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if errors.As(err, &netErr) && netErr.Timeout() && !isDialFailure(err) {
 		return true
 	}
 	var opErr *net.OpError
@@ -55,9 +59,21 @@ func isExpectedShadowTLSProbeFailure(err error) bool {
 		if errors.Is(opErr.Err, os.ErrDeadlineExceeded) {
 			return true
 		}
+		// Classify the errno, do NOT downgrade every syscall error.
+		//
+		// Treating any *os.SyscallError as an expected probe hid real server
+		// faults. The ShadowTLS inbound dials its handshake target, so a failed
+		// dial surfaces as exactly this shape:
+		//
+		//	*net.OpError{Op: "dial"} -> *os.SyscallError{connect, ECONNREFUSED}
+		//
+		// ECONNREFUSED, ENETUNREACH and EHOSTUNREACH on the handshake target mean
+		// the operator's configured upstream is down or unreachable - precisely
+		// the condition that must stay visible. Only errors that are provably
+		// about the PUBLIC PEER or the local lifecycle are downgraded.
 		var syscallErr *os.SyscallError
 		if errors.As(opErr.Err, &syscallErr) {
-			return true
+			return isPeerLifecycleErrno(syscallErr.Err)
 		}
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -65,6 +81,48 @@ func isExpectedShadowTLSProbeFailure(err error) bool {
 	}
 	if E.IsClosedOrCanceled(err) {
 		return true
+	}
+	return false
+}
+
+// isDialFailure reports whether the error chain describes an outbound DIAL
+// rather than I/O on an accepted connection.
+//
+// The distinction matters because the two mean different things: a read timeout
+// is a slow prober, while a dial timeout is the configured handshake target not
+// answering. net.OpError carries the operation, so this is a typed check.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		return false
+	}
+	return opErr.Op == "dial"
+}
+
+// isPeerLifecycleErrno reports whether an errno describes the peer going away or
+// the local side shutting down, rather than a fault on this server.
+//
+// Only these are treated as expected:
+//
+//	ECONNRESET    the peer closed abruptly (a scanner disconnecting)
+//	ECONNABORTED  the local side aborted the connection
+//	EPIPE         the peer is gone and the write failed
+//
+// Everything else - ECONNREFUSED, ENETUNREACH, EHOSTUNREACH, ETIMEDOUT, EACCES -
+// stays at error level. In particular a refused or unreachable HANDSHAKE TARGET
+// is an operator-visible fault, not scanner noise, and silently logging it at
+// debug is how a broken upstream goes unnoticed.
+//
+// The comparison is on syscall.Errno values, not on error strings.
+func isPeerLifecycleErrno(err error) bool {
+	for _, expected := range []syscall.Errno{
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		syscall.EPIPE,
+	} {
+		if errors.Is(err, expected) {
+			return true
+		}
 	}
 	return false
 }
