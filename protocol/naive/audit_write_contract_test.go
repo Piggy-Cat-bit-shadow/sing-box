@@ -214,61 +214,157 @@ type lyingWriter struct{}
 
 func (w *lyingWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-// TestAuditPaddingNeverOverflowsTheBuffer is the regression for a process crash.
+// TestAuditPaddingCoversFullRange asserts the Naive padding range is the whole
+// 0..255, and that a correctly sized buffer can carry any value in it.
 //
-// writeBufferWithPadding picks a padding size of rand.Intn(256) - up to 255 -
-// but it first calls ExtendHeader(3), which consumes 3 bytes of the buffer's
-// free space. A caller that sized the buffer from rearHeadroom(), which
-// advertises 255 bytes for padding, therefore had only 252 left when the padding
-// was written. Whenever the random size landed in 253..255 the write asked
-// WriteZeroN for more room than existed, got io.ErrShortBuffer, and common.Must
-// turned that into a PANIC that took the whole server process down - on roughly
-// 1 write in 85.
+// This is the regression for a process crash, and the crash was NOT where it
+// first appeared. The failing test built its buffer as
 //
-// The padding size is forced through the whole 0..255 range here so the boundary
-// is exercised deterministically instead of depending on the random draw.
-func TestAuditPaddingNeverOverflowsTheBuffer(t *testing.T) {
-	// Sized exactly as the production path sizes a buffer: 3 for the frame
-	// header, 255 for padding, plus the content.
+//	buf.NewSize(3 + 255 + len(content))
+//	b.Resize(3, 3+len(content))
+//
+// but sing/common/buf.Resize(start, end) sets b.end = b.start + end, so the
+// second argument is a LENGTH, not an end offset. That call produced
+// Len() == 3+len(content) instead of len(content) and left only 252 bytes of
+// rear headroom instead of 255. The buffer was therefore under-sized, and a
+// padding draw of 253..255 overflowed it.
+//
+// Production never does this: rearHeadroom() advertises 255 and the copy path
+// guarantees it - ReadWaitOptions.Copy reallocates when RearHeadroom > FreeLen,
+// and CopyExtendedBuffer calls buffer.Reserve(rearHeadroom). So the crash was a
+// test-construction bug, and the earlier clamp "fixed" it by narrowing the
+// protocol's padding distribution, which is the wrong repair.
+//
+// The buffer below is built with the correct Resize(start, length) semantics and
+// its headroom is asserted BEFORE the write, so the test can no longer pass for
+// the wrong reason.
+func TestAuditPaddingCoversFullRange(t *testing.T) {
 	content := []byte("hello")
-	// Resize takes (start, end) and sets end = start + end, so this yields a
-	// buffer whose Len() is 3+len(content). The payload the frame declares must
-	// therefore be that Len(), which is what the assertions below compare
-	// against - the buffer's real length, not the literal content slice.
-	makeBuffer := func() *buf.Buffer {
-		b := buf.NewSize(3 + 255 + len(content))
-		b.Resize(3, 3+len(content))
-		copy(b.Bytes(), content)
-		return b
-	}
-	expectedDataSize := 3 + len(content)
 
-	// Force every padding size, including the 253..255 range that used to panic.
 	for padding := range 256 {
 		t.Run(itoa(padding), func(t *testing.T) {
-			writer := &capturingWriter{allow: 1 << 20}
-			connection := &paddingConn{enabled: true}
-			forcedPadding = &padding
-			defer func() { forcedPadding = nil }()
+			buffer := buf.NewSize(3 + 255 + len(content))
+			// Resize takes (start, LENGTH). len(content) is the payload length.
+			buffer.Resize(3, len(content))
+			copy(buffer.Bytes(), content)
 
-			err := connection.writeBufferWithPadding(writer, makeBuffer())
-			require.NoError(t, err,
-				"padding size %d must not overflow the buffer", padding)
+			// Assert the construction itself, so a future edit that reintroduces
+			// the off-by-start error fails here rather than silently reducing the
+			// padding range the test covers.
+			require.GreaterOrEqual(t, buffer.Start(), 3,
+				"the frame header needs 3 bytes of front headroom")
+			require.GreaterOrEqual(t, buffer.FreeLen(), 255,
+				"the padding range is 0..255, so 255 bytes of rear headroom are required")
+			require.Equal(t, len(content), buffer.Len(),
+				"the payload length must be exactly len(content)")
+
+			// Capture the payload before framing: after ExtendHeader the buffer's
+			// Bytes() spans header + payload + padding, so comparing it to the
+			// content would be comparing the wrong region.
+			payloadBefore := append([]byte(nil), buffer.Bytes()...)
+			require.Equal(t, content, payloadBefore,
+				"precondition: the buffer must hold exactly the content")
+
+			writer := &capturingWriter{allow: 1 << 20}
+			size := padding
+			connection := &paddingConn{
+				enabled:     true,
+				paddingSize: func() int { return size },
+			}
+
+			require.NoError(t, connection.writeBufferWithPadding(writer, buffer),
+				"padding size %d must encode successfully", padding)
 			require.Equal(t, 1, connection.writePadding,
 				"a completed frame advances the counter exactly once")
 
-			// The frame the writer received must be self-consistent: the header's
-			// declared padding must match the bytes actually appended, because the
-			// peer skips exactly that many.
+			// The frame must be self-consistent: the declared padding must equal
+			// the bytes actually appended, because the peer skips exactly the
+			// number in the header.
 			written := writer.data()
 			require.GreaterOrEqual(t, len(written), 3)
 			declaredPadding := int(written[2])
 			declaredDataSize := int(written[0])<<8 | int(written[1])
-			require.Equal(t, expectedDataSize, declaredDataSize,
-				"the frame must declare the buffer's real payload length")
-			require.Equal(t, len(written), 3+declaredDataSize+declaredPadding,
-				"the frame length must equal header + data + the padding it "+
-					"declares; a mismatch desynchronises the peer's framing")
+			require.Equal(t, padding, declaredPadding,
+				"the frame must declare the padding size that was chosen")
+			require.Equal(t, len(content), declaredDataSize,
+				"the frame must declare the real payload length")
+			require.Equal(t, 3+len(content)+padding, len(written),
+				"the frame length must be header + payload + the declared padding")
+			require.Equal(t, content, written[3:3+len(content)],
+				"the payload must be unchanged by framing")
 		})
 	}
+}
+
+// TestAuditPaddingShortWriteDoesNotAdvanceCounter proves a frame that was not
+// fully written does not move the counter, which is what keeps the peer's
+// framing and ours from diverging.
+func TestAuditPaddingShortWriteDoesNotAdvanceCounter(t *testing.T) {
+	content := []byte("hello")
+	buffer := buf.NewSize(3 + 255 + len(content))
+	buffer.Resize(3, len(content))
+
+	writer := &capturingWriter{allow: 2}
+	size := 200
+	connection := &paddingConn{
+		enabled:     true,
+		paddingSize: func() int { return size },
+	}
+
+	err := connection.writeBufferWithPadding(writer, buffer)
+	require.ErrorIs(t, err, io.ErrShortWrite)
+	require.Zero(t, connection.writePadding,
+		"an incompletely written frame must not advance the frame counter")
+}
+
+// TestAuditInsufficientHeadroomIsAnErrorNotAPanic covers the defensive path.
+//
+// A caller that supplies a buffer without the advertised headroom is a
+// programming error. The point of this test is that it must produce an error
+// rather than a panic - it is NOT permission to silently clamp the padding,
+// which would change the protocol's padding distribution. The assertion checks
+// both halves: an error is returned, and the padding size is left alone.
+func TestAuditInsufficientHeadroomIsAnErrorNotAPanic(t *testing.T) {
+	t.Run("insufficient rear headroom", func(t *testing.T) {
+		content := []byte("hello")
+		// Only 8 bytes of rear space, far less than the 0..255 range needs.
+		buffer := buf.NewSize(3 + 8 + len(content))
+		buffer.Resize(3, len(content))
+
+		writer := &capturingWriter{allow: 1 << 20}
+		size := 255
+		connection := &paddingConn{
+			enabled:     true,
+			paddingSize: func() int { return size },
+		}
+
+		require.NotPanics(t, func() {
+			err := connection.writeBufferWithPadding(writer, buffer)
+			require.Error(t, err,
+				"an under-sized buffer must be reported as an error")
+			require.Contains(t, err.Error(), "padding range 0..255 must be preserved",
+				"the error must say the padding was NOT clamped, so the cause is "+
+					"visible instead of looking like a protocol decision")
+		})
+		require.Zero(t, connection.writePadding,
+			"a frame that was never written must not advance the counter")
+		require.Empty(t, writer.data(),
+			"nothing may reach the wire when the frame could not be built")
+	})
+
+	t.Run("insufficient front headroom", func(t *testing.T) {
+		content := []byte("hello")
+		buffer := buf.NewSize(255 + len(content))
+		buffer.Resize(0, len(content))
+
+		writer := &capturingWriter{allow: 1 << 20}
+		connection := &paddingConn{enabled: true}
+
+		require.NotPanics(t, func() {
+			err := connection.writeBufferWithPadding(writer, buffer)
+			require.Error(t, err,
+				"a buffer with no room for the 3-byte header must error, not panic")
+		})
+		require.Zero(t, connection.writePadding)
+	})
 }

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"testing"
+
+	"github.com/sagernet/sing/common/buf"
 )
 
 // Benchmarks for the Naive padding codec and the connection wrappers.
@@ -160,5 +162,91 @@ func BenchmarkHeadroomDecisions(b *testing.B) {
 		_ = framed.writerReplaceable()
 		_ = raw.frontHeadroom()
 		_ = raw.writerReplaceable()
+	}
+}
+
+// BenchmarkPaddingWriteBuffer measures the buffer path, which is the one the
+// router actually uses for bulk transfer (naiveConn.WriteBuffer).
+//
+// The buffer is built with the correct headroom the production copy path
+// guarantees, so the numbers reflect real work rather than a degenerate
+// allocation:
+//
+//	buf.NewSize(3 + 255 + len(payload)); b.Resize(3, len(payload))
+//
+// sing/common/buf.Resize(start, end) sets b.end = b.start + end, so the second
+// argument is a LENGTH. Passing an end offset here (as an earlier test did) both
+// corrupts Len() and eats 3 bytes of the rear headroom that the 0..255 padding
+// range depends on. Both headroom values are asserted before timing so this
+// benchmark cannot silently measure the wrong buffer.
+func BenchmarkPaddingWriteBuffer(b *testing.B) {
+	for _, testCase := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"small-64B", bytes.Repeat([]byte("s"), 64)},
+		{"medium-1400B", bytes.Repeat([]byte("m"), 1400)},
+		{"large-16KiB", bytes.Repeat([]byte("l"), 16*1024)},
+	} {
+		b.Run(testCase.name, func(b *testing.B) {
+			payload := testCase.payload
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				buffer := buf.NewSize(3 + 255 + len(payload))
+				// Resize(start, LENGTH), matching the production copy path.
+				buffer.Resize(3, len(payload))
+				copy(buffer.Bytes(), payload)
+				if buffer.Start() < 3 || buffer.FreeLen() < 255 || buffer.Len() != len(payload) {
+					b.Fatalf("buffer headroom is wrong: start=%d free=%d len=%d",
+						buffer.Start(), buffer.FreeLen(), buffer.Len())
+				}
+				connection := &paddingConn{enabled: true, writePadding: paddingCount}
+				b.StartTimer()
+				if err := connection.writeBufferWithPadding(io.Discard, buffer); err != nil {
+					b.Fatal(err)
+				}
+				buffer.Release()
+			}
+		})
+	}
+}
+
+// BenchmarkPaddingWriteBufferFramed is the same path with the padding window
+// still OPEN, so the frame header and the random padding are actually written.
+//
+// writePadding is set to paddingCount-1 so the counter is inside the window for
+// every iteration, which is where the codec cost lives.
+func BenchmarkPaddingWriteBufferFramed(b *testing.B) {
+	for _, testCase := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"small-64B", bytes.Repeat([]byte("s"), 64)},
+		{"medium-1400B", bytes.Repeat([]byte("m"), 1400)},
+		{"large-16KiB", bytes.Repeat([]byte("l"), 16*1024)},
+	} {
+		b.Run(testCase.name, func(b *testing.B) {
+			payload := testCase.payload
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				buffer := buf.NewSize(3 + 255 + len(payload))
+				buffer.Resize(3, len(payload))
+				copy(buffer.Bytes(), payload)
+				// paddingCount-1 keeps the frame window open, but the counter is
+				// advanced by the call, so reset it every iteration.
+				connection := &paddingConn{enabled: true, writePadding: paddingCount - 1}
+				b.StartTimer()
+				if err := connection.writeBufferWithPadding(io.Discard, buffer); err != nil {
+					b.Fatal(err)
+				}
+				buffer.Release()
+			}
+		})
 	}
 }

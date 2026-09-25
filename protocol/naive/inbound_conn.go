@@ -13,16 +13,21 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/rw"
 )
 
 const paddingCount = 8
 
-// forcedPadding, when non-nil, overrides the random padding size. It exists so a
-// test can exercise every value in 0..255 deterministically instead of relying on
-// the random draw to reach a boundary case; production always leaves it nil.
-var forcedPadding *int
+// paddingSizeSource yields the padding length for one frame.
+//
+// It is a per-connection field rather than a package global so a test can drive
+// every value in 0..255 without sharing mutable state between connections: a
+// global would race under -race and would couple concurrently running tests.
+// Production always leaves it nil and uses rand.Intn(256) directly, so the wire
+// distribution is exactly what Naive specifies (0..255, uniform).
+type paddingSizeSource func() int
 
 func generatePaddingHeader() string {
 	paddingLen := rand.Intn(32) + 30
@@ -59,6 +64,25 @@ type paddingConn struct {
 	writePadding     int
 	readRemaining    int
 	paddingRemaining int
+	// paddingSize, when non-nil, supplies the padding length instead of the
+	// default uniform rand.Intn(256). It exists only so tests can exercise the
+	// full 0..255 range deterministically; production leaves it nil.
+	paddingSize paddingSizeSource
+}
+
+// nextPaddingSize returns the padding length for one frame.
+//
+// The default is the Naive protocol's uniform 0..255 draw. The value is NOT
+// clamped to the buffer's free space: the wire format allows the whole range, so
+// narrowing it would change the sender's padding distribution. A caller that
+// cannot accommodate the range must supply a correctly sized buffer, which the
+// production copy path always does (see the headroom check in
+// writeBufferWithPadding).
+func (p *paddingConn) nextPaddingSize() int {
+	if p.paddingSize != nil {
+		return p.paddingSize()
+	}
+	return rand.Intn(256)
 }
 
 func (p *paddingConn) readWithPadding(reader io.Reader, buffer []byte) (n int, err error) {
@@ -116,7 +140,9 @@ func (p *paddingConn) writeWithPadding(writer io.Writer, data []byte) (n int, er
 		return writeFull(writer, data)
 	}
 	if p.writePadding < paddingCount {
-		paddingSize := rand.Intn(256)
+		paddingSize := p.nextPaddingSize()
+		// This path allocates its own buffer, so it always has room for the full
+		// 0..255 range; nothing needs clamping and nothing can fail here.
 		buffer := buf.NewSize(3 + len(data) + paddingSize)
 		defer buffer.Release()
 		header := buffer.Extend(3)
@@ -166,28 +192,32 @@ func (p *paddingConn) writeBufferWithPadding(writer io.Writer, buffer *buf.Buffe
 			_, err := p.writeChunked(writer, buffer.Bytes())
 			return err
 		}
-		paddingSize := rand.Intn(256)
-		if forcedPadding != nil {
-			paddingSize = *forcedPadding
+		if buffer.Start() < 3 {
+			return E.New("naive padding requires 3 bytes of front headroom, buffer has ", buffer.Start())
+		}
+		paddingSize := p.nextPaddingSize()
+		// The padding range is the protocol's full 0..255 and is deliberately
+		// NOT clamped to the buffer. rearHeadroom() advertises 255 for exactly
+		// this reason, and the copy path guarantees it (ReadWaitOptions.Copy
+		// reallocates when RearHeadroom > FreeLen, and CopyExtendedBuffer calls
+		// buffer.Reserve(rearHeadroom)). Narrowing the range here would silently
+		// change the padding-size distribution Naive specifies.
+		//
+		// If a caller still passes a buffer that cannot hold the frame, that is a
+		// programming error in the caller, not a protocol condition: report it as
+		// an error. It must not be common.Must, which would turn it into a panic
+		// and take the whole process down.
+		if buffer.FreeLen() < paddingSize {
+			return E.New("naive padding needs ", paddingSize,
+				" bytes of free space for padding, buffer has ", buffer.FreeLen(),
+				" (padding range 0..255 must be preserved, not clamped)")
 		}
 		header := buffer.ExtendHeader(3)
 		binary.BigEndian.PutUint16(header, uint16(bufferLen))
-		// The header has already consumed 3 bytes of the buffer's free space, so
-		// the padding must fit in what is LEFT. Callers size a buffer from
-		// rearHeadroom(), which reserves 255 bytes for padding alone; after the
-		// header only 252 remain, so a padding size in 253..255 used to reach
-		// WriteZeroN, fail with io.ErrShortBuffer and panic through common.Must -
-		// crashing the whole server process on roughly 1 write in 85.
-		//
-		// Clamping is safe and does not change the protocol: the padding length
-		// is an arbitrary 0..255 chosen by the sender and its only requirement
-		// is that the receiver skip exactly that many bytes, which it does from
-		// the header byte written below.
-		if available := buffer.FreeLen(); paddingSize > available {
-			paddingSize = available
-		}
 		header[2] = byte(paddingSize)
-		common.Must(buffer.WriteZeroN(paddingSize))
+		if err := buffer.WriteZeroN(paddingSize); err != nil {
+			return E.Cause(err, "write naive padding")
+		}
 		framed = true
 	}
 	if _, err := writeFull(writer, buffer.Bytes()); err != nil {
