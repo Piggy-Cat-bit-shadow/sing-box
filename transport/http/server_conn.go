@@ -133,12 +133,30 @@ func (c *serverConn) serveConnect(ctx context.Context, request *http.Request, so
 // parsed as a further request -- a request the client is then deemed to have
 // made. Answering it is a request-smuggling primitive.
 //
-// The RFC also updates CONNECT-UDP (section 6.3) for the same reason: an
-// HTTP/1.x CONNECT-UDP upgrade "is likely to be rejected in certain
+// CONNECT-UDP is handled by the same function and that is a SECURITY-HARDENING
+// choice, NOT an RFC requirement, and the distinction is stated here because an
+// earlier version of this comment got it wrong.
+//
+// RFC 9931 section 6.3 does NOT require a CONNECT-UDP server to close the
+// connection when it rejects an upgrade. What it requires is a CLIENT-side
+// discipline: an HTTP/1.x CONNECT-UDP client must not send UDP tunnel payload
+// optimistically, because the upgrade "is likely to be rejected in certain
 // circumstances, such as when the UDP destination address (which is
-// attacker-controlled) is invalid", and the tunnel content can be untrusted
-// material from other applications on the client device. So an HTTP/1.1
-// CONNECT-UDP rejected before the 101 must close too.
+// attacker-controlled) is invalid". The obligation is on the sender, and it
+// exists so that a rejected upgrade cannot leave payload half-read on the
+// connection.
+//
+// Closing here is therefore defence in depth rather than compliance: it removes
+// the same smuggling shape for a client that ignores section 6.3, at the cost of
+// one extra TLS handshake on the rejection path. It is kept because the cost is
+// paid only on rejection and the alternative is trusting a peer to obey a
+// client-side rule it may not implement.
+//
+// CONNECT-IP is deliberately NOT given the same treatment. RFC 9484 already
+// forbids HTTP/1.x optimistic IP packets, and symmetric application of a
+// hardening measure to a protocol whose specification does not create the shape
+// would be a behavioural change with no requirement behind it. See
+// TestJiejieMASQUERejectedHTTP1CONNECTIPLeavesTheConnectionReusable.
 //
 // This applies only to HTTP/1.1. HTTP/2 and HTTP/3 give every request an
 // explicit stream, so a rejected request cannot leave a second one half-read on

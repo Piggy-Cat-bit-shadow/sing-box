@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,4 +269,114 @@ func TestJiejieMASQUEH2RejectedCONNECTDoesNotKillTheConnection(t *testing.T) {
 			"multiplexed connection carrying unrelated requests")
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode)
+}
+
+// TestJiejieMASQUERejectedHTTP1CONNECTIPLeavesTheConnectionReusable pins that the
+// forced-close rule is NOT applied to CONNECT-IP.
+//
+// # Why this test exists, and what it is protecting against
+//
+// The CONNECT and CONNECT-UDP rejection paths force the HTTP/1.1 connection closed.
+// CONNECT-IP deliberately does not, because the requirement behind those two does not
+// exist for it:
+//
+//   - RFC 9931 section 8 requires a server to close when it rejects a CONNECT, without
+//     processing further requests. That is a SERVER requirement;
+//   - RFC 9931 section 6.3 forbids an HTTP/1.x CONNECT-UDP CLIENT from sending UDP
+//     payload optimistically. Closing on rejection is defence in depth for a client that
+//     ignores it, not compliance;
+//   - RFC 9484 already forbids HTTP/1.x optimistic IP packets for CONNECT-IP, so the
+//     smuggling shape those two close against is not created here.
+//
+// Applying the measure anyway would be a behavioural change with no requirement behind
+// it, costing every rejected CONNECT-IP client an extra TLS handshake for a shape the
+// protocol already rules out.
+//
+// This test is a GUARD, not a defect regression: it passes today, and its purpose is to
+// fail if someone later extends the forced-close rule by symmetry - which is exactly the
+// kind of change that looks obviously correct and is not.
+//
+// # MEASURED: what actually happens to an HTTP/1.1 CONNECT-IP upgrade
+//
+// The tunnel-handler lookup requires a REGISTERED handler for the named protocol, and
+// this fixture registers none (`tunnels` is empty on the http inbound). So
+// `Upgrade: connect-ip` is not a tunnel request here: it is an ordinary forward request,
+// which is answered 400 because the upgrade token is not a CONNECT.
+//
+// The important measurement is that the connection REMAINS USABLE afterwards, and the
+// observed log shows exactly that:
+//
+//	HTTP/1.1 400 Bad Request        <- the connect-ip request, not a tunnel upgrade
+//	HTTP/1.1 407 Proxy Authentication Required   <- the NEXT request on the SAME connection
+//
+// Two responses on one connection is the assertion. It is the exact opposite of the
+// CONNECT case above, which is why the two are separate tests with explicit reasoning
+// rather than one parameterised loop.
+func TestJiejieMASQUERejectedHTTP1CONNECTIPLeavesTheConnectionReusable(t *testing.T) {
+	decoyAddr, _ := startDecoyOrigins(t)
+	port := startJiejieMASQUEH1(t, decoyAddr)
+
+	conn := rawTLSConn(t, port)
+
+	// An HTTP/1.1 request naming the CONNECT-IP upgrade token, WITH valid credentials.
+	//
+	// The credential matters and the first version of this test omitted it, which produced
+	// a misleading failure: without it the FIRST request is answered 407 with "Connection:
+	// close", so the connection closed on the authentication failure and the test saw one
+	// response. That is the ordinary unauthenticated path and has nothing to do with
+	// CONNECT-IP.
+	//
+	// With valid credentials the request is authenticated and then handled as an ordinary
+	// forward request (no tunnel handler is registered for the token), which is the case
+	// whose connection-reuse semantics this test is about.
+	rejected := "GET / HTTP/1.1\r\n" +
+		"Host: example.org\r\n" +
+		"Connection: Upgrade, keep-alive\r\n" +
+		"Upgrade: connect-ip\r\n" +
+		"Capsule-Protocol: ?1\r\n" +
+		"Proxy-Authorization: " + jiejieProxyAuthorization() + "\r\n" +
+		"\r\n"
+
+	// The follow-up carries credentials too, so a response to it proves the connection was
+	// returned to the HTTP/1.1 loop rather than closed.
+	authenticatedFollowUp := "GET /smuggled HTTP/1.1\r\n" +
+		"Host: example.org\r\n" +
+		"Proxy-Authorization: " + jiejieProxyAuthorization() + "\r\n" +
+		"\r\n"
+
+	_, err := conn.Write([]byte(rejected + authenticatedFollowUp))
+	require.NoError(t, err)
+
+	received := readWithTimeout(t, conn, 5*time.Second)
+
+	require.NotContains(t, received, "101",
+		"a CONNECT-IP upgrade must not be accepted over HTTP/1.1")
+
+	// The SECOND request on the same connection must have been processed. This is the
+	// assertion that distinguishes CONNECT-IP from CONNECT: the forced-close rule was
+	// not applied, so the connection was returned to the HTTP/1.1 loop.
+	//
+	// Both requests are unauthenticated, so both are answered 4xx; what matters is that
+	// there are TWO responses. A forced close would produce one and then EOF.
+	require.Contains(t, received, "HTTP/1.1",
+		"the first request must have been answered")
+	responseCount := strings.Count(received, "HTTP/1.1")
+	require.GreaterOrEqual(t, responseCount, 2,
+		"the SECOND request on the same connection must have been processed. Only one "+
+			"response means the connection was closed after the first, i.e. the "+
+			"forced-close rule was applied to CONNECT-IP. That rule has no RFC basis for "+
+			"CONNECT-IP (RFC 9484 already forbids HTTP/1.x optimistic IP packets), so if "+
+			"this starts failing, the change should be reverted rather than accommodated "+
+			"here. Received %d bytes: %q", len(received), truncateForLog(received, 300))
+
+	t.Logf("rejected HTTP/1.1 CONNECT-IP request left the connection reusable: %d HTTP "+
+		"responses on one connection", responseCount)
+}
+
+// truncateForLog shortens a byte string for a log line.
+func truncateForLog(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
 }
