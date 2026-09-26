@@ -31,7 +31,7 @@ cloned at these revisions during this audit:
 | --- | --- | --- |
 | quic-go/masque-go | `c1cf0e4dd6439aea94d5491b27439a4736f00246` | `v0.6.0` |
 | quic-go/connect-ip-go | `fdd945e3d6009b3cee1b1a66493776d315727549` | `v0.4.1-0.20260924175820-fdd945e3d600` |
-| Google QUICHE | NOT-TESTED (see below) | - |
+| Google QUICHE | `c961965aa3ee8f2b6f05ebcac794f7854101adcd` | external tool, built by script |
 
 The two pins are not the same kind of pin, and the difference was measured rather
 than assumed:
@@ -45,7 +45,10 @@ than assumed:
   tidy` silently replaced it with `v0.4.0`, which is **not** the audited revision;
   `replace` cannot be dropped that way.
 
-Google QUICHE was **not** built or run. No interop result is claimed for it.
+Google QUICHE is pinned as an EXTERNAL TOOL rather than a module dependency: it is C++
+built with Bazel, so it is built by `scripts/ci/jiejie-quiche-live-interop.sh` and is
+never vendored and never reaches root `go.mod`. It IS now built and run - see the Boundary
+Closure Round at the end of this document for what that established and what it did not.
 
 ## Changes made in this audit
 
@@ -292,19 +295,29 @@ and none is claimed as PASS:
   behaviour of a CONNECT-UDP or CONNECT-IP tunnel under packet loss, reordering or
   duplication is unmeasured. The datagram paths are lossy by design and the capsule
   fallback is a reliable stream, but neither claim is tested.
-- **ICMP Packet Too Big for oversize IP packets.** The size at which a datagram is
-  rejected in favour of an ICMP error is computed and unit-tested; the ICMPv4
-  Fragmentation Needed and ICMPv6 Packet Too Big packets the endpoint GENERATES for
-  an oversize inner packet were not driven end to end.
+- **ICMP Packet Too Big for oversize IPv6 packets.** The IPv4 case is now CLOSED
+  (see below). The IPv6 message the endpoint GENERATES is still covered field by
+  field including the pseudo-header checksum, but no live IPv6 PTB is claimed: the
+  same asymmetric sender-capacity fixture was attempted for IPv6 and does not reduce
+  to the same margin, because the endpoint clamps the advertised MTU to the IPv6
+  minimum link MTU while the ICMPv6 body is smaller than its IPv4 counterpart.
 - **Proxy-Status beyond the DNS path.** PARTIAL, not absent: the DNS resolution
   failure is implemented and tested, while the other rejection paths (address pool
   exhausted, policy forbidden, internal error) return a bare status code and were
   not audited against RFC 9209.
-- **Google QUICHE interop.** Not built or run. No interop result is claimed.
+- **Google QUICHE MASQUE tunnel interop.** PARTIAL, and the split is deliberate.
+  QUICHE is now BUILT and RUN at the pinned commit, and its HTTP/3 transport interop
+  against a real sing-box process passes. What does NOT pass is the MASQUE tunnel
+  claim: QUICHE's nested encapsulated client aborts with
+  `QUIC_CONNECTION_CANCELLED` before emitting any CONNECT-UDP, while the outer
+  HTTP/3 exchange and sing-box's own CONNECT-UDP both work. The measured blocker and
+  everything ruled out are recorded in
+  `test/jiejie/reference/google_quiche_live_test.go`. No MASQUE tunnel interop with
+  QUICHE is claimed.
 - **RFC 9931's client-side half.** Section 8 tells proxy CLIENTS to wait for a 2xx
   before forwarding TCP payload or to send `Connection: close`, and section 6.3
-  forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client;
-  this repository's HTTP client was not audited against them.
+  forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client,
+  and this repository's HTTP client is now audited against them on the wire.
 
   **RECLASSIFIED as OUT-OF-SCOPE-FOR-SERVER-PRE-VPS**, not left as an open NOT-TESTED
   item. This fork ships exactly one product - a Linux amd64 VPS SERVER - and the
@@ -591,7 +604,7 @@ answered with a 1276-byte reply). No live PTB E2E is claimed.
 | --- | --- | --- |
 | quic-go/masque-go (`c1cf0e4d`) | PASS | `v0.6.0` tag; unchanged pin; CONNECT-UDP round trip, no-auth rejection, settings exchange |
 | quic-go/connect-ip-go (`fdd945e3`) | PASS | pseudo-version pin via `replace`; unchanged; handshake, assignment, ICMP differential, IPv4 and IPv6 control capsules, capsule fallback, migration |
-| Google QUICHE | CHECKED (protocol vectors) | Read at `c961965aa3ee8f2b6f05ebcac794f7854101adcd`; its context-ID decision table and unit vectors are pinned in `test/jiejie/reference/quiche_oracle_test.go`. NOT built and NOT run, so this is a protocol-vector CHECK and NOT interop. |
+| Google QUICHE | CHECKED (vectors) + HTTP/3 transport PASS, tunnel NOT-TESTED | Read at `c961965aa3ee8f2b6f05ebcac794f7854101adcd`, with its context-ID decision table pinned in `test/jiejie/reference/quiche_oracle_test.go`. It is now also BUILT and RUN at that pin: the HTTP/3 transport interop passes, and the MASQUE tunnel claim is NOT-TESTED with a measured QUICHE-side blocker. See the Boundary Closure Round at the end of this document. |
 | Volto-derived migration semantics | PASS | Migration survives a NAT rebind for CONNECT-UDP and CONNECT-IP; new tunnels open afterwards |
 
 Reference HEADs were re-checked at the start of this round: masque-go, connect-ip-go AND
@@ -665,3 +678,188 @@ The impairment tests apply impairment BELOW QUIC. What they measure is therefore
 STACK's tolerance - quic-go's duplicate detection and reassembly, plus the MASQUE session
 above it - not any sing-box loss-recovery logic. sing-box deliberately has none, because a
 QUIC DATAGRAM is unreliable by design and RFC 9297 gives it no retransmission.
+
+---
+
+## Boundary Closure Round
+
+This section records the last round of boundary work before the VPS run. Its rule is the
+one the whole document follows, applied to the four remaining boundaries: a boundary moves
+off the NOT-TESTED list only when a test actually triggers and measures it, and a runner
+that merely exists changes nothing.
+
+### CONNECT-IP live HTTP/3 Packet Too Big — PASS
+
+| Item | Value |
+| --- | --- |
+| Test | `TestReferenceConnectIPPacketTooBigOverHTTP3Live` (`test/jiejie/reference/connect_ip_ptb_live_test.go`) |
+| Trigger | a REAL `quic-go` `DatagramTooLargeError`, not a mock |
+| Server `initial_packet_size` | 1350 |
+| Client `InitialPacketSize` | 1452 |
+| `disable_path_mtu_discovery` | true on both peers |
+| Tunnel MTU | 1400 |
+| Client discovered datagram limit | 1415 bytes (measured, not assumed) |
+| Triggering packet size | 1312 bytes |
+| Returned advertised MTU | 1311 |
+
+The asymmetry is what makes this reachable without a public origin. quic-go derives a
+connection's datagram send limit from both peers' advertised frames AND its own
+conservative payload estimate, and that estimate is seeded from the connection's own
+`InitialPacketSize` and only ever grows. Configuring the two peers differently, with PMTU
+discovery off on both, therefore yields genuinely different capacities per direction:
+
+```
+server 1350 / client 1350 -> client send limit 1313   (symmetric: the old fixture)
+server 1350 / client 1452 -> client send limit 1415   (asymmetric: this fixture)
+```
+
+The client can send a packet the server cannot send back. That is exactly "a request that
+fits, a reply that does not", which the earlier symmetric echo fixture could never produce
+because the server could always shrink its echo reply to fit. The old fixture's
+NOT-TESTED record was correct for the fixture it had; the constraint was the fixture's
+symmetry, not an absence of a mechanism.
+
+The test REQUIRES a Packet Too Big. The trigger packet is asserted strictly below the
+configured tunnel MTU, and the advertised MTU is asserted below both the original packet
+size and the tunnel MTU, so a PTB produced by the endpoint's own MTU check cannot satisfy
+it. Both checksums, the addressing and the quoted packet are verified, and a survivor echo
+proves the session was not torn down.
+
+### A defect this boundary work found and fixed
+
+Running the new fixture against the unmodified endpoint produced **no PTB at all**. The
+cause was a real defect in the delivery path, and no earlier test could have found it
+because none of them reached this path.
+
+The oversized packet is one the endpoint was SENDING INTO the tunnel, so `buildICMPError`
+addressed the error to that packet's SOURCE - which for an endpoint-generated packet is
+the endpoint's own tunnel address. Routing the error by its destination then looked up the
+ENDPOINT's address, which `lookup()` refuses by design because that address is the
+server's and not a client's, so no session matched and the error went to the local device
+handler instead of into the tunnel. The peer that needed the error never received it.
+
+Measured before the fix:
+
+```
+DatagramTooLarge maxPayload=1312 mtu=1311 pktlen=1345
+reply src=198.18.0.1 dst=198.18.0.1   quoted src=198.18.0.1 dst=198.18.0.2
+lookup(198.18.0.1) -> not found       client received: nothing
+```
+
+After the fix, on the same live tunnel:
+
+```
+packet size 1312 -> PTB type=3 code=4 mtu=1311 src=198.18.0.1 dst=198.18.0.2
+```
+
+The endpoint now addresses the error to the peer that owns the failing tunnel and queues
+it on that same session - the shortest path, and the only one that cannot land on the
+wrong tunnel when several peers share an endpoint. `buildICMPErrorTo` performs the
+rewrite and recomputes the checksum, which is load-bearing rather than cosmetic: the IPv4
+checksum covers the addresses and the ICMPv6 checksum covers them through the
+pseudo-header, so a rewrite without recomputation produces an error every real stack
+discards, indistinguishable from the delivery failure being fixed.
+
+Regression injection confirms the test is load-bearing: restoring the exact pre-fix
+implementation fails it, as does the addressing change alone. Both regressions were
+reverted.
+
+### Google QUICHE — BUILT and RUN
+
+| Item | Value |
+| --- | --- |
+| Pinned commit | `c961965aa3ee8f2b6f05ebcac794f7854101adcd` |
+| Bazel version | 8.2.1 (from QUICHE's own `.bazelversion`) |
+| Bazel target | `//quiche:masque_client` |
+| `masque_client` sha256 | `7e84cc4d817bace4bc07f133f51846325c33e0e2c96c1d34d47fe222fedb7777` |
+| Builder | `scripts/ci/jiejie-quiche-live-interop.sh` |
+| Workflow | `.github/workflows/jiejie-masque-reference.yml` (manual + weekly) |
+
+QUICHE stays an EXTERNAL test-only tool. Root `go.mod` is untouched, the workflow
+re-verifies `go.mod` and `go.sum` are byte-identical after the C++ build, and nothing is
+vendored.
+
+**QUICHE HTTP/3 transport interop: PASS.** The real pinned binary completes a QUIC v1
+handshake and an HTTP/3 request/response against a real sing-box process. sing-box's
+SETTINGS were read from the peer and show `EnableDatagrams=true` and
+`EnableExtendedConnect=true`.
+
+**QUICHE CONNECT-UDP tunnel interop: NOT-TESTED.** Every encapsulated attempt fails before
+any CONNECT-UDP reaches the server:
+
+```
+masque_client.cc:143          Failed to connect. Error: QUIC_CONNECTION_CANCELLED
+masque_client_tools.cc:131    Failed to prepare MasqueEncapsulatedClient
+```
+
+The sing-box log for those runs contains the listener start line and nothing else - no
+tunnel, no rejected request - so the failure is inside QUICHE's nested encapsulated client,
+before it emits its first CONNECT-UDP.
+
+Ruled out by measurement rather than assumption:
+
+- the outer HTTP/3 connection works - a `/` argument exits 0 against the same server;
+- sing-box advertises the datagram settings QUICHE checks for;
+- the datagram floor QUICHE enforces is met - it requires
+  `GetGuaranteedLargestDatagramPayload() - 8 - 1 >= 1200`, and sing-box's advertised
+  maximum measured 1313 via `DatagramTooLargeError`, giving 1304;
+- sing-box's own CONNECT-UDP is fine - the pinned masque-go CONNECT-UDP test passes
+  against the same binary and fixture;
+- `--dns_on_client`, `--address_family` and `--masque_mode` make no difference.
+
+This is a QUICHE-side blocker this repository cannot fix, so the claim stays NOT-TESTED
+rather than being softened into a pass. The test is retained because it is the measurement
+that establishes the boundary and must start passing when the blocker is removed.
+
+The workflow keeps the two verdicts apart: the transport-layer step is the failing gate,
+and the tunnel-layer steps are reported with an explicit notice that the claim is
+NOT-TESTED. Sharing one status would either make the workflow red for a reason this
+repository cannot fix, or report the transport success as MASQUE interop.
+
+The cheap protocol-vector check in `quiche_oracle_test.go` is kept and still runs on every
+push: the vectors pin QUICHE's DECISIONS, the live run pins its BEHAVIOUR.
+
+### RFC 9931 client-side half — AUXILIARY FULL-REGISTRY CLIENT AUDIT: PASS
+
+`transport/http/rfc9931_client_optimism_test.go` pins section 8 on the wire rather than by
+reading the code, because the property is an ordering of events on a socket and the
+readable shape of the two functions does not constrain that ordering.
+
+| Pinned behaviour | Result |
+| --- | --- |
+| HTTP/1 CONNECT sends no TCP payload before the 2xx | PASS |
+| A payload written after the 200 reaches the proxy (positive control) | PASS |
+| Rejected CONNECT (407, 403) errors, exposes no conn, emits nothing | PASS |
+| HTTP/1 CONNECT-UDP sends no UDP payload before the 101 | PASS |
+| A datagram sent after the 101 reaches the proxy (positive control) | PASS |
+| Rejected upgrade (400, 407) errors, exposes no tunnel, emits nothing | PASS |
+| A 101 naming a different protocol is refused rather than trusted | PASS |
+
+Regression injection: an early write in either path fails the corresponding test with the
+intended message, and both were reverted.
+
+One defect was found in this test by regression injection and fixed. The first version did
+NOT fail on an injected early write, which would have made it a false green. The cause was
+in the harness: `http.ReadRequest` reads through a `bufio.Reader` and reads AHEAD, so an
+eagerly sent payload was already in the reader's buffer and was never seen by the later
+drain. Measured with the injected write in place, `observed=""` until those buffered bytes
+were drained explicitly.
+
+**SERVER PRE-VPS PRODUCT SCOPE: OUT-OF-SCOPE.** The production minimal registry still
+registers no MASQUE client endpoint, so the client half remains outside what this product
+ships. This audit does not turn it into a production coverage claim, and nothing here
+widens the registry or the binary. It becomes a product obligation only if a client is
+ever added.
+
+### Real VPS / WAN — NOT-TESTED
+
+`scripts/acceptance/jiejie-masque-vps.sh` makes the acceptance checklist repeatable. It is
+a runner, and running it does not close the boundary.
+
+No real deployment was available in this environment, so every WAN row remains NOT-TESTED.
+Verified by execution: with `JIEJIE_VPS_HOST` unset the runner records 11 NOT-TESTED, 0
+PASS, 0 FAIL and writes that explicitly into the report. Harness ready; real deployment
+measurement still required.
+
+Real WAN PMTU is recorded as a **separate** measurement from the loopback PTB test above.
+Neither substitutes for the other.

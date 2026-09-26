@@ -63,6 +63,8 @@ tested one.
 | Empty payload dropped, session survives | `TestReferenceConnectIPEmptyPayload*` | |
 | Largest ordinary IPv6 packet (65575) accepted | `TestIPv6MaximumOrdinaryPacketIsNotSilentlyDropped` | |
 | ICMP Packet Too Big generation, IPv4 and IPv6, both checksums | `TestPacketTooBig*` | |
+| ICMP Packet Too Big delivered over a live HTTP/3 tunnel from a real `DatagramTooLarge` | `TestReferenceConnectIPPacketTooBigOverHTTP3Live` | |
+| PTB addressed to the peer, checksums valid after the destination rewrite | `TestPacketTooBigCanBeAddressedToAnExplicitPeer` | |
 | Cross-session ownership (source forgery rejected) | route/session isolation tests | |
 | Route advertisement cannot override the gateway or another client | route validation tests | |
 | Protocol 0 means all protocols, and overlap cannot bypass ownership | route validation tests | |
@@ -89,6 +91,8 @@ tested one.
 | Every target defined in the source is registered in CI | coverage check inside that step | |
 | Seed corpora are genuinely valid | `TestRouteAdvertisementSeedsAreValid`, `TestAddressSeedsAreValid`, `TestProductionEncoderReproducesTheRFCVectors` | |
 | QUICHE protocol vectors agree (context-ID decision table, both protocols) | `TestQuicheOracle*` | |
+| Google QUICHE binary builds at the pin and completes an HTTP/3 exchange with sing-box | `TestReferenceQuicheH3TransportLiveInterop` | |
+| RFC 9931 client-side optimism (no payload before 2xx/101) | `TestRFC9931*` | |
 
 ---
 

@@ -385,6 +385,7 @@ jobs:
             TestReferenceConnectIPEmptyPayloadIsDroppedAndTheTunnelSurvives \
             TestReferenceConnectIPEmptyPayloadOverCapsules \
             TestReferenceConnectIPPacketTooBigOverHTTP3 \
+            TestReferenceConnectIPPacketTooBigOverHTTP3Live \
             TestReferenceConnectIPTunnelSurvivesPacketImpairment \
             TestReferenceConnectIPRejectsWithoutAuth \
             TestReferenceConnectIPICMPEchoDifferential \
