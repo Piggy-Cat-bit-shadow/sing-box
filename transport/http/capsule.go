@@ -332,8 +332,32 @@ func (c *http3PacketConn) loopDatagram() {
 		if !valid || contextID != 0 {
 			continue
 		}
-		buffer := buf.NewSize(len(datagram) - contextLength)
-		buffer.Write(datagram[contextLength:])
+		// ZERO-COPY: wrap the payload slice instead of copying it into a pooled
+		// buffer.
+		//
+		// This is safe only because of a property of the pinned quic-go that was
+		// VERIFIED rather than assumed (v0.61.0-sing-box-mod.7):
+		//
+		//	datagram_queue.go HandleDatagramFrame:
+		//	    data := make([]byte, len(f.Data)); copy(data, f.Data)
+		//	http3/state_tracking_stream.go enqueueDatagram: appends that slice
+		//	ReceiveDatagram: returns it and drops its own reference
+		//
+		// So the returned []byte is an INDEPENDENT allocation, not a window into a
+		// QUIC receive scratch buffer that the transport will reuse. Nothing else
+		// holds a reference to it once ReceiveDatagram returns, and the queue slot is
+		// popped before the value is handed back.
+		//
+		// buf.As is the right wrapper for that: it is UNMANAGED, so Release() does not
+		// return the slice to a pool - the backing allocation belongs to quic-go and
+		// is reclaimed by the GC. Using a managed pooled buffer here would hand
+		// quic-go's memory to the pool, and a later Get() could hand the same bytes to
+		// an unrelated code path.
+		//
+		// A zero-length payload is preserved: buf.As of an empty slice yields a
+		// zero-length buffer, which is a legal UDP datagram and must still be
+		// delivered. An empty datagram and no datagram are different outcomes.
+		buffer := buf.As(datagram[contextLength:])
 		select {
 		case c.packets <- buffer:
 		case <-c.ctx.Done():
