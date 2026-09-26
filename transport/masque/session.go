@@ -18,8 +18,35 @@ const (
 	PacketHeadroom     = 64
 	QUICPacketOverhead = 51
 	minimumLinkMTU     = 1280
-	maxPacketSize      = 65535
-	sendQueueSize      = 256
+	// maxPacketSize bounds one MASQUE inner IP packet, in bytes.
+	//
+	// It is the largest ORDINARY IPv6 packet, and the arithmetic differs between the
+	// two families:
+	//
+	//	IPv4  Total Length is 16 bits and counts the WHOLE packet, header included,
+	//	      so a maximal IPv4 packet is 65535 bytes;
+	//	IPv6  Payload Length is 16 bits and counts everything AFTER the 40-byte base
+	//	      header (RFC 8200 section 3), so a maximal ordinary IPv6 packet is
+	//	      40 + 65535 = 65575 bytes.
+	//
+	// The value used to be 65535, taken from the IPv4 figure. That silently DISCARDED
+	// any IPv6 packet in the 65536..65575 window: a legal packet, dropped by a bound
+	// that was never about IPv6. Measured before the change, with a real capsule on the
+	// wire path: 65535 was delivered, 65536 and 65575 produced nothing.
+	//
+	// JUMBOGRAMS ARE NOT SUPPORTED and this bound does not enable them. RFC 8200 section
+	// 4.5 allows a Payload Length of 0 with a Hop-by-Hop Jumbo Payload option to carry up
+	// to 2^32-1 bytes; that would need a different parser and is out of scope. The bound
+	// is raised to the largest ordinary packet and no further, and the packet parser
+	// still decides validity from the actual IP header, so a buffer in this range whose
+	// Payload Length does not agree with its size is rejected by the parser rather than
+	// by this limit.
+	//
+	// sing-tun agrees with the arithmetic: gtcpip/header/ipv6.go defines
+	// IPv6MaximumPayloadSize = 65535 for the amount after the base header, and its
+	// IPv6.IsValid admits a total of IPv6MinimumSize + that.
+	maxPacketSize = 40 + 65535
+	sendQueueSize = 256
 )
 
 type sessionHandler interface {
