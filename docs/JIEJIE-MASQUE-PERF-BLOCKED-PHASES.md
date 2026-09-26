@@ -177,9 +177,38 @@ This is the CPU cost of the copy loop and the wrapper, and the per-packet call c
 speedup is derived from it. It is darwin/arm64 and is not presented as a Linux/amd64 VPS
 measurement.
 
+### Ready-to-submit upstream branch
+
+The fix is generic - it adds no sing-box or Jiejie dependency - so it is also prepared
+for SagerNet/sing:
+
+| Item | Value |
+| --- | --- |
+| branch | `upstream/pr-packet-batch-timeout` on `Piggy-Cat-bit-shadow/sing` |
+| base | `87c33f17688fe3dd80eeabef7c3f7a69152ccd42` (current upstream `main`) |
+| commit | `3e644ef72f687fe5cccf9a1cc18cbc79a1b05220` |
+| PR body | `Preserve packet batching through timeout wrappers` |
+
+It is based on upstream `main` rather than the pinned fork branch, as required: the pinned
+branch is based on `4ca3bebe`, which is upstream `dev`. The interfaces the fix relies on
+(`ConnectedPacketBatchWriteCreator`, `ConnectedPacketBatchReadWaitCreator`,
+`bufio.CreateConnectedPacketBatchWriter`, `bufio.CreateConnectedPacketBatchReadWaiter`)
+are unchanged on `main`, so the commit cherry-picks with NO conflicts and needs no
+re-porting.
+
+Verified on that base: it builds, `go test ./common/canceler/` passes, `-race` passes,
+`go test ./common/bufio/` passes, and `gofmt` is clean.
+
+**No pull request was opened.** The task explicitly requires preparing the branch without
+creating a public PR, so the branch is pushed and left for a human to submit.
+
 ### Scope
 
 Phase 4 only. Phases 7, 9, 10 and 11 remain as recorded below; nothing else was changed.
+
+The Linux syscall evidence above is `sendmmsg` only. `recvmmsg` and `UDP_SEGMENT`/GSO were
+NOT traced, so **LINUX SYSCALL RUNTIME for those is NOT-TESTED** and no claim is made about
+them here.
 
 ## Phase 7 — batch HTTP Datagram enqueue in quic-go
 
