@@ -307,7 +307,7 @@ jobs:
           # check at the end of this step is what makes forgetting fail the build.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
             go test -v -count=1 -timeout 20m \
-            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceStreamFailure|TestReferenceUnauthenticatedLimiter|TestReferenceUnvalidatedSpoof|TestSourceIdentity' . \
+            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceStreamFailure|TestReferenceUnauthenticatedLimiter|TestReferenceUnvalidatedSpoof|TestSourceIdentity|TestQuicheOracle' . \
             2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
           # The CONNECT-IP cases run against the full-registry binary, which is
