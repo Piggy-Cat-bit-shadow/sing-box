@@ -232,20 +232,34 @@ func readAddressAssignmentAndRoutes(t *testing.T, reader io.Reader) (netip.Prefi
 // RFC 9484 section 4.5 defines the payload as a REPEATED sequence of entries, each
 //
 //	Request ID (varint)
-//	IP Address
+//	IP Version (one byte, 4 or 6)
+//	IP Address (4 bytes for version 4, 16 bytes for version 6)
 //	IP Prefix Length (one byte)
 //
-// with no leading count field. Measured against sing-box's own encoder:
-// a single assignment of 198.18.0.2/32 arrives as
+// with no leading count field. A single assignment of 198.18.0.2/32 arrives as
 //
 //	00                request ID 0 (unsolicited assignment)
-//	04 c6 12 00 02    address family byte 4 (IPv4, 32 bits) then the 4 address bytes
+//	04 c6 12 00 02    IP Version 4, then the 4 address bytes
 //	20                prefix length 32
 //
-// The family byte is a BIT count, not a byte count: 4 means IPv4 and 6 means
-// IPv6, and the address length is therefore family/8. Reading it as a byte length
-// consumes 4 bytes for IPv4 (coincidentally right) but only 6 for IPv6 (wrong),
-// which is why this is spelled out rather than inferred.
+// and a single assignment of 2001:db8::1/128 arrives as
+//
+//	00                request ID 0
+//	06 2001:0db8::1   IP Version 6, then the 16 address bytes
+//	80                prefix length 128
+//
+// CORRECTED: the byte before the address is the IP VERSION and is not a byte
+// length. An earlier version of this decoder read it as a byte count (4 -> 4
+// bytes, 16 -> 16 bytes). That looked correct for IPv4, because 4 is both the
+// version marker and the IPv4 byte length, and was wrong for IPv6, where it
+// consumed 6 address bytes and misaligned the prefix length and every following
+// entry. Nothing caught it because every control-capsule fixture in this module was
+// IPv4.
+//
+// control_capsule_wire_test.go locks the correction in with vectors written byte by
+// byte from the RFC and cross-checked against connect-ip-go's own writer. They
+// never call the production encoder, so the harness and the implementation cannot
+// be wrong together, which is the only way this class of mistake stays caught.
 func parseAddressAssign(payload []byte) (netip.Prefix, bool) {
 	// Request ID first, ignored: an unsolicited assignment carries zero.
 	if _, n, ok := decodeVarint(payload); ok {
@@ -276,77 +290,87 @@ func parseAssignedPrefix(payload []byte) (netip.Prefix, bool) {
 	return netip.PrefixFrom(address, bits), true
 }
 
-// parseAddress reads one address whose first byte is its BYTE length.
+// parseAddress reads one IP-version-prefixed address and reports how many bytes
+// it consumed.
 //
-// MEASURED against this server rather than inferred from the RFC text. A single
-// assignment of 198.18.0.2/32 arrives as
-//
-//	00                request ID 0 (unsolicited assignment)
-//	04 c6 12 00 02    family byte 04, then four address bytes
-//	20                prefix length 32
-//
-// so 04 is the number of ADDRESS BYTES (IPv4 = 4, IPv6 = 16), which matches
-// sing-box's own encoder (transport/masque/capsule.go appendAddress writes 4 for
-// IPv4 and 6... no: it writes 4 for IPv4 and 16 for IPv6, and the byte that
-// reaches the wire is the byte count).
-//
-// The temptation is to read 4 and 6 as "IPv4 and IPv6" version markers, which
-// happens to work for IPv4 and breaks IPv6. They are lengths: 4 bytes and 16
-// bytes. A zero first byte is the wildcard form the references use to mean "any
-// address" for a route endpoint.
+// The byte before the address is the IP VERSION, whose only legal values are 4 and
+// 6; the address length follows from it. It is NOT a byte length. See
+// parseAddressAssign for the correction history.
 func parseAddress(payload []byte) (netip.Addr, int, bool) {
+	address, _, consumed, ok := parseVersionedAddress(payload)
+	return address, consumed, ok
+}
+
+// parseVersionedAddress is the single decoder the address and route parsers share,
+// so the IP Version rule is stated exactly once, and reports the address BYTE
+// length as well as the bytes consumed.
+//
+// A zero version byte is refused: no IP Version is 0. The list forms in RFC 9484
+// that use 0 as "any address" are capsule-type 0x04 entries, which this suite does
+// not decode, so accepting 0 here would invent a wire shape the RFC does not have
+// and would let a misaligned buffer decode as something plausible.
+func parseVersionedAddress(payload []byte) (netip.Addr, int, int, bool) {
 	if len(payload) == 0 {
-		return netip.Addr{}, 0, false
+		return netip.Addr{}, 0, 0, false
 	}
-	byteLength := int(payload[0])
-	if byteLength == 0 {
-		return netip.IPv4Unspecified(), 1, true
+	byteLength, valid := addressByteLength(payload[0])
+	if !valid {
+		// Any other value, 16 included, is not an IP Version.
+		return netip.Addr{}, 0, 0, false
 	}
 	if len(payload) < 1+byteLength {
-		return netip.Addr{}, 0, false
+		return netip.Addr{}, 0, 0, false
 	}
 	switch byteLength {
 	case 4:
-		return netip.AddrFrom4([4]byte(payload[1:5])), 5, true
-	case 16:
-		return netip.AddrFrom16([16]byte(payload[1:17])), 17, true
+		return netip.AddrFrom4([4]byte(payload[1:5])), 4, 5, true
 	default:
-		return netip.Addr{}, 0, false
+		return netip.AddrFrom16([16]byte(payload[1:17])), 16, 17, true
+	}
+}
+
+// addressByteLength maps an IP Version byte to the address length that follows it.
+func addressByteLength(version byte) (int, bool) {
+	switch version {
+	case 4:
+		return 4, true
+	case 6:
+		return 16, true
+	default:
+		return 0, false
 	}
 }
 
 // parseRouteAdvertisement decodes a ROUTE_ADVERTISEMENT payload.
 //
-// MEASURED against this server, and the shape is asymmetric in a way that is easy
-// to get wrong. For an endpoint advertising 0.0.0.0/0 with protocol 0 the payload
-// is ten bytes:
+// RFC 9484 section 4.7 defines the payload as a REPEATED sequence of entries, each
 //
-//	04 00 00 00 00    start: family byte 04, then four address bytes
-//	ff ff ff ff       end:   four address bytes, NO family byte
+//	IP Version (one byte, 4 or 6)
+//	Start IP Address (4 or 16 bytes, by version)
+//	End IP Address (same width, RAW - no version byte of its own)
+//	IP Protocol (one byte)
+//
+// so an endpoint advertising 0.0.0.0/0 with protocol 0 sends ten bytes:
+//
+//	04 00 00 00 00    start: IP Version 4, then four address bytes
+//	ff ff ff ff       end:   four address bytes, NO version byte
 //	00                IP protocol 0 (all protocols)
 //
-// Only the START address carries a length byte. The end address is written raw,
-// because it is guaranteed to be the same family as the start, and sing-box's own
-// encoder does exactly that:
-//
-//	payload = appendAddress(payload, route.Start)
-//	payload = append(payload, route.End.AsSlice()...)
-//	payload = append(payload, route.Protocol)
-//
-// Reading a length byte before the end address therefore consumes one byte of the
-// address and shifts everything after it, which is what the first version of this
-// decoder did. The end address is now read using the length already established by
-// the start.
+// The asymmetry is the part that is easy to get wrong, and both halves of it have
+// now been wrong once: the FIRST version of this decoder expected a second version
+// byte before the end address and shifted every following byte, and the second
+// version read the single version byte as a byte length. The end address is read
+// with the width the start address's version already established.
 func parseRouteAdvertisement(payload []byte) ([]connectip.IPRoute, bool) {
 	var routes []connectip.IPRoute
 	for len(payload) > 0 {
-		start, byteLength, n, ok := parseAddressWithLength(payload)
+		start, byteLength, n, ok := parseVersionedAddress(payload)
 		if !ok {
 			return nil, false
 		}
 		payload = payload[n:]
 
-		// The end address is the same family as the start and carries no length
+		// The end address is the same family as the start and carries no version
 		// byte of its own.
 		if len(payload) < byteLength {
 			return nil, false
@@ -381,28 +405,4 @@ func parseRouteAdvertisement(payload []byte) ([]connectip.IPRoute, bool) {
 		return nil, false
 	}
 	return routes, true
-}
-
-// parseAddressWithLength reads one length-prefixed address and also reports the
-// address BYTE length, which the route decoder needs in order to read the
-// unprefixed end address that follows.
-func parseAddressWithLength(payload []byte) (netip.Addr, int, int, bool) {
-	if len(payload) == 0 {
-		return netip.Addr{}, 0, 0, false
-	}
-	byteLength := int(payload[0])
-	if byteLength == 0 {
-		return netip.IPv4Unspecified(), 0, 1, true
-	}
-	if len(payload) < 1+byteLength {
-		return netip.Addr{}, 0, 0, false
-	}
-	switch byteLength {
-	case 4:
-		return netip.AddrFrom4([4]byte(payload[1:5])), 4, 5, true
-	case 16:
-		return netip.AddrFrom16([16]byte(payload[1:17])), 16, 17, true
-	default:
-		return netip.Addr{}, 0, 0, false
-	}
 }
