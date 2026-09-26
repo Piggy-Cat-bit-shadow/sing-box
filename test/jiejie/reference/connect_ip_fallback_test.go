@@ -81,6 +81,96 @@ func startDatagramDisabledConnectIPClient(t *testing.T, server *singBoxServer) *
 	return client
 }
 
+// connectIPControlPeer is a CONNECT-IP peer whose datagram support is configurable,
+// built directly on quic-go's HTTP/3 API.
+//
+// It exists so a test can drive the CONNECT-IP endpoint with raw HTTP Datagrams -
+// including a nonzero context ID - which connect-ip-go cannot express: its Conn
+// always frames with context ID 0 and keeps its stream unexported.
+type connectIPControlPeer struct {
+	clientConn     *http3.ClientConn
+	transport      *http3.Transport
+	quicConn       *quic.Conn
+	enableDatagram bool
+}
+
+// startDatagramCapableConnectIPClient dials the CONNECT-IP endpoint advertising HTTP
+// Datagram support, so the datagram path (rather than the capsule fallback) is
+// exercised.
+func startDatagramCapableConnectIPClient(t *testing.T, server *singBoxServer) *connectIPControlPeer {
+	t.Helper()
+	return startConnectIPControlPeer(t, server, true)
+}
+
+// startDatagramDisabledConnectIPPeer is the same peer with datagrams OFF.
+func startDatagramDisabledConnectIPPeer(t *testing.T, server *singBoxServer) *connectIPControlPeer {
+	t.Helper()
+	return startConnectIPControlPeer(t, server, false)
+}
+
+func startConnectIPControlPeer(t *testing.T, server *singBoxServer, enableDatagram bool) *connectIPControlPeer {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	quicConn, err := quic.DialAddr(ctx, server.address(), &tls.Config{
+		ServerName:         referenceTestTLSName,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{http3.NextProtoH3},
+	}, &quic.Config{EnableDatagrams: true, InitialPacketSize: 1350})
+	require.NoError(t, err)
+
+	transport := &http3.Transport{EnableDatagrams: enableDatagram}
+	peer := &connectIPControlPeer{
+		clientConn:     transport.NewClientConn(quicConn),
+		transport:      transport,
+		quicConn:       quicConn,
+		enableDatagram: enableDatagram,
+	}
+	t.Cleanup(func() {
+		peer.clientConn.CloseWithError(0, "")
+		transport.Close()
+		_ = quicConn.CloseWithError(0, "")
+	})
+	return peer
+}
+
+// openTunnel performs the CONNECT-IP extended CONNECT and returns the request stream
+// plus the response.
+func (c *connectIPControlPeer) openTunnel(t *testing.T, server *singBoxServer) (*http3.RequestStream, *http.Response) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+
+	stream, err := c.clientConn.OpenRequestStream(ctx)
+	require.NoError(t, err)
+
+	template, err := uritemplate.New(server.connectIPURL())
+	require.NoError(t, err)
+	requestURL, err := url.Parse(template.Raw())
+	require.NoError(t, err)
+
+	request := &http.Request{
+		Method: http.MethodConnect,
+		Proto:  "connect-ip",
+		URL:    requestURL,
+		Host:   referenceTestTLSName,
+		Header: http.Header{
+			"Capsule-Protocol": []string{"?1"},
+			"Authorization":    []string{basicAuthorization()},
+		},
+	}
+	require.NoError(t, stream.SendRequestHeader(request))
+
+	response, err := stream.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode,
+		"the CONNECT-IP extended CONNECT must be accepted")
+	return stream, response
+}
+
 // openTunnel performs the CONNECT-IP extended CONNECT and returns the request
 // stream plus the response.
 func (c *datagramDisabledConnectIPClient) openTunnel(t *testing.T, server *singBoxServer) (*http3.RequestStream, *http.Response) {
