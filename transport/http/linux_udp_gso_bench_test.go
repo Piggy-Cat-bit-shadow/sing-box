@@ -196,30 +196,6 @@ func gsoTestSocket(t *testing.T) (sendFD int, recvFD int) {
 	return sendFD, recvFD
 }
 
-// gsoMedianBatch runs one batch repeatedly and returns the median duration.
-func gsoMedianBatch(t *testing.T, sendFD int, sizes []int, groups []int, payload []byte, useGSO bool, repeats int) time.Duration {
-	t.Helper()
-	samples := make([]time.Duration, 0, repeats)
-	for range repeats {
-		messages := gsoBuildMessages(sizes, groups, payload, useGSO)
-		start := time.Now()
-		if _, errno := sendmmsgRaw(sendFD, messages, 0); errno != 0 {
-			t.Fatalf("sendmmsg failed: %v", errno)
-		}
-		samples = append(samples, time.Since(start))
-	}
-	sortDurations(samples)
-	return samples[len(samples)/2]
-}
-
-func sortDurations(samples []time.Duration) {
-	for index := 1; index < len(samples); index++ {
-		for scan := index; scan > 0 && samples[scan] < samples[scan-1]; scan-- {
-			samples[scan], samples[scan-1] = samples[scan-1], samples[scan]
-		}
-	}
-}
-
 // TestLinuxGSOPreservesDatagramBoundaries proves the measurement is of REAL GSO.
 //
 // Without this, the benchmark below could be measuring a code path where the kernel
@@ -302,7 +278,7 @@ func BenchmarkLinuxGSOGroupingVsSendmmsgOnly(b *testing.B) {
 	if err != nil {
 		b.Skipf("no UDP socket available: %v", err)
 	}
-	defer unix.Close(recvFD)
+	defer func() { _ = unix.Close(recvFD) }()
 	_ = unix.SetsockoptInt(recvFD, unix.SOL_SOCKET, unix.SO_RCVBUF, 8<<20)
 	if err = unix.Bind(recvFD, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
 		b.Skipf("cannot bind loopback UDP: %v", err)
@@ -314,7 +290,7 @@ func BenchmarkLinuxGSOGroupingVsSendmmsgOnly(b *testing.B) {
 	if err != nil {
 		b.Skipf("no sender socket: %v", err)
 	}
-	defer unix.Close(sendFD)
+	defer func() { _ = unix.Close(sendFD) }()
 	_ = unix.SetsockoptInt(sendFD, unix.SOL_SOCKET, unix.SO_SNDBUF, 8<<20)
 	if err = unix.Connect(sendFD, &unix.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
 		b.Skipf("cannot connect sender: %v", err)
