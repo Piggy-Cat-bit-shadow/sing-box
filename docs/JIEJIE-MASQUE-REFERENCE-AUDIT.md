@@ -417,12 +417,38 @@ Seven chain shapes now resolve correctly to the upper-layer protocol (UDP 17 / T
 by sing-tun's `header.IPTransportProtocol`, which is pinned as a dependency; these
 tests lock the behaviour rather than reimplementing the parser.
 
-**One measured result, recorded rather than changed**: a NON-FIRST fragment reports
-protocol 17, the base header's value, because the chain walk stops at the fragment
-header. A non-first fragment genuinely carries no upper-layer header, so no protocol
-can be derived from it - but a route rule keyed on protocol does see the base
-header's value for fragmented traffic. Changing that would mean reimplementing
-sing-tun's parser or diverging from it.
+**CORRECTED in the Pre-VPS closure round.** This section previously stated that a
+NON-FIRST fragment "reports protocol 17, the base header's value, because the chain walk
+stops at the fragment header". **That was wrong, and the test that produced it was
+producing a different packet than its name claimed.**
+
+Two separate defects, both now fixed:
+
+1. The fixture's packet builder used `nextHeader == 0` as an "unset" sentinel, but 0 is
+   the real and only legal Hop-by-Hop value. The base header's Next Header was therefore
+   ALWAYS written as 0 regardless of the chain, and an explicit Hop-by-Hop entry was
+   silently rewritten to point at the next entry. The packet the old test called "a
+   non-first fragment" was actually `Hop-by-Hop -> Fragment(non-first)`.
+2. The claim itself misdescribes the dependency. The pinned sing-tun does not read the
+   base header's field at that point: `skipIPv6ExtensionHeaders` returns at the fragment
+   header (`flow_parse.go`, `case header.IPv6FragmentExtHdrIdentifier: return protocol,
+   payload, true, false`), and `IPTransportProtocol` then takes **the fragment header's own
+   Next Header** (`icmp_error.go`, `protocol = payload[0]`). The old claim looked right only
+   because both fields coincidentally held 17 in the mis-built fixture.
+
+Measured with a discriminator packet in which the two fields differ - base Next Header 43
+(Routing), fragment Next Header 6 (TCP) - the resolver returns **6**, i.e. the fragment
+header's field. A non-first fragment naming an extension header (0, 43, 60, 44) is
+REJECTED. See `transport/masque/ipv6_extension_chain_test.go`.
+
+The rest of the section stands: the walk is sing-tun's, it is pinned as a dependency, and
+these tests lock its behaviour rather than reimplementing it. What changed is that the
+recorded result now describes what the dependency actually does.
+
+The old fixture's other limitation is also recorded, because it hid coverage: EVERY
+Hop-by-Hop, Routing, Destination-Options, Fragment and multi-header case in it was
+byte-identical in the base header, so the chain walk was never exercised from a non-zero
+entry point.
 
 ### Proxy-Status is PARTIAL
 
@@ -581,8 +607,38 @@ Removed from the NOT-TESTED list, each with a live or deterministic test:
 - RFC 9931's client-side half: reclassified OUT-OF-SCOPE-FOR-SERVER-PRE-VPS rather than
   left as an open NOT-TESTED item. This fork's product is a Linux amd64 VPS server, and the
   production minimal registry serves no MASQUE client endpoint.
-- IPv6 extension headers and the IP packet parser: see the sub-sections below.
-- Cross-session ownership, route policy and control-plane resource bounds: see below.
+- IPv6 extension headers: rebuilt on a correct packet builder, with 10 chain cases
+  (plain UDP/TCP, Hop-by-Hop -> UDP, Routing -> TCP, Destination Options -> UDP, Fragment
+  offset 0 -> UDP, three-header chains, a 16-octet Hop-by-Hop, Destination Options ->
+  Fragment), the corrected non-first-fragment result, fragment-chain termination, nine
+  malformed shapes rejected without panicking, and a guard that a declared Payload Length
+  is not trusted for slicing. Four mutations of the production path were caught and
+  reverted. The IP packet parser stays clean under bounded fuzzing (283,922 executions for
+  the packet parser, 208,450 for capsule fragmentation, no crash).
+- Cross-session ownership, route policy and control-plane resource bounds: see the tests
+  in `transport/masque/ownership_policy_test.go` and `transport/masque/control_burst_test.go`.
+
+### One asymmetry recorded rather than fixed
+
+`serverSession.handlePacket` (peer -> server ingress) ENFORCES source ownership: a forged
+source is answered with ICMP Source Address Failed Ingress/Egress Policy and never written
+to the device. `Server.WritePacketBuffers` (device -> tunnel egress) applies NO
+source-ownership check at all; it routes on DESTINATION plus the receiver's advertised
+routes, so a packet whose source is another client's assigned address, or an address
+nobody holds, is queued into a tunnel exactly like a legitimate one.
+
+This is recorded as INFORMATION, not as a defect, and no production change was made:
+
+  - the ingress path is the one an untrusted peer can reach. The egress path is fed by the
+    local TUN device, where the host chose the source and the kernel has already applied
+    its own anti-spoofing filters. There is no attacker model in which a MASQUE peer
+    controls what the device emits;
+  - a check there would be defence in depth at best, and for a packet the host itself
+    generated it would drop legitimate traffic whose source is a routed address rather than
+    a tunnel address.
+
+The asymmetry is pinned by `TestDeviceIngressSourcePolicyIsNotEnforced` so that a future
+reader does not mistake one direction's behaviour for the other's.
 
 ### Still NOT-TESTED, and why
 
