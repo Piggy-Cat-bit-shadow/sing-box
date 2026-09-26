@@ -50,16 +50,27 @@ const (
 )
 
 // startServerProcess launches the sing-box binary with a configuration file and
-// returns a stop function.
+// returns a stop function plus the path of the file holding its output.
 //
-// The process is waited for readiness on its UDP port before returning, because
-// a QUIC client that dials too early fails with a transport error that reads
-// like a protocol bug. Readiness is proven by an actual QUIC path being bound,
-// which is the only thing the client needs.
-func startServerProcess(t *testing.T, binary string, configPath string) func() {
+// The log path is RETURNED rather than kept private, because the server's own log
+// is the only test-side observation of what sing-box recorded for a connection: the
+// reference clients are separate processes on the other end of a socket and cannot
+// see the server's view of a source address. Tests that need that view read this
+// file; see migration_test.go.
+//
+// Reading the log is a TEST-ONLY observation and needs no production change: the
+// server already logs the source address of every tunnel it admits, at INFO, and
+// the fixture already writes that output to a file. No debug hook, no exported API
+// and no build tag is involved.
+//
+// The process is waited for readiness on its UDP port before returning, because a
+// QUIC client that dials too early fails with a transport error that reads like a
+// protocol bug. Readiness is proven by an actual QUIC path being bound, which is the
+// only thing the client needs.
+func startServerProcess(t *testing.T, binary string, configPath string) (stop func(), logPath string) {
 	t.Helper()
 
-	logPath := filepath.Join(t.TempDir(), "sing-box-masque.log")
+	logPath = filepath.Join(t.TempDir(), "sing-box-masque.log")
 	logFile, err := os.Create(logPath)
 	require.NoError(t, err)
 
@@ -69,7 +80,7 @@ func startServerProcess(t *testing.T, binary string, configPath string) func() {
 	require.NoError(t, command.Start())
 
 	var once bool
-	stop := func() {
+	stop = func() {
 		if once {
 			return
 		}
@@ -93,7 +104,7 @@ func startServerProcess(t *testing.T, binary string, configPath string) func() {
 		_ = logFile.Close()
 	}
 
-	return stop
+	return stop, logPath
 }
 
 // startSingBoxWithConfig starts a sing-box process from an explicit top-level
@@ -155,11 +166,12 @@ func startSingBoxWithConfig(t *testing.T, overrides map[string]any) *singBoxServ
 	overrides["log"] = map[string]any{"level": "debug"}
 
 	configPath := writeConfigFile(t, overrides)
-	process := startServerProcess(t, binary, configPath)
+	process, logPath := startServerProcess(t, binary, configPath)
 
 	return &singBoxServer{
 		port:          port,
 		stop:          process,
+		logPath:       logPath,
 		connectIPPath: defaultConnectIPPath,
 	}
 }

@@ -299,9 +299,15 @@ jobs:
           #
           # CONNECT-UDP, migration and Proxy-Status run against the production
           # minimal binary.
+          # TestSourceIdentity* rather than TestReferenceSourceIdentity*: the
+          # source-identity measurement was rewritten (see
+          # test/jiejie/reference/source_identity_test.go) and the old
+          # TestReferenceSourceIdentityIsStableAcrossMigration is gone. The filter
+          # AND the assertion list below must both be updated together; the coverage
+          # check at the end of this step is what makes forgetting fail the build.
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
             go test -v -count=1 -timeout 20m \
-            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceUnvalidatedSpoof|TestReferenceSourceIdentity' . \
+            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceUnvalidatedSpoof|TestSourceIdentity' . \
             2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
 
           # The CONNECT-IP cases run against the full-registry binary, which is
@@ -347,11 +353,19 @@ jobs:
             TestReferenceMasqueGoConnectUDPRejectedWithoutAuth \
             TestReferenceMasqueGoRequiresServerDatagramSupport \
             TestReferenceHarnessDetectsAStoppedServer \
+            TestReferenceHarnessDecodesIPv6AddressAssign \
+            TestReferenceHarnessDecodesIPv6RouteAdvertisement \
+            TestReferenceHarnessRejectsInvalidIPVersion \
             TestReferenceConnectUDPSurvivesNATRebinding \
             TestReferenceConnectUDPNewTunnelAfterRebinding \
             TestReferenceUnvalidatedSpoofDoesNotChangeIdentity \
-            TestReferenceSourceIdentityIsStableAcrossMigration \
+            TestSourceIdentityIsRecordedAndDrivesRouting \
+            TestSourceIdentityIgnoresClientSuppliedHeaders \
+            TestSourceIdentityIsStableAcrossMigration \
+            TestSourceIdentityRoutingRuleIsLoadBearing \
             TestReferenceConnectIPHandshakeAndAssignment \
+            TestReferenceConnectIPv6ControlCapsulesAgainstRealServer \
+            TestReferenceConnectIPv6DatagramCapsuleFallback \
             TestReferenceConnectIPRejectsWithoutAuth \
             TestReferenceConnectIPICMPEchoDifferential \
             TestReferenceConnectIPSurvivesNATRebinding \
@@ -369,15 +383,22 @@ jobs:
             fi
           done
 
-          # Every TestReference case that EXISTS must have been run. The explicit
-          # list above is what caught the Phase 3 gap, but a list can go stale the
-          # same way a filter can: adding a test without adding it here would mean
-          # it never runs and nothing says so. This compares the tests present in
-          # the source against the ones the log reports having run, so a new test
-          # that is not covered fails the build instead of passing silently.
+          # Every self-contained reference case that EXISTS must have been run. The
+          # explicit list above is what caught the Phase 3 gap, but a list can go
+          # stale the same way a filter can: adding a test without adding it here
+          # would mean it never runs and nothing says so. This compares the tests
+          # present in the source against the ones the log reports having run, so a
+          # new test that is not covered fails the build instead of passing silently.
+          #
+          # BOTH naming conventions are matched. The suite is no longer uniformly
+          # TestReference*: the source-identity cases are TestSourceIdentity*, and an
+          # earlier version of this check only looked for TestReference, so those four
+          # tests would have been invisible to it and could have silently dropped out
+          # of the run filter. TestReferenceHarness* self-checks stay included because
+          # they still begin with TestReference.
           echo ""
           echo "=== reference test coverage check ==="
-          DEFINED=$(grep -rhoE '^func (TestReference[A-Za-z0-9_]*)' \
+          DEFINED=$(grep -rhoE '^func (Test(Reference|SourceIdentity)[A-Za-z0-9_]*)' \
             test/jiejie/reference/*_test.go | sed 's/^func //' | sort -u)
           MISSING=0
           for TEST in $DEFINED; do

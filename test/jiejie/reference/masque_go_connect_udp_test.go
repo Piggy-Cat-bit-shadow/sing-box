@@ -57,9 +57,18 @@ const (
 // configuration below is intentionally the same shape as
 // startJiejieMASQUEH3 so the two harnesses describe the same server.
 type singBoxServer struct {
-	port   uint16
-	stop   func()
-	origin string
+	port uint16
+	stop func()
+	// logPath is the file holding the server process's own output, which is the
+	// only test-side observation of what sing-box RECORDED for a connection. The
+	// reference clients are separate processes on the other end of a socket, so
+	// they can never see the server's view of a source address; reading the
+	// server's log is how a test asserts on it. See migration_test.go.
+	//
+	// This is a TEST-ONLY observation of output the server already writes at INFO
+	// level. It adds no production API, no debug hook and no build tag.
+	logPath string
+	origin  string
 	// connectIPPath is the URI template path for the CONNECT-IP resource. It is
 	// a field because the path is part of what is being tested: the reference
 	// client must be pointed at the resource the server actually serves.

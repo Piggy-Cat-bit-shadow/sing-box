@@ -194,46 +194,32 @@ func TestReferenceUnvalidatedSpoofDoesNotChangeIdentity(t *testing.T) {
 		"the connection must still be usable for new authenticated tunnels")
 }
 
-// TestReferenceSourceIdentityIsStableAcrossMigration measures what identity the
-// SERVER layer reports, which is the part sing-box owns.
+// The SOURCE-IDENTITY measurement lives in source_identity_test.go, and it moved
+// because the version that used to be here was not evidence.
 //
-// quic-go performs path validation; sing-box must then decide what source identity
-// to attach to a request. The requirement is not "always the newest address" nor
-// "always the original" - it is that an UNVALIDATED source can never replace a
-// validated one. This test records the measured behaviour rather than asserting a
-// preferred design, because the design is quic-go's to choose and observing it is
-// what the task asks for.
+// This comment is kept so the history is not silently lost. The old
+// TestReferenceSourceIdentityIsStableAcrossMigration said in its doc comment that it
+// measured "what identity the SERVER layer reports ... taken from the server's own
+// logs". It did not read the log and it did not read the source. What its body
+// actually proved was that the relay's source port changed and that both tunnels
+// still carried traffic - a real DATA-PATH property, and one that
+// TestReferenceConnectUDPSurvivesNATRebinding already covers, but not the identity
+// sing-box attached to the request.
 //
-// The measurement is taken from the server's own logs, which print the source
-// address for each tunnel, so it reflects what sing-box actually recorded rather
-// than what the client believes.
-func TestReferenceSourceIdentityIsStableAcrossMigration(t *testing.T) {
-	server := startSingBoxMASQUEH3(t, "")
-	t.Cleanup(server.stop)
-
-	relay, dialAddress := startUDPNATRelay(t, server.address())
-	client := startRelayedConnectUDPClient(t, server, dialAddress)
-
-	stream, _ := client.openTunnel(t, server.origin)
-	require.Equal(t, "origin:identity-1", datagramEchoRoundTrip(t, stream, "identity-1"))
-
-	relay.rebind()
-
-	// A new tunnel after the migration, whose admission identity the server records.
-	secondStream, _ := client.openTunnel(t, server.origin)
-	require.Equal(t, "origin:identity-2", datagramEchoRoundTrip(t, secondStream, "identity-2"))
-
-	// The first tunnel must be unaffected by anything the second one did.
-	require.Equal(t, "origin:identity-1b",
-		datagramEchoRoundTrip(t, stream, "identity-1b"))
-
-	// Both tunnels must present DIFFERENT client-facing addresses, which proves the
-	// relay really did change the path rather than the test having no effect.
-	ports := relay.upstreamPortsSeen()
-	require.GreaterOrEqual(t, len(ports), 2)
-	t.Logf("source identity: upstream ports seen %v; both tunnels usable after "+
-		"migration", ports)
-}
+// The audit recorded "source identity CLOSED" on that basis, which the test did not
+// support. The replacement observes metadata.Source through the ROUTING LAYER, which
+// is a real consumer of it: a `source_ip_cidr` rule routes to one of two named
+// outbounds, and the outbound tag in the server's log is the routing decision. See
+// source_identity_test.go for the fixture, the migration case and the load-bearing
+// negative control.
+//
+// What is NOT claimed anywhere in this suite: quic-go's cryptographic path
+// validation is quic-go's (RFC 9000 section 9), and no test here reimplements it or
+// synthesizes PATH_CHALLENGE / PATH_RESPONSE. The OPAQUE SPOOF test above
+// (TestReferenceUnvalidatedSpoofDoesNotChangeIdentity) shows only that opaque,
+// unvalidated third-party traffic cannot disturb an established connection; it does
+// not establish anything about QUIC's internal path state, and it is not presented
+// as if it did.
 
 // TestReferenceConnectIPSurvivesNATRebinding is migration case 3.
 //
