@@ -18,13 +18,24 @@ cd "$root"
 
 eval "$(./scripts/ci/version.sh)"
 
-# This fork ships exactly one product, so exactly one flavour is known. The
-# client flavours were removed when the project was narrowed to VPS-only.
+# This fork ships two products: the Server Edition (Linux amd64 VPS) and the
+# Client Edition (macOS). Every flavor each one publishes is listed here.
+# Every flavor the fork ships, in one place. A flavor missing from this case
+# would silently record "unknown" tags in the sidecar, which is worse than
+# failing: the artifact would look documented while claiming nothing.
 tags_file=""
 case "$flavor" in
   server-minimal) tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
+  # Client Edition macOS. `client-macos` is the lite core; `client-macos-naive`
+  # adds the Naive outbound and links Cronet through CGO.
+  client-macos|lite)       tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS" ;;
+  client-macos-naive|naive) tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE" ;;
 esac
-tags="$(cat "$tags_file" 2>/dev/null || echo unknown)"
+if [ -z "$tags_file" ] || [ ! -f "$tags_file" ]; then
+  echo "build-info.sh: unknown flavor '$flavor' (no tag file)" >&2
+  exit 2
+fi
+tags="$(cat "$tags_file")"
 
 # Dependency versions are read from the ACTUAL module graph, not hardcoded, so
 # the file cannot claim a version the binary was not built against.

@@ -1,0 +1,351 @@
+name: Client macOS
+# Builds and verifies the Jiejie Client Edition macOS core.
+#
+# This is a SEPARATE product from the Linux amd64 server the other workflows
+# ship, and a separate workflow on purpose: a red macOS client must never block
+# a server release, and a change to the server tag set must not silently alter
+# what the client ships. Nothing here touches jiejie-fast.yml,
+# server-linux-amd64.yml or jiejie-masque-reference.yml.
+#
+# Native macOS runners are used rather than cross-compiling from Linux. A
+# darwin binary cross-compiled on Linux cannot be executed, so none of the
+# runtime verification below would be possible; and the Cronet/CGO flavor is not
+# reliably cross-compilable at all.
+#
+# Every tag set is read from release/BUILD_TAGS_JIEJIE_CLIENT_MACOS* rather than
+# repeated here, so the workflow and the build script cannot drift.
+
+on:
+  push:
+    branches: [macos-client, 'feat/jiejie-macos-*', 'client/*']
+  pull_request:
+    paths:
+      - 'cmd/**'
+      - 'include/**'
+      - 'protocol/**'
+      - 'transport/**'
+      - 'dns/**'
+      - 'route/**'
+      - 'option/**'
+      - 'adapter/**'
+      - 'common/**'
+      - 'release/**'
+      - 'scripts/ci/**'
+      - 'test/jiejie/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/client-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: client-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static checks. Cheap, and they fail fast before a 10-minute macOS build.
+  # ---------------------------------------------------------------------------
+  static:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          files="$(gofmt -l . | grep -v '^$' || true)"
+          if [ -n "$files" ]; then
+            echo "gofmt reports unformatted files:"
+            echo "$files"
+            exit 1
+          fi
+          echo "gofmt: clean"
+
+      - name: vet (macOS client tags)
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          echo "tags: $TAGS"
+          # CGO off: the lite profile must vet without a C toolchain, and vetting
+          # the darwin file set is the point. A Linux-only vet would miss every
+          # file behind `darwin` in this repository.
+          #
+          # The package list is scoped to what this product ships. A whole-repo
+          # `go vet ./...` fails on two pre-existing upstream unsafe.Pointer
+          # findings in daemon/ and experimental/libbox/ — both of which are
+          # absent from this build and fail identically under every tag set on
+          # testing, so they are not this workflow's to fix.
+          CGO_ENABLED=0 go vet -tags "$TAGS" \
+            ./include/... ./route/... ./dns/... ./option/... ./adapter/... \
+            ./common/... ./protocol/... ./transport/... ./cmd/... ./constant/... \
+            ./log/... ./experimental/clashapi/...
+
+      - name: lint
+        # Lint deliberately runs with NO build tags, matching the server
+        # workflow's proven pattern.
+        #
+        # The minimal registries leave upstream's include/*.go helper functions
+        # (registerWireGuardEndpoint, registerTailscaleEndpoint, ...) uncalled, so
+        # golangci-lint's `unused` check reports ~19 functions under any minimal
+        # profile. That is a property of the registry-level trim, not a defect,
+        # and it is pre-existing: the Linux server profile reports the same 19 on
+        # testing. Deleting those helpers would mean editing upstream files the
+        # fork deliberately leaves alone.
+        #
+        # Running lint under the default tag set still catches every real lint
+        # issue in all the shared source, and the tag-specific correctness is
+        # covered by `go vet` under the client tags plus the registry-selection
+        # check below, which is the part vet does check.
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=15m
+
+      - name: registry must resolve under the client tags
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          # go list is what caught the missing jiejie_client_macos tag during
+          # development: the build succeeded with the upstream registry
+          # compiled in, and only the file set revealed it.
+          echo "compiled include files:"
+          GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
+            -f '{{range .GoFiles}}{{.}} {{end}}' ./include/
+          echo "ignored include files:"
+          GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
+            -f '{{.IgnoredGoFiles}}' ./include/
+          if GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
+              -f '{{range .GoFiles}}{{.}} {{end}}' ./include/ \
+              | grep -q 'registry.go'; then
+            echo "FAIL: the upstream registry (include/registry.go) is compiled in"
+            exit 1
+          fi
+          if ! GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
+              -f '{{range .GoFiles}}{{.}} {{end}}' ./include/ \
+              | grep -q 'registry_jiejie_client_macos.go'; then
+            echo "FAIL: the client registry is not compiled in"
+            exit 1
+          fi
+          echo "PASS: the client registry is active and the upstream one is not"
+
+  # ---------------------------------------------------------------------------
+  # Unit tests: the fork's own packages plus the client registry audit.
+  # ---------------------------------------------------------------------------
+  unit:
+    needs: static
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: client-macos
+            tags_file: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS
+            cgo: 0
+          # The upstream default tag set is a COMPATIBILITY SIGNAL only. It must
+          # never substitute for the client run, and it does not gate the build.
+          - name: upstream-default
+            tags_file: release/DEFAULT_BUILD_TAGS_OTHERS
+            cgo: 0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: unit tests (${{ matrix.name }})
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat ${{ matrix.tags_file }})"
+          echo "tags: $TAGS"
+          # Paths are chosen because they cover the areas this product actually
+          # depends on. A whole-repo `go test ./...` would also run the server
+          # integration suites, which need Linux-only facilities and would fail
+          # for reasons unrelated to the client.
+          go test -tags "$TAGS" -count=1 \
+            ./include/... ./route/... ./dns/... ./option/... \
+            ./common/... ./protocol/... ./transport/...
+
+      - name: client registry audit tests
+        if: matrix.name == 'client-macos'
+        env:
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          cd test
+          go test -tags "$TAGS" -count=1 -v -run 'TestClientMacOS' ./jiejie/
+
+  # ---------------------------------------------------------------------------
+  # Build both flavors from source.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: static
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            flavor: lite
+          - arch: arm64
+            flavor: naive
+          # darwin/amd64 is built because it is nearly free once the arm64 path
+          # works and Intel Macs are still in use. arm64 is the required target;
+          # this is additive.
+          - arch: amd64
+            flavor: lite
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build ${{ matrix.flavor }} darwin/${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          out="dist/sing-box-darwin-${{ matrix.arch }}"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            out="$out-naive"
+          fi
+          ./scripts/ci/build-macos-client.sh "${{ matrix.arch }}" "${{ matrix.flavor }}" "$out"
+
+      - name: version, architecture and tags
+        run: |
+          set -euo pipefail
+          bin="dist/sing-box-darwin-${{ matrix.arch }}"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            bin="$bin-naive"
+          fi
+          ./"$bin" version | tee version.txt
+          grep -F "${{ matrix.arch }}" version.txt
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            grep -F "arm64" version.txt
+          fi
+          # The tags the binary reports must be the tags the tag file declares.
+          # Without this, a tag file edit that the build ignored would go
+          # unnoticed, which is exactly how the missing jiejie_client_macos tag
+          # survived a successful build earlier in this branch's history.
+          expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE)"
+          fi
+          reported="$(sed -n 's/^Tags: //p' version.txt)"
+          if [ "$reported" != "$expected" ]; then
+            echo "FAIL: reported tags do not match the tag file"
+            echo "  reported: $reported"
+            echo "  expected: $expected"
+            exit 1
+          fi
+          echo "PASS: reported tags match release/ exactly"
+          file "$bin"
+
+      - name: config check
+        run: |
+          set -euo pipefail
+          bin="dist/sing-box-darwin-${{ matrix.arch }}"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            bin="$bin-naive"
+          fi
+          ./scripts/ci/check-macos-client-config.sh "$bin" "dist/fixture-${{ matrix.flavor }}-${{ matrix.arch }}"
+
+      - name: runtime smoke test (Clash API, process lifecycle)
+        # Only the native arm64 flavors can run on this runner. The amd64 binary
+        # is a cross-build for Intel Macs and is NOT executed here; that is
+        # recorded as NOT-TESTED rather than implied to pass.
+        if: matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          bin="dist/sing-box-darwin-${{ matrix.arch }}"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            bin="$bin-naive"
+          fi
+          ./scripts/ci/check-macos-client-runtime.sh "$bin" "dist/runtime-${{ matrix.flavor }}-${{ matrix.arch }}"
+
+      - name: registry and symbol audit
+        run: |
+          set -euo pipefail
+          bin="dist/sing-box-darwin-${{ matrix.arch }}"
+          if [ "${{ matrix.flavor }}" = "naive" ]; then
+            bin="$bin-naive"
+          fi
+          ./scripts/ci/audit-macos-client-registry.sh "$bin"
+
+  # ---------------------------------------------------------------------------
+  # Package. Needs every gate above, so a shipped artifact is only produced from
+  # a commit that passed all of them.
+  # ---------------------------------------------------------------------------
+  package:
+    needs: [unit, build]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: build the shipped arm64 lite core
+        run: ./scripts/ci/build-macos-client.sh arm64 lite dist/sing-box-darwin-arm64
+
+      - name: verify the shipped binary before packaging
+        run: |
+          set -euo pipefail
+          bin=dist/sing-box-darwin-arm64
+          ./"$bin" version
+          # The shipped flavor is lite, so the tag file must be the lite one.
+          expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          reported="$(./"$bin" version | sed -n 's/^Tags: //p')"
+          [ "$reported" = "$expected" ]
+          ./scripts/ci/check-macos-client-config.sh "$bin" dist/fixture-package
+          ./scripts/ci/check-macos-client-runtime.sh "$bin" dist/runtime-package
+          ./scripts/ci/audit-macos-client-registry.sh "$bin"
+
+      - name: stage the artifact
+        id: stage
+        run: |
+          set -euo pipefail
+          eval "$(./scripts/ci/version.sh)"
+          echo "artifact_version=$JJ_ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$JJ_SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          bin=dist/sing-box-darwin-arm64
+          stage=dist/Jiejie-Client-macOS-arm64-${JJ_ARTIFACT_VERSION}
+          mkdir -p "$stage"
+
+          cp "$bin" "$stage/sing-box-darwin-arm64"
+          cp LICENSE "$stage/LICENSE"
+          ./scripts/ci/build-info.sh "$stage/BUILD-INFO-MACOS.txt" darwin arm64 client-macos "$bin"
+
+          # The hash sidecar names the binary explicitly, so a downloader does
+          # not have to guess which line applies.
+          ( cd "$stage" && shasum -a 256 sing-box-darwin-arm64 > sing-box-darwin-arm64.sha256 )
+          cat "$stage/sing-box-darwin-arm64.sha256"
+          ls -la "$stage"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jiejie-Client-macOS-arm64-${{ steps.stage.outputs.artifact_version }}
+          path: dist/Jiejie-Client-macOS-arm64-*/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: summary
+        run: |
+          {
+            echo "## Jiejie Client Edition — macOS arm64"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| artifact | \`Jiejie-Client-macOS-arm64-${{ steps.stage.outputs.artifact_version }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| tags | \`$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)\` |"
+            echo "| binary sha256 | \`$(cut -d' ' -f1 dist/Jiejie-Client-macOS-arm64-*/sing-box-darwin-arm64.sha256)\` |"
+            echo ""
+            echo "Pair with the \`naive\` flavor artifact for the Naive outbound, or"
+            echo "rebuild locally with \`./scripts/ci/build-macos-client.sh arm64 naive\`."
+          } >> "$GITHUB_STEP_SUMMARY"
