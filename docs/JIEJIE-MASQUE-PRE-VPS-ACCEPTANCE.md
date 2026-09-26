@@ -88,7 +88,6 @@ tested one.
 | Seven fuzz targets run bounded in CI | `Fuzz the MASQUE parsers (bounded)` step | |
 | Every target defined in the source is registered in CI | coverage check inside that step | |
 | Seed corpora are genuinely valid | `TestRouteAdvertisementSeedsAreValid`, `TestAddressSeedsAreValid`, `TestProductionEncoderReproducesTheRFCVectors` | |
-| QUICHE protocol vectors agree (context-ID table, both protocols) | `TestQuicheOracle*` | |
 | QUICHE protocol vectors agree (context-ID decision table, both protocols) | `TestQuicheOracle*` | |
 
 ---
