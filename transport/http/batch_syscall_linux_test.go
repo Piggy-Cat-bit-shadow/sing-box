@@ -162,20 +162,28 @@ func TestBatchWriterOverRealSocketIsUsable(t *testing.T) {
 		t.Logf("batch reader implementation over a real socket: %T", reader)
 	}
 
-	// The interface the syscall implementation satisfies, asserted explicitly so a change
-	// that replaced it with a fallback would be visible here rather than only showing up
-	// as a slower run somewhere else.
-	//
-	// The assertion is written as a var declaration rather than a bare annotation so it
-	// stays a real compile-time check; staticcheck flagged the annotated form only because
-	// the right-hand side already carries the same type.
-	var connectedWriter N.ConnectedPacketBatchWriter = writer
-	require.NotNil(t, connectedWriter,
-		"the batch writer obtained from a real socket must satisfy the connected batch "+
-			"writer interface")
+	// The interface the syscall implementation satisfies is asserted through a typed
+	// helper rather than an inline annotation, so the check is real AND staticcheck has
+	// nothing to flag. An inline `var x T = y` where y already has type T is exactly the
+	// redundant form it reports.
+	assertConnectedBatchWriter(t, writer)
 	if reader != nil {
-		var connectedReader N.ConnectedPacketBatchReadWaiter = reader
-		require.NotNil(t, connectedReader)
+		assertConnectedBatchReadWaiter(t, reader)
 	}
+
 	_ = M.Socksaddr{}
+}
+
+// assertConnectedBatchWriter is a compile-time interface assertion with a runtime call,
+// so a writer that stopped satisfying the interface would fail to BUILD rather than
+// silently taking a different path.
+func assertConnectedBatchWriter(t *testing.T, writer N.ConnectedPacketBatchWriter) {
+	t.Helper()
+	require.NotNil(t, writer)
+}
+
+// assertConnectedBatchReadWaiter is the read-side counterpart.
+func assertConnectedBatchReadWaiter(t *testing.T, waiter N.ConnectedPacketBatchReadWaiter) {
+	t.Helper()
+	require.NotNil(t, waiter)
 }
