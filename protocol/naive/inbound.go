@@ -194,7 +194,7 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		n.newConnection(ctx, true, &naiveH2Conn{
 			reader:        request.Body,
 			writer:        writer,
-			flusher:       writer.(http.Flusher),
+			flusher:       http.NewResponseController(writer),
 			remoteAddress: source,
 		}, userName, source, destination)
 	}

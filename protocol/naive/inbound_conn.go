@@ -201,9 +201,10 @@ func (c *naiveConn) ReaderReplaceable() bool { return c.readerReplaceable() }
 func (c *naiveConn) WriterReplaceable() bool { return c.writerReplaceable() }
 
 type naiveH2Conn struct {
-	reader        io.Reader
-	writer        io.Writer
-	flusher       http.Flusher
+	reader  io.Reader
+	writer  io.Writer
+	flusher *http.ResponseController
+	// remoteAddress is the peer address reported to the router.
 	remoteAddress net.Addr
 	paddingConn
 }
@@ -215,19 +216,27 @@ func (c *naiveH2Conn) Read(p []byte) (n int, err error) {
 
 func (c *naiveH2Conn) Write(p []byte) (n int, err error) {
 	n, err = c.writeChunked(c.writer, p)
-	if err == nil {
-		c.flusher.Flush()
+	if err != nil {
+		return n, wrapError(err)
 	}
-	return n, wrapError(err)
+	// The payload reached the transport buffer but is not delivered until it is flushed,
+	// so a failed flush invalidates the write that just reported success.
+	if err = c.flusher.Flush(); err != nil {
+		return n, wrapError(err)
+	}
+	return n, nil
 }
 
 func (c *naiveH2Conn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
 	err := c.writeBufferWithPadding(c.writer, buffer)
-	if err == nil {
-		c.flusher.Flush()
+	if err != nil {
+		return wrapError(err)
 	}
-	return wrapError(err)
+	if err = c.flusher.Flush(); err != nil {
+		return wrapError(err)
+	}
+	return nil
 }
 
 func wrapError(err error) error {
