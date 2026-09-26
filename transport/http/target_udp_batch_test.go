@@ -59,12 +59,10 @@ func TestConnectedUDPSocketIsBatchCapable(t *testing.T) {
 	require.NoError(t, err)
 	defer connected.Close()
 
-	conn, isConn := connected.(net.Conn)
-	require.True(t, isConn)
-
 	// Wrap it the way the router does, so the assertion is on the shape the router
-	// actually passes downstream.
-	packetConn := bufio.NewUnbindPacketConn(conn)
+	// actually passes downstream. net.Dial already returns a net.Conn, so no assertion
+	// is needed here.
+	packetConn := bufio.NewUnbindPacketConn(connected)
 	defer packetConn.Close()
 
 	reader, hasReader := bufio.CreateConnectedPacketBatchReadWaiter(packetConn)
