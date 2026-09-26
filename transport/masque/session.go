@@ -19,7 +19,15 @@ const (
 	PacketHeadroom     = transportHTTP.CapsuleHeadroom
 	QUICPacketOverhead = 51
 	minimumLinkMTU     = 1280
-	maxPacketSize      = 65535
+	// maxPacketSize bounds one inner IP packet.
+	//
+	// IPv4 Total Length counts the whole packet, so the largest ordinary IPv4 packet is
+	// 65535. IPv6 Payload Length excludes the 40-byte base header (RFC 8200 section 3),
+	// so the largest ordinary IPv6 packet is 40 + 65535.
+	//
+	// Jumbograms are not supported: RFC 8200 section 4.5 carries them with a Payload
+	// Length of 0 and a Hop-by-Hop Jumbo Payload option, which this bound does not enable.
+	maxPacketSize = 40 + 65535
 )
 
 type sessionHandler interface {
