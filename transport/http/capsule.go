@@ -484,11 +484,40 @@ func (c *http3PacketConn) closeError() error {
 	return net.ErrClosed
 }
 
+// takeEarlyDatagrams detaches and returns the datagrams buffered during target setup,
+// leaving the queue empty.
+//
+// Detaching under earlyMutex is what makes the queue safe to claim from two racing
+// callers: settle() flushes these to the packet queue, and closeWithError() releases
+// them when the peer disappears before an outcome is known. A router that reports the
+// outcome while the peer is disconnecting does both, so whichever arrives first takes
+// ownership and the other finds nothing.
+func (c *http3PacketConn) takeEarlyDatagrams() []*buf.Buffer {
+	c.earlyMutex.Lock()
+	defer c.earlyMutex.Unlock()
+	early := c.early
+	c.early = nil
+	c.earlyBytes = 0
+	return early
+}
+
+// releaseEarlyDatagrams releases the datagrams buffered during target setup.
+//
+// It is the close-time counterpart of settle()'s flush: when the connection goes away
+// before the router reports an outcome, settle() never runs, and without this the
+// buffers held by the setup window would never reach Release. A peer that opens a
+// CONNECT-UDP request, sends datagrams and then hangs up during setup can trigger it at
+// will, so it is a peer-reachable leak rather than a teardown edge case.
+func (c *http3PacketConn) releaseEarlyDatagrams() {
+	buf.ReleaseMulti(c.takeEarlyDatagrams())
+}
+
 func (c *http3PacketConn) closeWithError(err error) {
 	c.closeOnce.Do(func() {
 		c.err = err
 		c.cancel()
 		c.stream.Close()
+		c.releaseEarlyDatagrams()
 		go func() {
 			c.waitGroup.Wait()
 			for {
@@ -597,11 +626,7 @@ func (c *http3PacketConn) settle(ready bool, err error) {
 
 		// Flush the early queue in arrival order. Buffers that no longer fit the queue
 		// are released rather than leaked.
-		c.earlyMutex.Lock()
-		early := c.early
-		c.early = nil
-		c.earlyBytes = 0
-		c.earlyMutex.Unlock()
+		early := c.takeEarlyDatagrams()
 		for _, buffer := range early {
 			select {
 			case c.packets <- buffer:

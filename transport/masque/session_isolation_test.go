@@ -132,6 +132,86 @@ func TestLookupNeverReturnsTheServersOwnAddress(t *testing.T) {
 	}
 }
 
+// TestGatewayGuardHoldsForBothFamiliesAndTheProductionEntryPoint extends the
+// self-traffic guard above in the two directions it did not cover.
+//
+// The guard exists on BOTH lookup() and Contains(), and Contains() is not a
+// convenience: it backs ServerEndpoint.PreferredAddress, which is what a
+// `preferred_by` route rule consults to decide whether this outbound may serve a
+// destination. If Contains() lost the guard while lookup() kept it, the two would
+// disagree and the server's own traffic would be routed into a tunnel that then
+// refuses it - a routing black hole rather than a misdelivery, and therefore
+// invisible to a test that only checks lookup().
+//
+// The families are covered separately because the guard compares against
+// inet4Address AND inet6Address, and an implementation that checked only the
+// family it happened to parse first would pass a v4-only test.
+func TestGatewayGuardHoldsForBothFamiliesAndTheProductionEntryPoint(t *testing.T) {
+	server := newTestServer(t, ServerOptions{
+		Address: []netip.Prefix{
+			netip.MustParsePrefix("198.18.0.1/24"),
+			netip.MustParsePrefix("2001:db8::1/64"),
+		},
+	})
+
+	// A session that advertises the widest ranges it legitimately can, covering
+	// BOTH gateways. Without the guard, every address below would be claimed.
+	current := noopSession(server, []netip.Addr{
+		netip.MustParseAddr("198.18.0.2"),
+		netip.MustParseAddr("2001:db8::2"),
+	}, []AddressRange{
+		{Start: netip.MustParseAddr("198.18.0.0"), End: netip.MustParseAddr("198.18.0.255"), Protocol: 0},
+		{Start: netip.MustParseAddr("2001:db8::"), End: netip.MustParseAddr("2001:db8::ffff"), Protocol: 0},
+	})
+	registerSession(server, current)
+	defer server.releaseSession(current)
+
+	gateway4 := server.inet4Address
+	gateway6 := server.inet6Address
+	if !gateway4.IsValid() || !gateway6.IsValid() {
+		t.Fatalf("the fixture's gateways did not parse: %s / %s", gateway4, gateway6)
+	}
+
+	for _, testCase := range []struct {
+		name    string
+		address netip.Addr
+	}{
+		{name: "IPv4 gateway", address: gateway4},
+		{name: "IPv6 gateway", address: gateway6},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Contains() must refuse it: this is the production PreferredAddress path.
+			if server.Contains(testCase.address) {
+				t.Fatalf("Contains(%s) reported the server's own gateway as "+
+					"session-owned: PreferredAddress would route the server's own "+
+					"traffic into a tunnel that refuses it", testCase.address)
+			}
+			// lookup() must refuse it too, so the two agree.
+			if got := server.lookup(testCase.address, 0); got != nil {
+				t.Fatalf("lookup(%s) returned a session for the server's own gateway",
+					testCase.address)
+			}
+			// route() composes lookup() with the egress policy and must also refuse.
+			if got := server.route(testCase.address, netip.MustParseAddr("203.0.113.9"), 6); got != nil {
+				t.Fatalf("route(%s, ...) returned a session for the server's own gateway",
+					testCase.address)
+			}
+		})
+	}
+
+	// The control: an ordinary address inside the advertised range IS still
+	// reported, so the guard is not simply refusing everything. Without this the
+	// assertions above would also pass against a Contains() that always returned
+	// false, which would silently disable the feature rather than protect it.
+	if !server.Contains(netip.MustParseAddr("198.18.0.77")) {
+		t.Fatalf("Contains refused an ordinary advertised address: the guard must " +
+			"exclude only the server's own addresses, not the whole tunnel network")
+	}
+	if !server.Contains(netip.MustParseAddr("2001:db8::77")) {
+		t.Fatalf("Contains refused an ordinary advertised IPv6 address")
+	}
+}
+
 // TestLookupPrefersTheAssignedAddressOverAnyAdvertisement pins precedence.
 //
 // An address the server actually ASSIGNED must win over a route another session

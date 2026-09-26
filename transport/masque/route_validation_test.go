@@ -96,6 +96,46 @@ func TestRouteAdvertisementOverlapIsRejected(t *testing.T) {
 				mustRange(t, "192.0.2.64", "192.0.2.128", 0),
 			},
 		},
+		{
+			// NON-ADJACENT overlap. The ordering rule compares consecutive
+			// ranges, so a checker built only on that comparison would inspect
+			// (0,6) and (6,17) and never (0,17) - and would accept this. Only a
+			// per-protocol high-water mark catches it, because the protocol 0
+			// range that reaches furthest is two entries back by the time the
+			// protocol 17 range is read.
+			//
+			// This is the shape the task calls out explicitly, and it is the one
+			// that distinguishes a correct linear implementation from an
+			// adjacent-pair implementation that happens to pass the cases above.
+			name: "non-adjacent: protocol 0 and protocol 17 overlap across a protocol 6 entry",
+			routes: []AddressRange{
+				mustRange(t, "192.0.2.0", "192.0.2.255", 0),
+				mustRange(t, "192.0.2.0", "192.0.2.63", 6),
+				mustRange(t, "192.0.2.128", "192.0.2.191", 17),
+			},
+		},
+		{
+			// The same non-adjacent shape with the wildcard in the MIDDLE, so the
+			// conflict is between two protocol-specific ranges that the wildcard
+			// bridges. Neither pair is adjacent to the other.
+			name: "non-adjacent: protocol 6 and protocol 17 overlap bridged by protocol 0",
+			routes: []AddressRange{
+				mustRange(t, "192.0.2.0", "192.0.2.127", 6),
+				mustRange(t, "192.0.2.64", "192.0.2.255", 0),
+				mustRange(t, "192.0.2.100", "192.0.2.110", 17),
+			},
+		},
+		{
+			// Non-adjacent with NO wildcard at all: two different protocols that
+			// genuinely overlap. The per-protocol high-water mark has to hold the
+			// earlier protocol's furthest end for this to be seen.
+			name: "non-adjacent: protocol 6 then protocol 17 overlap, no wildcard",
+			routes: []AddressRange{
+				mustRange(t, "192.0.2.0", "192.0.2.200", 6),
+				mustRange(t, "192.0.2.0", "192.0.2.10", 6),
+				mustRange(t, "192.0.2.150", "192.0.2.255", 17),
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := parseRoutes(routeCapsulePayload(tc.routes))
@@ -149,6 +189,18 @@ func TestRouteAdvertisementValidListsAreAccepted(t *testing.T) {
 				mustRange(t, "192.0.2.0", "192.0.2.127", 0),
 				mustRange(t, "192.0.2.128", "192.0.2.191", 6),
 				mustRange(t, "192.0.2.192", "192.0.2.255", 17),
+			},
+		},
+		{
+			// The per-protocol high-water mark must also be per IP VERSION. The
+			// ranges here overlap numerically across versions, which is not a
+			// conflict: comparison is only meaningful within one address family.
+			// A checker that shared one high-water mark across versions would
+			// wrongly reject this.
+			name: "overlapping addresses across IP versions are not a conflict",
+			routes: []AddressRange{
+				mustRange(t, "192.0.2.0", "192.0.2.255", 0),
+				mustRange(t, "2001:db8::", "2001:db8::ffff", 0),
 			},
 		},
 	} {
