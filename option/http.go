@@ -13,6 +13,12 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
+// UpstreamMaxHeaderBytes is the request header limit upstream sing-box uses when
+// nothing overrides it. transport/http keeps its own copy for the HTTP/2 server;
+// this one exists so option resolution can report the effective value without
+// importing the transport layer.
+const UpstreamMaxHeaderBytes = 1 << 20
+
 type HTTP2Options struct {
 	IdleTimeout             badoption.Duration       `json:"idle_timeout,omitempty"`
 	KeepAlivePeriod         badoption.Duration       `json:"keep_alive_period,omitempty"`

@@ -59,12 +59,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if !serveHTTP1 && !serveHTTP2 && options.SetSystemProxy {
 		return nil, E.New("set_system_proxy requires HTTP/1 or HTTP/2")
 	}
-	// server_profile only fills fields the user left unset; an explicit value
-	// always wins and an unset profile leaves upstream defaults in place.
+	// Every resource field is configured explicitly per inbound; there is no
+	// profile bundle. An unset field keeps the upstream default.
 	//
 	// ResolveServerResources returns the EFFECTIVE option sets. The inbound must
-	// use these and never the raw options: the resolved values carry the profile
-	// fill-ins, the receive windows, the header limit and the BBR profile.
+	// use these and never the raw options: the resolved values carry the header
+	// limit and the resolved BBR profile, which are validated in one place.
 	resourceOptions, err := options.ResolveServerResources()
 	if err != nil {
 		return nil, err

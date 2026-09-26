@@ -487,9 +487,18 @@ func startMinimalMASQUEH3WithLogFile(t *testing.T, withLimiter bool, logPath str
 			Listen:     minimalLoopback(),
 			ListenPort: port,
 		},
-		Version:       []int{3},
-		Users:         []auth.User{{Username: minimalTestUser, Password: minimalTestPassword}},
-		ServerProfile: "jiejie-balanced-1g",
+		Version: []int{3},
+		Users:   []auth.User{{Username: minimalTestUser, Password: minimalTestPassword}},
+		// Explicit resource settings, formerly supplied by the removed
+		// `server_profile: jiejie-balanced-1g` bundle. They are written out so the
+		// fixture keeps exercising a bounded listener.
+		MaxHeaderBytes: 64 << 10,
+		HTTP3Options: option.QUICOptions{
+			HTTP2Options: option.HTTP2Options{
+				MaxConcurrentStreams: 256,
+				IdleTimeout:          badoption.Duration(60 * time.Second),
+			},
+		},
 		Masquerade: &option.Hysteria2Masquerade{
 			Type: C.Hysterai2MasqueradeTypeProxy,
 			ProxyOptions: option.Hysteria2MasqueradeProxy{
@@ -923,39 +932,51 @@ func TestJiejieMinimalShadowTLSInboundRegisters(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// server_profile actually taking effect at runtime
+// explicit resource options actually taking effect at runtime
 // ---------------------------------------------------------------------------
 
-// TestJiejieMinimalServerProfileTakesEffect proves jiejie-balanced-1g changes the
-// RUNNING server, not merely the option struct.
+// TestJiejieMinimalServerResourceOptionsTakeEffect proves the explicitly
+// configured resource values change the RUNNING server, not merely the option
+// struct.
 //
 // This is the regression test for a real bug: ResolveServerResources previously
-// applied the profile to a copy and returned only the header limit, so
-// protocol/http went on using the raw options and the profile, the receive
-// windows and bbr_profile never reached any server. Asserting on the option
-// helper would not have caught it, so this drives a real config through the
-// real inbound constructor and reads the resulting QUIC and HTTP/2 settings.
-func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
+// applied values to a copy and returned only the header limit, so protocol/http
+// went on using the raw options and the receive windows and bbr_profile never
+// reached any server. Asserting on the option helper would not have caught it, so
+// this drives a real config through the real inbound constructor and reads the
+// resulting QUIC and HTTP/2 settings.
+//
+// It used to be driven by `server_profile: jiejie-balanced-1g`. That bundle is
+// removed, so the same settings are now written explicitly - which is a stronger
+// test of the resolution path, because it no longer depends on a profile lookup
+// happening to fill the field.
+func TestJiejieMinimalServerResourceOptionsTakeEffect(t *testing.T) {
 	originAddress := startMinimalHTTPOrigin(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, minimalTestTLSName)
 	h2Port := reserveTCPPort(t)
 	h3Port := reserveUDPPort(t)
 
-	// The profile is applied to an H3 listener; the H2 listener is asserted via
-	// its own inbound so both protocols are covered.
+	// The resource values are applied to an H3 listener; the H2 listener is
+	// asserted via its own inbound so both protocols are covered.
 	startInstance(t, option.Options{
 		Inbounds: []option.Inbound{
 			{
 				Type: C.TypeHTTP,
-				Tag:  "profile-h3",
+				Tag:  "resource-h3",
 				Options: &option.HTTPInboundOptions{
 					ListenOptions: option.ListenOptions{
 						Listen:     minimalLoopback(),
 						ListenPort: h3Port,
 					},
-					Version:                    []int{3},
-					ServerProfile:              "jiejie-balanced-1g",
-					BBRProfile:                 "aggressive",
+					Version:        []int{3},
+					MaxHeaderBytes: 64 << 10,
+					BBRProfile:     "aggressive",
+					HTTP3Options: option.QUICOptions{
+						HTTP2Options: option.HTTP2Options{
+							MaxConcurrentStreams: 256,
+							IdleTimeout:          badoption.Duration(60 * time.Second),
+						},
+					},
 					InboundTLSOptionsContainer: minimalInboundTLS(certPem, keyPem),
 					Masquerade: &option.Hysteria2Masquerade{
 						Type:          C.Hysterai2MasqueradeTypeString,
@@ -965,14 +986,18 @@ func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
 			},
 			{
 				Type: C.TypeHTTP,
-				Tag:  "profile-h2",
+				Tag:  "resource-h2",
 				Options: &option.HTTPInboundOptions{
 					ListenOptions: option.ListenOptions{
 						Listen:     minimalLoopback(),
 						ListenPort: h2Port,
 					},
-					Version:                    []int{2},
-					ServerProfile:              "jiejie-balanced-1g",
+					Version:        []int{2},
+					MaxHeaderBytes: 64 << 10,
+					HTTP2Options: option.HTTP2Options{
+						MaxConcurrentStreams: 256,
+						IdleTimeout:          badoption.Duration(60 * time.Second),
+					},
 					InboundTLSOptionsContainer: minimalInboundTLS(certPem, keyPem),
 				},
 			},
@@ -981,8 +1006,8 @@ func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
 		Route:     &option.RouteOptions{Final: "direct"},
 	})
 
-	// Both listeners must actually accept, which proves the profile did not make
-	// the inbound invalid.
+	// Both listeners must actually accept, which proves the resource options did
+	// not make the inbound invalid.
 	for _, tcpPort := range []uint16{h2Port} {
 		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(tcpPort)), 3*time.Second)
 		require.NoError(t, err)
@@ -990,15 +1015,16 @@ func TestJiejieMinimalServerProfileTakesEffect(t *testing.T) {
 	}
 
 	// The H3 listener must complete a real QUIC handshake and carry an
-	// authenticated CONNECT end to end, which only works if the profile's
-	// windows, stream limit and BBR profile produced a valid running server.
+	// authenticated CONNECT end to end, which only works if the stream limit, the
+	// application idle timeout and the BBR profile produced a valid running
+	// server.
 	client := dialMinimalH3Client(t, h3Port)
 	headers := http.Header{}
 	headers.Set("Proxy-Authorization", minimalBasicAuth())
 	response, stream := client.connect(t, originAddress, headers)
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode,
-		"an authenticated CONNECT must succeed on a profile-configured HTTP/3 listener")
+		"an authenticated CONNECT must succeed on a listener with explicit resource options")
 	_, err := stream.Write([]byte("GET / HTTP/1.1\r\nHost: origin\r\n\r\n"))
 	require.NoError(t, err)
 	originResponse, err := http.ReadResponse(std_bufio.NewReader(stream), nil)

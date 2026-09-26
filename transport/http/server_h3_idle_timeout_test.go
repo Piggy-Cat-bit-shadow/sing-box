@@ -48,47 +48,48 @@ import (
 // None of these tests sleep for the production 60s. They all use a test-only
 // short timeout, which is what makes them usable as regression tests.
 
-// TestH3ApplicationIdleTimeoutReachesServer proves the effective idle_timeout
-// resolved from the profile is carried into the QUIC option set the listener
-// factory receives. Before the fix IdleTimeout was never set on the
-// http3.Server at all, so the profile's 60s applied only to
-// quic.Config.MaxIdleTimeout and the application layer had no timeout.
+// TestH3ApplicationIdleTimeoutReachesServer proves an explicitly configured
+// idle_timeout is carried into the QUIC option set the listener factory receives.
+// Before the fix IdleTimeout was never set on the http3.Server at all, so it
+// applied only to quic.Config.MaxIdleTimeout and the application layer had no
+// timeout. That gap is what this asserts is closed, now through the explicit
+// option rather than through a named profile.
 func TestH3ApplicationIdleTimeoutReachesServer(t *testing.T) {
-	options := option.HTTPInboundOptions{
-		ServerProfile: option.HTTPServerProfileNameJiejieBalanced1G,
-	}
+	// Decoded from JSON with an explicit version, because the resource fields live
+	// on HTTP3Options, which carries `json:"-"` and is filled by
+	// unmarshalHTTPVersionsOptions. Without a version the decoder takes its default
+	// branch and leaves the option set zero, silently discarding idle_timeout.
+	var options option.HTTPInboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{
+		"version": 3,
+		"idle_timeout": "60s"
+	}`), &options)
+	require.NoError(t, err)
+
 	resolved, err := options.ResolveServerResources()
 	require.NoError(t, err)
 	require.Equal(t, 60*time.Second, time.Duration(resolved.HTTP3Options.IdleTimeout),
-		"the profile must resolve idle_timeout to 60s")
+		"an explicit idle_timeout must reach the resolved QUIC options")
 }
 
-// TestH3ExplicitIdleTimeoutBeatsProfile proves an explicitly configured
-// idle_timeout wins over the profile, matching the documented precedence rule.
-func TestH3ExplicitIdleTimeoutBeatsProfile(t *testing.T) {
-	// Decode real JSON so the presence set is populated exactly as it is in
-	// production: an explicit idle_timeout must beat the profile's 60s.
-	//
-	// "version": 3 is required and is not incidental. The resource fields
-	// (idle_timeout and friends) live on HTTP3Options/HTTP2Options, which carry
-	// `json:"-"` and are filled by unmarshalHTTPVersionsOptions. Without a
-	// version the decoder takes its default branch and leaves BOTH option sets
-	// zero, silently discarding idle_timeout. Production always sets a version
-	// (masque-h3 uses 3), so this mirrors the real configuration.
-	var options option.HTTPInboundOptions
-	err := json.UnmarshalContext(context.Background(), []byte(`{
-		"server_profile": "jiejie-balanced-1g",
-		"version": 3,
-		"idle_timeout": "7s"
-	}`), &options)
-	require.NoError(t, err)
-	require.True(t, options.Present.IdleTimeout,
-		"decoding an explicit idle_timeout must record its presence")
+// TestH3IdleTimeoutIsPerInboundNotInherited proves two inbounds can carry
+// different idle timeouts, which the removed profile could not express: it
+// applied one value to every H3 listener that selected it.
+func TestH3IdleTimeoutIsPerInboundNotInherited(t *testing.T) {
+	decode := func(literal string) time.Duration {
+		t.Helper()
+		var options option.HTTPInboundOptions
+		require.NoError(t, json.UnmarshalContext(context.Background(), []byte(literal), &options))
+		resolved, err := options.ResolveServerResources()
+		require.NoError(t, err)
+		return time.Duration(resolved.HTTP3Options.IdleTimeout)
+	}
 
-	resolved, err := options.ResolveServerResources()
-	require.NoError(t, err)
-	require.Equal(t, 7*time.Second, time.Duration(resolved.HTTP3Options.IdleTimeout),
-		"an explicit idle_timeout must beat the profile")
+	require.Equal(t, 7*time.Second, decode(`{"version": 3, "idle_timeout": "7s"}`))
+	require.Equal(t, 90*time.Second, decode(`{"version": 3, "idle_timeout": "90s"}`))
+
+	// And an inbound that sets nothing keeps quic-go's "no application timeout".
+	require.Zero(t, decode(`{"version": 3}`))
 }
 
 // TestH3IdleTimeoutUnsetKeepsUpstreamDefault proves that with no profile and no

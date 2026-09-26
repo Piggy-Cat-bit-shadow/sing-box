@@ -53,7 +53,7 @@
       "listen": "0.0.0.0",
       "listen_port": 443,
       "version": 3,
-      "server_profile": "jiejie-balanced-1g",
+      "bbr_profile": "standard",
       "users": [
         {
           "username": "example",

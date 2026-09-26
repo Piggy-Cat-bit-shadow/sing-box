@@ -23,138 +23,21 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
-	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/common/json/badoption"
 
 	"github.com/stretchr/testify/require"
 )
 
-// These tests prove that server_profile and max_header_bytes actually reach the
-// running servers. They deliberately do NOT test the ApplyToHTTP2 helper: an
-// earlier implementation filled the profile into a copy inside
-// ResolveServerResources and returned only the header limit, so the helper tests
-// passed while the inbound kept using the unresolved options and the profile had
-// no effect at runtime at all. Only inspecting the constructed server proves it.
-
-// TestServerProfileReachesHTTP2Server checks the HTTP/2 server built by
-// NewServer carries the profile's values.
-func TestServerProfileReachesHTTP2Server(t *testing.T) {
-	options := option.HTTPInboundOptions{
-		ServerProfile: option.HTTPServerProfileNameJiejieBalanced1G,
-	}
-	resolved, err := options.ResolveServerResources()
-	require.NoError(t, err)
-	require.True(t, resolved.ProfileApplied)
-
-	server := NewServer(ServerOptions{
-		Logger:         testLogger(),
-		HTTP2:          true,
-		HTTP2Options:   resolved.HTTP2Options,
-		MaxHeaderBytes: resolved.MaxHeaderBytes,
-	})
-	require.NotNil(t, server.http2Server, "the HTTP/2 server must be constructed")
-
-	// These are the profile's documented bounds, and they must be visible on the
-	// object that actually serves traffic.
-	require.Equal(t, uint32(256), server.http2Server.MaxConcurrentStreams,
-		"max_concurrent_streams must reach the HTTP/2 server")
-	require.Equal(t, 60*time.Second, server.http2Server.IdleTimeout,
-		"idle_timeout must reach the HTTP/2 server")
-	require.Equal(t, 64<<10, server.maxHeaderBytes,
-		"max_header_bytes must reach the HTTP/2 server")
-	// The profile must not size the receive windows: the option schema cannot
-	// express initial and maximum separately, so any value would also raise the
-	// initial window above the quic-go default.
-	require.Zero(t, time.Duration(resolved.HTTP2Options.KeepAlivePeriod),
-		"the profile must leave keep_alive_period disabled")
-	require.Nil(t, resolved.HTTP2Options.StreamReceiveWindow,
-		"the profile must leave stream_receive_window unset")
-}
-
-// TestServerProfileReachesQUICConfig checks the QUIC config the HTTP/3 listener
-// is built from carries the profile's windows and stream limit.
-func TestServerProfileReachesQUICConfig(t *testing.T) {
-	options := option.HTTPInboundOptions{
-		ServerProfile: option.HTTPServerProfileNameJiejieBalanced1G,
-	}
-	resolved, err := options.ResolveServerResources()
-	require.NoError(t, err)
-
-	quicConfig := httpclient.NewQUICConfig(resolved.HTTP3Options)
-	require.Equal(t, int64(256), quicConfig.MaxIncomingStreams,
-		"max_concurrent_streams must reach the QUIC config")
-	require.Equal(t, 60*time.Second, quicConfig.MaxIdleTimeout,
-		"idle_timeout must reach the QUIC config")
-	// The receive windows must be left at zero so quic-go applies its own
-	// defaults (2 MiB initial stream / 10 MiB initial connection). A non-zero
-	// value here would raise the INITIAL window, which is the opposite of a
-	// memory-conservative profile.
-	require.Zero(t, quicConfig.InitialStreamReceiveWindow,
-		"the profile must not raise the initial stream receive window")
-	require.Zero(t, quicConfig.InitialConnectionReceiveWindow,
-		"the profile must not raise the initial connection receive window")
-	require.Zero(t, quicConfig.MaxStreamReceiveWindow)
-	require.Zero(t, quicConfig.MaxConnectionReceiveWindow)
-	require.Zero(t, quicConfig.KeepAlivePeriod,
-		"the profile must not enable a QUIC keep-alive")
-}
-
-// TestServerProfileUnsetKeepsUpstreamDefaults is the compatibility half: with no
-// profile the constructed server must look exactly as it did before this fork.
-func TestServerProfileUnsetKeepsUpstreamDefaults(t *testing.T) {
-	options := option.HTTPInboundOptions{}
-	resolved, err := options.ResolveServerResources()
-	require.NoError(t, err)
-	require.False(t, resolved.ProfileApplied)
-
-	server := NewServer(ServerOptions{
-		Logger:         testLogger(),
-		HTTP2:          true,
-		HTTP2Options:   resolved.HTTP2Options,
-		MaxHeaderBytes: resolved.MaxHeaderBytes,
-	})
-	require.Equal(t, uint32(0), server.http2Server.MaxConcurrentStreams,
-		"an unset profile must leave the stream limit at the upstream value")
-	require.Equal(t, 1<<20, server.maxHeaderBytes,
-		"an unset profile must keep the upstream 1 MiB header limit")
-
-	quicConfig := httpclient.NewQUICConfig(resolved.HTTP3Options)
-	require.Zero(t, quicConfig.MaxIncomingStreams,
-		"an unset profile must not impose a stream limit on QUIC")
-}
-
-// TestExplicitValuesBeatProfileOnTheResolvedOptions proves the precedence rule
-// survives the refactor: an explicitly configured field is not overwritten.
-func TestExplicitValuesBeatProfileOnTheResolvedOptions(t *testing.T) {
-	// Decode through JSON rather than constructing the struct directly.
-	// ResourceFieldPresence is populated by the decoder, so a programmatically
-	// built value cannot express "the user wrote this field", and the profile
-	// would fill it. JSON is the real configuration path.
-	var options option.HTTPInboundOptions
-	err := json.UnmarshalContext(context.Background(), []byte(`{
-		"version": 3,
-		"server_profile": "jiejie-balanced-1g",
-		"max_header_bytes": 4096,
-		"max_concurrent_streams": 7,
-		"stream_receive_window": "1MB",
-		"idle_timeout": "5s"
-	}`), &options)
-	require.NoError(t, err)
-	resolved, err := options.ResolveServerResources()
-	require.NoError(t, err)
-
-	require.Equal(t, 7, resolved.HTTP2Options.MaxConcurrentStreams)
-	require.Equal(t, uint64(1<<20), resolved.HTTP2Options.StreamReceiveWindow.Value())
-	require.Equal(t, badoption.Duration(5*time.Second), resolved.HTTP2Options.IdleTimeout)
-	require.Equal(t, 4096, resolved.MaxHeaderBytes,
-		"an explicit max_header_bytes must win over the profile")
-	// The profile leaves the windows unset, so the explicit stream window is the
-	// only one present and the connection window stays nil.
-	require.Nil(t, resolved.HTTP2Options.ConnectionReceiveWindow,
-		"the profile must not fill the connection receive window")
-}
+// These tests prove that the HTTP/3 BBR option and max_header_bytes actually reach
+// the running servers. They deliberately do NOT test the resolution helpers alone:
+// an earlier implementation filled values into a copy inside option resolution and
+// returned only the header limit, so helper-level tests passed while the inbound
+// kept using the unresolved options and nothing had any effect at runtime. Only
+// inspecting the constructed server proves it.
+//
+// The former `server_profile` bundle was removed; these cases are what remained
+// valid after its removal, and they cover behaviour that is still configurable
+// explicitly per inbound.
 
 // TestBBRProfileReachesQUICOptions proves bbr_profile is carried on the resolved
 // QUIC options, which is what the HTTP/3 listener consumes. The parser is tested
@@ -188,28 +71,6 @@ func TestBBRProfileUnknownRejectedAtResolution(t *testing.T) {
 	options := option.HTTPInboundOptions{BBRProfile: "turbo"}
 	_, err := options.ResolveServerResources()
 	require.Error(t, err)
-}
-
-// TestServerProfileConfigDecodesAndResolves drives the whole path through the
-// real JSON decoder, so a schema regression is caught too.
-func TestServerProfileConfigDecodesAndResolves(t *testing.T) {
-	var inbound option.HTTPInboundOptions
-	// The "type" key is not part of HTTPInboundOptions, so it is omitted.
-	err := json.UnmarshalContext(context.Background(), []byte(`{
-		"version": 3,
-		"server_profile": "jiejie-balanced-1g",
-		"bbr_profile": "aggressive",
-		"max_header_bytes": 65536
-	}`), &inbound)
-	require.NoError(t, err)
-	require.Equal(t, option.HTTPServerProfileNameJiejieBalanced1G, inbound.ServerProfile)
-	require.Equal(t, "aggressive", inbound.BBRProfile)
-
-	resolved, err := inbound.ResolveServerResources()
-	require.NoError(t, err)
-	require.Equal(t, 256, resolved.HTTP2Options.MaxConcurrentStreams)
-	require.Equal(t, 65536, resolved.MaxHeaderBytes)
-	require.Equal(t, "aggressive", resolved.HTTP3Options.BBRProfile.BBRProfileValue())
 }
 
 // TestH3HeaderLimitIsEnforced drives a REAL HTTP/3 server and proves the

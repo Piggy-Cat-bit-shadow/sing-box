@@ -38,14 +38,15 @@ type _HTTPInboundOptions struct {
 	DomainResolver *DomainResolveOptions   `json:"domain_resolver,omitempty"`
 	SetSystemProxy bool                    `json:"set_system_proxy,omitempty"`
 	Version        badoption.Listable[int] `json:"version,omitempty" enum:"1,2,3"`
-	// ServerProfile applies a named set of resource defaults. Explicit fields
-	// always win. Unset means upstream defaults.
-	ServerProfile string `json:"server_profile,omitempty"`
 	// MaxHeaderBytes overrides the request header limit. Unset means upstream.
 	MaxHeaderBytes int `json:"max_header_bytes,omitempty"`
 	// BBRProfile selects the HTTP/3 server congestion control profile. It
-	// accepts only the profiles provided by congestion_meta2. Unset keeps the
-	// current standard behaviour.
+	// accepts only the profiles provided by congestion_meta2.
+	//
+	// An UNSET value means "leave quic-go's congestion control unchanged", which is
+	// the library default and what both reference implementations get. It does NOT
+	// mean "use the standard BBR profile": resolving it that way would make BBR a
+	// protocol default rather than an explicit operator choice.
 	BBRProfile string `json:"bbr_profile,omitempty" enum:"conservative,standard,aggressive"`
 	// UnauthenticatedLimits bounds pre-authentication traffic on this inbound.
 	// Authenticated proxy traffic is never affected.
@@ -53,49 +54,6 @@ type _HTTPInboundOptions struct {
 	InboundTLSOptionsContainer
 	HTTP2Options HTTP2Options `json:"-"`
 	HTTP3Options QUICOptions  `json:"-"`
-	// Present records which resource fields the user actually wrote, so a profile
-	// can distinguish "absent" from "explicitly zero". Without it,
-	// `keep_alive_period: 0` is indistinguishable from omitting the key and the
-	// profile would silently overwrite an explicit zero.
-	Present ResourceFieldPresence `json:"-"`
-}
-
-// ResourceFieldPresence records the resource fields that appeared in the config.
-type ResourceFieldPresence struct {
-	MaxConcurrentStreams    bool
-	IdleTimeout             bool
-	KeepAlivePeriod         bool
-	StreamReceiveWindow     bool
-	ConnectionReceiveWindow bool
-	MaxHeaderBytes          bool
-}
-
-// resourceFieldNames maps the JSON key to the presence flag it sets.
-var resourceFieldNames = map[string]func(*ResourceFieldPresence){
-	"max_concurrent_streams":    func(p *ResourceFieldPresence) { p.MaxConcurrentStreams = true },
-	"idle_timeout":              func(p *ResourceFieldPresence) { p.IdleTimeout = true },
-	"keep_alive_period":         func(p *ResourceFieldPresence) { p.KeepAlivePeriod = true },
-	"stream_receive_window":     func(p *ResourceFieldPresence) { p.StreamReceiveWindow = true },
-	"connection_receive_window": func(p *ResourceFieldPresence) { p.ConnectionReceiveWindow = true },
-	"max_header_bytes":          func(p *ResourceFieldPresence) { p.MaxHeaderBytes = true },
-}
-
-// recordPresence inspects the raw JSON for the resource keys the user supplied.
-func recordPresence(content []byte) ResourceFieldPresence {
-	var presence ResourceFieldPresence
-	if len(content) == 0 {
-		return presence
-	}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(content, &probe); err != nil {
-		return presence
-	}
-	for key, set := range resourceFieldNames {
-		if _, present := probe[key]; present {
-			set(&presence)
-		}
-	}
-	return presence
 }
 
 type HTTPInboundOptions _HTTPInboundOptions
@@ -103,37 +61,32 @@ type HTTPInboundOptions _HTTPInboundOptions
 // ServerResourceOptions carries the EFFECTIVE option sets an inbound must use.
 //
 // It returns the resolved values rather than mutating the options in place. An
-// earlier revision applied the profile to a copy inside
-// ResolveServerResources and returned only the header limit, so the caller kept
-// using the original HTTP2Options/HTTP3Options and the profile, the receive
-// windows and bbr_profile never reached the server. Returning the effective
-// values makes that mistake impossible to repeat: the caller has nothing else to
-// use.
+// earlier revision resolved values into a copy inside ResolveServerResources and
+// returned only the header limit, so the caller kept using the original
+// HTTP2Options/HTTP3Options and the resolved BBR profile never reached the server.
+// Returning the effective values makes that mistake impossible to repeat: the
+// caller has nothing else to use.
 type ServerResourceOptions struct {
-	Profile        HTTPServerProfile
-	ProfileApplied bool
-	// HTTP2Options is the effective HTTP/2 option set: the user's values with
-	// any unset field filled from the profile.
+	// HTTP2Options is the effective HTTP/2 option set.
 	HTTP2Options HTTP2Options
 	// HTTP3Options is the effective QUIC option set, including the resolved
 	// BBRProfile that the HTTP/3 listener must apply.
 	HTTP3Options QUICOptions
-	// MaxHeaderBytes is the effective request header limit, already falling back
-	// to the profile and then to the upstream default. It is never zero.
+	// MaxHeaderBytes is the effective request header limit, falling back to the
+	// upstream default when unset. It is never zero.
 	MaxHeaderBytes int
 }
 
 // ResolveServerResources returns the effective option sets for this inbound.
 //
-// The profile fills only fields the user left unset, so an explicit value always
-// wins. With no profile selected, nothing is changed and the result equals the
-// inbound's own options.
+// Every resource field is configured explicitly per inbound; there is no named
+// profile to layer on top. The removal of `server_profile` is deliberate: it only
+// ever had one entry, so a bundle indirection sat between the operator and the
+// values for no benefit. The removed profile also carried a third constructor and
+// a presence-tracking JSON probe whose sole purpose was to let that one bundle
+// distinguish an absent field from an explicit zero.
 func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, error) {
-	profile, applied, err := NewHTTPServerProfile(o.ServerProfile)
-	if err != nil {
-		return ServerResourceOptions{}, err
-	}
-	err = ValidateBBRProfile(o.BBRProfile)
+	err := ValidateBBRProfile(o.BBRProfile)
 	if err != nil {
 		return ServerResourceOptions{}, err
 	}
@@ -142,16 +95,10 @@ func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, err
 	// keep using unresolved options.
 	http2Options := o.HTTP2Options
 	http3Options := o.HTTP3Options
-	if applied {
-		// The presence set lets the profile distinguish an absent field from an
-		// explicit zero. An explicitly configured value always wins, including
-		// `keep_alive_period: 0` and `max_concurrent_streams: 0`.
-		profile.ApplyToHTTP2WithPresence(&http2Options, o.Present)
-		profile.ApplyToQUICWithPresence(&http3Options, o.Present)
-	}
-	// The BBR profile applies to the HTTP/3 server regardless of whether a
-	// resource profile was selected; an unset value resolves to standard, which
-	// is the previous hardcoded behaviour.
+	// An unset bbr_profile stays EMPTY, which the HTTP/3 listener reads as "leave
+	// quic-go's congestion control in place". It must not resolve to a concrete
+	// profile here: that would make BBR a protocol default rather than an explicit
+	// operator choice, and neither reference implementation sets one.
 	http3Options.BBRProfile = ServerBBRProfile{Name: o.BBRProfile}
 
 	// Validate the numeric bounds BEFORE resolving maxHeaderBytes, so an invalid
@@ -161,31 +108,25 @@ func (o HTTPInboundOptions) ResolveServerResources() (ServerResourceOptions, err
 	}
 
 	maxHeaderBytes := o.MaxHeaderBytes
-	if !o.Present.MaxHeaderBytes {
-		// Only an ABSENT max_header_bytes falls back to the profile.
-		maxHeaderBytes = profile.MaxHeaderBytesValue(UpstreamMaxHeaderBytes)
-	} else if o.MaxHeaderBytes <= 0 {
-		// An explicit non-positive value is a configuration error, not a request
-		// for the default.
-		//
-		// The previous behaviour replaced it with UpstreamMaxHeaderBytes, which
-		// contradicted the documented contract that an explicit value always wins:
-		// the operator wrote something invalid, got no error, and silently
-		// received a limit they did not ask for. Naming the mistake is better than
-		// guessing at intent.
+	if maxHeaderBytes == 0 {
+		// Unset means "use the upstream default".
+		maxHeaderBytes = UpstreamMaxHeaderBytes
+	} else if maxHeaderBytes < 0 {
+		// An explicit negative value is a configuration error, not a request for
+		// the default. The previous behaviour replaced it with
+		// UpstreamMaxHeaderBytes, which contradicted the documented contract that
+		// an explicit value wins: the operator wrote something invalid, got no
+		// error, and silently received a limit they did not ask for. Naming the
+		// mistake is better than guessing at intent.
 		return ServerResourceOptions{}, E.New("max_header_bytes must be positive, got ",
 			o.MaxHeaderBytes)
 	}
 	if maxHeaderBytes <= 0 {
-		// Reachable only when the profile itself supplied a non-positive value,
-		// which is a bug in the profile rather than in the user's configuration.
 		return ServerResourceOptions{}, E.New("resolved max_header_bytes is not positive: ",
 			maxHeaderBytes)
 	}
 
 	return ServerResourceOptions{
-		Profile:        profile,
-		ProfileApplied: applied,
 		HTTP2Options:   http2Options,
 		HTTP3Options:   http3Options,
 		MaxHeaderBytes: maxHeaderBytes,
@@ -310,10 +251,6 @@ func (o *HTTPInboundOptions) UnmarshalJSONContext(ctx context.Context, content [
 	if err != nil {
 		return err
 	}
-	// Record which resource fields the user wrote BEFORE unmarshalling the
-	// version-specific options, so the profile can tell "absent" from
-	// "explicitly zero".
-	o.Present = recordPresence(content)
 	return unmarshalHTTPVersionsOptions(ctx, content, (*_HTTPInboundOptions)(o), o.Versions(), &o.HTTP2Options, &o.HTTP3Options)
 }
 

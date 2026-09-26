@@ -37,9 +37,9 @@ const (
 )
 
 // ConfigureHTTP3ListenerFunc builds the HTTP/3 listener. maxHeaderBytes is the
-// effective request header limit resolved from server_profile and
-// max_header_bytes; the HTTP/3 server needs it explicitly because it does not
-// share the HTTP/2 server's configuration.
+// effective request header limit resolved from max_header_bytes; the HTTP/3
+// server needs it explicitly because it does not share the HTTP/2 server's
+// configuration.
 var ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, options option.QUICOptions, maxHeaderBytes int) (io.Closer, error)
 
 type Handler interface {

@@ -194,21 +194,24 @@ func TestMaxHeaderBytesContract(t *testing.T) {
 			"an explicit value must be used as given")
 	})
 
-	t.Run("an explicit non-positive value is an error", func(t *testing.T) {
-		// Decoded from JSON, because Present.MaxHeaderBytes is populated by the
-		// decoder: setting the field directly would leave the presence flag false
-		// and the absent path would run instead, so the test would not exercise
-		// the explicit branch at all.
-		for _, literal := range []string{`{"max_header_bytes": 0}`, `{"max_header_bytes": -1}`} {
-			options := decodeInboundOptions(t, literal)
-			require.True(t, options.Present.MaxHeaderBytes,
-				"precondition: %s must register as explicitly present", literal)
-			_, err := options.ResolveServerResources()
-			require.Error(t, err,
-				"an explicit %s must be refused rather than silently replaced "+
-					"with the default", literal)
-			require.Contains(t, err.Error(), "max_header_bytes")
-		}
+	t.Run("a negative value is an error", func(t *testing.T) {
+		// A NEGATIVE value is refused. Zero is NOT an error: with the profile
+		// mechanism removed, an unset and an explicit 0 both mean "use the upstream
+		// default", which is the same convention every other numeric resource field
+		// in this option set uses.
+		options := decodeInboundOptions(t, `{"max_header_bytes": -1}`)
+		_, err := options.ResolveServerResources()
+		require.Error(t, err,
+			"an explicit negative max_header_bytes must be refused rather than "+
+				"silently replaced with the default")
+		require.Contains(t, err.Error(), "max_header_bytes")
+	})
+
+	t.Run("zero means unset and resolves to the upstream default", func(t *testing.T) {
+		options := decodeInboundOptions(t, `{"max_header_bytes": 0}`)
+		resolved, err := options.ResolveServerResources()
+		require.NoError(t, err)
+		require.Equal(t, UpstreamMaxHeaderBytes, resolved.MaxHeaderBytes)
 	})
 }
 

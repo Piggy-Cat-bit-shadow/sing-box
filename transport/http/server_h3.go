@@ -45,9 +45,9 @@ func init() {
 		// (protocol.DefaultMaxIncomingStreams).
 		//
 		// An operator who genuinely needs more sets max_concurrent_streams, which
-		// NewQUICConfig already honours above; the production topology does
-		// exactly that through server_profile. So the default is bounded and the
-		// override is explicit, rather than the default being unbounded.
+		// NewQUICConfig already honours above, per inbound. So the default is
+		// bounded and the override is explicit, rather than the default being
+		// unbounded.
 		// 0-RTT is disabled on the proxy inbound.
 		//
 		// Why: a CONNECT is not a safe, idempotent request. It creates a tunnel,
@@ -90,8 +90,8 @@ func init() {
 		// the same class of silent divergence the HTTP/3 audit removed from the
 		// Native Naive listener.
 		//
-		// A deployment that wants BBR names it, and the production topology does
-		// that through server_profile.
+		// A deployment that wants BBR names it via bbr_profile, which the
+		// production topology does explicitly.
 		congestionProfile, profileErr := parseBBRProfile(options.BBRProfile.BBRProfileValue())
 		if profileErr != nil {
 			quicListener.Close()
