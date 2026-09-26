@@ -30,6 +30,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
 	"github.com/sagernet/sing-box/protocol/vmess"
+	"github.com/sagernet/sing-box/service/api"
 )
 
 // Registry for the Jiejie Client Edition macOS build (`jiejie_client_macos`).
@@ -192,15 +193,40 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 	return registry
 }
 
-// ServiceRegistry registers nothing beyond what the client needs.
+// ServiceRegistry registers the two management-plane services a headless client
+// needs, and nothing else.
 //
-// The `api` (Clash API) service is registered by include/clashapi.go, which
-// `with_clash_api` compiles in independently of this file — that is the service a
-// third-party GUI talks to, and it is a hard requirement of the profile. No
-// other sing-box service is registered: the client uses none of them, and
-// dropping them is what keeps ssmapi/derp/usbip/oomkiller out of the binary.
+// # Two different services, often confused
+//
+// sing-box has TWO independent management APIs, and this profile needs both:
+//
+//   - `api` (constant.TypeAPI, service/api) is the NATIVE management service. It
+//     serves a gRPC API over gRPC-Web and WebSocket, and it is the only service
+//     that can serve the sing-box Web Dashboard. Registering it is what makes
+//     headless `browser -> localhost` operation possible at all. An earlier
+//     revision of this registry did NOT register it — the comment here claimed
+//     the Clash API covered it, which was wrong: they are separate services with
+//     separate schemas, and the native dashboard was consequently unreachable
+//     ("unknown inbound type: api").
+//
+//   - `clash` (experimental/clashapi) is the COMPATIBILITY service. It is not
+//     registered here: include/clashapi.go registers it directly under
+//     `with_clash_api`, independently of this file, because it is a build-tag
+//     concern rather than a registry one. It stays because third-party GUIs,
+//     existing dashboards and debugging tools depend on it.
+//
+// Neither is required for proxying. If either is misconfigured the core's data
+// path — TUN, DNS, routing, outbounds — is unaffected; the control plane fails
+// and the data plane keeps working. That separation is deliberate and is what
+// makes a broken dashboard harmless.
+//
+// Everything else upstream registers (ssmapi, resolved, derp, ccm, ocm, usbip,
+// oomkiller) stays out, which is what keeps their dependency trees out of the
+// binary.
 func ServiceRegistry() *service.Registry {
 	registry := service.NewRegistry()
+
+	api.RegisterService(registry)
 
 	registerQUICServices(registry)
 
