@@ -1,0 +1,164 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "type": "https",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        }
+      },
+      {
+        "tag": "dns-direct",
+        "type": "udp",
+        "server": "223.5.5.5",
+        "server_port": 53
+      },
+      {
+        "tag": "dns-local",
+        "type": "local"
+      },
+      {
+        "tag": "dns-fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15"
+      }
+    ],
+    "rules": [
+      {
+        "query_type": ["A", "AAAA"],
+        "server": "dns-fakeip"
+      },
+      {
+        "domain_suffix": [".local", ".lan", ".home.arpa"],
+        "server": "dns-local"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "prefer_ipv4"
+  },
+  "services": [
+    {
+      "type": "api",
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "listen_port": 9090,
+      "dashboard": {
+        "enabled": true,
+        "path": "dashboard"
+      }
+    }
+  ],
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9091",
+      "default_mode": "rule"
+    },
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db"
+    }
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "utun10",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": false,
+      "route_exclude_address": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"],
+      "platform": {
+        "http_proxy": {
+          "enabled": false
+        }
+      }
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890,
+      "set_system_proxy": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["auto", "manual-node", "direct"],
+      "default": "auto"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["manual-node"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "tag": "manual-node",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "BkfFtKDjP-jUPC2rqPoU7U9ffvEpI1qL495YH4zeH1w",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".local", ".lan", ".home.arpa"],
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".example-ads.test"],
+        "outbound": "block"
+      }
+    ],
+    "final": "proxy",
+    "default_domain_resolver": "dns-remote"
+  }
+}
