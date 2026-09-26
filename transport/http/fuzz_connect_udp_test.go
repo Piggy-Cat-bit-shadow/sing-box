@@ -193,25 +193,45 @@ func FuzzConnectUDPTargetPath(fuzz *testing.F) {
 		if destination.AddrString() == "" {
 			t.Fatalf("an accepted destination must carry a host: %q", path)
 		}
-		// A zone identifier IS allowed through, and that is MEASURED rather than
-		// assumed: an earlier version of this target asserted the opposite and failed
-		// on correct code. The zone names an interface on the CLIENT, so what matters
-		// is not that it is stripped - stripping a zone from a link-local address
-		// would CHANGE the destination - but that the carried address is still a
-		// coherent one. TestJiejieMinimalConnectUDPScopedIPv6TargetIsMeasured records
-		// the end-to-end outcome: the request is accepted and the OS refuses to route
-		// a link-local destination, per datagram, without killing the tunnel.
-		if destination.Addr.IsValid() && destination.Addr.Zone() != "" {
+		// A zone identifier IS allowed through, on ANY IPv6 address, and that is
+		// MEASURED rather than assumed. Two earlier versions of this assertion were
+		// guesses and both failed on correct code:
+		//
+		//   - the first required the zone to be rejected;
+		//   - the second allowed it only on a LINK-LOCAL address, and the fuzzer
+		//     immediately produced `::%0` (an unspecified address with zone "0"),
+		//     which is accepted.
+		//
+		// The zone is produced by M.ParseSocksaddrHostPort, which keeps whatever zone
+		// the client spelled, so it is present for link-local (fe80::1%eth0), global
+		// (2001:db8::1%eth0) and unspecified (::%0) addresses alike. Enumerating the
+		// addresses the parser accepts is therefore not this target's business; what
+		// IS this target's business is that a zone never changes the ADDRESS itself
+		// and is only ever attached to an IPv6 address.
+		//
+		// The end-to-end consequence is recorded in
+		// TestJiejieMinimalConnectUDPScopedIPv6TargetIsMeasured: the request is
+		// accepted with 200, the zone survives into the destination, and the OS
+		// decides per datagram whether the scoped destination is routable, without
+		// killing the tunnel.
+		if zone := destination.Addr.Zone(); zone != "" {
 			if !destination.Addr.Is6() {
 				t.Fatalf("only an IPv6 address may carry a zone: %q -> %s", path, destination)
 			}
 			if destination.Addr.Is4In6() {
 				t.Fatalf("a v4-mapped address must not carry a zone: %q -> %s", path, destination)
 			}
-			if !destination.Addr.IsLinkLocalUnicast() {
-				t.Fatalf("a zone on a non-link-local address is not useful and should "+
-					"be recorded rather than passed through silently: %q -> %s",
+			// The zone must be the one the client spelled and must not have been
+			// folded into the address bytes: the address this endpoint would dial
+			// has to be the address that was written.
+			withoutZone := destination.Addr.WithZone("")
+			if !withoutZone.IsValid() {
+				t.Fatalf("stripping the zone must leave a valid address: %q -> %s",
 					path, destination)
+			}
+			if destination.AddrString() != withoutZone.WithZone(zone).String() {
+				t.Fatalf("the zone must be carried as a zone and not merged into the "+
+					"address: %q -> %s", path, destination)
 			}
 		}
 

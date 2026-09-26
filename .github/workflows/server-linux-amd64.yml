@@ -113,16 +113,60 @@ jobs:
       # The time budget is deliberately small: this is a regression gate, not a
       # long fuzzing campaign. Each target gets its own run so a crash names the
       # parser directly instead of leaving one opaque failure.
+      #
+      # EVERY target that exists must be listed here. A target that is not listed
+      # compiles, passes `go test` on its seed corpus, and never actually fuzzes -
+      # the same "present but never executed" false green the reference interop step
+      # already had to fix once. The coverage check at the end compares the targets
+      # DEFINED in the source against the ones run here, so adding a target without
+      # adding it to this list fails the build.
+      #
+      # The lists are per PACKAGE because `-fuzz` takes a package pattern: the
+      # CONNECT-UDP target parser lives in transport/http while the CONNECT-IP
+      # parsers live in transport/masque, so running one package's targets against
+      # the other's corpus would report a pass while measuring nothing.
       - name: Fuzz the MASQUE parsers (bounded)
         shell: bash
         run: |
           set -euo pipefail
           TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          for TARGET in FuzzCapsuleParser FuzzRouteAdvertisement FuzzConnectIPAddresses FuzzConnectUDPTemplatePath; do
-            echo "=== $TARGET ==="
-            go test -tags "$TAGS" -count=1 -run "^${TARGET}$" -fuzz "^${TARGET}$" \
-              -fuzztime 20s ./transport/masque/
+
+          MASQUE_TARGETS="FuzzCapsuleParser FuzzRouteAdvertisement FuzzConnectIPAddresses FuzzConnectIPTemplatePath FuzzMasqueIPPacketParser FuzzCapsuleStreamFragmentation"
+          HTTP_TARGETS="FuzzConnectUDPTargetPath"
+
+          run_target() {
+            package="$1"
+            target="$2"
+            echo "=== ${package}: ${target} ==="
+            go test -tags "$TAGS" -count=1 -run "^${target}$" -fuzz "^${target}$" \
+              -fuzztime 20s "$package"
+          }
+
+          for TARGET in $MASQUE_TARGETS; do
+            run_target ./transport/masque/ "$TARGET"
           done
+          for TARGET in $HTTP_TARGETS; do
+            run_target ./transport/http/ "$TARGET"
+          done
+
+          echo ""
+          echo "=== fuzz target coverage check ==="
+          DEFINED=$(grep -rhoE '^func (Fuzz[A-Za-z0-9_]*)' \
+            transport/masque/*_test.go transport/http/*_test.go \
+            | sed 's/^func //' | sort -u)
+          MISSING=0
+          for TARGET in $DEFINED; do
+            if ! echo "$MASQUE_TARGETS $HTTP_TARGETS" | grep -qw "$TARGET"; then
+              echo "::error::$TARGET is defined in transport/masque or transport/http"
+              echo "::error::but is not in the bounded fuzz lists above, so it never"
+              echo "::error::fuzzes. Add it to the correct package's list."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" != "0" ]; then
+            exit 1
+          fi
+          echo "all $(echo "$DEFINED" | wc -l | tr -d ' ') defined fuzz targets were run"
 
   production-minimal-integration:
     runs-on: ubuntu-latest

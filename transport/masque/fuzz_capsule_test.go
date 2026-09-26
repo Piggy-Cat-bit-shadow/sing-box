@@ -66,9 +66,15 @@ import (
 //     PARSE SUCCESSFULLY, with the expected decoded value, by a deterministic test
 //     in this same file. A seed that stops being valid fails the build instead of
 //     silently shrinking coverage;
-//  2. FuzzRouteAdvertisement and FuzzConnectIPAddresses count accepted-and-non-empty
-//     inputs and fail if a bounded run never produced one, so "the corpus only ever
-//     exercises the rejection path" is a visible failure rather than a vacuous pass.
+//  2. TestRouteAdvertisementSeedsAreValid / TestAddressSeedsAreValid and
+//     TestProductionEncoderReproducesTheRFCVectors below are deterministic, so the
+//     acceptance path has real coverage whether or not the fuzzer ever wanders into
+//     it. (An earlier attempt used a counter inside the fuzz function to assert the
+//     success path was reached. That does NOT work: `go test -fuzz` runs the seed
+//     corpus and the workers in CHILD processes, so a counter in the parent stays
+//     zero and the check fired on a perfectly good corpus. Coverage that has to be
+//     measured from inside one process belongs in a deterministic test, not in the
+//     fuzz function.)
 
 // ---------------------------------------------------------------------------
 // Deterministic pinning of the seed corpus
@@ -597,13 +603,11 @@ func FuzzRouteAdvertisement(fuzz *testing.F) {
 	// An 8-byte varint reused as a version byte.
 	fuzz.Add([]byte{0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0})
 
-	accepted := 0
 	fuzz.Fuzz(func(t *testing.T, data []byte) {
 		routes, err := parseRoutes(data)
 		if err != nil {
 			return
 		}
-		accepted++
 		if len(routes) > maxRoutesPerCapsule {
 			t.Fatalf("accepted %d routes, above the per-capsule bound of %d",
 				len(routes), maxRoutesPerCapsule)
@@ -649,13 +653,6 @@ func FuzzRouteAdvertisement(fuzz *testing.F) {
 			}
 		}
 	})
-	// The target must have reached its success path. If every seed and every
-	// generated input were rejected, this run proves nothing about the accepted
-	// shapes, which is exactly the false green the old corpus produced.
-	if accepted == 0 {
-		fuzz.Fatal("this fuzz run never parsed a ROUTE_ADVERTISEMENT successfully, " +
-			"so the accepted-input assertions were never reached")
-	}
 }
 
 // FuzzConnectIPAddresses drives the ADDRESS_ASSIGN / ADDRESS_REQUEST parser.
@@ -689,13 +686,11 @@ func FuzzConnectIPAddresses(fuzz *testing.F) {
 	// A varint whose declared width runs past the end of the capsule.
 	fuzz.Add([]byte{0xc0, 0x00, 0x00})
 
-	accepted := 0
 	fuzz.Fuzz(func(t *testing.T, data []byte) {
 		addresses, err := parseAddresses(data)
 		if err != nil {
 			return
 		}
-		accepted++
 		if len(addresses) > maxAddressesPerCapsule {
 			t.Fatalf("accepted %d addresses, above the per-capsule bound of %d",
 				len(addresses), maxAddressesPerCapsule)
@@ -719,10 +714,6 @@ func FuzzConnectIPAddresses(fuzz *testing.F) {
 			}
 		}
 	})
-	if accepted == 0 {
-		fuzz.Fatal("this fuzz run never parsed an ADDRESS_ASSIGN entry successfully, " +
-			"so the accepted-input assertions were never reached")
-	}
 }
 
 // FuzzConnectIPTemplatePath drives the CONNECT-IP URI-template matcher.
