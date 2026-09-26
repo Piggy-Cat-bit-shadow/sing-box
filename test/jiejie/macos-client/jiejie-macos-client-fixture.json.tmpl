@@ -1,0 +1,155 @@
+{
+  "log": {"level": "warn", "timestamp": true},
+  "dns": {
+    "servers": [
+      {"tag": "dns-local", "type": "local"},
+      {"tag": "dns-udp", "type": "udp", "server": "1.1.1.1", "server_port": 53},
+      {"tag": "dns-tcp", "type": "tcp", "server": "1.1.1.1", "server_port": 53},
+      {"tag": "dns-dot", "type": "tls", "server": "1.1.1.1", "server_port": 853, "tls": {"enabled": true, "server_name": "cloudflare-dns.com"}},
+      {"tag": "dns-doh", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "tls": {"enabled": true, "server_name": "cloudflare-dns.com"}},
+      {"tag": "dns-doq", "type": "quic", "server": "1.1.1.1", "server_port": 853, "tls": {"enabled": true, "server_name": "cloudflare-dns.com"}},
+      {"tag": "dns-doh3", "type": "h3", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query", "tls": {"enabled": true, "server_name": "cloudflare-dns.com"}},
+      {"tag": "dns-fakeip", "type": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"}
+    ],
+    "rules": [
+      {"domain_suffix": [".example.test"], "server": "dns-hosts"},
+      {"domain": ["dns-doq.example.test"], "server": "dns-doq"},
+      {"domain": ["dns-doh3.example.test"], "server": "dns-doh3"},
+      {"query_type": ["A", "AAAA"], "server": "dns-fakeip"}
+    ],
+    "final": "dns-udp",
+    "strategy": "prefer_ipv4"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:__CLASH_PORT__",
+      "default_mode": "rule"
+    },
+    "cache_file": {"enabled": true, "path": "__CACHE_FILE__"}
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": __MIXED_PORT__,
+      "users": [{"username": "example", "password": "example"}],
+      "set_system_proxy": false
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": __SOCKS_IN_PORT__,
+      "users": [{"username": "example", "password": "example"}]
+    },
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": __HTTP_IN_PORT__,
+      "users": [{"username": "example", "password": "example"}]
+    },
+    {
+      "type": "direct",
+      "tag": "direct-in",
+      "listen": "127.0.0.1",
+      "listen_port": __DIRECT_IN_PORT__,
+      "override_address": "127.0.0.1",
+      "override_port": __ECHO_PORT__
+    },
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "utun9",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": false,
+      "route_exclude_address": ["192.168.0.0/16"],
+      "platform": {"http_proxy": {"enabled": false}}
+    }
+  ],
+  "outbounds": [
+    {"type": "direct", "tag": "direct", "domain_resolver": "dns-udp"},
+    {"type": "block", "tag": "block"},
+
+    {"type": "selector", "tag": "select", "outbounds": ["urltest", "vless-reality", "direct"], "default": "urltest"},
+    {"type": "urltest", "tag": "urltest", "outbounds": ["vless-reality", "trojan-tls"], "url": "https://www.gstatic.com/generate_204", "interval": "10m", "tolerance": 50},
+
+    {"type": "socks", "tag": "socks-out", "server": "127.0.0.1", "server_port": __SOCKS_UPSTREAM_PORT__, "version": "5", "username": "example", "password": "example"},
+    {"type": "http", "tag": "http-out", "server": "127.0.0.1", "server_port": __HTTP_UPSTREAM_PORT__, "username": "example", "password": "example"},
+
+    {
+      "type": "vless", "tag": "vless-reality",
+      "server": "127.0.0.1", "server_port": __VLESS_PORT__,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "flow": "xtls-rprx-vision",
+      "tls": {"enabled": true, "server_name": "example.test", "utls": {"enabled": true, "fingerprint": "chrome"}, "reality": {"enabled": true, "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "short_id": "0123456789abcdef"}}
+    },
+    {
+      "type": "vmess", "tag": "vmess-ws",
+      "server": "127.0.0.1", "server_port": __VMESS_PORT__,
+      "uuid": "00000000-0000-0000-0000-000000000002",
+      "security": "auto", "alter_id": 0,
+      "transport": {"type": "ws", "path": "/ws", "headers": {"Host": "example.test"}}
+    },
+    {
+      "type": "trojan", "tag": "trojan-tls",
+      "server": "127.0.0.1", "server_port": __TROJAN_PORT__,
+      "password": "example",
+      "tls": {"enabled": true, "server_name": "example.test", "utls": {"enabled": true, "fingerprint": "chrome"}}
+    },
+    {
+      "type": "shadowsocks", "tag": "ss2022",
+      "server": "127.0.0.1", "server_port": __SS_PORT__,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+    },
+    {
+      "type": "shadowtls", "tag": "shadowtls-out",
+      "server": "127.0.0.1", "server_port": __SHADOWTLS_PORT__,
+      "version": 3, "password": "example",
+      "tls": {"enabled": true, "server_name": "example.test", "utls": {"enabled": true, "fingerprint": "chrome"}}
+    },
+    {
+      "type": "snell", "tag": "snell-out",
+      "server": "127.0.0.1", "server_port": __SNELL_PORT__,
+      "psk": "example-psk", "version": 4
+    },
+    {
+      "type": "anytls", "tag": "anytls-out",
+      "server": "127.0.0.1", "server_port": __ANYTLS_PORT__,
+      "password": "example",
+      "tls": {"enabled": true, "server_name": "example.test"}
+    },
+    {
+      "type": "hysteria2", "tag": "hysteria2-out",
+      "server": "127.0.0.1", "server_port": __HYSTERIA2_PORT__,
+      "password": "example",
+      "tls": {"enabled": true, "server_name": "example.test", "alpn": ["h3"]}
+    },
+    {
+      "type": "tuic", "tag": "tuic-out",
+      "server": "127.0.0.1", "server_port": __TUIC_PORT__,
+      "uuid": "00000000-0000-0000-0000-000000000003",
+      "password": "example",
+      "congestion_control": "bbr",
+      "tls": {"enabled": true, "server_name": "example.test", "alpn": ["h3"]}
+    }
+  ],
+  "route": {
+    "rules": [
+      {"action": "sniff"},
+      {"protocol": "dns", "action": "hijack-dns"},
+      {"ip_is_private": true, "outbound": "direct"},
+      {"domain_suffix": [".blocked.test"], "outbound": "block"},
+      {"domain_keyword": ["urltest-probe"], "outbound": "select"},
+      {"network": ["udp"], "port": [443], "outbound": "hysteria2-out"}
+    ],
+    "rule_set": [],
+    "final": "select",
+    "auto_detect_interface": false,
+    "default_domain_resolver": "dns-udp"
+  }
+}
