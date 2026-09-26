@@ -77,7 +77,6 @@ type batchCapablePacketConn struct {
 	// readWaiterCalls and readWaiterOK count creations, so "the wrapper asked the
 	// inner connection exactly once" is assertable.
 	readWaiterCalls int
-	readWaiterOK    bool
 	writeCreatorHit int
 
 	// batchReadCalls / batchWriteCalls count the calls the WRAPPER forwards, which is

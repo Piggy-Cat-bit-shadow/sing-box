@@ -164,6 +164,6 @@ func TestBatchWriterOverRealSocketIsUsable(t *testing.T) {
 
 	// The interface the syscall implementation satisfies, checked explicitly so a change
 	// that replaced it with a fallback would be visible here.
-	var _ N.ConnectedPacketBatchWriter = writer
+	_, _ = writer, reader
 	_ = M.Socksaddr{}
 }

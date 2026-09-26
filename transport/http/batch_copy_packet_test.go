@@ -165,10 +165,7 @@ func (w *instrumentedBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.Buffer,
 		return nil, M.Socksaddr{}, errBatchSourceDrained
 	}
 
-	want := w.size
-	if want > remaining {
-		want = remaining
-	}
+	want := min(w.size, remaining)
 
 	// Drain what is ALREADY queued, up to the bound, without waiting for more. This is
 	// what makes the batch a property of the queued data rather than of the timing.

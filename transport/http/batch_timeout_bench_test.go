@@ -104,10 +104,7 @@ func (w *benchBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.Buffer, M.Sock
 	if w.source.left <= 0 {
 		return nil, M.Socksaddr{}, errBenchDrained
 	}
-	want := w.size
-	if want > w.source.left {
-		want = w.source.left
-	}
+	want := min(w.size, w.source.left)
 	buffers := make([]*buf.Buffer, 0, want)
 	for range want {
 		packet := buf.NewSize(len(w.source.payload))
@@ -165,16 +162,6 @@ func (w *benchBatchWriter) WriteConnectedPacketBatch(buffers []*buf.Buffer) erro
 	w.destination.payloads += len(buffers)
 	buf.ReleaseMulti(buffers)
 	return nil
-}
-
-// benchReadWaitOptions is the geometry the copy path uses.
-func benchReadWaitOptions(batchSize int) N.ReadWaitOptions {
-	return N.ReadWaitOptions{
-		FrontHeadroom: 3,
-		RearHeadroom:  255,
-		MTU:           1500,
-		BatchSize:     batchSize,
-	}
 }
 
 // BenchmarkTimeoutWrapperBatchPath measures the three cases.
