@@ -779,10 +779,39 @@ QUICHE stays an EXTERNAL test-only tool. Root `go.mod` is untouched, the workflo
 re-verifies `go.mod` and `go.sum` are byte-identical after the C++ build, and nothing is
 vendored.
 
-**QUICHE HTTP/3 transport interop: PASS.** The real pinned binary completes a QUIC v1
-handshake and an HTTP/3 request/response against a real sing-box process. sing-box's
-SETTINGS were read from the peer and show `EnableDatagrams=true` and
-`EnableExtendedConnect=true`.
+**QUICHE HTTP/3 transport interop: PASS locally, NOT-TESTED on GitHub-hosted runners.**
+
+On a developer host the real pinned binary completes a QUIC v1 handshake and an HTTP/3
+request/response against a real sing-box process in ~0.2s, and sing-box's SETTINGS were
+read from the peer showing `EnableDatagrams=true` and `EnableExtendedConnect=true`. This
+was measured on both macOS and Linux.
+
+On a GitHub-hosted runner the same test does NOT complete. MEASURED across two real
+dispatches: QUICHE produces no output and the process is killed by the harness deadline.
+The runner's own log names the cause:
+
+```
+failed to sufficiently increase receive buffer size
+(was: 1024 kiB, wanted: 7168 kiB, got: 2048 kiB)
+```
+
+That is a host-tuning limit, not a protocol difference, so the two outcomes are kept
+apart rather than merged:
+
+| Observation | Verdict |
+| --- | --- |
+| QUICHE stalls, no output | NOT-TESTED, with the runner limitation named |
+| QUICHE runs, exits non-zero, output present | FAIL — a real disagreement |
+| No binary available | FAIL — the dispatch demonstrated nothing |
+
+The workflow enforces the same split: a SKIP because no binary was available fails the
+dispatch, while a SKIP because QUICHE stalled on this host is a warning that states
+NOT-TESTED. The first dispatch of this workflow produced the second kind of skip, and the
+run was then made to say so explicitly instead of reporting a false failure. Collapsing
+the two would blame sing-box for a runner limitation.
+
+The workflow run ID for the verified dispatch is `36238936300` (commit `a9c18602d`), with
+QUICHE built at the pin and root `go.mod` verified byte-identical afterwards.
 
 **QUICHE CONNECT-UDP tunnel interop: NOT-TESTED.** Every encapsulated attempt fails before
 any CONNECT-UDP reaches the server:
