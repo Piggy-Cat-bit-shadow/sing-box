@@ -41,6 +41,19 @@ tags="$(cat "$tags_file")"
 # the file cannot claim a version the binary was not built against.
 dep() { go list -m -f '{{.Version}}' "$1" 2>/dev/null || echo unknown; }
 
+# effective_dep reports the module a dependency ACTUALLY resolves to, following
+# any `replace`.
+#
+# This matters for github.com/sagernet/sing, which this fork replaces with
+# github.com/Piggy-Cat-bit-shadow/sing. `go list -m -f '{{.Version}}'` reports
+# the ORIGINAL upstream version from the require line and says nothing about the
+# replacement, so a plain dep() call recorded a version the binary was NOT built
+# against — the exact failure the comment above says this file must not have. It
+# was invisible because the upstream version is a real, plausible string.
+effective_dep() {
+  go list -m -f '{{if .Replace}}{{.Replace.Path}}@{{.Replace.Version}} (replaces {{.Path}}@{{.Version}}){{else}}{{.Path}}@{{.Version}}{{end}}' "$1" 2>/dev/null || echo unknown
+}
+
 {
   echo "Jiejie sing-box build information"
   echo "================================="
@@ -57,7 +70,7 @@ dep() { go list -m -f '{{.Version}}' "$1" 2>/dev/null || echo unknown; }
   echo "build_tags:            $tags"
   echo "quic_go:               $(dep github.com/sagernet/quic-go)"
   echo "sing_quic:             $(dep github.com/sagernet/sing-quic)"
-  echo "sing:                  $(dep github.com/sagernet/sing)"
+  echo "sing:                  $(effective_dep github.com/sagernet/sing)"
   echo ""
   echo "This build embeds NO timestamp: its hash is determined by the source"
   echo "commit and tags alone, so it is reproducible. The build_time_utc above is"
