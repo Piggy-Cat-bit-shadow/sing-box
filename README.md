@@ -19,6 +19,44 @@
 本仓库跟踪上游 `testing` 分支，并维护一组服务端改动。协议实现、路由、DNS、TLS
 和传输层均来自上游；本仓库增加的是部署相关的服务端行为、注册表裁剪与验证。
 
+MASQUE Pre-VPS code-closure baseline：`864be35e`（不是 README 更新后的 current HEAD，
+只是本轮代码收口的基线 commit）。
+
+## 当前状态
+
+| 项目 | 状态 |
+| --- | --- |
+| Native Naive | Caddy / forwardproxy reference parity、H1 / H2 / H3、Padding、half-close、ALPN、认证与资源边界均已有实测覆盖 |
+| MASQUE HTTP/2 / HTTP/3 | Pre-VPS code closure 已完成；代码侧与 CI 侧无已知 blocker |
+| MASQUE CONNECT-UDP | production minimal 的实际发布路径；H2 / H3 均有运行测试与 reference interop |
+| MASQUE CONNECT-IP | 有 full-registry reference / protocol 验证；不是当前 production minimal 发布的 endpoint |
+| 当前阶段 | 下一步为 Linux amd64 VPS 实机验收 |
+| 实机结果 | NOT-TESTED；本地 / CI 的 PASS 不等于 VPS PASS |
+
+上述状态只描述代码与测试能证明的范围。真实 VPS 尚未验收，因此这里不使用
+“production ready”一类的结论。
+
+## 构建产物
+
+CI 会产出两个 GitHub Actions artifact，用途完全不同：
+
+| Artifact | 用途 |
+| --- | --- |
+| `Jiejie-VPS-linux-amd64-<version>-<sha>` | 真正用于 Linux amd64 VPS 部署的生产 minimal 二进制 |
+| `naive-caddy-parity-<sha>` | Native Naive 与 pinned Caddy / forwardproxy reference 做差分测试后生成的 CI 报告 |
+
+`naive-caddy-parity-<sha>` **不是** Caddy binary，不是代理程序，也不是 VPS 部署程序。
+它只包含：
+
+```text
+naive-caddy-parity.json
+naive-parity.log
+```
+
+部署 VPS 时只需要 `Jiejie-VPS-linux-amd64-*`；`naive-caddy-parity-*` 仅用于兼容性审计与追溯。
+
+artifact 名称中的 `<version>` 与 `<sha>` 随构建 commit 变化，不写死。
+
 ## 构建范围（Build Scope）
 
 面向 Linux amd64 的服务端最小化构建。裁剪发生在**注册层面**：minimal registry
@@ -125,6 +163,32 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
   （`MaxIncomingStreams` 不再显式设置）。
 - `086aba2a45` — Padding codec 与 CONNECT authority 模糊测试。
 - `318dbee27d` — 差分结论与产物表达改为无歧义。
+- `2fbab5b96f` — Basic credential 比较改为 constant-time，去除明显的认证 timing signal。
+- `bc50e66ea7` — HTTP/2 / HTTP/3 tunnel flush 失败正确向上传播。
+- `aa32bdf781` — 未认证代理 challenge 与 Caddy / forwardproxy reference 对齐。
+- `497fb9272c` — 分离 bare Caddy 与 probe-resistant reference profile，避免错误比较。
+- `d22dd89443` — QUIC tuning 改为 opt-in，协议默认行为更接近 reference。
+- `11fd30d330` — 覆盖双向 tunnel half-close。
+- `1f0547577e` — 官方 NaiveProxy client preamble 对 Web masquerade 的真实行为验证。
+- `2e49e4508c` — 大 payload Padding segmentation 与 reference 实测比较。
+- `59401b422d` — mixed-address ACL hardening regression。
+- `1f9014c854` — malformed CONNECT port 不再被错误 coercion。
+- `8618312690` — 对照 reference 的校验式 HTTP/3 差分。
+- `10191b11c7` — shared TLS config 增加 transport-scoped ALPN view。
+- `d6820d0e7a` — tcp+udp inbound 下 TCP / QUIC ALPN 真正隔离。
+- `65e2270028` — padded response segmentation 与 forwardproxy reference 对齐。
+- `b16660ed18` — 去除 username-existence timing signal。
+- `242d8c2cba` — zero-length padded frame 仍然产生读取进度，避免 no-progress 行为。
+- `f74d9254cd` — QUIC version list 与 reference 对齐并固定。
+- `8ed7051c62` — 测量 HTTP/3 server defaults 与 Caddy reference 的差异。
+- `b67b3f6ae4` — 在运行时走到 HTTP/3 pseudo-header guard，不再只靠静态检查。
+- `f730f6e50` — HTTP/3 half-close 双向覆盖。
+- `9a553a7ff` — 固定 shared TLS config 在各 ALPN view 之间的生命周期归属。
+- `40b6d6fcc` — 真实 QUIC congestion-control validation（不再只做配置层断言）。
+- `385383dcc` — CI 中真正执行 HTTP/3 differential against the pinned reference。
+- `96eafce9b` — QUIC unit tests 从 repository root 执行，覆盖到需要 QUIC 的包。
+- `419a7e2efe` — 修正 write-contract fixture 的 buffer geometry，消除由 buffer-pool
+  状态暴露出的 flaky race；生产逻辑未变化。
 
 ### HTTP / MASQUE
 
@@ -144,6 +208,73 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 - `a3cb8abf58` — HTTP/MASQUE 来源身份默认使用 transport peer；
   `X-Forwarded-For` / `Forwarded` / `X-Real-IP` 不再决定来源。
 - `2fb3ba6930` — 服务端资源选项边界校验。
+
+### HTTP / MASQUE — reference hardening
+
+- `969909bc16` — 拒绝 ROUTE_ADVERTISEMENT 跨 protocol 的 overlap：
+  protocol 0 代表所有 protocol，同一 range 不能用不同 protocol 重复声明。
+- `b656b062f9` — overlap validation 改为线性时间，避免 O(n²) 造成的 CPU DoS。
+- `a529b68c83` — 限制单个 control capsule 内的 address / route entry 数量。
+- `e4f847ecf7` — MASQUE H3 QUIC tuning 改为 opt-in，默认贴近 quic-go reference。
+- `ab9c9f09d9` — CONNECT-UDP request path corpus。
+- `32b1d25cbf` — CONNECT-UDP / CONNECT-IP 对 pinned masque-go / connect-ip-go 的真实
+  reference interop。
+- `b81244bdf7` — H3 DATAGRAM → Capsule fallback 的真实 wire test。
+- `97e1487782` — RFC 9931 §8：conventional HTTP/1.1 CONNECT 被拒后关闭 connection。
+- `e4d2f6c1af` — `Contains` 与 `lookup` 对 server own-address 的语义保持一致。
+- `66f0e94360` — 针对 attacker-controlled MASQUE parser 的 fuzz targets。
+- `528858c444` — reference interop 按 case 使用正确 binary，避免 false-green / false-fail。
+- `6efcf0a75f` — CONNECT-IP ICMP fixture 改为真正指向 server gateway。
+- `0783a33b3b` — CONNECT-IP 在 HTTP Datagrams 未协商时使用 Capsule fallback。
+- `01f20ce4e6` — QUIC NAT rebinding / migration 行为实测。
+- `c5e2d3eb48` — active tunnel shutdown 与资源回收实测。
+- `858284e5a0` — send queue backpressure 与 buffer ownership。
+- `0cc6074e3d` — HTTP Datagram size accounting 在各 varint 边界固定。
+- `1325727a56` — IPv6 extension-header protocol 解析的 regression。
+- `86002b56f0` — IP packet parser 与 capsule fragmentation fuzz。
+- `824cd658a8` — `decrementHopLimit` 对 malformed IP header 做全量防御处理。
+  这是 HARDENING：两个调用点此前均已被 `packetAddresses` 拦截，并非可达的线上崩溃。
+- `429d8b6774` — Proxy-Status 与认证信息泄漏边界审计。
+- `a12e5c258c` — 关闭 reference CI 双向的 false-green 漏洞。
+- `0735d419c6` — MASQUE reference hardening merge 到 `testing`。
+
+关于 RFC 9931 的表述：§8 对 conventional CONNECT 是 server 侧 MUST；CONNECT-UDP
+被拒后关闭 connection 属于 SECURITY-HARDENING，不是 §6.3 对 server 的 MUST
+（§6.3 约束的是 client 不得乐观发送）。
+
+### HTTP / MASQUE — Pre-VPS code closure
+
+- `c70249783f` — 修复 reference harness 的 IPv6 control-capsule decoder：
+  地址前的 byte 是 IP Version（4 / 6），不是 address byte length（4 / 16）。
+  这是 TEST-HARNESS bug，不是 production bug。
+- `5434688268` — 修正 vacuous fuzz corpus（旧 seed 实际上全部 invalid），并补真正的
+  CONNECT-UDP path fuzz。
+- `7ae42c98d4` — 所有 MASQUE fuzz target 真正进入 bounded CI，并加 coverage guard。
+- `7bb4342755` — source identity 改为通过 routing layer 实际测量，不再靠错误的测试注释推断。
+- `8530321703` — NAT rebinding / source-port churn 不能重置 per-IP unauthenticated
+  limiter bucket。
+- `988df7a358` — live context-ID 边界、zero-length UDP、datagram error semantics。
+- `4fc9984b39` — 修正 MASQUE Capsule 路径的 IPv6 inner-packet 上限：
+  普通 IPv6 packet 可达到 65575 bytes；jumbogram 仍不支持。
+  这是本轮唯一确认的 production MASQUE bug。
+- `ba7f62a4ba` — IPv4 / IPv6 Packet Too Big 的完整证据链（含两个 checksum）。
+- `1dbf363d49` — QUIC 下 loss / duplicate / reorder impairment 实测，验证 tunnel
+  survival 与 recovery。这验证的是 quic-go + MASQUE stack 的行为，不是 sing-box
+  自己实现了 loss recovery。
+- `daa49073e8` — CONNECT-UDP H2 / H3 的 IPv6 live coverage；同时纠正 RFC 9931 §6.3
+  的引用。
+- `e823b4312b` — MASQUE reference audit 收口，并新增 Pre-VPS acceptance checklist。
+- `41a04ceb14` — cross-session ownership / route policy、control burst、IPv6 extension chain 覆盖。
+- `36d404826b` — Google QUICHE 作为第三个 protocol oracle。
+  状态是 CHECKED (protocol vectors)：只读取 pinned 源码并固定其 decision table 与
+  unit vectors，没有 build / run，因此不是 QUICHE interop PASS。
+- `0dbfc43d1e` — 记录 QUICHE vector check 的分类，并把 RFC 9931 client-side half
+  重新分类。
+- `4db6f90f98` — RFC 9931 client-side half 对当前 server-only product 归类为
+  OUT-OF-SCOPE。
+- `583bfc84f3` — QUICHE oracle tests 真正进入 reference CI 的 run filter。
+- `864be35ebc` — overlap-scaling test 在 shared runner 上改为抗噪声的 ratio / 最小值测量。
+  这是 TEST fix，不是 production 优化。
 
 ### AnyTLS
 
@@ -194,6 +325,25 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 - `4ed6dff200` — Naive HTTP/3 集成测试实际执行，不再跳过。
 - `9cce35ec3b` — HTTP/2 差分测试实际在 CI 中运行。
 - `a4f22a5949` — 上游 `testing` 同步 merge。
+- `935ffeca8` — CI 执行 MASQUE 包与 QUIC-tagged HTTP tests。
+- `e81f84994` — QUIC-tagged HTTP tests 从 repository root 执行，覆盖到需要 QUIC 的包。
+- `fc575d959` — 新增的 TLS 与 QUIC unit tests 进入 CI。
+- `96eafce9b` — QUIC unit tests 从 repository root 执行。
+- `a12e5c258c` — reference CI 双向 false-green 漏洞关闭。
+- `528858c444` — reference interop 按 case 使用正确 binary。
+- `7ae42c98d4` — bounded fuzz 覆盖所有 MASQUE target；新增 fuzz target 若没有进入
+  workflow，coverage 检查会让 CI fail。
+- `583bfc84f3` — QUICHE oracle tests 进入 reference run filter。
+- `864be35ebc` — 时间敏感的线性度断言改为抗噪声的 ratio 测量，避免 shared runner flaky。
+
+reference suite 另有一个 coverage guard：在 `test/jiejie/reference` 中定义但没有被
+`-run` filter 匹配到的测试，会让 CI fail，而不是静默跳过。
+
+生产 artifact 只在
+`lint-and-unit-tests`、`production-minimal-integration`、`build-production`
+三个 job 全部通过后才发布。
+
+注意：`naive-caddy-parity` 是 CI compatibility report artifact，不是生产 artifact。
 
 ### Documentation / Audit
 
@@ -203,6 +353,17 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 - `427defcbf7` — 生产协议能力矩阵。
 - `5c5440577d` — 审计结论与实测覆盖对齐：删除过期的 H3 结论，将过宽的 PASS
   标签下调为 PARTIAL / NOT-TESTED，并汇总所有未验证项。
+- `d159ec09d`、`762b0cede`、`67e55b387` — MASQUE reference audit 的 Phase 1 / 2 / 3 记录。
+- `e823b4312b` — MASQUE reference audit 收口，并新增 Pre-VPS acceptance checklist。
+
+文档：
+
+| 文件 | 内容 |
+| --- | --- |
+| [`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md`](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) | MASQUE reference audit，含 Phase 1/2/3 与 Pre-VPS closure |
+| [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) | 下一步 VPS 实机验收 checklist；区分 local / CI evidence 与 only-real-VPS evidence |
+| [`docs/JIEJIE-NAIVE-H3-AUDIT.md`](docs/JIEJIE-NAIVE-H3-AUDIT.md) | Native Naive H3 / QUIC 对照 reference 的审计 |
+| `naive-caddy-parity-<sha>` artifact | Caddy / forwardproxy differential 的 machine-readable 与 log 输出（CI artifact，不是文档文件） |
 
 ## Removed / Superseded Work
 
@@ -217,6 +378,9 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 
 仍然保留的 HTTP/3 工作仅限于服务端 listener 及其请求处理。
 
+Apple / iOS / macOS 客户端工作、Linux client-full 与 Windows client profile
+均不属于当前产品；当前产品只有 Linux amd64 VPS server。
+
 ## Maintenance Notes
 
 - **上游同步** —— 从上游 `testing` rebase/merge；fork 改动尽量集中在新增文件、
@@ -226,9 +390,25 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
   脚本与 workflow 读同一个文件，避免漂移。
 - **注册表改动** —— `include/registry_jiejie_server.go` 中的每一项注册都必须由生产
   拓扑 fixture 支撑；注册表审计测试会在漂移时报错。
-- **已知未验证项** —— HTTP/3 Caddy 差分、部分 half-close 矩阵、packet-level H3
-  SETTINGS、连接迁移行为，以及受控的 BBR/CUBIC benchmark。这些在文档中标记为
-  NOT-TESTED，不应视为已验证。
+- **已知未验证项** —— 只保留当前仍然成立的项目：
+  - **Google QUICHE live interop** —— NOT-TESTED。只有 protocol-vector CHECKED；
+    QUICHE 未 build、未 run。
+  - **CONNECT-IP live H3 Packet Too Big E2E** —— NOT-TESTED。PTB packet generation
+    已完整覆盖，但 loopback echo 无法构造“请求放得下、reply 放不下”的
+    `DatagramTooLarge` 条件。
+  - **真实 VPS / WAN** —— NOT-TESTED。下一步按
+    [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) 验收。
+  - **RFC 9931 client-side half** —— OUT-OF-SCOPE-FOR-SERVER-PRE-VPS。当前 production
+    minimal registry 不发布 MASQUE client endpoint，因此没有发布出去的组件会违反
+    client 侧义务。
+
+  以下项目此前列为 NOT-TESTED，现已由实测覆盖，不再属于未验证项：Native Naive 的
+  HTTP/3 Caddy differential、已覆盖的 half-close 矩阵、MASQUE NAT rebinding /
+  migration、MASQUE IPv6 路径、MASQUE 的 loss / duplicate / reorder 行为。
+
+  `docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md` 与 `docs/JIEJIE-NAIVE-H3-AUDIT.md`
+  的较早段落可能仍保留历史 NOT-TESTED 描述；与更新的测试、commit 及 Pre-VPS closure
+  冲突时，以当前代码、当前测试、当前 CI 与最新 closure 章节为准。
 - **详细文档** —— 架构与审计位于 [`docs/`](docs/)；
   `docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md` 按组件说明验证状态。
 
