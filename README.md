@@ -1,11 +1,19 @@
 # Jiejie Server Edition
 
-基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人服务端 fork。
+基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人 **server-only**
+fork。
 
+- 面向：**Linux amd64 VPS**，一套固定的生产拓扑（Nginx Stream 持有 TCP/443，
+  sing-box 持有 UDP/443）
+- 不是：通用 sing-box 替代品，也不是桌面 / 移动客户端；Apple、Linux client-full、
+  Windows client profile 均已移除
 - 上游分支：`testing`
-- 产品范围：Linux amd64 服务端
 - 生产 profile：`jiejie_server_minimal`
+- 交付方式：GitHub Actions artifact，**没有 stable GitHub Release**
 - 详细设计文档：[`docs/`](docs/)
+
+生产二进制只提供这一个拓扑需要的服务端能力；源码中仍然存在的其它协议模块**不在**
+生产构建内（见[构建范围](#构建范围build-scope)）。
 
 ## Upstream
 
@@ -13,37 +21,152 @@
 | --- | --- |
 | 上游仓库 | https://github.com/SagerNet/sing-box |
 | 跟踪分支 | `testing` |
-| fork 基线 | `b609f959f5` |
-| fork 版本 | `1.15.0-jiejie-masquerade.5` |
+| 当前上游基线 | `132b38e9c`（Bump version，2026-09-26） |
+| fork 当前版本 | `1.15.0-jiejie-masquerade.5` |
+| fork 当前 HEAD | `3878204393` |
 
 本仓库跟踪上游 `testing` 分支，并维护一组服务端改动。协议实现、路由、DNS、TLS
 和传输层均来自上游；本仓库增加的是部署相关的服务端行为、注册表裁剪与验证。
 
-MASQUE Pre-VPS code-closure baseline：`864be35e`（不是 README 更新后的 current HEAD，
-只是本轮代码收口的基线 commit）。
+最近一次上游同步是 `c992b1fab0`（Merge upstream testing into Jiejie testing），
+把上游 `132b38e9c` 合并进 fork 的 `71f0f1288`。该次同步保留了全部 fork hardening，
+并在合并过程中发现并修复了三个真实的生产回归（见
+[Upstream Sync 与合并期修复](#upstream-sync-与合并期修复)）。
+
+历史基线：MASQUE Pre-VPS code closure 的基线 commit 是 `864be35e`，它**不是**当前
+HEAD，只是当时那一轮代码收口的记录。
 
 ## 当前状态
 
 | 项目 | 状态 |
 | --- | --- |
-| Native Naive | Caddy / forwardproxy reference parity、H1 / H2 / H3、Padding、half-close、ALPN、认证与资源边界均已有实测覆盖 |
-| MASQUE HTTP/2 / HTTP/3 | Pre-VPS code closure 已完成；代码侧与 CI 侧无已知 blocker |
-| MASQUE CONNECT-UDP | production minimal 的实际发布路径；H2 / H3 均有运行测试与 reference interop |
-| MASQUE CONNECT-IP | 有 full-registry reference / protocol 验证；不是当前 production minimal 发布的 endpoint |
-| 当前阶段 | 下一步为 Linux amd64 VPS 实机验收 |
+| Native Naive | H1 / H2 / H3、Padding、half-close、ALPN、认证、Web masquerade、资源与 churn 边界、UoT v1/v2、目标 ACL 均已有实测覆盖；与 pinned Caddy / forwardproxy reference 做差分 |
+| MASQUE CONNECT-UDP | production minimal 的实际发布路径；H2 / H3 均有运行测试与 reference interop，含 IPv6、Datagram / Capsule fallback、NAT rebinding、impairment 与队列所有权 |
+| MASQUE CONNECT-IP | 协议实现与 full-registry reference interop 已有证据；**不是** production minimal 发布的 endpoint |
+| MASQUE Packet Too Big | IPv4 live H3 与 IPv6 生成、session ownership 已 PASS；**IPv6 live H3 仍 NOT-TESTED** |
+| Google QUICHE | 已 build 并 run；三个结果**互不相同**：HTTP/3 transport LOCAL PASS、GitHub runner INCONCLUSIVE-TIMEOUT、CONNECT-UDP / CONNECT-IP EXECUTED-FAILED（interop 未建立，root cause UNCONFIRMED） |
+| 当前阶段 | Pre-VPS code closure 已完成；下一步为 Linux amd64 VPS 实机验收 |
 | 实机结果 | NOT-TESTED；本地 / CI 的 PASS 不等于 VPS PASS |
 
 上述状态只描述代码与测试能证明的范围。真实 VPS 尚未验收，因此这里不使用
-“production ready”一类的结论。
+“production ready”一类的结论。逐项证据边界见
+[`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md`](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md)
+顶部的 `CURRENT STATUS`，以及
+[`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md)。
+
+### Native Naive
+
+覆盖范围（均为实测，非源码存在性）：
+
+| 维度 | 状态 |
+| --- | --- |
+| HTTP/1、HTTP/2、HTTP/3 inbound | PASS |
+| Caddy / forwardproxy reference 差分 | PASS（pinned 版本） |
+| Padding 协商与 segmentation | PASS |
+| ALPN（TCP 与 QUIC 相互隔离） | PASS |
+| 双向 half-close | PASS |
+| 认证（含 constant-time 凭据比较） | PASS |
+| Web masquerade（非代理请求） | PASS |
+| 资源边界与 churn（2000 sessions 标准） | PASS |
+| UoT v1 / v2 | PASS（CI 中实际执行，不跳过） |
+| 目标 ACL（含逐 datagram 目标） | PASS |
+| 真实 WAN / 长时 soak | NOT-TESTED |
+
+### MASQUE CONNECT-UDP
+
+这是当前 production minimal 实际发布的唯一 MASQUE endpoint（HTTP inbound，
+HTTP/2 与 HTTP/3 两条路径）。
+
+| 维度 | 状态 |
+| --- | --- |
+| HTTP/2 CONNECT-UDP（经 Nginx Stream） | PASS |
+| HTTP/3 CONNECT-UDP（UDP/443） | PASS |
+| HTTP Datagram 与 Capsule fallback | PASS（两条路径均有） |
+| IPv4 / IPv6 | PASS（两种 transport 的 IPv6 均有 live 覆盖） |
+| 认证边界 | PASS（无凭据不建立 tunnel） |
+| 目标 ACL | PASS |
+| 资源限制（未认证 limiter、请求体上限） | PASS |
+| NAT rebinding / migration | PASS（受控测试环境；真实移动网络 NOT-TESTED） |
+| loss / duplication / reordering | PASS（受控 impairment relay） |
+| batching（batch reader / writer） | PASS（功能路径 + Linux 真实 UDP socket） |
+| 队列所有权与背压 | PASS（`tun.OutboundQueue` 语义 + ownership 回归测试） |
+| early datagram 处理（setup window） | PASS（含 early-disconnect 释放回归） |
+| 真实 WAN / PMTU / CGNAT | NOT-TESTED |
+
+### MASQUE CONNECT-IP
+
+旧 README 把它笼统写成单一 PASS，这里按维度拆开，因为各项证据强度不同：
+
+| 维度 | 状态 | 说明 |
+| --- | --- | --- |
+| 协议实现 | PASS | control capsule、地址分配、路由广播、IPv4 / IPv6 解析 |
+| full-registry reference interop | PASS | 对 pinned connect-ip-go 的真实 interop |
+| Packet Too Big（生成 + ownership） | PASS | ICMP 生成与 owning session 隔离 |
+| live H3 Packet Too Big E2E（IPv6） | NOT-TESTED | 缺少合适的 asymmetric origin |
+| QUICHE CONNECT-IP tunnel interop | EXECUTED-FAILED | 见下节，interop 未建立 |
+| production minimal inclusion | **NO** | `masque-server` 只在 full registry 注册 |
+
+### Google QUICHE
+
+QUICHE 已由 `scripts/ci/jiejie-quiche-live-interop.sh` 实际 build 并 run（作为
+EXTERNAL TOOL，不进入 `go.mod`）。**三个结果不能压缩成一个 PASS 或 FAIL：**
+
+| 项目 | 当前状态 | 证据 |
+| --- | --- | --- |
+| QUICHE HTTP/3 transport | **LOCAL PASS**；GitHub runner **INCONCLUSIVE-TIMEOUT** | `TestReferenceQuicheH3TransportLiveInterop`；run `36238936300` |
+| QUICHE CONNECT-UDP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectUDPLiveInterop`；进程以 `QUIC_CONNECTION_CANCELLED` 非零退出 |
+| QUICHE CONNECT-IP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectIPLiveInterop`；同样的可观测失败 |
+| QUICHE root cause | **UNCONFIRMED** | 进程在发出任何 CONNECT 之前就失败；四个候选原因已由测量排除，其余无法用现有证据归因 |
+
+术语含义（不要混用）：
+
+- **EXECUTED-FAILED** = 进程运行了并给出不一致结果。这是**真实观测到的失败**，
+  不是“没有测试”，本身也不构成对任何一方实现有缺陷的证据。
+- **INCONCLUSIVE-TIMEOUT** = 进程运行了但在执行期限被终止。没有观测到交换，
+  因此两个方向都不成立。
+- **NOT-RUN** = 没有进程执行；这同样不是 PASS。
+
+**没有主张任何 QUICHE MASQUE tunnel interop。** 低成本的 protocol-vector 检查
+（`TestQuicheOracle*`）仍然在每次 push 运行并固定 QUICHE 的决策表，
+但 **protocol-vector check ≠ live interop**。
+
+### Packet Too Big
+
+按粒度记录，不统称为 “PTB PASS”：
+
+| 项目 | 状态 |
+| --- | --- |
+| IPv4 live H3 Packet Too Big | PASS（真实 `quic-go` `DatagramTooLargeError`） |
+| IPv6 Packet Too Big generation | PASS |
+| IPv6 live H3 Packet Too Big | NOT-TESTED |
+| Packet Too Big session ownership | PASS |
+
+**ownership 的隔离意义**：PTB 必须回到产生该条件的 owning session，不能广播到其它
+peer，也不能错误投递。若投递按错误的目的地址重新推导，一个 peer 的网络状况会泄漏进
+另一个 peer 的 session。回归测试以“恰好一个 session 收到、其余收到零个”断言这一点
+（`TestPacketTooBigIsDeliveredOnlyToTheOwningSession`、
+`TestPacketTooBigIsNotBroadcastToEverySession`）。
+
+以上均不构成完整网络环境验证；真实 PMTU 与 ICMP 可达性属于 VPS 阶段项目。
 
 ## 构建产物
 
-CI 会产出两个 GitHub Actions artifact，用途完全不同：
+CI 会产出三个 GitHub Actions artifact，用途完全不同：
 
 | Artifact | 用途 |
 | --- | --- |
 | `Jiejie-VPS-linux-amd64-<version>-<sha>` | 真正用于 Linux amd64 VPS 部署的生产 minimal 二进制 |
 | `naive-caddy-parity-<sha>` | Native Naive 与 pinned Caddy / forwardproxy reference 做差分测试后生成的 CI 报告 |
+| `quiche-live-interop` | Google QUICHE live interop 的日志与 provenance（`quiche-interop.log`、`QUICHE-PROVENANCE.txt`） |
+
+`Jiejie-VPS-linux-amd64-*` 只包含：
+
+```text
+sing-box-linux-amd64
+sing-box-linux-amd64.sha256
+BUILD-INFO-VPS.txt
+SIZE-REPORT-linux.txt
+```
 
 `naive-caddy-parity-<sha>` **不是** Caddy binary，不是代理程序，也不是 VPS 部署程序。
 它只包含：
@@ -53,9 +176,84 @@ naive-caddy-parity.json
 naive-parity.log
 ```
 
-部署 VPS 时只需要 `Jiejie-VPS-linux-amd64-*`；`naive-caddy-parity-*` 仅用于兼容性审计与追溯。
+`quiche-live-interop` 同样**不是**可部署 binary，它只是 interop 的执行日志与
+QUICHE 来源信息；其中的结局按上节的 QUICHE 分类阅读，不要当成 PASS。
+
+部署 VPS 时只需要 `Jiejie-VPS-linux-amd64-*`；另外两个仅用于兼容性审计与追溯。
 
 artifact 名称中的 `<version>` 与 `<sha>` 随构建 commit 变化，不写死。
+
+## 快速使用
+
+本仓库**没有 stable GitHub Release**，交付方式是 Actions artifact。因此获取方式与
+上游不同，请按下面的步骤做。
+
+**1. 取得生产二进制**
+
+打开 GitHub → Actions → `Linux amd64 server` → 选择 `testing` 上的一次成功运行 →
+下载 artifact `Jiejie-VPS-linux-amd64-<version>-<sha>`。
+只有 `build-production` job 成功（即 `lint-and-unit-tests` 与
+`production-minimal-integration` 都通过）之后该 artifact 才会产生。
+
+```bash
+unzip Jiejie-VPS-linux-amd64-*.zip
+sha256sum -c sing-box-linux-amd64.sha256
+```
+
+**2. 确认拿到的是正确的构建**
+
+```bash
+./sing-box-linux-amd64 version
+```
+
+输出应包含 `with_quic` 与 `jiejie_server_minimal`，且**不应**包含
+`with_tailscale`、`with_openvpn`。`Tags` 一行即为生产标签，
+`Revision` 一行是构建所用的 commit SHA。
+
+**3. 校验配置**
+
+```bash
+./sing-box-linux-amd64 check -c config.json
+```
+
+配置不合法时以非零退出，并在 stderr 说明原因。
+
+[`release/jiejie-production-topology.json`](release/jiejie-production-topology.json)
+是一个**无密钥的拓扑 fixture**，可以用来自检部署骨架。它引用的证书路径是
+`/tmp/jiejie-fixture/{cert,key}.pem`，因此需要先按 CI 的方式生成一张自签证书，
+否则 `check` 会因为读不到证书而失败（这是预期行为，不是配置错误）：
+
+```bash
+mkdir -p /tmp/jiejie-fixture
+openssl req -x509 -newkey rsa:2048 \
+  -keyout /tmp/jiejie-fixture/key.pem -out /tmp/jiejie-fixture/cert.pem \
+  -days 1 -nodes -subj "/CN=example.test"
+./sing-box-linux-amd64 check -c release/jiejie-production-topology.json
+```
+
+这个 fixture 只用于拓扑自检，**不是**可直接上线的配置：真实部署必须换成自己的
+证书、密码与监听地址。
+
+**4. 运行**
+
+```bash
+./sing-box-linux-amd64 run -c config.json
+```
+
+常用全局 flag：`-c/--config`（可重复）、`-C/--config-directory`、
+`-D/--directory`（工作目录）、`--disable-color`。
+
+**5. 配置与部署文档在哪**
+
+| 内容 | 位置 |
+| --- | --- |
+| 生产拓扑、各 inbound 的推荐配置、`server_profile`、`bbr_profile`、`unauthenticated_limits` | [`docs/JIEJIE-SERVER.md`](docs/JIEJIE-SERVER.md) |
+| 生产拓扑 fixture（可作为配置骨架） | [`release/jiejie-production-topology.json`](release/jiejie-production-topology.json) |
+| VPS 实机验收步骤 | [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) |
+| 本 fork 相对上游的完整改动 | [`docs/FORK-DIFF.md`](docs/FORK-DIFF.md) |
+
+注意本 fork 的生产拓扑要求 **Nginx Stream 持有 TCP/443**，sing-box 只持有 UDP/443
+以及若干 loopback 端口；不是单进程监听 443 的部署。
 
 ## 构建范围（Build Scope）
 
@@ -63,11 +261,24 @@ artifact 名称中的 `<version>` 与 `<sha>` 随构建 commit 变化，不写�
 不 import 未使用的包，链接器随之丢弃。上游完整构建仍然可用，位于
 `include/registry.go`（`!jiejie_server_minimal`）。
 
-生产构建标签：
+生产构建标签（直接取自
+[`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`](release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)，
+不在 README 里另写一份）：
 
 ```text
 with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0
 ```
+
+注册表实际注册项（`include/registry_jiejie_server.go`）：
+
+| 注册表 | 内容 |
+| --- | --- |
+| Inbound（5） | `http`、`anytls`、`naive`、`shadowtls`、`shadowsocks` |
+| Outbound（2） | `direct`、`socks` |
+| Endpoint（0） | 无。`EndpointRegistry()` 返回空注册表 |
+| Service（0） | 无。因此 systemd-resolved service 与 D-Bus 依赖都不在二进制内 |
+| Certificate provider（0） | 无 |
+| DNS transport | `udp`、`local` |
 
 **保留的 inbound**
 
@@ -105,8 +316,22 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 | DNS | DoT、DoH、DoQ、hosts、resolved |
 | Service | Clash API 及未使用的 service |
 | 证书 provider | 未使用的证书 provider |
+| Endpoint | MASQUE `masque-server`（full registry 才有） |
 
 注意：Native Naive 的 **inbound 保留**，被排除的只是 Naive outbound 与客户端运行时。
+
+**源码中存在 ≠ 生产二进制包含。** 上表描述的是 production minimal binary 实际**不包含**
+什么。仓库里仍然可以读到这些模块的源码（上游完整构建仍需它们），但 minimal registry
+不注册、不 import，因此不会进入链接结果。判断某个能力是否在生产二进制里，标准做法是
+查注册表并实测：
+
+```bash
+./sing-box-linux-amd64 version                      # 看 Tags 一行
+./sing-box-linux-amd64 check -c <一个 vmess 配置>    # 应 FAIL：unknown inbound type
+```
+
+生产产物大小上限 38000000 bytes，由 `server-linux-amd64.yml` 的 size guard 强制；
+超限时 workflow 直接失败，而不是静默放宽上限。
 
 ## Change Log
 
@@ -197,11 +422,12 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 | 范围 | 当前状态 | 发布关系 |
 | --- | --- | --- |
 | CONNECT-UDP over H2 / H3 | PASS（本地 / CI / reference evidence） | production minimal 实际发布路径 |
-| CONNECT-IP | PASS（已有 full-registry reference / protocol evidence） | 不是 production minimal endpoint |
+| CONNECT-IP | 协议实现与 full-registry reference interop PASS；production inclusion = NO | 不是 production minimal endpoint |
 | HTTP Datagram / Capsule fallback | PASS | CONNECT-UDP / CONNECT-IP 均有覆盖 |
 | IPv4 / IPv6 | PASS（已有对应测试范围内） | CONNECT-UDP production path 已覆盖 IPv6 |
 | NAT rebinding / impairment | PASS（受控测试环境） | 真实 WAN 仍待 VPS 验收 |
-| Google QUICHE | CHECKED (protocol vectors) | 没有 build / run，不是 interop PASS |
+| Packet Too Big | IPv4 live H3 PASS；IPv6 generation PASS；IPv6 live H3 NOT-TESTED；ownership PASS | 见上面的 Packet Too Big 表 |
+| Google QUICHE | 已 build / run：H3 transport LOCAL PASS（runner INCONCLUSIVE-TIMEOUT）、CONNECT-UDP / CONNECT-IP EXECUTED-FAILED、root cause UNCONFIRMED | 不是 interop PASS |
 | Real VPS / WAN | NOT-TESTED | 下一阶段 |
 
 当前 production minimal 实际发布的是 HTTP inbound 上的 CONNECT-UDP（HTTP/2 / HTTP/3）。
@@ -288,9 +514,11 @@ protocol 验证，不属于当前 VPS minimal artifact 的生产 endpoint。
 - `e823b4312b` — MASQUE reference audit 收口，并新增 Pre-VPS acceptance checklist。
 - `41a04ceb14` — cross-session ownership / route policy、control burst、IPv6 extension chain 覆盖。
 - `36d404826b` — Google QUICHE 作为第三个 protocol oracle。
-  状态是 **CHECKED (protocol vectors)**：读取 pinned 源码并固定其 decision table 与
+  当时状态是 **CHECKED (protocol vectors)**：读取 pinned 源码并固定其 decision table 与
   unit vectors；没有 build、没有 run、没有 live interop，
   因此不是 QUICHE PASS，也不是 QUICHE interop PASS。
+  **此条已被后续工作取代**：QUICHE 之后已实际 build 并 run，
+  当前状态见上面的 [Google QUICHE](#google-quiche) 表（三个结果互不相同）。
 - `0dbfc43d1e` — 记录 QUICHE vector check 的分类，并把 RFC 9931 client-side half
   重新分类。
 - `4db6f90f98` — RFC 9931 client-side half 对当前 server-only product 归类为
@@ -301,13 +529,89 @@ protocol 验证，不属于当前 VPS minimal artifact 的生产 endpoint。
 
 #### 当前剩余边界
 
-- **Google QUICHE live interop** — NOT-TESTED。当前只有 protocol-vector CHECKED。
-- **CONNECT-IP live H3 Packet Too Big E2E** — NOT-TESTED。
+- **Google QUICHE MASQUE tunnel interop** — 已 build 并 run，但**未建立 interop**。
+  CONNECT-UDP 与 CONNECT-IP 均为 EXECUTED-FAILED，root cause UNCONFIRMED；
+  HTTP/3 transport 为 LOCAL PASS / GitHub runner INCONCLUSIVE-TIMEOUT。
+  详见上面的 [Google QUICHE](#google-quiche) 表，不要压缩为单一结论。
+- **CONNECT-IP live H3 Packet Too Big E2E（IPv6）** — NOT-TESTED。
   PTB generation 已测试；真实 `DatagramTooLarge` E2E 仍缺少合适的 asymmetric origin。
 - **Real VPS / WAN behaviour** — NOT-TESTED。
   下一步按 `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md` 验收。
 - **RFC 9931 client-side half** — OUT-OF-SCOPE-FOR-SERVER-PRE-VPS。
   production minimal 不发布 MASQUE client endpoint。
+
+#### Upstream Sync 与合并期修复
+
+`c992b1fab0`（Merge upstream testing into Jiejie testing）把上游 `132b38e9c` 合并进
+fork 的 `71f0f1288`。50 处冲突按类型处理；fork hardening 全部保留；Phase 4 sing pin、
+生产拓扑与 minimal registry 均未改变，也没有恢复任何上游 workflow。
+
+合并过程暴露/引入了**三个真实生产回归**，均已修复：
+
+- `c992b1fab0` — `Server.Contains` 丢失 server own-address guard：
+  只要任一 session 广播了隧道网段，服务器自身地址就会被判定为 tunnel-owned。
+  `lookup` 一直有该 guard，`Contains` 没有，两者语义不一致。
+- `c992b1fab0` — ROUTE_ADVERTISEMENT 重叠检测只比较相邻项：
+  protocol 0（全协议）后接 protocol 6 / 17 的同段广播会被接受。
+  改为 per-protocol high-water 检测，保持线性时间。
+- `c992b1fab0` — `decrementHopLimit` 未校验 IPv4 头长度：
+  `packetAddresses` 校验的是头部**声明的**长度，因此 peer 提供的 datagram 可以让
+  checksum 计算读到切片之外并 panic 服务协程（远程 DoS）。
+  现在对声明长度做**上下双端**约束（IHL=0 会反转切片边界，过大的 IHL 会越界）。
+
+同时把 MASQUE 测试从上游已删除的 session send queue 迁移到 `tun.OutboundQueue`
+（上游把队列所有权移到了该类型）。三个针对旧 `sendQueue` API 的测试被
+OutboundQueue 语义下的饱和、取消与 shutdown 测试取代，不变量保留，
+**没有跳过或放宽任何断言**。
+
+- `143f886e21` — 修复 setup-window early-disconnect 下已确认的 datagram buffer
+  ownership / leak（见下）。
+- `3878204393` — 修复本次同步首次推送暴露的两个 CI 失败：
+  `test/go.mod` 中上游遗留的 `replace ../../sing-tun`（本地并排检出用，本仓库与
+  CI 都没有该目录，导致 `test/` 下任何 go 命令在运行前就失败），
+  以及四个 lint 失败。根模块的 sing pin 未受影响。
+
+#### Setup-window datagram ownership
+
+- `143f886e21` — CONNECT-UDP target 尚未 resolve 时，datagram 会被暂存在
+  setup window；`settle()` 是当时**唯一**的排空路径。peer 在 setup 期间发完
+  datagram 就断开时，连接先关闭、`settle()` 永不执行，暂存的 buffer 永不释放。
+  任何能访问监听端口的客户端都可触发。
+  修复后 close 与 settle 通过共享的 `takeEarlyDatagrams()` 争抢同一份所有权：
+  先到者负责 flush 或 release，另一方拿到空队列，避免 double claim 与泄漏。
+  对应回归覆盖：`transport/http/early_datagram_ownership_test.go`
+  （早断释放、release 而非仅丢引用、settle 与 close 竞态）。
+
+  这是**已确认的 datagram buffer ownership / leak 修复**，
+  不构成“全面解决 MASQUE 内存泄漏”的结论。
+
+#### Batching 与 packet timeout wrapper
+
+- `953e0a729a` — 将 `github.com/sagernet/sing` pin 到 fork
+  `github.com/Piggy-Cat-bit-shadow/sing` 的 `fix/packet-batch-timeout`
+  （commit `c0ee76200ae3`，伪版本 `v0.9.6-0.20260926122709-c0ee76200ae3`）。
+  该修复让 packet timeout wrapper 保留 `ConnectedPacketBatchReader` /
+  `ConnectedPacketBatchWriter` 能力，而不是在包装后丢失它。
+  `go.mod` 中的 `replace` 锁定到确切 commit；已核对解析后的模块目录中
+  这些 batch creator 确实存在。
+- `9d6bfc783f` — 对 timeout wrapper 的 batch 路径做 benchmark。
+- `c51772f6aa` — 在 Linux 上用**真实 UDP socket** 验证 batching 穿过 timeout wrapper。
+- `e7f7dde6af` / `4d22f4767d` — 验证 batching 在 timeout wrapper 之后仍然存活，
+  收敛 timeout 下的 batch forwarding 缺口。
+
+**证据分级（不要越级推导）：**
+
+| 项目 | 状态 |
+| --- | --- |
+| batch 路径功能性证据（跨平台） | PASS |
+| Linux 真实 UDP socket 证据（`linux \|\| netbsd` build tag） | PASS（CI 执行） |
+| `sendmmsg` / `recvmmsg` syscall 路径 | PASS（上述真实 socket 测试覆盖） |
+| `UDP_SEGMENT` / GSO 证据 | PASS（受控测量，非 WAN） |
+| batch benchmark | 存在并可本地运行；**CI 不运行 benchmark** |
+| 真实 VPS 吞吐量 | **NOT-TESTED** |
+
+**禁止**从 “batch benchmark 更快” 推导 “VPS 吞吐量提高 X%”。
+真实 WAN 性能属于 VPS 阶段项目，当前保持 NOT-TESTED。
 
 ### AnyTLS
 
@@ -368,15 +672,33 @@ protocol 验证，不属于当前 VPS minimal artifact 的生产 endpoint。
   workflow，coverage 检查会让 CI fail。
 - `583bfc84f3` — QUICHE oracle tests 进入 reference run filter。
 - `864be35ebc` — 时间敏感的线性度断言改为抗噪声的 ratio 测量，避免 shared runner flaky。
+- `3878204393` — 移除 `test/go.mod` 中上游遗留的 dev-only `replace ../../sing-tun`；
+  该 replace 指向本仓库与 CI 都不存在的并排检出，使 integration job 在运行任何测试前
+  就失败。同时清除四个 lint 失败。
 
-reference suite 另有一个 coverage guard：在 `test/jiejie/reference` 中定义但没有被
-`-run` filter 匹配到的测试，会让 CI fail，而不是静默跳过。
+reference suite 另有一个 coverage guard（`scripts/ci/check-reference-coverage.sh`，
+并有自己的 `check-reference-coverage.test.sh`）：在 `test/jiejie/reference` 中定义
+但没有被 `-run` filter 匹配到的测试，会让 CI fail，而不是静默跳过。
 
 生产 artifact 只在
 `lint-and-unit-tests`、`production-minimal-integration`、`build-production`
-三个 job 全部通过后才发布。
+三个 job 全部通过后才发布（`build-production` 的 `needs` 显式声明前两者）。
+其中 `production-minimal-integration` 以真实 production minimal binary 运行
+`test/jiejie` 的集成套件。
 
-注意：`naive-caddy-parity` 是 CI compatibility report artifact，不是生产 artifact。
+注意：`naive-caddy-parity` 与 `quiche-live-interop` 都是 CI 报告 artifact，
+不是生产 artifact，也不是可部署 binary。
+
+三个 workflow 的分工：
+
+| Workflow | 触发 | 作用 |
+| --- | --- | --- |
+| `jiejie-fast.yml` | push 到 `testing` / `feat/jiejie-*` / `cleanup/*` / `sync/*`、PR | 快速 vet + unit + race；`build-gate` |
+| `server-linux-amd64.yml` | 同上 | 完整 vet / unit / race、production minimal 集成、生产构建与 artifact、size guard |
+| `jiejie-masque-reference.yml` | **仅 `workflow_dispatch` 与每周 schedule** | reference interop 与 QUICHE live interop（构建成本高，**不是** per-push） |
+
+benchmark **不在 CI 中运行**（`batch_timeout_bench_test.go` 等仅供本地执行）；
+因此不要用 CI 绿灯推导任何性能结论。
 
 ### Documentation / Audit
 
@@ -393,9 +715,15 @@ reference suite 另有一个 coverage guard：在 `test/jiejie/reference` 中定
 
 | 文件 | 内容 |
 | --- | --- |
-| [`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md`](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) | MASQUE reference audit，含 Phase 1/2/3 与 Pre-VPS closure |
-| [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) | 下一步 VPS 实机验收 checklist；区分 local / CI evidence 与 only-real-VPS evidence |
+| [`docs/JIEJIE-SERVER.md`](docs/JIEJIE-SERVER.md) | 生产拓扑、各 inbound 配置、资源 profile、日志与构建 profile |
+| [`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md`](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) | MASQUE reference audit；顶部 `CURRENT STATUS` 为当前状态，其后为 HISTORICAL |
+| [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) | VPS 实机验收 checklist；Part 1 = local / CI，Part 2 = only-real-VPS |
+| [`docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md`](docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md) | 按组件说明验证状态（较早段落可能为历史状态） |
 | [`docs/JIEJIE-NAIVE-H3-AUDIT.md`](docs/JIEJIE-NAIVE-H3-AUDIT.md) | Native Naive H3 / QUIC 对照 reference 的审计 |
+| [`docs/JIEJIE-NAIVE-SERVER.md`](docs/JIEJIE-NAIVE-SERVER.md) | Native Naive 服务端行为与 UoT |
+| [`docs/JIEJIE-NAIVE-TARGET-ACL.md`](docs/JIEJIE-NAIVE-TARGET-ACL.md) | Naive / UoT 目标 ACL |
+| [`docs/JIEJIE-PROBE-RESISTANCE-MATRIX.md`](docs/JIEJIE-PROBE-RESISTANCE-MATRIX.md) | 探测面边界 |
+| [`docs/FORK-DIFF.md`](docs/FORK-DIFF.md) | 本 fork 相对上游的完整改动清单 |
 | `naive-caddy-parity-<sha>` artifact | Caddy / forwardproxy differential 的 machine-readable 与 log 输出（CI artifact，不是文档文件） |
 
 ## Removed / Superseded Work
@@ -419,26 +747,41 @@ Apple / iOS / macOS 客户端工作、Linux client-full 与 Windows client profi
 - **上游同步** —— 从上游 `testing` rebase/merge；fork 改动尽量集中在新增文件、
   option 解析、注册表与 build tag，以缩小冲突面。见
   [`docs/FORK-DIFF.md`](docs/FORK-DIFF.md)。
+  同步后务必核对 fork hardening 是否仍然存在于**生产调用路径**上，而不只是文件还在；
+  最近一次同步（`c992b1fab0`）就是在这一步发现 `Contains` guard 与路由重叠检测丢失。
 - **生产标签** —— 从 `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` 读取；
-  脚本与 workflow 读同一个文件，避免漂移。
+  脚本与 workflow 读同一个文件，避免漂移。README 不复制该值作为权威来源。
 - **注册表改动** —— `include/registry_jiejie_server.go` 中的每一项注册都必须由生产
-  拓扑 fixture 支撑；注册表审计测试会在漂移时报错。
+  拓扑 fixture（`release/jiejie-production-topology.json`）支撑；
+  注册表审计测试会在漂移时报错。
+- **sing 依赖 pin** —— `go.mod` 只有一个 `replace`，指向 fork
+  `github.com/Piggy-Cat-bit-shadow/sing` 的 packet-batch-timeout 修复。
+  这是有意保留的 pin，不要在同步时丢弃。
 - **已知未验证项** —— 只保留当前仍然成立的项目：
-  - **Google QUICHE live interop** —— NOT-TESTED。只有 protocol-vector CHECKED；
-    QUICHE 未 build、未 run。
-  - **CONNECT-IP live H3 Packet Too Big E2E** —— NOT-TESTED。
-  - **真实 VPS / WAN** —— NOT-TESTED。
+  - **Google QUICHE MASQUE tunnel interop** —— 已 build / run 但未建立 interop：
+    CONNECT-UDP 与 CONNECT-IP 为 EXECUTED-FAILED，root cause UNCONFIRMED；
+    HTTP/3 transport 为 LOCAL PASS / runner INCONCLUSIVE-TIMEOUT。
+    这不是“未测试”，也不是 PASS。
+  - **CONNECT-IP live H3 Packet Too Big E2E（IPv6）** —— NOT-TESTED。
+  - **真实 VPS / WAN**（含 PMTU、CGNAT、长时 soak、真实吞吐）—— NOT-TESTED。
+  - **mobile NAT rebinding / CGNAT** —— NOT-TESTED，需要真实移动网络。
 
   MASQUE 的当前验证边界见上面的 `HTTP / MASQUE` → `当前剩余边界`，
   完整验收见 [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md)。
+  该文档区分 Part 1（本地 / CI 已确立，VPS 上只作回归）与 Part 2（只有真实 VPS 能确立），
+  **Part 1 的结果不得报告为 Part 2 的结果**。
 
   以下项目此前列为 NOT-TESTED，现已由实测覆盖，不再属于未验证项：Native Naive 的
   HTTP/3 Caddy differential、已覆盖的 half-close 矩阵、MASQUE NAT rebinding /
-  migration、MASQUE IPv6 路径、MASQUE 的 loss / duplicate / reorder 行为。
+  migration、MASQUE IPv6 路径、MASQUE 的 loss / duplicate / reorder 行为、
+  Linux 真实 UDP socket 上的 batching。
 
-  `docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md` 与 `docs/JIEJIE-NAIVE-H3-AUDIT.md`
-  的较早段落可能仍保留历史 NOT-TESTED 描述；与更新的测试、commit 及 Pre-VPS closure
-  冲突时，以当前代码、当前测试、当前 CI 与最新 closure 章节为准。
+  `docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md`、`docs/JIEJIE-NAIVE-H3-AUDIT.md` 与
+  `docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md` 的较早段落可能仍保留历史状态描述；
+  与更新的测试、commit 及 Pre-VPS closure 冲突时，
+  以当前代码、当前测试、当前 CI 与最新 closure 章节为准
+  （`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md` 顶部有明确的 `CURRENT STATUS` 表，
+  其后全部为 HISTORICAL）。
 - **详细文档** —— 架构与审计位于 [`docs/`](docs/)；
   `docs/JIEJIE-PRODUCTION-PROTOCOL-MATRIX.md` 按组件说明验证状态。
 
