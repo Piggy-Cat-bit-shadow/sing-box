@@ -186,9 +186,30 @@ func h3ProbeFailedTunnel(t *testing.T, address string, authority string, headers
 
 	// The tunnel is open per the status; now push bytes and see whether anything
 	// comes back. A failed dial must not produce an echo.
-	outcome := "no-echo"
+	//
+	// # Why the two non-echo outcomes are normalised into one token
+	//
+	// MEASURED as a real flake in CI. Once the dial has failed the server tears the
+	// stream down, and the client's write races that teardown:
+	//
+	//	server resets first -> the client's Write fails      -> "write-reset"
+	//	client writes first -> the Write succeeds, read EOFs -> "no-echo"
+	//
+	// Both mean exactly the same thing - the tunnel produced no data - and which one
+	// is observed depends on scheduling, not on compatibility. Comparing the raw
+	// tokens made the differential report DIFF between two implementations that
+	// behaved identically; the run before this change recorded PASS=6 DIFF=0 and the
+	// next recorded PASS=5 DIFF=1 with no code difference on the path.
+	//
+	// So the observable that matters is "did anything come back", and the two
+	// shapes of "nothing came back" are collapsed into one token. An actual ECHO
+	// still produces a distinct token, which is what the case is testing: a failed
+	// dial must never deliver payload.
+	outcome := noEchoOutcome
 	if _, writeErr := stream.Write([]byte("probe-after-failed-dial")); writeErr != nil {
-		outcome = "write-" + classifyH3Error(writeErr)
+		// A write failure after a failed dial is the same non-result as a silent
+		// stream; see the note above.
+		outcome = noEchoOutcome
 	} else {
 		_ = stream.Close()
 		received, readErr := io.ReadAll(io.LimitReader(stream, 1024))
@@ -196,11 +217,17 @@ func h3ProbeFailedTunnel(t *testing.T, address string, authority string, headers
 		case len(received) > 0:
 			outcome = "echo:" + strconv.Itoa(len(received))
 		case readErr != nil:
-			outcome = "read-" + classifyH3Error(readErr)
+			outcome = noEchoOutcome
 		}
 	}
 	return h3ObservationOf(response, outcome, nil)
 }
+
+// noEchoOutcome is the single token for "the failed tunnel delivered nothing".
+//
+// It replaces the previous pair of racy tokens ("no-echo" and "write-reset"), which
+// described the same outcome and differed only by scheduling.
+const noEchoOutcome = "no-echo"
 
 // summarisePayload reduces a payload to a stable, comparable token so the
 // comparison does not depend on framing details that legitimately differ.
