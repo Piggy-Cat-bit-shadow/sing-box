@@ -306,6 +306,14 @@ and none is claimed as PASS:
   forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client;
   this repository's HTTP client was not audited against them.
 
+  **RECLASSIFIED as OUT-OF-SCOPE-FOR-SERVER-PRE-VPS**, not left as an open NOT-TESTED
+  item. This fork ships exactly one product - a Linux amd64 VPS SERVER - and the
+  production minimal registry serves no MASQUE client endpoint (`EndpointRegistry()`
+  registers none). A client-side obligation that no shipped component can violate is
+  not a gap in this product's coverage; keeping it on the NOT-TESTED list would imply a
+  debt that no planned work would repay. It becomes relevant only if a client product is
+  ever added, at which point the obligation moves to that product's scope.
+
 Closed in Phase 3, removed from this list: the CONNECT-IP capsule fallback, the IP
 packet parser fuzz target, IPv6 extension-header protocol resolution, send-queue and
 capsule write backpressure, and active-tunnel shutdown. QUIC migration and source
@@ -649,7 +657,7 @@ reader does not mistake one direction's behaviour for the other's.
 | Google QUICHE interop | NOT-TESTED | Not built and not run: C++ via Bazel, and no Bazel toolchain is available here. Its protocol vectors are checked instead (see the table above), which is a CHECK and not interop. |
 | Live H3 Packet Too Big end to end | NOT-TESTED | Needs an asymmetric origin (a reply larger than its request); a loopback echo cannot produce one. Generation is fully covered. |
 | Real VPS / WAN behaviour | NOT-TESTED | Only a real VPS can test it. See `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`. |
-| RFC 9931 client-side half | OUT-OF-SCOPE | Server-only product; no MASQUE client endpoint in the production registry. |
+| RFC 9931 client-side half | OUT-OF-SCOPE-FOR-SERVER-PRE-VPS | Server-only product; `include/registry_jiejie_server.go`'s `EndpointRegistry()` registers no endpoint, so no shipped component can violate a client-side obligation. |
 
 ### A narrowing stated rather than implied
 
