@@ -112,6 +112,8 @@
       "listen": "127.0.0.1",
       "listen_port": 28438,
       "network": "tcp",
+      "stream_receive_window": 8388608,
+      "connection_receive_window": 33554432,
       "users": [
         {
           "username": "example",

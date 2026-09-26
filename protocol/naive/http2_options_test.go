@@ -281,3 +281,116 @@ func TestHTTP2OptionsRejectOutOfRangeValues(t *testing.T) {
 			"an unconfigured inbound must validate: zero means upstream default")
 	})
 }
+
+// productionStreamReceiveWindow / productionConnectionReceiveWindow are the
+// values release/jiejie-production-topology.json pins for the naive inbound.
+//
+// They are repeated here as literals on purpose. The production fixture is a
+// configuration file, and this package cannot import it without turning a
+// deployment artifact into a test dependency; the fixture-side test
+// (TestJiejieProductionNaiveFlowControlWindows in test/jiejie) reads the file and
+// checks it against the same numbers. Duplicating the constant is what makes the
+// two sides able to disagree loudly instead of both drifting together.
+const (
+	productionStreamReceiveWindow     = 8 * 1024 * 1024
+	productionConnectionReceiveWindow = 32 * 1024 * 1024
+)
+
+// TestProductionReceiveWindowsReachTheServer proves the exact production
+// configuration produces the intended http2.Server bounds.
+//
+// The window options are the one part of this change that has no visible effect
+// when it is wrong: an inbound built with a mistyped window still serves traffic,
+// it just stops granting upload credit early and quietly caps bulk throughput.
+// So the assertion walks the whole chain the operator's JSON takes - decode, then
+// validate, then construct - and checks the constructed server, not the parsed
+// option, because the option is not what carries the data.
+func TestProductionReceiveWindowsReachTheServer(t *testing.T) {
+	// The literal a user or the fixture would actually write.
+	var options option.NaiveInboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{
+		"network": "tcp",
+		"listen": "127.0.0.1",
+		"listen_port": 28438,
+		"stream_receive_window": 8388608,
+		"connection_receive_window": 33554432,
+		"users": [{"username": "example", "password": "example"}]
+	}`), &options)
+	require.NoError(t, err, "the production window configuration must decode")
+
+	require.NotNil(t, options.HTTP2Options.StreamReceiveWindow,
+		"stream_receive_window must be parsed rather than dropped")
+	require.NotNil(t, options.HTTP2Options.ConnectionReceiveWindow,
+		"connection_receive_window must be parsed rather than dropped")
+	require.EqualValues(t, productionStreamReceiveWindow,
+		options.HTTP2Options.StreamReceiveWindow.Value(),
+		"the decoded stream window must be 8 MiB")
+	require.EqualValues(t, productionConnectionReceiveWindow,
+		options.HTTP2Options.ConnectionReceiveWindow.Value(),
+		"the decoded connection window must be 32 MiB")
+
+	// The inbound refuses out-of-range values at construction, so a production
+	// configuration that decoded but failed validation would be rejected at
+	// startup instead of silently running unbounded.
+	require.NoError(t, validateHTTP2Options(options.HTTP2Options),
+		"the production window values must survive validation")
+
+	inbound := &Inbound{options: options}
+	server := inbound.http2Server()
+
+	require.EqualValues(t, productionStreamReceiveWindow, server.MaxUploadBufferPerStream,
+		"8 MiB must reach the HTTP/2 server's per-stream upload buffer")
+	require.EqualValues(t, productionConnectionReceiveWindow, server.MaxUploadBufferPerConnection,
+		"32 MiB must reach the HTTP/2 server's per-connection upload buffer")
+
+	// A connection window below the stream window would make the stream window
+	// unreachable: one stream could never spend the credit its own window
+	// advertises, so the larger value would be decorative.
+	require.GreaterOrEqual(t, server.MaxUploadBufferPerConnection, server.MaxUploadBufferPerStream,
+		"the connection window must not be smaller than the stream window")
+
+	// The production tuning is flow control only. It must not smuggle in a
+	// stream-count or timeout change that the task did not ask for.
+	require.Zero(t, server.MaxConcurrentStreams,
+		"the production fixture must not pin max_concurrent_streams")
+	require.Zero(t, server.IdleTimeout,
+		"the production fixture must not pin idle_timeout")
+}
+
+// TestProductionReceiveWindowsExceedUpstreamDefaults records WHY the production
+// values are worth pinning: they must actually be larger than what x/net/http2
+// would have used, otherwise the tuning is a no-op that looks like a fix.
+func TestProductionReceiveWindowsExceedUpstreamDefaults(t *testing.T) {
+	// Both defaults are 1 MiB. Read from the pinned x/net/http2 source rather
+	// than assumed: setConfigDefaults() in http2/config.go substitutes 1<<20 for
+	// BOTH MaxUploadBufferPerStream and MaxUploadBufferPerConnection when the
+	// server is left at zero (the connection case is clamped to a floor of the
+	// protocol's 65535-byte initial window, which 1<<20 clears comfortably).
+	//
+	// The per-stream default matters most here. It is what the server advertises
+	// as SETTINGS_INITIAL_WINDOW_SIZE, and therefore the hard ceiling on how much
+	// unacknowledged request body a client may have in flight on ONE stream. At
+	// 1 MiB that ceiling is what caps a single bulk upload through the tunnel.
+	const upstreamServerDefault = 1 << 20
+
+	require.Greater(t, int64(productionStreamReceiveWindow), int64(upstreamServerDefault),
+		"the production stream window must exceed the upstream 1 MiB default, "+
+			"otherwise pinning it changes nothing")
+	require.Greater(t, int64(productionConnectionReceiveWindow), int64(upstreamServerDefault),
+		"the production connection window must exceed the upstream 1 MiB default, "+
+			"otherwise pinning it changes nothing")
+
+	// The connection window must be a real multiple of the stream window, not
+	// merely larger: it has to fund several concurrent streams at the raised
+	// per-stream size, which is the whole point of raising both together.
+	require.GreaterOrEqual(t, int64(productionConnectionReceiveWindow),
+		int64(productionStreamReceiveWindow)*4,
+		"the connection window must fund at least 4 streams at the production stream window")
+
+	// A bulk tunnel needs the stream window to cover many frames: one
+	// maximum-size padded Naive frame is 64 KiB, so 8 MiB is 128 frames of
+	// credit in flight rather than the 16 the default allows.
+	const paddedFrameSize = 65536
+	require.GreaterOrEqual(t, int64(productionStreamReceiveWindow)/paddedFrameSize, int64(128),
+		"the stream window should hold at least 128 maximum-size padded frames")
+}

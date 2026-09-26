@@ -38,7 +38,14 @@ type productionFixture struct {
 		Tag        string `json:"tag"`
 		Detour     string `json:"detour"`
 		ListenPort uint16 `json:"listen_port"`
-		Users      []struct {
+		// StreamReceiveWindow / ConnectionReceiveWindow are the Naive HTTP/2
+		// flow-control windows. Production sets them deliberately and nothing
+		// else in the fixture does, so they are captured as raw JSON: a value
+		// that is present but not a plain number still reaches the assertion
+		// below instead of quietly decoding to 0.
+		StreamReceiveWindow     json.RawMessage `json:"stream_receive_window"`
+		ConnectionReceiveWindow json.RawMessage `json:"connection_receive_window"`
+		Users                   []struct {
 			Name     string `json:"name"`
 			Username string `json:"username"`
 		} `json:"users"`
@@ -365,5 +372,91 @@ func TestJiejieProductionFixtureHasNoSecrets(t *testing.T) {
 	if !strings.Contains(text, "AAAAAAAAAAAAAAAAAAAAAA==") {
 		// The SS2022 key is a documented placeholder and must stay that way.
 		t.Log("note: SS2022 placeholder password not found verbatim; confirm it is still a placeholder")
+	}
+}
+
+// TestJiejieProductionNaiveFlowControlWindows pins the Naive HTTP/2 receive
+// windows in the production fixture.
+//
+// The Naive inbound is a bulk-carrying tunnel, and x/net/http2's defaults are
+// sized for a browser talking to a web server, not for a proxy carrying a large
+// download: the server stops granting the client more upload credit well before
+// the link is saturated, which caps throughput on a high-BDP path.
+//
+// This test exists because the values live in JSON, where a typo (a missing
+// zero, or bytes instead of mebibytes) is silent: the tunnel still works, just
+// slower. It asserts the exact byte counts, so the fixture cannot drift.
+func TestJiejieProductionNaiveFlowControlWindows(t *testing.T) {
+	fixture, _ := loadProductionFixture(t)
+
+	const (
+		expectedStream     = 8 * 1024 * 1024
+		expectedConnection = 32 * 1024 * 1024
+	)
+
+	var naiveLoaded bool
+	for _, inbound := range fixture.Inbounds {
+		if inbound.Type != "naive" {
+			if len(inbound.StreamReceiveWindow) != 0 || len(inbound.ConnectionReceiveWindow) != 0 {
+				t.Errorf("inbound %q (type %s) sets a receive window; only the naive "+
+					"inbound is meant to carry the production flow-control tuning",
+					inbound.Tag, inbound.Type)
+			}
+			continue
+		}
+		naiveLoaded = true
+		if inbound.Tag != "naive-in" {
+			t.Errorf("the production naive inbound must be tagged naive-in, got %q", inbound.Tag)
+		}
+		for _, field := range []struct {
+			name     string
+			raw      json.RawMessage
+			expected int64
+		}{
+			{"stream_receive_window", inbound.StreamReceiveWindow, expectedStream},
+			{"connection_receive_window", inbound.ConnectionReceiveWindow, expectedConnection},
+		} {
+			if len(field.raw) == 0 {
+				t.Errorf("naive-inbound %s is unset; production must pin it explicitly "+
+					"rather than inherit the http2 default", field.name)
+				continue
+			}
+			var actual int64
+			if parseErr := json.Unmarshal(field.raw, &actual); parseErr != nil {
+				t.Errorf("naive-inbound %s must be a plain byte count, got %s: %v",
+					field.name, field.raw, parseErr)
+				continue
+			}
+			if actual != field.expected {
+				t.Errorf("naive-inbound %s must be %d bytes, got %d",
+					field.name, field.expected, actual)
+			}
+		}
+	}
+	if !naiveLoaded {
+		t.Fatal("the production fixture must declare a naive inbound")
+	}
+
+	// The connection window must not be smaller than the stream window: with a
+	// connection window this low a single stream could never consume the credit
+	// its own stream window advertises, making the stream value useless.
+	var stream, connection int64
+	for _, inbound := range fixture.Inbounds {
+		if inbound.Type != "naive" {
+			continue
+		}
+		_ = json.Unmarshal(inbound.StreamReceiveWindow, &stream)
+		_ = json.Unmarshal(inbound.ConnectionReceiveWindow, &connection)
+	}
+	if connection < stream {
+		t.Errorf("naive connection_receive_window (%d) must be at least the "+
+			"stream_receive_window (%d), otherwise the stream window is unreachable",
+			connection, stream)
+	}
+	// The exact byte counts above already fix the values; this only records the
+	// shape so a future edit that swaps them is caught with a clearer message.
+	if stream != expectedStream || connection != expectedConnection {
+		t.Errorf("naive windows must stay %d stream / %d connection, got %d / %d",
+			expectedStream, expectedConnection, stream, connection)
 	}
 }
