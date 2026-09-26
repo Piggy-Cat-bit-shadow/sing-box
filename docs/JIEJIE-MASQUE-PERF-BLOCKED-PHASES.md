@@ -37,37 +37,149 @@ correct outcome for these phases is **BLOCKED**, not a workaround.
 
 ## Phase 4 — preserve batching through the timeout wrappers
 
-**Status: BLOCKED.** The loss is measured, not assumed:
-`transport/http/batch_through_timeout_test.go` asserts that the bare connection offers both
-connected batch capabilities and that `canceler.NewPacketConn` drops both. The test fails
-when the dependency starts forwarding, which turns this note into a signal.
+**Status: DONE.**
+
+### What was broken
 
 `route/conn.go` wraps every packet connection in `canceler.NewPacketConn` for the UDP idle
-timeout. sing's `TimerPacketConn` and `TimeoutPacketConn` implement only
-`ReadPacket`/`WritePacket`, so:
+timeout. sing's `TimerPacketConn` and `TimeoutPacketConn` implemented only
+`ReadPacket`/`WritePacket`, so both connected batch capabilities became invisible the
+moment the wrapper was applied:
 
 ```text
-http3PacketConn   -> offers connected batch read/write
-canceler wrapper  -> both invisible
-bufio.CopyPacket  -> falls back to one packet at a time
+http3PacketConn   -> offered connected batch read/write
+canceler wrapper  -> both dropped
+bufio.CopyPacket  -> fell back to one packet at a time
 ```
 
-The connection still works, so nothing fails; the tunnel is simply slower than the batch
-work above makes possible.
+The connection still worked, so nothing failed; the batching implemented on the tunnel was
+simply unreachable in production.
 
-What a fix must do, and what it must not:
+### The dependency change
 
-- forward `CreateConnectedPacketBatchReadWaiter` / `CreateConnectedPacketBatchWriter`
-  through the wrapper, AND
-- keep activity accounting at **once per batch**, not once per packet. A per-packet
-  `Update()` would negate the point of batching.
+| Item | Value |
+| --- | --- |
+| fork | `github.com/Piggy-Cat-bit-shadow/sing` |
+| base | `4ca3bebe0b8e96d07d031dce9f311b7675c2d8d9` (the revision already required) |
+| branch | `fix/packet-batch-timeout` |
+| `SING_PATCH_SHA` | `c0ee76200ae31ec90fd9a28506f42d33ce1fe32b` |
+| replace | `github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260926122709-c0ee76200ae3` |
 
-Marking the wrapper `ReaderReplaceable`/`WriterReplaceable` to make the resolver skip it is
-**not** a fix: it would bypass the timeout tracking the wrapper exists for, which is a
-behavioural regression in exchange for speed.
+The fork keeps `module github.com/sagernet/sing` and is pinned by commit, not by a branch.
+Every non-`replace` line of `go.mod` is byte-identical to before, so nothing else moved and
+`quic-go` is untouched. `go.sum` gained exactly the fork's two lines. There is no vendoring
+and no local path replacement.
 
-Unblocked by: a writable fork of `github.com/sagernet/sing` (or the change landing
-upstream) plus a `replace` pinned to a specific commit.
+The dependency was verified by its CODE, not by the text of `go.mod`:
+`go list -m -json` reports the `Replace` at that version, and the resolved module directory
+was inspected to confirm all four new creators are present.
+
+### Wrapper types changed
+
+| Wrapper | Branch selected when | Now forwards |
+| --- | --- | --- |
+| `TimerPacketConn` | the connection cannot take a read deadline (the HTTP/3 connection) | connected batch read + write |
+| `TimeoutPacketConn` | the connection accepts a read deadline (a real UDP socket) | connected batch read + write |
+
+Both are fixed. Only fixing one would leave the other half of production broken, so they
+are separate implementations with separate tests.
+
+Activity accounting is preserved and recorded **once per batch**, not once per packet, and
+keyed on the call succeeding rather than on payload bytes - a batch of zero-length UDP
+datagrams is ordinary RFC 9298 traffic and must not look idle. `TimeoutPacketConn` keeps
+its own deadline-and-liveness loop rather than copying the timer variant. Nothing is
+released on either side, because the inner readers and writers differ in their buffer
+ownership contracts.
+
+### Tests
+
+| Test | Covers |
+| --- | --- |
+| `TestTimerPacketConnPreservesConnectedBatchCapabilities` | timer branch, read + write, options forwarded |
+| `TestTimeoutPacketConnPreservesConnectedBatchCapabilities` | timeout branch, read + write |
+| `TestTimeoutWrapperDoesNotInventBatchCapabilities` | false when the inner connection has none, both branches |
+| `TestTimeoutWrapperKeepsTheOrdinaryPacketPathUsable` | `WritePacket`, `Upstream` unchanged |
+| `TestTimeoutWrapperSetTimeoutStillApplies` | `SetTimeout` after the wrapper exists |
+| `TestCopyPacketSelectsTheConnectedBatchPathThroughTheTimeoutWrapper` | the real `bufio.CopyPacket` selects batch |
+| `TestCopyPacketKeepsTheOrdinaryFallbackWithoutBatchSupport` | control: no capability, per-packet route |
+| `TestConnectUDPTimeoutRulesProduceTheExpectedBranchTimeout` | 443 -> QUIC/30s, 53 -> DNS/10s, from the real tables |
+| `TestConnectUDPBatchSurvivesTheRealDerivedTimeout` | both ports, both branches |
+| `TestConnectUDPNATWrappersForwardBothBatchCapabilities` | the NAT wrappers are not a second blocker |
+| `TestConnectUDPUploadDirectionBatchesFully` | the direction that is fixed, end to end |
+
+In sing itself (`common/canceler/packet_batch_test.go`): branch selection, both directions
+on both wrappers, batch sizes 1/2/8/16/64, zero-length datagrams, read and write failure
+propagation, `SetTimeout` after the waiter exists, bidirectional activity keeping a session
+alive, genuine idle expiry still firing, close releasing a pending read, concurrent read
+and write under `-race`, and no double release.
+
+Load-bearing: pointing the replace back at the unfixed upstream makes all four capability
+and copy-path tests fail, including the copy-path test with its intended message that the
+capability was visible but unused.
+
+### Actual production path
+
+```text
+client -> target:
+  http3PacketConn (source)
+    -> canceler.NewPacketConn (timeout wrapper, batch READ preserved)
+    -> bufio.CopyPacket
+    -> NAT wrappers (batch WRITE preserved)
+    -> connected UDP target
+
+target -> client:
+  connected UDP target -> NAT wrappers (batch READ preserved)
+    -> bufio.CopyPacket
+    -> canceler wrapper (batch WRITE preserved)
+    -> http3PacketConn
+```
+
+Every wrapper on both directions forwards both capabilities; no additional wrapper blocker
+was found. The NAT wrappers forward batch read through `nat_wait.go` and batch write
+through `nat.go`, which is a different file from the one an earlier inspection looked at -
+the test is what corrected that.
+
+### Linux syscall runtime
+
+**CONFIRMED for `sendmmsg`.** Measured on Linux aarch64 with `strace -f`, running the real
+socket test with one batch of 16 packets through the wrapper:
+
+```text
+sendmmsg(7, [{msg_hdr={...{iov_base="batch-syscall-probe", iov_len=19}, ...}], 16, 0)
+```
+
+One `sendmmsg` call carrying 16 iovecs, with zero `sendto` calls. The batch writer in
+effect was `*canceler.timeoutConnectedPacketBatchWriter`, this change's own wrapper.
+
+The same test against the UNFIXED upstream sing fails at the capability assertion with
+`sendmmsg: 0`, so the batching was genuinely lost before the fix rather than merely
+untested.
+
+`recvmmsg` is **NOT-TESTED**: the test drives the write direction, and the read direction
+over a real socket was not traced. `UDP_SEGMENT`/GSO is **NOT-TESTED** and is a separate
+phase, not claimed here.
+
+### Benchmark
+
+Same-process A/B on an Apple M1 (darwin/arm64), 2000 iterations per case. The pair that
+describes this change is `timeout-batch` against `fallback-per-packet`; the route taken is
+recorded by counters (`batches`, `single-writes`) rather than inferred from timing.
+
+| Payload | Batch | timeout-batch | fallback-per-packet | Packets per batch |
+| --- | --- | --- | --- | --- |
+| 1200B | 64 | 7141 ns/op | 8356 ns/op | 1 vs 0 |
+| 1200B | 32 | 4374 ns/op | 4942 ns/op | 1 vs 0 |
+| 64B | 64 | 5862 ns/op | 7261 ns/op | 1 vs 0 |
+| 64B | 32 | 3857 ns/op | 5082 ns/op | 1 vs 0 |
+
+This is the CPU cost of the copy loop and the wrapper, and the per-packet call count. It is
+**not** a throughput claim: it involves no system call, no NIC and no VPS, so no end-to-end
+speedup is derived from it. It is darwin/arm64 and is not presented as a Linux/amd64 VPS
+measurement.
+
+### Scope
+
+Phase 4 only. Phases 7, 9, 10 and 11 remain as recorded below; nothing else was changed.
 
 ## Phase 7 — batch HTTP Datagram enqueue in quic-go
 
@@ -136,7 +248,7 @@ and the test belong to `sing`, which has no writable fork here.
 
 | Phase | Status | Needs |
 | --- | --- | --- |
-| 4 | BLOCKED | writable `sagernet/sing` |
+| 4 | **DONE** | writable `sagernet/sing` — see the Phase 4 section |
 | 7 | BLOCKED | writable `sagernet/quic-go` |
 | 9 (GRO) | BLOCKED | writable `sagernet/quic-go` |
 | 9 (GSO, batching, buffers) | already present | - |
