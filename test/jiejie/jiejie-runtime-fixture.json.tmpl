@@ -33,7 +33,7 @@
     {
       "type": "http", "tag": "masque-h3",
       "listen": "127.0.0.1", "listen_port": __H3_PORT__,
-      "version": 3, "server_profile": "jiejie-balanced-1g",
+      "version": 3, "bbr_profile": "standard",
       "users": [{"username": "example", "password": "example"}],
       "tls": {"enabled": true, "server_name": "example.test", "certificate_path": "__CERT__", "key_path": "__KEY__"},
       "masquerade": {"type": "proxy", "url": "http://127.0.0.1:__DECOY_PORT__", "rewrite_host": true},
