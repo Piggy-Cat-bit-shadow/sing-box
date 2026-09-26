@@ -367,6 +367,9 @@ jobs:
             TestReferenceConnectUDPZeroLengthDatagramOverCapsules \
             TestReferenceStreamFailureDoesNotKillTheHTTP3Connection \
             TestReferenceUnauthenticatedLimiterSurvivesPortChurnOnTheWire \
+            TestReferenceConnectUDPTunnelSurvivesPacketImpairment \
+            TestReferenceConnectUDPNewTunnelAfterImpairment \
+            TestReferenceConnectUDPCapsuleStreamSurvivesPacketLoss \
             TestSourceIdentityIsRecordedAndDrivesRouting \
             TestSourceIdentityIgnoresClientSuppliedHeaders \
             TestSourceIdentityIsStableAcrossMigration \
@@ -378,6 +381,7 @@ jobs:
             TestReferenceConnectIPEmptyPayloadIsDroppedAndTheTunnelSurvives \
             TestReferenceConnectIPEmptyPayloadOverCapsules \
             TestReferenceConnectIPPacketTooBigOverHTTP3 \
+            TestReferenceConnectIPTunnelSurvivesPacketImpairment \
             TestReferenceConnectIPRejectsWithoutAuth \
             TestReferenceConnectIPICMPEchoDifferential \
             TestReferenceConnectIPSurvivesNATRebinding \
