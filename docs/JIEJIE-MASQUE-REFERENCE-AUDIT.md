@@ -583,11 +583,13 @@ answered with a 1276-byte reply). No live PTB E2E is claimed.
 | --- | --- | --- |
 | quic-go/masque-go (`c1cf0e4d`) | PASS | `v0.6.0` tag; unchanged pin; CONNECT-UDP round trip, no-auth rejection, settings exchange |
 | quic-go/connect-ip-go (`fdd945e3`) | PASS | pseudo-version pin via `replace`; unchanged; handshake, assignment, ICMP differential, IPv4 and IPv6 control capsules, capsule fallback, migration |
-| Google QUICHE | NOT-TESTED | Not built or run in this round. No interop result is claimed. |
+| Google QUICHE | CHECKED (protocol vectors) | Read at `c961965aa3ee8f2b6f05ebcac794f7854101adcd`; its context-ID decision table and unit vectors are pinned in `test/jiejie/reference/quiche_oracle_test.go`. NOT built and NOT run, so this is a protocol-vector CHECK and NOT interop. |
 | Volto-derived migration semantics | PASS | Migration survives a NAT rebind for CONNECT-UDP and CONNECT-IP; new tunnels open afterwards |
 
-Reference HEADs were re-checked at the start of this round and both are unchanged from the
-pins recorded above, so no re-pin was needed. Both remain isolated in
+Reference HEADs were re-checked at the start of this round: masque-go, connect-ip-go AND
+Google QUICHE all still stand at the commits recorded at the top of this document, so no
+re-pin was needed. QUICHE's source was additionally fetched and read for the vector check
+described above; it was not built. Both remain isolated in
 `test/jiejie/reference`, a separate Go module that neither the root nor the `test` module
 depends on.
 
@@ -644,7 +646,7 @@ reader does not mistake one direction's behaviour for the other's.
 
 | Item | Verdict | Reason |
 | --- | --- | --- |
-| Google QUICHE interop | NOT-TESTED | Not built or run this round. |
+| Google QUICHE interop | NOT-TESTED | Not built and not run: C++ via Bazel, and no Bazel toolchain is available here. Its protocol vectors are checked instead (see the table above), which is a CHECK and not interop. |
 | Live H3 Packet Too Big end to end | NOT-TESTED | Needs an asymmetric origin (a reply larger than its request); a loopback echo cannot produce one. Generation is fully covered. |
 | Real VPS / WAN behaviour | NOT-TESTED | Only a real VPS can test it. See `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`. |
 | RFC 9931 client-side half | OUT-OF-SCOPE | Server-only product; no MASQUE client endpoint in the production registry. |
