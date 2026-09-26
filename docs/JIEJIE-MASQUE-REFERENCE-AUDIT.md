@@ -5,6 +5,51 @@ Maintenance record for the MASQUE server audit run on the experimental branch
 what remains unverified. It is not a compatibility claim beyond what the tests
 show.
 
+---
+
+## CURRENT STATUS
+
+**This is the only section that states the present position.** Everything after it is a
+HISTORICAL record of what was true when each phase ran, and those sections are kept for
+audit value - several of them deliberately say the opposite of the current position,
+because that is what was measured at the time. Do not read a later historical section as a
+correction of an earlier one; read this table.
+
+| Boundary | Current status | Evidence |
+| --- | --- | --- |
+| IPv4 live H3 Packet Too Big | **PASS** | `TestReferenceConnectIPPacketTooBigOverHTTP3Live`; real `quic-go` `DatagramTooLargeError` |
+| Packet Too Big session ownership | **PASS** | `TestPacketTooBigIsDeliveredOnlyToTheOwningSession`, `TestPacketTooBigIsNotBroadcastToEverySession` |
+| IPv6 Packet Too Big generation | **PASS** | `TestPacketTooBigIPv6Shape`, `TestPacketTooBigCanBeAddressedToAnExplicitPeer` |
+| IPv6 live H3 Packet Too Big | **NOT-TESTED** | no live IPv6 trigger; see the Boundary Closure Round for the measured reason |
+| QUICHE HTTP/3 transport | **LOCAL PASS**, GitHub runner **INCONCLUSIVE-TIMEOUT** | `TestReferenceQuicheH3TransportLiveInterop`; run `36238936300` |
+| QUICHE CONNECT-UDP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectUDPLiveInterop`; process exits non-zero with `QUIC_CONNECTION_CANCELLED` |
+| QUICHE CONNECT-IP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectIPLiveInterop`; same observed failure |
+| QUICHE root cause | **UNCONFIRMED** | the process fails before emitting any CONNECT; four candidate causes were ruled out by measurement, the rest is not attributable with the evidence held |
+| RFC 9931 server behaviour | **PASS** | existing server-side tests |
+| RFC 9931 auxiliary client audit | **PASS** | `TestRFC9931*` |
+| RFC 9931 server product scope | **OUT-OF-SCOPE** for the client half | the production minimal registry ships no MASQUE client endpoint |
+| Real VPS / WAN | **NOT-TESTED** | no real deployment was available |
+| Real WAN IPv4 / IPv6 / PMTU | **NOT-TESTED** | as above; the runner exists and reports NOT-TESTED without one |
+| Mobile NAT rebinding, CGNAT | **NOT-TESTED** | requires a real mobile or carrier network |
+
+### Reading the QUICHE rows
+
+The three QUICHE rows are not one verdict, and the distinction is the point:
+
+- **EXECUTED-FAILED** means the process ran and disagreed. That is a real observed failure,
+  NOT an absence of testing, and it is not evidence of a defect in either implementation
+  on its own.
+- **INCONCLUSIVE-TIMEOUT** means the process ran and was killed at the execution deadline.
+  No exchange was observed, so nothing is established either way. The GitHub runner also
+  reports a UDP receive-buffer warning, which is recorded as host-environment diagnostic
+  evidence; **causation is not established** by it.
+- A **NOT-RUN** row would mean no process executed, which is also not a pass.
+
+No QUICHE MASQUE tunnel interop is claimed. The cheap protocol-vector check
+(`TestQuicheOracle*`) still runs on every push and pins QUICHE's decisions; it is not
+interop.
+
+
 ## Baseline
 
 | Item | Value |
@@ -196,6 +241,9 @@ nothing about the other. Which one is covered is stated with the result.
 
 ## Verified against the pinned references
 
+> **HISTORICAL STATUS.** The QUICHE row in this section predates the live QUICHE work and
+> describes the protocol-vector check only. See CURRENT STATUS.
+
 These are the external-interoperability results. "External" means the client on
 the wire is the pinned third-party library, not sing-box's own client: running
 sing-box against itself would only prove that sing-box agrees with sing-box.
@@ -282,6 +330,11 @@ masque-server"), which is correct rather than something to work around.
 
 ## Remaining NOT-TESTED
 
+> **HISTORICAL STATUS.** This list records what was open at the time this section was
+> written. Several entries here have since been closed or reclassified - see CURRENT
+> STATUS at the top. It is kept because the sequence of what was open and when is part
+> of the audit record.
+
 Listed so the gaps are not mistaken for coverage. None of these has a passing test,
 and none is claimed as PASS:
 
@@ -344,6 +397,9 @@ NOT-TESTED item becomes an implied PASS:
     verified here.
 
 ## Phase 3
+
+> **HISTORICAL STATUS.** Records the phase-3 position. Superseded in places by later
+> rounds; see CURRENT STATUS.
 
 Phase 3 continued on `masque-reference-hardening-phase3`, branched from the Phase 2
 head. Its scope was the areas Phase 2 identified as NOT-TESTED, plus a correction to
@@ -495,6 +551,9 @@ CONNECT-UDP-BIND, Compression Assign, DNS_ASSIGN, PREF64, and experimental
 drafts.
 
 ## Pre-VPS Final Closure
+
+> **HISTORICAL STATUS.** This section records the state at the end of that closure round.
+> Where it disagrees with CURRENT STATUS, CURRENT STATUS is authoritative.
 
 This section records the last code-closure round before Linux amd64 VPS acceptance. Its
 purpose was NOT to add MASQUE features. It was to finish the correctness, security,
@@ -682,6 +741,11 @@ QUIC DATAGRAM is unreliable by design and RFC 9297 gives it no retransmission.
 ---
 
 ## Boundary Closure Round
+
+> **HISTORICAL STATUS for its QUICHE rows.** The PTB rows here remain current. The QUICHE
+> rows record what was measured then; the tunnel claims are still not established, and
+> the failure is now classified more precisely (EXECUTED-FAILED rather than NOT-TESTED)
+> because the process was subsequently observed to run and fail. See CURRENT STATUS.
 
 This section records the last round of boundary work before the VPS run. Its rule is the
 one the whole document follows, applied to the four remaining boundaries: a boundary moves
