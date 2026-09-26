@@ -1,4 +1,4 @@
-//go:build !jiejie_server_minimal
+//go:build !jiejie_server_minimal && !jiejie_client_macos
 
 package include
 
