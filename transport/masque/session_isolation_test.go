@@ -53,7 +53,7 @@ func (discardStream) Close() error                { return nil }
 // the invariants production relies on.
 func noopSession(server *Server, addresses []netip.Addr, peerRoutes []AddressRange) *serverSession {
 	return &serverSession{
-		session:    newSession(context.Background(), discardStream{}, &shutdownProbeHandler{}, false),
+		session:    newSession(context.Background(), discardStream{}, &shutdownProbeHandler{}, func() int { return PacketHeadroom }),
 		server:     server,
 		ctx:        context.Background(),
 		addresses:  addresses,

@@ -128,7 +128,7 @@ func TestSessionShutdownUnblocksABlockedWriter(t *testing.T) {
 	stream := newBlockingWriteStream()
 	handler := &shutdownProbeHandler{}
 
-	current := newSession(context.Background(), stream, handler, true)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
 	// Queue the packet BEFORE starting run, so loopSend has work the moment it
 	// starts. Queueing afterwards would race the reader: run calls loopCapsule
@@ -137,7 +137,7 @@ func TestSessionShutdownUnblocksABlockedWriter(t *testing.T) {
 	packet := buf.NewSize(PacketHeadroom + 4)
 	packet.Resize(PacketHeadroom, 0)
 	packet.Write([]byte{0x45, 0x00, 0x00, 0x00})
-	current.queuePacket(packet)
+	go func() { _ = current.writePackets([]*buf.Buffer{packet}) }()
 
 	done := make(chan error, 1)
 	go func() { done <- current.run() }()
@@ -241,7 +241,7 @@ func TestRepeatedShutdownDoesNotAccumulateGoroutines(t *testing.T) {
 		stream := newBlockingWriteStream()
 		handler := &shutdownProbeHandler{}
 		current := &serverSession{
-			session:    newSession(context.Background(), stream, handler, true),
+			session:    newSession(context.Background(), stream, handler, func() int { return PacketHeadroom }),
 			server:     server,
 			ctx:        context.Background(),
 			addresses:  []netip.Addr{netip.MustParseAddr("198.18.0.2")},

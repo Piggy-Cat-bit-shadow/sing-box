@@ -268,7 +268,7 @@ func runFiniteSession(t *testing.T, current *session) {
 // driven directly.
 func newTestSession(t *testing.T, stream *bytes.Reader, handler sessionHandler, queued bool) *session {
 	t.Helper()
-	return newSession(t.Context(), &readWriteCloser{Reader: std_bufio.NewReader(stream)}, handler, queued)
+	return newSession(t.Context(), &readWriteCloser{Reader: std_bufio.NewReader(stream)}, handler, func() int { return PacketHeadroom })
 }
 
 // readWriteCloser adapts a reader into the io.ReadWriteCloser a session needs. Writes

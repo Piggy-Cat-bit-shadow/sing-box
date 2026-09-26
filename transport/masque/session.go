@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -15,38 +16,15 @@ import (
 const (
 	upgradeToken       = "connect-ip"
 	DefaultMTU         = 1280
-	PacketHeadroom     = 64
+	PacketHeadroom     = transportHTTP.CapsuleHeadroom
 	QUICPacketOverhead = 51
 	minimumLinkMTU     = 1280
-	// maxPacketSize bounds one MASQUE inner IP packet, in bytes.
+	// maxPacketSize bounds one MASQUE inner IP packet.
 	//
-	// It is the largest ORDINARY IPv6 packet, and the arithmetic differs between the
-	// two families:
-	//
-	//	IPv4  Total Length is 16 bits and counts the WHOLE packet, header included,
-	//	      so a maximal IPv4 packet is 65535 bytes;
-	//	IPv6  Payload Length is 16 bits and counts everything AFTER the 40-byte base
-	//	      header (RFC 8200 section 3), so a maximal ordinary IPv6 packet is
-	//	      40 + 65535 = 65575 bytes.
-	//
-	// The value used to be 65535, taken from the IPv4 figure. That silently DISCARDED
-	// any IPv6 packet in the 65536..65575 window: a legal packet, dropped by a bound
-	// that was never about IPv6. Measured before the change, with a real capsule on the
-	// wire path: 65535 was delivered, 65536 and 65575 produced nothing.
-	//
-	// JUMBOGRAMS ARE NOT SUPPORTED and this bound does not enable them. RFC 8200 section
-	// 4.5 allows a Payload Length of 0 with a Hop-by-Hop Jumbo Payload option to carry up
-	// to 2^32-1 bytes; that would need a different parser and is out of scope. The bound
-	// is raised to the largest ordinary packet and no further, and the packet parser
-	// still decides validity from the actual IP header, so a buffer in this range whose
-	// Payload Length does not agree with its size is rejected by the parser rather than
-	// by this limit.
-	//
-	// sing-tun agrees with the arithmetic: gtcpip/header/ipv6.go defines
-	// IPv6MaximumPayloadSize = 65535 for the amount after the base header, and its
-	// IPv6.IsValid admits a total of IPv6MinimumSize + that.
+	// IPv4 Total Length counts the whole packet, so the largest ordinary IPv4 packet is
+	// 65535. IPv6 Payload Length excludes the 40-byte base header (RFC 8200 section 3),
+	// so the largest ordinary IPv6 packet is 40 + 65535. Jumbograms are not supported.
 	maxPacketSize = 40 + 65535
-	sendQueueSize = 256
 )
 
 type sessionHandler interface {
@@ -58,55 +36,34 @@ type sessionHandler interface {
 }
 
 type session struct {
-	ctx    context.Context
-	cancel context.CancelCauseFunc
-	stream io.ReadWriteCloser
-	// datagrams is the datagram-capable view of the stream, or nil when the peer
-	// did not negotiate HTTP Datagrams.
-	//
-	// The write path uses nil to mean "write a capsule instead", which is why the
-	// distinction is kept here rather than recovered from SendDatagram's error.
-	//
-	// This is NOT a fix for a demonstrated bug. Clearing it does not make the
-	// capsule fallback fail and does not leak a goroutine (measured: the fallback
-	// test passes either way, and an active tunnel shows 9 goroutines both ways).
-	// The reason is that the server-side ReceiveDatagram reads a dedicated datagram
-	// queue rather than the DATA stream, so a datagram loop with no datagrams just
-	// blocks harmlessly. See the note on DatagramStream for the full measurement.
-	datagrams   transportHTTP.DatagramStream
-	reader      *std_bufio.Reader
-	handler     sessionHandler
-	sendQueue   chan *buf.Buffer
-	writeAccess sync.Mutex
+	ctx            context.Context
+	cancel         context.CancelCauseFunc
+	stream         io.ReadWriteCloser
+	datagrams      transportHTTP.DatagramStream
+	reader         *std_bufio.Reader
+	handler        sessionHandler
+	packetHeadroom func() int
+	writeAccess    sync.Mutex
 }
 
-// newSession builds a session over a MASQUE request stream.
-//
-// The datagram view is taken only when the peer actually negotiated HTTP
-// Datagrams, so the session records the capability rather than re-deriving it from
-// a type assertion that cannot express it.
-//
-// A stream that does not report the capability at all is treated as incapable,
-// which is the safe default: the capsule path always works for both protocols.
-//
-// This is intent-clarifying rather than defect-fixing; see DatagramStream for the
-// measurement that distinguishes the two.
-func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionHandler, queued bool) *session {
+func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionHandler, packetHeadroom func() int) *session {
 	sessionCtx, cancel := context.WithCancelCause(ctx)
+	// The datagram view is taken only when the peer actually negotiated HTTP Datagrams,
+	// so the session records the capability instead of re-deriving it from a type
+	// assertion that cannot express it. A stream that does not report it is treated as
+	// incapable, which is the safe default: the capsule path always works.
 	var datagrams transportHTTP.DatagramStream
 	if capable, isDatagramStream := stream.(transportHTTP.DatagramStream); isDatagramStream && capable.DatagramsEnabled() {
 		datagrams = capable
 	}
 	current := &session{
-		ctx:       sessionCtx,
-		cancel:    cancel,
-		stream:    stream,
-		datagrams: datagrams,
-		reader:    std_bufio.NewReader(stream),
-		handler:   handler,
-	}
-	if queued {
-		current.sendQueue = make(chan *buf.Buffer, sendQueueSize)
+		ctx:            sessionCtx,
+		cancel:         cancel,
+		stream:         stream,
+		datagrams:      datagrams,
+		reader:         std_bufio.NewReader(stream),
+		handler:        handler,
+		packetHeadroom: packetHeadroom,
 	}
 	return current
 }
@@ -119,9 +76,6 @@ func (s *session) run() error {
 	var loops sync.WaitGroup
 	if s.datagrams != nil {
 		loops.Go(s.loopDatagram)
-	}
-	if s.sendQueue != nil {
-		loops.Go(s.loopSend)
 	}
 	err := s.loopCapsule()
 	s.cancel(err)
@@ -141,31 +95,11 @@ func (s *session) loopDatagram() {
 		if !valid || contextID != 0 || len(datagram) == contextLength {
 			continue
 		}
-		buffer := buf.NewSize(PacketHeadroom + len(datagram) - contextLength)
-		buffer.Resize(PacketHeadroom, 0)
-		buffer.Write(datagram[contextLength:])
+		headroom := s.packetHeadroom()
+		buffer := buf.NewSize(headroom + len(datagram) - contextLength)
+		buffer.Resize(headroom, 0)
+		common.Must1(buffer.Write(datagram[contextLength:]))
 		s.handler.handlePacket(buffer)
-	}
-}
-
-func (s *session) loopSend() {
-	for {
-		select {
-		case buffer := <-s.sendQueue:
-			err := s.writePacket(buffer)
-			if err != nil {
-				s.cancel(err)
-			}
-		case <-s.ctx.Done():
-			for {
-				select {
-				case buffer := <-s.sendQueue:
-					buffer.Release()
-				default:
-					return
-				}
-			}
-		}
 	}
 }
 
@@ -209,8 +143,9 @@ func (s *session) readDatagramCapsule(length int) error {
 		_, err = s.reader.Discard(payloadLength)
 		return err
 	}
-	buffer := buf.NewSize(PacketHeadroom + payloadLength)
-	buffer.Resize(PacketHeadroom, 0)
+	headroom := s.packetHeadroom()
+	buffer := buf.NewSize(headroom + payloadLength)
+	buffer.Resize(headroom, 0)
 	_, err = buffer.ReadFullFrom(s.reader, payloadLength)
 	if err != nil {
 		buffer.Release()
@@ -264,39 +199,40 @@ func (s *session) writeCapsule(capsule *buf.Buffer) error {
 	return err
 }
 
-func (s *session) queuePacket(buffer *buf.Buffer) {
-	select {
-	case s.sendQueue <- buffer:
-	default:
-		buffer.Release()
-	}
-}
-
-func (s *session) writePacket(buffer *buf.Buffer) error {
-	datagram := transportHTTP.PrependContextID(buffer)
-	if s.datagrams != nil {
-		err := s.datagrams.SendDatagram(datagram.Bytes())
-		var tooLarge *transportHTTP.DatagramTooLargeError
-		switch {
-		case err == nil:
-			datagram.Release()
-			return nil
-		case errors.As(err, &tooLarge):
-			mtu := tooLarge.MaxPayloadSize - 1
-			if mtu < minimumLinkMTU {
+func (s *session) writePackets(buffers []*buf.Buffer) error {
+	capsules := buffers[:0]
+	for i, buffer := range buffers {
+		datagram := transportHTTP.PrependContextID(buffer)
+		if s.datagrams != nil {
+			err := s.datagrams.SendDatagram(datagram.Bytes())
+			var tooLarge *transportHTTP.DatagramTooLargeError
+			switch {
+			case err == nil:
 				datagram.Release()
-				return E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets")
+				continue
+			case errors.As(err, &tooLarge):
+				mtu := tooLarge.MaxPayloadSize - 1
+				if mtu >= minimumLinkMTU {
+					datagram.Advance(1)
+					s.handler.handlePacketTooBig(datagram, mtu)
+					continue
+				}
+				err = E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets")
+			case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
+				capsules = append(capsules, datagram)
+				continue
 			}
-			datagram.Advance(1)
-			s.handler.handlePacketTooBig(datagram, mtu)
-			return nil
-		case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
-		default:
 			datagram.Release()
+			buf.ReleaseMulti(capsules)
+			buf.ReleaseMulti(buffers[i+1:])
 			return err
 		}
+		capsules = append(capsules, datagram)
+	}
+	if len(capsules) == 0 {
+		return nil
 	}
 	s.writeAccess.Lock()
 	defer s.writeAccess.Unlock()
-	return transportHTTP.WriteDatagramCapsule(s.stream, datagram)
+	return transportHTTP.WriteDatagramCapsules(s.stream, capsules)
 }

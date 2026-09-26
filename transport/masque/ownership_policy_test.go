@@ -3,9 +3,11 @@ package masque
 import (
 	"context"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 )
@@ -93,19 +95,25 @@ func buildOwnershipIPv6Packet(source netip.Addr, destination netip.Addr, protoco
 // the fields are filled here and the tests assert on a session that WOULD forward.
 func tunnelSession(t *testing.T, server *Server, addresses []netip.Addr, peerRoutes []AddressRange) *serverSession {
 	t.Helper()
-	// queued=true is required, not cosmetic: queuePacket drops silently when
-	// sendQueue is nil, so a session built with queued=false looks like an
-	// implementation that "rejected the packet without telling anyone" when in fact
-	// nothing was ever wired up to receive the reply. NewTunnelRequest passes true.
+	// An outbound queue is required, not cosmetic: a session writes its replies through it,
+	// and a session built without one looks like an implementation that "rejected the packet
+	// without telling anyone" when in fact nothing was ever wired up to receive the reply.
+	// The queue's handler captures what the session sends so a test can inspect it.
 	current := &serverSession{
-		session:          newSession(context.Background(), discardStream{}, nil, true),
+		session:          newSession(context.Background(), discardStream{}, nil, func() int { return PacketHeadroom }),
 		server:           server,
 		ctx:              context.Background(),
 		addresses:        addresses,
 		peerRoutes:       peerRoutes,
 		advertisedRoutes: advertisedRoutesFor(server, addresses, 0),
 	}
+	// The fixture keeps production wiring: a serverSession IS its own sessionHandler. What
+	// is captured instead is the QUEUE's delivery, because that is where a reply actually
+	// goes out.
 	current.handler = current
+	current.queue = newTestOutboundQueue(func(packetBuffers []*buf.Buffer) {
+		recordDelivery(current, packetBuffers)
+	})
 	if len(current.advertisedRoutes) == 0 {
 		t.Fatalf("the fixture produced no egress routes for %v", addresses)
 	}
@@ -165,6 +173,12 @@ func (h *ownershipProbeHandler) handlePacketTooBig(buffer *buf.Buffer, mtu int) 
 	buffer.Release()
 }
 
+func (h *ownershipProbeHandler) FrontHeadroom() int { return PacketHeadroom }
+
+func (h *ownershipProbeHandler) NewOutboundQueue(handler func(packetBuffers []*buf.Buffer)) *tun.OutboundQueue {
+	return newTestOutboundQueue(nil)
+}
+
 func (h *ownershipProbeHandler) WriteInboundBuffers(buffers []*buf.Buffer) error {
 	h.device += len(buffers)
 	for _, buffer := range buffers {
@@ -181,18 +195,34 @@ type queuedObservation struct {
 	dest     netip.Addr
 }
 
-// drainQueuedPackets empties a session's send queue, records what each packet says
-// about itself, and releases the buffers.
-//
-// A session that has not been run() never drains its own queue, so a test that
-// wants to observe a DELIVERED packet has to take it off the channel itself. The
-// values are measured BEFORE the release, because Release recycles the buffer.
+// drainQueuedPackets records what each packet a session queued says about itself, then
+// releases the buffers. The values are measured BEFORE the release, because Release
+// recycles the buffer.
 func drainQueuedPackets(t *testing.T, current *serverSession) []queuedObservation {
+	t.Helper()
+	return drainQueuedPacketsUntil(t, current, 0)
+}
+
+// drainQueuedPacketsUntil is drainQueuedPackets for a caller that KNOWS a delivery is
+// coming.
+//
+// expected is how many packets the caller expects the session's queue to deliver. The
+// queue delivers through its handler loop, which runs after the code that queued the
+// packet returns, so an immediate drain races it and observes nothing. Waiting for the
+// expected delivery observes the same packet through the same production queue; a caller
+// that expects nothing (expected == 0) still returns immediately, so negative assertions
+// are not slowed down or turned into timeouts.
+func drainQueuedPacketsUntil(t *testing.T, current *serverSession, expected int) []queuedObservation {
 	t.Helper()
 	var observations []queuedObservation
 	for {
-		select {
-		case packet := <-current.sendQueue:
+		packet := current.takeQueuedUntil(func(queued int) bool {
+			return len(observations)+queued < expected
+		})
+		if packet == nil {
+			return observations
+		}
+		{
 			observation := queuedObservation{}
 			if source, destination, protocol, valid := packetAddresses(packet.Bytes()); valid {
 				observation.source = source
@@ -207,10 +237,91 @@ func drainQueuedPackets(t *testing.T, current *serverSession) []queuedObservatio
 			}
 			observations = append(observations, observation)
 			packet.Release()
-		default:
-			return observations
 		}
 	}
+}
+
+// takeQueued returns the next packet a session queued, or nil when nothing is pending.
+//
+// The queue delivers through its handler, so the fixture records what arrived and this
+// pops from that record. A session that has not been run() never drains its own queue, so a
+// test that wants to observe a DELIVERED packet takes it here.
+func (s *serverSession) takeQueued() *buf.Buffer {
+	return s.takeQueuedUntil(nil)
+}
+
+// takeQueuedUntil is takeQueued with a settle predicate, used to observe a reply that the
+// production path queues asynchronously.
+//
+// tun.OutboundQueue.WriteBuffers only ENQUEUES the buffer: a handler-loop goroutine calls
+// the delivery handler afterwards. Production does not care, because that loop runs for as
+// long as the session does, but a test that queues a reply and reads it immediately races
+// the loop and observes nothing. Waiting for the expected reply observes the same
+// DELIVERED packet through the same production queue without weakening any assertion.
+//
+// pending reports whether the caller still expects more packets. A predicate rather than a
+// fixed count, so a test asserting EMPTINESS returns immediately instead of paying a
+// timeout, while a test asserting a reply waits for that reply to actually arrive.
+func (s *serverSession) takeQueuedUntil(pending func(queued int) bool) *buf.Buffer {
+	if pending != nil {
+		deadline := time.Now().Add(settleTimeout)
+		for pending(s.queuedCount()) && time.Now().Before(deadline) {
+			time.Sleep(settleInterval)
+		}
+	}
+	value, loaded := queuedDeliveries.Load(s)
+	if !loaded {
+		return nil
+	}
+	recorder := value.(*deliveryRecorder)
+	recorder.access.Lock()
+	defer recorder.access.Unlock()
+	if len(recorder.queued) == 0 {
+		return nil
+	}
+	packet := recorder.queued[0]
+	recorder.queued = recorder.queued[1:]
+	return packet
+}
+
+// queuedCount returns how many packets the session's queue has delivered so far.
+func (s *serverSession) queuedCount() int {
+	value, loaded := queuedDeliveries.Load(s)
+	if !loaded {
+		return 0
+	}
+	recorder := value.(*deliveryRecorder)
+	recorder.access.Lock()
+	defer recorder.access.Unlock()
+	return len(recorder.queued)
+}
+
+// settleTimeout bounds how long a test waits for the queue's handler loop to deliver, and
+// settleInterval is the polling step. The loop delivers as soon as it is scheduled, so this
+// is a generous upper bound rather than a sleep the tests rely on for correctness.
+const (
+	settleTimeout  = 2 * time.Second
+	settleInterval = 200 * time.Microsecond
+)
+
+// queuedDeliveries records what each session's outbound queue delivered.
+//
+// The capture lives here rather than on serverSession so the production struct and the
+// production wiring (a serverSession is its own sessionHandler) are both untouched: what a
+// test observes is the QUEUE's delivery, which is where a reply actually leaves the session.
+var queuedDeliveries sync.Map
+
+func recordDelivery(session *serverSession, buffers []*buf.Buffer) {
+	value, _ := queuedDeliveries.LoadOrStore(session, &deliveryRecorder{})
+	recorder := value.(*deliveryRecorder)
+	recorder.access.Lock()
+	recorder.queued = append(recorder.queued, buffers...)
+	recorder.access.Unlock()
+}
+
+type deliveryRecorder struct {
+	access sync.Mutex
+	queued []*buf.Buffer
 }
 
 // otherAddress returns whichever of first/second is not the given address.
@@ -446,8 +557,17 @@ func TestDeviceIngressSourcePolicyIsNotEnforced(t *testing.T) {
 					uint8(header.TCPProtocolNumber), 64)),
 			}, false)
 			deviceDeliveries := probe.device - before
-			tunnelDeliveries := len(drainQueuedPackets(t, b))
-			replies := len(drainQueuedPackets(t, b))
+			// The routing decision puts the packet on the session's queue, which delivers
+			// through its handler loop after this call returns, so wait for the expected
+			// delivery rather than racing it.
+			//
+			// This is drained ONCE. An earlier version drained the queue twice, once for
+			// "tunnel" and once for "replies"; the first drain consumed the only packet,
+			// so the second always reported zero and the two counters could not be
+			// compared. There is one observation here: what the session received.
+			queued := drainQueuedPacketsUntil(t, b, 1)
+			tunnelDeliveries := len(queued)
+			replies := 0
 
 			t.Logf("source %s -> device %d, tunnel %d, replies %d (%s)",
 				testCase.source, deviceDeliveries, tunnelDeliveries, replies, testCase.note)

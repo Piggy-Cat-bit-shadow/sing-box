@@ -23,6 +23,8 @@ import (
 
 type ServerHandler interface {
 	WriteInboundBuffers(packetBuffers []*buf.Buffer) error
+	FrontHeadroom() int
+	NewOutboundQueue(handler func(packetBuffers []*buf.Buffer)) *tun.OutboundQueue
 }
 
 type ServerOptions struct {
@@ -52,6 +54,7 @@ type Server struct {
 
 type serverSession struct {
 	*session
+	queue            *tun.OutboundQueue
 	server           *Server
 	ctx              context.Context
 	user             string
@@ -191,7 +194,13 @@ func (s *Server) NewTunnelRequest(ctx context.Context, request transportHTTP.Tun
 		s.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", request.Source()))
 		return
 	}
-	current.session = newSession(s.ctx, stream, current, true)
+	current.session = newSession(s.ctx, stream, current, s.receivedPacketHeadroom)
+	current.queue = s.handler.NewOutboundQueue(func(packetBuffers []*buf.Buffer) {
+		err := current.writePackets(packetBuffers)
+		if err != nil {
+			current.cancel(err)
+		}
+	})
 	s.access.Lock()
 	for _, address := range current.addresses {
 		s.addresses[address] = current
@@ -229,6 +238,9 @@ func (s *Server) releaseSession(current *serverSession) {
 		return it == current
 	})
 	s.access.Unlock()
+	if current.queue != nil {
+		current.queue.Close()
+	}
 	for _, address := range current.addresses {
 		for _, pool := range s.pools {
 			if pool.prefix.Contains(address) {
@@ -256,31 +268,45 @@ func (s *Server) lookup(destination netip.Addr, protocol uint8) *serverSession {
 	return nil
 }
 
-// Contains reports whether this server would route traffic for an address into
-// one of its tunnels.
+func (s *Server) route(source netip.Addr, destination netip.Addr, protocol uint8) *serverSession {
+	target := s.lookup(destination, protocol)
+	if target == nil || !target.accepts(source, protocol) {
+		return nil
+	}
+	return target
+}
+
+func (s *Server) RouteOutbound(packet []byte) *tun.OutboundQueue {
+	source, destination, protocol, valid := packetAddresses(packet)
+	if !valid {
+		return nil
+	}
+	target := s.route(source, destination, protocol)
+	if target == nil {
+		return nil
+	}
+	return target.queue
+}
+
+// Contains reports whether this server would route traffic for an address into one of its
+// tunnels.
 //
-// It must agree with lookup(). lookup() refuses the server's own address inside
-// the tunnel prefix before it consults any route advertisement, because that
-// address is the server's, not a client's. Contains() did NOT apply the same
-// guard, so it reported the server's own address as tunnel-owned as soon as any
-// session advertised a route covering it - which is the normal case, since a
-// client advertises the tunnel network.
+// It must agree with lookup(). lookup() refuses the server's own address inside the tunnel
+// prefix before it consults any route advertisement, because that address is the server's,
+// not a client's. Without the same guard here, Contains() reports the server's own address
+// as tunnel-owned as soon as any session advertises a route covering it - which is the
+// normal case, since a client advertises the tunnel network.
 //
 // The consequence is a routing decision, not a misdelivery: Contains() backs
 // PreferredAddress, which lets a `preferred_by` rule select this outbound for a
-// destination. With the guard missing, the server's own address was advertised
-// as preferred by this endpoint, the packet was routed into the MASQUE path, and
-// lookup() then returned no session for it. That is wasted work and an
-// inconsistency between the two answers, so the guard is applied here as well
-// rather than left to lookup() to absorb.
+// destination. With the guard missing, the server's own traffic is routed into a tunnel
+// that then refuses it.
 func (s *Server) Contains(address netip.Addr) bool {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	if _, loaded := s.addresses[address]; loaded {
 		return true
 	}
-	// The server's own address is never tunnel-owned, however wide a session's
-	// advertisement is. See lookup() for the same guard.
 	if address == s.inet4Address || address == s.inet6Address {
 		return false
 	}
@@ -290,7 +316,11 @@ func (s *Server) Contains(address netip.Addr) bool {
 }
 
 func (s *Server) WritePacketBuffers(packetBuffers []*buf.Buffer, forwarded bool) error {
-	var replies []*buf.Buffer
+	var (
+		replies       []*buf.Buffer
+		currentTarget *serverSession
+	)
+	currentBatch := make([]*buf.Buffer, 0, len(packetBuffers))
 	for _, packetBuffer := range packetBuffers {
 		source, destination, protocol, valid := packetAddresses(packetBuffer.Bytes())
 		if !valid {
@@ -298,29 +328,37 @@ func (s *Server) WritePacketBuffers(packetBuffers []*buf.Buffer, forwarded bool)
 			continue
 		}
 		errorType := tun.ICMPErrorNoRoute
-		target := s.lookup(destination, protocol)
-		routed := target != nil && target.accepts(source, protocol)
-		if routed && forwarded && !decrementHopLimit(packetBuffer.Bytes()) {
-			routed = false
+		target := s.route(source, destination, protocol)
+		if target != nil && forwarded && !decrementHopLimit(packetBuffer.Bytes()) {
+			target = nil
 			errorType = tun.ICMPErrorHopLimitExceeded
 		}
-		if routed {
-			buffer := buf.NewSize(transportHTTP.CapsuleHeadroom + packetBuffer.Len())
-			buffer.Resize(transportHTTP.CapsuleHeadroom, 0)
-			buffer.Write(packetBuffer.Bytes())
-			target.queuePacket(buffer)
-		} else {
-			reply, built := buildICMPError(packetBuffer.Bytes(), errorType, s.inet4Address, s.inet6Address, 0, PacketHeadroom)
+		if target == nil {
+			reply, built := buildICMPError(packetBuffer.Bytes(), errorType, s.inet4Address, s.inet6Address, 0, s.handler.FrontHeadroom())
 			if built {
 				replies = append(replies, reply)
 			}
+			packetBuffer.Release()
+			continue
 		}
-		packetBuffer.Release()
+		if len(currentBatch) > 0 && target != currentTarget {
+			currentTarget.queue.WriteBuffers(currentBatch)
+			currentBatch = currentBatch[:0]
+		}
+		currentTarget = target
+		currentBatch = append(currentBatch, packetBuffer)
+	}
+	if len(currentBatch) > 0 {
+		currentTarget.queue.WriteBuffers(currentBatch)
 	}
 	if len(replies) > 0 {
 		return s.handler.WriteInboundBuffers(replies)
 	}
 	return nil
+}
+
+func (s *Server) receivedPacketHeadroom() int {
+	return max(PacketHeadroom, s.handler.FrontHeadroom())
 }
 
 func (s *Server) Close() error {
@@ -428,76 +466,40 @@ func (s *serverSession) handlePacket(buffer *buf.Buffer) {
 			errorType = tun.ICMPErrorHopLimitExceeded
 			break
 		}
-		target.queuePacket(buffer)
+		target.queue.WriteBuffers([]*buf.Buffer{buffer})
 		return
 	}
 	reply, built := buildICMPError(buffer.Bytes(), errorType, s.server.inet4Address, s.server.inet6Address, 0, transportHTTP.CapsuleHeadroom)
 	buffer.Release()
 	if built {
-		s.queuePacket(reply)
+		s.queue.WriteBuffers([]*buf.Buffer{reply})
 	}
 }
 
-// handlePacketTooBig reports a Packet Too Big back to the peer whose packet did
-// not fit, addressed to that peer.
+// handlePacketTooBig reports a Packet Too Big to the peer whose packet did not fit.
 //
-// # Why the addressing is not taken from the quoted packet
-//
-// buildICMPError addresses the error to the SOURCE of the oversized packet, which
-// is correct when the oversized packet came from the peer: the error then travels
-// back along the path the packet arrived on. That is the case handlePacket handles,
-// and it works because a failed inbound packet is answered toward its sender.
-//
-// This path is different, and the difference is the whole reason this function
-// cannot use the reply's own destination. The packet that failed here is one this
-// endpoint was SENDING INTO the tunnel, so the peer must be told about it. The
-// oversized packet's source is therefore frequently the ENDPOINT ITSELF - the
-// clearest example is an oversized packet the endpoint's own inner stack
-// generated, such as an echo reply to a large echo request - and buildICMPError
-// then addresses the error to the endpoint's own tunnel address rather than to the
-// peer.
-//
-// Routing that error by its destination (the previous implementation) then looks
-// up the ENDPOINT's address, which lookup() refuses by design because that address
-// is the server's and not a client's, so no session is found and the error is
-// delivered to the local device handler instead of into the tunnel. The peer that
-// actually needed the error never sees it, and a packet that was too large is
-// reported to nobody. MEASURED before this change, against a real quic-go
-// DatagramTooLargeError on a live HTTP/3 tunnel:
-//
-//	reply src=198.18.0.1 dst=198.18.0.1   quoted src=198.18.0.1 dst=198.18.0.2
-//	lookup(198.18.0.1) -> not found       client received: nothing
-//
-// The peer is the session this handler belongs to - the one whose writePacket
-// failed and invoked this handler - so the error is addressed to the peer's own
-// assigned address and queued on the same session. That is both the shortest path
-// and the only one that cannot land on the wrong tunnel when several peers are
-// attached to the same endpoint.
-//
-// MTU is carried through unchanged and is still validated by the caller in
-// session.writePacket, which refuses to build an error below minimumLinkMTU.
+// The error is addressed to the PEER rather than to the source of the oversized packet.
+// buildICMPError answers the quoted packet's source, which is correct when that packet
+// arrived from a peer, but this path handles a packet the endpoint was SENDING into the
+// tunnel - so the source is frequently the endpoint's own tunnel address, and routing the
+// error by that destination finds no session and delivers it to the local device instead.
 func (s *serverSession) handlePacketTooBig(buffer *buf.Buffer, mtu int) {
-	addresses := s.assignedAddresses(nil)
-	peerAddress := firstPeerAddress(buffer.Bytes(), addresses)
+	peerAddress := firstPeerAddress(buffer.Bytes(), s.assignedAddresses(nil))
 	if !peerAddress.IsValid() {
-		// No address is assigned in the packet's family, so there is no peer to
-		// report to. Released rather than delivered to the device handler: an error
-		// addressed to nobody is worse than no error, because it would be attributed
-		// to the local stack.
+		// No address is assigned in the packet's family, so there is no peer to report to.
 		buffer.Release()
 		return
 	}
-	reply, built := buildICMPErrorTo(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, peerAddress, mtu, PacketHeadroom)
+	reply, built := buildICMPErrorTo(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, peerAddress, mtu, s.server.receivedPacketHeadroom())
 	buffer.Release()
 	if !built {
 		return
 	}
-	s.queuePacket(reply)
+	s.queue.WriteBuffers([]*buf.Buffer{reply})
 }
 
-// firstPeerAddress returns the address from the peer's assignment that matches
-// the oversized packet's family, so an IPv4 error is never addressed to an IPv6
-// peer (or the reverse).
+// firstPeerAddress returns the assigned address matching the packet's family, so an IPv4
+// error is never addressed to an IPv6 peer or the reverse.
 func firstPeerAddress(packet []byte, addresses []AssignedAddress) netip.Addr {
 	wantIPv6 := header.IPVersion(packet) == header.IPv6Version
 	for _, address := range addresses {

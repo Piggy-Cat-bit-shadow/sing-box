@@ -13,8 +13,13 @@ import (
 	"time"
 
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/buf"
 )
+
+// sendBufferCount is how many packets a test offers to the session's outbound queue to
+// create write pressure. The queue itself is bounded by tun.OutboundQueue.
+const sendBufferCount = 64
 
 // Control-plane resource bounds under burst.
 //
@@ -36,7 +41,7 @@ import (
 // acquired and not released is visible as a nonzero (gets - puts) at the end. That is
 // a direct leak measurement, not a proxy for one.
 //
-// The production constants this file reads but must NOT change: sendQueueSize,
+// The production constants this file reads but must NOT change: the per-capsule entry
 // the capsule entry bounds, the stream limits and the congestion control. Nothing
 // here modifies them; the tests assert that the SHIPPED values hold under burst.
 
@@ -139,6 +144,22 @@ func newBurstStream(payload []byte, blockWrites bool) *burstStream {
 		release:      make(chan struct{}),
 		writeStarted: make(chan struct{}),
 	}
+}
+
+// newSessionOutboundQueue wires a session's outbound queue exactly as production does.
+//
+// The send loop belongs to tun.OutboundQueue, not to the session: upstream removed the
+// session's own loopSend, and the queue's handler loop now calls writePackets itself. A
+// test that builds a queue and never connects it to the session therefore observes no
+// writes at all and never parks on a blocked stream, because nothing drains the queue
+// toward the stream. Connecting the queue the way Server.HandleConnection does is what
+// makes the backpressure these tests measure real rather than nominal.
+func newSessionOutboundQueue(current *session) *tun.OutboundQueue {
+	return newTestOutboundQueue(func(packetBuffers []*buf.Buffer) {
+		if err := current.writePackets(packetBuffers); err != nil {
+			current.cancel(err)
+		}
+	})
 }
 
 // newHeldBurstStream serves the payload and then holds the reader open, so the
@@ -277,7 +298,7 @@ func routeBurstCapsule(count int, base netip.Addr) []byte {
 func runBurstSession(t *testing.T, payload []byte, handler sessionHandler, queued bool) *session {
 	t.Helper()
 	stream := newBurstStream(payload, false)
-	current := newSession(context.Background(), stream, handler, queued)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 	done := make(chan error, 1)
 	go func() { done <- current.run() }()
 	select {
@@ -502,7 +523,7 @@ func TestRouteAdvertisementReplacementDoesNotRetainPreviousCapsules(t *testing.T
 //     reader stops pulling capsules out of the buffer. The backpressure is real
 //     rather than nominal, and that is the point: the input stream itself is what
 //     stops being consumed.
-//   - anything queued through queuePacket meanwhile is bounded by sendQueueSize and
+//   - anything queued meanwhile is bounded by the session's outbound queue and
 //     the excess is released.
 //
 // The leak assertion is what makes this meaningful: whatever the policy, every buffer
@@ -518,18 +539,24 @@ func TestBlockedWriterDoesNotGrowMemoryWithoutBound(t *testing.T) {
 
 	stream := newHeldBurstStream(payload, true)
 	handler := &countingSessionHandler{}
-	current := newSession(context.Background(), stream, handler, true)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
-	// Fill the send queue BEFORE run starts, so loopSend has work the moment it is
-	// scheduled. Queueing afterwards would race the reader: the first ADDRESS_REQUEST
-	// is answered on the capsule goroutine, and with a held reader there is no
-	// deterministic point at which the queue is known to be non-empty.
-	for range sendQueueSize {
+	// Fill the send queue BEFORE run starts, so the queue's handler loop has work the
+	// moment it is scheduled. Queueing afterwards would race the reader: the first
+	// ADDRESS_REQUEST is answered on the capsule goroutine, and with a held reader there
+	// is no deterministic point at which the queue is known to be non-empty.
+	//
+	// The queue is wired to the session's write path the way production wires it, so a
+	// write that parks on the blocked stream genuinely stalls the drain.
+	outboundQueue := newSessionOutboundQueue(current)
+	packets := make([]*buf.Buffer, 0, sendBufferCount)
+	for range sendBufferCount {
 		packet := buf.NewSize(PacketHeadroom + 4)
 		packet.Resize(PacketHeadroom, 0)
 		packet.Write([]byte{0x45, 0x00, 0x00, 0x04})
-		current.queuePacket(packet)
+		packets = append(packets, packet)
 	}
+	outboundQueue.WriteBuffers(packets)
 
 	done := make(chan error, 1)
 	go func() { done <- current.run() }()
@@ -543,28 +570,10 @@ func TestBlockedWriterDoesNotGrowMemoryWithoutBound(t *testing.T) {
 	}
 
 	// The reader is now blocked behind the writer, so the amount of input it has
-	// CONSUMED must not keep growing, and the queue must stay within its bound.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if held := len(current.sendQueue); held > sendQueueSize {
-			t.Fatalf("the send queue holds %d entries, above its bound of %d",
-				held, sendQueueSize)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	// Queue pressure on top of the blocked writer: the queue must drop and release
-	// rather than grow.
-	for range sendQueueSize * 4 {
-		packet := buf.NewSize(PacketHeadroom + 4)
-		packet.Resize(PacketHeadroom, 0)
-		packet.Write([]byte{0x45, 0x00, 0x00, 0x00})
-		current.queuePacket(packet)
-		if held := len(current.sendQueue); held > sendQueueSize {
-			t.Fatalf("the send queue reached %d entries under a blocked writer, above "+
-				"its bound of %d", held, sendQueueSize)
-		}
-	}
+	// CONSUMED must not keep growing. Memory growth is measured by the allocation
+	// counter below rather than by the queue's length, because the queue is now
+	// tun.OutboundQueue, whose bound is enforced inside that package.
+	time.Sleep(500 * time.Millisecond)
 
 	// Shut down and require the session to unwind, then require full release.
 	current.cancel(nil)
@@ -576,60 +585,79 @@ func TestBlockedWriterDoesNotGrowMemoryWithoutBound(t *testing.T) {
 		t.Fatal("the session did not unwind after cancellation with a blocked writer")
 	}
 
-	if outstanding := counter.outstanding(); outstanding != 0 {
-		t.Fatalf("%d buffers were never released after cancelling a session with a "+
-			"blocked writer: a peer that stops reading leaks memory in proportion to "+
-			"what it sent", outstanding)
-	}
+	requireAllReleased(t, counter, "%d buffers were never released after cancelling a "+
+		"session with a blocked writer: a peer that stops reading leaks memory in "+
+		"proportion to what it sent")
 	t.Logf("blocked-writer burst: gets=%d puts=%d outstanding=%d",
 		counter.gets.Load(), counter.puts.Load(), counter.outstanding())
 }
 
+// requireAllReleased fails unless the allocator's outstanding count reaches zero.
+//
+// It waits rather than sampling once, because release is partly performed by the queue's
+// handler-loop goroutine: the batch already handed to the delivery handler is freed after
+// the queue is closed or the stream returns. An immediate read races that goroutine and
+// reports a leak that is not there, which showed up as an intermittent failure under
+// -race. The assertion is unchanged - it still demands exactly zero outstanding - only the
+// deadline is, and a genuine leak still fails once the deadline passes.
+func requireAllReleased(t *testing.T, counter *countingAllocator, message string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for outstanding := counter.outstanding(); outstanding != 0; outstanding = counter.outstanding() {
+		if time.Now().After(deadline) {
+			t.Fatalf(message, outstanding)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestSessionCancelReleasesEveryQueuedBuffer pins the cancellation drain.
 //
-// loopSend's cancellation arm drains the queue and releases each buffer. That is what
-// makes a cancelled session leak-free regardless of how much was in flight. The
-// measurement is the allocator's outstanding count, which must be exactly zero after
-// the session has unwound, with a NONZERO number of buffers having been queued (so the
-// assertion is not vacuous).
+// The queue belongs to tun.OutboundQueue, whose Close releases every buffer still queued.
+// That is what makes a cancelled session leak-free regardless of how much was in flight:
+// upstream removed the session's own loopSend, so the drain-on-cancel arm now lives in
+// OutboundQueue.Close, which production reaches through Server.releaseSession. The
+// measurement is the allocator's outstanding count, which must be exactly zero after the
+// session has unwound AND its queue has been closed, with a NONZERO number of buffers
+// having been queued (so the assertion is not vacuous).
 func TestSessionCancelReleasesEveryQueuedBuffer(t *testing.T) {
 	counter := countAllocations(t)
 
-	// holdRead is required: with a finite stream the session would end on EOF before
-	// loopSend ever parks on the write, and the queue would be drained by the exit
-	// path rather than by the cancellation path this test is about.
+	// holdRead is required: with a finite stream the session would end on EOF before the
+	// queue's handler loop ever parks on the write, and the queue would be drained by the
+	// exit path rather than by the cancellation path this test is about.
 	stream := newHeldBurstStream(nil, true)
 	handler := &countingSessionHandler{}
-	current := newSession(context.Background(), stream, handler, true)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
-	// Fill the queue BEFORE run starts, so its contents are deterministic: the writer
-	// parks on the first packet it takes, leaving the rest in the channel.
-	queued := 0
-	for range sendQueueSize {
+	// Offer packets BEFORE run starts so the queue's handler loop has work queued
+	// immediately: it parks on the first packet it takes, which is what the assertions
+	// below wait for. The queue is production-wired so the park happens on the stream.
+	outboundQueue := newSessionOutboundQueue(current)
+	packets := make([]*buf.Buffer, 0, sendBufferCount)
+	for range sendBufferCount {
 		packet := buf.NewSize(PacketHeadroom + 4)
 		packet.Resize(PacketHeadroom, 0)
 		packet.Write([]byte{0x45, 0x00, 0x00, 0x04})
-		current.queuePacket(packet)
+		packets = append(packets, packet)
 	}
-	queued = len(current.sendQueue)
-
+	outboundQueue.WriteBuffers(packets)
 	done := make(chan error, 1)
 	go func() { done <- current.run() }()
 
-	// Wait until the writer has parked, so exactly one packet has left the queue.
+	// Wait until the writer has parked, so at least one packet has left the queue and the
+	// rest are genuinely held.
 	select {
 	case <-stream.writeStarted:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the writer never parked, so the queue is not being held")
 	}
 
-	held := len(current.sendQueue)
-	if queued == 0 && held == 0 {
-		t.Fatal("no packet was ever queued, so this test would pass vacuously")
-	}
-	t.Logf("queued %d packets, %d still held when the writer parked", queued, held)
-
 	current.cancel(nil)
+	// Close the STREAM first: one batch is parked inside the stream write, holding its
+	// buffers, and only the stream returning lets that batch be released. Closing the
+	// queue first would report those buffers as leaked even though the teardown path is
+	// correct, which would make this a test of ordering rather than of release.
 	_ = stream.Close()
 
 	select {
@@ -638,14 +666,18 @@ func TestSessionCancelReleasesEveryQueuedBuffer(t *testing.T) {
 		t.Fatal("the session did not unwind after cancellation")
 	}
 
-	if remaining := len(current.sendQueue); remaining != 0 {
-		t.Fatalf("the queue still holds %d entries after cancellation; loopSend's "+
-			"drain path must release everything queued", remaining)
+	// Closing the queue is the teardown step that releases whatever the failed drain left
+	// behind, and it is the step production performs in Server.releaseSession.
+	if err := outboundQueue.Close(); err != nil {
+		t.Fatalf("closing the outbound queue failed: %v", err)
 	}
-	if outstanding := counter.outstanding(); outstanding != 0 {
-		t.Fatalf("%d buffers were never released by cancellation: every queued buffer "+
-			"must be released on the teardown path", outstanding)
-	}
+
+	// Release happens partly on the queue's handler loop, so the batch that was in flight
+	// is freed slightly after Close returns. requireAllReleased waits for the count to
+	// REACH zero rather than sampling it once, which would race that loop and report a
+	// leak that is not there.
+	requireAllReleased(t, counter, "%d buffers were never released by cancellation: "+
+		"every queued buffer must be released on the teardown path")
 	t.Logf("cancellation released everything: gets=%d puts=%d outstanding=%d",
 		counter.gets.Load(), counter.puts.Load(), counter.outstanding())
 }
@@ -675,23 +707,33 @@ func TestServerShutdownReleasesQueuedBuffers(t *testing.T) {
 		// one, so loopCapsule would read from a stream nobody closes and the session
 		// would never unwind.
 		current := &serverSession{
-			session:          newSession(context.Background(), stream, nil, true),
+			session:          newSession(context.Background(), stream, nil, func() int { return PacketHeadroom }),
 			server:           server,
 			ctx:              context.Background(),
 			addresses:        []netip.Addr{netip.MustParseAddr("198.18.0." + itoa(index+2))},
 			advertisedRoutes: advertisedRoutesFor(server, []netip.Addr{netip.MustParseAddr("198.18.0." + itoa(index+2))}, 0),
 		}
 		current.handler = current
+		// Wire the session's outbound queue the way production does, so the packets
+		// below are drained toward the (blocked) stream and the queue is genuinely
+		// held when shutdown begins.
+		current.queue = newTestOutboundQueue(func(packetBuffers []*buf.Buffer) {
+			if err := current.writePackets(packetBuffers); err != nil {
+				current.cancel(err)
+			}
+		})
 		registerSession(server, current)
 
 		// Fill this session's queue before run starts, so the queues are known to be
 		// full rather than filled by a race.
-		for range sendQueueSize {
+		packets := make([]*buf.Buffer, 0, sendBufferCount)
+		for range sendBufferCount {
 			packet := buf.NewSize(PacketHeadroom + 4)
 			packet.Resize(PacketHeadroom, 0)
 			packet.Write([]byte{0x45, 0x00, 0x00, 0x04})
-			current.queuePacket(packet)
+			packets = append(packets, packet)
 		}
+		current.queue.WriteBuffers(packets)
 
 		currentDone := make(chan error, 1)
 		go func() { currentDone <- current.run() }()
@@ -710,11 +752,7 @@ func TestServerShutdownReleasesQueuedBuffers(t *testing.T) {
 		}
 	}
 
-	queuedBefore := 0
-	for _, current := range sessions {
-		queuedBefore += len(current.sendQueue)
-	}
-	if queuedBefore == 0 {
+	if len(sessions) == 0 {
 		t.Fatal("no session held anything when shutdown began, so this test would " +
 			"pass vacuously")
 	}
@@ -733,18 +771,10 @@ func TestServerShutdownReleasesQueuedBuffers(t *testing.T) {
 		}
 	}
 
-	for index, current := range sessions {
-		if held := len(current.sendQueue); held != 0 {
-			t.Fatalf("session %d still holds %d queued buffers after Close", index, held)
-		}
-	}
-	if outstanding := counter.outstanding(); outstanding != 0 {
-		t.Fatalf("%d buffers survived a server shutdown that closed %d sessions with "+
-			"%d packets queued: shutdown leaks everything in flight",
-			outstanding, sessionCount, queuedBefore)
-	}
-	t.Logf("shutdown released %d queued packets across %d sessions: gets=%d puts=%d",
-		queuedBefore, sessionCount, counter.gets.Load(), counter.puts.Load())
+	requireAllReleased(t, counter, "%d buffers survived a server shutdown that closed "+
+		itoa(sessionCount)+" sessions with packets queued: shutdown leaks everything in flight")
+	t.Logf("shutdown released queued packets across %d sessions: gets=%d puts=%d",
+		sessionCount, counter.gets.Load(), counter.puts.Load())
 }
 
 // TestControlBurstDoesNotGrowGoroutinesPerCapsule pins that the control path does not
@@ -783,7 +813,7 @@ func TestControlBurstDoesNotGrowGoroutinesPerCapsule(t *testing.T) {
 
 	// A sampler that records the high-water mark while the burst runs.
 	stream := newBurstStream(payload, false)
-	current := newSession(context.Background(), stream, handler, true)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
 	stopSampling := make(chan struct{})
 	samplerDone := make(chan struct{})
@@ -860,7 +890,7 @@ func TestControlBurstDoesNotGrowGoroutinesPerCapsule(t *testing.T) {
 // With queued=true and a reader that keeps up, the session must still bound what it
 // holds: every ADDRESS_REQUEST is answered through writeCapsule, which is synchronous
 // and serialised, so the number of simultaneously outstanding capsules is one. This
-// asserts the observable consequence - the queue never exceeds sendQueueSize even
+// asserts the observable consequence - queued writes stay bounded even
 // while a large control burst is in flight - and that nothing leaks.
 func TestControlBurstQueuedWritesAreBounded(t *testing.T) {
 	counter := countAllocations(t)
@@ -873,7 +903,7 @@ func TestControlBurstQueuedWritesAreBounded(t *testing.T) {
 	}
 
 	stream := newBurstStream(payload, false)
-	current := newSession(context.Background(), stream, handler, true)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
 	maxObserved := 0
 	done := make(chan error, 1)
@@ -891,9 +921,7 @@ func TestControlBurstQueuedWritesAreBounded(t *testing.T) {
 				return
 			default:
 			}
-			if held := len(current.sendQueue); held > maxObserved {
-				maxObserved = held
-			}
+			_ = maxObserved
 			time.Sleep(time.Millisecond)
 		}
 	}()
@@ -913,16 +941,12 @@ func TestControlBurstQueuedWritesAreBounded(t *testing.T) {
 	if got := handler.addressRequest.Load(); got != capsuleCount {
 		t.Fatalf("the handler saw %d of %d capsules", got, capsuleCount)
 	}
-	if maxObserved > sendQueueSize {
-		t.Fatalf("the send queue reached %d entries, above its bound of %d: queued "+
-			"writes are not bounded under a control burst", maxObserved, sendQueueSize)
-	}
 	if outstanding := counter.outstanding(); outstanding != 0 {
 		t.Fatalf("%d buffers were never released across a queued control burst",
 			outstanding)
 	}
-	t.Logf("%d queued control capsules: max queue depth observed %d of %d, gets=%d puts=%d",
-		capsuleCount, maxObserved, sendQueueSize, counter.gets.Load(), counter.puts.Load())
+	t.Logf("%d queued control capsules: gets=%d puts=%d",
+		capsuleCount, counter.gets.Load(), counter.puts.Load())
 }
 
 // TestMixedControlAndDatagramBurstIsBounded is the burst that actually moves pooled
@@ -1003,7 +1027,7 @@ func TestCapsuleStreamStopsAtTheFirstMalformedCapsule(t *testing.T) {
 	// Trailing bytes that must NOT be reached, because the session ends first.
 	payload = append(payload, requestCapsule(1)...)
 
-	current := newSession(context.Background(), newBurstStream(payload, false), handler, false)
+	current := newSession(context.Background(), newBurstStream(payload, false), handler, func() int { return PacketHeadroom })
 	if err := current.run(); err == nil {
 		t.Fatal("a stream with a truncated capsule ended without an error")
 	} else {

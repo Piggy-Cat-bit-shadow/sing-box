@@ -4,8 +4,10 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/logger"
@@ -41,6 +43,9 @@ import (
 // session received it - the recording handler is the instrument for the writePacket path
 // and for proving the other session's handler saw nothing.
 type recordingSession struct {
+	access sync.Mutex
+	// queued are the buffers the session wrote to its outbound queue.
+	queued []*buf.Buffer
 	// packets are the buffers passed to handlePacket.
 	packets []*buf.Buffer
 	// tooBig are the buffers passed to handlePacketTooBig.
@@ -62,25 +67,28 @@ func (h *recordingSession) handlePacketTooBig(buffer *buf.Buffer, mtu int) {
 	h.mtus = append(h.mtus, mtu)
 }
 
-// queuedReplies drains a session's send queue, releasing each buffer after inspecting it.
+// queuedReplies collects the buffers a session handed to its outbound queue.
 //
-// The queue is the observable effect of handlePacketTooBig, because that method builds the
-// ICMP error and hands it to queuePacket rather than invoking the handler directly.
-func queuedReplies(session *serverSession) [][]byte {
+// handlePacketTooBig builds the ICMP error and writes it to the session's queue rather than
+// invoking the handler directly, so the queue is the observable effect. The queue delivers
+// through its handler loop asynchronously, so this waits for expected replies to arrive
+// before draining: without the wait the read would race the loop and see nothing.
+func queuedReplies(session *serverSession, expected int) [][]byte {
 	var replies [][]byte
 	for {
-		select {
-		case queued := <-session.sendQueue:
-			replies = append(replies, append([]byte(nil), queued.Bytes()...))
-			queued.Release()
-		default:
+		buffer := session.takeQueuedUntil(func(queued int) bool {
+			return len(replies)+queued < expected
+		})
+		if buffer == nil {
 			return replies
 		}
+		replies = append(replies, append([]byte(nil), buffer.Bytes()...))
+		buffer.Release()
 	}
 }
 
-// newServerSessionForTest builds a serverSession with the given assigned addresses and a
-// queued send queue, so queuePacket has somewhere to put a reply.
+// newServerSessionForTest builds a serverSession with the given assigned addresses and an
+// outbound queue that records what the session sends.
 func newServerSessionForTest(t *testing.T, server *Server, addresses []netip.Addr) (*serverSession, *recordingSession) {
 	t.Helper()
 	handler := &recordingSession{}
@@ -88,23 +96,30 @@ func newServerSessionForTest(t *testing.T, server *Server, addresses []netip.Add
 	t.Cleanup(func() { cancel(net.ErrClosed) })
 	current := &serverSession{
 		session: &session{
-			ctx:       ctx,
-			cancel:    cancel,
-			handler:   handler,
-			sendQueue: make(chan *buf.Buffer, 8),
+			ctx:     ctx,
+			cancel:  cancel,
+			handler: handler,
 		},
 		server:    server,
 		ctx:       ctx,
 		addresses: addresses,
 	}
+	// The queue's handler records what the session sends, which is how these tests observe
+	// a Packet Too Big: handlePacketTooBig builds the error and writes it to the queue.
+	current.queue = newTestOutboundQueue(func(packetBuffers []*buf.Buffer) {
+		recordDelivery(current, packetBuffers)
+	})
 	return current, handler
 }
 
 // newServerForTest builds the minimum Server a serverSession needs for delivery.
 func newServerForTest(t *testing.T) *Server {
 	t.Helper()
+	// The server needs a handler because handlePacketTooBig derives its ICMP headroom from
+	// the device through receivedPacketHeadroom, which reads handler.FrontHeadroom.
 	return &Server{
 		logger:       logger.NOP(),
+		handler:      &ptbTestHandler{},
 		inet4Address: netip.MustParseAddr("198.18.0.1"),
 		inet6Address: netip.MustParseAddr("2001:db8::1"),
 	}
@@ -159,7 +174,7 @@ func TestPacketTooBigIsDeliveredOnlyToTheOwningSession(t *testing.T) {
 
 	// The owning session must have exactly one queued reply, and it must be correctly
 	// addressed.
-	repliesA := queuedReplies(sessionA)
+	repliesA := queuedReplies(sessionA, 1)
 	require.Len(t, repliesA, 1,
 		"the owning session must receive exactly one Packet Too Big for its own tunnel")
 
@@ -178,7 +193,7 @@ func TestPacketTooBigIsDeliveredOnlyToTheOwningSession(t *testing.T) {
 	// And the OTHER session must have been handed nothing. This is the isolation
 	// property: one peer's network conditions must never be reported into another peer's
 	// session.
-	require.Empty(t, queuedReplies(sessionB),
+	require.Empty(t, queuedReplies(sessionB, 0),
 		"a Packet Too Big for one peer must never be queued on another peer's session; "+
 			"that would leak one user's network conditions into another session")
 	require.Empty(t, handlerB.tooBig,
@@ -222,7 +237,12 @@ func TestPacketTooBigIsNotBroadcastToEverySession(t *testing.T) {
 
 	totalDelivered := 0
 	for index, current := range peers {
-		replies := queuedReplies(current.session)
+		replies := queuedReplies(current.session, func() int {
+			if current.address == owner.address {
+				return 1
+			}
+			return 0
+		}())
 		totalDelivered += len(replies)
 		if current.address == owner.address {
 			require.Len(t, replies, 1,
@@ -260,7 +280,7 @@ func TestPacketTooBigWithoutAnAssignedAddressIsDropped(t *testing.T) {
 
 	require.Empty(t, handler.tooBig,
 		"no error may be generated when there is no peer to address it to")
-	require.Empty(t, queuedReplies(session),
+	require.Empty(t, queuedReplies(session, 0),
 		"nothing may be queued when there is no peer to address it to")
 }
 
@@ -292,7 +312,7 @@ func TestPacketTooBigAddressingFollowsThePacketFamily(t *testing.T) {
 
 	session.handlePacketTooBig(buf.As(oversized6), 1280)
 
-	replies := queuedReplies(session)
+	replies := queuedReplies(session, 1)
 	require.Len(t, replies, 1, "the IPv6 packet must produce exactly one error")
 
 	packet := replies[0]
@@ -308,3 +328,35 @@ func TestPacketTooBigAddressingFollowsThePacketFamily(t *testing.T) {
 // Compile-time reference so the test's use of Socksaddr stays meaningful if the fixtures
 // change.
 var _ = M.Socksaddr{}
+
+// newTestOutboundQueue builds a usable OutboundQueue.
+//
+// The zero value is not usable: its rings are uninitialised and Close dereferences them, so
+// a fixture that constructs one directly panics during teardown. The queue must come from a
+// MemoryTun, which allocates the rings and starts the handler loop.
+func newTestOutboundQueue(handler func(packetBuffers []*buf.Buffer)) *tun.OutboundQueue {
+	memoryTun := tun.NewMemoryTun(tun.MemoryTunOptions{})
+	if handler == nil {
+		handler = func(packetBuffers []*buf.Buffer) {
+			for _, packet := range packetBuffers {
+				packet.Release()
+			}
+		}
+	}
+	return memoryTun.NewOutboundQueue(handler)
+}
+
+// ptbTestHandler satisfies ServerHandler for the Packet Too Big fixture, which needs only a
+// headroom source and a queue factory; deliveries are captured by the test registry.
+type ptbTestHandler struct{}
+
+func (h *ptbTestHandler) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {
+	buf.ReleaseMulti(packetBuffers)
+	return nil
+}
+
+func (h *ptbTestHandler) FrontHeadroom() int { return PacketHeadroom }
+
+func (h *ptbTestHandler) NewOutboundQueue(handler func(packetBuffers []*buf.Buffer)) *tun.OutboundQueue {
+	return newTestOutboundQueue(handler)
+}

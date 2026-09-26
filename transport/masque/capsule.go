@@ -19,17 +19,9 @@ const (
 // Control capsule entry bounds.
 //
 // RFC 9484 does not specify a limit, so these follow quic-go/connect-ip-go
-// (maxAddressesPerCapsule / maxRoutesPerCapsule, both 8192) rather than a number
-// invented here.
-//
-// Why a bound is needed at all, measured rather than assumed: the capsule size
-// limit alone allows 149,796 ADDRESS_ASSIGN entries in one 1 MiB capsule, and
-// keeping those parsed entries live retains 17.65 MiB of heap. The 8192 bound
-// retains 1.38 MiB for the same shape. On a ~1 GiB VPS the unbounded figure is
-// material amplification for a single capsule from an authenticated peer.
-//
-// The values are per capsule, so a peer sending many capsules is bounded by the
-// per-session state limits rather than by these.
+// (maxAddressesPerCapsule / maxRoutesPerCapsule, both 8192) rather than a number invented
+// here. Without them the per-capsule size limit alone admits a very large number of parsed
+// entries from one capsule, which is material amplification for a single authenticated peer.
 const (
 	maxAddressesPerCapsule = 8192
 	maxRoutesPerCapsule    = 8192
@@ -50,26 +42,6 @@ func (r AddressRange) Contains(address netip.Addr) bool {
 	return address.BitLen() == r.Start.BitLen() && r.Start.Compare(address) <= 0 && address.Compare(r.End) <= 0
 }
 
-// OverlapsProtocol reports whether two ranges describe any of the same traffic.
-//
-// Two ranges conflict when their ADDRESS ranges intersect AND their protocols
-// can both match the same packet. Protocol 0 matches every protocol in
-// RoutesContain, so it conflicts with any other protocol over an intersecting
-// range - that is the case the ordering-based check used to miss.
-//
-// Ranges of different IP versions never conflict, because Contains requires the
-// address length to match.
-func (r AddressRange) OverlapsProtocol(other AddressRange) bool {
-	if r.Start.BitLen() != other.Start.BitLen() {
-		return false
-	}
-	if r.End.Compare(other.Start) < 0 || other.End.Compare(r.Start) < 0 {
-		return false
-	}
-	// Protocol 0 is "all protocols", so it conflicts with anything.
-	return r.Protocol == 0 || other.Protocol == 0 || r.Protocol == other.Protocol
-}
-
 func parseAddresses(payload []byte) ([]AssignedAddress, error) {
 	var addresses []AssignedAddress
 	for len(payload) > 0 {
@@ -77,6 +49,7 @@ func parseAddresses(payload []byte) ([]AssignedAddress, error) {
 			return nil, E.New("too many addresses in one capsule (maximum ",
 				maxAddressesPerCapsule, ")")
 		}
+
 		requestID, requestIDLength, valid := transportHTTP.DecodeVarint(payload)
 		if !valid {
 			return nil, E.New("truncated request ID")
@@ -116,6 +89,21 @@ func parseVersion(payload []byte) (int, error) {
 	default:
 		return 0, E.New("invalid IP version: ", payload[0])
 	}
+}
+
+func (r AddressRange) OverlapsProtocol(other AddressRange) bool {
+	if r.Start.BitLen() != other.Start.BitLen() {
+		return false
+	}
+	if r.End.Compare(other.Start) < 0 || other.End.Compare(r.Start) < 0 {
+		return false
+	}
+	// Protocol 0 is "all protocols", so it conflicts with anything.
+	return r.Protocol == 0 || other.Protocol == 0 || r.Protocol == other.Protocol
+}
+
+func protocolConflicts(first uint8, second uint8) bool {
+	return first == 0 || second == 0 || first == second
 }
 
 func parseRoutes(payload []byte) ([]AddressRange, error) {
@@ -218,15 +206,6 @@ func parseRoutes(payload []byte) ([]AddressRange, error) {
 		routes = append(routes, route)
 	}
 	return routes, nil
-}
-
-// protocolConflicts reports whether two route protocols can both match one packet.
-//
-// Protocol 0 is the wildcard: RoutesContain matches a route when
-// `route.Protocol == 0 || route.Protocol == protocol`, so 0 conflicts with
-// everything and any other pair conflicts only when the values are equal.
-func protocolConflicts(first uint8, second uint8) bool {
-	return first == 0 || second == 0 || first == second
 }
 
 func appendAddress(payload []byte, address netip.Addr) []byte {

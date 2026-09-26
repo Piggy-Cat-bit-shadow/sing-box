@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"github.com/sagernet/sing-box/adapter"
 	"io"
 	"net"
 	"net/http"
@@ -13,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -164,6 +165,36 @@ func WriteDatagramCapsule(writer io.Writer, datagram *buf.Buffer) error {
 	return err
 }
 
+func WriteDatagramCapsules(writer io.Writer, datagrams []*buf.Buffer) error {
+	if len(datagrams) == 1 {
+		return WriteDatagramCapsule(writer, datagrams[0])
+	}
+	defer buf.ReleaseMulti(datagrams)
+	var totalLength int
+	for _, datagram := range datagrams {
+		totalLength += 1 + VarintLen(uint64(datagram.Len())) + datagram.Len()
+	}
+	capsules := buf.NewSize(min(totalLength, buf.MaxPooledBufferSize))
+	defer capsules.Release()
+	for _, datagram := range datagrams {
+		length := uint64(datagram.Len())
+		headerLength := 1 + VarintLen(length)
+		if headerLength+datagram.Len() > capsules.FreeLen() {
+			_, err := writer.Write(capsules.Bytes())
+			if err != nil {
+				return err
+			}
+			capsules.Reset()
+		}
+		header := capsules.Extend(headerLength)
+		header[0] = CapsuleTypeDatagram
+		PutVarint(header[1:], length)
+		common.Must1(capsules.Write(datagram.Bytes()))
+	}
+	_, err := writer.Write(capsules.Bytes())
+	return err
+}
+
 type capsuleConn struct {
 	reader      *std_bufio.Reader
 	writer      io.Writer
@@ -180,16 +211,6 @@ func newCapsuleConn(reader *std_bufio.Reader, upstream net.Conn, destination M.S
 		destination: destination,
 	}
 }
-
-// IsUDPConnect reports that this CONNECT-UDP tunnel has a fixed destination.
-//
-// capsuleConn is built by transport/http for an RFC 9298 CONNECT-UDP request, whose
-// target is parsed once from the request path and never changes, so this is always
-// true. It is a method rather than a constant so the router can test for the
-// interface without importing this package.
-func (c *capsuleConn) IsUDPConnect() bool { return true }
-
-var _ adapter.UDPConnectPacketConn = (*capsuleConn)(nil)
 
 func (c *capsuleConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	err := readDatagramCapsule(c.reader, buffer)
@@ -239,37 +260,22 @@ func (c *capsuleConn) Upstream() any {
 
 var _ N.PacketConn = (*capsuleConn)(nil)
 
-// DatagramStream is the HTTP/3 request stream surface a MASQUE session uses.
+// IsUDPConnect reports that this CONNECT-UDP tunnel has a fixed destination.
 //
-// DatagramsEnabled makes the negotiated capability explicit. The stream TYPE
-// cannot answer that question: the same concrete type satisfies every method here
-// whether or not the peer negotiated HTTP Datagrams, so a type assertion says
-// nothing about whether datagrams can actually flow.
-//
-// WHAT THIS IS NOT: it is not a fix for a demonstrated defect. An earlier version
-// of this comment claimed that a session which inferred the capability from the
-// type would start a receive loop that consumed bytes from the capsule reader and
-// could cancel the session. That claim was measured and is FALSE:
-//
-//   - the server-side implementation is quic-go's
-//     http3.StateTrackingStream.ReceiveDatagram, which reads from a DEDICATED
-//     datagram queue and blocks on a signal when empty. It does not touch the
-//     HTTP/3 DATA stream that the capsule reader owns. (The method that does read
-//     from the stream is Stream.ReceiveDatagram in stream.go, a different type,
-//     which is what the mistaken claim was based on.)
-//   - the CONNECT-IP capsule-fallback test passes with and without this change,
-//     and an active fallback tunnel shows an identical goroutine count either way
-//     (base 2, during 9).
-//
-// So this is a legibility and correctness-of-intent change: the session now decides
-// from the peer's SETTINGS rather than from a type, and a reader no longer has to
-// reason about quic-go internals to know whether datagrams are usable.
+// capsuleConn is built for an RFC 9298 CONNECT-UDP request, whose target is parsed once
+// from the request path and never changes, so this is always true.
+func (c *capsuleConn) IsUDPConnect() bool { return true }
+
+var _ adapter.UDPConnectPacketConn = (*capsuleConn)(nil)
+
 type DatagramStream interface {
 	io.ReadWriteCloser
 	SendDatagram(payload []byte) error
 	ReceiveDatagram(ctx context.Context) ([]byte, error)
-	// DatagramsEnabled reports whether the PEER negotiated HTTP Datagrams, i.e.
-	// whether SendDatagram can succeed and ReceiveDatagram can ever deliver.
+	// DatagramsEnabled reports whether the PEER negotiated HTTP Datagrams, i.e. whether
+	// SendDatagram can succeed and ReceiveDatagram can ever deliver. The stream type
+	// cannot answer that: the same concrete type satisfies every method here whether or
+	// not the peer negotiated the extension.
 	DatagramsEnabled() bool
 }
 
@@ -329,14 +335,9 @@ type http3PacketConn struct {
 	activated atomic.Bool
 }
 
-// Early-datagram bounds for the setup window.
-//
-// Both limits apply simultaneously and whichever is reached first stops further
-// buffering: a client that floods during setup must not be able to spend server memory
-// while the target is still being dialled. Past the bound the excess is DROPPED, which
-// is the correct UDP semantic - a datagram has no retransmission to preserve, and the
-// alternative (unbounded buffering) is a memory-amplification primitive for an
-// unauthenticated-adjacent path.
+// maxEarlyDatagramPackets and maxEarlyDatagramBytes bound the datagrams buffered before
+// the target is confirmed. Past the bound the excess is dropped, which is the
+// correct UDP semantic and keeps a setup-time flood from spending server memory.
 const (
 	maxEarlyDatagramPackets = 8
 	maxEarlyDatagramBytes   = 64 << 10
@@ -362,17 +363,6 @@ func newHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAdd
 	go conn.loopDatagram()
 	go conn.loopCapsule()
 	return conn
-}
-
-// deferUntilTargetReady holds incoming datagrams until the router reports the target
-// setup outcome through the handshake hooks.
-//
-// It must be called BEFORE the connection is handed to the router, so no datagram can
-// be delivered on the strength of a 200 that has not been sent yet.
-func (c *http3PacketConn) deferUntilTargetReady() {
-	c.activated.Store(false)
-	c.handshakeOnce = sync.Once{}
-	c.settled = make(chan struct{})
 }
 
 func (c *http3PacketConn) loopDatagram() {
@@ -452,14 +442,6 @@ func (c *http3PacketConn) loopCapsule() {
 	}
 }
 
-// IsUDPConnect reports that this H3 CONNECT-UDP tunnel has a fixed destination.
-//
-// http3PacketConn is built only for an RFC 9298 CONNECT-UDP request, so its
-// destination is the parsed target for the tunnel's whole lifetime.
-func (c *http3PacketConn) IsUDPConnect() bool { return true }
-
-var _ adapter.UDPConnectPacketConn = (*http3PacketConn)(nil)
-
 func (c *http3PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	for {
 		select {
@@ -476,6 +458,106 @@ func (c *http3PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 		}
 	}
 }
+
+func (c *http3PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	datagram := PrependContextID(buffer)
+	err := c.stream.SendDatagram(datagram.Bytes())
+	if err == nil {
+		datagram.Release()
+		return nil
+	}
+	if !errors.Is(err, ErrDatagramUnsupported) {
+		datagram.Release()
+		return err
+	}
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	return WriteDatagramCapsule(c.stream, datagram)
+}
+
+// closeError reports the connection's terminal error, defaulting to net.ErrClosed so a
+// caller never receives a nil error alongside an empty result.
+func (c *http3PacketConn) closeError() error {
+	if c.err != nil {
+		return c.err
+	}
+	return net.ErrClosed
+}
+
+func (c *http3PacketConn) closeWithError(err error) {
+	c.closeOnce.Do(func() {
+		c.err = err
+		c.cancel()
+		c.stream.Close()
+		go func() {
+			c.waitGroup.Wait()
+			for {
+				select {
+				case packet := <-c.packets:
+					packet.Release()
+				default:
+					return
+				}
+			}
+		}()
+	})
+}
+
+func (c *http3PacketConn) Close() error {
+	c.closeWithError(net.ErrClosed)
+	return nil
+}
+
+func (c *http3PacketConn) wait(ctx context.Context) {
+	select {
+	case <-c.ctx.Done():
+	case <-ctx.Done():
+		c.Close()
+	}
+}
+
+func (c *http3PacketConn) LocalAddr() net.Addr {
+	return c.localAddr
+}
+
+func (c *http3PacketConn) SetDeadline(t time.Time) error {
+	return os.ErrInvalid
+}
+
+func (c *http3PacketConn) SetReadDeadline(t time.Time) error {
+	return os.ErrInvalid
+}
+
+func (c *http3PacketConn) SetWriteDeadline(t time.Time) error {
+	return os.ErrInvalid
+}
+
+func (c *http3PacketConn) NeedAdditionalReadDeadline() bool {
+	return true
+}
+
+func (c *http3PacketConn) FrontHeadroom() int {
+	return CapsuleHeadroom
+}
+
+// deferUntilTargetReady holds incoming datagrams until the router reports the target
+// setup outcome through the handshake hooks.
+//
+// It must be called BEFORE the connection is handed to the router, so no datagram can
+// be delivered on the strength of a 200 that has not been sent yet.
+func (c *http3PacketConn) deferUntilTargetReady() {
+	c.activated.Store(false)
+	c.handshakeOnce = sync.Once{}
+	c.settled = make(chan struct{})
+}
+
+// IsUDPConnect reports that this H3 CONNECT-UDP tunnel has a fixed destination.
+//
+// http3PacketConn is built only for an RFC 9298 CONNECT-UDP request, so its
+// destination is the parsed target for the tunnel's whole lifetime.
+func (c *http3PacketConn) IsUDPConnect() bool { return true }
+
+var _ adapter.UDPConnectPacketConn = (*http3PacketConn)(nil)
 
 // PacketConnHandshakeSuccess is called by the router once the target socket is ready.
 //
@@ -580,6 +662,24 @@ func (c *http3PacketConn) bufferEarlyDatagram(buffer *buf.Buffer) bool {
 // Returning false here is always safe: CopyPacket falls through to the next capability,
 // and ultimately to ReadPacket/WritePacket. So this is an optimization the caller opts
 // into, never a correctness requirement.
+// CreateConnectedPacketBatchReadWaiter offers the batch read path to bufio.CopyPacket.
+//
+// # Why the destination being fixed is what makes this possible
+//
+// The standard batch waiter must return a destination per packet, because an
+// unconnected socket can receive from anywhere. This connection's destination is fixed
+// by the CONNECT-UDP request, so the connected form is the honest one: it returns a
+// single destination for the whole batch and lets the writer use a connected socket.
+//
+// bufio.CopyPacket tries the batch forms BEFORE the single-packet form, so offering
+// this is what moves a CONNECT-UDP tunnel off the one-packet-at-a-time path and onto
+// copyConnectedPacketBatchToConnectedWaitWithPool. That path is also the only consumer
+// of the zero-copy wrapping done at ingress: ReadPacket must copy into the caller's
+// buffer, but the batch waiter hands the queued buffers straight to the writer.
+//
+// Returning false here is always safe: CopyPacket falls through to the next capability,
+// and ultimately to ReadPacket/WritePacket. So this is an optimization the caller opts
+// into, never a correctness requirement.
 func (c *http3PacketConn) CreateConnectedPacketBatchReadWaiter() (N.ConnectedPacketBatchReadWaiter, bool) {
 	return &connectedBatchReadWaiter{conn: c, batchSize: defaultBatchSize}, true
 }
@@ -646,15 +746,6 @@ func (w *connectedBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.Buffer, M.
 	case <-w.conn.ctx.Done():
 		return nil, M.Socksaddr{}, w.conn.closeError()
 	}
-}
-
-// closeError reports the connection's terminal error, defaulting to net.ErrClosed so a
-// caller never receives a nil error alongside an empty result.
-func (c *http3PacketConn) closeError() error {
-	if c.err != nil {
-		return c.err
-	}
-	return net.ErrClosed
 }
 
 // connectedBatchWriter forwards one batch of target replies to the client.
@@ -735,93 +826,6 @@ func (c *http3PacketConn) writeOnePacketLocked(buffer *buf.Buffer) error {
 		}
 	}
 	return WriteDatagramCapsule(c.stream, datagram)
-}
-
-func (c *http3PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	datagram := PrependContextID(buffer)
-	err := c.stream.SendDatagram(datagram.Bytes())
-	if err == nil {
-		datagram.Release()
-		return nil
-	}
-	if !errors.Is(err, ErrDatagramUnsupported) {
-		datagram.Release()
-		return err
-	}
-	c.writeAccess.Lock()
-	defer c.writeAccess.Unlock()
-	return WriteDatagramCapsule(c.stream, datagram)
-}
-
-func (c *http3PacketConn) closeWithError(err error) {
-	c.closeOnce.Do(func() {
-		c.err = err
-		c.cancel()
-		c.stream.Close()
-		// Release anything still buffered for the setup window, so a tunnel that
-		// fails or closes during setup cannot leak the early datagrams.
-		c.earlyMutex.Lock()
-		early := c.early
-		c.early = nil
-		c.earlyBytes = 0
-		c.earlyMutex.Unlock()
-		for _, packet := range early {
-			packet.Release()
-		}
-		// And settle, so a handler parked in AwaitReady is not left waiting forever.
-		c.handshakeOnce.Do(func() {
-			c.setupErr = err
-			close(c.settled)
-		})
-		go func() {
-			c.waitGroup.Wait()
-			for {
-				select {
-				case packet := <-c.packets:
-					packet.Release()
-				default:
-					return
-				}
-			}
-		}()
-	})
-}
-
-func (c *http3PacketConn) Close() error {
-	c.closeWithError(net.ErrClosed)
-	return nil
-}
-
-func (c *http3PacketConn) wait(ctx context.Context) {
-	select {
-	case <-c.ctx.Done():
-	case <-ctx.Done():
-		c.Close()
-	}
-}
-
-func (c *http3PacketConn) LocalAddr() net.Addr {
-	return c.localAddr
-}
-
-func (c *http3PacketConn) SetDeadline(t time.Time) error {
-	return os.ErrInvalid
-}
-
-func (c *http3PacketConn) SetReadDeadline(t time.Time) error {
-	return os.ErrInvalid
-}
-
-func (c *http3PacketConn) SetWriteDeadline(t time.Time) error {
-	return os.ErrInvalid
-}
-
-func (c *http3PacketConn) NeedAdditionalReadDeadline() bool {
-	return true
-}
-
-func (c *http3PacketConn) FrontHeadroom() int {
-	return CapsuleHeadroom
 }
 
 var _ N.PacketConn = (*http3PacketConn)(nil)

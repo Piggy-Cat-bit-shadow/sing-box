@@ -32,7 +32,7 @@ type HTTPMixedInboundOptions struct {
 type _HTTPInboundOptions struct {
 	ListenOptions
 	Users []auth.User `json:"users,omitempty"`
-	// Masquerade handles unauthenticated HTTP/2 and HTTP/3 requests.  It uses
+	// Masquerade handles unauthenticated HTTP/2 and HTTP/3 requests. It uses
 	// the same schema and semantics as the Hysteria2 masquerade option.
 	Masquerade     *Hysteria2Masquerade    `json:"masquerade,omitempty"`
 	DomainResolver *DomainResolveOptions   `json:"domain_resolver,omitempty"`
@@ -40,13 +40,12 @@ type _HTTPInboundOptions struct {
 	Version        badoption.Listable[int] `json:"version,omitempty" enum:"1,2,3"`
 	// MaxHeaderBytes overrides the request header limit. Unset means upstream.
 	MaxHeaderBytes int `json:"max_header_bytes,omitempty"`
-	// BBRProfile selects the HTTP/3 server congestion control profile. It
-	// accepts only the profiles provided by congestion_meta2.
+	// BBRProfile selects the HTTP/3 server congestion control profile.
 	//
-	// An UNSET value means "leave quic-go's congestion control unchanged", which is
-	// the library default and what both reference implementations get. It does NOT
-	// mean "use the standard BBR profile": resolving it that way would make BBR a
-	// protocol default rather than an explicit operator choice.
+	// An UNSET value means "leave quic-go's congestion control unchanged", which is the
+	// library default and what both reference implementations get. It does NOT mean "use
+	// the standard BBR profile": resolving it that way would make BBR a protocol default
+	// rather than an explicit operator choice.
 	BBRProfile string `json:"bbr_profile,omitempty" enum:"conservative,standard,aggressive"`
 	// UnauthenticatedLimits bounds pre-authentication traffic on this inbound.
 	// Authenticated proxy traffic is never affected.
@@ -302,11 +301,7 @@ func (o *HTTPOutboundOptions) UnmarshalJSONContext(ctx context.Context, content 
 	if err != nil {
 		return err
 	}
-	err = unmarshalHTTPVersionOptions(ctx, content, (*_HTTPOutboundOptions)(o), o.Version, &o.HTTP2Options, &o.HTTP3Options)
-	if err != nil {
-		return err
-	}
-	return nil
+	return unmarshalHTTPVersionOptions(ctx, content, (*_HTTPOutboundOptions)(o), o.Version, &o.HTTP2Options, &o.HTTP3Options)
 }
 
 func (o HTTPOutboundOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {

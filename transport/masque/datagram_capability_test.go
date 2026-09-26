@@ -115,7 +115,7 @@ func TestSessionDoesNotStartTheDatagramLoopWhenCapabilityIsAbsent(t *testing.T) 
 	stream := newCapabilityProbeStream(false)
 	handler := &capabilityProbeHandler{}
 
-	current := newSession(context.Background(), stream, handler, false)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 	if current.datagrams != nil {
 		t.Fatal("the session must hold no datagram view when the peer did not " +
 			"negotiate HTTP Datagrams")
@@ -156,7 +156,7 @@ func TestSessionStartsTheDatagramLoopWhenCapabilityIsPresent(t *testing.T) {
 	stream := newCapabilityProbeStream(true)
 	handler := &capabilityProbeHandler{}
 
-	current := newSession(context.Background(), stream, handler, false)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 	if current.datagrams == nil {
 		t.Fatal("the session must hold the datagram view when the peer negotiated " +
 			"HTTP Datagrams, or a capable peer would lose its data path")
@@ -194,14 +194,14 @@ func TestSessionSendPathFallsBackToCapsulesWhenCapabilityIsAbsent(t *testing.T) 
 	stream := newCapabilityProbeStream(false)
 	handler := &capabilityProbeHandler{}
 
-	current := newSession(context.Background(), stream, handler, false)
+	current := newSession(context.Background(), stream, handler, func() int { return PacketHeadroom })
 
 	packet := buf.NewSize(PacketHeadroom + 4)
 	packet.Resize(PacketHeadroom, 0)
 	packet.Write([]byte{0x45, 0x00, 0x00, 0x00})
 
-	if err := current.writePacket(packet); err != nil {
-		t.Fatalf("writePacket must fall back to a capsule rather than reporting an "+
+	if err := current.writePackets([]*buf.Buffer{packet}); err != nil {
+		t.Fatalf("the write path must fall back to a capsule rather than reporting an "+
 			"error, got %v", err)
 	}
 	if calls := stream.sendCalls.Load(); calls != 0 {
