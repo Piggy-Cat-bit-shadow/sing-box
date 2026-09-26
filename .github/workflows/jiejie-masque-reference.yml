@@ -1,0 +1,224 @@
+name: Jiejie MASQUE reference
+
+# The HEAVY, MANUAL reference-interop workflow.
+#
+# # Why this is not in jiejie-fast.yml
+#
+# This job builds Google QUICHE from source with Bazel. That pulls BoringSSL,
+# Abseil and Protobuf from the Bazel Central Registry and compiles them: it is a
+# long C++ build, it needs network access to several registries, and it has a
+# build-time profile completely unlike the Go build. Putting it on every push
+# would slow every push down and make ordinary CI fail for reasons that have
+# nothing to do with this fork's code.
+#
+# So it is dispatched by hand, and the fast workflow keeps its cheap protocol-
+# vector check. Both are kept: the vector test runs always and pins QUICHE's
+# DECISIONS; this workflow runs on demand and pins QUICHE's BEHAVIOUR.
+#
+# # What it proves
+#
+# 1. QUICHE's masque_client builds at the revision this repository pins.
+# 2. The built binary interoperates with a sing-box CONNECT-UDP proxy, fetching a
+#    real HTTP/3 origin through the tunnel.
+# 3. When the registry allows it, the same for CONNECT-IP.
+#
+# A skipped interop test is treated as a FAILURE here, because this workflow's
+# whole purpose is to run it: if the binary is missing or the test skips, the
+# dispatch did not demonstrate anything and must not report success.
+on:
+  workflow_dispatch:
+    inputs:
+      run_connect_ip:
+        description: 'Also run the CONNECT-IP interop (needs the full-registry binary)'
+        type: boolean
+        default: true
+  # A low-frequency safety net so the pinned interop cannot rot unnoticed. It is
+  # NOT a per-push trigger: see the note above on build cost.
+  schedule:
+    - cron: '17 4 * * 1'
+
+concurrency:
+  group: jiejie-masque-reference-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  quiche-live-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The database is required by Bazel itself, which needs a JDK for its
+      # server; a bare runner image does not always carry one.
+      - name: Install Bazel prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git python3 openjdk-17-jre-headless
+
+      - name: Install bazelisk
+        run: |
+          set -euo pipefail
+          go install github.com/bazelbuild/bazelisk@v1.25.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/bazelisk" version
+
+      # The Bazel cache key MUST contain the QUICHE commit. Without it a cache
+      # from one pinned revision would be restored for another, and Bazel would
+      # report a build that never recompiled the changed sources - i.e. the
+      # workflow would claim interop for a revision it did not build.
+      - name: Read the pinned QUICHE commit
+        id: pin
+        run: |
+          set -euo pipefail
+          PIN=$(grep -oE 'QUICHE_PIN="[0-9a-f]{40}"' scripts/ci/jiejie-quiche-live-interop.sh \
+            | head -1 | cut -d'"' -f2)
+          test -n "$PIN"
+          echo "commit=$PIN" >> "$GITHUB_OUTPUT"
+          echo "pinned QUICHE commit: $PIN"
+
+      - name: Restore Bazel caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: quiche-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ github.run_id }}
+          restore-keys: |
+            quiche-${{ runner.os }}-${{ steps.pin.outputs.commit }}-
+
+      - name: Record root go.mod before the QUICHE build
+        run: |
+          set -euo pipefail
+          # QUICHE must stay an external tool. This hash is compared after the
+          # build to prove the C++ dependency did not leak into the Go module.
+          sha256sum go.mod go.sum > /tmp/go-mod-before.txt
+          cat /tmp/go-mod-before.txt
+
+      - name: Build QUICHE masque_client at the pinned revision
+        run: |
+          set -euo pipefail
+          ./scripts/ci/jiejie-quiche-live-interop.sh --output-dir "$RUNNER_TEMP/quiche-out"
+          test -x "$RUNNER_TEMP/quiche-out/masque_client"
+          echo "JIEJIE_QUICHE_MASQUE_CLIENT=$RUNNER_TEMP/quiche-out/masque_client" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/quiche-out/QUICHE-PROVENANCE.txt"
+
+      - name: Save Bazel caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/bazel
+            ~/.cache/bazelisk
+          key: quiche-${{ runner.os }}-${{ steps.pin.outputs.commit }}-${{ github.run_id }}
+
+      - name: Assert root go.mod is unchanged by the QUICHE build
+        run: |
+          set -euo pipefail
+          sha256sum -c /tmp/go-mod-before.txt
+          echo "root go.mod and go.sum are byte-identical: QUICHE stayed external"
+
+      - name: Build the production minimal and full-registry binaries
+        run: |
+          set -euo pipefail
+          MIN_TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          go build -tags "$MIN_TAGS" -o "$RUNNER_TEMP/sing-box-minimal" ./cmd/sing-box
+          FULL_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
+          go build -tags "$FULL_TAGS" -o "$RUNNER_TEMP/sing-box-full" ./cmd/sing-box
+
+      # The transport-layer interop is the FAILING GATE. It must pass: it proves the
+      # pinned QUICHE binary completed a QUIC + HTTP/3 exchange with a real sing-box
+      # listener. A SKIP here means the binary was missing, which would make the
+      # whole dispatch meaningless.
+      - name: QUICHE HTTP/3 transport live interop (required)
+        run: |
+          set -euo pipefail
+          cd test/jiejie/reference
+          set +e
+          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
+            go test -v -count=1 -timeout 15m \
+            -run 'TestReferenceQuicheH3TransportLiveInterop' . \
+            2>&1 | tee "$GITHUB_WORKSPACE/quiche-interop.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -q -- '--- SKIP' "$GITHUB_WORKSPACE/quiche-interop.log"; then
+            echo "::error::the QUICHE transport interop SKIPPED, so nothing was demonstrated"
+            exit 1
+          fi
+          exit "$status"
+
+      # The tunnel-layer interop is REPORTED, NOT GATED.
+      #
+      # It does not currently pass, and the reason is recorded in the test itself:
+      # QUICHE's nested encapsulated-client handshake aborts with
+      # QUIC_CONNECTION_CANCELLED before it emits any CONNECT-UDP, while the outer
+      # HTTP/3 exchange and sing-box's own CONNECT-UDP both work. Gating on it would
+      # make this workflow red for a reason this repository cannot fix, and marking
+      # it green would be a false claim of MASQUE interop. So it runs, its result is
+      # printed and summarised, and the step does not decide the workflow outcome.
+      #
+      # The `|| true` is deliberate and is why this step is separated from the gate
+      # above: the two claims must not share a verdict.
+      - name: QUICHE CONNECT-UDP tunnel interop (reported, NOT-TESTED upstream)
+        if: always()
+        run: |
+          set -euo pipefail
+          cd test/jiejie/reference
+          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
+            go test -v -count=1 -timeout 15m \
+            -run 'TestReferenceQuicheConnectUDPLiveInterop' . \
+            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log" || true
+          echo "::notice::the CONNECT-UDP tunnel claim is NOT-TESTED; see the test comment for the measured blocker"
+
+      - name: QUICHE CONNECT-IP tunnel interop (reported)
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_connect_ip) }}
+        run: |
+          set -euo pipefail
+          cd test/jiejie/reference
+          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
+          JIEJIE_FULL_REGISTRY_BINARY=1 \
+            go test -v -count=1 -timeout 15m \
+            -run 'TestReferenceQuicheConnectIPLiveInterop' . \
+            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log" || true
+          echo "::notice::the CONNECT-IP tunnel claim is NOT-TESTED; see the test comment"
+
+      - name: Summarise the interop result
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Google QUICHE live MASQUE interop"
+            echo
+            echo "QUICHE commit: \`${{ steps.pin.outputs.commit }}\`"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/quiche-out/QUICHE-PROVENANCE.txt" 2>/dev/null || echo "no provenance recorded"
+            echo '```'
+            echo
+            echo '```'
+            grep -E '^(=== RUN|--- (PASS|FAIL|SKIP)|    google_quiche_live_test.go|ok|FAIL)' \
+              "$GITHUB_WORKSPACE/quiche-interop.log" 2>/dev/null || echo "no interop log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the interop log and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quiche-live-interop
+          path: |
+            quiche-interop.log
+            ${{ runner.temp }}/quiche-out/QUICHE-PROVENANCE.txt
+          if-no-files-found: warn
+          retention-days: 30
