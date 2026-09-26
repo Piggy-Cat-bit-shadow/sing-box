@@ -218,7 +218,7 @@ var routeSeeds = []routeSeed{
 // in ascending protocol order at ascending addresses.
 func everyProtocolPayload() []byte {
 	payload := make([]byte, 0, 256*10)
-	for protocol := 0; protocol < 256; protocol++ {
+	for protocol := range 256 {
 		payload = append(payload, 4, 198, 18, byte(protocol), 0, 198, 18, byte(protocol), 0, byte(protocol))
 	}
 	return payload
@@ -226,7 +226,7 @@ func everyProtocolPayload() []byte {
 
 func everyProtocolExpected() []AddressRange {
 	ranges := make([]AddressRange, 0, 256)
-	for protocol := 0; protocol < 256; protocol++ {
+	for protocol := range 256 {
 		address := netip.AddrFrom4([4]byte{198, 18, byte(protocol), 0})
 		ranges = append(ranges, AddressRange{Start: address, End: address, Protocol: uint8(protocol)})
 	}

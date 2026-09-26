@@ -369,7 +369,7 @@ func TestIPv6FragmentChainProgressesAndTerminates(t *testing.T) {
 	// last naming UDP. This is the well-formed version of the loop input.
 	const fragments = 4
 	chain := make([]extensionChainEntry, 0, fragments)
-	for index := 0; index < fragments-1; index++ {
+	for range fragments - 1 {
 		chain = append(chain, ipv6Fragment(ipv6FragmentIdentifier, 0))
 	}
 	chain = append(chain, ipv6Fragment(testProtocolUDP, 0))

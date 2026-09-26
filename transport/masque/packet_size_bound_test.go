@@ -228,12 +228,10 @@ type recordingSessionHandler struct {
 }
 
 func (h *recordingSessionHandler) handleAddressAssign([]AssignedAddress) error { return nil }
-func (h *recordingSessionHandler) handleAddressRequest([]AssignedAddress) error {
-	return nil
-}
-func (h *recordingSessionHandler) handleRouteAdvertisement([]AddressRange) error {
-	return nil
-}
+
+func (h *recordingSessionHandler) handleAddressRequest([]AssignedAddress) error { return nil }
+
+func (h *recordingSessionHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 
 func (h *recordingSessionHandler) handlePacket(buffer *buf.Buffer) {
 	// Copy the bytes out, because the session owns and releases the buffer.
