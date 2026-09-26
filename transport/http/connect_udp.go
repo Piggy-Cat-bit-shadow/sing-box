@@ -3,6 +3,7 @@ package http
 import (
 	std_bufio "bufio"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
@@ -77,19 +78,45 @@ func (h *httpHandler) serveConnectUDP(ctx context.Context, writer http.ResponseW
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	writer.Header().Set("Capsule-Protocol", "?1")
-	writer.WriteHeader(http.StatusOK)
-	writer.(http.Flusher).Flush()
 	if request.ProtoMajor == 3 && HTTP3StreamFunc != nil {
 		stream, isDatagramStream := HTTP3StreamFunc(request.Context(), writer)
 		if isDatagramStream {
 			localAddr, _ := request.Context().Value(http.LocalAddrContextKey).(net.Addr)
 			conn := newHTTP3PacketConn(stream, destination, localAddr)
+			// Hold the response until the target is actually reachable.
+			//
+			// Without this the sequence was: 200 OK, flush, and only THEN dial the
+			// target. A DNS or dial failure therefore arrived after the client had
+			// already been told the tunnel was up, and the only signal left was a
+			// silent dead tunnel - the client could not distinguish "target
+			// unreachable" from "target is quiet".
+			//
+			// The router signals the outcome through the handshake hooks, and this
+			// goroutine is the only one that touches the ResponseWriter. So the
+			// router never writes here; it only reports, and the handler decides.
+			conn.deferUntilTargetReady()
 			h.handler.NewPacketConnectionEx(ctx, conn, source, destination, nil)
+
+			if err := conn.AwaitReady(request.Context()); err != nil {
+				// The target could not be set up and the headers are still unset, so a
+				// real HTTP error can be returned instead of a 200.
+				h.server.logger.ErrorContext(ctx, "process connection from ", source,
+					": connect-udp target setup failed: ", err)
+				conn.Close()
+				rejectConnectUDPSetup(writer, err)
+				return
+			}
+
+			writer.Header().Set("Capsule-Protocol", "?1")
+			writer.WriteHeader(http.StatusOK)
+			writer.(http.Flusher).Flush()
 			conn.wait(request.Context())
 			return
 		}
 	}
+	writer.Header().Set("Capsule-Protocol", "?1")
+	writer.WriteHeader(http.StatusOK)
+	writer.(http.Flusher).Flush()
 	// Normalize stream-level errors before they reach the routing layer, for the
 	// same reason as serveConnect: route/conn.go logs a copy failure at ERROR
 	// unless it recognises the error as a normal closure, and an http3.Error
@@ -105,4 +132,45 @@ func (h *httpHandler) serveConnectUDP(ctx context.Context, writer http.ResponseW
 	}))
 	<-done
 	rawConn.CloseWrapper()
+}
+
+// rejectConnectUDPSetup maps a target-setup failure to an HTTP status, and adds a
+// Proxy-Status only where RFC 9209 has a token that matches the meaning EXACTLY.
+//
+// The mapping is deliberately conservative, and the reasoning mirrors the masque-server
+// endpoint audit:
+//
+//	deadline / timeout        -> 504, no Proxy-Status. RFC 9209 has no timeout token, and
+//	                             connection_timeout describes the client's connection, not
+//	                             the proxy's upstream dial.
+//	DNS resolution failure    -> 502 with error=dns_error, which IS an exact match:
+//	                             RFC 9209 section 2.3.4 defines it as "the proxy failed to
+//	                             resolve the requested hostname".
+//	any other dial/route fail -> 502, no Proxy-Status. There is no token for "could not
+//	                             reach the target", and http_protocol_error /
+//	                             proxy_internal_error would both be wrong: the HTTP layer
+//	                             was fine and nothing internal failed.
+//
+// Nothing internal is ever echoed: the client sees a status and, at most, the standard
+// error token. The detailed cause stays in the server log.
+func rejectConnectUDPSetup(writer http.ResponseWriter, err error) {
+	switch {
+	case E.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded):
+		writer.WriteHeader(http.StatusGatewayTimeout)
+	case isDNSError(err):
+		writer.Header().Set("Proxy-Status", "sing-box; error=dns_error")
+		writer.WriteHeader(http.StatusBadGateway)
+	default:
+		writer.WriteHeader(http.StatusBadGateway)
+	}
+}
+
+// isDNSError reports whether the failure came from name resolution.
+//
+// It walks the wrapped chain for a *net.DNSError rather than matching on message text,
+// so a renamed error keeps working and an unrelated failure that merely mentions "dns"
+// is not misreported as a DNS error with a Proxy-Status token attached.
+func isDNSError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }

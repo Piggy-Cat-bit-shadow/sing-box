@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -301,7 +302,45 @@ type http3PacketConn struct {
 	waitGroup   sync.WaitGroup
 	writeAccess sync.Mutex
 	err         error
+
+	// Deferred-success state.
+	//
+	// For an H3 CONNECT-UDP request the HTTP response is withheld until the target
+	// is actually reachable, so a setup failure can be reported as an HTTP error
+	// instead of a 200 followed by silence. The router signals the outcome through
+	// the handshake hooks; this connection carries the signal back to the handler
+	// goroutine, which is the only goroutine allowed to touch the ResponseWriter.
+	//
+	// early holds datagrams that arrived while the target was still being set up. A
+	// client is entitled to send immediately after the request, and dropping those
+	// datagrams would lose the first packets of a tunnel that succeeds moments later.
+	early      []*buf.Buffer
+	earlyBytes int
+	earlyMutex sync.Mutex
+	// settled is closed once ready/failure has been decided.
+	settled chan struct{}
+	// ready reports whether the target setup succeeded.
+	ready bool
+	// setupErr is the failure reported by the router, if any.
+	setupErr error
+	// handshakeOnce guards the single settle of the outcome.
+	handshakeOnce sync.Once
+	// activated switches the connection from buffering to normal delivery.
+	activated atomic.Bool
 }
+
+// Early-datagram bounds for the setup window.
+//
+// Both limits apply simultaneously and whichever is reached first stops further
+// buffering: a client that floods during setup must not be able to spend server memory
+// while the target is still being dialled. Past the bound the excess is DROPPED, which
+// is the correct UDP semantic - a datagram has no retransmission to preserve, and the
+// alternative (unbounded buffering) is a memory-amplification primitive for an
+// unauthenticated-adjacent path.
+const (
+	maxEarlyDatagramPackets = 8
+	maxEarlyDatagramBytes   = 64 << 10
+)
 
 func newHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAddr net.Addr) *http3PacketConn {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -313,11 +352,27 @@ func newHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAdd
 		packets:     make(chan *buf.Buffer, 64),
 		ctx:         ctx,
 		cancel:      cancel,
+		settled:     make(chan struct{}),
 	}
+	// A connection is ACTIVE by default so the non-deferred callers (and the fixtures in
+	// this package) deliver immediately. The H3 CONNECT-UDP path calls
+	// deferUntilTargetReady to hold datagrams until the target is confirmed.
+	conn.activated.Store(true)
 	conn.waitGroup.Add(2)
 	go conn.loopDatagram()
 	go conn.loopCapsule()
 	return conn
+}
+
+// deferUntilTargetReady holds incoming datagrams until the router reports the target
+// setup outcome through the handshake hooks.
+//
+// It must be called BEFORE the connection is handed to the router, so no datagram can
+// be delivered on the strength of a 200 that has not been sent yet.
+func (c *http3PacketConn) deferUntilTargetReady() {
+	c.activated.Store(false)
+	c.handshakeOnce = sync.Once{}
+	c.settled = make(chan struct{})
 }
 
 func (c *http3PacketConn) loopDatagram() {
@@ -358,6 +413,17 @@ func (c *http3PacketConn) loopDatagram() {
 		// zero-length buffer, which is a legal UDP datagram and must still be
 		// delivered. An empty datagram and no datagram are different outcomes.
 		buffer := buf.As(datagram[contextLength:])
+		// Before the target is ready, hold the datagram instead of queueing it: the
+		// tunnel has not been confirmed yet, and a client is entitled to send
+		// immediately after its request.
+		if !c.activated.Load() {
+			if !c.bufferEarlyDatagram(buffer) {
+				// Past a bound. Dropping is the UDP semantic and the only bounded
+				// choice; the client will retry at the application layer if it cares.
+				buffer.Release()
+			}
+			continue
+		}
 		select {
 		case c.packets <- buffer:
 		case <-c.ctx.Done():
@@ -409,6 +475,91 @@ func (c *http3PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 			return M.Socksaddr{}, c.err
 		}
 	}
+}
+
+// PacketConnHandshakeSuccess is called by the router once the target socket is ready.
+//
+// This is the signal that lets the HTTP handler send a 200. It does NOT send anything
+// itself: the handler goroutine owns the ResponseWriter, and writing from the router
+// goroutine would race with the handler. So this only records the outcome and closes
+// the settled channel.
+//
+// It also activates normal delivery. Everything buffered during setup is handed to the
+// packet queue FIRST, in arrival order, so no early datagram is lost and none is
+// delivered twice.
+func (c *http3PacketConn) PacketConnHandshakeSuccess(net.PacketConn) error {
+	c.settle(true, nil)
+	return nil
+}
+
+// HandshakeFailure is called by the router when the target could not be set up.
+//
+// The error is carried to the handler so it can be mapped to an HTTP status. It is NOT
+// returned to the router as a failure to write a handshake response: the handler is the
+// one that must respond, and it has not had the chance yet.
+func (c *http3PacketConn) HandshakeFailure(err error) error {
+	c.settle(false, err)
+	return nil
+}
+
+// settle records the setup outcome exactly once and releases any buffered datagrams.
+//
+// sync.Once is what makes double-settling safe: a router that reports success and then
+// reports a failure while tearing down must not flip the result or panic on a closed
+// channel.
+func (c *http3PacketConn) settle(ready bool, err error) {
+	c.handshakeOnce.Do(func() {
+		c.ready = ready
+		c.setupErr = err
+		c.activated.Store(true)
+
+		// Flush the early queue in arrival order. Buffers that no longer fit the queue
+		// are released rather than leaked.
+		c.earlyMutex.Lock()
+		early := c.early
+		c.early = nil
+		c.earlyBytes = 0
+		c.earlyMutex.Unlock()
+		for _, buffer := range early {
+			select {
+			case c.packets <- buffer:
+			default:
+				// The queue is full, so the tunnel is already behind. Dropping here is
+				// the UDP semantic; blocking would stall the router goroutine.
+				buffer.Release()
+			}
+		}
+		close(c.settled)
+	})
+}
+
+// AwaitReady blocks until the target setup has been decided, and reports the outcome.
+//
+// The handler calls this before writing a response. A context cancellation (the client
+// disconnected) returns an error so the handler does not wait forever on a peer that is
+// gone.
+func (c *http3PacketConn) AwaitReady(ctx context.Context) error {
+	select {
+	case <-c.settled:
+		return c.setupErr
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+
+// bufferEarlyDatagram holds one datagram received before the target was ready.
+//
+// It reports whether the datagram was retained. Once either bound is reached further
+// datagrams are refused, and the caller drops them.
+func (c *http3PacketConn) bufferEarlyDatagram(buffer *buf.Buffer) bool {
+	c.earlyMutex.Lock()
+	defer c.earlyMutex.Unlock()
+	if len(c.early) >= maxEarlyDatagramPackets || c.earlyBytes+buffer.Len() > maxEarlyDatagramBytes {
+		return false
+	}
+	c.early = append(c.early, buffer)
+	c.earlyBytes += buffer.Len()
+	return true
 }
 
 // CreateConnectedPacketBatchReadWaiter offers the batch read path to bufio.CopyPacket.
@@ -607,6 +758,21 @@ func (c *http3PacketConn) closeWithError(err error) {
 		c.err = err
 		c.cancel()
 		c.stream.Close()
+		// Release anything still buffered for the setup window, so a tunnel that
+		// fails or closes during setup cannot leak the early datagrams.
+		c.earlyMutex.Lock()
+		early := c.early
+		c.early = nil
+		c.earlyBytes = 0
+		c.earlyMutex.Unlock()
+		for _, packet := range early {
+			packet.Release()
+		}
+		// And settle, so a handler parked in AwaitReady is not left waiting forever.
+		c.handshakeOnce.Do(func() {
+			c.setupErr = err
+			close(c.settled)
+		})
 		go func() {
 			c.waitGroup.Wait()
 			for {
