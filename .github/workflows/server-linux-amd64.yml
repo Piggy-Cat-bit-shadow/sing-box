@@ -419,52 +419,24 @@ jobs:
           # they still begin with TestReference.
           echo ""
           echo "=== reference test coverage check ==="
-          DEFINED=$(grep -rhoE '^func (Test(Reference|SourceIdentity|QuicheOracle)[A-Za-z0-9_]*)' \
-            test/jiejie/reference/*_test.go | sed 's/^func //' | sort -u)
-
-          # These require an EXTERNAL Google QUICHE binary that this fast job does
-          # not build: building QUICHE means compiling BoringSSL and Abseil with
-          # Bazel, which is why it lives in .github/workflows/jiejie-masque-reference.yml
-          # instead. They must therefore be excluded here BY NAME, and the exclusion
-          # is explicit rather than a filter tweak so that it cannot silently widen:
-          # a test added to this list without being wired into the reference workflow
-          # would stop running entirely, which is the failure this whole check exists
-          # to catch.
-          QUICHE_EXTERNAL="TestReferenceQuicheH3TransportLiveInterop TestReferenceQuicheConnectUDPLiveInterop TestReferenceQuicheConnectIPLiveInterop"
-          # DEFINED is NEWLINE separated, and a `case` glob cannot match across
-          # newlines, so it is flattened to one space-separated line before being
-          # used as the haystack. Without this the exclusion silently never matches
-          # and every QUICHE test is reported as missing - which is how this was
-          # found, by simulating the check rather than trusting it.
-          DEFINED_FLAT=" $(echo "$DEFINED" | tr '\n' ' ') "
-          MISSING=0
-          for TEST in $DEFINED; do
-            case "$DEFINED_FLAT" in
-              *" $TEST "*) continue ;;
-            esac
-            if ! grep -qE -- "--- (PASS|FAIL|SKIP): ${TEST}( |\$)" "$LOG"; then
-              echo "::error::$TEST is defined in test/jiejie/reference but the run"
-              echo "::error::never reported it. It is not in the -run filter, so it"
-              echo "::error::never executed. A test that does not run is NOT a pass."
-              MISSING=1
-            fi
-          done
-          if [ "$MISSING" != "0" ]; then
-            echo "::error::the reference suite has tests outside the CI filter."
-            exit 1
-          fi
-          echo "all $(echo "$DEFINED" | wc -l | tr -d ' ') defined reference tests accounted for:"
-          echo "  - reported a result in this fast job, or"
-          echo "  - excluded by name as QUICHE-external (run by jiejie-masque-reference.yml)"
-          for TEST in $QUICHE_EXTERNAL; do
-            case "$DEFINED_FLAT" in
-              *" $TEST "*) ;;
-              *) echo "::error::$TEST is listed as QUICHE-external but no longer exists;"
-                 echo "::error::remove it from QUICHE_EXTERNAL rather than leaving a dead exclusion."
-                 MISSING=1 ;;
-            esac
-          done
-          if [ "$MISSING" != "0" ]; then exit 1; fi
+          # The check lives in a script so that it can be tested on its own, which is not
+          # a style preference: its previous INLINE form compared each test against the
+          # list the test came from, so the comparison was always true and every single
+          # test was skipped while the step still reported success. The check protected
+          # nothing for a full round and the workflow stayed green.
+          #
+          # The test script is run FIRST so that a broken checker cannot approve the run
+          # it is part of. It proves the checker fails when it should - a normal test
+          # missing from the log, an exclusion naming a nonexistent test, a wrongly
+          # excluded test that nothing else runs, and a vacuously empty test set - and
+          # that it verifies a non-zero number of tests on the real suite.
+          #
+          # This proves EXECUTION only. A SKIP satisfies it, which is correct, because
+          # some reference tests are expected to skip against a binary that cannot serve
+          # them; whether a SKIP is ACCEPTABLE is answered by the explicit per-test
+          # assertions below, which must not be removed.
+          bash scripts/ci/check-reference-coverage.test.sh
+          bash scripts/ci/check-reference-coverage.sh "$LOG" test/jiejie/reference
 
           # And the positive evidence must be in the log, not merely implied by an
           # exit status.
