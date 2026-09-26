@@ -2,29 +2,41 @@
 
 Base: `SagerNet/sing-box` `testing`
 Fork: `Piggy-Cat-bit-shadow/sing-box`
-Current version: `1.15.0-jiejie-masquerade.4`
+Current version: `1.15.0-jiejie-masquerade.5`
 
-**Jiejie Server Edition is a VPS-only fork.**
+This fork maintains **two independent product lines**, separated entirely by build
+tags and registries:
 
-This repository ships exactly one custom product: a minimal Linux amd64
-production server binary.
+| | Server Edition | Client Edition |
+| --- | --- | --- |
+| branch | `testing` | `macos-client` |
+| platform | Linux amd64 VPS | macOS arm64 / amd64 |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` |
+| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
+| workflow | `server-linux-amd64.yml` | `client-macos.yml` |
+| docs | [JIEJIE-SERVER.md](JIEJIE-SERVER.md) | [JIEJIE-MACOS-CLIENT.md](JIEJIE-MACOS-CLIENT.md) |
 
-It does not ship or maintain:
+**This document describes the Server Edition**, which is what the `testing` branch
+ships. The Client Edition is documented separately in
+[JIEJIE-MACOS-CLIENT.md](JIEJIE-MACOS-CLIENT.md); the patches below are inherited
+by the client branch, but they are not what it is about.
+
+Neither product line ships or maintains:
 
 - iOS clients
 - Apple Libbox products
 - Windows clients
 - Linux full clients
 - TrustTunnel
-- general-purpose client features
+- general-purpose client features beyond the macOS core
 
-The single long-term branch is `testing`. Work lands there; short-lived
-`feat/jiejie-*` branches exist only while a change is being verified, and are
-deleted once its workflows are green.
+Each product line has one long-term branch. Work lands on `testing` (server) or
+`macos-client` (client); short-lived `feat/jiejie-*` branches exist only while a
+change is being verified, and are deleted once its workflows are green.
 
-This fork intentionally changes only the server-side areas listed below.
-Everything is optional and off by default; an unmodified configuration behaves
-like upstream. See [JIEJIE-SERVER.md](JIEJIE-SERVER.md) for the full reference.
+This fork intentionally changes only the areas listed below. Everything is
+optional and off by default; an unmodified configuration behaves like upstream.
+See [JIEJIE-SERVER.md](JIEJIE-SERVER.md) for the full reference.
 
 ## Patch 1: HTTP inbound masquerade
 
@@ -132,7 +144,10 @@ requires the minimal build to reject a protocol it deliberately excludes.
 
 ## Maintenance and CI
 
-Two workflows, one product.
+The Server Edition has two workflows. (The Client Edition has its own,
+`client-macos.yml`, described in [JIEJIE-MACOS-CLIENT.md](JIEJIE-MACOS-CLIENT.md);
+the three server workflows are unaffected by it, and a red macOS build cannot
+block a server release.)
 
 **Jiejie Fast** (`.github/workflows/jiejie-fast.yml`) is the fast gate on every
 push and pull request:

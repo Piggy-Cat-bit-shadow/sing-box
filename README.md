@@ -1,7 +1,51 @@
+# Jiejie sing-box fork
+
+基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人 fork，维护
+**两条互相独立的产品线**。
+
+> **你正在读的分支是 `macos-client`（Jiejie Client Edition）。**
+> 服务端产品线在 `testing` 分支，本文档对应的是其中的 Server Edition 说明；
+> Client Edition 的完整说明见 [`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md)。
+
+| | Jiejie Server Edition | Jiejie Client Edition |
+| --- | --- | --- |
+| 分支 | `testing` | **`macos-client`** |
+| 平台 | Linux amd64 VPS | macOS arm64 / amd64 |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` |
+| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
+| workflow | `server-linux-amd64.yml` | `client-macos.yml` |
+| artifact | `Jiejie-VPS-linux-amd64-…` | `Jiejie-Client-macOS-arm64-…` |
+
+两条产品线共用同一份源码树，**只靠 build tags 和 registry 隔离**，互斥且不会互相
+污染：改动其中一条不需要、也不会影响另一条。
+
+## Jiejie Client Edition（macOS）
+
+macOS 客户端产品线交付的是**原生 CLI sing-box core**，供第三方 GUI 作为
+**外部 core** 加载。
+
+- 是：`sing-box-darwin-arm64` 可执行文件，支持 `version` / `check` / `run` /
+  `format` 和 Clash API
+- **不是**：Apple App、不是 Swift GUI、不是 NetworkExtension、不是 libbox、不是
+  App Store 构建，也不是官方 sing-box 的替代品
+- 目标架构：`darwin/arm64`（必需）、`darwin/amd64`
+- profile：`jiejie_client_macos`（lite，默认）/ `jiejie_client_macos` +
+  `with_naive_outbound`（naive）
+- 详细设计、测试矩阵与已知限制：[`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md)
+
+```bash
+chmod +x sing-box-darwin-arm64
+./sing-box-darwin-arm64 version
+./sing-box-darwin-arm64 check -c config.json
+./sing-box-darwin-arm64 run   -c config.json
+```
+
+---
+
 # Jiejie Server Edition
 
-基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人 **server-only**
-fork。
+基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人
+**server-only** fork。
 
 - 面向：**Linux amd64 VPS**，一套固定的生产拓扑（Nginx Stream 持有 TCP/443，
   sing-box 持有 UDP/443）

@@ -68,3 +68,14 @@ fi
 echo "checking $config"
 "$binary" check -c "$config"
 echo "PASS: $config"
+
+# The example config is what a GUI operator actually copies, so it is checked
+# too. A stale example is worse than no example: the first thing a new user does
+# is run it, and a failure there reads as "this build is broken" rather than
+# "this file is out of date".
+example="test/jiejie/macos-client/example-config.json"
+if [ -f "$example" ]; then
+  echo "checking $example"
+  "$binary" check -c "$example"
+  echo "PASS: $example"
+fi
