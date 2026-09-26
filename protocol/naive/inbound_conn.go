@@ -1,6 +1,7 @@
 package naive
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
 	"math/rand"
@@ -170,6 +171,32 @@ func (p *paddingConn) readerReplaceable() bool {
 
 func (p *paddingConn) writerReplaceable() bool {
 	return p.writePadding == paddingCount
+}
+
+// hijackedConn returns the tunnel connection for a hijacked HTTP/1 client, including any
+// bytes the HTTP parser already read past the end of the request.
+//
+// net/http reads ahead while parsing the request headers, so the bufio.ReadWriter returned
+// by Hijack can already hold the start of the tunnel payload. Reading only from the
+// underlying connection loses those bytes, which desynchronises the tunnel from its first
+// payload.
+func hijackedConn(conn net.Conn, buffered *bufio.ReadWriter) net.Conn {
+	if buffered == nil || buffered.Reader.Buffered() == 0 {
+		return conn
+	}
+	return &hijackedTunnelConn{Conn: conn, buffered: buffered.Reader}
+}
+
+type hijackedTunnelConn struct {
+	net.Conn
+	buffered *bufio.Reader
+}
+
+func (c *hijackedTunnelConn) Read(p []byte) (int, error) {
+	if c.buffered.Buffered() > 0 {
+		return c.buffered.Read(p)
+	}
+	return c.Conn.Read(p)
 }
 
 type naiveConn struct {

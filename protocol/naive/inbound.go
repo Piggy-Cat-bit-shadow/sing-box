@@ -184,12 +184,12 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
-		conn, _, err := hijacker.Hijack()
+		conn, buffered, err := hijacker.Hijack()
 		if err != nil {
 			n.badRequest(ctx, request, E.New("hijack failed"))
 			return
 		}
-		n.newConnection(ctx, false, &naiveConn{Conn: conn}, userName, source, destination)
+		n.newConnection(ctx, false, &naiveConn{Conn: hijackedConn(conn, buffered)}, userName, source, destination)
 	} else {
 		n.newConnection(ctx, true, &naiveH2Conn{
 			reader:        request.Body,
