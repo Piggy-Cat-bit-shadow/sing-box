@@ -11,6 +11,7 @@ import (
 
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
@@ -437,20 +438,73 @@ func (s *serverSession) handlePacket(buffer *buf.Buffer) {
 	}
 }
 
+// handlePacketTooBig reports a Packet Too Big back to the peer whose packet did
+// not fit, addressed to that peer.
+//
+// # Why the addressing is not taken from the quoted packet
+//
+// buildICMPError addresses the error to the SOURCE of the oversized packet, which
+// is correct when the oversized packet came from the peer: the error then travels
+// back along the path the packet arrived on. That is the case handlePacket handles,
+// and it works because a failed inbound packet is answered toward its sender.
+//
+// This path is different, and the difference is the whole reason this function
+// cannot use the reply's own destination. The packet that failed here is one this
+// endpoint was SENDING INTO the tunnel, so the peer must be told about it. The
+// oversized packet's source is therefore frequently the ENDPOINT ITSELF - the
+// clearest example is an oversized packet the endpoint's own inner stack
+// generated, such as an echo reply to a large echo request - and buildICMPError
+// then addresses the error to the endpoint's own tunnel address rather than to the
+// peer.
+//
+// Routing that error by its destination (the previous implementation) then looks
+// up the ENDPOINT's address, which lookup() refuses by design because that address
+// is the server's and not a client's, so no session is found and the error is
+// delivered to the local device handler instead of into the tunnel. The peer that
+// actually needed the error never sees it, and a packet that was too large is
+// reported to nobody. MEASURED before this change, against a real quic-go
+// DatagramTooLargeError on a live HTTP/3 tunnel:
+//
+//	reply src=198.18.0.1 dst=198.18.0.1   quoted src=198.18.0.1 dst=198.18.0.2
+//	lookup(198.18.0.1) -> not found       client received: nothing
+//
+// The peer is the session this handler belongs to - the one whose writePacket
+// failed and invoked this handler - so the error is addressed to the peer's own
+// assigned address and queued on the same session. That is both the shortest path
+// and the only one that cannot land on the wrong tunnel when several peers are
+// attached to the same endpoint.
+//
+// MTU is carried through unchanged and is still validated by the caller in
+// session.writePacket, which refuses to build an error below minimumLinkMTU.
 func (s *serverSession) handlePacketTooBig(buffer *buf.Buffer, mtu int) {
-	reply, built := buildICMPError(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, mtu, PacketHeadroom)
+	addresses := s.assignedAddresses(nil)
+	peerAddress := firstPeerAddress(buffer.Bytes(), addresses)
+	if !peerAddress.IsValid() {
+		// No address is assigned in the packet's family, so there is no peer to
+		// report to. Released rather than delivered to the device handler: an error
+		// addressed to nobody is worse than no error, because it would be attributed
+		// to the local stack.
+		buffer.Release()
+		return
+	}
+	reply, built := buildICMPErrorTo(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, peerAddress, mtu, PacketHeadroom)
 	buffer.Release()
 	if !built {
 		return
 	}
-	_, destination, protocol, _ := packetAddresses(reply.Bytes())
-	target := s.server.lookup(destination, protocol)
-	if target != nil {
-		target.queuePacket(reply)
-		return
+	s.queuePacket(reply)
+}
+
+// firstPeerAddress returns the address from the peer's assignment that matches
+// the oversized packet's family, so an IPv4 error is never addressed to an IPv6
+// peer (or the reverse).
+func firstPeerAddress(packet []byte, addresses []AssignedAddress) netip.Addr {
+	wantIPv6 := header.IPVersion(packet) == header.IPv6Version
+	for _, address := range addresses {
+		candidate := address.Prefix.Addr()
+		if candidate.Is6() == wantIPv6 {
+			return candidate
+		}
 	}
-	err := s.server.handler.WriteInboundBuffers([]*buf.Buffer{reply})
-	if err != nil {
-		s.server.logger.DebugContext(s.ctx, E.Cause(err, "write packet to device"))
-	}
+	return netip.Addr{}
 }

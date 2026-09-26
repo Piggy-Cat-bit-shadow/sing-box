@@ -4,6 +4,7 @@ import (
 	"net/netip"
 
 	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun/gtcpip"
 	"github.com/sagernet/sing-tun/gtcpip/header"
 	"github.com/sagernet/sing/common/buf"
 )
@@ -105,5 +106,67 @@ func buildICMPError(packet []byte, errorType tun.ICMPError, inet4Source netip.Ad
 	}
 	buffer := buf.As(reply)
 	buffer.Advance(headroom)
+	return buffer, true
+}
+
+// buildICMPErrorTo builds the same ICMP error as buildICMPError but addresses it
+// to an explicitly chosen destination instead of the quoted packet's source.
+//
+// It exists for the CONNECT-IP endpoint's Packet Too Big path, where the packet
+// that did not fit is one the endpoint was SENDING INTO a tunnel rather than one
+// that arrived FROM a peer. The upstream builder has no destination parameter and
+// always answers the quoted packet's source, which in that direction is frequently
+// the endpoint itself, so the error would be addressed to the wrong host entirely.
+// See serverSession.handlePacketTooBig for the full reasoning and the measurement.
+//
+// The destination is rewritten on the constructed packet rather than passed down,
+// because the header checksum covers the addresses: changing a destination without
+// recomputing the checksum produces an error packet that the peer's stack discards,
+// which would look exactly like the delivery failure this function exists to fix.
+// IPv4 and IPv6 checksum differently (IPv6 has no header checksum at all), so each
+// family is handled explicitly rather than assumed to be uniform.
+func buildICMPErrorTo(packet []byte, errorType tun.ICMPError, inet4Source netip.Addr, inet6Source netip.Addr, destination netip.Addr, mtu int, headroom int) (*buf.Buffer, bool) {
+	buffer, built := buildICMPError(packet, errorType, inet4Source, inet6Source, mtu, headroom)
+	if !built {
+		return nil, false
+	}
+	bytes := buffer.Bytes()
+	switch header.IPVersion(bytes) {
+	case header.IPv4Version:
+		if !destination.Is4() || len(bytes) < header.IPv4MinimumSize {
+			buffer.Release()
+			return nil, false
+		}
+		// SetDestinationAddressWithChecksumUpdate maintains the header checksum
+		// itself, which is required: the IPv4 checksum covers the addresses, so a
+		// plain SetDestinationAddress would leave the error packet failing its own
+		// checksum at the peer and looking exactly like the delivery failure this
+		// function exists to fix.
+		header.IPv4(bytes).SetDestinationAddressWithChecksumUpdate(tcpip.AddrFrom4(destination.As4()))
+	case header.IPv6Version:
+		if !destination.Is6() || len(bytes) < header.IPv6MinimumSize {
+			buffer.Release()
+			return nil, false
+		}
+		ipHeader := header.IPv6(bytes)
+		ipHeader.SetDestinationAddress(tcpip.AddrFrom16(destination.As16()))
+		// IPv6 has no header checksum, but the ICMPv6 checksum covers the
+		// addresses through the pseudo-header, so it must be recomputed AFTER the
+		// address is in place and from the packet's own (rewritten) addresses.
+		icmpHeader := header.ICMPv6(ipHeader.Payload())
+		if len(icmpHeader) < header.ICMPv6MinimumSize {
+			buffer.Release()
+			return nil, false
+		}
+		icmpHeader.SetChecksum(0)
+		icmpHeader.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header: icmpHeader,
+			Src:    ipHeader.SourceAddressSlice(),
+			Dst:    ipHeader.DestinationAddressSlice(),
+		}))
+	default:
+		buffer.Release()
+		return nil, false
+	}
 	return buffer, true
 }

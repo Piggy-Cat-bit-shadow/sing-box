@@ -351,3 +351,101 @@ func verifyICMPv4Checksum(t *testing.T, icmpHeader header.ICMPv4) {
 	require.Equal(t, icmpHeader.Checksum(), header.ICMPv4Checksum(icmpHeader, 0),
 		"the ICMPv4 checksum is invalid; the message would be discarded by the receiver")
 }
+
+// TestPacketTooBigCanBeAddressedToAnExplicitPeer covers buildICMPErrorTo.
+//
+// It exists because of a defect the live HTTP/3 test found and the tests above could
+// not: those all build an error for a packet that arrived FROM a peer, where
+// addressing the reply to the packet's source is correct. The endpoint's own PTB path
+// is the other direction - the packet that did not fit is one the endpoint was SENDING
+// INTO a tunnel - and there the source is frequently the ENDPOINT's own tunnel address.
+// Addressing the error to it means the peer that needs the message never receives it.
+//
+// MEASURED on a live asymmetric tunnel before the fix:
+//
+//	reply src=198.18.0.1 dst=198.18.0.1   quoted src=198.18.0.1 dst=198.18.0.2
+//	lookup(198.18.0.1) -> not found       client received: nothing
+//
+// The rewrite also has to maintain the checksums, which is what the second half of this
+// test pins: the IPv4 checksum covers the addresses and the ICMPv6 checksum covers them
+// through the pseudo-header, so an address change without a recomputation produces an
+// error every real stack discards - indistinguishable, from the peer's side, from the
+// delivery failure being fixed.
+func TestPacketTooBigCanBeAddressedToAnExplicitPeer(t *testing.T) {
+	t.Run("ipv4", func(t *testing.T) {
+		// The oversized packet is one the ENDPOINT generated, so its source is the
+		// gateway - the exact shape that made the old addressing wrong.
+		gateway := netip.MustParseAddr("198.18.0.1")
+		peer := netip.MustParseAddr("198.18.0.2")
+		oversized := buildTestIPv4Packet(t, gateway, peer, 1400)
+
+		const advertisedMTU = 1280
+
+		reply, built := buildICMPErrorTo(oversized, tun.ICMPErrorPacketTooBig,
+			gateway, netip.Addr{}, peer, advertisedMTU, PacketHeadroom)
+		require.True(t, built)
+		defer reply.Release()
+
+		packet := reply.Bytes()
+		ipHeader := header.IPv4(packet)
+		require.True(t, ipHeader.IsValid(len(packet)),
+			"the header must stay self-consistent after the destination rewrite")
+
+		require.Equal(t, gateway, ipHeader.SourceAddr(),
+			"the error must still come from the endpoint's tunnel address")
+		require.Equal(t, peer, ipHeader.DestinationAddr(),
+			"the error must be addressed to the PEER whose tunnel could not carry the "+
+				"packet, not to the source of the oversized packet (which here is the "+
+				"endpoint itself, so the peer would never learn the MTU)")
+
+		icmpHeader := header.ICMPv4(ipHeader.Payload())
+		require.Equal(t, header.ICMPv4DstUnreachable, icmpHeader.Type())
+		require.Equal(t, header.ICMPv4FragmentationNeeded, icmpHeader.Code())
+		require.Equal(t, uint16(advertisedMTU), icmpHeader.MTU())
+
+		// Recomputing the checksum is the part that makes the rewrite deliverable.
+		verifyIPv4Checksum(t, packet)
+		verifyICMPv4Checksum(t, icmpHeader)
+
+		// The quoted packet is unchanged by the rewrite: it must still identify the
+		// packet that was too large, not the error that reports it.
+		quoted := icmpHeader.Payload()
+		require.Equal(t, oversized[:len(quoted)], quoted,
+			"rewriting the destination must not disturb the quoted original, or the "+
+				"peer cannot tell which flow was affected")
+	})
+
+	t.Run("ipv6", func(t *testing.T) {
+		gateway := netip.MustParseAddr("2001:db8:1::1")
+		peer := netip.MustParseAddr("2001:db8:1::2")
+		oversized := buildTestIPv6Packet(t, gateway, peer, 1400)
+
+		const advertisedMTU = 1280
+
+		reply, built := buildICMPErrorTo(oversized, tun.ICMPErrorPacketTooBig,
+			netip.Addr{}, gateway, peer, advertisedMTU, PacketHeadroom)
+		require.True(t, built)
+		defer reply.Release()
+
+		packet := reply.Bytes()
+		ipHeader := header.IPv6(packet)
+		require.True(t, ipHeader.IsValid(len(packet)))
+
+		require.Equal(t, gateway, ipHeader.SourceAddr())
+		require.Equal(t, peer, ipHeader.DestinationAddr(),
+			"the ICMPv6 error must be addressed to the peer")
+
+		icmpHeader := header.ICMPv6(ipHeader.Payload())
+		require.Equal(t, header.ICMPv6PacketTooBig, icmpHeader.Type())
+		require.Equal(t, header.ICMPv6UnusedCode, icmpHeader.Code())
+
+		// IPv6 has no header checksum, so the only integrity field is the ICMPv6 one
+		// - and it covers the addresses through the pseudo-header. A rewrite that
+		// skipped it would leave a message every receiver drops.
+		require.Equal(t, icmpHeader.Checksum(), header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header: icmpHeader,
+			Src:    ipHeader.SourceAddressSlice(),
+			Dst:    ipHeader.DestinationAddressSlice(),
+		}), "the ICMPv6 checksum must be recomputed for the rewritten destination")
+	})
+}

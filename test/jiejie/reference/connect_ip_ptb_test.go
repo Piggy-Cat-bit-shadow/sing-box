@@ -61,7 +61,25 @@ func startConnectIPPTBServer(t *testing.T) *singBoxServer {
 	return startSingBoxConnectIPServer(t)
 }
 
-// TestReferenceConnectIPPacketTooBigOverHTTP3 attempts the live PTB path.
+// TestReferenceConnectIPPacketTooBigOverHTTP3 measures the live PTB path on a
+// SYMMETRIC echo tunnel.
+//
+// # Superseded for the PTB claim by connect_ip_ptb_live_test.go
+//
+// This fixture cannot reach the trigger, and the note it records below says why: its
+// two QUIC peers use the same InitialPacketSize, so the connection is symmetric and the
+// server can always shrink its echo reply to fit. It therefore reports NOT-TESTED and
+// remains as the measurement that established the constraint.
+//
+// The PTB claim itself is now made by
+// TestReferenceConnectIPPacketTooBigOverHTTP3Live, which configures the two peers with
+// DIFFERENT InitialPacketSize values and disables path MTU discovery on both, giving the
+// client more send capacity than the server. That makes "a request that fits, a reply
+// that does not" reachable without any public asymmetric origin, and the test REQUIRES
+// the PTB rather than recording whichever branch occurred.
+//
+// This test is kept because it still proves something the other does not: that an
+// ordinary symmetric tunnel answers a large request at all, without a size failure.
 //
 // It discovers the connection's real datagram limit by BISECTION from the client side -
 // quic-go exposes no getter, but it returns a DatagramTooLargeError carrying
