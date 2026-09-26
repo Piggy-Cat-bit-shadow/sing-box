@@ -176,3 +176,67 @@ is `NOT-TESTED` or `SKIP` with a reason. In particular:
 Fill in the verdict column, attach the raw measurements for anything that is not `PASS`,
 and record the binary SHA256 and `BUILD-INFO-VPS.txt` alongside the result. If any Part 2
 row is `FAIL`, the deployment does not ship until it is understood.
+
+---
+
+## Part 3 — The repeatable runner
+
+`scripts/acceptance/jiejie-masque-vps.sh` automates the parts of this checklist that can be
+collected mechanically, and writes a verdict table in the format above.
+
+It is a RUNNER, not a substitute for a deployment. Without reachable infrastructure it
+writes `NOT-TESTED` for every row and exits 0 with a report that contains **zero** `PASS`
+lines. That is the intended behaviour: the script can only report what it observed, and it
+observed nothing.
+
+### Modes
+
+| Mode | What it does | Safety |
+| --- | --- | --- |
+| `--safe` (default) | Collects facts, inspects the certificate, checks ALPN, runs the external client | Read-only. Changes nothing on the server |
+| `--stress` | Adds soak and churn at 10/50/100/250/500 concurrency, with RSS/VmPeak/FD/thread sampling | Loads the server; still modifies nothing |
+| `--destructive` | Adds kill -9 recovery | Requires `--destructive` **and** `JIEJIE_ACCEPT_DESTRUCTIVE=1`; anything it changes it restores |
+
+`--destructive` without `JIEJIE_ACCEPT_DESTRUCTIVE=1` refuses to start. A single flag is
+too easy to leave in a shell history and re-run against production by accident.
+
+FD exhaustion and cgroup memory pressure are deliberately `SKIP` even in destructive
+mode: they need a reviewed plan for the specific host, and an unattended script that
+lowers a production limit and fails to restore it is worse than no test.
+
+### Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `JIEJIE_VPS_HOST` | The deployment. Unset means every row is `NOT-TESTED` |
+| `JIEJIE_VPS_USER` | SSH user (default `root`) |
+| `JIEJIE_TLS_NAME` | The SNI name, for the certificate and ALPN checks |
+| `JIEJIE_MASQUE_USER` / `JIEJIE_MASQUE_PASSWORD` | Test credentials |
+| `JIEJIE_VPS_CLIENT` | The EXTERNAL client harness. It must not run on the VPS |
+| `JIEJIE_ACCEPTANCE_OUT` | Where the report and `BUILD-INFO-VPS.txt` are written |
+
+Credentials are read from the environment only and never appear on a command line, so they
+cannot leak through `ps`, shell history or a CI log. The runner never echoes a password.
+
+### The external client is not optional
+
+The runner refuses to claim any WAN result from the server itself. A `curl` on the VPS
+proves the loopback path and nothing about the deployment, so every WAN row depends on
+`JIEJIE_VPS_CLIENT` running somewhere else. Its exit codes are interpreted as: `0` PASS,
+`77` SKIP with a reason, anything else FAIL.
+
+### Real WAN PMTU is a separate measurement
+
+The runner probes inner payload sizes from 1000 to 1400 over the real path. That result is
+recorded **separately** from the loopback Packet Too Big test in
+`test/jiejie/reference/connect_ip_ptb_live_test.go`, and the two must never be conflated:
+the loopback test proves the ICMP error is generated and delivered by the real
+`DatagramTooLarge` path, while this proves what the real network does. Neither substitutes
+for the other.
+
+### What automation still cannot produce
+
+Mobile handover, NAT rebinding under a real carrier, and CGNAT remain `NOT-TESTED` until a
+person performs the recorded procedure in the report's manual section. Both "survived" and
+"reconnected" are acceptable outcomes; what matters is that the recorded observation
+matches the expectation.
