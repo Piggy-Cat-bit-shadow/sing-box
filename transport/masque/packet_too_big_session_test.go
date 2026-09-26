@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sync"
 	"testing"
 
 	"github.com/sagernet/sing-tun"
@@ -37,15 +36,15 @@ import (
 
 // recordingSession is a sessionHandler that records what reached it.
 //
+// It needs no mutex of its own: the tests below drive one session at a time from a single
+// goroutine, and the fields are read only after the call under test has returned.
+//
 // handlePacketTooBig is reached through session.writePacket when the QUIC connection
 // reports a datagram that does not fit. The serverSession.handlePacketTooBig path builds an
 // ICMP error and QUEUES it, so the tests below assert on the queued reply and on WHICH
 // session received it - the recording handler is the instrument for the writePacket path
 // and for proving the other session's handler saw nothing.
 type recordingSession struct {
-	access sync.Mutex
-	// queued are the buffers the session wrote to its outbound queue.
-	queued []*buf.Buffer
 	// packets are the buffers passed to handlePacket.
 	packets []*buf.Buffer
 	// tooBig are the buffers passed to handlePacketTooBig.

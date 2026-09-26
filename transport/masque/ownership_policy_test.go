@@ -241,27 +241,23 @@ func drainQueuedPacketsUntil(t *testing.T, current *serverSession, expected int)
 	}
 }
 
-// takeQueued returns the next packet a session queued, or nil when nothing is pending.
+// takeQueuedUntil pops the next packet a session queued, or nil when nothing is pending,
+// waiting first for a delivery the caller expects.
 //
 // The queue delivers through its handler, so the fixture records what arrived and this
 // pops from that record. A session that has not been run() never drains its own queue, so a
 // test that wants to observe a DELIVERED packet takes it here.
-func (s *serverSession) takeQueued() *buf.Buffer {
-	return s.takeQueuedUntil(nil)
-}
-
-// takeQueuedUntil is takeQueued with a settle predicate, used to observe a reply that the
-// production path queues asynchronously.
 //
-// tun.OutboundQueue.WriteBuffers only ENQUEUES the buffer: a handler-loop goroutine calls
-// the delivery handler afterwards. Production does not care, because that loop runs for as
-// long as the session does, but a test that queues a reply and reads it immediately races
-// the loop and observes nothing. Waiting for the expected reply observes the same
-// DELIVERED packet through the same production queue without weakening any assertion.
+// The wait exists because tun.OutboundQueue.WriteBuffers only ENQUEUES the buffer: a
+// handler-loop goroutine calls the delivery handler afterwards. Production does not care,
+// because that loop runs for as long as the session does, but a test that queues a reply
+// and reads it immediately races the loop and observes nothing. Waiting for the expected
+// reply observes the same DELIVERED packet through the same production queue without
+// weakening any assertion.
 //
 // pending reports whether the caller still expects more packets. A predicate rather than a
-// fixed count, so a test asserting EMPTINESS returns immediately instead of paying a
-// timeout, while a test asserting a reply waits for that reply to actually arrive.
+// fixed count, so a test asserting EMPTINESS passes nil and returns immediately instead of
+// paying a timeout, while a test asserting a reply waits for that reply to actually arrive.
 func (s *serverSession) takeQueuedUntil(pending func(queued int) bool) *buf.Buffer {
 	if pending != nil {
 		deadline := time.Now().Add(settleTimeout)
