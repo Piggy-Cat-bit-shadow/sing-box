@@ -411,6 +411,181 @@ func (c *http3PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	}
 }
 
+// CreateConnectedPacketBatchReadWaiter offers the batch read path to bufio.CopyPacket.
+//
+// # Why the destination being fixed is what makes this possible
+//
+// The standard batch waiter must return a destination per packet, because an
+// unconnected socket can receive from anywhere. This connection's destination is fixed
+// by the CONNECT-UDP request, so the connected form is the honest one: it returns a
+// single destination for the whole batch and lets the writer use a connected socket.
+//
+// bufio.CopyPacket tries the batch forms BEFORE the single-packet form, so offering
+// this is what moves a CONNECT-UDP tunnel off the one-packet-at-a-time path and onto
+// copyConnectedPacketBatchToConnectedWaitWithPool. That path is also the only consumer
+// of the zero-copy wrapping done at ingress: ReadPacket must copy into the caller's
+// buffer, but the batch waiter hands the queued buffers straight to the writer.
+//
+// Returning false here is always safe: CopyPacket falls through to the next capability,
+// and ultimately to ReadPacket/WritePacket. So this is an optimization the caller opts
+// into, never a correctness requirement.
+func (c *http3PacketConn) CreateConnectedPacketBatchReadWaiter() (N.ConnectedPacketBatchReadWaiter, bool) {
+	return &connectedBatchReadWaiter{conn: c, batchSize: defaultBatchSize}, true
+}
+
+// CreateConnectedPacketBatchWriteCreator offers the batch write path to bufio.CopyPacket.
+func (c *http3PacketConn) CreateConnectedPacketBatchWriter() (N.ConnectedPacketBatchWriter, bool) {
+	return &connectedBatchWriter{conn: c}, true
+}
+
+// defaultBatchSize is the number of datagrams one batch read collects when the caller
+// does not ask for a specific size. It matches sing's DefaultPacketReadBatchSize so a
+// CONNECT-UDP tunnel batches like every other connected UDP path rather than inventing
+// its own number.
+const defaultBatchSize = 64
+
+// connectedBatchReadWaiter collects queued datagrams into one batch.
+type connectedBatchReadWaiter struct {
+	conn      *http3PacketConn
+	batchSize int
+}
+
+// InitializeReadWaiter reserves the batch slice. It reports needCopy=false because the
+// queue already holds fully-formed buffers: nothing has to be copied into the waiter's
+// own storage.
+func (w *connectedBatchReadWaiter) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	w.batchSize = options.BatchSize
+	if w.batchSize <= 0 {
+		w.batchSize = defaultBatchSize
+	}
+	return false
+}
+
+// WaitReadConnectedPackets blocks for the first datagram, then drains what is already
+// queued up to the batch bound.
+//
+// The first packet MAY block; every later one is taken non-blockingly, so a batch is
+// whatever the tunnel actually has in flight and never waits for a slow sender to fill
+// it. An empty return with ok reports a closed connection.
+//
+// Ownership: every buffer returned is handed to the caller, which in the CopyPacket
+// path is the batch writer that releases them. On the error path nothing is returned
+// and nothing is leaked, because the buffers taken from the queue are returned to the
+// caller or, on a context cancellation, released here.
+func (w *connectedBatchReadWaiter) WaitReadConnectedPackets() ([]*buf.Buffer, M.Socksaddr, error) {
+	// The first packet may block: an idle tunnel must park here rather than spin.
+	select {
+	case first := <-w.conn.packets:
+		buffers := make([]*buf.Buffer, 0, w.batchSize)
+		buffers = append(buffers, first)
+		// Drain what is ALREADY queued, without waiting for more.
+		//
+		// The bound is the batch size, so one slow reader cannot turn a burst into an
+		// unbounded allocation. Anything left stays queued for the next round, which
+		// preserves order: the channel is FIFO and this loop takes from the front.
+		for len(buffers) < w.batchSize {
+			select {
+			case next := <-w.conn.packets:
+				buffers = append(buffers, next)
+			default:
+				return buffers, w.conn.destination, nil
+			}
+		}
+		return buffers, w.conn.destination, nil
+	case <-w.conn.ctx.Done():
+		return nil, M.Socksaddr{}, w.conn.closeError()
+	}
+}
+
+// closeError reports the connection's terminal error, defaulting to net.ErrClosed so a
+// caller never receives a nil error alongside an empty result.
+func (c *http3PacketConn) closeError() error {
+	if c.err != nil {
+		return c.err
+	}
+	return net.ErrClosed
+}
+
+// connectedBatchWriter forwards one batch of target replies to the client.
+type connectedBatchWriter struct {
+	conn *http3PacketConn
+}
+
+// WriteConnectedPacketBatch sends one batch, holding the write lock ONCE for the whole
+// batch instead of once per packet.
+//
+// # Datagram vs capsule, per packet
+//
+// The transport decision is made per packet, because it depends on whether the peer
+// negotiated HTTP Datagrams and on whether THIS payload fits:
+//
+//	a datagram-capable peer, payload accepted  -> HTTP Datagram
+//	DatagramUnsupported                        -> DATAGRAM capsule
+//	DatagramTooLarge                           -> DATAGRAM capsule (it is a size problem,
+//	                                              not a capability problem: the peer can
+//	                                              still read a capsule, and a capsule
+//	                                              has no datagram size ceiling)
+//	any other error                            -> returned to the caller
+//
+// That last line is deliberate and matches the single-packet path: a real QUIC
+// connection error must NOT be downgraded into a capsule write, which would turn a
+// transport failure into a silent protocol change.
+//
+// The single lock for the batch is what makes the capsule case cheaper: a run of
+// fallback capsules is written under one acquisition, in order, instead of one
+// lock/unlock per packet.
+//
+// Ownership: the batch AND everything in it belongs to this call in all cases, so it
+// releases every buffer before returning, on every path.
+func (w *connectedBatchWriter) WriteConnectedPacketBatch(buffers []*buf.Buffer) error {
+	c := w.conn
+
+	// Datagrams cannot be written concurrently on one stream, and the capsule fallback
+	// writes to the stream too, so the whole batch takes the lock once.
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+
+	defer func() {
+		for _, buffer := range buffers {
+			buffer.Release()
+		}
+	}()
+
+	for _, buffer := range buffers {
+		if err := c.writeOnePacketLocked(buffer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeOnePacketLocked writes a single payload, datagram-first with a capsule fallback.
+// The caller MUST hold writeAccess.
+func (c *http3PacketConn) writeOnePacketLocked(buffer *buf.Buffer) error {
+	datagram := PrependContextID(buffer)
+	if c.stream.DatagramsEnabled() {
+		err := c.stream.SendDatagram(datagram.Bytes())
+		switch {
+		case err == nil:
+			// SendDatagram copies the payload into the QUIC frame, so the buffer is
+			// reusable immediately; the caller's deferred release handles it.
+			return nil
+		case errors.Is(err, ErrDatagramUnsupported):
+			// Fall through to the capsule path.
+		default:
+			var tooLarge *DatagramTooLargeError
+			if !errors.As(err, &tooLarge) {
+				// A real transport error. Returning it lets CopyPacket close the
+				// session instead of silently switching transports.
+				return err
+			}
+			// Too large for a datagram: a capsule carries it instead. This is a size
+			// decision, not a capability one.
+		}
+	}
+	return WriteDatagramCapsule(c.stream, datagram)
+}
+
 func (c *http3PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	datagram := PrependContextID(buffer)
 	err := c.stream.SendDatagram(datagram.Bytes())
