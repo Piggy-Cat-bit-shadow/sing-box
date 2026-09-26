@@ -164,6 +164,11 @@ jobs:
           #                       never completes. That is a host limitation, not a
           #                       protocol disagreement, so it is reported as
           #                       NOT-TESTED instead of being blamed on sing-box.
+          cd "$GITHUB_WORKSPACE"
+          transport_outcome="$(bash scripts/ci/quiche-result.sh "HTTP/3 transport" quiche-interop.log "$status")"
+          echo "transport_outcome=$transport_outcome" >> "$GITHUB_ENV"
+          echo "HTTP/3 transport outcome: $transport_outcome (exit $status)"
+
           if grep -q -- '--- SKIP' "$GITHUB_WORKSPACE/quiche-interop.log"; then
             if grep -q 'produced no output' "$GITHUB_WORKSPACE/quiche-interop.log"; then
               echo "::warning::the QUICHE transport interop did not complete on this runner (UDP receive-buffer limit). NOT-TESTED here; it passes on a host where QUICHE runs."
@@ -186,28 +191,58 @@ jobs:
       #
       # The `|| true` is deliberate and is why this step is separated from the gate
       # above: the two claims must not share a verdict.
-      - name: QUICHE CONNECT-UDP tunnel interop (reported, NOT-TESTED upstream)
+      - name: QUICHE CONNECT-UDP tunnel interop (reported)
         if: always()
         run: |
           set -euo pipefail
           cd test/jiejie/reference
+          set +e
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
             go test -v -count=1 -timeout 15m \
             -run 'TestReferenceQuicheConnectUDPLiveInterop' . \
-            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log" || true
-          echo "::notice::the CONNECT-UDP tunnel claim is NOT-TESTED; see the test comment for the measured blocker"
+            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          # The result is CLASSIFIED rather than discarded. This step does not gate the
+          # workflow - a known incomplete external interoperability test must not stop the
+          # rest of the suite - but `|| true` alone threw the outcome away, so a green run
+          # could mean passed, failed, or never ran.
+          cd "$GITHUB_WORKSPACE"
+          outcome="$(bash scripts/ci/quiche-result.sh "CONNECT-UDP" quiche-interop.log "$status")"
+          echo "CONNECT-UDP outcome: $outcome (exit $status)"
+          echo "connect_udp_outcome=$outcome" >> "$GITHUB_ENV"
+          if [ "$outcome" = "PASS" ]; then
+            echo "::notice::QUICHE CONNECT-UDP interop PASSED"
+          elif [ "$outcome" = "EXECUTED-FAILED" ]; then
+            echo "::warning::QUICHE CONNECT-UDP EXECUTED and FAILED. This is an observed failure, not an absence of testing."
+          else
+            echo "::warning::QUICHE CONNECT-UDP: $outcome"
+          fi
 
       - name: QUICHE CONNECT-IP tunnel interop (reported)
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.run_connect_ip) }}
         run: |
           set -euo pipefail
           cd test/jiejie/reference
+          set +e
           JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
           JIEJIE_FULL_REGISTRY_BINARY=1 \
             go test -v -count=1 -timeout 15m \
             -run 'TestReferenceQuicheConnectIPLiveInterop' . \
-            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log" || true
-          echo "::notice::the CONNECT-IP tunnel claim is NOT-TESTED; see the test comment"
+            2>&1 | tee -a "$GITHUB_WORKSPACE/quiche-interop.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          outcome="$(bash scripts/ci/quiche-result.sh "CONNECT-IP" quiche-interop.log "$status")"
+          echo "CONNECT-IP outcome: $outcome (exit $status)"
+          echo "connect_ip_outcome=$outcome" >> "$GITHUB_ENV"
+          if [ "$outcome" = "PASS" ]; then
+            echo "::notice::QUICHE CONNECT-IP interop PASSED"
+          elif [ "$outcome" = "EXECUTED-FAILED" ]; then
+            echo "::warning::QUICHE CONNECT-IP EXECUTED and FAILED. This is an observed failure, not an absence of testing."
+          else
+            echo "::warning::QUICHE CONNECT-IP: $outcome"
+          fi
 
       - name: Summarise the interop result
         if: always()
@@ -215,6 +250,19 @@ jobs:
           set -euo pipefail
           {
             echo "## Google QUICHE live MASQUE interop"
+            echo
+            # The two verdicts are stated separately and FIRST, because the workflow can be
+            # green while the tunnel claims are not established. Without this a reader sees a
+            # passing Action and concludes the interoperability was proven.
+            echo "| Claim | Outcome | Interop |"
+            echo "| --- | --- | --- |"
+            echo "| HTTP/3 transport | ${TRANSPORT_OUTCOME:-unknown} | $([ "${TRANSPORT_OUTCOME:-}" = "PASS" ] && echo "ESTABLISHED" || echo "NOT ESTABLISHED") |"
+            echo "| CONNECT-UDP tunnel | ${CONNECT_UDP_OUTCOME:-unknown} | $([ "${CONNECT_UDP_OUTCOME:-}" = "PASS" ] && echo "ESTABLISHED" || echo "NOT ESTABLISHED") |"
+            echo "| CONNECT-IP tunnel | ${CONNECT_IP_OUTCOME:-not applicable} | $([ "${CONNECT_IP_OUTCOME:-}" = "PASS" ] && echo "ESTABLISHED" || echo "NOT ESTABLISHED") |"
+            echo
+            echo "**HARNESS EXECUTION SUCCEEDED is not the same as MASQUE INTEROPERABILITY PASSED.**"
+            echo "A green workflow means the reference client was built and run; it does not mean"
+            echo "the tunnel claims were established. Read the table above."
             echo
             echo "QUICHE commit: \`${{ steps.pin.outputs.commit }}\`"
             echo

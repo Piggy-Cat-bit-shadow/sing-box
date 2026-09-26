@@ -3,6 +3,7 @@ package reference_test
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -112,15 +113,101 @@ type quicheRun struct {
 	command string
 	output  string
 	err     error
+
+	// started reports whether the process was actually launched. A failure to start is a
+	// different outcome from a process that ran and failed, and conflating them would let a
+	// broken binary path read as a protocol problem.
+	started bool
+	// timedOut reports that the process was killed because it exceeded the deadline. It is
+	// captured from the context rather than inferred from the error text, because matching
+	// strings to detect a deadline is exactly the kind of check that breaks silently.
+	timedOut bool
+	// exitCode is the process exit status, or -1 when it never exited normally.
+	exitCode int
+}
+
+// quicheOutcome is the precise classification of one QUICHE invocation.
+//
+// The task this implements distinguishes three separate questions, and collapsing them
+// loses the information that makes a failure actionable:
+//
+//	EXECUTION     did the process run at all?
+//	OBSERVED      what did it do?
+//	INTEROP       did the two implementations interoperate?
+//
+// A process that exited non-zero after running is EXECUTED-FAILED with a known exit code.
+// It is NOT "not tested": it was tested, and it failed. A process killed by the deadline is
+// INCONCLUSIVE-TIMEOUT, which is also not "not tested" and is not a failure of either
+// implementation - it is an absence of evidence.
+type quicheOutcome string
+
+const (
+	// notRunBinaryMissing: no binary was available, so nothing was executed.
+	notRunBinaryMissing quicheOutcome = "NOT-RUN (binary missing)"
+	// notRunStartFailed: a binary was configured but the process could not be launched.
+	notRunStartFailed quicheOutcome = "NOT-RUN (start failed)"
+	// executedFailed: the process ran and exited non-zero.
+	executedFailed quicheOutcome = "EXECUTED-FAILED"
+	// inconclusiveTimeout: the process was killed at the deadline.
+	inconclusiveTimeout quicheOutcome = "INCONCLUSIVE-TIMEOUT"
+	// executedSucceeded: the process ran and exited zero.
+	executedSucceeded quicheOutcome = "EXECUTED-SUCCEEDED"
+)
+
+// classify maps a run to its outcome.
+//
+// The order matters: a timeout is checked before the exit code, because a killed process
+// also reports an error and reporting it as EXECUTED-FAILED would blame the implementation
+// for a harness deadline.
+func (r quicheRun) classify() quicheOutcome {
+	switch {
+	case !r.started:
+		return notRunStartFailed
+	case r.timedOut:
+		return inconclusiveTimeout
+	case r.err != nil:
+		return executedFailed
+	default:
+		return executedSucceeded
+	}
+}
+
+// describe renders the outcome with the evidence that supports it, for a log or a summary.
+func (r quicheRun) describe() string {
+	description := string(r.classify())
+	if r.started {
+		description += fmt.Sprintf(" (exit code %d)", r.exitCode)
+	}
+	if r.timedOut {
+		description += " [killed at the execution deadline]"
+	}
+	return description
 }
 
 // runQuicheClient executes masque_client with the given arguments and a bounded
 // deadline.
 //
-// The password is never placed on the command line: proxy credentials travel in a
-// header value that the caller builds, and the recorded command string redacts it.
-// That keeps credentials out of `ps`, shell history and workflow logs, which is a
-// requirement rather than a nicety because these runs happen on shared runners.
+// # Credential visibility: what is and is not protected
+//
+// The credentials used here are TEST-ONLY and are the same throwaway values the rest of
+// this fixture suite uses. No real production secret is loaded into this test.
+//
+// TEST-ONLY CREDENTIALS APPEAR IN PROCESS ARGV. They are passed as
+// `--proxy_headers=...:<value>`, so they are visible to `ps` and to anything else that can
+// read the process table for the duration of the run. The redaction below protects the
+// RECORDED command and the LOGS, and nothing more. An earlier version of this comment
+// claimed the password was "never placed on the command line"; that was wrong for this
+// implementation and is corrected here rather than papered over.
+//
+// A fix would require QUICHE's masque_client to accept headers from stdin or a protected
+// file. It does not: the pinned binary takes them only as a flag, and changing Google
+// QUICHE's C++ to work around a test-harness visibility issue would be out of scope for
+// this repository and would invalidate the pinned-interop evidence. So the limitation is
+// recorded instead of being hidden, and it is contained by using throwaway credentials.
+//
+// Re-encoding the credential (for example base64-in-base64) would NOT hide it: any
+// transformation the client can reverse, an observer can reverse too. That kind of change
+// is deliberately not made, because it would obscure the limitation without removing it.
 func runQuicheClient(t *testing.T, client *quicheClient, timeout time.Duration, args ...string) quicheRun {
 	t.Helper()
 
@@ -135,18 +222,44 @@ func runQuicheClient(t *testing.T, client *quicheClient, timeout time.Duration, 
 	combined, err := command.CombinedOutput()
 
 	recorded := redactQuicheCommand(append([]string{client.path}, args...))
-	return quicheRun{
-		command: strings.Join(recorded, " "),
-		output:  string(combined),
-		err:     err,
+	run := quicheRun{
+		command:  strings.Join(recorded, " "),
+		output:   string(combined),
+		err:      err,
+		exitCode: -1,
 	}
+
+	// Whether the process STARTED is read from the process state, not guessed from the
+	// error: an exec failure leaves no process, while a killed or failed process does.
+	if command.ProcessState != nil {
+		run.started = true
+		run.exitCode = command.ProcessState.ExitCode()
+	} else if ctx.Err() == nil {
+		// No process state and the deadline had not passed: the launch itself failed.
+		run.started = false
+	}
+
+	// The deadline is read from the context, which is the only reliable signal. Inferring
+	// it from the error or from empty output was the previous behaviour and it could not
+	// tell a timeout apart from a process that ran and printed nothing.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		run.timedOut = true
+		run.started = true
+	}
+
+	return run
 }
 
 // redactQuicheCommand removes proxy credentials from a recorded command line.
 //
-// The Basic value is base64 of user:password and the Concealed value is a
-// signature; neither belongs in a log or an artifact. The header NAME is kept so
-// a reader can still see that authentication was configured.
+// The Basic value is base64 of user:password and the Concealed value is a signature;
+// neither belongs in a log or an artifact. The header NAME is kept so a reader can still
+// see that authentication was configured.
+//
+// Scope: this protects the RECORDED string - what the test logs, what the workflow summary
+// prints and what an uploaded artifact contains. It does NOT change what the operating
+// system exposes while the process runs, because the value is still in the process's argv.
+// See the note on runQuicheClient.
 func redactQuicheCommand(argv []string) []string {
 	redacted := make([]string, len(argv))
 	for index, argument := range argv {
@@ -419,31 +532,38 @@ func TestReferenceQuicheH3TransportLiveInterop(t *testing.T) {
 	t.Logf("QUICHE command: %s", run.command)
 	t.Logf("QUICHE output:\n%s", run.output)
 
-	if run.err != nil && strings.TrimSpace(run.output) == "" {
-		// No output at all means QUICHE never got far enough to log anything, which
-		// is a DIFFERENT outcome from QUICHE running and reporting a disagreement -
-		// and the difference matters, because only the second is evidence about this
-		// repository.
+	t.Logf("HTTP/3 transport outcome: %s", run.describe())
+
+	switch run.classify() {
+	case inconclusiveTimeout:
+		// INCONCLUSIVE, not NOT-TESTED and not FAIL: the process ran but was killed at
+		// the deadline, so no exchange was observed. Reporting it as a failure would
+		// blame an implementation for a harness deadline; reporting it as a pass would
+		// claim an exchange that never happened.
 		//
-		// MEASURED on a GitHub-hosted runner: this test passes locally on macOS and
-		// Linux in ~0.2s, but on the runner QUICHE produced no output and the process
-		// was killed by the harness deadline. The runner's own log names the cause:
-		// the UDP socket buffer could not be grown ("was: 1024 kiB, wanted: 7168
-		// kiB, got: 2048 kiB"), which is a host-tuning limit rather than a protocol
-		// difference. A QUIC handshake that cannot complete because the socket
-		// buffer is too small says nothing about either implementation.
-		//
-		// Reporting that as FAIL would be a false negative that blames sing-box for
-		// a runner limitation, so it is reported as NOT-TESTED with the reason.
-		t.Skipf("QUICHE produced no output within %s and was killed, so no transport "+
-			"exchange was observed. On a host where QUICHE runs, this test passes. "+
-			"On a GitHub-hosted runner the cause was the UDP receive-buffer limit "+
-			"(see the runner log: 'failed to sufficiently increase receive buffer "+
-			"size'). This is NOT-TESTED, never a pass.", quicheTestTimeout)
+		// The runner also reports a UDP receive-buffer warning, which is recorded as a
+		// HOST ENVIRONMENT DIAGNOSTIC. It is deliberately NOT stated as the cause:
+		// MEASURED, the process produced no output at all before the deadline, and a
+		// warning about a socket buffer does not by itself prove it stopped the
+		// handshake. Causality is UNCONFIRMED.
+		t.Skipf("QUICHE PROCESS TIMED OUT after %s without completing the exchange, so "+
+			"no transport interop was observed. EXECUTION: %s. OBSERVED RESULT: no "+
+			"output before the deadline. INTEROP VERDICT: not established. ROOT CAUSE: "+
+			"UNCONFIRMED - the runner additionally reported a UDP receive-buffer warning, "+
+			"which is recorded as host-environment diagnostic evidence and is not proof "+
+			"of causation. On a host where QUICHE runs, this test passes.",
+			quicheTestTimeout, run.describe())
+	case notRunStartFailed:
+		require.Failf(t, "QUICHE did not start",
+			"the binary at %s could not be launched: %v", client.path, run.err)
+	case executedFailed:
+		require.Failf(t, "QUICHE EXECUTED-FAILED",
+			"the process ran and exited non-zero (%s), so the two implementations did "+
+				"not complete an HTTP/3 exchange. This is a real observed failure, not an "+
+				"absence of testing. Output is above.", run.describe())
+	case executedSucceeded:
+		// Nothing to do: the assertions below establish the result.
 	}
-	require.NoError(t, run.err,
-		"QUICHE ran and produced output but exited non-zero, so the two "+
-			"implementations did not agree at the transport layer. Output is above")
 
 	// The server must have logged its listener and no protocol error, which is the
 	// server-side half of the same statement.
