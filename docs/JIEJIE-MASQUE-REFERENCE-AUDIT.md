@@ -446,3 +446,156 @@ does not apply here.
 Not implemented and not planned here: CONNECT-ETHERNET, Concealed Auth,
 CONNECT-UDP-BIND, Compression Assign, DNS_ASSIGN, PREF64, and experimental
 drafts.
+
+## Pre-VPS Final Closure
+
+This section records the last code-closure round before Linux amd64 VPS acceptance. Its
+purpose was NOT to add MASQUE features. It was to finish the correctness, security,
+resource-bound, lifecycle, protocol-boundary and test-evidence work that can be done
+locally, in CI, or against the reference implementations.
+
+### Baseline corrected
+
+The document header used to describe the audit branch as `masque-reference-hardening`
+and marked it "experimental; not merged". **That is no longer true and the header has been
+corrected**: the MASQUE hardening is merged into `testing`, which is the fork's main
+development branch, and the VPS work continues from there. The Phase 1 / Phase 2 / Phase 3
+history above is retained rather than rewritten; this section is the current state.
+
+| Item | Value |
+| --- | --- |
+| Branch | `testing` (main development branch; MASQUE hardening merged) |
+| Phase 1 head | `d159ec09d` |
+| Phase 2 head | `67e55b387` |
+| Phase 3 head | `419a7e2ef` |
+| Pre-VPS closure base | `419a7e2ef` |
+
+### Production bugs found in this round
+
+Exactly one. It is a real defect with a failing regression, not a hardening change.
+
+**The MASQUE inner-packet size bound discarded legal IPv6 packets.**
+`transport/masque/session.go` bounded one inner IP packet at 65535 bytes. That is the
+IPv4 figure - an IPv4 Total Length field is 16 bits and counts the WHOLE packet - and it
+is wrong for IPv6, whose Payload Length field counts only what follows the 40-byte base
+header (RFC 8200 section 3). The largest ORDINARY IPv6 packet is therefore
+`40 + 65535 = 65575` bytes.
+
+A legal IPv6 packet of 65536..65575 bytes was silently DISCARDED on the DATAGRAM capsule
+path: not misrouted, not reported, just dropped, because the size gate runs before the
+parser. Evidence, measured before the fix: a real DATAGRAM capsule carrying context ID 0
+and then a 65535-byte packet was delivered; 65536 and 65575 produced no packet at all.
+sing-tun agrees with the arithmetic (`gtcpip/header/ipv6.go` defines
+`IPv6MaximumPayloadSize = 65535` for the amount AFTER the base header, and its
+`IPv6.IsValid` admits `IPv6MinimumSize + that`).
+
+Fixed by raising the bound to `40 + 65535`, written as an expression so the arithmetic is
+visible. Jumbograms remain UNSUPPORTED and the change does not enable them; the bound is
+not removed, and `TestIPv4MaximumPacketStillBounded` plus
+`TestOversizedPacketIsDiscardedWithoutKillingTheSession` pin that it is still a bound.
+
+### TEST-HARNESS bugs found in this round
+
+These are defects in the TESTS, not in production. Each is recorded because each one made
+a test report something other than what it claimed.
+
+| Harness defect | Symptom | Correction |
+| --- | --- | --- |
+| The reference module's IPv6 control-capsule decoder read the byte before an address as a BYTE LENGTH (4/16) instead of the IP VERSION (4/6). IPv4 worked by coincidence because 4 is both. | Every IPv6 ADDRESS_ASSIGN / ROUTE_ADVERTISEMENT failed to parse. Five new regression cases fail against the old decoder. | Corrected, with RFC-derived vectors in `control_capsule_wire_test.go` that never call the production encoder. See the table below. |
+| The fuzz corpus seeds for ROUTE_ADVERTISEMENT and ADDRESS_ASSIGN were written as if the wire carried a leading entry COUNT and a byte length. | Measured against the real parsers, EVERY "valid" seed failed with "invalid IP version: 1". Because the fuzz functions open with `if err != nil { return }`, the targets reached no assertion at all and passed vacuously. | Corpus rebuilt from RFC-derived tables (`routeSeeds` / `addressSeeds`) with IPv4 and IPv6 cases; `TestRouteAdvertisementSeedsAreValid`, `TestAddressSeedsAreValid` and `TestProductionEncoderReproducesTheRFCVectors` now fail the BUILD if a seed stops being valid. |
+| `TestReferenceSourceIdentityIsStableAcrossMigration` claimed in its own doc comment to measure "what identity the SERVER layer reports ... taken from the server's own logs". It read neither the log nor the source. | The audit recorded "source identity CLOSED" on evidence that did not exist. The test proved only that the relay's source port changed and both tunnels still worked - a data-path property already covered elsewhere. | Replaced by four cases that observe `metadata.Source` through the ROUTING LAYER (`source_ip_cidr` selecting one of two named outbounds), plus a load-bearing negative control. |
+| The bounded-fuzz CI step listed four targets and had already gone stale: `FuzzMasqueIPPacketParser` and `FuzzCapsuleStreamFragmentation` existed, compiled, and never fuzzed. | Two of six targets reported "covered" while never running. | The step is per-package and ends with a coverage check that compares the targets DEFINED in the source against the ones run. Adding a target without registering it now fails the build. |
+| The reference CI coverage check matched only `TestReference*` names. | The four new `TestSourceIdentity*` tests would have been invisible to it and could have silently dropped out of the run filter. | The check now matches both naming conventions. |
+| A speculative "nothing arrived" read on the reliable capsule stream left a goroutine parked; when its timeout fired, the goroutine went on to consume the NEXT capsule. | The zero-length CONNECT-IP capsule test reported "no DATAGRAM capsule arrived" - a test artefact that reads exactly like a server defect. | Removed; the property is asserted via ordered reply sequence numbers instead. |
+| The impairment relay's CONNECT-IP case asserted its drop counter was positive after a burst of 20 requests. | Only nine packets had crossed and none hit the cadence, so the guard failed - correctly, since a run where nothing was dropped proves nothing. | The loop now drives traffic until the relay reports it actually dropped something. |
+
+### A fuzz target was misnamed, and the gap it hid
+
+`FuzzConnectUDPTemplatePath` never drove CONNECT-UDP. It drove `transport/masque`'s
+CONNECT-IP URI template (`/.well-known/masque/ip/{target}/{ipproto}/`). The name claimed
+coverage of the CONNECT-UDP target parser - the one on the production minimal VPS path -
+that did not exist.
+
+It is renamed to `FuzzConnectIPTemplatePath`, and the real parser now has its own target,
+`FuzzConnectUDPTargetPath` in `transport/http`, covering domain / IPv4 / IPv6 (raw and
+percent-escaped), ports 0, 1, 65535 and 65536, negatives, non-decimal digits, overflow,
+empty hosts, encoded and doubled slashes, malformed percent escapes, extra segments, a
+missing trailing slash, zones and Unicode. For any accepted destination it asserts that
+`connectUDPURL` followed by `parseConnectUDPTarget` recovers an equivalent destination -
+the property that keeps a client and server from routing to different places.
+
+### RFC 9931 attribution corrected
+
+The comment on `rejectionKeepAlive` claimed RFC 9931 section 6.3 requires a CONNECT-UDP
+**server** to close the connection when it rejects an upgrade. It does not. Section 6.3
+imposes a **client**-side discipline: an HTTP/1.x CONNECT-UDP client must not send UDP
+payload optimistically. The obligation is on the sender.
+
+The behaviour is unchanged and is now classified **SECURITY-HARDENING** rather than
+compliance: it removes the same smuggling shape for a client that ignores section 6.3, at
+the cost of one TLS handshake paid only on the rejection path. RFC 9931 section 8's
+server-side MUST for plain CONNECT is unchanged and remains a requirement.
+
+CONNECT-IP is deliberately NOT given the same treatment, and
+`TestJiejieMASQUERejectedHTTP1CONNECTIPLeavesTheConnectionReusable` is a guard against
+extending the rule by symmetry: RFC 9484 already forbids HTTP/1.x optimistic IP packets,
+so the shape the rule exists for is not created there.
+
+### CONNECT-IP packet size and PTB
+
+The `maxPacketSize` defect is recorded above. The ICMP Packet Too Big chain is now covered
+field by field for both families, including the ICMPv6 pseudo-header checksum (a functional
+requirement: without it every conforming receiver discards the message, so a client would
+never learn the tunnel MTU). The live end-to-end case is **NOT-TESTED** for a measured
+reason: reaching `DatagramTooLarge` needs a reply larger than its request, and a loopback
+echo origin produces a reply the server SHRINKS instead (measured: a 1311-byte request is
+answered with a 1276-byte reply). No live PTB E2E is claimed.
+
+### Reference results in this round
+
+| Reference | Result | Note |
+| --- | --- | --- |
+| quic-go/masque-go (`c1cf0e4d`) | PASS | `v0.6.0` tag; unchanged pin; CONNECT-UDP round trip, no-auth rejection, settings exchange |
+| quic-go/connect-ip-go (`fdd945e3`) | PASS | pseudo-version pin via `replace`; unchanged; handshake, assignment, ICMP differential, IPv4 and IPv6 control capsules, capsule fallback, migration |
+| Google QUICHE | NOT-TESTED | Not built or run in this round. No interop result is claimed. |
+| Volto-derived migration semantics | PASS | Migration survives a NAT rebind for CONNECT-UDP and CONNECT-IP; new tunnels open afterwards |
+
+Reference HEADs were re-checked at the start of this round and both are unchanged from the
+pins recorded above, so no re-pin was needed. Both remain isolated in
+`test/jiejie/reference`, a separate Go module that neither the root nor the `test` module
+depends on.
+
+### Closed in this round
+
+Removed from the NOT-TESTED list, each with a live or deterministic test:
+
+- DATAGRAM context IDs other than 0: every varint WIDTH boundary (1, 2, 63, 64, 16383,
+  16384, 2^30-1, 2^30, 2^62-1) for BOTH CONNECT-UDP and CONNECT-IP, asserting that the
+  datagram is dropped, the tunnel survives, and the next context-0 datagram still works.
+- Loss, reordering and duplication: a controllable UDP impairment relay below QUIC with
+  per-mode counters, and a guard that FAILS the run if the impairment never fired.
+- ICMP Packet Too Big generation: type, code, MTU, checksums, quoted packet and both MTU
+  clamps, for IPv4 and IPv6.
+- Proxy-Status: the mapping audited path by path against RFC 9209, with a compiled guard
+  that fails if a new rejection path is added without a decision.
+- RFC 9931's client-side half: reclassified OUT-OF-SCOPE-FOR-SERVER-PRE-VPS rather than
+  left as an open NOT-TESTED item. This fork's product is a Linux amd64 VPS server, and the
+  production minimal registry serves no MASQUE client endpoint.
+- IPv6 extension headers and the IP packet parser: see the sub-sections below.
+- Cross-session ownership, route policy and control-plane resource bounds: see below.
+
+### Still NOT-TESTED, and why
+
+| Item | Verdict | Reason |
+| --- | --- | --- |
+| Google QUICHE interop | NOT-TESTED | Not built or run this round. |
+| Live H3 Packet Too Big end to end | NOT-TESTED | Needs an asymmetric origin (a reply larger than its request); a loopback echo cannot produce one. Generation is fully covered. |
+| Real VPS / WAN behaviour | NOT-TESTED | Only a real VPS can test it. See `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`. |
+| RFC 9931 client-side half | OUT-OF-SCOPE | Server-only product; no MASQUE client endpoint in the production registry. |
+
+### A narrowing stated rather than implied
+
+The impairment tests apply impairment BELOW QUIC. What they measure is therefore the
+STACK's tolerance - quic-go's duplicate detection and reassembly, plus the MASQUE session
+above it - not any sing-box loss-recovery logic. sing-box deliberately has none, because a
+QUIC DATAGRAM is unreliable by design and RFC 9297 gives it no retransmission.

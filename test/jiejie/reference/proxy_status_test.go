@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -298,3 +301,119 @@ func TestProxyStatusIsAbsentOnSuccessAndOnLocalRejections(t *testing.T) {
 func wrongAuthorization() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(referenceTestUser+":wrong-password"))
 }
+
+// ---------------------------------------------------------------------------
+// The RFC 9209 mapping audit: which rejection paths carry Proxy-Status, and why
+// ---------------------------------------------------------------------------
+//
+// transport/masque/server.go has exactly SIX pre-accept rejection paths. This file
+// records the RFC 9209 decision for each one, because the interesting question is not
+// "how many carry the header" but "is each one either correctly mapped or deliberately
+// left bare".
+//
+// The paths, in the order they are reachable:
+//
+//	1. path does not match the URI template   -> 404, no Proxy-Status
+//	2. template matched but failed to expand  -> 400, no Proxy-Status
+//	3. authenticated DNS resolution failed    -> 502, Proxy-Status: sing-box; error=dns_error
+//	4. address pool exhausted                 -> 503, no Proxy-Status
+//	5. advertised-route construction failed   -> 500, no Proxy-Status
+//	6. requested target is not routable       -> 403, no Proxy-Status
+//
+// # Why only ONE of the six carries the header
+//
+// RFC 9209 section 2.3 defines a fixed set of `error` tokens, and the rule applied here
+// is that the header is added ONLY where a standardised token matches the meaning
+// exactly. An approximate mapping is worse than none: it tells a client something
+// specific and wrong, and it leaks internal detail to a probe.
+//
+//	path 3 (dns_error)
+//	    dns_error is an EXACT match: RFC 9209 section 2.3.4 defines it as "the proxy
+//	    failed to resolve the requested hostname". That is precisely what failed.
+//
+//	path 4 (address pool exhausted)
+//	    There is NO exact token. The nearest is connection_limit_reached, which RFC 9209
+//	    section 2.3.7 defines in terms of the PROXY's connection limit being reached -
+//	    a different condition from "this endpoint has no free tunnel address". Mapping it
+//	    would tell a client to back off from a limit that is not what it hit. Left bare:
+//	    the 503 status is accurate and carries the same actionable meaning.
+//
+//	path 6 (target not routable)
+//	    There is NO exact token. http_protocol_error and proxy_internal_error are both
+//	    wrong (the HTTP layer was fine and nothing internal failed - the request asked for
+//	    a prefix this endpoint is not allowed to reach). Left bare, with a 403 that a
+//	    client can already act on.
+//
+//	paths 1, 2, 5
+//	    These are not proxying outcomes at all. Paths 1 and 2 are request-malformation
+//	    failures and path 5 is an internal construction failure; RFC 9209 describes what a
+//	    proxy DID with a request, and there is nothing to describe. Path 5 in particular
+//	    would leak implementation detail.
+//
+// # What is deliberately NOT done
+//
+//   - no Proxy-Status is emitted for an UNauthenticated request, on any path. The header
+//     describes proxy behaviour to a client that is entitled to it; emitting it before
+//     authentication would fingerprint this server as a proxy to a prober, which is the
+//     opposite of what the masquerade path exists for. This is asserted by
+//     TestProxyStatusIsAbsentForUnauthenticatedRequests.
+//   - no Proxy-Status is added AFTER a 200 has been sent. Once the tunnel is established
+//     the HTTP response is complete and RFC 9209 has no mechanism for a late header; a
+//     failure at that point is a data-path failure and is reported by ICMP, not by HTTP.
+//
+// PARTIAL is the correct verdict for this area and it is stated rather than implied: one
+// of six paths carries the header, and that is a deliberate outcome rather than an
+// unfinished one.
+
+// TestProxyStatusAuditCoversEveryRejectionPath guards the audit above from going stale.
+//
+// The list of rejection paths is COMPILED HERE from the source, so adding a new
+// `request.Reject` call in transport/masque/server.go without deciding its RFC 9209
+// mapping fails this test. A stale audit is worse than none, because it reads as a
+// reviewed decision.
+func TestProxyStatusAuditCoversEveryRejectionPath(t *testing.T) {
+	source := readServerSource(t)
+
+	// Every rejection call in the file, in order.
+	rejections := rejectionCallPattern.FindAllStringSubmatch(source, -1)
+	require.NotEmpty(t, rejections,
+		"the audit must be looking at a file that actually contains rejection calls; "+
+			"finding none means the path or the pattern is wrong, and the rest of this "+
+			"test would be vacuous")
+
+	// The audited count. If a rejection path is added or removed, this fails and the
+	// reader is sent to the table above.
+	const auditedRejectionPaths = 6
+	require.Len(t, rejections, auditedRejectionPaths,
+		"transport/masque/server.go now has %d rejection paths but the audit above "+
+			"documents %d. Decide the RFC 9209 mapping for the new one (add a "+
+			"standardised error token ONLY where one matches the meaning exactly), then "+
+			"update this constant and the table. Paths found: %v",
+		len(rejections), auditedRejectionPaths, rejections)
+
+	// Exactly ONE path may carry Proxy-Status, and it must be the dns_error one. If a
+	// second appears, the reasoning above is out of date.
+	withProxyStatus := strings.Count(source, "Proxy-Status")
+	require.Equal(t, 1, withProxyStatus,
+		"exactly one rejection path carries Proxy-Status (the authenticated DNS "+
+			"failure, error=dns_error). Found %d occurrences of \"Proxy-Status\", which "+
+			"means a mapping was added or removed without updating the audit",
+		withProxyStatus)
+
+	require.Contains(t, source, `"sing-box; error=dns_error"`,
+		"the one mapped path must use the RFC 9209 dns_error token verbatim")
+}
+
+// readServerSource returns the production source this audit describes.
+func readServerSource(t *testing.T) string {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join("..", "..", "..", "transport", "masque", "server.go"))
+	require.NoError(t, err,
+		"the audit reads the production file relative to this test's directory; if the "+
+			"layout changed, fix the path rather than deleting the guard")
+	return string(content)
+}
+
+// rejectionCallPattern matches a `request.Reject(` call, which is the only way a MASQUE
+// pre-accept rejection is issued.
+var rejectionCallPattern = regexp.MustCompile(`request\.Reject\(`)
