@@ -25,6 +25,16 @@ func NewUpstreamHandler(
 	}
 }
 
+// applyUDPConnect records a connection's fixed-destination declaration on the
+// metadata. Both packet wrappers call it so the two entry points cannot drift: a
+// tunnel that declares UDPConnectPacketConn must take the connected-UDP path no
+// matter which wrapper carried it to the router.
+func applyUDPConnect(metadata *InboundContext, conn N.PacketConn) {
+	if marker, isMarker := conn.(UDPConnectPacketConn); isMarker && marker.IsUDPConnect() {
+		metadata.UDPConnect = true
+	}
+}
+
 var _ UpstreamHandlerAdapter = (*myUpstreamHandlerWrapper)(nil)
 
 type myUpstreamHandlerWrapper struct {
@@ -128,6 +138,7 @@ func (r *routeHandlerWrapper) NewPacketConnectionEx(ctx context.Context, conn N.
 	if destination.IsValid() {
 		r.metadata.Destination = destination
 	}
+	applyUDPConnect(&r.metadata, conn)
 	r.router.RoutePacketConnectionEx(ctx, conn, r.metadata, onClose)
 }
 
@@ -164,5 +175,6 @@ func (r *routeContextHandlerWrapper) NewPacketConnectionEx(ctx context.Context, 
 	if destination.IsValid() {
 		metadata.Destination = destination
 	}
+	applyUDPConnect(metadata, conn)
 	r.router.RoutePacketConnectionEx(ctx, conn, *metadata, onClose)
 }

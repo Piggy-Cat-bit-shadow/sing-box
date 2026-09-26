@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -178,6 +179,16 @@ func newCapsuleConn(reader *std_bufio.Reader, upstream net.Conn, destination M.S
 		destination: destination,
 	}
 }
+
+// IsUDPConnect reports that this CONNECT-UDP tunnel has a fixed destination.
+//
+// capsuleConn is built by transport/http for an RFC 9298 CONNECT-UDP request, whose
+// target is parsed once from the request path and never changes, so this is always
+// true. It is a method rather than a constant so the router can test for the
+// interface without importing this package.
+func (c *capsuleConn) IsUDPConnect() bool { return true }
+
+var _ adapter.UDPConnectPacketConn = (*capsuleConn)(nil)
 
 func (c *capsuleConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	err := readDatagramCapsule(c.reader, buffer)
@@ -350,6 +361,14 @@ func (c *http3PacketConn) loopCapsule() {
 		}
 	}
 }
+
+// IsUDPConnect reports that this H3 CONNECT-UDP tunnel has a fixed destination.
+//
+// http3PacketConn is built only for an RFC 9298 CONNECT-UDP request, so its
+// destination is the parsed target for the tunnel's whole lifetime.
+func (c *http3PacketConn) IsUDPConnect() bool { return true }
+
+var _ adapter.UDPConnectPacketConn = (*http3PacketConn)(nil)
 
 func (c *http3PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	for {

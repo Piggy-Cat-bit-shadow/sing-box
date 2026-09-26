@@ -44,6 +44,33 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// UDPConnectPacketConn marks a packet connection whose destination is FIXED for the
+// lifetime of the tunnel.
+//
+// RFC 9298 CONNECT-UDP binds one tunnel to one target host:port, and RFC 9484
+// CONNECT-IP binds one tunnel to one assigned address set. Every datagram on such a
+// connection therefore goes to the same peer, which is exactly the precondition the
+// connected-UDP fast path in route/conn.go needs.
+//
+// A caller cannot infer this from the connection's shape: a plain SOCKS/mixed UDP
+// association also implements N.PacketConn and carries a destination per packet.
+// Guessing from the destination would route an association that legitimately
+// retargets into a socket that cannot accept a new destination. So the protocol
+// layer that KNOWS the destination is fixed declares it here, and the router opts in
+// on that declaration alone.
+//
+// The router sets InboundContext.UDPConnect when this reports true, which selects:
+//
+//	DialContext("udp", fixed target) over ListenPacket
+//	bufio.NewUnbindPacketConn(connected) over the unconnected form
+//
+// That removes the per-packet destination lookup and enables the connected-socket
+// batch read/write path (recvmmsg / sendmmsg / UDP GSO) downstream.
+type UDPConnectPacketConn interface {
+	// IsUDPConnect reports that this connection's destination is fixed.
+	IsUDPConnect() bool
+}
+
 type InboundContext struct {
 	Inbound     string
 	InboundType string
