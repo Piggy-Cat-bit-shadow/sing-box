@@ -192,6 +192,25 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 
 ### HTTP / MASQUE
 
+#### 当前能力边界
+
+| 范围 | 当前状态 | 发布关系 |
+| --- | --- | --- |
+| CONNECT-UDP over H2 / H3 | PASS（本地 / CI / reference evidence） | production minimal 实际发布路径 |
+| CONNECT-IP | PASS（已有 full-registry reference / protocol evidence） | 不是 production minimal endpoint |
+| HTTP Datagram / Capsule fallback | PASS | CONNECT-UDP / CONNECT-IP 均有覆盖 |
+| IPv4 / IPv6 | PASS（已有对应测试范围内） | CONNECT-UDP production path 已覆盖 IPv6 |
+| NAT rebinding / impairment | PASS（受控测试环境） | 真实 WAN 仍待 VPS 验收 |
+| Google QUICHE | CHECKED (protocol vectors) | 没有 build / run，不是 interop PASS |
+| Real VPS / WAN | NOT-TESTED | 下一阶段 |
+
+当前 production minimal 实际发布的是 HTTP inbound 上的 CONNECT-UDP（HTTP/2 / HTTP/3）。
+
+CONNECT-IP 的 `masque-server` endpoint 只在 full registry 中存在，用于 reference /
+protocol 验证，不属于当前 VPS minimal artifact 的生产 endpoint。
+
+#### 服务端基础与生产路径
+
 - `d53c867b7d` — inbound masquerade handler：非代理请求落到 Web 后端。
 - `f7e51ef60e` — 服务端资源 profile 与 header 限制选项。
 - `9771af9f49` — `server_profile` 与 `max_header_bytes` 在运行中的 server 上生效。
@@ -205,11 +224,11 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 - `cd8d702122` — HTTP/3 上强制 request header 限制。
 - `0eccef3c40` — 认证先于缺失 handler 的响应。
 - `127ae9c3b9` — 未认证名额释放按每次获取幂等。
-- `a3cb8abf58` — HTTP/MASQUE 来源身份默认使用 transport peer；
-  `X-Forwarded-For` / `Forwarded` / `X-Real-IP` 不再决定来源。
+- `a3cb8abf58` — HTTP / MASQUE 的来源身份默认取 transport peer；
+  `X-Forwarded-For`、`Forwarded`、`X-Real-IP` 不参与安全来源判定。
 - `2fb3ba6930` — 服务端资源选项边界校验。
 
-### HTTP / MASQUE — reference hardening
+#### Reference hardening
 
 - `969909bc16` — 拒绝 ROUTE_ADVERTISEMENT 跨 protocol 的 overlap：
   protocol 0 代表所有 protocol，同一 range 不能用不同 protocol 重复声明。
@@ -232,17 +251,19 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
 - `0cc6074e3d` — HTTP Datagram size accounting 在各 varint 边界固定。
 - `1325727a56` — IPv6 extension-header protocol 解析的 regression。
 - `86002b56f0` — IP packet parser 与 capsule fragmentation fuzz。
-- `824cd658a8` — `decrementHopLimit` 对 malformed IP header 做全量防御处理。
-  这是 HARDENING：两个调用点此前均已被 `packetAddresses` 拦截，并非可达的线上崩溃。
+- `824cd658a8` — `decrementHopLimit` 对 malformed IP header 做防御性 hardening。
+  两个生产调用点此前均已由 `packetAddresses` 完成校验拦截，这不是线上可利用的 panic。
 - `429d8b6774` — Proxy-Status 与认证信息泄漏边界审计。
 - `a12e5c258c` — 关闭 reference CI 双向的 false-green 漏洞。
 - `0735d419c6` — MASQUE reference hardening merge 到 `testing`。
 
-关于 RFC 9931 的表述：§8 对 conventional CONNECT 是 server 侧 MUST；CONNECT-UDP
-被拒后关闭 connection 属于 SECURITY-HARDENING，不是 §6.3 对 server 的 MUST
-（§6.3 约束的是 client 不得乐观发送）。
+> **RFC 9931：**
+> §8 对 conventional HTTP/1.1 CONNECT 的拒绝路径包含 server-side close 要求；
+> CONNECT-UDP 被拒后关闭 connection 在本 fork 中属于 **SECURITY-HARDENING**，
+> 不是 §6.3 对 server 的 MUST。
+> §6.3 约束的是 HTTP/1.x CONNECT-UDP client 不得 optimistic send UDP payload。
 
-### HTTP / MASQUE — Pre-VPS code closure
+#### Pre-VPS code closure
 
 - `c70249783f` — 修复 reference harness 的 IPv6 control-capsule decoder：
   地址前的 byte 是 IP Version（4 / 6），不是 address byte length（4 / 16）。
@@ -255,26 +276,38 @@ local   （box.go 的 DNS transport fallback 在启动时必需）
   limiter bucket。
 - `988df7a358` — live context-ID 边界、zero-length UDP、datagram error semantics。
 - `4fc9984b39` — 修正 MASQUE Capsule 路径的 IPv6 inner-packet 上限：
-  普通 IPv6 packet 可达到 65575 bytes；jumbogram 仍不支持。
+  普通 IPv6 packet 最大总长度可达到 65575 bytes，旧的 65535 hard bound 会静默丢弃
+  合法的 65536–65575 byte IPv6 packet；jumbogram 仍不支持。
   这是本轮唯一确认的 production MASQUE bug。
 - `ba7f62a4ba` — IPv4 / IPv6 Packet Too Big 的完整证据链（含两个 checksum）。
-- `1dbf363d49` — QUIC 下 loss / duplicate / reorder impairment 实测，验证 tunnel
-  survival 与 recovery。这验证的是 quic-go + MASQUE stack 的行为，不是 sing-box
-  自己实现了 loss recovery。
+- `1dbf363d49` — 受控 UDP impairment relay 验证 quic-go + MASQUE stack 在
+  loss / duplication / reordering 之后可以 survival / recover。
+  这验证的是 stack 行为，不是 sing-box 自己实现了 packet loss recovery。
 - `daa49073e8` — CONNECT-UDP H2 / H3 的 IPv6 live coverage；同时纠正 RFC 9931 §6.3
   的引用。
 - `e823b4312b` — MASQUE reference audit 收口，并新增 Pre-VPS acceptance checklist。
 - `41a04ceb14` — cross-session ownership / route policy、control burst、IPv6 extension chain 覆盖。
 - `36d404826b` — Google QUICHE 作为第三个 protocol oracle。
-  状态是 CHECKED (protocol vectors)：只读取 pinned 源码并固定其 decision table 与
-  unit vectors，没有 build / run，因此不是 QUICHE interop PASS。
+  状态是 **CHECKED (protocol vectors)**：读取 pinned 源码并固定其 decision table 与
+  unit vectors；没有 build、没有 run、没有 live interop，
+  因此不是 QUICHE PASS，也不是 QUICHE interop PASS。
 - `0dbfc43d1e` — 记录 QUICHE vector check 的分类，并把 RFC 9931 client-side half
   重新分类。
 - `4db6f90f98` — RFC 9931 client-side half 对当前 server-only product 归类为
   OUT-OF-SCOPE。
 - `583bfc84f3` — QUICHE oracle tests 真正进入 reference CI 的 run filter。
-- `864be35ebc` — overlap-scaling test 在 shared runner 上改为抗噪声的 ratio / 最小值测量。
-  这是 TEST fix，不是 production 优化。
+- `864be35ebc` — 把 linearity regression test 改为抗 shared-runner noise 的
+  ratio / 最小值测量。这是 TEST fix，不是 production performance optimization。
+
+#### 当前剩余边界
+
+- **Google QUICHE live interop** — NOT-TESTED。当前只有 protocol-vector CHECKED。
+- **CONNECT-IP live H3 Packet Too Big E2E** — NOT-TESTED。
+  PTB generation 已测试；真实 `DatagramTooLarge` E2E 仍缺少合适的 asymmetric origin。
+- **Real VPS / WAN behaviour** — NOT-TESTED。
+  下一步按 `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md` 验收。
+- **RFC 9931 client-side half** — OUT-OF-SCOPE-FOR-SERVER-PRE-VPS。
+  production minimal 不发布 MASQUE client endpoint。
 
 ### AnyTLS
 
@@ -393,14 +426,11 @@ Apple / iOS / macOS 客户端工作、Linux client-full 与 Windows client profi
 - **已知未验证项** —— 只保留当前仍然成立的项目：
   - **Google QUICHE live interop** —— NOT-TESTED。只有 protocol-vector CHECKED；
     QUICHE 未 build、未 run。
-  - **CONNECT-IP live H3 Packet Too Big E2E** —— NOT-TESTED。PTB packet generation
-    已完整覆盖，但 loopback echo 无法构造“请求放得下、reply 放不下”的
-    `DatagramTooLarge` 条件。
-  - **真实 VPS / WAN** —— NOT-TESTED。下一步按
-    [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md) 验收。
-  - **RFC 9931 client-side half** —— OUT-OF-SCOPE-FOR-SERVER-PRE-VPS。当前 production
-    minimal registry 不发布 MASQUE client endpoint，因此没有发布出去的组件会违反
-    client 侧义务。
+  - **CONNECT-IP live H3 Packet Too Big E2E** —— NOT-TESTED。
+  - **真实 VPS / WAN** —— NOT-TESTED。
+
+  MASQUE 的当前验证边界见上面的 `HTTP / MASQUE` → `当前剩余边界`，
+  完整验收见 [`docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`](docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md)。
 
   以下项目此前列为 NOT-TESTED，现已由实测覆盖，不再属于未验证项：Native Naive 的
   HTTP/3 Caddy differential、已覆盖的 half-close 矩阵、MASQUE NAT rebinding /
