@@ -162,8 +162,20 @@ func TestBatchWriterOverRealSocketIsUsable(t *testing.T) {
 		t.Logf("batch reader implementation over a real socket: %T", reader)
 	}
 
-	// The interface the syscall implementation satisfies, checked explicitly so a change
-	// that replaced it with a fallback would be visible here.
-	_, _ = writer, reader
+	// The interface the syscall implementation satisfies, asserted explicitly so a change
+	// that replaced it with a fallback would be visible here rather than only showing up
+	// as a slower run somewhere else.
+	//
+	// The assertion is written as a var declaration rather than a bare annotation so it
+	// stays a real compile-time check; staticcheck flagged the annotated form only because
+	// the right-hand side already carries the same type.
+	var connectedWriter N.ConnectedPacketBatchWriter = writer
+	require.NotNil(t, connectedWriter,
+		"the batch writer obtained from a real socket must satisfy the connected batch "+
+			"writer interface")
+	if reader != nil {
+		var connectedReader N.ConnectedPacketBatchReadWaiter = reader
+		require.NotNil(t, connectedReader)
+	}
 	_ = M.Socksaddr{}
 }
