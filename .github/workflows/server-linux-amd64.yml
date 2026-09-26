@@ -377,6 +377,7 @@ jobs:
             TestReferenceConnectIPUnsupportedContextIDsAreDropped \
             TestReferenceConnectIPEmptyPayloadIsDroppedAndTheTunnelSurvives \
             TestReferenceConnectIPEmptyPayloadOverCapsules \
+            TestReferenceConnectIPPacketTooBigOverHTTP3 \
             TestReferenceConnectIPRejectsWithoutAuth \
             TestReferenceConnectIPICMPEchoDifferential \
             TestReferenceConnectIPSurvivesNATRebinding \
