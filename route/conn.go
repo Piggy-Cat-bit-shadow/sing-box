@@ -168,9 +168,57 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
-	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+	// Resolved ONCE per connection, so both copy directions use the same
+	// threshold and the decision is visible at the call site rather than buried in
+	// the goroutine body.
+	increaseBufferAfter := connectionIncreaseBufferAfter(metadata)
+	go m.connectionCopy(ctx, conn, remoteConn, false, increaseBufferAfter, &done, onClose)
+	go m.connectionCopy(ctx, remoteConn, conn, true, increaseBufferAfter, &done, onClose)
 }
+
+// connectionIncreaseBufferAfter reports after how many copied bytes the tunnel copy
+// loop may switch to its larger buffer.
+//
+// # Why this is per-protocol rather than a global change
+//
+// sing's copy path starts with a pooled ~32 KiB buffer and only switches to the
+// larger geometry once the cumulative byte count reaches IncreaseBufferAfter, which
+// defaults to 512000. For most protocols that is fine.
+//
+// Native Naive is different, for two reasons that are both about the WRITER rather
+// than about Naive being special:
+//
+//   - its padding layer advertises WriterMTU 65278 with 3 bytes of front headroom and
+//     255 of rear, so the ideal pooled buffer is exactly 65536 bytes. Until the
+//     threshold is crossed the copy loop is feeding that writer 32 KiB at a time and
+//     the geometry is never exercised;
+//   - it writes in a bounded window: only the first requests are padded
+//     (paddingCount = 8), and after that the writer passes through unchanged. So the
+//     bulk of a large transfer happens on a writer whose ideal buffer is 64 KiB while
+//     the copy loop is still using 32 KiB for the first ~512 KiB.
+//
+// Returning 1 makes the upgrade happen after the FIRST successful transfer instead of
+// after ~512 KiB. It is deliberately not 0: sing's condition is
+// `IncreaseBufferAfter > 0 && n >= IncreaseBufferAfter`, so 0 means "never increase",
+// which is the opposite of the intent. With 1, the first chunk is still read with the
+// current default buffer and every subsequent chunk uses the larger one.
+//
+// # Why this does not change other protocols
+//
+// Every inbound type other than Naive keeps bufio.DefaultIncreaseBufferAfter, so its
+// copy behaviour is byte-for-byte unchanged. Returning the library constant rather than
+// a copied literal means a future change to the default follows here automatically.
+func connectionIncreaseBufferAfter(metadata adapter.InboundContext) int64 {
+	if metadata.InboundType == C.TypeNaive {
+		return naiveIncreaseBufferAfter
+	}
+	return bufio.DefaultIncreaseBufferAfter
+}
+
+// naiveIncreaseBufferAfter is the Native Naive threshold: upgrade after the first
+// transfer. See connectionIncreaseBufferAfter for the reasoning, including why the
+// value must be positive.
+const naiveIncreaseBufferAfter = 1
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
@@ -289,8 +337,8 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 }
 
-func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, increaseBufferAfter int64, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+	_, err := bufio.CopyWithIncreateBuffer(destination, source, increaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
 		common.Close(source, destination)
 	} else {
