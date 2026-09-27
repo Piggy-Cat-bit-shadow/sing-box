@@ -90,8 +90,17 @@ on:
         default: false
         type: boolean
 
+# `group` includes the MODE as well as the ref. Without the mode, a manual
+# `deep_checks=true` dispatch shares a group with the push run for the same ref and
+# CANCELS it: dispatching a deep audit right after a push silently kills the very
+# fast run the push existed to produce. MEASURED - that cancelled runs 36343441291
+# and 36343441290 while their deep counterparts proceeded.
+#
+# With the mode in the key, the two coexist, and supersession still works where it
+# is wanted: a newer push still cancels an older push, and a newer deep dispatch
+# still cancels an older deep dispatch.
 concurrency:
-  group: linux-amd64-${{ github.ref }}
+  group: linux-amd64-${{ github.ref }}-${{ inputs.deep_checks && 'deep' || 'fast' }}
   cancel-in-progress: true
 
 permissions:

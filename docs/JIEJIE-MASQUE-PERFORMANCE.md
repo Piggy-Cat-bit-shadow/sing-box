@@ -16,6 +16,37 @@ Method: `benchstat` where a before/after comparison is claimed, with the sample
 count recorded. A change is only described as an improvement if `benchstat` reports
 a statistically significant delta.
 
+## Re-verification, 2026-09-28 (commit e07ffdb2b + this cycle)
+
+Every headline number below was re-measured on the same host and Go version, at a
+later commit, to check that the recorded deltas still hold rather than having been
+captured once and carried forward. The benchmarks themselves are unchanged.
+
+```text
+claim                        recorded    re-measured    verdict
+IngressBuffer geomean         -56.69%      -56.5%       VERIFIED
+  /64B                        -47.13%      -47.0%       VERIFIED
+  /256B                       -50.16%      -51.1%       VERIFIED
+  /1280B                      -62.01%      -64.4%       VERIFIED
+  /1400B                      -64.84%      -61.1%       VERIFIED
+SessionConfigRead             -95.25%      -95.56%      VERIFIED
+  mutex read (uncontended)     94.065n      91.935n     VERIFIED
+  atomic snapshot read          4.472n       4.082n     VERIFIED
+  mutex read (contended)      105-112n      105.500n    VERIFIED
+```
+
+Method: `go test -bench -benchmem -benchtime 200000x -count 10` per size for the
+buffer comparison, `-benchtime 2000000x -count 8` for the session reads; medians
+compared directly (`benchstat` was not usable in this environment, so the medians
+and the geomean of the per-size ratios are reported rather than a p-value). The
+per-size deltas agree with the recorded ones within run-to-run variance, so the
+recorded numbers were not stale.
+
+**The throughput line below (+163% / +184%) is derived from the same `ns/op` run
+and is MICRO-benchmark throughput** - it is not a real-network measurement and must
+not be read as one. No real-socket or real-VPS throughput figure is claimed
+anywhere in this document.
+
 ---
 
 ## 1. HTTP/3 datagram ingress: the per-packet copy

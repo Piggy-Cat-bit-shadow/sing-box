@@ -30,7 +30,7 @@ HTTP/3、QUIC、buffer、framing、安全修复）。两者只通过 **build tag
 | registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
 | CGO | `0` | `1`（Cronet） |
 | tag 文件 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
-| 实测大小 | 33,767,608 B | 76,819,170 B |
+| 实测大小 | 33,767,608 B | 76,819,250 B |
 
 macOS tag 完整列表：
 
@@ -224,7 +224,7 @@ runtime/headless smoke、registry/symbol audit、size、SHA256、BUILD-INFO、�
 
 - `7756ee514` — 修复带后缀的开发版本号触发 `invalid deprecated note` panic。
 - `df31ff950` — 上游同步后修复 test module。
-- `d24028a`（`Piggy-Cat-bit-shadow/sing`）— 补回 `EnableUDPFragment`，供上游同步后使用。
+- [`d24028a6091`](https://github.com/Piggy-Cat-bit-shadow/sing/commit/d24028a609112cc5636bd123cb9a87f4691342eb)（**另一个仓库** `Piggy-Cat-bit-shadow/sing`，不是本仓库）— `control: add EnableUDPFragment`，供上游同步后使用。本仓库通过 `go.mod` 的 `replace` 指向该 fork。
 
 ### CI
 

@@ -80,8 +80,11 @@ on:
         default: ''
         type: string
 
+# `group` includes the MODE as well as the ref, so a manual deep dispatch and a
+# push run for the same ref no longer cancel each other; a newer run of the SAME
+# mode still supersedes an older one. See the Linux workflow for the measurement.
 concurrency:
-  group: macos-arm64-${{ github.ref }}
+  group: macos-arm64-${{ github.ref }}-${{ inputs.deep_checks && 'deep' || 'fast' }}
   cancel-in-progress: true
 
 permissions:
