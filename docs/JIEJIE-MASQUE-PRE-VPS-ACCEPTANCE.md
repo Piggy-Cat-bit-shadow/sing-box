@@ -91,7 +91,6 @@ tested one.
 | Every target defined in the source is registered in CI | coverage check inside that step | |
 | Seed corpora are genuinely valid | `TestRouteAdvertisementSeedsAreValid`, `TestAddressSeedsAreValid`, `TestProductionEncoderReproducesTheRFCVectors` | |
 | QUICHE protocol vectors agree (context-ID decision table, both protocols) | `TestQuicheOracle*` | |
-| Google QUICHE binary builds at the pin and completes an HTTP/3 exchange with sing-box | `TestReferenceQuicheH3TransportLiveInterop` | |
 | RFC 9931 client-side optimism (no payload before 2xx/101) | `TestRFC9931*` | |
 
 ---

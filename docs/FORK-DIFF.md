@@ -173,9 +173,9 @@ every commit.
   size ceiling, reproducibility, `BUILD-INFO-LINUX.txt`, SHA-256, and the upload.
 
 Deep checks (`workflow_dispatch` with `deep_checks=true`): race tests, the fuzz
-campaign, the upstream-default tag build and its tests, the Caddy/forwardproxy
-reference differential tests, the MASQUE reference interop, and the QUICHE live
-interop.
+campaign, the upstream-default tag build and its tests, the `test/jiejie/reference`
+interop suite and the Caddy/forwardproxy reference differential tests, and the
+MASQUE reference interop.
 
 **macOS arm64** (`.github/workflows/client-macos.yml`):
 

@@ -13,7 +13,8 @@
 #
 # Passing on the happy path would not have caught that, and does not catch its
 # reintroduction. What catches it is proving the checker FAILS on the exact conditions it
-# claims to detect, which is why most of the cases below are negative.
+# claims to detect, which is why most of the cases below are negative. Case C covers the
+# other historical hole: an exclusion list that lets a test opt out of ever running.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,16 +70,6 @@ package reference_test
 
 func TestReferenceBetaOne(t *testing.T) {}
 func TestSourceIdentitySomething(t *testing.T) {}
-EOF
-  # The QUICHE tests must EXIST in the fixture, because the checker requires every name in
-  # its exclusion list to be defined somewhere. Without them every case fails on the
-  # dead-exclusion rule instead of on the condition under test.
-  cat > "$dir/quiche_test.go" <<'EOF'
-package reference_test
-
-func TestReferenceQuicheH3TransportLiveInterop(t *testing.T) {}
-func TestReferenceQuicheConnectUDPLiveInterop(t *testing.T) {}
-func TestReferenceQuicheConnectIPLiveInterop(t *testing.T) {}
 EOF
 }
 
@@ -145,75 +136,50 @@ set -e
 report "B SKIP counts as a reported result" 0 "$rc_b2"
 
 # ---------------------------------------------------------------------------
-# CASE C: an exclusion naming a test that does not exist -> must FAIL
+# CASE C: the checker has NO exclusion list anymore
 # ---------------------------------------------------------------------------
+#
+# An exclusion list used to exist for the Google QUICHE live interop tests. Those were driven
+# by an out-of-tree Bazel-built `masque_client` instead of `go test`, so the checker had to
+# let them through. That harness is deleted. An exclusion list is the one construct that can
+# silently stop the checker from protecting the suite, so its reintroduction is now itself a
+# failure: a reference test must run here or the check fails.
 
-# Driven by copying the checker and widening its exclusion list with a bogus name, which is
-# exactly the "dead exclusion" condition: a test deleted or renamed while the exclusion
-# stayed behind.
-bogus_checker="$work_dir/checker-bogus.sh"
-sed 's|^QUICHE_EXTERNAL=.*|QUICHE_EXTERNAL="TestReferenceQuicheH3TransportLiveInterop TestReferenceQuicheConnectUDPLiveInterop TestReferenceQuicheConnectIPLiveInterop TestThisDoesNotExistAnywhere"|' \
-  "$checker" > "$bogus_checker"
-chmod +x "$bogus_checker"
-
-set +e
-out_c="$("$bogus_checker" "$log_a" "$fake_dir" 2>&1)"; rc_c=$?
-set -e
-report "C exclusion naming a nonexistent test" 1 "$rc_c"
-if printf '%s' "$out_c" | grep -q "TestThisDoesNotExistAnywhere"; then
-  report "C failure names the dead exclusion" 0 0
+if grep -qE '^[A-Z_]*EXTERNAL=' "$checker"; then
+  report "C the checker declares no external-test exclusion list" 1 1 \
+    "found an exclusion list in the checker"
 else
-  report "C failure names the dead exclusion" 0 1
+  report "C the checker declares no external-test exclusion list" 0 0
 fi
 
-# ---------------------------------------------------------------------------
-# CASE D: a real test wrongly placed in the exclusion list
-# ---------------------------------------------------------------------------
-#
-# The requirement is that this must FAIL unless the test is genuinely wired into the
-# dedicated QUICHE workflow. The checker cannot see that workflow, so the responsibility is
-# enforced in two places and this case proves the first of them:
-#
-#   - the checker fails when the excluded test is not DEFINED (case C);
-#   - wiring is enforced by the dedicated workflow itself, which the second half of this
-#     case reads directly.
-#
-# So case D is: put an EXISTING test in the exclusion list and confirm the checker treats it
-# as excluded, THEN confirm the workflow genuinely runs it - because an excluded test that
-# nothing else runs is a test that no longer runs at all.
-
-# A test existing in the fixture is wrongly excluded.
-wrong_checker="$work_dir/checker-wrong.sh"
-sed 's|^QUICHE_EXTERNAL=.*|QUICHE_EXTERNAL="TestReferenceQuicheH3TransportLiveInterop TestReferenceQuicheConnectUDPLiveInterop TestReferenceQuicheConnectIPLiveInterop TestReferenceBetaOne"|' \
-  "$checker" > "$wrong_checker"
-chmod +x "$wrong_checker"
-
-# Case D part 1: the checker now treats TestReferenceBetaOne as excluded, so a log WITHOUT
-# it passes - which demonstrates exactly why the workflow wiring check below is required.
-set +e
-"$wrong_checker" "$log_b" "$fake_dir" > /dev/null 2>&1; rc_d1=$?
-set -e
-report "D wrongly-excluded existing test is accepted by the checker" 0 "$rc_d1" \
-  "(this is why the workflow wiring check is needed)"
-
-# Case D part 2: every name the real checker excludes must actually be run by the dedicated
-# reference workflow. This is the assertion that makes a wrong exclusion fail.
-reference_workflow="$repo_root/.github/workflows/server-linux-amd64.yml"
-if [ ! -f "$reference_workflow" ]; then
-  report "D deep_checks workflow exists" 1 1 "not found at $reference_workflow"
+# The exclusion loop itself must be gone too, not merely emptied: an empty list iterated by a
+# `case` match is one edit away from being useful again.
+if grep -qE 'case \" \$[A-Z_]*EXTERNAL \"' "$checker"; then
+  report "C the checker has no name-based skip logic" 1 1 "found a `case ... EXTERNAL ...` skip"
 else
-  report "D deep_checks workflow exists" 0 0
-
-  real_excluded="$(grep -E '^QUICHE_EXTERNAL=' "$checker" | head -1 | cut -d'"' -f2)"
-  unrun=0
-  for test_name in $real_excluded; do
-    if ! grep -q -- "$test_name" "$reference_workflow"; then
-      echo "FAIL  D $test_name is excluded here but never run by the deep_checks workflow"
-      unrun=1
-    fi
-  done
-  report "D every excluded test is wired into the deep_checks workflow" 0 "$unrun"
+  report "C the checker has no name-based skip logic" 0 0
 fi
+
+# And the whole fixture that only existed to feed the exclusion list must be gone.
+if [ -e "$fake_dir/quiche_test.go" ]; then
+  report "C the fixture carries no QUICHE-only test file" 1 1
+else
+  report "C the fixture carries no QUICHE-only test file" 0 0
+fi
+
+# The counterpart of case C: a test DEFINED in the fixture but absent from the log must now
+# always fail, with nothing able to exempt it. This is the guarantee the exclusion list used
+# to weaken, asserted directly.
+for missing_name in TestReferenceBetaOne TestSourceIdentitySomething; do
+  log_c="$work_dir/c-$missing_name.log"
+  make_log "$log_c" TestReferenceAlphaOne TestReferenceAlphaTwo TestReferenceBetaOne TestSourceIdentitySomething
+  # Drop the target test's result line: it is defined but never reported.
+  grep -v -- "$missing_name" "$log_c" > "$log_c.tmp" && mv "$log_c.tmp" "$log_c"
+  set +e
+  "$checker" "$log_c" "$fake_dir" > /dev/null 2>&1; rc_c="$?"
+  set -e
+  report "C $missing_name unreported is always a failure" 1 "$rc_c"
+done
 
 # ---------------------------------------------------------------------------
 # CASE E: a stale discovery pattern must fail rather than pass vacuously
@@ -252,14 +218,9 @@ if [ -d "$real_dir" ]; then
   : > "$real_log"
   real_defined="$(grep -rhoE '^func (Test(Reference|SourceIdentity|QuicheOracle)[A-Za-z0-9_]*)' \
     "$real_dir"/*_test.go | sed 's/^func //' | sort -u)"
-  real_excluded="$(grep -E '^QUICHE_EXTERNAL=' "$checker" | head -1 | cut -d'"' -f2)"
 
+  # Every real test must be reported: there is no exclusion list to subtract.
   for test_name in $real_defined; do
-    skip=0
-    for excluded_name in $real_excluded; do
-      [ "$test_name" = "$excluded_name" ] && skip=1
-    done
-    [ "$skip" = "1" ] && continue
     printf '=== RUN   %s\n--- PASS: %s (0.01s)\n' "$test_name" "$test_name" >> "$real_log"
   done
 

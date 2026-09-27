@@ -49,8 +49,9 @@ name: Linux amd64
 # Everything expensive sits behind `workflow_dispatch` with `deep_checks=true`:
 # the FULL `test/jiejie` suite (including the four known-failing Naive UoT audits),
 # race tests, the fuzz campaign, reproducibility, the upstream-default tag build,
-# the Caddy/forwardproxy reference differential, the MASQUE reference interop and
-# the QUICHE live interop. Slow is fine there; it is a manual full audit.
+# the `test/jiejie/reference` interop suite and the Caddy/forwardproxy reference
+# differential, and the MASQUE reference interop.
+# Slow is fine there; it is a manual full audit.
 #
 # # Triggers
 #
@@ -71,7 +72,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_checks:
-        description: Run expensive deep validation (full jiejie suite, race, fuzz, reproducibility, reference interop)
+        description: Run expensive deep validation (full jiejie suite, race, fuzz, reproducibility, reference suite, MASQUE interop)
         required: false
         default: false
         type: boolean
@@ -95,14 +96,13 @@ jobs:
   linux-amd64:
     runs-on: ubuntu-latest
     # The FAST path finishes in ~2.5 minutes, so this ceiling exists for the
-    # deep_checks path, which is genuinely long: the full jiejie suite is ~13 min on
-    # its own, and the QUICHE interop compiles 1,811 Bazel targets (BoringSSL and
-    # Abseil) from scratch on a 4-core runner.
+    # deep_checks path, which is genuinely long: the full jiejie suite is ~13 minutes
+    # on its own, and the race and fuzz legs add several more.
     #
-    # It was 45 minutes, which CUT OFF the QUICHE build mid-compile at 45.4 minutes
-    # and reported the job as cancelled. That is worse than a failure: it looks like
-    # a flake and hides the fact that the preceding seven deep checks had all passed.
-    # 120 gives the deep path room while still bounding a hung run.
+    # 120 minutes gives that room while still bounding a hung run. The ceiling was
+    # raised from 45 after a run was CANCELLED mid-flight at 45.4 minutes, which is
+    # worse than a failure: it looks like a flake and hides the fact that every
+    # preceding deep check had passed.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
@@ -179,8 +179,8 @@ jobs:
         #
         # Everything else in test/jiejie is integration/conformance/reference work
         # (packet-impairment campaigns, NAT rebinding, resource profiling, Caddy
-        # parity, QUICHE interop, long-lived connection leak checks) and runs in the
-        # deep_checks leg below.
+        # parity, long-lived connection leak checks) and runs in the deep_checks leg
+        # below.
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
@@ -652,13 +652,48 @@ jobs:
           echo "NOTE: common/netns needs CLONE_NEWNET, and libbox/boxdd do not link"
           echo "      under badlinkname+tfogo_checklinkname0. Both are pre-existing."
 
-      - name: deep check - reference differential tests
-        # Diffs this fork against the pinned Caddy/forwardproxy reference. Far too
-        # heavy for a standard push, and valuable before a protocol release.
+      - name: deep check - reference suite (module + differential)
+        # Runs the `test/jiejie/reference` module - the external-reference interop suite,
+        # pinned against quic-go/masque-go and quic-go/connect-ip-go - and diffs this fork
+        # against the pinned Caddy/forwardproxy reference. Far too heavy for a standard
+        # push, and valuable before a protocol release.
+        #
+        # It also runs the reference module itself, and then the coverage check over that
+        # run. The reference tests live in their OWN Go module (`test/jiejie/reference`)
+        # and do NOT appear in the jiejie package's log, so a coverage check pointed at
+        # the jiejie log would fail on every test and a check pointed at nothing would
+        # pass vacuously. It is pointed at the reference module, whose tests it exists to
+        # verify.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+
+          # The reference module needs a binary built from the reference tag set, and it
+          # reads its path from JIEJIE_SING_BOX_BINARY.
+          go build -tags "$TAGS" -o /tmp/sing-box-reference ./cmd/sing-box
+          (
+            cd test/jiejie/reference
+            JIEJIE_SING_BOX_BINARY=/tmp/sing-box-reference \
+              go test -tags "$TAGS" -count=1 -timeout 30m -v . \
+              > /tmp/reference-module.log 2>&1 || {
+                tail -80 /tmp/reference-module.log >&2
+                exit 1
+              }
+          )
+          ran="$(grep -cE '^--- (PASS|FAIL|SKIP):' /tmp/reference-module.log || true)"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::the reference module reported no tests; it was not actually run" >&2
+            exit 1
+          fi
+          tail -5 /tmp/reference-module.log
+
+          # Its own test script runs FIRST, so a broken checker cannot approve the run it
+          # is part of. The checker is what caught the vacuous `-run` filter in the MASQUE
+          # interop step above; before that fix, this check had no live caller at all.
+          bash scripts/ci/check-reference-coverage.test.sh
+          bash scripts/ci/check-reference-coverage.sh /tmp/reference-module.log test/jiejie/reference
+
           cd test
           go test -tags "$TAGS" -count=1 -timeout 60m -v \
             -run 'TestJiejieNaive.*(Differential|Caddy|Reference|Parity)' \
@@ -666,8 +701,13 @@ jobs:
               tail -80 /tmp/reference-differential.log >&2
               exit 1
             }
+          ran="$(grep -cE '^--- (PASS|FAIL|SKIP):' /tmp/reference-differential.log || true)"
           tail -20 /tmp/reference-differential.log
-          echo "PASS: reference differential tests"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::reference differential tests matched no tests; the -run filter is stale" >&2
+            exit 1
+          fi
+          echo "PASS: reference suite ($ran differential tests)"
 
       - name: deep check - MASQUE reference interop
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
@@ -675,113 +715,22 @@ jobs:
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
           cd test
-          go test -tags "$TAGS" -count=1 -timeout 60m -v -run 'TestJiejieMasque' ./jiejie/ \
+          # The names are `TestJiejieMASQUE*` and `TestJiejieMinimalMASQUE*`, in
+          # UPPERCASE. This filter used to read `TestJiejieMasque`, which is
+          # case-sensitive and matched NOTHING: the step passed vacuously while
+          # reporting "PASS: MASQUE reference interop". It is spelled out in full
+          # here, and the count below makes a future empty match a failure rather
+          # than a green tick.
+          go test -tags "$TAGS" -count=1 -timeout 60m -v \
+            -run 'TestJiejie(MASQUE|MinimalMASQUE)' ./jiejie/ \
             > /tmp/masque-reference.log 2>&1 || {
               tail -80 /tmp/masque-reference.log >&2
               exit 1
             }
+          ran="$(grep -cE '^--- (PASS|FAIL|SKIP):' /tmp/masque-reference.log || true)"
           tail -20 /tmp/masque-reference.log
-          echo "PASS: MASQUE reference interop"
-
-      - name: deep check - QUICHE live interop
-        # Builds Google QUICHE's masque_client at the pinned commit (BoringSSL and
-        # Abseil via Bazel - 1,811 targets, measured at 734s) and then runs the three
-        # interop tests excluded by name from the normal reference suite:
-        #
-        #   TestReferenceQuicheH3TransportLiveInterop
-        #   TestReferenceQuicheConnectUDPLiveInterop
-        #   TestReferenceQuicheConnectIPLiveInterop
-        #
-        # scripts/ci/check-reference-coverage.sh asserts that every test it excludes is
-        # run here, so the names are spelled out rather than inferred.
-        #
-        # # Two binaries, because the tests need different registries
-        #
-        # CONNECT-UDP and the HTTP/3 transport are served by the `http` inbound, which
-        # the PRODUCTION MINIMAL registry provides. CONNECT-IP needs the
-        # `masque-server` ENDPOINT, which the minimal registry does not register at all.
-        # The harness reads JIEJIE_SING_BOX_BINARY for every server it starts, so the
-        # registry is selected by running the tests in two invocations with different
-        # values - not by a second variable, which the harness does not read.
-        #
-        # # Why a stall is not a failure here, and is still not a pass
-        #
-        # MEASURED, and documented by the predecessor workflow: on a GitHub-hosted
-        # runner QUICHE's handshake often never completes. The test passes locally in
-        # ~0.2s, but the runner's UDP receive buffer cannot be grown to what quic-go
-        # asks for, so the client exits with QUIC_NETWORK_IDLE_TIMEOUT.
-        #
-        # That is a HOST limitation, not a protocol disagreement, so it is classified
-        # rather than treated as a red gate - a blanket failure would make this step
-        # permanently red for a reason that says nothing about the code. It is equally
-        # not silently green: scripts/ci/quiche-result.sh distinguishes PASS from
-        # EXECUTED-FAILED from INCONCLUSIVE-TIMEOUT from NOT-RUN, and the four states
-        # are printed. A PASS that regresses to EXECUTED-FAILED stays visible.
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
-        run: |
-          set -euo pipefail
-          ./scripts/ci/jiejie-quiche-live-interop.sh
-          eval "$(./scripts/ci/jiejie-quiche-live-interop.sh --print-env)"
-          echo "masque_client: $JIEJIE_QUICHE_MASQUE_CLIENT"
-
-          go build -trimpath -buildvcs=false \
-            -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
-            -o /tmp/sing-box-minimal ./cmd/sing-box
-          go build -trimpath -buildvcs=false \
-            -o /tmp/sing-box-full ./cmd/sing-box
-          echo "minimal: /tmp/sing-box-minimal  full: /tmp/sing-box-full"
-
-          # test/jiejie/reference is its OWN Go module (it has a go.mod so the MASQUE
-          # reference implementations can be imported without entering the production
-          # dependency graph), so it must be run from inside that directory as `.`.
-          cd test/jiejie/reference
-
-          # Collect the classifier verdicts so the NOT-RUN gate below keys off the
-          # CLASSIFIED OUTCOME rather than a grep of raw test output, which could match
-          # a skip message from a different test's section.
-          outcomes=""
-          run_interop() {
-            local label="$1" binary="$2" pattern="$3" extra_env="$4"
-            set +e
-            env JIEJIE_SING_BOX_BINARY="$binary" $extra_env \
-              go test -count=1 -timeout 15m -v -run "$pattern" . \
-              > "/tmp/quiche-$label.log" 2>&1
-            local status=$?
-            set -e
-            local outcome
-            outcome="$(bash ../../../scripts/ci/quiche-result.sh "$label" "/tmp/quiche-$label.log" "$status" 2>/dev/null)"
-            # The human-readable report goes to stderr; show it in the log.
-            bash ../../../scripts/ci/quiche-result.sh "$label" "/tmp/quiche-$label.log" "$status" >/dev/null || true
-            echo "OUTCOME $label = $outcome (go test exit $status)"
-            tail -6 "/tmp/quiche-$label.log" | sed 's/^/    /'
-            outcomes="$outcomes $outcome"
-          }
-
-          run_interop "H3-transport" /tmp/sing-box-minimal \
-            'TestReferenceQuicheH3TransportLiveInterop' ''
-          run_interop "CONNECT-UDP" /tmp/sing-box-minimal \
-            'TestReferenceQuicheConnectUDPLiveInterop' ''
-          run_interop "CONNECT-IP" /tmp/sing-box-full \
-            'TestReferenceQuicheConnectIPLiveInterop' 'JIEJIE_FULL_REGISTRY_BINARY=1'
-
-          echo "outcomes:$outcomes"
-
-          # NOT-RUN or NO-RESULT means the binary was missing or the test never
-          # produced a verdict, which would make this whole step meaningless. That IS a
-          # failure. PASS and EXECUTED-FAILED both mean the interop actually ran, and
-          # INCONCLUSIVE-TIMEOUT is the documented runner limitation, so none of those
-          # three are treated as a harness failure.
-          if grep -qE "NOT-RUN|NO-RESULT" <<<"$outcomes"; then
-            echo "FAIL: at least one QUICHE interop did not execute; the interop was not" >&2
-            echo "      demonstrated, which is a harness failure rather than a finding." >&2
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::MASQUE reference interop matched no tests; the -run filter is stale" >&2
             exit 1
           fi
-          if grep -qE "PASS" <<<"$outcomes"; then
-            echo "PASS: at least one QUICHE interop established its MASQUE claim"
-          else
-            echo "NOTE: no QUICHE interop reached PASS on this host; the outcomes above"
-            echo "      are EXECUTED-FAILED and/or INCONCLUSIVE-TIMEOUT. Neither is a"
-            echo "      pass, and neither is a silent skip - the state is reported."
-          fi
-          echo "PASS: QUICHE live interop executed (outcomes reported above; a stall is"
-          echo "      a documented host limitation of GitHub-hosted runners, not a pass)"
+          echo "PASS: MASQUE reference interop ($ran tests)"

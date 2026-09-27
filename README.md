@@ -202,7 +202,7 @@ CI 只有两个 workflow，一个产品一个：
 runtime/headless smoke、registry/symbol audit、size、SHA256、BUILD-INFO、上传）
 都复用同一个 binary。
 
-耗时的深度验证（race、fuzz、reference differential、QUICHE interop、Cronet A/B）
+耗时的深度验证（race、fuzz、reference suite、Cronet A/B）
 不再在普通 push 上运行，改为手动 `workflow_dispatch` + `deep_checks=true`。
 
 ---

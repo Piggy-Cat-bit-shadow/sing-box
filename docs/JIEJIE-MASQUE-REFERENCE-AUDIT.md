@@ -21,10 +21,8 @@ correction of an earlier one; read this table.
 | Packet Too Big session ownership | **PASS** | `TestPacketTooBigIsDeliveredOnlyToTheOwningSession`, `TestPacketTooBigIsNotBroadcastToEverySession` |
 | IPv6 Packet Too Big generation | **PASS** | `TestPacketTooBigIPv6Shape`, `TestPacketTooBigCanBeAddressedToAnExplicitPeer` |
 | IPv6 live H3 Packet Too Big | **NOT-TESTED** | no live IPv6 trigger; see the Boundary Closure Round for the measured reason |
-| QUICHE HTTP/3 transport | **LOCAL PASS**, GitHub runner **INCONCLUSIVE-TIMEOUT** | `TestReferenceQuicheH3TransportLiveInterop`; run `36238936300` |
-| QUICHE CONNECT-UDP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectUDPLiveInterop`; process exits non-zero with `QUIC_CONNECTION_CANCELLED` |
-| QUICHE CONNECT-IP tunnel | **EXECUTED-FAILED** — interop NOT established | `TestReferenceQuicheConnectIPLiveInterop`; same observed failure |
-| QUICHE root cause | **UNCONFIRMED** | the process fails before emitting any CONNECT; four candidate causes were ruled out by measurement, the rest is not attributable with the evidence held |
+| QUICHE live interop | **REMOVED** — harness deleted, not carried | the live tests, their builder and their classifier are gone; the historical measurements are kept below as history |
+| QUICHE protocol vectors | **PASS** | `TestQuicheOracle*` — an in-process vector check that runs on every push |
 | RFC 9931 server behaviour | **PASS** | existing server-side tests |
 | RFC 9931 auxiliary client audit | **PASS** | `TestRFC9931*` |
 | RFC 9931 server product scope | **OUT-OF-SCOPE** for the client half | the production minimal registry ships no MASQUE client endpoint |
@@ -34,20 +32,41 @@ correction of an earlier one; read this table.
 
 ### Reading the QUICHE rows
 
-The three QUICHE rows are not one verdict, and the distinction is the point:
+**The QUICHE live interop harness has been removed from this repository.** The live tests
+(`TestReferenceQuiche*LiveInterop`), the Bazel builder that compiled `masque_client`, and
+the outcome classifier that produced `PASS` / `EXECUTED-FAILED` / `INCONCLUSIVE-TIMEOUT` /
+`NOT-RUN` / `NO-RESULT` (the vocabulary quoted below is that classifier's, now historical)
+are all deleted, as is the CI step that drove them. The historical
+verdicts are preserved in the Boundary Closure Round below because they record what was
+measured at the time; they are no longer produced by anything, and nothing in CI depends on
+them.
 
-- **EXECUTED-FAILED** means the process ran and disagreed. That is a real observed failure,
-  NOT an absence of testing, and it is not evidence of a defect in either implementation
-  on its own.
-- **INCONCLUSIVE-TIMEOUT** means the process ran and was killed at the execution deadline.
-  No exchange was observed, so nothing is established either way. The GitHub runner also
-  reports a UDP receive-buffer warning, which is recorded as host-environment diagnostic
-  evidence; **causation is not established** by it.
-- A **NOT-RUN** row would mean no process executed, which is also not a pass.
+The reason is cost against value. QUICHE is C++ built by Bazel (BoringSSL and Abseil, 1,811
+targets), it is an external tool that never was a module dependency, and on GitHub-hosted
+runners the handshake routinely never completed: the runner's UDP receive buffer cannot be
+grown to what quic-go asks for, so the run ended in `QUIC_NETWORK_IDLE_TIMEOUT`. That is a
+host limitation, not a finding about either implementation. Meanwhile the harness added tens
+of minutes to every deep run without ever being a product gate.
 
-No QUICHE MASQUE tunnel interop is claimed. The cheap protocol-vector check
-(`TestQuicheOracle*`) still runs on every push and pins QUICHE's decisions; it is not
-interop.
+What remains, and what is enough:
+
+- the **protocol-vector check** (`TestQuicheOracle*` in
+  `test/jiejie/reference/quiche_oracle_test.go`) runs on every push and pins QUICHE's
+  DECISIONS — the context-ID decision table for both CONNECT-UDP and CONNECT-IP — against
+  this repository's production loops. It is cheap, in-process, and needs no Bazel;
+- the **reference interop suite** (`test/jiejie/reference`, a separate Go module, pinned
+  against quic-go/masque-go and quic-go/connect-ip-go) still runs in the deep checks and
+  remains the live tunnel evidence. Its execution is checked by
+  `scripts/ci/check-reference-coverage.sh`, which requires every test DEFINED in that
+  module to report a result in the run - no exclusions. That checker had been invoked only
+  from the QUICHE step, so removing the step would have left it with no caller at all; it
+  now runs in the reference step, next to the run it inspects. It pays for itself: it is
+  what caught the MASQUE interop step's `-run` filter matching nothing while printing
+  "PASS" (see `docs/FORK-DIFF.md` and the workflow's own comments).
+
+No QUICHE MASQUE tunnel interop is claimed, and none was claimed before: the historical
+verdicts below record an HTTP/3 transport exchange and two tunnel attempts that never
+established interop. The vector check is a CHECK, not interop, and is labelled as such.
 
 
 ## Baseline
@@ -76,7 +95,7 @@ cloned at these revisions during this audit:
 | --- | --- | --- |
 | quic-go/masque-go | `c1cf0e4dd6439aea94d5491b27439a4736f00246` | `v0.6.0` |
 | quic-go/connect-ip-go | `fdd945e3d6009b3cee1b1a66493776d315727549` | `v0.4.1-0.20260924175820-fdd945e3d600` |
-| Google QUICHE | `c961965aa3ee8f2b6f05ebcac794f7854101adcd` | external tool, built by script |
+| Google QUICHE | `c961965aa3ee8f2b6f05ebcac794f7854101adcd` | read for its vectors; not built |
 
 The two pins are not the same kind of pin, and the difference was measured rather
 than assumed:
@@ -90,10 +109,11 @@ than assumed:
   tidy` silently replaced it with `v0.4.0`, which is **not** the audited revision;
   `replace` cannot be dropped that way.
 
-Google QUICHE is pinned as an EXTERNAL TOOL rather than a module dependency: it is C++
-built with Bazel, so it is built by `scripts/ci/jiejie-quiche-live-interop.sh` and is
-never vendored and never reaches root `go.mod`. It IS now built and run - see the Boundary
-Closure Round at the end of this document for what that established and what it did not.
+Google QUICHE never was a module dependency and never will be: it is C++ built with Bazel,
+so it is never vendored and never reaches root `go.mod`. Its source was read at the commit
+above for the protocol-vector check (`test/jiejie/reference/quiche_oracle_test.go`), which
+is what remains. The temporary Bazel build/run harness has been removed; the Boundary
+Closure Round at the end of this document is kept as the historical record of it.
 
 ## Changes made in this audit
 
@@ -242,7 +262,8 @@ nothing about the other. Which one is covered is stated with the result.
 ## Verified against the pinned references
 
 > **HISTORICAL STATUS.** The QUICHE row in this section predates the live QUICHE work and
-> describes the protocol-vector check only. See CURRENT STATUS.
+> describes the protocol-vector check only. See CURRENT STATUS. The live QUICHE rows
+> further down are historical too: that harness has been removed.
 
 These are the external-interoperability results. "External" means the client on
 the wire is the pinned third-party library, not sing-box's own client: running
@@ -358,15 +379,21 @@ and none is claimed as PASS:
   failure is implemented and tested, while the other rejection paths (address pool
   exhausted, policy forbidden, internal error) return a bare status code and were
   not audited against RFC 9209.
-- **Google QUICHE MASQUE tunnel interop.** PARTIAL, and the split is deliberate.
-  QUICHE is now BUILT and RUN at the pinned commit, and its HTTP/3 transport interop
-  against a real sing-box process passes. What does NOT pass is the MASQUE tunnel
-  claim: QUICHE's nested encapsulated client aborts with
-  `QUIC_CONNECTION_CANCELLED` before emitting any CONNECT-UDP, while the outer
-  HTTP/3 exchange and sing-box's own CONNECT-UDP both work. The measured blocker and
-  everything ruled out are recorded in
-  `test/jiejie/reference/google_quiche_live_test.go`. No MASQUE tunnel interop with
-  QUICHE is claimed.
+- **Google QUICHE MASQUE tunnel interop.** WITHDRAWN from this repository, not
+  claimed. The interop harness - the live tests, the Bazel builder for
+  `masque_client`, and the outcome classifier - has been deleted, so this is no
+  longer an open item with a standing verdict; it is recorded history. What was
+  measured before removal: QUICHE did build and run at the pinned commit and its
+  HTTP/3 transport interop against a real sing-box process passed locally, while
+  its nested encapsulated client aborted with `QUIC_CONNECTION_CANCELLED` before
+  emitting any CONNECT-UDP, leaving the MASQUE tunnel claim unestablished. No MASQUE
+  tunnel interop with QUICHE is claimed, here or anywhere else in this document.
+  The reason for removal is cost against value: roughly 1,811 Bazel targets of
+  BoringSSL and Abseil on every deep run, an external tool that was never a module
+  dependency and never a product gate, and a GitHub-hosted runner whose UDP receive
+  buffer cannot be grown to what quic-go asks for - so the run routinely ended in
+  `QUIC_NETWORK_IDLE_TIMEOUT`, a host limitation rather than a finding. The
+  protocol-vector check (`TestQuicheOracle*`) is kept and still runs on every push.
 - **RFC 9931's client-side half.** Section 8 tells proxy CLIENTS to wait for a 2xx
   before forwarding TCP payload or to send `Connection: close`, and section 6.3
   forbids optimistic UDP sending over HTTP/1.x. Those requirements bind a client,
@@ -663,12 +690,12 @@ answered with a 1276-byte reply). No live PTB E2E is claimed.
 | --- | --- | --- |
 | quic-go/masque-go (`c1cf0e4d`) | PASS | `v0.6.0` tag; unchanged pin; CONNECT-UDP round trip, no-auth rejection, settings exchange |
 | quic-go/connect-ip-go (`fdd945e3`) | PASS | pseudo-version pin via `replace`; unchanged; handshake, assignment, ICMP differential, IPv4 and IPv6 control capsules, capsule fallback, migration |
-| Google QUICHE | CHECKED (vectors) + HTTP/3 transport PASS, tunnel NOT-TESTED | Read at `c961965aa3ee8f2b6f05ebcac794f7854101adcd`, with its context-ID decision table pinned in `test/jiejie/reference/quiche_oracle_test.go`. It is now also BUILT and RUN at that pin: the HTTP/3 transport interop passes, and the MASQUE tunnel claim is NOT-TESTED with a measured QUICHE-side blocker. See the Boundary Closure Round at the end of this document. |
+| Google QUICHE | CHECKED (vectors) | Read at `c961965aa3ee8f2b6f05ebcac794f7854101adcd`, with its context-ID decision table pinned in `test/jiejie/reference/quiche_oracle_test.go`. The temporary Bazel build/run harness was removed after this round; the Boundary Closure Round at the end of this document keeps its measurements as history. |
 | Volto-derived migration semantics | PASS | Migration survives a NAT rebind for CONNECT-UDP and CONNECT-IP; new tunnels open afterwards |
 
 Reference HEADs were re-checked at the start of this round: masque-go, connect-ip-go AND
 Google QUICHE all still stand at the commits recorded at the top of this document, so no
-re-pin was needed. QUICHE's source was additionally fetched and read for the vector check
+re-pin was needed. QUICHE's source was fetched and read for the vector check
 described above; it was not built. Both remain isolated in
 `test/jiejie/reference`, a separate Go module that neither the root nor the `test` module
 depends on.
@@ -726,7 +753,7 @@ reader does not mistake one direction's behaviour for the other's.
 
 | Item | Verdict | Reason |
 | --- | --- | --- |
-| Google QUICHE interop | NOT-TESTED | Not built and not run: C++ via Bazel, and no Bazel toolchain is available here. Its protocol vectors are checked instead (see the table above), which is a CHECK and not interop. |
+| Google QUICHE interop | REMOVED | The live interop harness was deleted rather than left standing. QUICHE's protocol vectors are still checked on every push (see the table above), which is a CHECK and not interop. |
 | Live H3 Packet Too Big end to end | NOT-TESTED | Needs an asymmetric origin (a reply larger than its request); a loopback echo cannot produce one. Generation is fully covered. |
 | Real VPS / WAN behaviour | NOT-TESTED | Only a real VPS can test it. See `docs/JIEJIE-MASQUE-PRE-VPS-ACCEPTANCE.md`. |
 | RFC 9931 client-side half | OUT-OF-SCOPE-FOR-SERVER-PRE-VPS | Server-only product; `include/registry_jiejie_server.go`'s `EndpointRegistry()` registers no endpoint, so no shipped component can violate a client-side obligation. |
@@ -743,9 +770,10 @@ QUIC DATAGRAM is unreliable by design and RFC 9297 gives it no retransmission.
 ## Boundary Closure Round
 
 > **HISTORICAL STATUS for its QUICHE rows.** The PTB rows here remain current. The QUICHE
-> rows record what was measured then; the tunnel claims are still not established, and
-> the failure is now classified more precisely (EXECUTED-FAILED rather than NOT-TESTED)
-> because the process was subsequently observed to run and fail. See CURRENT STATUS.
+> rows record what was measured then, by a harness that has since been REMOVED: the live
+> tests, the Bazel builder and the outcome classifier are deleted, and no CI step drives
+> them. Read the section below as a record of an experiment, not as a live verdict. The
+> tunnel claims were never established. See CURRENT STATUS.
 
 This section records the last round of boundary work before the VPS run. Its rule is the
 one the whole document follows, applied to the four remaining boundaries: a boundary moves
@@ -836,12 +864,17 @@ reverted.
 | Bazel version | 8.2.1 (from QUICHE's own `.bazelversion`) |
 | Bazel target | `//quiche:masque_client` |
 | `masque_client` sha256 | `7e84cc4d817bace4bc07f133f51846325c33e0e2c96c1d34d47fe222fedb7777` |
-| Builder | `scripts/ci/jiejie-quiche-live-interop.sh` |
-| Workflow | `.github/workflows/server-linux-amd64.yml`, `deep_checks=true` (manual) |
+| Builder | `scripts/ci/jiejie-quiche-live-interop.sh` - since deleted from the repository |
+| Workflow | `.github/workflows/server-linux-amd64.yml`, `deep_checks=true` (manual) - step since deleted |
 
-QUICHE stays an EXTERNAL test-only tool. Root `go.mod` is untouched, the deep-check
-step re-verifies the build did not mutate the module files after the C++ build, and
-nothing is vendored.
+QUICHE stayed an EXTERNAL test-only tool. Root `go.mod` was never touched by it, the
+deep-check step re-verified that the build did not mutate the module files after the C++
+build, and nothing was vendored. **This harness has since been removed from the
+repository** - the builder, the live tests, the outcome classifier and the workflow step
+are all deleted - because it was never a module dependency, never a product gate, and
+cost tens of minutes of Bazel compilation per deep run on a runner where the handshake
+routinely never completed. What follows is the historical record of what it measured
+while it existed.
 
 **QUICHE HTTP/3 transport interop: PASS locally, NOT-TESTED on GitHub-hosted runners.**
 
@@ -910,7 +943,9 @@ NOT-TESTED. Sharing one status would either make the workflow red for a reason t
 repository cannot fix, or report the transport success as MASQUE interop.
 
 The cheap protocol-vector check in `quiche_oracle_test.go` is kept and still runs on every
-push: the vectors pin QUICHE's DECISIONS, the live run pins its BEHAVIOUR.
+push: the vectors pin QUICHE's DECISIONS. The live run that pinned its BEHAVIOUR has been
+removed with the rest of the harness, so those behaviour claims are now history rather than
+a standing guarantee.
 
 ### RFC 9931 client-side half — AUXILIARY FULL-REGISTRY CLIENT AUDIT: PASS
 

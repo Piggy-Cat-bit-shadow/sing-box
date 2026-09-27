@@ -243,8 +243,8 @@ workflow_dispatch:
 ```
 
 Linux deep checks: race tests, the fuzz campaign, the upstream-default tag build
-and tests, the Caddy/forwardproxy reference differential tests, the MASQUE
-reference interop, and the QUICHE live interop.
+and tests, the `test/jiejie/reference` interop suite plus the Caddy/forwardproxy
+reference differential tests, and the MASQUE reference interop.
 
 macOS deep checks: race tests, the fuzz campaign, the upstream-default build, and
 the Cronet engine A/B (which needs a live Naive server and otherwise reports NOT
