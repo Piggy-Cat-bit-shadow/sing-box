@@ -2,44 +2,61 @@ name: Linux amd64
 
 # Builds and verifies THE Linux amd64 server core.
 #
-# # One product, one job, one build
+# # What this workflow is for
 #
-# This workflow exists to produce one artifact: the Jiejie VPS server binary. The
-# quick path is deliberately a single job, because every additional job means
-# another runner startup, checkout, setup-go, cache restore and dependency
-# resolution for a workload that does not need them.
+# One job, one build, one artifact: `sing-box-linux-amd64`. A push to `testing` must
+# mean "build the Linux kernel", not "run a protocol laboratory for a quarter of an
+# hour and build a kernel at the end of it".
 #
-# The production binary is built EXACTLY ONCE and every check afterwards reads that
-# same file: version, tag agreement, config check, runtime smoke, symbol and
-# pruning audit, size ceiling, SHA-256, BUILD-INFO and the upload all operate on
-# `dist/sing-box-linux-amd64`. Nothing re-runs `go build` to inspect something the
-# binary already contains.
+# # The fast path, and why it looks like this
 #
-# # Quick path vs deep checks
+# The previous revision ran the whole `test/jiejie` package on every push. Measured
+# on run 36306308538, that single step was **776s** of a ~16 minute job - roughly
+# 80% of the wall clock - while everything it actually gated (build, config,
+# runtime, audit, upload) totalled under 90s. It is an integration, conformance and
+# reference suite, not a unit test suite, and it does not belong on every commit.
 #
-# A push to `testing` runs the fast path: formatting, vet, the core unit tests
-# under the production tags, one build, and the artifact checks above.
+# The fast path now runs only what gates the artifact:
 #
-# Everything expensive moved behind a manual `deep_checks` input:
+#   gofmt
+#   focused go vet                  (the packages this server's graph reaches)
+#   focused production unit tests   (same principle)
+#   9 jiejie PRODUCTION-CONTRACT tests   - registry + topology fixture, 0.47s
+#   build ONCE
+#   version and tags
+#   production topology config check
+#   runtime smoke
+#   package-graph pruning audit     (`go list -deps`, no build)
+#   runtime registry pruning audit  (the shipped binary rejects pruned types)
+#   size ceiling
+#   SHA-256 and BUILD-INFO
+#   upload
 #
-#   - race tests
-#   - the fuzz campaign
-#   - the upstream-default (non-production) tag build and its tests
-#   - the pinned Caddy/forwardproxy reference build and differential tests
-#   - the quic-go/masque-go and connect-ip-go reference interop
-#   - the QUICHE live interop
+# # The fast path performs EXACTLY ONE `go build`
 #
-# Those checks are valuable and the SOURCE for them stays in the repository. They
-# simply do not belong on every commit: none of them gates whether the artifact is
-# shippable, and together they dominated the wall clock.
+# This claim was false before and is enforced now:
+#
+#   - the `.debug` second build for the symbol audit is GONE. Pruning is checked
+#     against the compile-time package graph (`go list -deps`), which needs no build
+#     at all and is in fact a stronger statement: it proves the package is not in
+#     the program, not merely that its symbols were not observed.
+#   - reproducibility moved to deep_checks, so the `repro-check` rebuild is gone.
+#
+# Both `go build` invocations that remain in this file are inside deep-check steps.
+#
+# # Deep checks
+#
+# Everything expensive sits behind `workflow_dispatch` with `deep_checks=true`:
+# the FULL `test/jiejie` suite (including the four known-failing Naive UoT audits),
+# race tests, the fuzz campaign, reproducibility, the upstream-default tag build,
+# the Caddy/forwardproxy reference differential, the MASQUE reference interop and
+# the QUICHE live interop. Slow is fine there; it is a manual full audit.
 #
 # # Triggers
 #
-# push to testing, plus manual dispatch. Documentation-only changes are ignored so
-# a README edit does not rebuild a kernel. The ignore list is deliberately
-# `paths-ignore` rather than a `paths` allowlist: a new source directory added
-# later must trigger the build automatically, which an allowlist would silently
-# prevent.
+# push to testing, plus manual dispatch. Documentation-only changes are ignored.
+# `paths-ignore` is used rather than a `paths` allowlist so a new source directory
+# still triggers a build.
 
 on:
   push:
@@ -54,7 +71,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_checks:
-        description: Run expensive deep validation (race, fuzz, reference interop)
+        description: Run expensive deep validation (full jiejie suite, race, fuzz, reproducibility, reference interop)
         required: false
         default: false
         type: boolean
@@ -67,17 +84,17 @@ permissions:
   contents: read
 
 env:
-  # Raw ELF size ceiling. The current production binary is about 48.6 MB; this
+  # Raw ELF size ceiling. The current production binary is about 33.9 MB; this
   # leaves room for normal Go and dependency growth while still catching an
   # accidental regression, such as a protocol or service that should have been
   # pruned finding its way back into the registry.
-  MAX_BINARY_BYTES: 56000000
+  MAX_BINARY_BYTES: 48000000
   BINARY: dist/sing-box-linux-amd64
 
 jobs:
   linux-amd64:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -87,9 +104,6 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      # -----------------------------------------------------------------------
-      # Cheap static checks.
-      # -----------------------------------------------------------------------
       - name: gofmt
         run: |
           set -euo pipefail
@@ -102,93 +116,79 @@ jobs:
           echo "PASS: gofmt clean"
 
       - name: go vet
-        # A FOCUSED package set rather than ./... . This fork's own packages and
-        # everything it ships are covered; ./... would additionally pull in
-        # daemon/managed_service.go and experimental/libbox/debug.go, which carry
-        # pre-existing upstream vet warnings about unsafe.Pointer that this fork
-        # does not modify. Failing the artifact build on those would be noise, and
-        # silencing them globally would hide a real one.
-        run: |
-          set -euo pipefail
-          go vet -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
-            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
-            ./include ./route ./adapter/... ./dns/... ./service/...
-          echo "PASS: go vet clean under the production tags"
-
-      # -----------------------------------------------------------------------
-      # Core unit tests, production tags only.
-      #
-      # The upstream-default tag build is a DEEP check: this workflow ships the
-      # production profile, and verifying a second, differently-configured product
-      # on every commit is not what makes this artifact trustworthy.
-      # -----------------------------------------------------------------------
-      - name: unit tests (production tags)
-        # An explicit package list rather than ./... . Two packages are excluded
-        # deliberately and not because they are unimportant:
+        # The package list is the set of first-party packages this server's own
+        # dependency graph actually reaches, derived from `go list -deps` rather
+        # than from a wildcard. `./protocol/... ./transport/... ./dns/...` pulled in
+        # packages the Server Minimal profile never compiles, which cost time and
+        # proved nothing about this artifact.
         #
-        #   experimental/libbox   uses badlinkname tricks that do not link under
-        #                         the tfogo_checklinkname0 tag this profile
-        #                         carries; it is a library binding for embedding,
-        #                         not part of this server, and this failure is
-        #                         pre-existing and unrelated to CI structure.
-        #   daemon/, cmd/         CLI wiring with no unit tests of its own; the
-        #                         built binary is exercised by the runtime smoke
-        #                         test below, which is stronger evidence.
-        #
-        # Everything this server actually ships and this fork modifies is listed.
+        # `./option` is included because the option schema is part of the shipped
+        # contract. daemon/ and experimental/libbox are excluded deliberately: both
+        # carry pre-existing upstream vet warnings this fork does not modify, and
+        # neither is in the server's graph.
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
-          go test -tags "$TAGS" -count=1 -timeout 20m \
-            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
-            ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashapi
-          echo "PASS: unit tests under $TAGS"
+          go vet -tags "$TAGS" \
+            ./option ./include ./route ./adapter/... \
+            ./protocol/direct ./protocol/dns ./protocol/group ./protocol/anytls \
+            ./protocol/http ./protocol/naive ./protocol/shadowsocks \
+            ./protocol/shadowtls ./protocol/socks \
+            ./transport/http ./transport/v2ray ./transport/v2rayhttp \
+            ./transport/v2raygrpclite ./transport/v2rayhttpupgrade \
+            ./transport/v2raywebsocket ./transport/simple-obfs ./transport/sip003 \
+            ./dns/... ./common/httpclient ./common/tls ./common/listener
+          echo "PASS: go vet clean under the production tags"
 
-      - name: jiejie server test suite (production tags)
-        # The dedicated server-profile suite lives in its own module.
+      - name: unit tests (production tags)
+        # Focused for the same reason as vet: every listed package is one the
+        # server compiles, plus the ones this fork actually modifies. transport/http
+        # and protocol/naive are the two heaviest, and both are in the data path of
+        # the protocols this server serves.
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          go test -tags "$TAGS" -count=1 -timeout 10m \
+            ./option ./transport/http ./protocol/http ./protocol/naive \
+            ./protocol/anytls ./protocol/shadowtls ./protocol/shadowsocks \
+            ./common/httpclient ./common/tls ./include ./route
+          echo "PASS: focused unit tests under $TAGS"
+
+      - name: production contract tests (jiejie registry + topology)
+        # The ONLY jiejie tests on the fast path, chosen by reading them rather than
+        # by name. These nine assert the two things that decide whether the shipped
+        # binary can serve the production topology at all:
         #
-        # FOUR TESTS ARE EXCLUDED BY NAME, and this is a recorded finding rather
-        # than a convenience. All four fail identically at f9a524d6d, the revision
-        # before this CI work, and they were simply never surfaced because the old
-        # pipeline did not run this suite on a push:
+        #   - every inbound, outbound and DNS transport type the production fixture
+        #     names is resolvable through the shipped registry;
+        #   - the fixture is internally consistent (no dangling references, the
+        #     modelled topology matches, no secrets, the Naive flow-control windows
+        #     are the ones intended).
         #
-        #   TestAuditLoopbackIsReachableByDefault
-        #   TestAuditRouteRuleBlocksLoopback
-        #   TestAuditUoTV2NonConnectMode
-        #   TestAuditUoTV2NonConnectMultipleTargets
+        # They are pure in-memory assertions over include.*Registry and the fixture
+        # JSON: no listener, no socket, no process. Measured at 0.47s for all nine.
         #
-        # They are Naive UoT server audits that fail with an EOF during the UoT
-        # handshake. They are NOT skipped silently: they run in the deep-check leg
-        # below, so the failure is still visible when someone asks for it, and they
-        # are named here so a later reader can find and fix them rather than
-        # wondering why coverage looks thin.
+        # Everything else in test/jiejie is integration/conformance/reference work
+        # (packet-impairment campaigns, NAT rebinding, resource profiling, Caddy
+        # parity, QUICHE interop, long-lived connection leak checks) and runs in the
+        # deep_checks leg below.
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
           cd test
-          go test -tags "$TAGS" -count=1 -timeout 25m ./jiejie/ \
-            -skip 'TestAuditLoopbackIsReachableByDefault|TestAuditRouteRuleBlocksLoopback|TestAuditUoTV2NonConnectMode|TestAuditUoTV2NonConnectMultipleTargets'
-          echo "PASS: jiejie server suite under $TAGS"
+          go test -tags "$TAGS" -count=1 -timeout 5m -v \
+            -run 'TestJiejieRegistry|TestJiejieProductionFixture|TestJiejieProductionNaiveFlowControl' \
+            ./jiejie/
+          echo "PASS: production registry and topology contract tests"
 
       # -----------------------------------------------------------------------
-      # THE build. Everything below reads this one file.
+      # THE build. This is the only `go build` on the fast path.
       # -----------------------------------------------------------------------
       - name: build production binary
         run: |
           set -euo pipefail
           mkdir -p dist
           ./scripts/ci/build-server.sh linux amd64 "$BINARY"
-          # A copy without -s -w, so the symbol audit has real symbols to read.
-          # The version is injected identically; only the strip flags differ, so
-          # what the audit inspects is the same program the artifact ships.
-          #
-          # This is not a second compilation: the Go build cache is warm from the
-          # build above and only the link step differs.
-          version="$(tr -d '[:space:]' < release/JIEJIE_VERSION)"
-          go build -trimpath -buildvcs=false \
-            -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
-            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS)" \
-            -o "$BINARY.debug" ./cmd/sing-box
 
       - name: version and tag agreement
         run: |
@@ -222,22 +222,19 @@ jobs:
         # this fails here rather than on the VPS.
         #
         # It deliberately does NOT check release/config/config.json: that is the
-        # upstream stock example, and the Server Minimal profile correctly rejects
-        # it ("unknown transport type: tls") because the trim removes DNS
-        # transports this topology does not use. Asserting on it would be asserting
-        # that the trim had not happened.
+        # upstream stock example, and Server Minimal correctly rejects it
+        # ("unknown transport type: tls") because the trim removes DNS transports
+        # this topology does not use.
         run: |
           set -euo pipefail
           topology="release/jiejie-production-topology.json"
           [ -f "$topology" ] || { echo "FAIL: $topology is missing" >&2; exit 1; }
 
-          # The topology references TLS material at /tmp/jiejie-fixture, the same
-          # paths the test suite uses. `check` LOADS the certificates rather than
-          # merely parsing the paths, so they must exist for the configuration to
-          # validate. A throwaway self-signed pair is enough: the point is that the
-          # registry resolves every type the topology names and that the TLS
-          # settings are well formed, not that the certificates are the production
-          # ones.
+          # The topology references TLS material at /tmp/jiejie-fixture, and `check`
+          # LOADS the certificates rather than only parsing the paths, so they must
+          # exist. A throwaway self-signed pair is enough: the assertion is that
+          # every type the topology names resolves and its TLS settings are well
+          # formed, not that the certificates are the production ones.
           mkdir -p /tmp/jiejie-fixture
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
             -keyout /tmp/jiejie-fixture/key.pem \
@@ -250,30 +247,15 @@ jobs:
           ./"$BINARY" check -c "$topology"
           echo "PASS: the production topology validates against the shipped registry"
 
-          # The trim must be REAL at the type level, not only in the symbol table:
-          # a config naming a pruned inbound must be rejected. Without this, the
-          # step above would still pass if the registry silently grew.
-          workdir="$(mktemp -d)"
-          cat > "$workdir/pruned.json" <<'JSON'
-          {"log": {"level": "error"},
-           "inbounds": [{"type": "tun", "tag": "t", "interface_name": "tun0"}]}
-          JSON
-          if ./"$BINARY" check -c "$workdir/pruned.json" >/dev/null 2>&1; then
-            echo "FAIL: the pruned 'tun' inbound was accepted; the trim is not real" >&2
-            exit 1
-          fi
-          echo "PASS: a pruned inbound type is rejected"
-
       - name: runtime smoke test
         # Starts the real binary and talks to it over a real socket. A config check
         # proves the configuration parses; this proves the process runs, binds its
         # listener, accepts a connection and shuts down cleanly.
         #
-        # There is deliberately NO API readiness probe here. Server Minimal
-        # registers no service at all - no Clash API, no native API - because the
-        # production topology uses none (see ServiceRegistry in
-        # include/registry_jiejie_server.go). Readiness is therefore observed the
-        # way an operator would observe it: the listener accepts.
+        # There is deliberately NO API readiness probe: Server Minimal registers no
+        # service at all - no Clash API, no native API - because the production
+        # topology uses none. Readiness is observed the way an operator would
+        # observe it: the listener accepts.
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
@@ -298,8 +280,6 @@ jobs:
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT
 
-          # Wait for the listener, polling with a real connect rather than sleeping
-          # a fixed amount, so a slow start is not mistaken for a failure.
           ready=""
           for _ in $(seq 1 100); do
             if python3 -c "
@@ -337,16 +317,24 @@ jobs:
           fi
           echo "PASS: started cleanly and shut down on SIGTERM with no panic"
 
-      - name: dependency pruning and registry audit
-        # Reads the symbol table of the binary that was ALREADY built, via the
-        # debug copy so -s -w cannot hide the symbols.
+      - name: dependency pruning audit (compile-time package graph)
+        # Answers "is this package in the program" using the compiler's own view,
+        # with NO build step. `go list -deps` resolves the import graph for the
+        # production tags in under a second, and it is a STRONGER check than reading
+        # a symbol table: a package absent from the graph is definitively not
+        # compiled in, whereas a missing symbol could in principle be inlining,
+        # dead-code elimination or a stripped table.
+        #
+        # This replaces an earlier revision that linked a second, unstripped
+        # `*.debug` binary purely to run `go tool nm`.
         run: |
           set -euo pipefail
-          go tool nm "$BINARY.debug" > /tmp/server.syms
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          go list -deps -tags "$TAGS" ./cmd/sing-box > /tmp/deps.txt
+          echo "package graph: $(wc -l < /tmp/deps.txt) packages"
           failed=0
 
-          # Full import paths, not loose substrings, so this cannot false-positive
-          # on an unrelated symbol that merely contains the word.
+          # Must NOT be in the graph. Full import paths, not loose substrings.
           pruned=(
             "github.com/sagernet/sing-box/protocol/hysteria"
             "github.com/sagernet/sing-box/protocol/hysteria2"
@@ -361,6 +349,8 @@ jobs:
             "github.com/sagernet/sing-box/protocol/mixed"
             "github.com/sagernet/sing-box/protocol/redirect"
             "github.com/sagernet/sing-box/protocol/tun"
+            "github.com/sagernet/sing-box/protocol/masque"
+            "github.com/sagernet/sing-box/transport/masque"
             "github.com/sagernet/sing-box/service/resolved"
             "github.com/sagernet/sing-box/service/origin_ca"
             "github.com/sagernet/sing-box/service/ssmapi"
@@ -368,40 +358,29 @@ jobs:
             "github.com/sagernet/sing-box/dns/transport/quic"
             "github.com/sagernet/sing-box/tailscale"
             "github.com/caddyserver/certmagic"
-            # The CONNECT-IP endpoint packages are a CLIENT capability in this
-            # fork. The server serves MASQUE through protocol/http instead, so
-            # these must not appear.
-            "github.com/sagernet/sing-box/protocol/masque"
-            "github.com/sagernet/sing-box/transport/masque"
           )
           for pkg in "${pruned[@]}"; do
-            if grep -qF "$pkg" /tmp/server.syms; then
-              echo "FAIL: $pkg is still linked" >&2
+            if grep -qxF "$pkg" /tmp/deps.txt; then
+              echo "FAIL: $pkg is in the production package graph" >&2
               failed=1
             else
               echo "PASS: $pkg pruned"
             fi
           done
 
-          # The production transports must be present, or the topology this server
-          # exists to serve is not actually servable.
-          #
-          # MASQUE is served here through protocol/http + transport/http, which is
-          # what the `http` inbound IS: the production topology runs a masque-h2
-          # listener on 28440 and a masque-h3 listener on UDP/443 through it. The
-          # server does NOT import protocol/masque or transport/masque - those are
-          # the CONNECT-IP endpoint packages, whose client role the macOS core
-          # registers. Asserting transport/masque here would have been wrong and
-          # would have failed on a correct build.
-          for pkg in \
-            "github.com/sagernet/sing-box/protocol/http" \
-            "github.com/sagernet/sing-box/protocol/anytls" \
-            "github.com/sagernet/sing-box/protocol/naive" \
-            "github.com/sagernet/sing-box/protocol/shadowtls" \
-            "github.com/sagernet/sing-box/protocol/shadowsocks" \
-            "github.com/sagernet/sing-box/transport/http" \
-            ; do
-            if grep -qF "$pkg" /tmp/server.syms; then
+          # MUST be in the graph, or the topology this server exists to serve is
+          # not actually servable. Without this half, the check above would pass on
+          # a build that compiled nothing at all.
+          required=(
+            "github.com/sagernet/sing-box/protocol/http"
+            "github.com/sagernet/sing-box/protocol/anytls"
+            "github.com/sagernet/sing-box/protocol/naive"
+            "github.com/sagernet/sing-box/protocol/shadowtls"
+            "github.com/sagernet/sing-box/protocol/shadowsocks"
+            "github.com/sagernet/sing-box/transport/http"
+          )
+          for pkg in "${required[@]}"; do
+            if grep -qxF "$pkg" /tmp/deps.txt; then
               echo "PASS: $pkg linked"
             else
               echo "FAIL: $pkg is MISSING; the production topology cannot be served" >&2
@@ -411,6 +390,52 @@ jobs:
 
           [ "$failed" -eq 0 ] || exit 1
           echo "AUDIT: PASS"
+
+      - name: registry pruning audit (runtime, against the shipped binary)
+        # The package graph proves what was COMPILED. This proves what the shipped
+        # binary will actually ACCEPT, which is a different question: the registry
+        # could resolve a type whose package is present but unregistered, and the
+        # config loader is what an operator experiences.
+        #
+        # Both directions, so neither can be satisfied by rejecting everything.
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+
+          # A pruned inbound must be REJECTED.
+          cat > "$workdir/pruned.json" <<'JSON'
+          {"log": {"level": "error"},
+           "inbounds": [{"type": "tun", "tag": "t", "interface_name": "tun0"}]}
+          JSON
+          if ./"$BINARY" check -c "$workdir/pruned.json" >/dev/null 2>&1; then
+            echo "FAIL: the pruned 'tun' inbound was accepted; the trim is not real" >&2
+            exit 1
+          fi
+          echo "PASS: a pruned inbound type is rejected by the shipped binary"
+
+          # A pruned OUTBOUND must be rejected too, since the production registry
+          # registers only direct and socks.
+          cat > "$workdir/pruned-out.json" <<'JSON'
+          {"log": {"level": "error"},
+           "outbounds": [{"type": "vmess", "tag": "v", "server": "127.0.0.1", "server_port": 1, "uuid": "00000000-0000-0000-0000-000000000000"}]}
+          JSON
+          if ./"$BINARY" check -c "$workdir/pruned-out.json" >/dev/null 2>&1; then
+            echo "FAIL: the pruned 'vmess' outbound was accepted" >&2
+            exit 1
+          fi
+          echo "PASS: a pruned outbound type is rejected by the shipped binary"
+
+          # And the transports the topology uses must be ACCEPTED, so the checks
+          # above cannot pass by the registry rejecting everything.
+          cat > "$workdir/present.json" <<'JSON'
+          {"log": {"level": "error"},
+           "outbounds": [{"type": "direct", "tag": "direct"}]}
+          JSON
+          if ! ./"$BINARY" check -c "$workdir/present.json" >/dev/null 2>&1; then
+            echo "FAIL: the 'direct' outbound the topology uses was rejected" >&2
+            exit 1
+          fi
+          echo "PASS: the direct outbound is accepted"
 
       - name: size ceiling
         run: |
@@ -426,24 +451,6 @@ jobs:
             exit 1
           fi
           echo "PASS: $SIZE <= $MAX_BINARY_BYTES bytes"
-
-      - name: reproducibility
-        # -trimpath and -buildvcs=false remove the path and VCS inputs that would
-        # otherwise make every build unique. If a future change reintroduces a
-        # timestamp or a random id, this is what catches it.
-        run: |
-          set -euo pipefail
-          ./scripts/ci/build-server.sh linux amd64 dist/repro-check >/dev/null
-          source scripts/ci/lib.sh
-          first="$(sha256_of "$BINARY")"
-          second="$(sha256_of dist/repro-check)"
-          if [ "$first" != "$second" ]; then
-            echo "FAIL: not reproducible" >&2
-            echo "  first:  $first" >&2
-            echo "  second: $second" >&2
-            exit 1
-          fi
-          echo "PASS: reproducible ($first)"
 
       # -----------------------------------------------------------------------
       # Package: the artifact holds what was verified, and nothing else.
@@ -499,24 +506,43 @@ jobs:
       # =======================================================================
       # Deep checks: manual dispatch with deep_checks=true only.
       # =======================================================================
-      - name: deep check - known-failing Naive UoT audits
-        # The four tests excluded from the fast path, run here so their state is
-        # observable on demand. They are EXPECTED to fail today. This step reports
-        # the outcome and does not fail the job, because a known pre-existing
-        # failure is information, not a regression - but it is printed loudly so
-        # it cannot be mistaken for a pass.
+      - name: deep check - full jiejie suite
+        # The WHOLE package, exactly as it ran on every push before. Measured at
+        # 776s. It is an integration, conformance and reference suite - packet
+        # impairment campaigns, NAT rebinding, UoT leak checks, resource profiling,
+        # Caddy parity, H3 stream churn - and it belongs to a manual full audit.
+        #
+        # The four known-failing Naive UoT audits are NOT excluded here, so their
+        # state stays visible on every deep run.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
-        continue-on-error: true
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
           cd test
-          go test -tags "$TAGS" -count=1 -timeout 20m -v ./jiejie/ \
-            -run 'TestAuditLoopbackIsReachableByDefault|TestAuditRouteRuleBlocksLoopback|TestAuditUoTV2NonConnectMode|TestAuditUoTV2NonConnectMultipleTargets' \
-            2>&1 | tail -40 || true
-          echo "NOTE: these four are KNOWN to fail as of f9a524d6d. A PASS here would"
-          echo "      mean someone fixed them - update the exclusion list in the"
-          echo "      fast-path step if so."
+          go test -tags "$TAGS" -count=1 -timeout 40m ./jiejie/ 2>&1 | tail -40
+          echo "NOTE: four Naive UoT audits (TestAuditLoopbackIsReachableByDefault,"
+          echo "      TestAuditRouteRuleBlocksLoopback, TestAuditUoTV2NonConnectMode,"
+          echo "      TestAuditUoTV2NonConnectMultipleTargets) are known to fail as of"
+          echo "      f9a524d6d. If this step passes, they were fixed."
+
+      - name: deep check - reproducibility
+        # Was on the fast path, where it meant compiling the whole program a second
+        # time on every commit to compare hashes. That is a release-audit question,
+        # not a per-commit one.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-server.sh linux amd64 dist/repro-check >/dev/null
+          source scripts/ci/lib.sh
+          first="$(sha256_of "$BINARY")"
+          second="$(sha256_of dist/repro-check)"
+          if [ "$first" != "$second" ]; then
+            echo "FAIL: not reproducible" >&2
+            echo "  first:  $first" >&2
+            echo "  second: $second" >&2
+            exit 1
+          fi
+          echo "PASS: reproducible ($first)"
 
       - name: deep check - race tests
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
@@ -600,9 +626,7 @@ jobs:
         #   TestReferenceQuicheConnectIPLiveInterop
         #
         # The names are spelled out because scripts/ci/check-reference-coverage.sh
-        # asserts that every test it excludes is actually run here. Building the
-        # client without running them would leave those tests verified by nothing,
-        # which is exactly what that check exists to catch.
+        # asserts that every test it excludes is actually run here.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
