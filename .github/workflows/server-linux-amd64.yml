@@ -359,6 +359,11 @@ jobs:
             "github.com/sagernet/sing-box/protocol/tun"
             "github.com/sagernet/sing-box/protocol/masque"
             "github.com/sagernet/sing-box/transport/masque"
+            # Native Naive left this profile when NaiveProxy moved to Caddy
+            # forwardproxy@udpintcp. Asserting it here is what stops the import
+            # creeping back in: the registry is the only thing that kept the whole
+            # package in the graph, so its absence is a compile-time property.
+            "github.com/sagernet/sing-box/protocol/naive"
             "github.com/sagernet/sing-box/service/resolved"
             "github.com/sagernet/sing-box/service/origin_ca"
             "github.com/sagernet/sing-box/service/ssmapi"
@@ -382,7 +387,6 @@ jobs:
           required=(
             "github.com/sagernet/sing-box/protocol/http"
             "github.com/sagernet/sing-box/protocol/anytls"
-            "github.com/sagernet/sing-box/protocol/naive"
             "github.com/sagernet/sing-box/protocol/shadowtls"
             "github.com/sagernet/sing-box/protocol/shadowsocks"
             "github.com/sagernet/sing-box/transport/http"
