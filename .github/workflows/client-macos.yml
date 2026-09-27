@@ -16,12 +16,16 @@ name: Client macOS
 # repeated here, so the workflow and the build script cannot drift.
 
 on:
-  # `testing` is the single development branch now that the macOS client and the
-  # server share one source tree. `macos-client` is kept in the list because the
-  # branch still exists as a backup until its deletion is confirmed safe; it is no
-  # longer where client work happens.
+  # `testing` is the single development branch: the macOS client and the server
+  # share one source tree, so client work happens there.
+  #
+  # `macos-client` was removed from this list because the branch no longer exists.
+  # It was deleted only after its contents were confirmed fully contained in
+  # `testing` (0 unique commits) AND all four workflows passed at the consolidated
+  # revision; its final tip is preserved as the tag
+  # `archive/macos-client-before-consolidation`.
   push:
-    branches: [testing, macos-client, 'feat/jiejie-macos-*', 'client/*']
+    branches: [testing, 'feat/jiejie-macos-*', 'client/*']
   pull_request:
     paths:
       - 'cmd/**'
