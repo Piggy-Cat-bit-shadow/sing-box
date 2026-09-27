@@ -75,6 +75,61 @@ func TestRegistryProvidesEveryFixtureInbound(t *testing.T) {
 	}
 }
 
+// TestRegistryOmitsNativeNaive proves the SHIPPED Server Minimal registry no longer
+// provides the Native Naive inbound.
+//
+// # Why absence is the contract
+//
+// NaiveProxy in this deployment is served by Caddy's forwardproxy@udpintcp, not by
+// sing-box. The Native Naive inbound was therefore linked into every production
+// binary while being unreachable in practice: it added a listener implementation, a
+// UoT data path and an HTTP/2 masquerade to the attack surface and the binary, for a
+// capability the topology does not use.
+//
+// Removing the registration is the fix; deleting protocol/naive is NOT, because the
+// source is still used by the full/upstream registry, by the client-side tests, and
+// as the reference the macOS Naive work is checked against.
+//
+// This test is what makes the removal stick: re-adding the import or the
+// RegisterInbound call fails here, and the failure names the reason rather than
+// leaving a future reader to guess whether it was deliberate.
+func TestRegistryOmitsNativeNaive(t *testing.T) {
+	requireJiejieMinimalRegistry(t)
+
+	registry := include.InboundRegistry()
+
+	if _, loaded := registry.CreateOptions("naive"); loaded {
+		t.Error("the Server Minimal registry still provides the \"naive\" inbound. " +
+			"Native Naive is served by Caddy forwardproxy in this deployment, so " +
+			"registering it links a listener the topology never starts")
+	}
+
+	// The ShadowTLS detour must still point at an inbound that the fixture actually
+	// declares, proving the removal did not break the chain it is part of.
+	//
+	// A detour names a TAG, not a type, so it is checked against the fixture's own
+	// inbound tags rather than against CreateOptions, which resolves types.
+	topology := loadProductionTopology(t)
+	declaredTags := make(map[string]bool, len(topology.Inbounds))
+	for _, inbound := range topology.Inbounds {
+		declaredTags[inbound.Tag] = true
+	}
+
+	var shadowTLSDetour string
+	for _, inbound := range topology.Inbounds {
+		if inbound.Type == "shadowtls" {
+			shadowTLSDetour = inbound.Detour
+		}
+	}
+	require.NotEmpty(t, shadowTLSDetour,
+		"the fixture must declare a shadowtls inbound with a detour")
+	require.NotEqual(t, "naive-in", shadowTLSDetour,
+		"the ShadowTLS detour must not point at the removed Native Naive inbound")
+	require.True(t, declaredTags[shadowTLSDetour],
+		"the ShadowTLS detour %q is not declared by any inbound in the fixture",
+		shadowTLSDetour)
+}
+
 // TestRegistryProvidesEveryFixtureOutbound proves each outbound type,
 // including the ones only named from route rules, is registered.
 func TestRegistryProvidesEveryFixtureOutbound(t *testing.T) {

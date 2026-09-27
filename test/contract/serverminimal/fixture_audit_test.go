@@ -376,88 +376,122 @@ func TestProductionFixtureHasNoSecrets(t *testing.T) {
 	}
 }
 
-// TestProductionNaiveFlowControlWindows pins the Naive HTTP/2 receive
-// windows in the production fixture.
+// TestProductionFixtureExcludesNativeNaive pins that Native Naive has LEFT the
+// Server production topology, and that nothing in the fixture still refers to it.
 //
-// The Naive inbound is a bulk-carrying tunnel, and x/net/http2's defaults are
-// sized for a browser talking to a web server, not for a proxy carrying a large
-// download: the server stops granting the client more upload credit well before
-// the link is saturated, which caps throughput on a high-BDP path.
+// # Why this replaced a presence assertion
 //
-// This test exists because the values live in JSON, where a typo (a missing
-// zero, or bytes instead of mebibytes) is silent: the tunnel still works, just
-// slower. It asserts the exact byte counts, so the fixture cannot drift.
-func TestProductionNaiveFlowControlWindows(t *testing.T) {
-	fixture, _ := loadProductionFixture(t)
+// The fixture used to declare a `naive` inbound on 28438 with a set of routes to
+// 28439, and this test used to assert its exact HTTP/2 flow-control windows. That
+// modelled a NaiveProxy endpoint served by sing-box itself. Production no longer
+// works that way: NaiveProxy is served by Caddy's forwardproxy@udpintcp, and the
+// Native Naive inbound is not used at all.
+//
+// A fixture that keeps describing a component production does not run is worse than
+// stale documentation, because the contract tests are what CI trusts. Keeping the
+// old assertion would have forced the dead inbound to stay registered purely to
+// satisfy it, so the test is inverted rather than deleted: the property worth
+// defending now is the ABSENCE.
+//
+// This is a real assertion, not a removal. If a `naive` inbound, the `naive-in` tag,
+// or either retired port is reintroduced into the fixture, this fails and says so.
+func TestProductionFixtureExcludesNativeNaive(t *testing.T) {
+	fixture, path := loadProductionFixture(t)
+
+	for _, inbound := range fixture.Inbounds {
+		if inbound.Type == "naive" {
+			t.Errorf("%s declares a %q inbound (tag %q); Native Naive is served by "+
+				"Caddy forwardproxy and must not be part of the sing-box production "+
+				"topology", path, inbound.Type, inbound.Tag)
+		}
+		if inbound.Tag == "naive-in" {
+			t.Errorf("%s still carries the retired tag %q on inbound type %q",
+				path, inbound.Tag, inbound.Type)
+		}
+		// The retired Native Naive listener and its UoT target must not come back
+		// under a different tag: the ports themselves are part of the contract.
+		switch inbound.ListenPort {
+		case 28438, 28439:
+			t.Errorf("%s binds retired Native Naive port %d on inbound %q",
+				path, inbound.ListenPort, inbound.Tag)
+		}
+	}
+
+	// No route may reference the retired tag in any form. A dangling reference is
+	// exactly what this file exists to catch, so it is checked here too rather than
+	// relying on the inbound-side checks above.
+	for index, rule := range fixture.Route.Rules {
+		for _, tag := range rule.Inbound {
+			if tag == "naive-in" {
+				t.Errorf("%s route rule %d still routes inbound %q, which is no longer "+
+					"an inbound in this topology", path, index, tag)
+			}
+		}
+		if rule.OverridePort == 28439 {
+			t.Errorf("%s route rule %d still targets the retired Native Naive UoT "+
+				"port %d", path, index, rule.OverridePort)
+		}
+	}
+}
+
+// TestProductionFixtureUsesOnlyRealReceiveWindowOwners keeps the flow-control
+// assertion that the retired Naive test existed to make, generalised so it does not
+// depend on Naive being present.
+//
+// The original point was that production pins HTTP/2 flow-control windows
+// deliberately and that no OTHER inbound should quietly inherit or override them.
+// That property is still worth defending after Naive left, so it is stated on its
+// own: whichever inbound sets a receive window must set it explicitly and sanely.
+func TestProductionFixtureUsesOnlyRealReceiveWindowOwners(t *testing.T) {
+	fixture, path := loadProductionFixture(t)
 
 	const (
 		expectedStream     = 8 * 1024 * 1024
 		expectedConnection = 32 * 1024 * 1024
 	)
 
-	var naiveLoaded bool
+	var owners int
 	for _, inbound := range fixture.Inbounds {
-		if inbound.Type != "naive" {
-			if len(inbound.StreamReceiveWindow) != 0 || len(inbound.ConnectionReceiveWindow) != 0 {
-				t.Errorf("inbound %q (type %s) sets a receive window; only the naive "+
-					"inbound is meant to carry the production flow-control tuning",
-					inbound.Tag, inbound.Type)
-			}
+		if len(inbound.StreamReceiveWindow) == 0 && len(inbound.ConnectionReceiveWindow) == 0 {
 			continue
 		}
-		naiveLoaded = true
-		if inbound.Tag != "naive-in" {
-			t.Errorf("the production naive inbound must be tagged naive-in, got %q", inbound.Tag)
+		owners++
+		if inbound.Type != "http" {
+			t.Errorf("%s inbound %q (type %s) sets a receive window; the MASQUE HTTP "+
+				"inbound is the only production listener that pins HTTP/2 flow control",
+				path, inbound.Tag, inbound.Type)
 		}
-		for _, field := range []struct {
-			name     string
-			raw      json.RawMessage
-			expected int64
-		}{
-			{"stream_receive_window", inbound.StreamReceiveWindow, expectedStream},
-			{"connection_receive_window", inbound.ConnectionReceiveWindow, expectedConnection},
-		} {
-			if len(field.raw) == 0 {
-				t.Errorf("naive-inbound %s is unset; production must pin it explicitly "+
-					"rather than inherit the http2 default", field.name)
-				continue
-			}
-			var actual int64
-			if parseErr := json.Unmarshal(field.raw, &actual); parseErr != nil {
-				t.Errorf("naive-inbound %s must be a plain byte count, got %s: %v",
-					field.name, field.raw, parseErr)
-				continue
-			}
-			if actual != field.expected {
-				t.Errorf("naive-inbound %s must be %d bytes, got %d",
-					field.name, field.expected, actual)
-			}
-		}
-	}
-	if !naiveLoaded {
-		t.Fatal("the production fixture must declare a naive inbound")
-	}
 
-	// The connection window must not be smaller than the stream window: with a
-	// connection window this low a single stream could never consume the credit
-	// its own stream window advertises, making the stream value useless.
-	var stream, connection int64
-	for _, inbound := range fixture.Inbounds {
-		if inbound.Type != "naive" {
-			continue
+		var stream, connection int64
+		if len(inbound.StreamReceiveWindow) > 0 {
+			if err := json.Unmarshal(inbound.StreamReceiveWindow, &stream); err != nil {
+				t.Errorf("%s inbound %q stream_receive_window must be a plain byte "+
+					"count, got %s: %v", path, inbound.Tag, inbound.StreamReceiveWindow, err)
+				continue
+			}
 		}
-		_ = json.Unmarshal(inbound.StreamReceiveWindow, &stream)
-		_ = json.Unmarshal(inbound.ConnectionReceiveWindow, &connection)
+		if len(inbound.ConnectionReceiveWindow) > 0 {
+			if err := json.Unmarshal(inbound.ConnectionReceiveWindow, &connection); err != nil {
+				t.Errorf("%s inbound %q connection_receive_window must be a plain byte "+
+					"count, got %s: %v", path, inbound.Tag, inbound.ConnectionReceiveWindow, err)
+				continue
+			}
+		}
+		if stream != 0 && stream != expectedStream {
+			t.Errorf("%s inbound %q stream_receive_window is %d, expected %d",
+				path, inbound.Tag, stream, expectedStream)
+		}
+		if connection != 0 && connection != expectedConnection {
+			t.Errorf("%s inbound %q connection_receive_window is %d, expected %d",
+				path, inbound.Tag, connection, expectedConnection)
+		}
+		if connection != 0 && stream != 0 && connection < stream {
+			t.Errorf("%s inbound %q connection_receive_window (%d) must be at least the "+
+				"stream_receive_window (%d), otherwise the stream window is unreachable",
+				path, inbound.Tag, connection, stream)
+		}
 	}
-	if connection < stream {
-		t.Errorf("naive connection_receive_window (%d) must be at least the "+
-			"stream_receive_window (%d), otherwise the stream window is unreachable",
-			connection, stream)
-	}
-	// The exact byte counts above already fix the values; this only records the
-	// shape so a future edit that swaps them is caught with a clearer message.
-	if stream != expectedStream || connection != expectedConnection {
-		t.Errorf("naive windows must stay %d stream / %d connection, got %d / %d",
-			expectedStream, expectedConnection, stream, connection)
+	if owners == 0 {
+		t.Logf("%s: no inbound pins HTTP/2 flow control; nothing to verify", path)
 	}
 }
