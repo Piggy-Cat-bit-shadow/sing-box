@@ -526,10 +526,8 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	// The source is the real socket peer, NOT a forwarded header.
 	//
-	// badhttp.SourceAddress returns request.RemoteAddr but then overwrites it
-	// with the first valid entry of X-Forwarded-For when that header is present
-	// (sing/protocol/http/addr.go). Any client can therefore choose the source
-	// address this server records and routes on, simply by sending the header.
+	// Any client can choose a value in X-Forwarded-For, so a header cannot be
+	// allowed to decide the source address this server records and routes on.
 	// That matters because metadata.Source feeds routing rules and the logs.
 	//
 	// There is no way for this deployment to validate such a header. The Naive
@@ -538,9 +536,15 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// future it must come from PROXY protocol, which the front end would have to
 	// emit deliberately. Until then the only trustworthy value is RemoteAddr.
 	//
-	// This is a Naive-local decision on purpose: badhttp.SourceAddress has no
-	// other caller in this repository, so changing behaviour here cannot affect
-	// another protocol, and no shared trusted-proxy mechanism exists to reuse.
+	// This is a Naive-local decision on purpose, and no shared trusted-proxy
+	// mechanism exists to reuse. It does not rely on badhttp.SourceAddress being
+	// unused elsewhere: that helper has several other callers
+	// (transport/v2rayhttp, transport/v2raywebsocket, transport/v2raygrpclite,
+	// transport/v2rayhttpupgrade, protocol/hysteria2/realm, service/ssmapi), and
+	// it does NOT read X-Forwarded-For either - this fork hardened it to return
+	// RemoteAddr. Naive reads RemoteAddr directly rather than through that helper
+	// because it needs the address before the request is hijacked, not because
+	// the helper is unsafe here.
 	source := M.ParseSocksaddr(request.RemoteAddr).Unwrap()
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
