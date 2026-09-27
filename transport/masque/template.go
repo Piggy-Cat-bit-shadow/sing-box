@@ -196,7 +196,22 @@ func (t *Template) Match(requestURL *url.URL) (Scope, bool, error) {
 		prefix, err := parseTarget(target)
 		if err == nil {
 			scope.Prefix = prefix
-		} else if strings.ContainsAny(target, ":/") {
+		} else if strings.ContainsAny(target, ":/\\") {
+			// A target that failed IP parsing AND contains a path separator is a
+			// malformed address, not a domain.
+			//
+			// The backslash is in this set because of a fuzz finding: it was
+			// absent, so a request path such as
+			//
+			//	/masque?target=a\b&ipproto=17
+			//
+			// produced a Scope with Domain "a\b" - a value carrying a path
+			// separator straight into the dialled domain. Measurement showed no
+			// traversal (Go's resolver treats it as an unknown host and it resolves
+			// to a blackhole, and net.JoinHostPort does not reinterpret it), so
+			// this was a validation gap rather than an exploitable escape. It is
+			// closed anyway: FuzzConnectIPTemplatePath asserts the invariant, and a
+			// domain that cannot be a hostname should not reach the resolver at all.
 			return Scope{}, true, E.Cause(err, "parse target")
 		} else {
 			scope.Domain = target
