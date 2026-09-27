@@ -12,9 +12,12 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -347,4 +350,69 @@ func NewQUICConfig(options option.QUICOptions) *quic.Config {
 		quicConfig.MaxIncomingStreams = int64(options.MaxConcurrentStreams)
 	}
 	return quicConfig
+}
+
+// NewClientCongestionControl resolves `quic_congestion_control` to a sender
+// factory for a CLIENT HTTP/3 connection.
+//
+// It returns (nil, nil) for an unset or explicitly "default" value, which means
+// "leave quic-go's own sender in place". That is the important case: the upstream
+// default is CUBIC, and this fork must not silently select a different algorithm,
+// because a congestion control choice changes wire behaviour and would not be
+// visible in the configuration.
+//
+// It is a separate function from the option parsing so the VALUE VALIDATION can be
+// tested without opening a QUIC connection: a test that wanted to check "bogus is
+// refused" through a dial would need a live server.
+//
+// Matching is exact, with no trimming and no case folding: an unrecognised value is
+// a configuration error the operator should see, and silently accepting "BBR" or
+// " bbr" would make a typo look like it worked.
+func NewClientCongestionControl(name string) (func(conn *quic.Conn) congestion.CongestionControl, error) {
+	switch name {
+	case "", "default":
+		// nil leaves quic-go's own sender, which is CUBIC.
+		return nil, nil
+	case "bbr":
+		// The congestion_meta2 BBR profile, the same implementation the HTTP/3
+		// server selects through bbr_profile, so a client and server that both
+		// name BBR get the same sender rather than two different BBRs.
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard)
+		}, nil
+	case "cubic":
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta1.NewCubicSender(
+				congestion_meta1.DefaultClock{},
+				conn.InitialPacketSize(),
+				false,
+			)
+		}, nil
+	case "reno":
+		// congestion_meta1's CubicSender with `reno=true` IS the Reno
+		// implementation; there is no separate constructor, and this mirrors how
+		// protocol/naive/quic resolves the same option name.
+		return func(conn *quic.Conn) congestion.CongestionControl {
+			return congestion_meta1.NewCubicSender(
+				congestion_meta1.DefaultClock{},
+				conn.InitialPacketSize(),
+				true,
+			)
+		}, nil
+	default:
+		return nil, E.New("unknown quic congestion control: ", name)
+	}
+}
+
+// ApplyClientCongestionControl installs the configured congestion control on a
+// freshly dialled client QUIC connection.
+//
+// A nil factory is the "leave the library default" case and is deliberately NOT an
+// error: that is what an unset option resolves to, and it is the upstream
+// behaviour.
+func ApplyClientCongestionControl(conn *quic.Conn, factory func(conn *quic.Conn) congestion.CongestionControl) {
+	if factory == nil {
+		return
+	}
+	conn.SetCongestionControl(factory(conn))
 }

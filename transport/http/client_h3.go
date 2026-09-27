@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-quic"
@@ -34,10 +35,13 @@ type http3ClientImpl struct {
 	headers       http.Header
 	authorization string
 	quicConfig    *quic.Config
-	transport     *http3.Transport
-	access        sync.Mutex
-	conn          *http3.ClientConn
-	rawConn       net.Conn
+	// congestionControl is resolved once in newHTTP3Client. nil means "keep
+	// quic-go's default sender", which is what an unset option selects.
+	congestionControl func(conn *quic.Conn) congestion.CongestionControl
+	transport         *http3.Transport
+	access            sync.Mutex
+	conn              *http3.ClientConn
+	rawConn           net.Conn
 }
 
 func newHTTP3Client(options ClientOptions, authorization string) (http3Client, error) {
@@ -50,6 +54,14 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 	}
 	quicConfig := httpclient.NewQUICConfig(options.HTTP3Options)
 	quicConfig.EnableDatagrams = true
+	// Resolve the client congestion control ONCE, at construction, so an
+	// unrecognised value is a configuration error reported at load rather than a
+	// failure on the first packet. A nil result is the "leave quic-go's default"
+	// case and is not an error: that is what an unset option means.
+	congestionControl, err := httpclient.NewClientCongestionControl(options.HTTP3Options.CongestionControl)
+	if err != nil {
+		return nil, err
+	}
 	headers := options.Headers.Clone()
 	authority := options.Server.String()
 	if options.Authority != "" {
@@ -62,14 +74,15 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		headers.Del("Host")
 	}
 	return &http3ClientImpl{
-		dialer:        dialer,
-		tlsConfig:     options.TLSConfig,
-		server:        options.Server,
-		authority:     authority,
-		headers:       headers,
-		authorization: authorization,
-		quicConfig:    quicConfig,
-		transport:     &http3.Transport{EnableDatagrams: true, DisableCompression: true},
+		dialer:            dialer,
+		tlsConfig:         options.TLSConfig,
+		server:            options.Server,
+		authority:         authority,
+		headers:           headers,
+		authorization:     authorization,
+		quicConfig:        quicConfig,
+		congestionControl: congestionControl,
+		transport:         &http3.Transport{EnableDatagrams: true, DisableCompression: true},
 	}, nil
 }
 
@@ -98,6 +111,11 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		}
 		return nil, E.Cause1(ErrHTTP3Unavailable, err)
 	}
+	// The congestion control must be installed on the conn BEFORE the HTTP/3
+	// client conn starts using it. SetCongestionControl swaps the sender, so
+	// applying it here - immediately after the handshake and before any stream is
+	// opened - means not a single packet is sent under the default sender.
+	httpclient.ApplyClientCongestionControl(quicConn, c.congestionControl)
 	c.conn = c.transport.NewClientConn(quicConn)
 	c.rawConn = rawConn
 	return c.conn, nil

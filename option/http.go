@@ -32,8 +32,7 @@ type QUICOptions struct {
 	InitialPacketSize       int  `json:"initial_packet_size,omitempty"`
 	DisablePathMTUDiscovery bool `json:"disable_path_mtu_discovery,omitempty"`
 	// BBRProfile sets the HTTP/3 *server* congestion control profile. It is
-	// resolved from the http inbound `bbr_profile` option. This fork is
-	// VPS-only, so the only HTTP/3 options here are the server's.
+	// resolved from the http inbound `bbr_profile` option.
 	BBRProfile ServerBBRProfile `json:"-"`
 	// DisablePathManager turns off QUIC connection migration on the HTTP/3
 	// server.
@@ -45,6 +44,25 @@ type QUICOptions struct {
 	// the references and the library default, so it is opted into rather than
 	// compiled in.
 	DisablePathManager bool `json:"-"`
+	// CongestionControl selects the QUIC congestion control algorithm for a
+	// CLIENT HTTP/3 connection, e.g. the macOS MASQUE client endpoint.
+	//
+	// Accepted values, and only these: "" / "default" (leave quic-go's own
+	// sender, which is CUBIC), "cubic", "bbr", "reno".
+	//
+	// # Why unset must stay the library default
+	//
+	// BBR is a performance preference, not a protocol requirement. Upstream
+	// sing-box, quic-go/masque-go and quic-go/connect-ip-go all leave the client
+	// congestion control alone, so silently selecting BBR here would make this
+	// fork's wire behaviour differ from every reference with nothing in the
+	// configuration to show it. An unset value therefore keeps quic-go's CUBIC,
+	// and a deployment that wants BBR names it.
+	//
+	// This complements BBRProfile rather than replacing it: BBRProfile is the
+	// SERVER knob (resolved from the http inbound `bbr_profile` option and using
+	// the congestion_meta2 profiles), while this is the CLIENT knob.
+	CongestionControl string `json:"quic_congestion_control,omitempty" enum:"default,cubic,bbr,reno"`
 }
 
 type _HTTPClientOptions struct {
