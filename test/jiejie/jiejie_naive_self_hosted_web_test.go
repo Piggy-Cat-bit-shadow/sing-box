@@ -66,6 +66,35 @@ type selfHostedWebEnv struct {
 //
 // The ingress port is passed to the rule as override_port, so the test does not
 // need to own 28439 while still exercising exactly the production rule shape.
+// selfHostedWebRules renders the rule array that gives the self-hosted web path its
+// security shape.
+//
+// It is a named function rather than an inline literal so the runtime tests and
+// TestJiejieNaiveSelfHostedWebRuleShape assert against ONE definition. The property
+// that matters here is ORDER, and an order is only meaningful if the code that runs
+// and the test that checks it read the same list.
+//
+// This is the shape production used while Native Naive was part of the Server
+// Minimal profile. It is kept because protocol/naive still ships in the full
+// registry: the ordering rule below is a real security property of the inbound
+// regardless of which profile links it.
+//
+// Rule ORDER is the security property:
+//  1. exact proxy-ingress deny (before the suffix rule can rewrite them)
+//  2. self-hosted web suffix   (rewrite to the isolated ingress)
+//  3. resolve
+//  4. self-IP SSH exception
+//  5. self + restricted reject
+func selfHostedWebRules(selfCIDR string, webIngressPort uint16) string {
+	return `
+				{"inbound": ["naive-in"], "network": ["tcp"], "domain": ["` + proxyIngressRIRI + `", "` + proxyIngressAPI + `"], "port": [443], "action": "reject"},
+				{"inbound": ["naive-in"], "network": ["tcp"], "domain_suffix": ["` + selfHostedSuffix + `"], "port": [443], "action": "route", "outbound": "direct", "override_address": "127.0.0.1", "override_port": ` + strconv.Itoa(int(webIngressPort)) + `},
+				{"inbound": ["naive-in"], "action": "resolve"},
+				{"inbound": ["naive-in"], "network": ["tcp"], "ip_cidr": ["` + selfCIDR + `"], "port": [2222], "action": "route", "outbound": "direct"},
+				{"inbound": ["naive-in"], "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "0.0.0.0/8", "` + selfCIDR + `"], "action": "reject"}
+			`
+}
+
 func startSelfHostedWebInstance(t *testing.T, selfAddress net.IP, webIngressPort uint16) *selfHostedWebEnv {
 	t.Helper()
 	requireFullNaiveRegistry(t)
@@ -117,13 +146,7 @@ func startSelfHostedWebInstance(t *testing.T, selfAddress net.IP, webIngressPort
 		}],
 		"outbounds": [{"type": "direct", "tag": "direct", "domain_resolver": "scripted"}],
 		"route": {
-			"rules": [
-				{"inbound": ["naive-in"], "network": ["tcp"], "domain": ["` + proxyIngressRIRI + `", "` + proxyIngressAPI + `"], "port": [443], "action": "reject"},
-				{"inbound": ["naive-in"], "network": ["tcp"], "domain_suffix": ["` + selfHostedSuffix + `"], "port": [443], "action": "route", "outbound": "direct", "override_address": "127.0.0.1", "override_port": ` + strconv.Itoa(int(webIngressPort)) + `},
-				{"inbound": ["naive-in"], "action": "resolve"},
-				{"inbound": ["naive-in"], "network": ["tcp"], "ip_cidr": ["` + selfCIDR + `"], "port": [2222], "action": "route", "outbound": "direct"},
-				{"inbound": ["naive-in"], "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "0.0.0.0/8", "` + selfCIDR + `"], "action": "reject"}
-			],
+			"rules": [` + selfHostedWebRules(selfCIDR, webIngressPort) + `],
 			"final": "direct"
 		}
 	}`
@@ -510,99 +533,132 @@ func loadTestCertificate(certPath, keyPath string) (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{certificate}}, nil
 }
 
-// TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction pins the shipped rule
-// shape, so the production fixture and the tests cannot drift apart.
+// TestJiejieNaiveSelfHostedWebRuleShape asserts the rule shape that
+// startSelfHostedWebInstance runs, by parsing the SAME rule array the runtime test
+// renders through selfHostedWebRules.
 //
-// This is the test that keeps the runtime tests honest: they build their own
-// config, and without this check the two could diverge and the runtime tests
-// would keep passing against a shape production no longer uses.
-func TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction(t *testing.T) {
-	fixture, path := loadProductionFixture(t)
+// # Why it no longer reads the production fixture
+//
+// This test used to compare the runtime config against
+// release/jiejie-production-topology.json, on the theory that the two must not
+// drift. That was right while Native Naive was part of the Server Minimal profile.
+// NaiveProxy is now served by Caddy's forwardproxy@udpintcp, so the fixture
+// deliberately contains no naive inbound and none of these rules.
+//
+// The runtime tests still matter - they exercise protocol/naive, which this fork
+// keeps because the full registry and the macOS Naive work depend on it - so the
+// shape they rely on is asserted against the config they actually build. Reading a
+// fixture that no longer describes them would have asserted nothing about production
+// while still failing whenever production changed.
+//
+// Rule ORDER is the security property, and it is asserted as raw JSON: the parsed
+// option.Rule is a wrapped union whose fields differ per action, so unmarshalling
+// into a typed struct would silently drop exactly the fields under test.
+func TestJiejieNaiveSelfHostedWebRuleShape(t *testing.T) {
+	const webIngressPort = 28439
+	selfCIDR := "192.0.2.10/32"
 
-	var denyRule, rewriteRule *productionRouteRule
+	var rules []struct {
+		Inbound         []string `json:"inbound"`
+		Network         []string `json:"network"`
+		Domain          []string `json:"domain"`
+		DomainSuffix    []string `json:"domain_suffix"`
+		IPCIDR          []string `json:"ip_cidr"`
+		Port            []uint16 `json:"port"`
+		Action          string   `json:"action"`
+		Outbound        string   `json:"outbound"`
+		OverrideAddress string   `json:"override_address"`
+		OverridePort    uint16   `json:"override_port"`
+	}
+	require.NoError(t, json.Unmarshal([]byte("["+selfHostedWebRules(selfCIDR, webIngressPort)+"]"), &rules),
+		"the rule array the runtime test renders must be valid JSON")
+	require.NotEmpty(t, rules, "the self-hosted web path must declare rules")
+
 	var denyIndex, rewriteIndex, resolveIndex = -1, -1, -1
-	for index := range fixture.Route.Rules {
-		rule := &fixture.Route.Rules[index]
-		if len(rule.Inbound) != 1 || rule.Inbound[0] != "naive-in" {
-			continue
-		}
+	for index, rule := range rules {
+		require.Equal(t, []string{"naive-in"}, rule.Inbound,
+			"every rule in this shape is scoped to the naive inbound; a rule that "+
+				"leaked to other inbounds would change unrelated routing")
 		switch {
 		case rule.Action == "reject" && len(rule.Domain) > 0:
-			denyRule, denyIndex = rule, index
+			denyIndex = index
 		case len(rule.DomainSuffix) > 0:
-			rewriteRule, rewriteIndex = rule, index
+			rewriteIndex = index
 		case rule.Action == "resolve":
 			resolveIndex = index
 		}
 	}
 
-	require.NotNil(t, denyRule,
-		"%s must declare an exact proxy-ingress deny for naive-in", path)
-	require.NotNil(t, rewriteRule,
-		"%s must declare the self-hosted web rewrite for naive-in", path)
+	// -1 means "no rule matched"; index 0 is legitimate and is in fact the position
+	// the deny is REQUIRED to occupy, so Positive() would be the wrong assertion.
+	require.GreaterOrEqual(t, denyIndex, 0,
+		"the config must declare an exact proxy-ingress deny")
+	require.GreaterOrEqual(t, rewriteIndex, 0,
+		"the config must declare the self-hosted web rewrite")
+	require.GreaterOrEqual(t, resolveIndex, 0,
+		"the config must declare a resolve action")
 
 	t.Run("the deny names both proxy ingress hostnames", func(t *testing.T) {
-		// Both of these are TLS server_name values of proxy inbounds, so a client
-		// reaching them through the proxy would recurse.
-		require.Contains(t, denyRule.Domain, proxyIngressRIRI,
-			"riri is the TLS server_name of masque-h2, masque-h3 and naive-in")
-		require.Contains(t, denyRule.Domain, proxyIngressAPI,
+		deny := rules[denyIndex]
+		require.Contains(t, deny.Domain, proxyIngressRIRI,
+			"riri is a TLS server_name of the proxy inbounds, so a client reaching "+
+				"it through the proxy would recurse")
+		require.Contains(t, deny.Domain, proxyIngressAPI,
 			"api is the TLS server_name of anytls-in")
-		require.Equal(t, "reject", denyRule.Action)
-		require.Equal(t, []string{"tcp"}, denyRule.Network)
-		require.Equal(t, []uint16{443}, denyRule.Port)
+		require.Equal(t, "reject", deny.Action)
+		require.Equal(t, []string{"tcp"}, deny.Network)
+		require.Equal(t, []uint16{443}, deny.Port)
 	})
 
 	t.Run("the rewrite targets the loopback web ingress", func(t *testing.T) {
-		require.Equal(t, "route", rewriteRule.Action)
-		require.Equal(t, "direct", rewriteRule.Outbound)
-		require.Equal(t, "127.0.0.1", rewriteRule.OverrideAddress,
+		rewrite := rules[rewriteIndex]
+		require.Equal(t, "route", rewrite.Action)
+		require.Equal(t, "direct", rewrite.Outbound)
+		require.Equal(t, "127.0.0.1", rewrite.OverrideAddress,
 			"the self-hosted web path must be rewritten to loopback, never to the "+
 				"public self address")
-		require.EqualValues(t, 28439, rewriteRule.OverridePort,
-			"the isolated Web-only ingress port is fixed at 28439")
-		require.Contains(t, rewriteRule.DomainSuffix, selfHostedSuffix,
-			"domain_suffix must be the bare zone; sing-box matches the zone and "+
-				"its subdomains without a wildcard prefix")
-		for _, suffix := range rewriteRule.DomainSuffix {
+		require.EqualValues(t, webIngressPort, rewrite.OverridePort,
+			"the isolated Web-only ingress port is fixed at %d", webIngressPort)
+		require.Contains(t, rewrite.DomainSuffix, selfHostedSuffix,
+			"domain_suffix must be the bare zone; sing-box matches the zone and its "+
+				"subdomains without a wildcard prefix")
+		for _, suffix := range rewrite.DomainSuffix {
 			require.False(t, strings.HasPrefix(suffix, "*."),
-				"domain_suffix is a raw suffix matcher and must not be written "+
-					"with a wildcard prefix")
+				"domain_suffix is a raw suffix matcher and must not be written with "+
+					"a wildcard prefix")
 		}
-		require.Empty(t, rewriteRule.Domain,
+		require.Empty(t, rewrite.Domain,
 			"the rewrite must be suffix-based; an exact domain list would silently "+
 				"stop covering new subdomains")
 	})
 
 	t.Run("the rewrite is tcp and 443 only", func(t *testing.T) {
-		require.Equal(t, []string{"tcp"}, rewriteRule.Network,
+		rewrite := rules[rewriteIndex]
+		require.Equal(t, []string{"tcp"}, rewrite.Network,
 			"the self-hosted web exception must not create a UDP or UoT path")
-		require.Equal(t, []uint16{443}, rewriteRule.Port)
+		require.Equal(t, []uint16{443}, rewrite.Port)
 	})
 
 	t.Run("the deny precedes the rewrite and both precede resolve", func(t *testing.T) {
-		require.Positive(t, denyIndex)
-		require.Positive(t, rewriteIndex)
 		require.Less(t, denyIndex, rewriteIndex,
 			"the exact proxy-ingress deny must come BEFORE the suffix rewrite, or "+
 				"an ingress name would be rewritten into the web ingress")
 		require.Greater(t, resolveIndex, rewriteIndex,
-			"both new rules must precede the naive-in resolve action: a domain "+
-				"matcher needs the destination to still be a domain")
+			"both rules must precede the resolve action: a domain matcher needs the "+
+				"destination to still be a domain")
 	})
 
 	t.Run("the self address stays denied on 443", func(t *testing.T) {
-		// The whole point of the fallback deny: only the named zone is rewritten.
 		var rejectCIDRs []string
-		for _, rule := range fixture.Route.Rules {
+		for _, rule := range rules {
 			if rule.Action == "reject" && len(rule.IPCIDR) > 0 {
 				rejectCIDRs = append(rejectCIDRs, rule.IPCIDR...)
 			}
 		}
 		require.NotEmpty(t, rejectCIDRs,
 			"the self and restricted address ranges must still be rejected")
-		require.Contains(t, rejectCIDRs, "192.0.2.10/32",
-			"the self address placeholder must remain in the reject list; "+
-				"rewriting the web zone does not reopen the public self address")
+		require.Contains(t, rejectCIDRs, selfCIDR,
+			"the self address placeholder must remain in the reject list; rewriting "+
+				"the web zone does not reopen the public self address")
 	})
 }
