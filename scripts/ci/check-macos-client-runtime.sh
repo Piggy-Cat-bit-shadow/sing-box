@@ -74,6 +74,7 @@ subs = {
     "__ANYTLS_PORT__": "19194",
     "__HYSTERIA2_PORT__": "19195",
     "__TUIC_PORT__": "19196",
+    "__MASQUE_PORT__": "19197",
 }
 for k, v in subs.items():
     tmpl = tmpl.replace(k, v)
