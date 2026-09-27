@@ -178,11 +178,16 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           ./scripts/ci/build-server.sh linux amd64 "$BINARY"
-          # A copy WITHOUT -s -w so the symbol audit below has real symbols to
-          # read. This is not a second compilation of the program: the Go build
-          # cache is warm from the build above and only the link step differs.
+          # A copy without -s -w, so the symbol audit has real symbols to read.
+          # The version is injected identically; only the strip flags differ, so
+          # what the audit inspects is the same program the artifact ships.
+          #
+          # This is not a second compilation: the Go build cache is warm from the
+          # build above and only the link step differs.
+          version="$(tr -d '[:space:]' < release/JIEJIE_VERSION)"
           go build -trimpath -buildvcs=false \
             -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS)" \
             -o "$BINARY.debug" ./cmd/sing-box
 
       - name: version and tag agreement
