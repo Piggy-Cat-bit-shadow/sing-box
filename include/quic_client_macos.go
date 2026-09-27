@@ -9,7 +9,6 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/dns/transport/quic"
 	"github.com/sagernet/sing-box/protocol/hysteria2"
-	_ "github.com/sagernet/sing-box/protocol/naive/quic"
 	"github.com/sagernet/sing-box/protocol/tuic"
 	_ "github.com/sagernet/sing-box/transport/v2rayquic"
 )
@@ -25,11 +24,38 @@ import (
 //     resolver, and FakeIP + DoH3 is a common GUI template.
 //   - the v2ray QUIC transport, which VLESS needs for its QUIC-based packet
 //     encoding.
-//   - the naive QUIC import, which protocol/naive/quic implements for the
-//     NaiveProxy client. This package carries no build tag of its own, so it is
-//     pulled in by this import exactly as the server build does; when
-//     `with_naive_outbound` is off, protocol/naive/outbound.go is not compiled
-//     and the server-side half of that package is unused.
+//
+// # Why protocol/naive/quic is NOT imported here
+//
+// This import used to be present, and removing it is a correction rather than a
+// trim. protocol/naive/quic does exactly two things, both in init():
+//
+//	naive.ConfigureHTTP3ListenerFunc = ...   // qtls.ListenEarly + http3.Server
+//	naive.WrapError = qtls.WrapError
+//
+// Both are SERVER-side. ConfigureHTTP3ListenerFunc is called only from
+// protocol/naive/inbound.go, and WrapError only from protocol/naive/inbound_conn.go
+// -- the Native Naive HTTP/3 LISTENER and its connection wrapper. The macOS client
+// is outbound-only: it has no Naive inbound (the registry audit asserts `naive` is
+// absent from the inbound registry), and its Naive outbound goes through
+// `cronet.NewNaiveClient`, not through this package.
+//
+// So the import linked a complete HTTP/3 server listener stack -- qtls.ListenEarly,
+// http3.Server, and the congestion_meta1/meta2 trees -- into a binary that could
+// never call it. With `with_quic` set, the client profile was paying for a server
+// it cannot run.
+//
+// Everything that actually matters for a Naive CLIENT is unaffected:
+//
+//   - Naive outbound over HTTP/2: protocol/naive/outbound.go, linked under
+//     with_naive_outbound (the Naive flavor).
+//   - Naive outbound over QUIC/HTTP/3: the same outbound with `"quic": true`,
+//     which selects Cronet's QUIC stack, not this listener.
+//   - Cronet: unchanged; it is the outbound implementation.
+//
+// The removal is verified by symbol audit rather than by reading this comment:
+// scripts/ci/audit-macos-client-registry.sh asserts the native-Naive H3 listener
+// symbols are absent while the Naive outbound still resolves.
 //
 // # What is deliberately NOT registered
 //

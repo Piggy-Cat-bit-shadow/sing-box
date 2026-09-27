@@ -95,18 +95,49 @@ excluded_packages=(
 # difference. Registering the client role alone in the registry is not sufficient
 # evidence on its own: if some other package pulled in the server constructor, the
 # server endpoint would be linked as dead weight in the artifact.
+#
+# The positive evidence is NewClientEndpoint and its METHOD SET, not
+# RegisterClientEndpoint: the registrar is a two-line wrapper with a single call
+# site, so the linker inlines it away and no symbol survives. Asserting on the
+# registrar would produce a permanent false FAIL, which is worse than having no
+# check at all -- it trains a reader to ignore the audit. The methods are the
+# honest evidence that the client ENDPOINT is really linked, and they are what
+# cannot be inlined.
 masque_client_symbols=(
-  "masque.RegisterClientEndpoint"
   "masque.NewClientEndpoint"
+  "masque.(*ClientEndpoint)"
 )
 
 # masque.NewServerEndpoint is the server role's constructor, and
 # masque.RegisterEndpoint is the COMBINED helper. The client registry must call
 # neither: the combined helper registers masque-server too, which is exactly the
 # mistake this audit is here to catch.
+#
+# (*ServerEndpoint) is asserted as well because the TYPE is what would actually
+# ship: a build that linked the type but not the registrar would still carry the
+# whole server endpoint implementation.
 masque_server_symbols=(
   "masque.NewServerEndpoint"
   "masque.RegisterEndpoint"
+  "masque.(*ServerEndpoint)"
+)
+
+# The Native Naive HTTP/3 listener is a SERVER and must not be linked into the
+# macOS client.
+#
+# include/quic_client_macos.go used to import protocol/naive/quic, whose init()
+# installs naive.ConfigureHTTP3ListenerFunc (qtls.ListenEarly + http3.Server) and
+# naive.WrapError. Both are consumed only by protocol/naive/inbound.go and
+# protocol/naive/inbound_conn.go -- the Naive INBOUND. The macOS client is
+# outbound-only and never constructs that inbound, so the import linked an
+# unreachable HTTP/3 server listener stack into the artifact.
+#
+# Naive outbound over HTTP/2 and over QUIC/HTTP3 is unaffected: it goes through
+# cronet.NewNaiveClient, which the flavor check further down still requires.
+naive_server_h3_symbols=(
+  "naive.ConfigureHTTP3ListenerFunc"
+  "naive.WrapError"
+  "sing-box/protocol/naive/quic."
 )
 
 # dns/transport/mdns is deliberately NOT asserted absent, and that is a finding
@@ -160,7 +191,7 @@ done
 echo ""
 echo "== excluded symbols (must have 0 occurrences) =="
 for sym in "${excluded_symbols[@]}"; do
-  count="$(grep -c "$sym" "$nm_out" || true)"
+  count="$(grep -cF "$sym" "$nm_out" || true)"
   if [ "$count" -eq 0 ]; then
     echo "PASS: $sym absent"
   else
@@ -172,7 +203,7 @@ done
 echo ""
 echo "== MASQUE role split (client present, server absent) =="
 for sym in "${masque_client_symbols[@]}"; do
-  count="$(grep -c "$sym" "$nm_out" || true)"
+  count="$(grep -cF "$sym" "$nm_out" || true)"
   if [ "$count" -gt 0 ]; then
     echo "PASS: client role symbol $sym is linked ($count)"
   else
@@ -181,12 +212,12 @@ for sym in "${masque_client_symbols[@]}"; do
   fi
 done
 for sym in "${masque_server_symbols[@]}"; do
-  count="$(grep -c "$sym" "$nm_out" || true)"
+  count="$(grep -cF "$sym" "$nm_out" || true)"
   if [ "$count" -eq 0 ]; then
     echo "PASS: server role symbol $sym absent"
   else
     echo "FAIL: server role symbol $sym is linked; masque-server leaked into the client" >&2
-    grep "$sym" "$nm_out" | head -5 >&2
+    grep -F "$sym" "$nm_out" | head -5 >&2
     fail=1
   fi
 done
@@ -203,6 +234,20 @@ for pkg in "${masque_shared_packages[@]}"; do
     echo "PASS: shared MASQUE data plane $pkg is linked ($count symbols)"
   else
     echo "FAIL: shared MASQUE data plane $pkg has no symbols" >&2
+    fail=1
+  fi
+done
+
+echo ""
+echo "== Native Naive server HTTP/3 listener (must be absent from the client) =="
+for sym in "${naive_server_h3_symbols[@]}"; do
+  count="$(grep -cF "$sym" "$nm_out" || true)"
+  if [ "$count" -eq 0 ]; then
+    echo "PASS: naive server H3 symbol $sym absent"
+  else
+    echo "FAIL: naive server H3 symbol $sym is linked; the client profile is" \
+         "linking a server it cannot run" >&2
+    grep -F "$sym" "$nm_out" | head -5 >&2
     fail=1
   fi
 done
