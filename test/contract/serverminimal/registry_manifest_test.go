@@ -1,4 +1,4 @@
-package jiejie_test
+package serverminimal_test
 
 import (
 	"encoding/json"
@@ -50,7 +50,7 @@ type productionTopology struct {
 
 func loadProductionTopology(t *testing.T) productionTopology {
 	t.Helper()
-	path := filepath.Join("..", "..", "release", "jiejie-production-topology.json")
+	path := filepath.Join("..", "..", "..", "release", "jiejie-production-topology.json")
 	content, err := os.ReadFile(path)
 	require.NoError(t, err, "the production topology must be readable")
 	var topology productionTopology
@@ -59,9 +59,9 @@ func loadProductionTopology(t *testing.T) productionTopology {
 	return topology
 }
 
-// TestJiejieRegistryProvidesEveryFixtureInbound proves each inbound type the
+// TestRegistryProvidesEveryFixtureInbound proves each inbound type the
 // fixture declares can actually be constructed.
-func TestJiejieRegistryProvidesEveryFixtureInbound(t *testing.T) {
+func TestRegistryProvidesEveryFixtureInbound(t *testing.T) {
 	topology := loadProductionTopology(t)
 	registry := include.InboundRegistry()
 	require.NotEmpty(t, topology.Inbounds, "the fixture must declare inbounds")
@@ -75,9 +75,9 @@ func TestJiejieRegistryProvidesEveryFixtureInbound(t *testing.T) {
 	}
 }
 
-// TestJiejieRegistryProvidesEveryFixtureOutbound proves each outbound type,
+// TestRegistryProvidesEveryFixtureOutbound proves each outbound type,
 // including the ones only named from route rules, is registered.
-func TestJiejieRegistryProvidesEveryFixtureOutbound(t *testing.T) {
+func TestRegistryProvidesEveryFixtureOutbound(t *testing.T) {
 	topology := loadProductionTopology(t)
 	registry := include.OutboundRegistry()
 
@@ -114,12 +114,12 @@ func TestJiejieRegistryProvidesEveryFixtureOutbound(t *testing.T) {
 	}
 }
 
-// TestJiejieRegistryProvidesEveryFixtureDNSTransport proves each DNS server type
+// TestRegistryProvidesEveryFixtureDNSTransport proves each DNS server type
 // is registered.
 //
 // A DNS transport is resolved when the DNS router initialises, so a missing one
 // prevents startup rather than degrading resolution.
-func TestJiejieRegistryProvidesEveryFixtureDNSTransport(t *testing.T) {
+func TestRegistryProvidesEveryFixtureDNSTransport(t *testing.T) {
 	topology := loadProductionTopology(t)
 	registry := include.DNSTransportRegistry()
 	require.NotEmpty(t, topology.DNS.Servers, "the fixture must declare DNS servers")
@@ -132,14 +132,14 @@ func TestJiejieRegistryProvidesEveryFixtureDNSTransport(t *testing.T) {
 	}
 }
 
-// TestJiejieRegistryResolvesEveryInboundDetour proves the ShadowTLS chain is
+// TestRegistryResolvesEveryInboundDetour proves the ShadowTLS chain is
 // constructible end to end.
 //
 // The fixture routes shadowtls-in through `detour: ss2022-in`, and a detour is
 // resolved through the INBOUND registry. A detour naming an unregistered inbound
 // is only discovered at start time, and the resulting error does not say which
 // piece of the chain is absent.
-func TestJiejieRegistryResolvesEveryInboundDetour(t *testing.T) {
+func TestRegistryResolvesEveryInboundDetour(t *testing.T) {
 	topology := loadProductionTopology(t)
 	registry := include.InboundRegistry()
 
@@ -171,14 +171,14 @@ func TestJiejieRegistryResolvesEveryInboundDetour(t *testing.T) {
 			"none means this test silently verified nothing")
 }
 
-// TestJiejieRegistryAuditFindsTheExpectedSet pins the exact registry contents.
+// TestRegistryAuditFindsTheExpectedSet pins the exact registry contents.
 //
 // The audit above proves nothing is MISSING. This proves nothing unexpected was
 // added either: a protocol registered for a topology that does not use it is dead
 // weight in a production binary, and the minimal registry's whole purpose is to
 // avoid that. A new registration must be a deliberate decision, so it fails here
 // first.
-func TestJiejieRegistryAuditFindsTheExpectedSet(t *testing.T) {
+func TestRegistryAuditFindsTheExpectedSet(t *testing.T) {
 	// THIS TEST IS ONLY VALID UNDER THE PRODUCTION MINIMAL TAG SET.
 	//
 	// It asserts that the registry contains nothing the production topology does
@@ -273,7 +273,7 @@ func isBootDependencyDNSType(t *testing.T, dnsType string) bool {
 	if dnsType != "local" {
 		return false
 	}
-	source, err := os.ReadFile(filepath.Join("..", "..", "box.go"))
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "box.go"))
 	require.NoError(t, err, "box.go must be readable to verify the boot dependency")
 	require.Contains(t, string(source), "C.DNSTypeLocal",
 		"\"local\" is only justified as a boot dependency while box.go creates a "+

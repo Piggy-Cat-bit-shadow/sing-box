@@ -1,4 +1,4 @@
-package jiejie_test
+package serverminimal_test
 
 import (
 	"encoding/json"
@@ -96,7 +96,7 @@ type productionRouteRule struct {
 
 func loadProductionFixture(t *testing.T) (*productionFixture, string) {
 	t.Helper()
-	path := filepath.Join("..", "..", "release", "jiejie-production-topology.json")
+	path := filepath.Join("..", "..", "..", "release", "jiejie-production-topology.json")
 	content, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read production fixture: %v", err)
@@ -106,9 +106,10 @@ func loadProductionFixture(t *testing.T) (*productionFixture, string) {
 		t.Fatalf("parse production fixture: %v", err)
 	}
 	// Capture the rules twice: once typed, once raw. The raw copy is what
-	// TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction asserts against, so a
-	// rule option that production sets but this struct does not model still shows
-	// up in the test rather than being silently dropped by the decoder.
+	// TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction (still in
+	// test/jiejie, which exercises the live server) asserts against, so a rule
+	// option that production sets but this struct does not model still shows up in
+	// the test rather than being silently dropped by the decoder.
 	var envelope struct {
 		Route struct {
 			Rules []json.RawMessage `json:"rules"`
@@ -121,8 +122,8 @@ func loadProductionFixture(t *testing.T) (*productionFixture, string) {
 	return &fixture, path
 }
 
-// TestJiejieProductionFixtureReferencesResolve is the reference audit.
-func TestJiejieProductionFixtureReferencesResolve(t *testing.T) {
+// TestProductionFixtureReferencesResolve is the reference audit.
+func TestProductionFixtureReferencesResolve(t *testing.T) {
 	fixture, _ := loadProductionFixture(t)
 
 	inboundTags := make(map[string]bool)
@@ -208,9 +209,9 @@ func TestJiejieProductionFixtureReferencesResolve(t *testing.T) {
 	}
 }
 
-// TestJiejieProductionFixtureModelsRealTopology pins the specific production
+// TestProductionFixtureModelsRealTopology pins the specific production
 // links so they cannot silently regress into a feature showcase.
-func TestJiejieProductionFixtureModelsRealTopology(t *testing.T) {
+func TestProductionFixtureModelsRealTopology(t *testing.T) {
 	fixture, _ := loadProductionFixture(t)
 
 	inboundTags := make(map[string]string)
@@ -348,9 +349,9 @@ func TestJiejieProductionFixtureModelsRealTopology(t *testing.T) {
 	}
 }
 
-// TestJiejieProductionFixtureHasNoSecrets guards against a real credential,
+// TestProductionFixtureHasNoSecrets guards against a real credential,
 // UUID or private key ever being committed into the fixture.
-func TestJiejieProductionFixtureHasNoSecrets(t *testing.T) {
+func TestProductionFixtureHasNoSecrets(t *testing.T) {
 	_, path := loadProductionFixture(t)
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -375,7 +376,7 @@ func TestJiejieProductionFixtureHasNoSecrets(t *testing.T) {
 	}
 }
 
-// TestJiejieProductionNaiveFlowControlWindows pins the Naive HTTP/2 receive
+// TestProductionNaiveFlowControlWindows pins the Naive HTTP/2 receive
 // windows in the production fixture.
 //
 // The Naive inbound is a bulk-carrying tunnel, and x/net/http2's defaults are
@@ -386,7 +387,7 @@ func TestJiejieProductionFixtureHasNoSecrets(t *testing.T) {
 // This test exists because the values live in JSON, where a typo (a missing
 // zero, or bytes instead of mebibytes) is silent: the tunnel still works, just
 // slower. It asserts the exact byte counts, so the fixture cannot drift.
-func TestJiejieProductionNaiveFlowControlWindows(t *testing.T) {
+func TestProductionNaiveFlowControlWindows(t *testing.T) {
 	fixture, _ := loadProductionFixture(t)
 
 	const (

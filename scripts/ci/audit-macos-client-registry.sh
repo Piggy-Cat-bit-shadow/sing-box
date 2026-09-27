@@ -446,6 +446,21 @@ else
   fail=1
 fi
 
+# A substring count over the whole cronet-go tree is NOT proof that the NaiveProxy
+# client itself is present: any shared helper, CGO shim or vendored utility from that
+# module would satisfy it. The constructor is the symbol the `naive` outbound actually
+# calls, so it is asserted by NAME. This is the assertion the retired
+# "product capability verification" workflow step made, folded in here so the binary's
+# symbol table is read once.
+if grep -qF "cronet-go.NewNaiveClient" "$nm_out"; then
+  echo "PASS: cronet-go.NewNaiveClient is linked (the real Naive outbound constructor)"
+else
+  echo "FAIL: cronet-go.NewNaiveClient is MISSING. cronet-go symbols exist, but not the" >&2
+  echo "      constructor the naive outbound calls, so a \`type: naive\` config may still" >&2
+  echo "      resolve to a stub. Refusing to accept a substring match as proof." >&2
+  fail=1
+fi
+
 # The stub must NOT be what is linked. If both the stub and the real
 # implementation were present the binary would be larger than needed and the
 # resolution order would decide which one a configuration got, which is not a
@@ -456,6 +471,37 @@ if grep -qF "naive outbound is not included in this build" "$nm_out"; then
   fail=1
 else
   echo "PASS: the naive not-included stub is absent (the real outbound is linked)"
+fi
+
+echo ""
+echo "== product capability: gVisor (the system TUN stack) =="
+#
+# `with_gvisor` is a build TAG, and a tag name is not proof that the gVisor stack was
+# linked: the tag gates the dependency, but a registry or platform-constraint change
+# could drop it while the tag stays set, and the TUN inbound would then fall back to a
+# stack the product does not intend. This asserts the package is genuinely in the
+# binary. Folded in from the retired "product capability verification" step.
+gvisor_symbols="$(grep -c "sagernet/gvisor" "$nm_out" || true)"
+if [ "$gvisor_symbols" -gt 0 ]; then
+  echo "PASS: gVisor is linked ($gvisor_symbols symbols); the TUN stack is real"
+else
+  echo "FAIL: with_gvisor is set but NO gVisor symbols are linked; the TUN inbound" >&2
+  echo "      would not have the system stack the product depends on" >&2
+  fail=1
+fi
+
+echo ""
+echo "== product capability: LXD daemon package =="
+#
+# The launcher decides whether a core supports daemon mode by running
+# `<core> lxd --help` and grepping for --state-dir. That runtime probe lives in its own
+# CI step; this is the cheaper static half, proving the package is linked at all, so a
+# failure points at linkage rather than at argument parsing.
+if grep -qF "sing-box/lxd." "$nm_out"; then
+  echo "PASS: the LXD daemon package is linked"
+else
+  echo "FAIL: sing-box/lxd. has no symbols; the daemon subcommand cannot exist" >&2
+  fail=1
 fi
 
 echo ""

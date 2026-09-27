@@ -10,9 +10,9 @@ name: macOS arm64
 # for. There is no lite/naive split, no darwin/amd64 build, and therefore no
 # matrix: a matrix over profiles that are not products is just extra runner time.
 #
-# The binary is built EXACTLY ONCE. Version, architecture, tag agreement, config
-# check, runtime smoke, headless smoke, registry and symbol audit, capability
-# verification, SHA-256, BUILD-INFO and the upload all read the same
+# The binary is built EXACTLY ONCE. Version, architecture, tag agreement, runtime
+# smoke, headless smoke, the product registry/capability audit, the LXD CLI probe,
+# SHA-256, BUILD-INFO and the upload all read the same
 # `dist/sing-box-darwin-arm64`. The previous design rebuilt the shipped core inside
 # the package job, which meant the artifact was never the file that had been
 # tested.
@@ -24,11 +24,32 @@ name: macOS arm64
 #
 # Behind the manual `deep_checks` input:
 #
+#   - go vet
+#   - reproducibility
 #   - race tests
 #   - the fuzz campaign
-#   - the upstream-default (non-product) build
 #   - the Cronet engine A/B and the receive-window sweep, which need a live Naive
 #     server and are therefore never runnable on a standard push
+#
+# # What is NOT here, and why
+#
+#   - the upstream-default (non-product) build. Neither shipped product is a stock
+#     SagerNet build, and upstream breakage still surfaces through the real product
+#     build and the unit tests.
+#   - the `TestClient` registry assertions. `-run` filters what EXECUTES, not what
+#     COMPILES, so the step paid ~25s to compile the whole `test/jiejie` integration
+#     suite in order to run a few light registry assertions - and those same
+#     properties are asserted against the SHIPPED binary by the product registry and
+#     capability audit below, which is strictly stronger evidence. The test source is
+#     untouched and still runs locally.
+#   - a standalone `config check` step. The consolidated audit already runs
+#     `check-macos-client-config.sh` against both the fixture and example-config.json,
+#     so the real binary is still fully config-validated - once, not twice.
+#   - a standalone `product capability verification` step. It ran a SECOND
+#     `go tool nm` over the same binary for a mostly-overlapping assertion set. Its
+#     unique assertions were merged into the audit script.
+#
+# No step here uses `continue-on-error`: every check on this workflow is a hard gate.
 #
 # # Triggers
 #
@@ -49,7 +70,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_checks:
-        description: Run expensive deep validation (race, fuzz, Cronet A/B)
+        description: Run expensive deep validation (vet, reproducibility, race, fuzz, Cronet A/B)
         required: false
         default: false
         type: boolean
@@ -103,16 +124,6 @@ jobs:
           fi
           echo "PASS: gofmt clean"
 
-      - name: go vet
-        # A FOCUSED package set rather than ./... , for the same reason as the
-        # Linux workflow: ./... pulls in two upstream files with pre-existing
-        # unsafe.Pointer vet warnings that this fork does not modify.
-        run: |
-          set -euo pipefail
-          CGO_ENABLED=1 go vet -tags "$(cat "$TAGS_FILE")" \
-            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
-            ./include ./route ./adapter/... ./dns/... ./service/...
-          echo "PASS: go vet clean under the macOS tags"
 
       - name: unit tests (macOS tags)
         # An explicit package list rather than ./... , for the same reason as the
@@ -125,20 +136,6 @@ jobs:
             ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashapi
           echo "PASS: unit tests under the macOS tags"
 
-      - name: macOS registry audit tests
-        # The registry and fixture assertions in their own module, constrained to
-        # jiejie_client_macos. This is where "the MASQUE client role resolves and
-        # the server role does not" is asserted at the type level.
-        run: |
-          set -euo pipefail
-          TAGS="$(cat "$TAGS_FILE")"
-          cd test
-          CGO_ENABLED=1 go test -tags "$TAGS" -count=1 -timeout 20m -run 'TestClient' ./jiejie/
-          echo "PASS: macOS registry audit tests"
-
-      # -----------------------------------------------------------------------
-      # THE build. Everything below reads this one file.
-      # -----------------------------------------------------------------------
       - name: build macOS core
         run: |
           set -euo pipefail
@@ -186,11 +183,6 @@ jobs:
           ./"$BINARY" version | grep -F "CGO: enabled"
           echo "PASS: arm64, version, tags and CGO all agree with release/"
 
-      - name: config check
-        run: |
-          set -euo pipefail
-          ./scripts/ci/check-macos-client-config.sh "$BINARY" dist/config-check
-          echo "PASS: client fixture and example configs validate"
 
       - name: runtime smoke test (Clash API, process lifecycle)
         run: |
@@ -204,67 +196,28 @@ jobs:
           ./scripts/ci/check-macos-client-headless.sh "$BINARY" dist/headless
           echo "PASS: headless smoke"
 
-      - name: registry and symbol audit
+      - name: product registry and capability audit
+        # ONE `go tool nm` over the SHIPPED binary, covering everything a name cannot
+        # prove: excluded packages, included packages, the registry role split, the
+        # Naive real-vs-stub distinction, the exact Cronet constructor, gVisor, the
+        # MASQUE client/server split and the shared transport plane, Hysteria2, TUIC,
+        # the Clash API, TUN and the LXD daemon package.
+        #
+        # It also runs `sing-box check` against the real client fixture and
+        # example-config.json, which is where the standalone `config check` step used
+        # to run. That validation is therefore still performed on the shipped binary -
+        # once, inside the script, instead of twice.
+        #
+        # The former `product capability verification` step ran a SECOND `go tool nm`
+        # over the same binary to assert a mostly-overlapping set. Its unique
+        # assertions (exact `cronet-go.NewNaiveClient`, gVisor linkage, the LXD daemon
+        # package) were merged into the script rather than dropped; the binary's symbol
+        # table is now read once.
         run: |
           set -euo pipefail
           ./scripts/ci/audit-macos-client-registry.sh "$BINARY"
-          echo "PASS: registry and symbol audit"
+          echo "PASS: product registry and capability audit"
 
-      - name: product capability verification
-        # The tag file says with_naive_outbound and the registry says masque-client,
-        # but names are not proof. This asserts against the SHIPPED BINARY that the
-        # real implementations are present and that the server-only roles are not.
-        #
-        # Specifically it catches the failure mode where the `naive` TYPE resolves
-        # because upstream's stub registered it, while the actual Cronet
-        # implementation is absent: that configuration check passes and the user
-        # gets "rebuild with -tags with_naive_outbound" from a binary that claims
-        # to have it.
-        run: |
-          set -euo pipefail
-          go tool nm "$BINARY" > /tmp/macos.syms
-
-          require() {
-            if grep -qF "$1" /tmp/macos.syms; then
-              echo "PASS: $2"
-            else
-              echo "FAIL: $2 (missing symbol: $1)" >&2
-              exit 1
-            fi
-          }
-          forbid() {
-            if grep -qF "$1" /tmp/macos.syms; then
-              echo "FAIL: $2 (unexpected symbol: $1)" >&2
-              exit 1
-            else
-              echo "PASS: $2"
-            fi
-          }
-
-          # NaiveProxy: the real Cronet implementation, not the stub.
-          require "cronet-go.NewNaiveClient" "NaiveProxy outbound implementation is linked (Cronet)"
-          forbid  "naive outbound is not included in this build" "the naive not-included stub is absent"
-
-          # MASQUE: the client role, and the shared data plane it depends on.
-          require "protocol/masque.(*ClientEndpoint)" "masque-client endpoint is linked"
-          require "transport/masque." "the shared MASQUE data plane is linked"
-          require "transport/http." "the shared HTTP/2 + HTTP/3 + datagram plane is linked"
-          forbid  "protocol/masque.(*ServerEndpoint)" "masque-server is NOT linked"
-
-          # The rest of the required macOS feature set.
-          require "sagernet/gvisor" "gVisor (system TUN stack) is linked"
-          require "protocol/hysteria2." "Hysteria2 outbound is linked"
-          require "protocol/tuic." "TUIC outbound is linked"
-          require "experimental/clashapi" "the Clash compatibility API is linked"
-          require "protocol/tun." "the TUN inbound is linked"
-
-          # LXD daemon: the launcher runs `<core> lxd --help` and greps for
-          # --state-dir, so the command must exist in the SHIPPED binary. The symbol
-          # check below proves the package is linked; the CLI step after this one
-          # proves the command actually runs.
-          require "sing-box/lxd." "the LXD daemon package is linked"
-
-          echo "PASS: every required macOS capability is present in the shipped binary"
 
       - name: LXD daemon capability verification
         # The launcher decides whether a core supports daemon mode by running
@@ -328,24 +281,6 @@ jobs:
           fi
           echo "PASS: github.com/sagernet/sing-box/lxd is in the dependency graph"
 
-      - name: reproducibility
-        run: |
-          set -euo pipefail
-          ./scripts/ci/build-macos-client.sh arm64 dist/repro-check >/dev/null
-          source scripts/ci/lib.sh
-          first="$(sha256_of "$BINARY")"
-          second="$(sha256_of dist/repro-check)"
-          if [ "$first" != "$second" ]; then
-            echo "FAIL: not reproducible" >&2
-            echo "  first:  $first" >&2
-            echo "  second: $second" >&2
-            exit 1
-          fi
-          echo "PASS: reproducible ($first)"
-
-      # -----------------------------------------------------------------------
-      # Package: the artifact holds what was verified, and nothing else.
-      # -----------------------------------------------------------------------
       - name: write BUILD-INFO and SHA256
         run: |
           set -euo pipefail
@@ -399,6 +334,45 @@ jobs:
       # =======================================================================
       # Deep checks: manual dispatch with deep_checks=true only.
       # =======================================================================
+      - name: deep check - go vet
+        # A FOCUSED package set rather than ./... , for the same reason as the
+        # Linux workflow: ./... pulls in two upstream files with pre-existing
+        # unsafe.Pointer vet warnings that this fork does not modify.
+        # Moved off the fast path: measured 69s on every push, where gofmt, the unit
+        # tests and the real product build already exercise the same code. The package
+        # list is UNCHANGED - nothing was widened to `./...`. It is a HARD gate, with
+        # no continue-on-error.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go vet -tags "$(cat "$TAGS_FILE")" \
+            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./include ./route ./adapter/... ./dns/... ./service/...
+          echo "PASS: go vet clean under the macOS tags"
+
+      - name: deep check - reproducibility
+        # Moved off the fast path, matching Linux, which has always run it here: it
+        # costs a second full build and answers a release-audit question rather than a
+        # per-commit one. NOT deleted - the check itself is unchanged.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-macos-client.sh arm64 dist/repro-check >/dev/null
+          source scripts/ci/lib.sh
+          first="$(sha256_of "$BINARY")"
+          second="$(sha256_of dist/repro-check)"
+          if [ "$first" != "$second" ]; then
+            echo "FAIL: not reproducible" >&2
+            echo "  first:  $first" >&2
+            echo "  second: $second" >&2
+            exit 1
+          fi
+          echo "PASS: reproducible ($first)"
+
+      # -----------------------------------------------------------------------
+      # Package: the artifact holds what was verified, and nothing else.
+      # -----------------------------------------------------------------------
+
       - name: deep check - race tests
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
@@ -408,6 +382,11 @@ jobs:
           echo "PASS: race tests"
 
       - name: deep check - fuzz campaign
+        # Every target is the same set as before; only the BUDGET changed, from 20s to
+        # 5s each, matching Linux. 20s per target is long-run fuzzing, not a CI
+        # regression smoke: CI establishes that the corpus still loads, the parser does
+        # not immediately crash, and no obvious panic regression is present. The
+        # accumulated corpus in testdata is replayed either way.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
@@ -416,21 +395,13 @@ jobs:
             echo "--- fuzzing $2 in $1 for ${3}s"
             go test -tags "$TAGS" -run '^$' -fuzz "^$2\$" -fuzztime "$3" "$1"
           }
-          run_fuzz ./transport/masque FuzzCapsuleParser 20s
-          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 20s
-          run_fuzz ./transport/http FuzzConnectUDPTargetPath 20s
-          run_fuzz ./protocol/naive FuzzNaiveConnectAuthority 20s
-          run_fuzz ./protocol/naive FuzzNaivePaddingFrame 20s
+          run_fuzz ./transport/masque FuzzCapsuleParser 5s
+          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 5s
+          run_fuzz ./transport/http FuzzConnectUDPTargetPath 5s
+          run_fuzz ./protocol/naive FuzzNaiveConnectAuthority 5s
+          run_fuzz ./protocol/naive FuzzNaivePaddingFrame 5s
           echo "PASS: fuzz campaign"
 
-      - name: deep check - upstream-default build
-        # The upstream stock configuration is not a product this fork ships.
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
-        run: |
-          set -euo pipefail
-          go build -trimpath -buildvcs=false -o /tmp/upstream-default ./cmd/sing-box
-          /tmp/upstream-default version
-          echo "PASS: upstream-default build"
 
       - name: deep check - Cronet engine A/B
         # Needs a live Naive server on a real path: the two engine layouts differ
