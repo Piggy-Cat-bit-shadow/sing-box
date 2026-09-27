@@ -2,6 +2,7 @@ package masque
 
 import (
 	"context"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -150,8 +151,19 @@ func (s *scriptedDatagramStream) ReceiveDatagram(ctx context.Context) ([]byte, e
 	return nil, ctx.Err()
 }
 
-func (s *scriptedDatagramStream) SendDatagram([]byte) error   { return nil }
-func (s *scriptedDatagramStream) Read([]byte) (int, error)    { select {} }
+func (s *scriptedDatagramStream) SendDatagram([]byte) error { return nil }
+
+// Read returns io.EOF rather than blocking forever.
+//
+// These tests drive loopDatagram DIRECTLY, so the capsule reader is never used.
+// A permanent block here would leave a goroutine parked with no way to release it,
+// which is not a theoretical concern: an earlier version of this file used
+// `select {}` and the package's test binary hung at exit even though every test had
+// PASSED, because the runtime waits for leaked goroutines to finish. Returning EOF
+// is honest about the fixture's contract - it serves datagrams, not a byte stream -
+// and cannot leak.
+func (s *scriptedDatagramStream) Read([]byte) (int, error) { return 0, io.EOF }
+
 func (s *scriptedDatagramStream) Write(p []byte) (int, error) { return len(p), nil }
 func (s *scriptedDatagramStream) Close() error                { return nil }
 
@@ -228,8 +240,22 @@ func TestIngressBufferOutlivesReceiveDatagram(t *testing.T) {
 
 	payload := []byte("packet-one")
 	handler := newIngressCapture(1)
-	source := &scriptedDatagramStream{datagrams: [][]byte{frameIngressDatagram(payload)}}
-	current := newSession(context.Background(), source, handler, func() int { return PacketHeadroom })
+	// The session is built inline rather than through runIngressSession because
+	// this test needs to REPLAY the source afterwards, to prove the delivered
+	// buffer no longer depends on it.
+	//
+	// ctx must be cancelled once the datagram has been delivered. The scripted
+	// source parks on ctx.Done() when its script is exhausted, so without the
+	// cancel the loop goroutine would never return and the test binary would hang
+	// at exit even though every assertion passed - which is exactly what an
+	// earlier version of this file did.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := &scriptedDatagramStream{
+		datagrams:   [][]byte{frameIngressDatagram(payload)},
+		onExhausted: cancel,
+	}
+	current := newSession(ctx, source, handler, func() int { return PacketHeadroom })
 	current.datagrams = source
 	current.loopDatagram()
 
