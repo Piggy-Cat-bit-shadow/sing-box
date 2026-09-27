@@ -20,6 +20,19 @@ type Note struct {
 	MigrationLink     string
 }
 
+// isStableRelease reports whether version is a TRUE stable SemVer release: it parses
+// as valid SemVer and carries no prerelease component.
+//
+// This is deliberately NOT badversion's PreReleaseIdentifier == "". badversion only
+// fills that field for a prerelease shaped `-<name>.<digits>`, so a version such as
+// `1.15.0-jiejie-masquerade.6` leaves it EMPTY while remaining, by SemVer, a
+// prerelease. Reading that empty field as "stable" is what made this fork's own
+// development build trip the mis-authored-note panic below.
+func isStableRelease(version string) bool {
+	tagged := "v" + version
+	return semver.IsValid(tagged) && semver.Prerelease(tagged) == ""
+}
+
 func (n Note) Impending() bool {
 	if n.ScheduledVersion == "" {
 		return false
@@ -29,7 +42,12 @@ func (n Note) Impending() bool {
 	}
 	versionCurrent := badversion.Parse(C.Version)
 	versionMinor := badversion.Parse(n.ScheduledVersion).Minor - versionCurrent.Minor
-	if versionCurrent.PreReleaseIdentifier == "" && versionMinor < 0 {
+	// This panic guards a MIS-AUTHORED note: a schedule that has already passed means
+	// the note outlived the code it describes. It may only fire for a genuinely STABLE
+	// release, because a development or prerelease build legitimately runs ahead of a
+	// removal schedule. Judging stability by badversion's prerelease field was wrong
+	// for suffixed versions, so SemVer decides it instead.
+	if isStableRelease(C.Version) && versionMinor < 0 {
 		panic("invalid deprecated note: " + n.Name)
 	}
 	return versionMinor <= 1
