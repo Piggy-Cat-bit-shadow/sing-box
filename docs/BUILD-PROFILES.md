@@ -153,28 +153,55 @@ All builds use `-trimpath -buildvcs=false`.
 
 ## Reproducibility
 
-Same source, same Go, same dependencies, same profile ⇒ **identical SHA-256**.
-Measured by building each profile twice and comparing:
+Two builds of the same source on the **same machine** produce an identical
+SHA-256, for both products. Each workflow asserts this by building twice and
+comparing, so a change that reintroduces a timestamp or a random id fails the job.
 
 ```text
-server-minimal  be2ccbc2df38207d5b4b4880551bfa836476c3c5197ac1195956e323634574a3
-macos-client    fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e
+Linux amd64   two builds on a darwin/arm64 M1 host   identical
+macOS arm64   two builds on a darwin/arm64 M1 host   identical
+macOS arm64   two builds on the macOS CI runner      identical
 ```
 
-Three inputs are removed to make this hold:
+Measured hashes, for reference:
+
+```text
+Linux amd64   18e72cc1f6e966cdf73ebcdfc8d63530be3fa244b4ad7c6013d105fb9123deab   local, 33,870,008 B
+macOS arm64   fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e   local, 76,166,402 B
+macOS arm64   a3391c4ec56b6cf3f29cc47d2f50d4a78cec00a5cd0e4a3237cb412b8ced408f   GitHub runner, same size
+```
+
+Three inputs are removed to make same-machine builds identical:
 
 - `-trimpath` removes the build directory, which would otherwise embed the
   machine-specific checkout path.
 - `-buildvcs=false` removes the VCS stamp, which embeds the commit and a dirty
   flag.
-- No timestamp or random id is injected at link time.
+- No timestamp or random id is injected at link time. Build time lives only in the
+  `BUILD-INFO` sidecar.
 
-The macOS profile was the expected exception, because it links a prebuilt Cronet
-static library under CGO and an external archive could embed a build id.
-Measurement shows it does not, so both profiles are held to the same standard
-rather than exempting the CGO leg.
+### Cross-machine: measured, and NOT identical for the macOS core
 
-Each workflow rebuilds its binary once and fails if the hashes differ.
+The two macOS hashes above have the same byte size but different bytes. That is a
+measurement, not rounding, and it is recorded because the temptation is to claim
+more than is true.
+
+The Linux profile is pure Go, so its hash matches across machines running the same
+Go version. The macOS core is **CGO**: it compiles the cgo-generated objects and
+links the Cronet static archive with the host's Apple clang, so two machines with
+different Xcode command-line tools produce different bytes from identical source.
+
+What that means in practice:
+
+- **Same-machine reproducibility is enforced by CI.** Two builds on one runner must
+  match, and the job fails if they do not.
+- **Cross-machine reproducibility is not guaranteed for the macOS core.** Its
+  SHA-256 is a same-run integrity check and a download-verification hash, not a
+  fingerprint of the source.
+
+Closing this would mean pinning the Xcode toolchain version in CI and comparing
+against a locally pinned toolchain. That is **NOT DONE** and is left as an open
+item rather than implied to pass.
 
 ## CI
 
