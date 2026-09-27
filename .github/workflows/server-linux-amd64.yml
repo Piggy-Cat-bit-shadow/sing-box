@@ -701,11 +701,16 @@ jobs:
           eval "$(./scripts/ci/jiejie-quiche-live-interop.sh --print-env)"
           echo "masque_client: $JIEJIE_QUICHE_MASQUE_CLIENT"
 
-          cd test
-          go test -tags "$(cat ../release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
-            -count=1 -timeout 30m -v \
+          # test/jiejie/reference is its OWN Go module (it has a go.mod so the MASQUE
+          # reference implementations can be imported without ever entering the
+          # production dependency graph). It must therefore be tested from inside that
+          # directory, as `.` - referencing it as ./jiejie/reference from the parent
+          # module fails with "main module (test) does not contain package
+          # test/jiejie/reference", which is a PATH mistake, not a test failure.
+          cd test/jiejie/reference
+          go test -count=1 -timeout 30m -v \
             -run 'TestReferenceQuiche(H3Transport|ConnectUDP|ConnectIP)LiveInterop' \
-            ./jiejie/reference/ 2>&1 | tee /tmp/quiche-interop.log
+            . 2>&1 | tee /tmp/quiche-interop.log
           # A skipped interop is NOT a pass: it means the external binary never ran.
           if grep -qE "^\s*--- SKIP" /tmp/quiche-interop.log; then
             echo "FAIL: a QUICHE interop test skipped; the interop was not demonstrated" >&2
