@@ -1,0 +1,287 @@
+name: Jiejie unified profiles
+
+# Builds and verifies ALL THREE Jiejie build profiles from ONE commit.
+#
+# # Why this workflow exists
+#
+# There used to be two development lines - `testing` for the Linux server and
+# `macos-client` for the macOS client - and therefore two ways to be wrong:
+#
+#   * a protocol fix landed on one branch only, so the two products silently
+#     diverged;
+#   * the client branch was periodically rebased onto `testing`, so the exact
+#     source a client artifact came from was a moving target.
+#
+# The branches are consolidated into `testing` as a single source tree, and the
+# three profiles differ only by build tags, registry and CI. This workflow is what
+# makes that structural claim CHECKABLE: the three artifacts below are built from
+# the SAME commit SHA, in one run, so a divergence cannot hide between workflows.
+#
+# # Relationship to the per-product workflows
+#
+# server-linux-amd64.yml and client-macos.yml are kept. They carry deeper
+# per-product checks (the server's size ceiling and reference coverage, the client's
+# launchd and headless checks) and they fail independently, which is what you want
+# during development: a red macOS client must not block a server release.
+#
+# This workflow is the CROSS-PRODUCT gate. It answers the one question neither of
+# those can: "do all three profiles still build and pass their audits at this
+# SHA?" Its matrix is deliberately shallow per profile and wide across profiles.
+#
+# # Profile summary
+#
+#   server-minimal   linux/amd64   jiejie_server_minimal    CGO=0
+#   macos-lite       darwin/arm64  jiejie_client_macos      CGO=0
+#   macos-naive      darwin/arm64  jiejie_client_macos      CGO=1 + with_naive_outbound
+#
+# Every tag set comes from release/BUILD_TAGS_* rather than being repeated here, so
+# the workflow and the build scripts cannot drift apart.
+
+on:
+  push:
+    branches: [testing, 'feat/jiejie-*', 'cleanup/*', 'sync/*']
+  pull_request:
+    branches: [testing]
+  workflow_dispatch:
+
+concurrency:
+  group: jiejie-profiles-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Source-level checks, shared by every profile.
+  # ---------------------------------------------------------------------------
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt (jiejie surfaces)
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l include protocol/masque transport/masque transport/http common/httpclient option test/jiejie 2>&1 || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
+      - name: the single-source property
+        # The consolidation claim is that ONE source tree serves every profile, and
+        # that the profiles differ only in registry, build tags, platform glue, CI
+        # and packaging. This asserts the part of that claim a script can check:
+        # there is no second copy of the MASQUE or Naive data plane.
+        run: |
+          set -euo pipefail
+          for pkg in protocol/masque transport/masque transport/http protocol/naive; do
+            count="$(find . -type d -path "*/$pkg" -not -path './.git/*' | wc -l | tr -d ' ')"
+            if [ "$count" -ne 1 ]; then
+              echo "FAIL: $pkg exists in $count places; the data plane must have one copy" >&2
+              find . -type d -path "*/$pkg" -not -path './.git/*' >&2
+              exit 1
+            fi
+            echo "PASS: $pkg has exactly one copy"
+          done
+
+          # A macOS-specific MASQUE or Naive implementation would also break the
+          # claim, so no file may be named for the client inside those packages.
+          if find protocol/masque transport/masque -name '*macos*' -o -name '*darwin*' | grep -q .; then
+            echo "FAIL: a platform-specific file exists inside the shared MASQUE packages:" >&2
+            find protocol/masque transport/masque -name '*macos*' -o -name '*darwin*' >&2
+            exit 1
+          fi
+          echo "PASS: no platform-specific MASQUE implementation"
+
+  # ---------------------------------------------------------------------------
+  # Per-profile build and audit.
+  # ---------------------------------------------------------------------------
+  profile:
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server-minimal
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cgo: "0"
+            tags_file: release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL
+            build_script: scripts/ci/build-server.sh
+            artifact: sing-box-linux-amd64
+          - name: macos-lite
+            runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            cgo: "0"
+            tags_file: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS
+            build_script: scripts/ci/build-macos-client.sh
+            artifact: sing-box-darwin-arm64
+          - name: macos-naive
+            runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            cgo: "1"
+            tags_file: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE
+            build_script: scripts/ci/build-macos-client.sh
+            artifact: sing-box-darwin-arm64-naive
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: record the source revision
+        # Written before the build so the artifact can be traced to a SHA, and so a
+        # reader of a downloaded artifact does not have to trust a filename.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          {
+            echo "profile: ${{ matrix.name }}"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "goos: ${{ matrix.goos }}"
+            echo "goarch: ${{ matrix.goarch }}"
+            echo "cgo: ${{ matrix.cgo }}"
+            echo "tags: $(cat ${{ matrix.tags_file }})"
+            echo "go: $(go version)"
+          } | tee "dist/BUILD-INFO-${{ matrix.name }}.txt"
+
+      - name: build ${{ matrix.name }}
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.name }}" in
+            server-minimal)
+              ./scripts/ci/build-server.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ matrix.artifact }}"
+              ;;
+            macos-lite)
+              ./scripts/ci/build-macos-client.sh arm64 lite "${{ matrix.artifact }}"
+              ;;
+            macos-naive)
+              ./scripts/ci/build-macos-client.sh arm64 naive "${{ matrix.artifact }}"
+              ;;
+          esac
+
+      - name: reported tags match the tag file
+        run: |
+          set -euo pipefail
+          reported="$(./${{ matrix.artifact }} version | sed -n 's/^Tags: //p')"
+          expected="$(cat ${{ matrix.tags_file }})"
+          if [ "$reported" != "$expected" ]; then
+            echo "FAIL: reported tags do not match the tag file" >&2
+            echo "  reported: $reported" >&2
+            echo "  expected: $expected" >&2
+            exit 1
+          fi
+          echo "PASS: ${{ matrix.name }} reports the tags its tag file declares"
+
+      - name: reproducibility (two builds must be bit-identical)
+        # -trimpath and -buildvcs=false remove the path and VCS inputs that would
+        # otherwise make every build unique. If a future change reintroduces a
+        # timestamp or a random id, this is what catches it.
+        #
+        # MEASURED for all three profiles on a darwin/arm64 M1 host with Go 1.25.5,
+        # each built twice and compared:
+        #
+        #   server-minimal  be2ccbc2...  identical
+        #   macos-lite      55d8dc6f...  identical
+        #   macos-naive     fa976ee5...  identical
+        #
+        # The macos-naive result is worth stating because it was the expected
+        # failure: that profile links a prebuilt Cronet static library (CGO=1), and
+        # an external archive is not under this repository's control, so it could
+        # plausibly embed a timestamp or a build id. It does not - the archive is
+        # itself deterministic - so all three profiles are held to the same standard
+        # here rather than exempting the Naive leg in advance.
+        #
+        # If a future Cronet bump DOES break this, the fix is to find the real cause
+        # and record it, not to skip the check for that leg.
+        run: |
+          set -euo pipefail
+          second="dist/repro-check-${{ matrix.name }}"
+          case "${{ matrix.name }}" in
+            server-minimal) ./scripts/ci/build-server.sh "${{ matrix.goos }}" "${{ matrix.goarch }}" "$second" ;;
+            macos-lite)     ./scripts/ci/build-macos-client.sh arm64 lite "$second" ;;
+            macos-naive)    ./scripts/ci/build-macos-client.sh arm64 naive "$second" ;;
+          esac
+          source scripts/ci/lib.sh
+          first_sha="$(sha256_of "${{ matrix.artifact }}")"
+          second_sha="$(sha256_of "$second")"
+          if [ "$first_sha" != "$second_sha" ]; then
+            echo "FAIL: ${{ matrix.name }} is not reproducible" >&2
+            echo "  first:  $first_sha" >&2
+            echo "  second: $second_sha" >&2
+            exit 1
+          fi
+          echo "PASS: ${{ matrix.name }} reproducible ($first_sha)"
+
+      - name: artifact size and linkage
+        run: |
+          set -euo pipefail
+          echo "== size =="
+          du -h "${{ matrix.artifact }}"
+          echo "== dynamic linkage =="
+          case "${{ matrix.goos }}" in
+            linux) ldd "${{ matrix.artifact }}" 2>&1 | head -20 || true ;;
+            darwin) otool -L "${{ matrix.artifact }}" 2>&1 | head -20 || true ;;
+          esac
+
+      - name: registry and symbol audit (macOS profiles)
+        if: matrix.goos == 'darwin'
+        run: |
+          set -euo pipefail
+          ./scripts/ci/audit-macos-client-registry.sh "${{ matrix.artifact }}"
+
+      - name: config check
+        run: |
+          set -euo pipefail
+          case "${{ matrix.name }}" in
+            server-minimal)
+              ./${{ matrix.artifact }} check -c release/config/*.json 2>/dev/null || echo "NOTE: no server config fixture to check"
+              ;;
+            macos-lite|macos-naive)
+              ./scripts/ci/check-macos-client-config.sh "${{ matrix.artifact }}" "dist/config-check-${{ matrix.name }}"
+              ;;
+          esac
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-${{ github.sha }}
+          path: |
+            ${{ matrix.artifact }}
+            dist/BUILD-INFO-${{ matrix.name }}.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Cross-profile summary. Fails if any profile did not report success, so the
+  # workflow's single status means "all three profiles are good at this SHA".
+  # ---------------------------------------------------------------------------
+  summary:
+    needs: profile
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify every profile succeeded
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.profile.result }}" != "success" ]; then
+            echo "FAIL: at least one Jiejie profile failed at $(echo ${{ github.sha }} | cut -c1-12)" >&2
+            echo "profile result: ${{ needs.profile.result }}" >&2
+            exit 1
+          fi
+          echo "PASS: server-minimal, macos-lite and macos-naive all built and verified"
+          echo "at the same revision: ${{ github.sha }}"

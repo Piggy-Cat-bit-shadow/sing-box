@@ -16,8 +16,12 @@ name: Client macOS
 # repeated here, so the workflow and the build script cannot drift.
 
 on:
+  # `testing` is the single development branch now that the macOS client and the
+  # server share one source tree. `macos-client` is kept in the list because the
+  # branch still exists as a backup until its deletion is confirmed safe; it is no
+  # longer where client work happens.
   push:
-    branches: [macos-client, 'feat/jiejie-macos-*', 'client/*']
+    branches: [testing, macos-client, 'feat/jiejie-macos-*', 'client/*']
   pull_request:
     paths:
       - 'cmd/**'
