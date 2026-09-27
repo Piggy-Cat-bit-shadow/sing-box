@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -95,12 +94,76 @@ func (s *session) loopDatagram() {
 		if !valid || contextID != 0 || len(datagram) == contextLength {
 			continue
 		}
-		headroom := s.packetHeadroom()
-		buffer := buf.NewSize(headroom + len(datagram) - contextLength)
-		buffer.Resize(headroom, 0)
-		common.Must1(buffer.Write(datagram[contextLength:]))
-		s.handler.handlePacket(buffer)
+		s.handleIngressDatagram(datagram[contextLength:])
 	}
+}
+
+// handleIngressDatagram delivers one received HTTP/3 datagram payload to the
+// handler.
+//
+// # Ownership, stated explicitly
+//
+// The buffer WRAPS the slice quic-go returned; it does not copy it. That is only
+// valid because of a property of the pinned quic-go (v0.61.0-sing-box-mod.7) that
+// was verified in the source rather than assumed:
+//
+//	datagram_queue.go HandleDatagramFrame:
+//	    data := make([]byte, len(f.Data))
+//	    copy(data, f.Data)
+//	    h.rcvQueue = append(h.rcvQueue, data)
+//	datagram_queue.go Receive:
+//	    data := h.rcvQueue[0]
+//	    h.rcvQueue = h.rcvQueue[1:]
+//	    return data
+//
+// So the returned slice is an INDEPENDENT per-datagram allocation, the receive
+// queue drops its own reference before handing it back, and the backing array is
+// never reused by the transport. Nothing else holds a reference to it once
+// ReceiveDatagram returns.
+//
+// # Who owns what
+//
+//	creator    quic-go allocates the slice (make+copy in HandleDatagramFrame)
+//	holder     this session, from the return of ReceiveDatagram onward
+//	released   whoever consumes the buffer calls Release()
+//	invalid    never by quic-go; the array is not recycled while it is alive
+//	async use  permitted, because the allocation outlives the transport's
+//	           reference to it - which is exactly what the TUN hand-off does
+//
+// # Why buf.As and not buf.NewSize
+//
+// buf.As is UNMANAGED: Release() does not return the slice to sing's pool. The
+// backing array belongs to quic-go and is reclaimed by the GC. Wrapping it in a
+// MANAGED buffer would hand quic-go's memory to the pool, where a later buf.Get
+// in an unrelated code path could hand the same bytes out again - a
+// memory-corruption class of bug.
+//
+// The cost is that this packet does not enter the pooled-buffer fast path, so a
+// managed buffer still has to be acquired on the TUN side when the packet is
+// written out. That is the deliberate trade: one pooled acquisition there
+// instead of a pooled acquisition PLUS a full-packet memcpy here.
+//
+// # What this replaced, and why
+//
+//	buffer := buf.NewSize(headroom + len(datagram) - contextLength)
+//	buffer.Resize(headroom, 0)
+//	common.Must1(buffer.Write(datagram[contextLength:]))
+//
+// which acquired a pooled buffer and memcpy'd the entire packet into it, on top
+// of the copy quic-go had already performed. The headroom the pooled path
+// reserved is not needed here: this buffer carries only the payload, and the
+// consumer that prepends a header (the packet writer) is the one that needs
+// headroom, which it obtains on its own path.
+//
+// # Empty payloads
+//
+// A zero-length payload is preserved rather than skipped. An empty datagram and
+// no datagram are different outcomes, and buf.As of an empty slice is a legal
+// zero-length buffer. The length check in loopDatagram already rejects the case
+// where the varint consumed the whole datagram, which is a malformed frame
+// rather than an empty packet.
+func (s *session) handleIngressDatagram(payload []byte) {
+	s.handler.handlePacket(buf.As(payload))
 }
 
 func (s *session) loopCapsule() error {
