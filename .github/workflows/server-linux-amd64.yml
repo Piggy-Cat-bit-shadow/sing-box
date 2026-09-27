@@ -94,7 +94,16 @@ env:
 jobs:
   linux-amd64:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The FAST path finishes in ~2.5 minutes, so this ceiling exists for the
+    # deep_checks path, which is genuinely long: the full jiejie suite is ~13 min on
+    # its own, and the QUICHE interop compiles 1,811 Bazel targets (BoringSSL and
+    # Abseil) from scratch on a 4-core runner.
+    #
+    # It was 45 minutes, which CUT OFF the QUICHE build mid-compile at 45.4 minutes
+    # and reported the job as cancelled. That is worse than a failure: it looks like
+    # a flake and hides the fact that the preceding seven deep checks had all passed.
+    # 120 gives the deep path room while still bounding a hung run.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
