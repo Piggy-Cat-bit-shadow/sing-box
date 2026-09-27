@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/http"
+	"github.com/sagernet/sing-box/protocol/masque"
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
@@ -62,8 +63,10 @@ import (
 //   - redirect / tproxy: Linux netfilter only.
 //   - ssh, tor: not part of the Jiejie client feature set; `tor` in particular
 //     drags in a full Tor client.
-//   - masque (endpoint), tailscale, openvpn, openconnect, wireguard: large
-//     endpoint trees for transports the Jiejie client does not offer.
+//   - tailscale, openvpn, openconnect, wireguard: large endpoint trees for
+//     transports the Jiejie client does not offer. MASQUE is NOT in this list:
+//     the client role is registered (see EndpointRegistry), the server role is
+//     not.
 //   - resolved: a systemd D-Bus transport with no meaning on Darwin.
 //   - acme / origin_ca: a client consumes CA-signed certificates and never
 //     issues its own.
@@ -153,14 +156,46 @@ func OutboundRegistry() *outbound.Registry {
 	return registry
 }
 
-// EndpointRegistry registers no endpoint.
+// EndpointRegistry registers exactly one endpoint: the MASQUE client.
 //
-// Every endpoint this build wants to offer is absent by design: the Jiejie macOS
-// client connects through ordinary proxy protocols, not through Tailscale,
-// WireGuard, OpenVPN or OpenConnect. Registering none of them is also the single
-// largest dependency saving in the profile.
+// # Why MASQUE is registered here at all
+//
+// The Jiejie macOS client connects through ordinary proxy protocols AND through
+// the `masque-client` endpoint (CONNECT-IP / CONNECT-UDP over HTTP/2 or HTTP/3).
+// MASQUE is a first-class Jiejie transport, so the client role must resolve:
+// without this registration a perfectly valid `type: masque-client` configuration
+// fails with "unknown endpoint type", even though the complete implementation is
+// compiled into the binary. That was the state this registration fixes, and it is
+// why an empty EndpointRegistry was wrong rather than merely minimal.
+//
+// # Why the roles are split instead of calling masque.RegisterEndpoint
+//
+// masque.RegisterEndpoint registers BOTH `masque-client` and `masque-server`. The
+// macOS client must get the first and not the second: `masque-server` binds a TUN
+// device and serves a full CONNECT-IP endpoint, which is a Server Edition
+// capability with no place in a desktop client core. Calling the combined helper
+// would have silently shipped it.
+//
+// protocol/masque.RegisterClientEndpoint therefore registers only the client
+// role. The protocol and transport source stays shared: this is one registry
+// entry, not a second implementation, and every framing/capsule/H3 fix continues
+// to benefit both roles.
+//
+// # What stays out, and why
+//
+//   - wireguard, tailscale, openvpn, openconnect: large endpoint trees for
+//     transports the Jiejie client does not offer. Excluding them remains the
+//     single largest dependency saving in the profile.
+//   - masque-server: see above; the server role is not a client feature.
+//
+// See test/jiejie/macos_client_registry_audit_test.go, which asserts both
+// directions: masque-client resolves, masque-server does not.
 func EndpointRegistry() *endpoint.Registry {
-	return endpoint.NewRegistry()
+	registry := endpoint.NewRegistry()
+
+	masque.RegisterClientEndpoint(registry)
+
+	return registry
 }
 
 // DNSTransportRegistry registers every resolver a desktop client can configure.

@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/protocol/hysteria2"
+	"github.com/sagernet/sing-box/protocol/masque"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/socks"
 	"github.com/sagernet/sing-box/protocol/trojan"
@@ -235,21 +236,108 @@ func TestClientMacOSServiceRegistryIsMinimal(t *testing.T) {
 	})
 }
 
-// TestClientMacOSEndpointsAreAbsent asserts no endpoint is registered.
+// TestClientMacOSMASQUEClientEndpointResolves is the fix for the profile's most
+// consequential registration bug.
 //
-// Registering none is the single largest dependency saving in the profile, so it
-// is worth an explicit assertion rather than an implicit one.
-func TestClientMacOSEndpointsAreAbsent(t *testing.T) {
+// MASQUE is a first-class Jiejie CLIENT transport: `type: masque-client` opens a
+// CONNECT-IP or CONNECT-UDP tunnel over HTTP/2 or HTTP/3. An earlier revision of
+// this registry returned a completely empty endpoint registry, so the complete
+// MASQUE implementation was compiled into the binary but UNREACHABLE: a valid
+// configuration failed with "unknown endpoint type: masque-client", and there was
+// no way for a user to tell whether the feature was missing or misconfigured.
+//
+// The fix is deliberately NOT to call masque.RegisterEndpoint, because that
+// registers BOTH roles. See TestClientMacOSMASQUEServerEndpointIsAbsent.
+func TestClientMacOSMASQUEClientEndpointResolves(t *testing.T) {
 	t.Parallel()
 	types := include.EndpointRegistry().OptionTypes()
 
-	require.Empty(t, types, "the macOS client profile registers no endpoint")
+	requireTypesPresent(t, "endpoint", types, []string{
+		"masque-client", // CONNECT-IP / CONNECT-UDP over H2 or H3
+	})
+}
+
+// TestClientMacOSMASQUEServerEndpointIsAbsent asserts the other half of the role
+// split: the client profile must not register the MASQUE server.
+//
+// `masque-server` binds a TUN device and serves a full CONNECT-IP endpoint. That
+// is a Server Edition capability, and registering it in a desktop client core
+// would ship a listening tunnel endpoint that no client configuration should ever
+// enable. The split exists precisely because protocol/masque holds both roles in
+// one package and masque.RegisterEndpoint would register both at once.
+//
+// This is also why the shell audit no longer excludes the whole protocol/masque
+// PACKAGE: "client present, server absent" is the real invariant, and only a
+// role-level check can express it.
+func TestClientMacOSMASQUEServerEndpointIsAbsent(t *testing.T) {
+	t.Parallel()
+	types := include.EndpointRegistry().OptionTypes()
+
+	requireTypesAbsent(t, "endpoint", types, map[string]string{
+		"masque-server": "a Server Edition tunnel endpoint; the client only dials out",
+	})
+}
+
+// TestClientMacOSEndpointRegistryIsExactlyMASQUEClient pins the whole endpoint
+// surface rather than only its members.
+//
+// Both assertions above would still pass if an unrelated endpoint were added
+// alongside masque-client, so the exact set is asserted here. The endpoint
+// registry is the single largest dependency lever in this profile: every entry
+// beyond masque-client (wireguard, tailscale, openvpn, openconnect) drags in a
+// large transport tree a desktop client does not use.
+func TestClientMacOSEndpointRegistryIsExactlyMASQUEClient(t *testing.T) {
+	t.Parallel()
+	types := include.EndpointRegistry().OptionTypes()
+
+	require.Equal(t, []string{"masque-client"}, types,
+		"the macOS client endpoint registry must contain exactly the MASQUE client role")
+}
+
+// TestClientMacOSMASQUERolesAreDistinct guards the protocol-level split itself.
+//
+// Registering each role into its own fresh registry is what proves the two
+// helpers are genuinely separable. If a future edit made RegisterClientEndpoint
+// call the combined RegisterEndpoint, that would be caught here rather than only
+// in a user's configuration.
+func TestClientMacOSMASQUERolesAreDistinct(t *testing.T) {
+	t.Parallel()
+
+	clientRegistry := endpoint.NewRegistry()
+	masque.RegisterClientEndpoint(clientRegistry)
+	clientTypes := clientRegistry.OptionTypes()
+	require.True(t, hasType(clientTypes, "masque-client"),
+		"RegisterClientEndpoint must register masque-client; got %v", clientTypes)
+	require.False(t, hasType(clientTypes, "masque-server"),
+		"RegisterClientEndpoint must NOT register masque-server; got %v", clientTypes)
+
+	serverRegistry := endpoint.NewRegistry()
+	masque.RegisterServerEndpoint(serverRegistry)
+	serverTypes := serverRegistry.OptionTypes()
+	require.True(t, hasType(serverTypes, "masque-server"),
+		"RegisterServerEndpoint must register masque-server; got %v", serverTypes)
+	require.False(t, hasType(serverTypes, "masque-client"),
+		"RegisterServerEndpoint must NOT register masque-client; got %v", serverTypes)
+
+	// The combined helper must still mean "both", so the server build and the
+	// untagged upstream build keep their full surface.
+	combinedRegistry := endpoint.NewRegistry()
+	masque.RegisterEndpoint(combinedRegistry)
+	combinedTypes := combinedRegistry.OptionTypes()
+	require.True(t, hasType(combinedTypes, "masque-client") && hasType(combinedTypes, "masque-server"),
+		"RegisterEndpoint must remain the full registration; got %v", combinedTypes)
+}
+
+// TestClientMacOSEndpointsAreMinimal asserts the large endpoint trees stay out.
+func TestClientMacOSEndpointsAreMinimal(t *testing.T) {
+	t.Parallel()
+	types := include.EndpointRegistry().OptionTypes()
+
 	requireTypesAbsent(t, "endpoint", types, map[string]string{
 		"wireguard":   "a large tree the client does not offer",
 		"tailscale":   "a large tree the client does not offer",
 		"openvpn":     "a large tree the client does not offer",
 		"openconnect": "a large tree the client does not offer",
-		"masque":      "not part of the client profile",
 	})
 }
 

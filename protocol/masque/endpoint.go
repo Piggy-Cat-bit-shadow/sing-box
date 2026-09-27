@@ -21,9 +21,39 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
-func RegisterEndpoint(registry *endpoint.Registry) {
+// RegisterClientEndpoint registers only the `masque-client` endpoint type.
+//
+// This exists because the two MASQUE endpoint roles are NOT the same product
+// feature. A desktop client dials out through `masque-client` and has no use for
+// `masque-server`, which binds a TUN device and serves a CONNECT-IP/IP proxying
+// endpoint. The Jiejie macOS client profile needs the first and must not ship the
+// second, so the roles are registered separately rather than through one call
+// that forces both.
+//
+// The implementation is unaffected: this is purely which registry entry is
+// created. protocol/masque and transport/masque stay a single shared source tree
+// consumed by both roles.
+func RegisterClientEndpoint(registry *endpoint.Registry) {
 	endpoint.Register[option.MASQUEClientEndpointOptions](registry, C.TypeMASQUEClient, NewClientEndpoint)
+}
+
+// RegisterServerEndpoint registers only the `masque-server` endpoint type.
+//
+// A server profile registers this and not the client; see RegisterClientEndpoint
+// for why the split exists at all.
+func RegisterServerEndpoint(registry *endpoint.Registry) {
 	endpoint.Register[option.MASQUEServerEndpointOptions](registry, C.TypeMASQUEServer, NewServerEndpoint)
+}
+
+// RegisterEndpoint registers BOTH MASQUE endpoint roles.
+//
+// This is the upstream-compatible full registration, kept for the default
+// (untagged) and server builds that want the complete MASQUE surface. Profiles
+// with a narrower feature set call RegisterClientEndpoint or
+// RegisterServerEndpoint directly.
+func RegisterEndpoint(registry *endpoint.Registry) {
+	RegisterClientEndpoint(registry)
+	RegisterServerEndpoint(registry)
 }
 
 type endpointBase struct {

@@ -61,7 +61,6 @@ go tool nm "$tmpdir/audit" > "$nm_out"
 # nonzero count means something dragged it back into the import graph, which is
 # exactly the regression this audit exists to catch.
 excluded_packages=(
-  "protocol/masque"
   "protocol/openvpn"
   "protocol/openconnect"
   "protocol/ssh"
@@ -74,6 +73,40 @@ excluded_packages=(
   "protocol/hysteria"          # Hysteria v1: superseded by Hysteria2
   "dns/transport/dhcp"
   "protocol/bridge"
+)
+
+# protocol/masque is deliberately NOT in the list above.
+#
+# It used to be, on the reasoning that "the macOS client connects through ordinary
+# proxy protocols" and MASQUE was a server concern. That was wrong: MASQUE is a
+# first-class Jiejie CLIENT transport, and excluding the whole package meant a
+# valid `type: masque-client` configuration failed with "unknown endpoint type"
+# even though the implementation was compiled in.
+#
+# The distinction that actually matters is CLIENT PRESENT / SERVER ABSENT, which
+# a package-level check cannot express because both roles live in one package.
+# The role split is asserted at symbol level below and at type level in
+# test/jiejie/macos_client_registry_audit_test.go.
+
+# The MASQUE role split, asserted at symbol level.
+#
+# protocol/masque holds BOTH endpoint roles. The macOS client must link the client
+# role and must NOT link the server role, and only the symbol table can tell the
+# difference. Registering the client role alone in the registry is not sufficient
+# evidence on its own: if some other package pulled in the server constructor, the
+# server endpoint would be linked as dead weight in the artifact.
+masque_client_symbols=(
+  "masque.RegisterClientEndpoint"
+  "masque.NewClientEndpoint"
+)
+
+# masque.NewServerEndpoint is the server role's constructor, and
+# masque.RegisterEndpoint is the COMBINED helper. The client registry must call
+# neither: the combined helper registers masque-server too, which is exactly the
+# mistake this audit is here to catch.
+masque_server_symbols=(
+  "masque.NewServerEndpoint"
+  "masque.RegisterEndpoint"
 )
 
 # dns/transport/mdns is deliberately NOT asserted absent, and that is a finding
@@ -136,6 +169,44 @@ for sym in "${excluded_symbols[@]}"; do
   fi
 done
 
+echo ""
+echo "== MASQUE role split (client present, server absent) =="
+for sym in "${masque_client_symbols[@]}"; do
+  count="$(grep -c "$sym" "$nm_out" || true)"
+  if [ "$count" -gt 0 ]; then
+    echo "PASS: client role symbol $sym is linked ($count)"
+  else
+    echo "FAIL: client role symbol $sym is MISSING; masque-client would not resolve" >&2
+    fail=1
+  fi
+done
+for sym in "${masque_server_symbols[@]}"; do
+  count="$(grep -c "$sym" "$nm_out" || true)"
+  if [ "$count" -eq 0 ]; then
+    echo "PASS: server role symbol $sym absent"
+  else
+    echo "FAIL: server role symbol $sym is linked; masque-server leaked into the client" >&2
+    grep "$sym" "$nm_out" | head -5 >&2
+    fail=1
+  fi
+done
+
+# The shared data plane must be present for BOTH roles: this is the "one source
+# tree" property. If transport/masque were absent the client role could not work.
+masque_shared_packages=(
+  "transport/masque"
+  "transport/http"
+)
+for pkg in "${masque_shared_packages[@]}"; do
+  count="$(grep -c "sing-box/$pkg\." "$nm_out" || true)"
+  if [ "$count" -gt 0 ]; then
+    echo "PASS: shared MASQUE data plane $pkg is linked ($count symbols)"
+  else
+    echo "FAIL: shared MASQUE data plane $pkg has no symbols" >&2
+    fail=1
+  fi
+done
+
 # ---------------------------------------------------------------------------
 # 2. Included protocols must have symbols.
 # ---------------------------------------------------------------------------
@@ -160,6 +231,7 @@ included_packages=(
   "protocol/anytls"
   "protocol/hysteria2"
   "protocol/tuic"
+  "protocol/masque"            # the CLIENT role; server role asserted absent above
   "dns/transport/fakeip"
   "dns/transport/hosts"
   "dns/transport/local"
@@ -211,6 +283,45 @@ if "$binary" check -c "$rejected" >/dev/null 2>&1; then
   fail=1
 else
   echo "PASS: an excluded outbound type (tor) is rejected"
+fi
+
+# masque-server must be rejected as an endpoint type while masque-client is
+# accepted. This is the type-level half of the role split: the symbol audit above
+# proves what is LINKED, this proves what the registry RESOLVES, and a profile can
+# get either one wrong independently.
+masque_server_cfg="$tmpdir/masque-server.json"
+cat > "$masque_server_cfg" <<'JSON'
+{
+  "log": {"level": "error"},
+  "endpoints": [{"type": "masque-server", "tag": "ms", "system": false}]
+}
+JSON
+if "$binary" check -c "$masque_server_cfg" >/dev/null 2>&1; then
+  echo "FAIL: masque-server is registered in the macOS client build" >&2
+  fail=1
+else
+  echo "PASS: masque-server is rejected as an endpoint type in the client build"
+fi
+
+masque_client_cfg="$tmpdir/masque-client.json"
+cat > "$masque_client_cfg" <<'JSON'
+{
+  "log": {"level": "error"},
+  "endpoints": [{
+    "type": "masque-client",
+    "tag": "mc",
+    "server": "example.com",
+    "server_port": 443,
+    "tls": {"enabled": true, "server_name": "example.com"}
+  }]
+}
+JSON
+if "$binary" check -c "$masque_client_cfg" >/dev/null 2>&1; then
+  echo "PASS: masque-client resolves and validates in the client build"
+else
+  echo "FAIL: masque-client does not resolve in the macOS client build" >&2
+  "$binary" check -c "$masque_client_cfg" >&2 || true
+  fail=1
 fi
 
 echo ""
