@@ -91,7 +91,6 @@ type productionRouteRule struct {
 	RuleSet         json.RawMessage `json:"rule_set"`
 }
 
-
 // loadProductionFixture reads release/jiejie-production-topology.json, resolved
 // relative to this test's working directory (test/jiejie), which is two levels below
 // the repository root.

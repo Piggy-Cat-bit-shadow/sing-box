@@ -116,7 +116,7 @@ jobs:
       - name: gofmt
         run: |
           set -euo pipefail
-          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter test/jiejie 2>&1 || true)"
+          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter test/contract test/jiejie 2>&1 || true)"
           if [ -n "$unformatted" ]; then
             echo "FAIL: these files are not gofmt-clean:" >&2
             echo "$unformatted" >&2
