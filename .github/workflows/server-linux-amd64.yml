@@ -217,22 +217,36 @@ jobs:
           echo "PASS: version and tags agree with release/"
 
       - name: config check
-        # Parses the real production topology rather than a synthetic minimum, so
-        # a registry trim that removed something the topology needs fails here
-        # rather than on the VPS.
+        # Checks the REAL production topology, which is the config this server
+        # exists to run. If a registry trim removed something the topology needs,
+        # this fails here rather than on the VPS.
+        #
+        # It deliberately does NOT check release/config/config.json: that is the
+        # upstream stock example, and the Server Minimal profile correctly rejects
+        # it ("unknown transport type: tls") because the trim removes DNS
+        # transports this topology does not use. Asserting on it would be asserting
+        # that the trim had not happened.
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          configs=(release/config/*.json)
-          if [ ${#configs[@]} -eq 0 ]; then
-            echo "note: no config fixture under release/config; nothing to check"
-            exit 0
+          topology="release/jiejie-production-topology.json"
+          [ -f "$topology" ] || { echo "FAIL: $topology is missing" >&2; exit 1; }
+          echo "checking $topology"
+          ./"$BINARY" check -c "$topology"
+          echo "PASS: the production topology validates against the shipped registry"
+
+          # The trim must be REAL at the type level, not only in the symbol table:
+          # a config naming a pruned inbound must be rejected. Without this, the
+          # step above would still pass if the registry silently grew.
+          workdir="$(mktemp -d)"
+          cat > "$workdir/pruned.json" <<'JSON'
+          {"log": {"level": "error"},
+           "inbounds": [{"type": "tun", "tag": "t", "interface_name": "tun0"}]}
+          JSON
+          if ./"$BINARY" check -c "$workdir/pruned.json" >/dev/null 2>&1; then
+            echo "FAIL: the pruned 'tun' inbound was accepted; the trim is not real" >&2
+            exit 1
           fi
-          for config in "${configs[@]}"; do
-            echo "checking $config"
-            ./"$BINARY" check -c "$config"
-          done
-          echo "PASS: production configs validate"
+          echo "PASS: a pruned inbound type is rejected"
 
       - name: runtime smoke test
         # Starts the real binary and talks to its real API. A config check proves
