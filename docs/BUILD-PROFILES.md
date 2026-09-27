@@ -186,3 +186,79 @@ Per-profile workflows are kept and are not redundant:
 
 They fail independently on purpose: a red macOS client must not block a server
 release.
+
+---
+
+## Known pre-existing test results
+
+These are recorded so a future reader does not mistake them for damage from the
+consolidation, and so the baseline is explicit rather than rediscovered.
+
+### `test/jiejie` under the macOS client tag set
+
+Running the full `test/jiejie` suite with `jiejie_client_macos` produces **17
+failures**. Every one is a **server-profile test that lacks a build constraint**, so
+it runs under client tags and asserts on things the client profile correctly does
+not have:
+
+| group | why it fails under client tags |
+|---|---|
+| AnyTLS inbound / ALPN fallback (9 tests) | the client registers the anytls *outbound*, not the inbound |
+| ShadowTLS decoy / probe (3 tests) | the client registers the shadowtls *outbound*, not the inbound |
+| registry audits (4 tests) | assert the **server** registry's inbound set |
+| residential SOCKS outbound | a server-only outbound |
+
+Measured on the revision before this work (`49579cf32`) and on the current HEAD:
+**17 failures both times, with no test failing in one and not the other.** Verified
+by diffing the sorted failure lists:
+
+```bash
+# before
+git checkout 49579cf32 && cd test && \
+  go test -tags "with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
+    -count=1 ./jiejie/ 2>&1 | grep '^--- FAIL' | sort > /tmp/before.txt
+# after
+git checkout testing && cd test && \
+  go test -tags "with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
+    -count=1 ./jiejie/ 2>&1 | grep '^--- FAIL' | sort > /tmp/after.txt
+comm -13 <(sed 's/ ([0-9.]*s)//' /tmp/before.txt | sort) \
+         <(sed 's/ ([0-9.]*s)//' /tmp/after.txt | sort)   # empty
+```
+
+The proper fix is a `jiejie_client_macos` (or `!jiejie_server_minimal`) build
+constraint on those files so they are compiled only into the profile they describe.
+That is **not done here**, because it is an unrelated change to files this work does
+not otherwise touch, and doing it would have hidden whether the consolidation
+itself caused anything. The client-specific assertions that matter live in
+`macos_client_registry_audit_test.go` and `macos_client_fixture_audit_test.go`,
+which are constrained to `jiejie_client_macos` and pass.
+
+### `test/jiejie` under the server tag set
+
+Four additional failures, also **pre-existing and verified identical on
+`49579cf32`**:
+
+```text
+TestAuditLoopbackIsReachableByDefault
+TestAuditRouteRuleBlocksLoopback
+TestAuditUoTV2NonConnectMode
+TestAuditUoTV2NonConnectMultipleTargets
+```
+
+These are Naive UoT server audit tests that fail with an `EOF` during the UoT
+handshake. They are unrelated to the build-profile work and were not investigated
+further; they are recorded so the server baseline is not mistaken for a clean run.
+
+### What is green
+
+```text
+go test ./...                             24 packages ok, 0 FAIL (main module)
+go test -race ./transport/masque           ok 34.1s
+go test -race ./transport/http             ok  4.8s
+go test -race ./protocol/naive             ok  3.2s
+go test -race ./route                      ok  2.9s
+go test -race ./common/httpclient          ok  3.7s
+```
+
+Plus, for both macOS flavors: registry audit PASS, config check PASS, runtime smoke
+PASS, headless smoke PASS.
