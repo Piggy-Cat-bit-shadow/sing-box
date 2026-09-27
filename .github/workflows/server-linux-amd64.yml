@@ -508,22 +508,58 @@ jobs:
       # =======================================================================
       - name: deep check - full jiejie suite
         # The WHOLE package, exactly as it ran on every push before. Measured at
-        # 776s. It is an integration, conformance and reference suite - packet
+        # ~760s. It is an integration, conformance and reference suite - packet
         # impairment campaigns, NAT rebinding, UoT leak checks, resource profiling,
         # Caddy parity, H3 stream churn - and it belongs to a manual full audit.
         #
         # The four known-failing Naive UoT audits are NOT excluded here, so their
-        # state stays visible on every deep run.
+        # state stays visible. Because they DO fail, this step is
+        # `continue-on-error`: without that, a known pre-existing failure would
+        # abort the job and silently skip the seven deep checks below, which is
+        # worse than the failure itself. The step is still marked as failed in the
+        # run, and the summary records it.
+        #
+        # The four, measured failing at f9a524d6d:
+        #   TestAuditLoopbackIsReachableByDefault
+        #   TestAuditRouteRuleBlocksLoopback
+        #   TestAuditUoTV2NonConnectMode
+        #   TestAuditUoTV2NonConnectMultipleTargets
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
           cd test
-          go test -tags "$TAGS" -count=1 -timeout 40m ./jiejie/ 2>&1 | tail -40
-          echo "NOTE: four Naive UoT audits (TestAuditLoopbackIsReachableByDefault,"
-          echo "      TestAuditRouteRuleBlocksLoopback, TestAuditUoTV2NonConnectMode,"
-          echo "      TestAuditUoTV2NonConnectMultipleTargets) are known to fail as of"
-          echo "      f9a524d6d. If this step passes, they were fixed."
+          go test -tags "$TAGS" -count=1 -timeout 40m -v ./jiejie/ > /tmp/jiejie-full.log 2>&1
+          status=$?
+
+          echo "===== failing tests ====="
+          grep -E "^--- FAIL" /tmp/jiejie-full.log | sed 's/^/  /' || echo "  (none)"
+
+          known_failures="TestAuditLoopbackIsReachableByDefault|TestAuditRouteRuleBlocksLoopback|TestAuditUoTV2NonConnectMode|TestAuditUoTV2NonConnectMultipleTargets"
+          unexpected="$(grep -E "^--- FAIL" /tmp/jiejie-full.log | grep -vE "$known_failures" || true)"
+
+          if [ -n "$unexpected" ]; then
+            echo ""
+            echo "FAIL: the following failures are NOT among the four known ones:" >&2
+            echo "$unexpected" >&2
+            echo ""
+            echo "===== tail of the run =====" >&2
+            tail -60 /tmp/jiejie-full.log >&2
+            exit 1
+          fi
+
+          if [ "$status" -eq 0 ]; then
+            echo ""
+            echo "NOTE: the full suite PASSED. The four known-failing Naive UoT audits"
+            echo "      appear to have been fixed - remove them from the known list in"
+            echo "      this step and re-enable them."
+            exit 0
+          fi
+
+          echo ""
+          echo "EXPECTED: the full suite failed only on the four known Naive UoT audits"
+          echo "          (measured failing at f9a524d6d). No new failures."
 
       - name: deep check - reproducibility
         # Was on the fast path, where it meant compiling the whole program a second
