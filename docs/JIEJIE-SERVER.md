@@ -440,7 +440,7 @@ never enter the import graph, so the Go linker removes them.
 
 | Registry | Default build | `jiejie_server_minimal` |
 | --- | --- | --- |
-| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | **http, anytls, naive, shadowtls, shadowsocks** |
+| Inbounds | tun, redirect/tproxy, direct, socks, http, mixed, shadowsocks, snell, vmess, trojan, naive, shadowtls, vless, anytls, hysteria, tuic, hysteria2, cloudflared, tailscale | **http, anytls, shadowtls, shadowsocks** |
 | Outbounds | direct, bridge, block, selector, urltest, socks, http, shadowsocks, snell, vmess, trojan, naive, tor, ssh, shadowtls, vless, anytls, hysteria, tuic, hysteria2, tailscale | **direct, socks** |
 | Endpoints | WireGuard, OpenConnect, OpenVPN, MASQUE, Tailscale | none |
 | DNS transports | tcp, udp, tls, https, hosts, local, mdns, fakeip, quic, http3, resolved, dhcp, tailscale, openconnect, openvpn | **udp, local** |
@@ -488,6 +488,13 @@ config that references a removed type now fails at `sing-box check` with
 `unknown inbound type` (or the equivalent). The one safety net that needs no
 import already exists upstream: `transport/v2ray.NewQUICServer` returns
 `os.ErrInvalid` when no constructor is registered.
+
+**Native Naive is excluded from this profile.** NaiveProxy is served by Caddy's
+`forwardproxy@udpintcp` on the production host, so the Native Naive inbound is not
+registered and does not enter the import graph. `protocol/naive` source is
+unchanged and still builds under the full registry; only `jiejie_server_minimal`
+leaves it out. A config naming `type: naive` therefore fails `sing-box check` here
+by design.
 
 Measured artifact sizes (Linux amd64, `-trimpath`, `-ldflags "-s -w"`, no UPX,
 no external strip):

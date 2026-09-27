@@ -128,8 +128,16 @@ func InboundRegistry() *inbound.Registry {
 //	hysteria2, tuic        -> registered by registerQUICOutbounds
 //
 // `naive` is registered by registerNaiveOutbound, which is compiled only under
-// `with_naive_outbound`. The macOS core deliberately does NOT enable that tag by
-// default: see docs/JIEJIE-MACOS-CLIENT.md for the Cronet/CGO rationale.
+// `with_naive_outbound`. The macOS core DOES enable that tag - it is part of
+// release/BUILD_TAGS_JIEJIE_CLIENT_MACOS - so the shipped client links the real
+// Cronet-backed NaiveProxy outbound rather than the upstream not-included stub.
+//
+// The stub and the real implementation are indistinguishable at the TYPE level,
+// because upstream registers the stub behind `!with_naive_outbound` so a user gets
+// an actionable error instead of "unknown outbound type". That is why the shipped
+// binary is checked for cronet-go.NewNaiveClient and for the stub's message string
+// by scripts/ci/audit-macos-client-registry.sh, rather than trusting the tag.
+// See docs/JIEJIE-MACOS-CLIENT.md for the Cronet/CGO rationale.
 func OutboundRegistry() *outbound.Registry {
 	registry := outbound.NewRegistry()
 
