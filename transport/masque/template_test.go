@@ -192,3 +192,124 @@ func urlMustParse(t *testing.T, raw string) *url.URL {
 	require.NoError(t, err, "parse %s", raw)
 	return parsed
 }
+
+// TestTemplateEncodingMatrixIsTheWholeAttackSurface closes the question the fuzz
+// finding opened: is a single-separator check sufficient, or can another ENCODING
+// level smuggle a separator past the classifier into the dialled host?
+//
+// # What was measured
+//
+// The target reaches the classifier through exactly ONE decode, and which decode
+// depends on the template form:
+//
+//   - query form: net/url decodes the query once, so "a%5Cb" and a literal "a\b"
+//     both arrive as `a\b`;
+//   - path form: the regex captures the still-escaped segment and
+//     url.PathUnescape decodes it once, so "a%5Cb" arrives as `a\b`.
+//
+// One more encoding level therefore does NOT produce a separator. It produces a
+// literal percent-sequence:
+//
+//	a%252Fb -> "a%2Fb"   (no "/" character)
+//	a%255Cb -> "a%5Cb"   (no "\" character)
+//
+// That value is accepted as a Domain, and it is CORRECT to accept it: it contains
+// no separator, so the invariant below still holds. It is also inert - measured:
+// netip.ParseAddr rejects it, net.JoinHostPort passes it through verbatim, and Go's
+// resolver treats it as an unknown host returning a blackhole address. Nothing in
+// transport/masque or the router calls path.Clean or filepath.Clean on a target, so
+// there is no second, filesystem-semantics interpretation to disagree with the
+// first.
+//
+// This test states that as an executable property rather than prose, so a future
+// change that introduces a second decode - which WOULD turn a%252Fb into a real
+// separator after validation had already passed - fails here.
+func TestTemplateEncodingMatrixIsTheWholeAttackSurface(t *testing.T) {
+	t.Parallel()
+
+	template, err := ParseTemplate(DefaultPath)
+	require.NoError(t, err)
+
+	type step struct {
+		// encoded is inserted verbatim into the path segment, the way a client that
+		// has already escaped its target would send it.
+		encoded string
+		// wantDomain is the exact Domain the classifier must produce. Empty means
+		// the request must be rejected outright.
+		wantDomain string
+		// wantRejected records which of the two outcomes above applies.
+		wantRejected bool
+		note         string
+	}
+
+	for _, testCase := range []step{
+		{"a%2Fb", "", true, "single-encoded slash decodes to a separator and is rejected"},
+		{"a%5Cb", "", true, "single-encoded backslash decodes to a separator and is rejected"},
+		{"a%252Fb", "a%2Fb", false, "double-encoded slash stays percent-encoded: no separator"},
+		{"a%255Cb", "a%5Cb", false, "double-encoded backslash: no separator"},
+		{"a%25252Fb", "a%252Fb", false, "triple-encoded: still no separator"},
+		{"example.com", "example.com", false, "an ordinary hostname is accepted"},
+	} {
+		testCase := testCase
+		t.Run(testCase.encoded, func(t *testing.T) {
+			t.Parallel()
+
+			request := urlMustParse(t,
+				"/.well-known/masque/ip/"+testCase.encoded+"/17/")
+			scope, matched, matchErr := template.Match(request)
+			require.True(t, matched,
+				"the default template must match this request shape")
+
+			if testCase.wantRejected {
+				require.Error(t, matchErr, testCase.note)
+				require.Empty(t, scope.Domain,
+					"a rejected match must not carry a domain")
+				return
+			}
+
+			require.NoError(t, matchErr, testCase.note)
+			require.Equal(t, testCase.wantDomain, scope.Domain, testCase.note)
+
+			// The invariant, checked on every accepted value regardless of how many
+			// encoding levels it passed through. THIS is the property that makes a
+			// single decode sufficient.
+			require.NotContains(t, scope.Domain, "/",
+				"an accepted domain must never contain a forward slash")
+			require.NotContains(t, scope.Domain, "\\",
+				"an accepted domain must never contain a backslash")
+			require.NotContains(t, scope.Domain, ":",
+				"an accepted domain must never contain a colon")
+		})
+	}
+}
+
+// TestTemplateNeverDecodesTwice is the narrow guard on the mechanism above.
+//
+// If a second PathUnescape is ever introduced between validation and use, a
+// double-encoded separator would become a real one AFTER the classifier had already
+// approved the value - validation sees A while the dial sees B. That is the
+// parser-differential failure mode, and it is worth failing on explicitly rather
+// than only implicitly through the matrix above.
+func TestTemplateNeverDecodesTwice(t *testing.T) {
+	t.Parallel()
+
+	template, err := ParseTemplate(DefaultPath)
+	require.NoError(t, err)
+
+	// Double-encoded separators: one decode leaves them inert.
+	request := urlMustParse(t, "/.well-known/masque/ip/a%252Fb%255Cc/17/")
+	scope, matched, matchErr := template.Match(request)
+	require.True(t, matched)
+	require.NoError(t, matchErr)
+	require.Equal(t, "a%2Fb%5Cc", scope.Domain,
+		"exactly one decode must be applied to the captured path segment")
+
+	// Applying the decode a second time is what must never happen downstream; this
+	// asserts the raw value is what a consumer receives, by showing that a second
+	// decode WOULD change it into something with separators.
+	onceMore, err := url.PathUnescape(scope.Domain)
+	require.NoError(t, err)
+	require.Contains(t, onceMore, "/",
+		"a second decode would introduce a forward slash, which is exactly why the "+
+			"Domain must be consumed as-is and never decoded again")
+}
