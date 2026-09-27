@@ -175,6 +175,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	default:
 		return nil, E.New("unknown quic congestion control: ", options.QUICCongestionControl)
 	}
+	// InsecureConcurrencySingleEngine is passed through only when the operator asked
+	// for it. cronet-go ORs this with `runtime.GOOS == "ios"`, so leaving it false
+	// keeps the platform behaviour exactly as upstream: N engines on macOS, one
+	// engine on iOS. Setting it true is what makes the single-engine + isolation-key
+	// shape selectable on macOS for the A/B described in
+	// docs/JIEJIE-NAIVE-CLIENT-AUDIT.md.
 	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
 		Context:                  ctx,
 		Logger:                   logger,
@@ -183,6 +189,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Username:                 options.Username,
 		Password:                 options.Password,
 		InsecureConcurrency:      options.InsecureConcurrency,
+		TestForceSingleEngine:    options.InsecureConcurrencySingleEngine,
 		ExtraHeaders:             extraHeaders,
 		ReceiveWindow:            options.ReceiveWindow.Value(),
 		TrustedRootCertificates:  trustedRootCertificates,

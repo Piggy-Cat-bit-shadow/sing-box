@@ -89,14 +89,44 @@ type _NaiveInboundOptions NaiveInboundOptions
 type NaiveOutboundOptions struct {
 	DialerOptions
 	ServerOptions
-	Username                 string                   `json:"username,omitempty"`
-	Password                 string                   `json:"password,omitempty"`
-	InsecureConcurrency      int                      `json:"insecure_concurrency,omitempty"`
-	ExtraHeaders             badoption.HTTPHeader     `json:"extra_headers,omitempty"`
-	ReceiveWindow            *byteformats.MemoryBytes `json:"stream_receive_window,omitempty"`
-	UDPOverTCP               *UDPOverTCPOptions       `json:"udp_over_tcp,omitempty"`
-	QUIC                     bool                     `json:"quic,omitempty"`
-	QUICCongestionControl    string                   `json:"quic_congestion_control,omitempty" enum:"bbr,bbr2,cubic,reno"`
-	QUICSessionReceiveWindow *byteformats.MemoryBytes `json:"quic_session_receive_window,omitempty"`
+	Username            string `json:"username,omitempty"`
+	Password            string `json:"password,omitempty"`
+	InsecureConcurrency int    `json:"insecure_concurrency,omitempty"`
+	// InsecureConcurrencySingleEngine makes `insecure_concurrency` share ONE Cronet
+	// engine instead of starting N of them.
+	//
+	// # What the two shapes cost
+	//
+	// cronet-go's NaiveClient starts `concurrency` engines unless told otherwise:
+	//
+	//	engineCount := 1
+	//	if c.concurrency > 1 && !c.singleEngine { engineCount = c.concurrency }
+	//
+	// Each engine is a full Chromium network stack (its own thread pool, socket
+	// pools, caches and DNS layer), so `insecure_concurrency: 4` on macOS means four
+	// of them. A single engine still yields N independent HTTP/2 sessions, because
+	// the client then sends a per-pool `-network-isolation-key` header instead,
+	// which is the mechanism iOS already relies on:
+	//
+	//	if len(c.streamEngines) > 1 { streamEngine = c.streamEngines[i] } else {
+	//	    headers["-network-isolation-key"] = "https://pool-<i>:443"
+	//	}
+	//
+	// # Why this is opt-in rather than the macOS default
+	//
+	// It changes which Chromium code path carries the traffic, so it is a behaviour
+	// change and not only a resource change. The task was to measure it before
+	// considering a default flip, and a measurement needs a build that can select
+	// each shape. This option is that switch.
+	//
+	// See docs/JIEJIE-NAIVE-CLIENT-AUDIT.md for the A/B method and for why the
+	// macOS default was left unchanged.
+	InsecureConcurrencySingleEngine bool                     `json:"insecure_concurrency_single_engine,omitempty"`
+	ExtraHeaders                    badoption.HTTPHeader     `json:"extra_headers,omitempty"`
+	ReceiveWindow                   *byteformats.MemoryBytes `json:"stream_receive_window,omitempty"`
+	UDPOverTCP                      *UDPOverTCPOptions       `json:"udp_over_tcp,omitempty"`
+	QUIC                            bool                     `json:"quic,omitempty"`
+	QUICCongestionControl           string                   `json:"quic_congestion_control,omitempty" enum:"bbr,bbr2,cubic,reno"`
+	QUICSessionReceiveWindow        *byteformats.MemoryBytes `json:"quic_session_receive_window,omitempty"`
 	OutboundTLSOptionsContainer
 }
