@@ -70,11 +70,22 @@
       "platform": {"http_proxy": {"enabled": false}}
     }
   ],
+  "endpoints": [
+    {
+      "type": "masque-client",
+      "tag": "masque-out",
+      "server": "127.0.0.1",
+      "server_port": __MASQUE_PORT__,
+      "path": "/connect-ip",
+      "advertise_routes": ["0.0.0.0/0", "::/0"],
+      "tls": {"enabled": true, "server_name": "example.test"}
+    }
+  ],
   "outbounds": [
     {"type": "direct", "tag": "direct", "domain_resolver": "dns-udp"},
     {"type": "block", "tag": "block"},
 
-    {"type": "selector", "tag": "select", "outbounds": ["urltest", "vless-reality", "direct"], "default": "urltest"},
+    {"type": "selector", "tag": "select", "outbounds": ["urltest", "vless-reality", "masque-out", "direct"], "default": "urltest"},
     {"type": "urltest", "tag": "urltest", "outbounds": ["vless-reality", "trojan-tls"], "url": "https://www.gstatic.com/generate_204", "interval": "10m", "tolerance": 50},
 
     {"type": "socks", "tag": "socks-out", "server": "127.0.0.1", "server_port": __SOCKS_UPSTREAM_PORT__, "version": "5", "username": "example", "password": "example"},

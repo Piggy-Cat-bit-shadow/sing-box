@@ -53,6 +53,7 @@ sed \
   -e "s/__ANYTLS_PORT__/19094/g" \
   -e "s/__HYSTERIA2_PORT__/19095/g" \
   -e "s/__TUIC_PORT__/19096/g" \
+  -e "s/__MASQUE_PORT__/19097/g" \
   "$tmpl" > "$config"
 
 # A placeholder left behind means the fixture grew a token this script does not

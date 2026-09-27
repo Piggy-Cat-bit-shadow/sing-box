@@ -93,6 +93,23 @@
       "set_system_proxy": false
     }
   ],
+  "endpoints": [
+    {
+      "type": "masque-client",
+      "tag": "masque-out",
+      "server": "127.0.0.1",
+      "server_port": 443,
+      "path": "/connect-ip",
+      "advertise_routes": [
+        "0.0.0.0/0",
+        "::/0"
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "example.test"
+      }
+    }
+  ],
   "outbounds": [
     {
       "type": "selector",
@@ -100,6 +117,7 @@
       "outbounds": [
         "auto",
         "manual-node",
+        "masque-out",
         "direct"
       ],
       "default": "auto"
