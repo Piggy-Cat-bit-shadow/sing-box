@@ -12,7 +12,7 @@ import (
 
 // Ownership of datagrams buffered during CONNECT-UDP target setup.
 //
-// deferUntilTargetReady holds datagrams that arrive while the target is unresolved, and
+// deferred construction holds datagrams that arrive while the target is unresolved, and
 // settle() flushes them once the router reports the outcome. That covers the happy path
 // and the reported-failure path. The case these tests cover is the one with no outcome at
 // all: the peer disconnects during setup, so the connection closes and settle() never
@@ -89,13 +89,12 @@ func TestEarlyDatagramsAreReleasedWhenThePeerDisconnectsDuringSetup(t *testing.T
 	stream := newCancellableDatagramStream([][]byte{
 		{0x00, 'a'}, {0x00, 'b'}, {0x00, 'c'},
 	})
-	conn := newHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
+	conn := newDeferredHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
 	// Wait for the goroutines to end before the test returns. They allocate through
 	// buf.DefaultAllocator, which the ownership test below swaps out; leaving them alive
 	// would race that swap and report a data race in the HARNESS rather than in the code
 	// under test.
 	defer conn.waitGroup.Wait()
-	conn.deferUntilTargetReady()
 
 	// Wait for the setup window to actually hold something, so the case is known to be
 	// exercised. This polls a mutex-guarded field rather than sleeping a fixed time.
@@ -122,9 +121,8 @@ func TestEarlyDatagramsAreReleasedWhenThePeerDisconnectsDuringSetup(t *testing.T
 // empty rather than double-release or deliver after teardown.
 func TestSettleAfterCloseIsSafe(t *testing.T) {
 	stream := newCancellableDatagramStream([][]byte{{0x00, 'a'}, {0x00, 'b'}})
-	conn := newHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
+	conn := newDeferredHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
 	defer conn.waitGroup.Wait()
-	conn.deferUntilTargetReady()
 	awaitEarlyDatagrams(t, conn, 2)
 
 	if err := conn.Close(); err != nil {

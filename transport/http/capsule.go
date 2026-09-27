@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -322,7 +321,31 @@ type http3PacketConn struct {
 	// datagrams would lose the first packets of a tunnel that succeeds moments later.
 	early      []*buf.Buffer
 	earlyBytes int
+	// earlyMutex guards `early`, `earlyBytes` AND `activated` together.
+	//
+	// # Why one mutex and not an atomic plus a mutex
+	//
+	// `activated` used to be an atomic.Bool read WITHOUT the lock while the early
+	// queue was appended under it. That split produced a lost-packet window:
+	//
+	//	reader:  Load(activated) == false        <- observes deferred
+	//	settle:  activated.Store(true)
+	//	         takeEarlyDatagrams()             <- detaches the (still empty) queue
+	//	reader:  bufferEarlyDatagram(buf)        <- appends to the DETACHED slice
+	//
+	// The datagram was accepted by the bounded policy and then stranded forever: never
+	// delivered, never released. Merging the flag into the same critical section as the
+	// queue removes the window, because "observe deferred and append" is now atomic
+	// with respect to "activate and detach".
+	//
+	// The cost is one uncontended mutex acquisition per received datagram. That is the
+	// right trade: the alternative was a silent packet loss that only reproduces under
+	// adversarial scheduling. The zero-copy wrapping and the batch read path - the
+	// parts that actually mattered for throughput - are untouched.
 	earlyMutex sync.Mutex
+	// activated switches the connection from buffering to normal delivery.
+	// It is read and written ONLY while holding earlyMutex.
+	activated bool
 	// settled is closed once ready/failure has been decided.
 	settled chan struct{}
 	// ready reports whether the target setup succeeded.
@@ -331,8 +354,6 @@ type http3PacketConn struct {
 	setupErr error
 	// handshakeOnce guards the single settle of the outcome.
 	handshakeOnce sync.Once
-	// activated switches the connection from buffering to normal delivery.
-	activated atomic.Bool
 }
 
 // maxEarlyDatagramPackets and maxEarlyDatagramBytes bound the datagrams buffered before
@@ -343,7 +364,57 @@ const (
 	maxEarlyDatagramBytes   = 64 << 10
 )
 
+// newHTTP3PacketConn builds a connection that delivers immediately.
+//
+// This is the form for every caller that does NOT withhold the HTTP response: the
+// non-deferred H2/H3 paths and the in-package fixtures. It is ACTIVE from
+// construction, which is an immutable property - see newHTTP3PacketConnInternal.
 func newHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAddr net.Addr) *http3PacketConn {
+	return newHTTP3PacketConnInternal(stream, destination, localAddr, true)
+}
+
+// newDeferredHTTP3PacketConn builds a connection that BUFFERS inbound datagrams until
+// the router reports the target setup outcome.
+//
+// This is the form for H3 CONNECT-UDP, where the HTTP response is withheld until the
+// target is actually reachable.
+//
+// # Why this is a separate constructor
+//
+// The deferred state used to be applied AFTER construction, by a call to
+// deferUntilTargetReady() made after the reader goroutines had already been started:
+//
+//	newHTTP3PacketConn(...)      // activated = true
+//	                             // go loopDatagram()   <- reader already running
+//	conn.deferUntilTargetReady() // activated = false
+//
+// Between those two statements a datagram could be received and delivered on the
+// strength of a 200 that had not been sent yet. That is an initialization race in the
+// API itself, not a slip in one caller: the constructor started the readers in a state
+// the caller then had to correct, and nothing enforced that the correction happened
+// first. It reproduced deterministically when the reader goroutine was given the chance
+// to run first.
+//
+// Making the initial mode a constructor argument removes the window entirely: the
+// activation state is established while the connection is still single-goroutine, and
+// the readers are started last. There is no longer any way to express "start the
+// readers, then defer".
+func newDeferredHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAddr net.Addr) *http3PacketConn {
+	return newHTTP3PacketConnInternal(stream, destination, localAddr, false)
+}
+
+// newHTTP3PacketConnInternal is the single construction path.
+//
+// Ordering is the whole point of this function:
+//
+//  1. allocate the connection and every field the readers touch;
+//  2. set the initial activation state - while nothing else can observe it;
+//  3. start the reader goroutines, which are the only things that ever observe it.
+//
+// Only `handshakeOnce` is left at its zero value on purpose: it is the zero value that
+// makes settle() run exactly once, so resetting it (as the old two-phase code did) was
+// both unnecessary and a second way to get this wrong.
+func newHTTP3PacketConnInternal(stream DatagramStream, destination M.Socksaddr, localAddr net.Addr, activated bool) *http3PacketConn {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &http3PacketConn{
 		stream:      stream,
@@ -354,11 +425,10 @@ func newHTTP3PacketConn(stream DatagramStream, destination M.Socksaddr, localAdd
 		ctx:         ctx,
 		cancel:      cancel,
 		settled:     make(chan struct{}),
+		// The initial mode, fixed before any goroutine can read it.
+		activated: activated,
 	}
-	// A connection is ACTIVE by default so the non-deferred callers (and the fixtures in
-	// this package) deliver immediately. The H3 CONNECT-UDP path calls
-	// deferUntilTargetReady to hold datagrams until the target is confirmed.
-	conn.activated.Store(true)
+	// Readers start LAST, after every field they can observe is final.
 	conn.waitGroup.Add(2)
 	go conn.loopDatagram()
 	go conn.loopCapsule()
@@ -406,18 +476,9 @@ func (c *http3PacketConn) loopDatagram() {
 		// Before the target is ready, hold the datagram instead of queueing it: the
 		// tunnel has not been confirmed yet, and a client is entitled to send
 		// immediately after its request.
-		if !c.activated.Load() {
-			if !c.bufferEarlyDatagram(buffer) {
-				// Past a bound. Dropping is the UDP semantic and the only bounded
-				// choice; the client will retry at the application layer if it cares.
-				buffer.Release()
-			}
-			continue
-		}
-		select {
-		case c.packets <- buffer:
-		case <-c.ctx.Done():
-			buffer.Release()
+		if !c.enqueueInboundPacket(buffer) {
+			// The connection is finished. enqueueInboundPacket has already released
+			// the buffer, so this only has to stop the loop.
 			return
 		}
 	}
@@ -433,12 +494,61 @@ func (c *http3PacketConn) loopCapsule() {
 			c.closeWithError(err)
 			return
 		}
-		select {
-		case c.packets <- buffer:
-		case <-c.ctx.Done():
-			buffer.Release()
+		// The capsule path obeys the SAME deferred semantics as the datagram path.
+		//
+		// It previously wrote to c.packets unconditionally, so an HTTP Datagram
+		// Capsule carrying CONNECT-UDP payload could be delivered during the setup
+		// window even though the datagram path withheld it - the very leak the
+		// deferred state exists to prevent, reachable through the other transport.
+		// Routing both through one helper is what makes that impossible to reintroduce
+		// in only one of them.
+		if !c.enqueueInboundPacket(buffer) {
 			return
 		}
+	}
+}
+
+// enqueueInboundPacket delivers one inbound packet, or holds it during the setup window.
+//
+// It reports whether the loop should CONTINUE. A false return means the connection is
+// finished and the caller must return; the buffer has already been released either way,
+// so the caller never owns it after this call.
+//
+// # Why the check and the append share one critical section
+//
+// The deferred state and the early queue are guarded by the same mutex, so this is a
+// single atomic decision:
+//
+//	held, done := func() (bool, bool) {
+//	    c.earlyMutex.Lock()
+//	    defer c.earlyMutex.Unlock()
+//	    if !c.activated { return c.bufferEarlyDatagramLocked(buffer), false }
+//	    return false, false
+//	}()
+//
+// Reading an atomic flag and THEN locking the queue (the previous shape) allowed
+// settle() to activate and detach the queue in between, stranding the buffer: accepted
+// by the bounded policy, never delivered, never released.
+func (c *http3PacketConn) enqueueInboundPacket(buffer *buf.Buffer) bool {
+	c.earlyMutex.Lock()
+	if !c.activated {
+		retained := c.bufferEarlyDatagramLocked(buffer)
+		c.earlyMutex.Unlock()
+		if !retained {
+			// Past a bound. Dropping is the UDP semantic and the only bounded choice;
+			// the client will retry at the application layer if it cares.
+			buffer.Release()
+		}
+		return true
+	}
+	c.earlyMutex.Unlock()
+
+	select {
+	case c.packets <- buffer:
+		return true
+	case <-c.ctx.Done():
+		buffer.Release()
+		return false
 	}
 }
 
@@ -492,6 +602,11 @@ func (c *http3PacketConn) closeError() error {
 // them when the peer disappears before an outcome is known. A router that reports the
 // outcome while the peer is disconnecting does both, so whichever arrives first takes
 // ownership and the other finds nothing.
+//
+// settle() performs the same detach INLINE rather than calling this, because it must
+// happen in the same critical section that flips `activated`. This method remains for
+// the close path. Both detach under the same mutex, so whichever runs first wins and
+// the other observes an empty queue - the "exactly one owner" property is preserved.
 func (c *http3PacketConn) takeEarlyDatagrams() []*buf.Buffer {
 	c.earlyMutex.Lock()
 	defer c.earlyMutex.Unlock()
@@ -569,16 +684,34 @@ func (c *http3PacketConn) FrontHeadroom() int {
 	return CapsuleHeadroom
 }
 
-// deferUntilTargetReady holds incoming datagrams until the router reports the target
-// setup outcome through the handshake hooks.
+// deferUntilTargetReady is GONE, deliberately.
 //
-// It must be called BEFORE the connection is handed to the router, so no datagram can
-// be delivered on the strength of a 200 that has not been sent yet.
-func (c *http3PacketConn) deferUntilTargetReady() {
-	c.activated.Store(false)
-	c.handshakeOnce = sync.Once{}
-	c.settled = make(chan struct{})
-}
+// It used to switch a live connection from active to deferred:
+//
+//	func (c *http3PacketConn) deferUntilTargetReady() {
+//	    c.activated.Store(false)
+//	    c.handshakeOnce = sync.Once{}
+//	    c.settled = make(chan struct{})
+//	}
+//
+// Three things were wrong with it, and all three are structural rather than a slip in
+// one caller:
+//
+//  1. It could only be correct if called before the reader goroutines ran, but the
+//     constructor had already started them. Between construction and this call a
+//     datagram could be delivered on the strength of a 200 that had not been sent.
+//  2. It reset handshakeOnce and settled. Those are channel/Once fields another
+//     goroutine could already be touching - AwaitReady selects on `settled`, and
+//     settle() runs under handshakeOnce - so "reset before handing it over" was a
+//     convention, not an invariant, and re-initialising a sync.Once after use is
+//     undefined behaviour waiting to happen.
+//  3. It expressed ACTIVE -> DEFERRED, a transition that has no meaning: a connection
+//     that has already delivered packets cannot un-deliver them.
+//
+// The initial mode is now a constructor argument
+// (newHTTP3PacketConnInternal), so deferred state is established while the connection
+// is still single-goroutine and the readers start afterwards. The only transition that
+// remains is DEFERRED -> ACTIVE, performed by settle().
 
 // IsUDPConnect reports that this H3 CONNECT-UDP tunnel has a fixed destination.
 //
@@ -618,15 +751,27 @@ func (c *http3PacketConn) HandshakeFailure(err error) error {
 // sync.Once is what makes double-settling safe: a router that reports success and then
 // reports a failure while tearing down must not flip the result or panic on a closed
 // channel.
+//
+// Activation and detaching the early queue happen in ONE critical section. Splitting
+// them (store the flag, then lock and detach) left a window in which a reader could
+// observe "deferred" before the flag flipped and append after the queue was detached,
+// stranding its buffer forever.
 func (c *http3PacketConn) settle(ready bool, err error) {
 	c.handshakeOnce.Do(func() {
 		c.ready = ready
 		c.setupErr = err
-		c.activated.Store(true)
+
+		// Activate and claim the early queue atomically, so no reader can be holding a
+		// "deferred" decision across this point.
+		c.earlyMutex.Lock()
+		c.activated = true
+		early := c.early
+		c.early = nil
+		c.earlyBytes = 0
+		c.earlyMutex.Unlock()
 
 		// Flush the early queue in arrival order. Buffers that no longer fit the queue
 		// are released rather than leaked.
-		early := c.takeEarlyDatagrams()
 		for _, buffer := range early {
 			select {
 			case c.packets <- buffer:
@@ -654,13 +799,15 @@ func (c *http3PacketConn) AwaitReady(ctx context.Context) error {
 	}
 }
 
-// bufferEarlyDatagram holds one datagram received before the target was ready.
+// bufferEarlyDatagramLocked holds one datagram received before the target was ready.
 //
 // It reports whether the datagram was retained. Once either bound is reached further
 // datagrams are refused, and the caller drops them.
-func (c *http3PacketConn) bufferEarlyDatagram(buffer *buf.Buffer) bool {
-	c.earlyMutex.Lock()
-	defer c.earlyMutex.Unlock()
+//
+// The caller MUST hold earlyMutex. That is what lets enqueueInboundPacket test
+// `activated` and append in one atomic step: the decision to buffer and the buffer
+// itself cannot be separated by a concurrent settle().
+func (c *http3PacketConn) bufferEarlyDatagramLocked(buffer *buf.Buffer) bool {
 	if len(c.early) >= maxEarlyDatagramPackets || c.earlyBytes+buffer.Len() > maxEarlyDatagramBytes {
 		return false
 	}

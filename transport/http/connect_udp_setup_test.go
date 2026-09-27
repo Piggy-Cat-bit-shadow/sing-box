@@ -29,8 +29,7 @@ import (
 func TestDeferredSuccessWithholdsDeliveryUntilReady(t *testing.T) {
 	stream := &datagramFeedingStream{datagrams: [][]byte{{0x00, 'a'}, {0x00, 'b'}}}
 
-	conn := newHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
-	conn.deferUntilTargetReady()
+	conn := newDeferredHTTP3PacketConn(stream, M.ParseSocksaddr("192.0.2.1:443"), nil)
 	defer conn.Close()
 
 	// Nothing may be delivered while the target is unconfirmed, even though the
@@ -59,8 +58,7 @@ func TestDeferredSuccessWithholdsDeliveryUntilReady(t *testing.T) {
 
 // TestDeferredSuccessReportsSetupFailure proves the outcome reaches the handler.
 func TestDeferredSuccessReportsSetupFailure(t *testing.T) {
-	conn := newHTTP3PacketConn(&datagramFeedingStream{}, M.ParseSocksaddr("192.0.2.1:443"), nil)
-	conn.deferUntilTargetReady()
+	conn := newDeferredHTTP3PacketConn(&datagramFeedingStream{}, M.ParseSocksaddr("192.0.2.1:443"), nil)
 	defer conn.Close()
 
 	setupErr := errors.New("dial tcp 192.0.2.1:443: connection refused")
@@ -122,7 +120,7 @@ func TestEarlyDatagramQueueIsBoundedByCount(t *testing.T) {
 
 	accepted := 0
 	for range maxEarlyDatagramPackets * 4 {
-		if conn.bufferEarlyDatagram(buf.As([]byte("x"))) {
+		if bufferEarlyForTest(conn, buf.As([]byte("x"))) {
 			accepted++
 		}
 	}
@@ -143,7 +141,7 @@ func TestEarlyDatagramQueueIsBoundedByBytes(t *testing.T) {
 	const chunk = 16 << 10
 	accepted := 0
 	for range 64 {
-		if conn.bufferEarlyDatagram(buf.As(make([]byte, chunk))) {
+		if bufferEarlyForTest(conn, buf.As(make([]byte, chunk))) {
 			accepted++
 		}
 	}
@@ -152,7 +150,7 @@ func TestEarlyDatagramQueueIsBoundedByBytes(t *testing.T) {
 			"still below its own limit")
 
 	// And a further datagram must be refused once the byte budget is spent.
-	require.False(t, conn.bufferEarlyDatagram(buf.As(make([]byte, chunk))),
+	require.False(t, bufferEarlyForTest(conn, buf.As(make([]byte, chunk))),
 		"a datagram that would exceed the byte bound must be refused")
 }
 
@@ -164,7 +162,7 @@ func TestEarlyDatagramBytesBoundCoversZeroLength(t *testing.T) {
 
 	accepted := 0
 	for range maxEarlyDatagramPackets * 4 {
-		if conn.bufferEarlyDatagram(buf.As(nil)) {
+		if bufferEarlyForTest(conn, buf.As(nil)) {
 			accepted++
 		}
 	}
@@ -234,8 +232,7 @@ func TestSetupFailureDoesNotLeakInternals(t *testing.T) {
 // newHTTP3PacketConnForTest builds a connection with deferred success enabled.
 func newHTTP3PacketConnForTest(t *testing.T) *http3PacketConn {
 	t.Helper()
-	conn := newHTTP3PacketConn(&datagramFeedingStream{}, M.ParseSocksaddr("192.0.2.1:443"), nil)
-	conn.deferUntilTargetReady()
+	conn := newDeferredHTTP3PacketConn(&datagramFeedingStream{}, M.ParseSocksaddr("192.0.2.1:443"), nil)
 	t.Cleanup(func() { conn.Close() })
 	return conn
 }
@@ -265,4 +262,19 @@ func (r *statusRecorder) WriteHeader(status int) { r.status = status }
 func (r *statusRecorder) Write(p []byte) (int, error) {
 	r.body = append(r.body, p...)
 	return len(p), nil
+}
+
+// bufferEarlyForTest exercises the bounded early-queue policy through its locked
+// entry point.
+//
+// bufferEarlyDatagram became bufferEarlyDatagramLocked when the activation flag and the
+// early queue were merged into one critical section: enqueueInboundPacket now tests
+// `activated` and appends while holding earlyMutex, which is what makes the two atomic
+// with respect to settle(). These tests still describe the POLICY (the two bounds), so
+// they take the lock themselves rather than exercising a second, unlocked path that
+// production no longer uses.
+func bufferEarlyForTest(conn *http3PacketConn, buffer *buf.Buffer) bool {
+	conn.earlyMutex.Lock()
+	defer conn.earlyMutex.Unlock()
+	return conn.bufferEarlyDatagramLocked(buffer)
 }

@@ -82,7 +82,6 @@ func (h *httpHandler) serveConnectUDP(ctx context.Context, writer http.ResponseW
 		stream, isDatagramStream := HTTP3StreamFunc(request.Context(), writer)
 		if isDatagramStream {
 			localAddr, _ := request.Context().Value(http.LocalAddrContextKey).(net.Addr)
-			conn := newHTTP3PacketConn(stream, destination, localAddr)
 			// Hold the response until the target is actually reachable.
 			//
 			// Without this the sequence was: 200 OK, flush, and only THEN dial the
@@ -94,7 +93,14 @@ func (h *httpHandler) serveConnectUDP(ctx context.Context, writer http.ResponseW
 			// The router signals the outcome through the handshake hooks, and this
 			// goroutine is the only one that touches the ResponseWriter. So the
 			// router never writes here; it only reports, and the handler decides.
-			conn.deferUntilTargetReady()
+			//
+			// The deferred mode is chosen by the CONSTRUCTOR, not applied afterwards.
+			// An earlier revision built an ACTIVE connection and then called
+			// deferUntilTargetReady(), which left a window in which the already-running
+			// reader goroutine could deliver a datagram before the deferral took
+			// effect. The constructor now establishes the mode while the connection is
+			// still single-goroutine and starts the readers last.
+			conn := newDeferredHTTP3PacketConn(stream, destination, localAddr)
 			h.handler.NewPacketConnectionEx(ctx, conn, source, destination, nil)
 
 			if err := conn.AwaitReady(request.Context()); err != nil {
