@@ -685,8 +685,8 @@ jobs:
 
       - name: deep check - QUICHE live interop
         # Builds Google QUICHE's masque_client at the pinned commit (BoringSSL and
-        # Abseil via Bazel - minutes of work) and then RUNS the three interop tests
-        # that are excluded by name from the normal reference suite:
+        # Abseil via Bazel - 1,811 targets, measured at 734s) and then RUNS the three
+        # interop tests that are excluded by name from the normal reference suite:
         #
         #   TestReferenceQuicheH3TransportLiveInterop
         #   TestReferenceQuicheConnectUDPLiveInterop
@@ -694,6 +694,21 @@ jobs:
         #
         # The names are spelled out because scripts/ci/check-reference-coverage.sh
         # asserts that every test it excludes is actually run here.
+        #
+        # TWO binaries are needed, and getting this wrong produces silent SKIPs rather
+        # than failures:
+        #
+        #   JIEJIE_SING_BOX_BINARY   a sing-box binary the tests launch as the server.
+        #   JIEJIE_FULL_REGISTRY_BINARY=1   declares that binary was built with the FULL
+        #                            registry, which requireFullRegistryBuild checks.
+        #
+        # The binary must be the UPSTREAM-DEFAULT (full) build. The harness reads ONE
+        # binary for all three tests, and the production minimal registry registers no
+        # endpoints, so CONNECT-IP's masque-server only exists in the full registry.
+        # CONNECT-UDP, which needs only the `http` inbound, is served there as well.
+        #
+        # The PRODUCTION MINIMAL binary was already built, audited and smoke-tested
+        # earlier in this job, so nothing about the shipped artifact depends on this.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
@@ -701,19 +716,44 @@ jobs:
           eval "$(./scripts/ci/jiejie-quiche-live-interop.sh --print-env)"
           echo "masque_client: $JIEJIE_QUICHE_MASQUE_CLIENT"
 
+          # ONE binary serves all three tests, and it must be the FULL-registry build.
+          #
+          # The harness reads a single variable (harness_test.go: os.Getenv(
+          # singBoxBinaryEnv)) for every server it starts, so there is no way to hand
+          # CONNECT-IP a different binary than CONNECT-UDP. Since the minimal registry
+          # registers NO endpoints, the masque-server endpoint that CONNECT-IP needs
+          # exists only in the upstream-default (full) registry - and CONNECT-UDP,
+          # which only needs the `http` inbound, is served there too.
+          #
+          # So the full-registry binary is the one that makes all three run, and
+          # JIEJIE_FULL_REGISTRY_BINARY=1 declares that fact to the harness, which is
+          # what requireFullRegistryBuild checks.
+          go build -trimpath -buildvcs=false -o /tmp/sing-box-full-registry ./cmd/sing-box
+          /tmp/sing-box-full-registry version
+
+          export JIEJIE_SING_BOX_BINARY=/tmp/sing-box-full-registry
+          export JIEJIE_FULL_REGISTRY_BINARY=1
+          echo "full-registry binary: $JIEJIE_SING_BOX_BINARY"
+
           # test/jiejie/reference is its OWN Go module (it has a go.mod so the MASQUE
           # reference implementations can be imported without ever entering the
-          # production dependency graph). It must therefore be tested from inside that
-          # directory, as `.` - referencing it as ./jiejie/reference from the parent
+          # production dependency graph). It must therefore be run from inside that
+          # directory as `.` - referencing it as ./jiejie/reference from the parent
           # module fails with "main module (test) does not contain package
           # test/jiejie/reference", which is a PATH mistake, not a test failure.
           cd test/jiejie/reference
           go test -count=1 -timeout 30m -v \
             -run 'TestReferenceQuiche(H3Transport|ConnectUDP|ConnectIP)LiveInterop' \
             . 2>&1 | tee /tmp/quiche-interop.log
+
           # A skipped interop is NOT a pass: it means the external binary never ran.
           if grep -qE "^\s*--- SKIP" /tmp/quiche-interop.log; then
             echo "FAIL: a QUICHE interop test skipped; the interop was not demonstrated" >&2
+            grep -E "^\s*--- SKIP|_test.go:[0-9]+:" /tmp/quiche-interop.log >&2
+            exit 1
+          fi
+          if ! grep -qE "^--- PASS: TestReferenceQuiche" /tmp/quiche-interop.log; then
+            echo "FAIL: no QUICHE interop test reported a PASS" >&2
             exit 1
           fi
           echo "PASS: QUICHE live interop"
