@@ -104,9 +104,7 @@ func TestSessionSnapshotReadIsConsistentUnderConcurrentPublish(t *testing.T) {
 	address := netip.MustParsePrefix("192.0.2.1/32")
 	stop := make(chan struct{})
 	var writer sync.WaitGroup
-	writer.Add(1)
-	go func() {
-		defer writer.Done()
+	writer.Go(func() {
 		for i := 0; ; i++ {
 			select {
 			case <-stop:
@@ -127,14 +125,12 @@ func TestSessionSnapshotReadIsConsistentUnderConcurrentPublish(t *testing.T) {
 			current.publishStateLocked()
 			current.access.Unlock()
 		}
-	}()
+	})
 
 	var reads atomic.Int64
 	var readers sync.WaitGroup
 	for range 8 {
-		readers.Add(1)
-		go func() {
-			defer readers.Done()
+		readers.Go(func() {
 			for range 20000 {
 				state := current.loadState()
 				if state.ready {
@@ -145,7 +141,7 @@ func TestSessionSnapshotReadIsConsistentUnderConcurrentPublish(t *testing.T) {
 				}
 				reads.Add(1)
 			}
-		}()
+		})
 	}
 	readers.Wait()
 	close(stop)

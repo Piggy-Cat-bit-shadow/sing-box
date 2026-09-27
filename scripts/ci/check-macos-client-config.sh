@@ -19,6 +19,31 @@ binary="${1:-dist/sing-box-darwin-arm64}"
 outdir="${2:-$(mktemp -d)}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Resolve the binary to an ABSOLUTE path BEFORE changing directory.
+#
+# This script cd's to the repository root, so a relative binary path is resolved
+# against the root rather than against the caller's working directory. A caller
+# already standing in the root that passes `dist/sing-box-darwin-arm64` works; the
+# same string from a CI step in another directory produced "command not found".
+# Because the registry audit calls this script, that surfaced as "the client
+# fixture does not pass sing-box check" - naming the fixture rather than the actual
+# missing binary, which is why it is now checked explicitly.
+case "$binary" in
+  /*) ;;
+  *)
+    if [ -e "$binary" ]; then
+      binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+    elif [ -e "$root/$binary" ]; then
+      binary="$root/$binary"
+    fi
+    ;;
+esac
+if [ ! -x "$binary" ]; then
+  echo "binary not found or not executable: $binary" >&2
+  exit 2
+fi
+
 cd "$root"
 
 tmpl="test/jiejie/macos-client/jiejie-macos-client-fixture.json.tmpl"

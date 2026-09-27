@@ -123,9 +123,7 @@ func BenchmarkSessionConfigReadContended(b *testing.B) {
 	}
 	stop := make(chan struct{})
 	var writer sync.WaitGroup
-	writer.Add(1)
-	go func() {
-		defer writer.Done()
+	writer.Go(func() {
 		for {
 			select {
 			case <-stop:
@@ -139,7 +137,7 @@ func BenchmarkSessionConfigReadContended(b *testing.B) {
 			reader.ready = !reader.ready
 			reader.access.Unlock()
 		}
-	}()
+	})
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {

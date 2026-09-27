@@ -22,6 +22,33 @@ set -euo pipefail
 binary="${1:-dist/sing-box-darwin-arm64}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Resolve the binary to an ABSOLUTE path BEFORE changing directory.
+#
+# The flavor is derived from `basename "$binary"` below, so the NAME must still be
+# visible after resolution - which it is, since only the directory part changes.
+#
+# This matters because the script cd's to the repository root and then invokes
+# "$binary" for the type-level checks. A relative path is therefore resolved
+# against the root, not against the caller's directory: invoked from CI with
+# `dist/sing-box-darwin-arm64` from a different working directory, every
+# "$binary" invocation failed with "command not found" while the surrounding
+# assertions reported the failure as a fixture problem.
+case "$binary" in
+  /*) ;;
+  *)
+    if [ -e "$binary" ]; then
+      binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+    elif [ -e "$root/$binary" ]; then
+      binary="$root/$binary"
+    fi
+    ;;
+esac
+if [ ! -x "$binary" ]; then
+  echo "binary not found or not executable: $binary" >&2
+  exit 2
+fi
+
 cd "$root"
 
 # The flavor decides which tag file is used, and therefore whether Cronet is

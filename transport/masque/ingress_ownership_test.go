@@ -122,7 +122,6 @@ type scriptedDatagramStream struct {
 	access    sync.Mutex
 	datagrams [][]byte
 	index     int
-	cancel    context.CancelFunc
 	// onExhausted is called once the script has been fully consumed, so the test
 	// can end the session deterministically instead of parking forever.
 	onExhausted context.CancelFunc
