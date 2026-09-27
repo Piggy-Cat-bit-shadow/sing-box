@@ -4,12 +4,18 @@ This document describes the macOS Client Edition of the Jiejie sing-box fork: wh
 it is, what it contains, why each part is included or excluded, and what has
 actually been verified.
 
-- **Product** — a native macOS CLI sing-box core, intended to be loaded by a
-  third-party GUI as an external core.
-- **Branch** — `macos-client`
-- **Base branch** — `testing` (Jiejie Server Edition)
-- **Base SHA** — `783c2bb52318a12dd2a3b7c16ab2f33e7ebbb9da`
+- **Product** — a native macOS CLI sing-box core. The primary usage is headless
+  daemon plus browser Web Dashboard; loading it as an external core from a
+  third-party GUI is also supported.
+- **Branch** — `testing`. The client and the server share ONE branch and ONE source
+  tree; the former `macos-client` branch was consolidated into `testing` and is no
+  longer a development line.
+- **Profiles** — `macos-lite` (`jiejie_client_macos`) and `macos-naive` (the same
+  tags plus `with_naive_outbound`, CGO=1 for Cronet)
 - **Target** — `darwin/arm64` (required), `darwin/amd64` (also built)
+
+See [`BUILD-PROFILES.md`](BUILD-PROFILES.md) for the complete profile matrix,
+build commands and reproducibility measurements.
 
 ## What this is not
 
@@ -26,27 +32,38 @@ sound similar:
 
 ## Architecture
 
-The repository carries two independent products. They share one source tree and
-one set of upstream-derived packages, and are separated entirely by build tags and
-registries. Neither product's build can accidentally select the other's registry,
-because the constraints are mutually exclusive.
+The repository carries ONE source tree that produces three build profiles. They
+share every protocol and transport package, and are separated entirely by build
+tags and registries. No profile's build can accidentally select another's
+registry, because the constraints are mutually exclusive.
 
 ```text
-testing                          macos-client
-└── Jiejie Server Edition        └── Jiejie Client Edition
-    └── Linux amd64                  └── macOS
-        └── jiejie_server_minimal        └── jiejie_client_macos
+                     testing  (single source tree)
+                          │
+      ┌───────────────────┼───────────────────┐
+      ↓                   ↓                   ↓
+ Linux Server Minimal  macOS Lite        macOS Naive
+ jiejie_server_minimal jiejie_client_macos jiejie_client_macos
+                                           + with_naive_outbound
 ```
 
-| | Server Edition | Client Edition |
-| --- | --- | --- |
-| branch | `testing` | `macos-client` |
-| platform | Linux amd64 | macOS arm64 / amd64 |
-| build tag | `jiejie_server_minimal` | `jiejie_client_macos` |
-| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
-| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
-| workflow | `server-linux-amd64.yml` | `client-macos.yml` |
-| artifact | `Jiejie-VPS-linux-amd64-…` | `Jiejie-Client-macOS-arm64-…` |
+There is no "Mac copy" of any protocol. MASQUE, Naive, HTTP/2, HTTP/3, QUIC,
+buffering and framing all live in one place and are consumed by every profile.
+
+| | Server Minimal | macOS Lite | macOS Naive |
+| --- | --- | --- | --- |
+| branch | `testing` | `testing` | `testing` |
+| platform | Linux amd64 | macOS arm64 / amd64 | macOS arm64 |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` | `jiejie_client_macos` + `with_naive_outbound` |
+| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE` |
+| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` | same as Lite |
+| CGO | `0` | `0` | `1` (Cronet) |
+| workflow | `server-linux-amd64.yml` | `client-macos.yml` | `client-macos.yml` |
+| artifact | `Jiejie-VPS-linux-amd64-…` | `Jiejie-Client-macOS-arm64-…` | `Jiejie-Client-macOS-arm64-naive-…` |
+
+All three are built from one commit by
+`.github/workflows/jiejie-profiles.yml`, so a divergence between profiles cannot
+hide between two workflows.
 
 The three registries are mutually exclusive and complete:
 
@@ -267,11 +284,55 @@ on Darwin. `dhcp` and `mdns` are not registered.
 
 ### Endpoints, services, certificates
 
-- **Endpoints: none.** This is the single largest dependency saving in the
-  profile. No WireGuard, Tailscale, OpenVPN, OpenConnect or MASQUE endpoint.
-- **Services: none** beyond the Clash API, which `with_clash_api` compiles in
-  through `include/clashapi.go`, independently of the registry file.
+- **Endpoints: `masque-client` only.** MASQUE is a first-class client transport
+  (CONNECT-IP / CONNECT-UDP over HTTP/2 or HTTP/3), so the client role is
+  registered. The **server** role is not: see below.
+- **Services:** the native `api` service (which serves the Web Dashboard) plus the
+  Clash API, which `with_clash_api` compiles in through `include/clashapi.go`,
+  independently of the registry file.
 - **Certificate providers: none.** A client consumes CA-signed certificates.
+
+#### Why the MASQUE roles are split
+
+`protocol/masque` holds BOTH endpoint roles in one package, and
+`masque.RegisterEndpoint` registers both at once. That helper is wrong for this
+profile in both directions:
+
+- calling it would ship `masque-server` — a TUN-binding CONNECT-IP endpoint — inside
+  a desktop client that has no server role;
+- not calling it at all, which was the previous state, left `masque-client`
+  **unreachable**: the implementation was compiled into the binary but a valid
+  `type: masque-client` configuration failed with "unknown endpoint type".
+
+The registration is therefore split:
+
+```go
+masque.RegisterClientEndpoint(registry)  // masque-client only  ← this profile
+masque.RegisterServerEndpoint(registry)  // masque-server only
+masque.RegisterEndpoint(registry)        // both; upstream and server builds
+```
+
+The resulting macOS surface is exactly:
+
+```text
+masque-client  ✅
+masque-server  ❌
+```
+
+The protocol and transport source stays SHARED — this is one registry entry, not a
+second implementation — so every framing, capsule, H3 and packet-ownership fix
+continues to benefit both roles. The `transport/masque` and `transport/http`
+packages are linked in full.
+
+Because the roles live in one package, the audit no longer excludes the whole
+`protocol/masque` PACKAGE; "client present, server absent" is the real invariant and
+is asserted at symbol level by `scripts/ci/audit-macos-client-registry.sh` and at
+type level by `test/jiejie/macos_client_registry_audit_test.go`.
+
+The client fixture and the example configs both contain a `masque-client` endpoint
+wired into the selector, so `sing-box check` in CI covers the registration. This was
+verified to be a real guard: building the client with the registration removed makes
+the fixture fail with `endpoints[0]: unknown endpoint type: masque-client`.
 
 ### Excluded protocols
 
@@ -766,18 +827,18 @@ registry, so it does not enter the client binary. This was verified with
 
 ## Upstream sync
 
-The same policy as the server branch:
+One branch now, so one sync policy:
 
 ```sh
 git fetch upstream
-git switch macos-client
+git switch testing
 git log --oneline HEAD..upstream/testing
 git diff HEAD...upstream/testing
 git rebase upstream/testing        # or: git merge upstream/testing
 ```
 
-Never reset or force-push either branch. After every sync, re-run the full
-verification set above, and in particular re-check:
+Never reset or force-push. After every sync, re-run the full verification set
+above, and in particular re-check:
 
 - the three registries are still mutually exclusive;
 - `with_gvisor` is still what gates the Darwin TUN files in `sing-tun`;
