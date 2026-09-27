@@ -275,6 +275,25 @@ jobs:
           fi
           ./scripts/ci/audit-macos-client-registry.sh "$bin"
 
+      - name: headless smoke test (native Web API, no GUI)
+        # The native management API is control-plane only and behaves identically
+        # in both flavors, so this runs once rather than per matrix entry.
+        if: matrix.arch == 'arm64' && matrix.flavor == 'lite'
+        run: |
+          set -euo pipefail
+          ./scripts/ci/check-macos-client-headless.sh \
+            dist/sing-box-darwin-arm64 dist/headless-smoke
+
+      - name: headless example config still checks
+        # The shipped example is what a user copies first, so a stale one is a
+        # support burden. It is validated here even though the smoke test builds
+        # its own config.
+        if: matrix.arch == 'arm64' && matrix.flavor == 'lite'
+        run: |
+          set -euo pipefail
+          ./dist/sing-box-darwin-arm64 check -c test/jiejie/macos-client/example-headless.json
+          echo "PASS: example-headless.json checks"
+
   # ---------------------------------------------------------------------------
   # Package. Needs every gate above, so a shipped artifact is only produced from
   # a commit that passed all of them.
@@ -302,6 +321,7 @@ jobs:
           [ "$reported" = "$expected" ]
           ./scripts/ci/check-macos-client-config.sh "$bin" dist/fixture-package
           ./scripts/ci/check-macos-client-runtime.sh "$bin" dist/runtime-package
+          ./scripts/ci/check-macos-client-headless.sh "$bin" dist/headless-package
           ./scripts/ci/audit-macos-client-registry.sh "$bin"
 
       - name: stage the artifact
