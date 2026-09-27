@@ -160,41 +160,76 @@ func TestClientMacOSExcludedOutboundsAreAbsent(t *testing.T) {
 	})
 }
 
-// TestClientMacOSNaiveOutboundIsAStubNotAnImplementation pins the Naive decision.
+// TestClientMacOSNaiveOutboundIsARealImplementation pins the Naive decision.
 //
-// `naive` RESOLVES in this profile, and that is deliberate rather than an
-// oversight. Upstream ships include/naive_outbound_stub.go behind
-// `!with_naive_outbound`, and the stub registers the type with a constructor
-// that always fails with "naive outbound is not included in this build, rebuild
-// with -tags with_naive_outbound".
+// The macOS core SHIPS NaiveProxy. This test used to assert the opposite - that
+// `naive` resolved only to upstream's stub, which fails with "rebuild with -tags
+// with_naive_outbound" - because the old lite profile did not link Cronet. The
+// unified profile enables `with_naive_outbound`, so the stub is no longer what is
+// registered and asserting it would now be asserting a regression.
 //
-// So the honest description of the macOS core is: Naive is a KNOWN type that
-// explains itself, not an absent one. A GUI offering a Naive node gets an
-// actionable message instead of "unknown outbound type", and because the stub
-// imports no Cronet code, the CGO dependency stays out of the binary.
+// # Why this is worth a test rather than only a tag-file grep
 //
-// Deleting the stub call to make `naive` vanish would be worse for users and
-// would not save anything: the stub is a few lines and the expensive package is
-// already excluded. The property worth asserting is therefore that the type
-// resolves while the IMPLEMENTATION is absent, which the symbol audit checks
-// separately.
-func TestClientMacOSNaiveOutboundIsAStubNotAnImplementation(t *testing.T) {
+// The `naive` TYPE resolves either way, because upstream's
+// include/naive_outbound_stub.go registers it behind `!with_naive_outbound`. So a
+// type-level check alone cannot tell a working implementation from a stub, and a
+// tag-file edit that dropped `with_naive_outbound` would leave every other check
+// in this file passing while the shipped core silently lost NaiveProxy.
+//
+// The distinction is therefore made on the ERROR, which is the only thing that
+// differs at this layer:
+//
+//	stub   -> "naive outbound is not included in this build, rebuild with
+//	           -tags with_naive_outbound"
+//	real   -> a configuration or dial error from the real constructor
+//
+// The symbol-level half of the same property is asserted in
+// scripts/ci/audit-macos-client-registry.sh and in the workflow's product
+// capability step, which check for the Cronet implementation directly.
+func TestClientMacOSNaiveOutboundIsARealImplementation(t *testing.T) {
 	t.Parallel()
 	types := include.OutboundRegistry().OptionTypes()
 
-	require.True(t, hasType(types, "naive"),
-		"`naive` must resolve so users get an actionable error, not 'unknown outbound type'")
+	require.True(t, hasType(types, "naive"), "`naive` must resolve as an outbound type")
 
-	// The construction must fail, which is what proves it is the stub rather
-	// than a working implementation.
 	registry := include.OutboundRegistry()
 	rawOptions, loaded := registry.CreateOptions("naive")
-	require.True(t, loaded, "the stub registers option types too")
+	require.True(t, loaded, "the naive outbound registers option types")
+
+	// Constructing with EMPTY options must fail - a naive outbound needs a server
+	// and TLS - but it must fail for a real configuration reason, not because the
+	// implementation is absent.
+	_, err := registry.CreateOutbound(context.Background(), nil, nil, "naive", "naive", rawOptions)
+	require.Error(t, err, "empty naive options must not construct")
+
+	require.NotContains(t, err.Error(), "not included in this build",
+		"the naive outbound STUB is linked; the macOS core must ship the real "+
+			"NaiveProxy implementation, which requires with_naive_outbound in %s",
+		"release/BUILD_TAGS_JIEJIE_CLIENT_MACOS")
+	require.NotContains(t, err.Error(), "with_naive_outbound",
+		"the error names the build tag, which is the stub's signature; the real "+
+			"constructor must have produced this error instead")
+}
+
+// TestClientMacOSNaiveOutboundRequiresTLS is the positive counterpart: the real
+// constructor must be reachable and must validate its configuration.
+//
+// The specific error this asserts ("TLS required") is what the real Naive
+// outbound returns when TLS is missing. Pinning it means the test would notice if
+// the implementation were replaced by something else that merely happened not to
+// be the stub.
+func TestClientMacOSNaiveOutboundRequiresTLS(t *testing.T) {
+	t.Parallel()
+
+	registry := include.OutboundRegistry()
+	rawOptions, loaded := registry.CreateOptions("naive")
+	require.True(t, loaded)
 
 	_, err := registry.CreateOutbound(context.Background(), nil, nil, "naive", "naive", rawOptions)
-	require.Error(t, err, "naive must not construct without with_naive_outbound")
-	require.Contains(t, err.Error(), "with_naive_outbound",
-		"the error must name the tag that enables it")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TLS",
+		"the real naive outbound must reject a configuration with no TLS; got %q",
+		err.Error())
 }
 
 // TestClientMacOSNativeAPIServiceIsRegistered guards the headless control plane.

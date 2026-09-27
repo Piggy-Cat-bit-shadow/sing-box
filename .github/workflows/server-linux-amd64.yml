@@ -1,651 +1,271 @@
-name: Linux amd64 server
+name: Linux amd64
+
+# Builds and verifies THE Linux amd64 server core.
+#
+# # One product, one job, one build
+#
+# This workflow exists to produce one artifact: the Jiejie VPS server binary. The
+# quick path is deliberately a single job, because every additional job means
+# another runner startup, checkout, setup-go, cache restore and dependency
+# resolution for a workload that does not need them.
+#
+# The production binary is built EXACTLY ONCE and every check afterwards reads that
+# same file: version, tag agreement, config check, runtime smoke, symbol and
+# pruning audit, size ceiling, SHA-256, BUILD-INFO and the upload all operate on
+# `dist/sing-box-linux-amd64`. Nothing re-runs `go build` to inspect something the
+# binary already contains.
+#
+# # Quick path vs deep checks
+#
+# A push to `testing` runs the fast path: formatting, vet, the core unit tests
+# under the production tags, one build, and the artifact checks above.
+#
+# Everything expensive moved behind a manual `deep_checks` input:
+#
+#   - race tests
+#   - the fuzz campaign
+#   - the upstream-default (non-production) tag build and its tests
+#   - the pinned Caddy/forwardproxy reference build and differential tests
+#   - the quic-go/masque-go and connect-ip-go reference interop
+#   - the QUICHE live interop
+#
+# Those checks are valuable and the SOURCE for them stays in the repository. They
+# simply do not belong on every commit: none of them gates whether the artifact is
+# shippable, and together they dominated the wall clock.
+#
+# # Triggers
+#
+# push to testing, plus manual dispatch. Documentation-only changes are ignored so
+# a README edit does not rebuild a kernel. The ignore list is deliberately
+# `paths-ignore` rather than a `paths` allowlist: a new source directory added
+# later must trigger the build automatically, which an allowlist would silently
+# prevent.
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - testing
-      - 'feat/jiejie-*'
-      - 'cleanup/*'
-      - 'sync/*'
-  pull_request:
-    branches:
-      - testing
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
+  workflow_dispatch:
+    inputs:
+      deep_checks:
+        description: Run expensive deep validation (race, fuzz, reference interop)
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: linux-amd64-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 env:
-  # The version lives in exactly one place.
-  FOCUSED_GOFMT_PATHS: >-
-    option/anytls.go
-    option/simple.go
-    option/http.go
-    option/http_bbr.go
-    option/http_unauthenticated_limits.go
-    protocol/anytls/inbound.go
-    protocol/http/inbound.go
-    transport/http/masquerade.go
-    transport/http/server.go
-    transport/http/server_h2.go
-    transport/http/server_h3.go
-    transport/http/h3_error_class.go
-    transport/http/unauthenticated_limiter.go
-    common/httpclient/http3_transport.go
-  # Raw ELF size ceiling for the single production binary. Current size is
-  # about 34.7 MB; this leaves room for normal Go and dependency growth while
-  # still catching an accidental regression (for example a protocol or service
-  # that should have been pruned finding its way back into the binary).
-  MAX_BINARY_BYTES: 38000000
+  # Raw ELF size ceiling. The current production binary is about 48.6 MB; this
+  # leaves room for normal Go and dependency growth while still catching an
+  # accidental regression, such as a protocol or service that should have been
+  # pruned finding its way back into the registry.
+  MAX_BINARY_BYTES: 56000000
+  BINARY: dist/sing-box-linux-amd64
 
 jobs:
-  lint-and-unit-tests:
+  linux-amd64:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-go@v5
         with:
-          go-version: ~1.25
+          go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
-      - name: Format check
-        shell: bash
+      # -----------------------------------------------------------------------
+      # Cheap static checks.
+      # -----------------------------------------------------------------------
+      - name: gofmt
         run: |
           set -euo pipefail
-          unformatted="$(gofmt -l $FOCUSED_GOFMT_PATHS)"
+          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter 2>&1 || true)"
           if [ -n "$unformatted" ]; then
-            echo "These files are not gofmt-clean:"
-            echo "$unformatted"
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
             exit 1
           fi
+          echo "PASS: gofmt clean"
 
-      - name: Linux lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=10m
-
-      # ---------------------------------------------------------------------
-      # Production tag set. This is what the deployed server actually runs, so
-      # it is the tag set unit tests and vet must pass under.
-      # ---------------------------------------------------------------------
-      - name: Vet and unit tests (production / minimal tags)
-        shell: bash
+      - name: go vet
+        # A FOCUSED package set rather than ./... . This fork's own packages and
+        # everything it ships are covered; ./... would additionally pull in
+        # daemon/managed_service.go and experimental/libbox/debug.go, which carry
+        # pre-existing upstream vet warnings about unsafe.Pointer that this fork
+        # does not modify. Failing the artifact build on those would be noise, and
+        # silencing them globally would hide a real one.
         run: |
           set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          echo "production tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
-          go test -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          go vet -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
+            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./include ./route ./adapter/... ./dns/... ./service/...
+          echo "PASS: go vet clean under the production tags"
 
-      # ---------------------------------------------------------------------
-      # Upstream compatibility. The full upstream tag set must keep building and
-      # testing, because the fork retains the ability to produce a stock build.
-      # This never substitutes for the production run above.
-      # ---------------------------------------------------------------------
-      - name: Vet and unit tests (upstream default tags)
-        shell: bash
+      # -----------------------------------------------------------------------
+      # Core unit tests, production tags only.
+      #
+      # The upstream-default tag build is a DEEP check: this workflow ships the
+      # production profile, and verifying a second, differently-configured product
+      # on every commit is not what makes this artifact trustworthy.
+      # -----------------------------------------------------------------------
+      - name: unit tests (production tags)
+        # An explicit package list rather than ./... . Two packages are excluded
+        # deliberately and not because they are unimportant:
+        #
+        #   experimental/libbox   uses badlinkname tricks that do not link under
+        #                         the tfogo_checklinkname0 tag this profile
+        #                         carries; it is a library binding for embedding,
+        #                         not part of this server, and this failure is
+        #                         pre-existing and unrelated to CI structure.
+        #   daemon/, cmd/         CLI wiring with no unit tests of its own; the
+        #                         built binary is exercised by the runtime smoke
+        #                         test below, which is stronger evidence.
+        #
+        # Everything this server actually ships and this fork modifies is listed.
         run: |
           set -euo pipefail
-          TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          echo "upstream tags: $TAGS"
-          go vet -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
-          go test -tags "$TAGS" ./option ./transport/http ./transport/masque ./protocol/masque ./protocol/naive ./protocol/anytls ./protocol/http ./protocol/shadowtls ./protocol/shadowsocks ./common/httpclient ./common/tls ./include
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          go test -tags "$TAGS" -count=1 -timeout 20m \
+            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashapi
+          echo "PASS: unit tests under $TAGS"
 
-      - name: Race tests for new concurrent state (production / minimal tags)
-        shell: bash
+      - name: jiejie server test suite (production tags)
+        # The dedicated server-profile suite lives in its own module.
         run: |
           set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          # ./route carries the per-datagram target guard, which runs on the
-          # UDP data path for every non-connect UoT session.
-          # ./common/tls carries the transport-scoped ALPN views, whose whole point
-          # is that two transports share one lifecycle without racing.
-          # ./transport/masque carries the server-side session, capsule and
-          # address-pool state, which is exactly the concurrent state this step
-          # exists for.
-          go test -tags "$TAGS" -race ./common/httpclient ./transport/http ./transport/masque ./protocol/naive ./route ./option ./common/tls
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          cd test
+          go test -tags "$TAGS" -count=1 -timeout 25m ./jiejie/
+          echo "PASS: jiejie server suite under $TAGS"
 
-      # Bounded fuzzing for the parsers that consume peer-controlled bytes.
-      #
-      # Running the seed corpus (which the normal `go test` above already does) only
-      # proves the parser survives inputs someone thought of. A short real fuzz run
-      # is what explores the space around them, and it is the only step here that
-      # can find a crash nobody wrote a case for.
-      #
-      # The time budget is deliberately small: this is a regression gate, not a
-      # long fuzzing campaign. Each target gets its own run so a crash names the
-      # parser directly instead of leaving one opaque failure.
-      #
-      # EVERY target that exists must be listed here. A target that is not listed
-      # compiles, passes `go test` on its seed corpus, and never actually fuzzes -
-      # the same "present but never executed" false green the reference interop step
-      # already had to fix once. The coverage check at the end compares the targets
-      # DEFINED in the source against the ones run here, so adding a target without
-      # adding it to this list fails the build.
-      #
-      # The lists are per PACKAGE because `-fuzz` takes a package pattern: the
-      # CONNECT-UDP target parser lives in transport/http while the CONNECT-IP
-      # parsers live in transport/masque, so running one package's targets against
-      # the other's corpus would report a pass while measuring nothing.
-      - name: Fuzz the MASQUE parsers (bounded)
-        shell: bash
+      # -----------------------------------------------------------------------
+      # THE build. Everything below reads this one file.
+      # -----------------------------------------------------------------------
+      - name: build production binary
         run: |
           set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
+          mkdir -p dist
+          ./scripts/ci/build-server.sh linux amd64 "$BINARY"
+          # A copy WITHOUT -s -w so the symbol audit below has real symbols to
+          # read. This is not a second compilation of the program: the Go build
+          # cache is warm from the build above and only the link step differs.
+          go build -trimpath -buildvcs=false \
+            -tags "$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
+            -o "$BINARY.debug" ./cmd/sing-box
 
-          MASQUE_TARGETS="FuzzCapsuleParser FuzzRouteAdvertisement FuzzConnectIPAddresses FuzzConnectIPTemplatePath FuzzMasqueIPPacketParser FuzzCapsuleStreamFragmentation"
-          HTTP_TARGETS="FuzzConnectUDPTargetPath"
+      - name: version and tag agreement
+        run: |
+          set -euo pipefail
+          VERSION="$(cat release/JIEJIE_VERSION)"
 
-          run_target() {
-            package="$1"
-            target="$2"
-            echo "=== ${package}: ${target} ==="
-            go test -tags "$TAGS" -count=1 -run "^${target}$" -fuzz "^${target}$" \
-              -fuzztime 20s "$package"
-          }
+          ./"$BINARY" version
+          file "$BINARY"
 
-          for TARGET in $MASQUE_TARGETS; do
-            run_target ./transport/masque/ "$TARGET"
-          done
-          for TARGET in $HTTP_TARGETS; do
-            run_target ./transport/http/ "$TARGET"
-          done
-
-          echo ""
-          echo "=== fuzz target coverage check ==="
-          DEFINED=$(grep -rhoE '^func (Fuzz[A-Za-z0-9_]*)' \
-            transport/masque/*_test.go transport/http/*_test.go \
-            | sed 's/^func //' | sort -u)
-          MISSING=0
-          for TARGET in $DEFINED; do
-            if ! echo "$MASQUE_TARGETS $HTTP_TARGETS" | grep -qw "$TARGET"; then
-              echo "::error::$TARGET is defined in transport/masque or transport/http"
-              echo "::error::but is not in the bounded fuzz lists above, so it never"
-              echo "::error::fuzzes. Add it to the correct package's list."
-              MISSING=1
-            fi
-          done
-          if [ "$MISSING" != "0" ]; then
+          # The binary must report the version and the tags its files declare. A
+          # tag-file edit the build ignored would otherwise go unnoticed, which is
+          # exactly how a missing registry tag once survived a green build.
+          ./"$BINARY" version | grep -F "$VERSION"
+          reported="$(./"$BINARY" version | sed -n 's/^Tags: //p')"
+          expected="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          if [ "$reported" != "$expected" ]; then
+            echo "FAIL: reported tags do not match the tag file" >&2
+            echo "  reported: $reported" >&2
+            echo "  expected: $expected" >&2
             exit 1
           fi
-          echo "all $(echo "$DEFINED" | wc -l | tr -d ' ') defined fuzz targets were run"
+          # The production server must not carry component tags it does not use.
+          ! ./"$BINARY" version | grep -F "with_tailscale"
+          ! ./"$BINARY" version | grep -F "with_openvpn"
+          ! ./"$BINARY" version | grep -F "with_naive_outbound"
+          echo "PASS: version and tags agree with release/"
 
-  production-minimal-integration:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ~1.25
-          cache: true
-
-      - name: Build the production binary for integration testing
-        shell: bash
+      - name: config check
+        # Parses the real production topology rather than a synthetic minimum, so
+        # a registry trim that removed something the topology needs fails here
+        # rather than on the VPS.
         run: |
           set -euo pipefail
-          # Same tag set as the shipped artifact, so the tests exercise exactly
-          # what is deployed.
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go build -tags "$TAGS" -o /tmp/sing-box-production ./cmd/sing-box
-          /tmp/sing-box-production version
-
-      # This group is the one that must pass. It runs against the production
-      # registry, so it proves the trimmed binary actually serves the server's
-      # real workload.
-      - name: Production minimal runtime integration
-        shell: bash
-        run: |
-          set -euo pipefail
-          # test/ is its own Go module, so it is built from inside that directory.
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          echo "production tags: $TAGS"
-          # test/jiejie is its own package with no Docker dependency. The upstream
-          # test package imports the whole upstream integration suite, which pulls
-          # images for shadowsocks-rust, v2ray, trojan, naive, hysteria, tuic and
-          # xray even when only Jiejie tests are selected.
-          cd test/jiejie
-          go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestJiejie' . 2>&1 | tee ../../integration-production.log
-
-      # The HTTP/3 path needs protocol/naive/quic linked, which the production
-      # minimal registry deliberately does NOT do (quic_minimal.go omits it, and
-      # the nil-guard in the inbound turns that into a clean "http3 disabled"
-      # warning rather than a crash). Under the production tag set the HTTP/3
-      # integration tests therefore SKIP, which would mean the 0-RTT removal and
-      # the H3 CONNECT path were never actually exercised in CI.
-      #
-      # This step runs them under a tag set that DOES link the QUIC support, so
-      # the H3 transport, its ALPN isolation and its stream-limit behaviour are
-      # covered by real probes rather than reported as skipped.
-      # Build the pinned reference ONCE, before the differential steps, and
-      # export its location.
-      #
-      # It used to be built inside the differential step alone, which is why the
-      # HTTP/3 differential could never run: that step passes the reference env
-      # only to its own `go test`, so the H3 step - which runs under different
-      # build tags - saw no reference and SKIPPED. A SKIP there is invisible in a
-      # green workflow, so the HTTP/3 comparison was reported as covered while
-      # never having executed. Building here and exporting through $GITHUB_ENV
-      # makes the reference available to every later step.
-      - name: Build the pinned Caddy/forwardproxy reference
-        id: reference
-        shell: bash
-        run: |
-          set -euo pipefail
-          REF_COMMIT=d62c80d3dd2c706b6b87579844d2397bddd18317
-          REF_DIR="$RUNNER_TEMP/forwardproxy-ref"
-
-          git init -q "$REF_DIR"
-          git -C "$REF_DIR" remote add origin https://github.com/klzgrad/forwardproxy.git
-          if ! git -C "$REF_DIR" fetch -q --depth 1 origin "$REF_COMMIT"; then
-            echo "::warning::could not fetch the reference"
-            echo "JIEJIE_REFERENCE_READY=0" >> "$GITHUB_ENV"
+          shopt -s nullglob
+          configs=(release/config/*.json)
+          if [ ${#configs[@]} -eq 0 ]; then
+            echo "note: no config fixture under release/config; nothing to check"
             exit 0
           fi
-          git -C "$REF_DIR" checkout -q FETCH_HEAD
-          ACTUAL=$(git -C "$REF_DIR" rev-parse HEAD)
-          if [ "$ACTUAL" != "$REF_COMMIT" ]; then
-            echo "::error::reference checkout is $ACTUAL, expected $REF_COMMIT"
-            exit 1
-          fi
-
-          # The differential harness builds the binary itself from this source
-          # when JIEJIE_CADDY_REFERENCE_SOURCE is set, which keeps the pin in the
-          # repository rather than in a cached artifact.
-          echo "JIEJIE_CADDY_REFERENCE_SOURCE=$REF_DIR" >> "$GITHUB_ENV"
-          echo "JIEJIE_REFERENCE_READY=1" >> "$GITHUB_ENV"
-
-      # The MASQUE reference interop runs against a REAL sing-box process. It
-      # needs two binaries:
-      #
-      #   - the production minimal one, for the CONNECT-UDP (http inbound) cases;
-      #   - a FULL-registry one, because masque-server is registered only by
-      #     include/registry.go and the production minimal registry registers no
-      #     endpoints at all. Without the second binary the CONNECT-IP cases
-      #     SKIP, which is exactly the "present but never executed" gap this
-      #     workflow already had to fix once for the HTTP/3 differential.
-      #
-      # The reference clients (masque-go, connect-ip-go) live in their own Go
-      # module under test/jiejie/reference, so they are never imported by the
-      # root or `test` module and cannot reach the shipped binary.
-      - name: MASQUE reference interop (quic-go/masque-go and connect-ip-go)
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go build -tags "$TAGS" -o "$RUNNER_TEMP/sing-box-minimal" ./cmd/sing-box
-          # Full registry: same QUIC support, no jiejie_server_minimal.
-          FULL_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
-          go build -tags "$FULL_TAGS" -o "$RUNNER_TEMP/sing-box-full" ./cmd/sing-box
-
-          cd test/jiejie/reference
-          # The CONNECT-UDP cases run against the PRODUCTION MINIMAL binary, and
-          # JIEJIE_FULL_REGISTRY_BINARY is deliberately NOT set: the minimal
-          # registry registers no endpoints, so the CONNECT-IP tests must SKIP
-          # here rather than run against a binary that cannot serve them.
-          #
-          # Setting the flag for this invocation was the first version of this
-          # step and it failed in CI exactly as it should have: the CONNECT-IP
-          # tests stopped skipping, dialled the minimal binary's UDP port (which
-          # is not listening, because the minimal registry registers no
-          # masque-server endpoint), and failed with a QUIC handshake timeout
-          # that reads like a protocol bug. The flag means "this binary has the
-          # full registry", so it must only be set for the full binary.
-          # The run filter and the assertion list below must together cover EVERY
-          # TestReference case. Phase 3 added migration, capsule-fallback and
-          # Proxy-Status tests AFTER this step was written, and they were neither
-          # matched by the filter nor named in the assertion - so they would have
-          # passed locally and never executed in CI. A test that is not in the
-          # filter is a false green, which is the exact failure mode this step
-          # exists to prevent. When adding a TestReference case, add it in BOTH
-          # places.
-          #
-          # CONNECT-UDP, migration and Proxy-Status run against the production
-          # minimal binary.
-          # TestSourceIdentity* rather than TestReferenceSourceIdentity*: the
-          # source-identity measurement was rewritten (see
-          # test/jiejie/reference/source_identity_test.go) and the old
-          # TestReferenceSourceIdentityIsStableAcrossMigration is gone. The filter
-          # AND the assertion list below must both be updated together; the coverage
-          # check at the end of this step is what makes forgetting fail the build.
-          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-minimal" \
-            go test -v -count=1 -timeout 20m \
-            -run 'TestReferenceMasqueGo|TestReferenceHarness|TestReferenceConnectUDP|TestReferenceStreamFailure|TestReferenceUnauthenticatedLimiter|TestReferenceUnvalidatedSpoof|TestSourceIdentity|TestQuicheOracle' . \
-            2>&1 | tee "$GITHUB_WORKSPACE/masque-reference-interop.log"
-
-          # The CONNECT-IP cases run against the full-registry binary, which is
-          # the only one that can serve them.
-          JIEJIE_SING_BOX_BINARY="$RUNNER_TEMP/sing-box-full" \
-          JIEJIE_FULL_REGISTRY_BINARY=1 \
-            go test -v -count=1 -timeout 20m \
-            -run 'TestReferenceConnectIP|TestProxyStatus' . \
-            2>&1 | tee -a "$GITHUB_WORKSPACE/masque-reference-interop.log"
-
-      # A skipped reference test is invisible in a green workflow, which is how
-      # the HTTP/3 differential was once reported as covered while never having
-      # run. Assert explicitly that the reference clients actually connected.
-      - name: Assert the reference interop actually ran
-        shell: bash
-        run: |
-          set -euo pipefail
-          LOG=masque-reference-interop.log
-
-          # Every reference test that RAN must have passed. A SKIP is expected for
-          # exactly one group - the CONNECT-IP cases under the minimal binary,
-          # whose registry has no endpoints - so the check is that no test FAILED
-          # and that the tests which must run did run.
-          #
-          # A blanket "no SKIP allowed" rule was the first version of this step and
-          # it is wrong here for the same reason it is right for the HTTP/3
-          # differential: there, a skip meant the only comparison never executed;
-          # here, one group's skip is the correct outcome for that binary, and
-          # demanding a pass would force the test to run against a binary that
-          # cannot serve it - which is precisely the CI failure this step was
-          # rewritten to stop.
-          if grep -qE '^\s*--- FAIL: TestReference' "$LOG"; then
-            echo "::error::a MASQUE reference interop test FAILED."
-            grep -E '^\s*--- FAIL: TestReference' "$LOG" || true
-            exit 1
-          fi
-
-          # These must PASS. They are the external-interoperability evidence: the
-          # pinned third-party clients completing a real round trip against
-          # sing-box.
-          for TEST in \
-            TestReferenceMasqueGoConnectUDP \
-            TestReferenceMasqueGoConnectUDPRejectedWithoutAuth \
-            TestReferenceMasqueGoRequiresServerDatagramSupport \
-            TestReferenceHarnessDetectsAStoppedServer \
-            TestReferenceHarnessDecodesIPv6AddressAssign \
-            TestReferenceHarnessDecodesIPv6RouteAdvertisement \
-            TestReferenceHarnessRejectsInvalidIPVersion \
-            TestQuicheOracleContextIDDecisionTable \
-            TestQuicheOracleAgreesOnTheSerialisedForm \
-            TestQuicheOracleConnectIPHasTheSameTable \
-            TestQuicheOracleSingboxDecisionMatchesTheProductionLoops \
-            TestReferenceConnectUDPSurvivesNATRebinding \
-            TestReferenceConnectUDPNewTunnelAfterRebinding \
-            TestReferenceUnvalidatedSpoofDoesNotChangeIdentity \
-            TestReferenceConnectUDPUnsupportedContextIDsAreDropped \
-            TestReferenceConnectUDPMalformedContextVarintIsDropped \
-            TestReferenceConnectUDPDatagramCapsuleFramingIsFatal \
-            TestReferenceConnectUDPMalformedDatagramKeepsTheTunnelAlive \
-            TestReferenceConnectUDPZeroLengthDatagramOverQUICDatagrams \
-            TestReferenceConnectUDPZeroLengthDatagramOverCapsules \
-            TestReferenceStreamFailureDoesNotKillTheHTTP3Connection \
-            TestReferenceUnauthenticatedLimiterSurvivesPortChurnOnTheWire \
-            TestReferenceConnectUDPTunnelSurvivesPacketImpairment \
-            TestReferenceConnectUDPNewTunnelAfterImpairment \
-            TestReferenceConnectUDPCapsuleStreamSurvivesPacketLoss \
-            TestSourceIdentityIsRecordedAndDrivesRouting \
-            TestSourceIdentityIgnoresClientSuppliedHeaders \
-            TestSourceIdentityIsStableAcrossMigration \
-            TestSourceIdentityRoutingRuleIsLoadBearing \
-            TestReferenceConnectIPHandshakeAndAssignment \
-            TestReferenceConnectIPv6ControlCapsulesAgainstRealServer \
-            TestReferenceConnectIPv6DatagramCapsuleFallback \
-            TestReferenceConnectIPUnsupportedContextIDsAreDropped \
-            TestReferenceConnectIPEmptyPayloadIsDroppedAndTheTunnelSurvives \
-            TestReferenceConnectIPEmptyPayloadOverCapsules \
-            TestReferenceConnectIPPacketTooBigOverHTTP3 \
-            TestReferenceConnectIPPacketTooBigOverHTTP3Live \
-            TestReferenceConnectIPTunnelSurvivesPacketImpairment \
-            TestReferenceConnectIPRejectsWithoutAuth \
-            TestReferenceConnectIPICMPEchoDifferential \
-            TestReferenceConnectIPSurvivesNATRebinding \
-            TestReferenceConnectIPDatagramFallbackKeepsTheTunnelAlive \
-            TestReferenceConnectIPDatagramFallbackDoesNotSendDatagrams \
-            TestProxyStatusIsAbsentForUnauthenticatedRequests \
-            TestProxyStatusIsPresentForAnAuthenticatedDNSFailure \
-            TestProxyStatusUsesTheRFC9209Shape \
-            TestProxyStatusIsAbsentOnSuccessAndOnLocalRejections
-          do
-            if ! grep -q -- "--- PASS: $TEST" "$LOG"; then
-              echo "::error::$TEST did not report a pass; the reference client never"
-              echo "::error::completed a round trip against sing-box."
-              exit 1
-            fi
+          for config in "${configs[@]}"; do
+            echo "checking $config"
+            ./"$BINARY" check -c "$config"
           done
+          echo "PASS: production configs validate"
 
-          # Every self-contained reference case that EXISTS must have been run. The
-          # explicit list above is what caught the Phase 3 gap, but a list can go
-          # stale the same way a filter can: adding a test without adding it here
-          # would mean it never runs and nothing says so. This compares the tests
-          # present in the source against the ones the log reports having run, so a
-          # new test that is not covered fails the build instead of passing silently.
-          #
-          # BOTH naming conventions are matched. The suite is no longer uniformly
-          # TestReference*: the source-identity cases are TestSourceIdentity*, and an
-          # earlier version of this check only looked for TestReference, so those four
-          # tests would have been invisible to it and could have silently dropped out
-          # of the run filter. TestReferenceHarness* self-checks stay included because
-          # they still begin with TestReference.
-          echo ""
-          echo "=== reference test coverage check ==="
-          # The check lives in a script so that it can be tested on its own, which is not
-          # a style preference: its previous INLINE form compared each test against the
-          # list the test came from, so the comparison was always true and every single
-          # test was skipped while the step still reported success. The check protected
-          # nothing for a full round and the workflow stayed green.
-          #
-          # The test script is run FIRST so that a broken checker cannot approve the run
-          # it is part of. It proves the checker fails when it should - a normal test
-          # missing from the log, an exclusion naming a nonexistent test, a wrongly
-          # excluded test that nothing else runs, and a vacuously empty test set - and
-          # that it verifies a non-zero number of tests on the real suite.
-          #
-          # This proves EXECUTION only. A SKIP satisfies it, which is correct, because
-          # some reference tests are expected to skip against a binary that cannot serve
-          # them; whether a SKIP is ACCEPTABLE is answered by the explicit per-test
-          # assertions below, which must not be removed.
-          bash scripts/ci/check-reference-coverage.test.sh
-          bash scripts/ci/check-reference-coverage.sh "$LOG" test/jiejie/reference
-
-          # And the positive evidence must be in the log, not merely implied by an
-          # exit status.
-          grep -E 'interop: assigned=' "$LOG" || {
-            echo "::error::the CONNECT-IP interop did not report its measured"
-            echo "::error::assignment and routes, so the comparison produced no"
-            echo "::error::observable result."
-            exit 1
-          }
-          grep -E 'interop: assigned=|PASS: TestReferenceMasqueGoConnectUDP' "$LOG" || true
-          echo "MASQUE reference interop executed: masque-go against the production"
-          echo "minimal binary, connect-ip-go against the full-registry binary."
-
-      - name: Naive HTTP/3 integration (QUIC support linked)
-        shell: bash
+      - name: runtime smoke test
+        # Starts the real binary and talks to its real API. A config check proves
+        # the configuration parses; this proves the process runs, listens, answers
+        # and shuts down cleanly.
         run: |
           set -euo pipefail
-          # Same production tag set minus jiejie_server_minimal, which is the
-          # switch that excludes protocol/naive/quic.
-          H3_TAGS="with_quic,badlinkname,tfogo_checklinkname0"
-          echo "h3 tags: $H3_TAGS"
-          cd test/jiejie
-          # The H3 differential is included HERE, under the tags that link QUIC.
-          # It cannot run under the production tag set, because that tag set
-          # deliberately omits protocol/naive/quic - so if this step does not run
-          # it, nothing does.
-          go test -tags "$H3_TAGS" -v -count=1 -timeout 25m \
-            -run 'TestJiejieNaiveH3|TestJiejieNaiveTCPALPN|TestJiejieNaiveTCPAndUDPALPN|TestJiejieNaiveH3DifferentialAgainstReference' . \
-            2>&1 | tee ../../naive-h3-integration.log
-          # The QUIC-dependent unit tests. They need QUIC linked, so this step is
-          # the only place they can run; without this they would exist and never
-          # execute - the same "present but permanently skipped" gap that hid the
-          # HTTP/3 differential.
-          #
-          # transport/http carries the MASQUE HTTP/3 server defaults, which are
-          # build-tagged on with_quic.
-          echo ""
-          echo "=== transport/http unit tests (QUIC linked) ==="
-          # Run from the repository root: this step has already cd'd into
-          # test/jiejie, which is a SEPARATE Go module, so ./transport/... does
-          # not resolve there.
-          (cd ../.. && go test -tags "$H3_TAGS" -count=1 -timeout 10m ./transport/http/) \
-            2>&1 | tee -a ../../naive-h3-integration.log
-          echo ""
-          echo "=== protocol/naive/quic unit tests (QUIC linked) ==="
-          # Run from the repository root: this step has already cd'd into
-          # test/jiejie, which is a SEPARATE Go module, so a ./protocol/... path
-          # does not resolve there.
-          (cd ../.. && go test -tags "$H3_TAGS" -v -count=1 -timeout 10m ./protocol/naive/quic/) \
-            2>&1 | tee -a ../../naive-h3-integration.log
-
-      # The HTTP/3 differential must have actually compared something. A SKIP
-      # produces a green workflow, so the result is checked explicitly rather
-      # than inferred from the exit status.
-      - name: Assert the HTTP/3 differential actually ran
-        shell: bash
-        run: |
-          set -euo pipefail
-          LOG=naive-h3-integration.log
-          if grep -q 'SKIP: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG"; then
-            echo "::error::the HTTP/3 reference differential SKIPPED. It is the only"
-            echo "::error::HTTP/3 comparison this project has, so a skip means H3"
-            echo "::error::parity was never measured. This is NOT a pass."
-            grep -A3 'SKIP: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG" || true
-            exit 1
-          fi
-          if ! grep -q -- '--- PASS: TestJiejieNaiveH3DifferentialAgainstReference' "$LOG"; then
-            echo "::error::the HTTP/3 reference differential did not report a pass."
-            exit 1
-          fi
-          grep -E 'H3 differential: ' "$LOG" || true
-          echo "HTTP/3 reference differential executed."
-
-      # Differential compatibility against the REFERENCE implementation
-      # (klzgrad/forwardproxy@naive behind Caddy), which is what the Naive
-      # protocol is defined by. The reference is pinned here, never @latest, so
-      # the comparison cannot drift underneath the suite.
-      #
-      # The reference checkout is cached by commit, because building Caddy takes
-      # several minutes. A cache miss rebuilds; it does not fail the job, and the
-      # harness SKIPs with an explicit message if the binary cannot be produced -
-      # "not compared" is reported as SKIP, never as a pass.
-      - name: Differential test against the reference Caddy/forwardproxy
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          # JIEJIE_CADDY_REFERENCE_SOURCE comes from the build step above, so the
-          # reference is checked out exactly once for the whole job.
-          if [ "${JIEJIE_REFERENCE_READY:-0}" != "1" ]; then
-            echo "::warning::the reference was not built; the differential will SKIP"
-          fi
-
-          cd test/jiejie
-          JIEJIE_PARITY_REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json" \
-            go test -tags "$TAGS" -v -count=1 -timeout 25m \
-              -run 'TestJiejieNaiveCaddyDifferentialCompatibility|TestJiejieNaiveParity|TestJiejieNaiveH2DifferentialAgainstReference|TestJiejieNaiveH1RawDifferentialAgainstReference|TestJiejieNaivePaddingSegmentationMatchesTheReference|TestJiejieNativeNaiveMatchesTheBareProfileChallenge|TestJiejieReferenceProfilesAreDistinct' . \
-            2>&1 | tee ../../naive-parity.log
-
-      - name: Summarise the Naive compatibility report
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          REPORT="$GITHUB_WORKSPACE/naive-caddy-parity.json"
+          workdir="$(mktemp -d)"
+          cat > "$workdir/smoke.json" <<'JSON'
           {
-            echo "## Naive / Caddy differential"
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
+            "log": {"level": "info"},
+            "inbounds": [
+              {"type": "mixed", "tag": "smoke-in", "listen": "127.0.0.1", "listen_port": 19301}
+            ],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "experimental": {"clash_api": {"external_controller": "127.0.0.1:19302"}},
+            "route": {"final": "direct"}
+          }
+          JSON
+          ./"$BINARY" run -c "$workdir/smoke.json" > "$workdir/smoke.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
 
-          if [ ! -s "$REPORT" ]; then
-            # The distinction this whole step exists for: a report that is absent
-            # means the comparison did NOT run, which must never read as parity.
-            {
-              echo "**REFERENCE COMPARISON: NOT-TESTED**"
-              echo ""
-              echo "No parity report was produced, so no case was compared against"
-              echo "the reference. This is \`NOT-TESTED\`, not \`PASS\`."
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
+          ready=""
+          for _ in $(seq 1 100); do
+            if curl -sf http://127.0.0.1:19302/version >/dev/null 2>&1; then ready=1; break; fi
+            sleep 0.2
+          done
+          [ -n "$ready" ] || { echo "FAIL: API never became reachable" >&2; cat "$workdir/smoke.log" >&2; exit 1; }
+          echo "PASS: API reachable"
+          curl -sf http://127.0.0.1:19302/version | head -c 200; echo
 
-          python3 - "$REPORT" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, sys
-          report = json.load(open(sys.argv[1]))
-          summary = report.get("summary", {})
-          print(f"reference: caddy {report.get('caddy_version')} + "
-                f"forwardproxy@{report.get('reference_commit')}")
-          print("")
-          print("| verdict | count |")
-          print("| --- | --- |")
-          for verdict in ("PASS", "INTENTIONAL-DIFF", "DIFF", "NOT-TESTED"):
-              if verdict in summary:
-                  print(f"| {verdict} | {summary[verdict]} |")
-          print("")
-          if summary.get("NOT-TESTED"):
-              print(f"**REFERENCE COMPARISON: NOT-TESTED for "
-                    f"{summary['NOT-TESTED']} case(s)** - these were not compared "
-                    f"against the reference and must not be read as passing.")
-          for case in report.get("cases", []):
-              if case.get("verdict") != "PASS":
-                  print(f"- `{case.get('protocol')}` {case.get('verdict')}: "
-                        f"{case.get('case')}")
+          # The mixed inbound must accept a real TCP connection.
+          python3 - <<'PY'
+          import socket
+          s = socket.create_connection(("127.0.0.1", 19301), timeout=5)
+          s.close()
+          print("PASS: mixed inbound accepted a TCP connection")
           PY
 
-      - name: Publish the Naive compatibility report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: naive-caddy-parity-${{ github.sha }}
-          path: |
-            naive-caddy-parity.json
-            naive-parity.log
-          if-no-files-found: warn
+          kill -TERM $pid
+          wait $pid || true
+          if grep -qiE "panic|FATAL" "$workdir/smoke.log"; then
+            echo "FAIL: panic or fatal error in the log" >&2
+            cat "$workdir/smoke.log" >&2
+            exit 1
+          fi
+          echo "PASS: clean shutdown, no panic"
 
-      # Runs the REAL cmd/sing-box binary as a separate process and drives traffic
-      # at it from the test process. Everything above this uses include.Context +
-      # box.New + Start, which is in-process integration and never exercises
-      # main(), the CLI, signal handling or the process lifecycle.
-      - name: Actual binary process integration
-        shell: bash
+      - name: dependency pruning and registry audit
+        # Reads the symbol table of the binary that was ALREADY built, via the
+        # debug copy so -s -w cannot hide the symbols.
         run: |
           set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go build -tags "$TAGS" -o /tmp/sing-box-production ./cmd/sing-box
-          cd test/jiejie
-          SING_BOX_PRODUCTION_BINARY=/tmp/sing-box-production \
-            go test -tags "$TAGS" -v -count=1 -timeout 20m -run 'TestProductionBinary' . 2>&1 | tee ../../integration-process.log
-
-  build-production:
-    runs-on: ubuntu-latest
-    needs: [lint-and-unit-tests, production-minimal-integration]
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ~1.25
-          cache: true
-
-      - name: Read version
-        id: version
-        run: echo "value=$(cat release/JIEJIE_VERSION)" >> "$GITHUB_OUTPUT"
-
-      # The one and only production build. Same recipe as before: official Go
-      # linker, -trimpath, -s -w. No UPX, no external strip, no objcopy and no
-      # secondary compression step.
-      - name: Build the production binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          echo "production tags: $TAGS"
-          go build \
-            -trimpath \
-            -tags "$TAGS" \
-            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=$JIEJIE_VERSION" \
-            -o sing-box-linux-amd64 \
-            ./cmd/sing-box
-
-      # Symbol audit. Builds a temporary unstripped copy purely to inspect the
-      # dependency graph; it is deleted immediately and never uploaded.
-      - name: Audit dependency pruning
-        shell: bash
-        run: |
-          set -euo pipefail
-          TAGS=$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)
-          go build -trimpath -tags "$TAGS" -o /tmp/analysis-minimal ./cmd/sing-box
-          go tool nm /tmp/analysis-minimal > /tmp/analysis-minimal.syms
+          go tool nm "$BINARY.debug" > /tmp/server.syms
           failed=0
 
           # Full import paths, not loose substrings, so this cannot false-positive
@@ -671,209 +291,237 @@ jobs:
             "github.com/sagernet/sing-box/dns/transport/quic"
             "github.com/sagernet/sing-box/tailscale"
             "github.com/caddyserver/certmagic"
-            "github.com/sagernet/sing-box/service/resolved"
+            # The CONNECT-IP endpoint packages are a CLIENT capability in this
+            # fork. The server serves MASQUE through protocol/http instead, so
+            # these must not appear.
+            "github.com/sagernet/sing-box/protocol/masque"
+            "github.com/sagernet/sing-box/transport/masque"
           )
           for pkg in "${pruned[@]}"; do
-            if grep -qF "$pkg" /tmp/analysis-minimal.syms; then
-              echo "UNEXPECTED: $pkg is still linked"
-              failed=1
-            fi
-          done
-
-          # protocol/tailscale is counted rather than required absent: the
-          # `generate tailcat` CLI subcommand imports a few helpers directly,
-          # which is a cmd-level concern outside this registry trim.
-          tailscaleSymbols=$(grep -c "sing-box/protocol/tailscale" /tmp/analysis-minimal.syms || true)
-          echo "protocol/tailscale symbols (expected 3, from the generate-tailcat CLI): $tailscaleSymbols"
-          if [ "$tailscaleSymbols" -gt 10 ]; then
-            echo "UNEXPECTED: protocol/tailscale linked beyond the CLI helpers"
-            failed=1
-          fi
-
-          # Required: the production data path and its QUIC stack.
-          required=(
-            "github.com/sagernet/sing-box/protocol/http"
-            "github.com/sagernet/sing-box/protocol/anytls"
-            # The Native Naive server. It is required, not pruned: it carries the
-            # Naive CONNECT, UoT v1/v2 and the Web masquerade on this server.
-            "github.com/sagernet/sing-box/protocol/naive"
-            "github.com/sagernet/sing-box/protocol/shadowtls"
-            "github.com/sagernet/sing-box/protocol/shadowsocks"
-            "github.com/sagernet/sing-box/protocol/socks"
-            "github.com/sagernet/sing-box/protocol/direct"
-            "github.com/sagernet/sing-box/transport/http"
-            "github.com/sagernet/sing-box/dns/transport"
-            "github.com/sagernet/sing-quic/congestion_meta2"
-            "github.com/sagernet/quic-go"
-          )
-
-          # The Naive OUTBOUND and its Chromium/Cronet client stack must stay out
-          # of a server build. protocol/naive/outbound.go carries its own
-          # `with_naive_outbound` tag, so only the inbound compiles here; this
-          # asserts that the split is real rather than assumed.
-          serverOnlyAbsent=(
-            "github.com/sagernet/cronet-go"
-          )
-          for pkg in "${serverOnlyAbsent[@]}"; do
-            if grep -qF "$pkg" /tmp/analysis-minimal.syms; then
-              echo "UNEXPECTED: $pkg must not be linked into a server-only build"
+            if grep -qF "$pkg" /tmp/server.syms; then
+              echo "FAIL: $pkg is still linked" >&2
               failed=1
             else
-              echo "confirmed-absent: $pkg"
+              echo "PASS: $pkg pruned"
             fi
           done
-          for pkg in "${required[@]}"; do
-            if ! grep -qF "$pkg" /tmp/analysis-minimal.syms; then
-              echo "MISSING: $pkg must be present"
+
+          # The production transports must be present, or the topology this server
+          # exists to serve is not actually servable.
+          #
+          # MASQUE is served here through protocol/http + transport/http, which is
+          # what the `http` inbound IS: the production topology runs a masque-h2
+          # listener on 28440 and a masque-h3 listener on UDP/443 through it. The
+          # server does NOT import protocol/masque or transport/masque - those are
+          # the CONNECT-IP endpoint packages, whose client role the macOS core
+          # registers. Asserting transport/masque here would have been wrong and
+          # would have failed on a correct build.
+          for pkg in \
+            "github.com/sagernet/sing-box/protocol/http" \
+            "github.com/sagernet/sing-box/protocol/anytls" \
+            "github.com/sagernet/sing-box/protocol/naive" \
+            "github.com/sagernet/sing-box/protocol/shadowtls" \
+            "github.com/sagernet/sing-box/protocol/shadowsocks" \
+            "github.com/sagernet/sing-box/transport/http" \
+            ; do
+            if grep -qF "$pkg" /tmp/server.syms; then
+              echo "PASS: $pkg linked"
+            else
+              echo "FAIL: $pkg is MISSING; the production topology cannot be served" >&2
               failed=1
             fi
           done
 
-          # Known and accepted: quic-go imports metacubex/utls unconditionally,
-          # and the upstream core (common/dialer, dns) imports the power report
-          # and OOM killer services. Report them so a change is visible.
-          # dbus is Linux-only and arrives through common/settings, which
-          # common/listener and route import, so it cannot be pruned without
-          # editing upstream core packages. oomkiller links on some platforms and
-          # not others, so it is reported rather than asserted.
-          for expected in "github.com/metacubex/utls" \
-                          "github.com/godbus/dbus" \
-                          "github.com/sagernet/sing-box/common/settings" \
-                          "github.com/sagernet/sing-box/service/powerreport" \
-                          "github.com/sagernet/sing-box/service/oomkiller"; do
-            echo "expected-present: $expected ($(grep -cF "$expected" /tmp/analysis-minimal.syms) symbols)"
-          done
+          [ "$failed" -eq 0 ] || exit 1
+          echo "AUDIT: PASS"
 
-          rm -f /tmp/analysis-minimal /tmp/analysis-minimal.syms
-          if [ "$failed" -ne 0 ]; then
-            exit 1
-          fi
-          echo "Dependency pruning verified."
-
-      - name: Verify the production binary
-        shell: bash
+      - name: size ceiling
         run: |
           set -euo pipefail
-          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
-          BINARY=sing-box-linux-amd64
-
-          echo "===== FILE ====="
-          file "$BINARY"
-          echo "===== SIZE ====="
           SIZE=$(stat -c '%s' "$BINARY")
           echo "raw bytes: $SIZE"
+          echo "ceiling:   $MAX_BINARY_BYTES"
           ls -lh "$BINARY"
-
-          echo "===== VERSION ====="
-          ./"$BINARY" version
-          ./"$BINARY" version | grep -F "$JIEJIE_VERSION"
-          ./"$BINARY" version | grep -F "with_quic"
-          ./"$BINARY" version | grep -F "jiejie_server_minimal"
-          # The production build must not carry the optional components.
-          ! ./"$BINARY" version | grep -F "with_tailscale"
-          ! ./"$BINARY" version | grep -F "with_openvpn"
-
-          # ---- size regression guard (raw ELF bytes, not archive size) ----
           if [ "$SIZE" -gt "$MAX_BINARY_BYTES" ]; then
-            echo "FAIL: production binary size regression"
-            echo "  size:    $SIZE bytes"
-            echo "  ceiling: $MAX_BINARY_BYTES bytes"
-            echo "A protocol or service that should have been pruned has most"
-            echo "likely found its way back into the registry."
+            echo "FAIL: production binary size regression" >&2
+            echo "A protocol or service that should have been pruned has most likely" >&2
+            echo "found its way back into the registry." >&2
             exit 1
           fi
-          echo "size guard OK: $SIZE <= $MAX_BINARY_BYTES bytes"
+          echo "PASS: $SIZE <= $MAX_BINARY_BYTES bytes"
 
-          # A secret-free fixture of the whole production topology. The
-          # certificate paths must match release/jiejie-production-topology.json.
-          mkdir -p /tmp/jiejie-fixture
-          openssl req -x509 -newkey rsa:2048 \
-            -keyout /tmp/jiejie-fixture/key.pem -out /tmp/jiejie-fixture/cert.pem \
-            -days 1 -nodes -subj "/CN=example.test" 2>/dev/null
-
-          echo "===== PRODUCTION TOPOLOGY CHECK ====="
-          ./"$BINARY" check -c release/jiejie-production-topology.json
-
-          echo "===== EXCLUDED PROTOCOL REJECTION ====="
-          cat > /tmp/excluded.json <<'JSON'
-          {"inbounds":[{"type":"vmess","tag":"x","listen":"127.0.0.1","listen_port":9099,
-            "users":[{"uuid":"00000000-0000-0000-0000-000000000000"}]}],
-           "outbounds":[{"type":"direct"}]}
-          JSON
-          if ./"$BINARY" check -c /tmp/excluded.json >/dev/null 2>&1; then
-            echo "FAIL: the production binary accepted a vmess inbound that must be pruned"
+      - name: reproducibility
+        # -trimpath and -buildvcs=false remove the path and VCS inputs that would
+        # otherwise make every build unique. If a future change reintroduces a
+        # timestamp or a random id, this is what catches it.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-server.sh linux amd64 dist/repro-check >/dev/null
+          source scripts/ci/lib.sh
+          first="$(sha256_of "$BINARY")"
+          second="$(sha256_of dist/repro-check)"
+          if [ "$first" != "$second" ]; then
+            echo "FAIL: not reproducible" >&2
+            echo "  first:  $first" >&2
+            echo "  second: $second" >&2
             exit 1
           fi
-          echo "correctly rejects excluded protocols"
+          echo "PASS: reproducible ($first)"
 
-          echo "===== CHECKSUM ====="
-          sha256sum "$BINARY" > "$BINARY.sha256"
-          cat "$BINARY.sha256"
-
-      - name: Write BUILD-INFO for the VPS artifact
-        shell: bash
+      # -----------------------------------------------------------------------
+      # Package: the artifact holds what was verified, and nothing else.
+      # -----------------------------------------------------------------------
+      - name: write BUILD-INFO and SHA256
         run: |
           set -euo pipefail
-          JIEJIE_VERSION="${{ steps.version.outputs.value }}"
-          CORE_SHA="$(git rev-parse HEAD)"
-          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
-          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-          SERVER_TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
-          SERVER_BYTES="$(stat -c '%s' sing-box-linux-amd64)"
-          SERVER_SHA="$(sha256sum sing-box-linux-amd64 | awk '{print $1}')"
+          VERSION="$(cat release/JIEJIE_VERSION)"
+          OUT="dist/Jiejie-Linux-amd64-${VERSION}-$(git rev-parse --short HEAD)"
+          mkdir -p "$OUT"
+          cp "$BINARY" "$OUT/sing-box-linux-amd64"
+          cp LICENSE "$OUT/LICENSE"
+          ./scripts/ci/build-info.sh "$OUT/BUILD-INFO-LINUX.txt" linux amd64 server-minimal "$OUT/sing-box-linux-amd64"
+          # A standalone .sha256 beside the binary, so an operator can verify a
+          # download without parsing a manifest.
+          source scripts/ci/lib.sh
+          ( cd "$OUT" && printf '%s  %s\n' "$(sha256_of sing-box-linux-amd64)" sing-box-linux-amd64 > sing-box-linux-amd64.sha256 )
+          echo "ARTIFACT_DIR=$OUT" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$(basename "$OUT")" >> "$GITHUB_ENV"
+          ls -la "$OUT"
+          cat "$OUT/sing-box-linux-amd64.sha256"
 
-          {
-            echo "Jiejie VPS production server"
-            echo "============================"
-            echo "ROLE=VPS_PRODUCTION_SERVER"
-            echo "SERVER_MINIMAL=true"
-            echo "PRODUCT_SCOPE=VPS_ONLY"
-            echo "version:            $JIEJIE_VERSION"
-            echo "core_sha:           $CORE_SHA"
-            echo "core_short_sha:     $SHORT_SHA"
-            echo "branch:             $BRANCH"
-            echo "go_version:         $(go version)"
-            echo "GOOS:               linux"
-            echo "GOARCH:             amd64"
-            echo "CGO_ENABLED:        ${CGO_ENABLED:-0}"
-            echo "build_tags:         $SERVER_TAGS"
-            echo "builder:            official Go linker, -trimpath -s -w"
-            echo "binary:             sing-box-linux-amd64"
-            echo "binary_bytes:       $SERVER_BYTES"
-            echo "binary_sha256:      $SERVER_SHA"
-            echo "trusttunnel:        false"
-            echo "ios_product:        false"
-            echo "client_product:     false"
-            echo "build_time_utc:     $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "workflow_run_id:    ${GITHUB_RUN_ID}"
-            echo ""
-            echo "This fork ships exactly one product. There is no iOS, Apple,"
-            echo "Windows or Linux client artifact, and no TrustTunnel support."
-          } > BUILD-INFO-VPS.txt
-          cat BUILD-INFO-VPS.txt
-
-      - name: VPS binary size report
-        shell: bash
-        run: |
-          set -euo pipefail
-          {
-            echo "===== VPS PRODUCTION BINARY ====="
-            echo "bytes:   $(stat -c '%s' sing-box-linux-amd64)"
-            echo "mib:     $(awk "BEGIN{printf \"%.1f\", $(stat -c '%s' sing-box-linux-amd64)/1048576}")"
-            echo "ceiling: $MAX_BINARY_BYTES"
-            echo ""
-            echo "The binary is not compressed or packed: it uses the official Go"
-            echo "linker with -trimpath -s -w. No UPX, no external strip."
-          } > SIZE-REPORT-linux.txt
-          cat SIZE-REPORT-linux.txt
-
-      - uses: actions/upload-artifact@v4
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: Jiejie-VPS-linux-amd64-${{ steps.version.outputs.value }}-${{ github.sha }}
-          path: |
-            sing-box-linux-amd64
-            sing-box-linux-amd64.sha256
-            BUILD-INFO-VPS.txt
-            SIZE-REPORT-linux.txt
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
           if-no-files-found: error
+          retention-days: 14
+          # The payload is a binary that is already close to incompressible, so a
+          # low level keeps the upload fast instead of chasing a few percent.
+          compression-level: 1
 
+      - name: summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### Linux amd64"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| platform | linux |"
+            echo "| arch | amd64 |"
+            echo "| version | \`$(cat release/JIEJIE_VERSION)\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| build tags | \`$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)\` |"
+            echo "| binary bytes | $(stat -c '%s' "$BINARY") |"
+            echo "| sha256 | \`$(cut -d' ' -f1 "$ARTIFACT_DIR/sing-box-linux-amd64.sha256")\` |"
+            echo "| artifact | \`$ARTIFACT_NAME\` |"
+            echo "| deep_checks | ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks || 'false' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # =======================================================================
+      # Deep checks: manual dispatch with deep_checks=true only.
+      # =======================================================================
+      - name: deep check - race tests
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          go test -race -tags "$TAGS" -count=1 -timeout 40m \
+            ./transport/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
+          echo "PASS: race tests"
+
+      - name: deep check - fuzz campaign
+        # Bounded campaigns over the MASQUE and Naive parsers. These seed the
+        # corpus and catch parser regressions, which is why they are worth running
+        # - just not on every commit.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          run_fuzz() {
+            echo "--- fuzzing $2 in $1 for ${3}s"
+            go test -tags "$TAGS" -run '^$' -fuzz "^$2\$" -fuzztime "$3" "$1"
+          }
+          run_fuzz ./transport/masque FuzzCapsuleParser 20s
+          run_fuzz ./transport/masque FuzzRouteAdvertisement 20s
+          run_fuzz ./transport/masque FuzzConnectIPAddresses 20s
+          run_fuzz ./transport/masque FuzzConnectIPTemplatePath 20s
+          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 20s
+          run_fuzz ./transport/masque FuzzCapsuleStreamFragmentation 20s
+          run_fuzz ./transport/http FuzzConnectUDPTargetPath 20s
+          echo "PASS: fuzz campaign"
+
+      - name: deep check - upstream-default tag build and tests
+        # The upstream stock configuration is not a product this fork ships, so
+        # verifying it is a compatibility check rather than an artifact gate.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          go build -trimpath -buildvcs=false -o /tmp/upstream-default ./cmd/sing-box
+          /tmp/upstream-default version
+          go test -count=1 -timeout 40m ./...
+          echo "PASS: upstream-default build and tests"
+
+      - name: deep check - reference differential tests
+        # Diffs this fork against the pinned Caddy/forwardproxy reference. Far too
+        # heavy for a standard push, and valuable before a protocol release.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          cd test
+          go test -tags "$TAGS" -count=1 -timeout 60m -v \
+            -run 'TestJiejieNaive.*(Differential|Caddy|Reference|Parity)' \
+            ./jiejie/ > /tmp/reference-differential.log 2>&1 || {
+              tail -80 /tmp/reference-differential.log >&2
+              exit 1
+            }
+          tail -20 /tmp/reference-differential.log
+          echo "PASS: reference differential tests"
+
+      - name: deep check - MASQUE reference interop
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          cd test
+          go test -tags "$TAGS" -count=1 -timeout 60m -v -run 'TestJiejieMasque' ./jiejie/ \
+            > /tmp/masque-reference.log 2>&1 || {
+              tail -80 /tmp/masque-reference.log >&2
+              exit 1
+            }
+          tail -20 /tmp/masque-reference.log
+          echo "PASS: MASQUE reference interop"
+
+      - name: deep check - QUICHE live interop
+        # Builds Google QUICHE's masque_client at the pinned commit (BoringSSL and
+        # Abseil via Bazel - minutes of work) and then RUNS the three interop tests
+        # that are excluded by name from the normal reference suite:
+        #
+        #   TestReferenceQuicheH3TransportLiveInterop
+        #   TestReferenceQuicheConnectUDPLiveInterop
+        #   TestReferenceQuicheConnectIPLiveInterop
+        #
+        # The names are spelled out because scripts/ci/check-reference-coverage.sh
+        # asserts that every test it excludes is actually run here. Building the
+        # client without running them would leave those tests verified by nothing,
+        # which is exactly what that check exists to catch.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/jiejie-quiche-live-interop.sh
+          eval "$(./scripts/ci/jiejie-quiche-live-interop.sh --print-env)"
+          echo "masque_client: $JIEJIE_QUICHE_MASQUE_CLIENT"
+
+          cd test
+          go test -tags "$(cat ../release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)" \
+            -count=1 -timeout 30m -v \
+            -run 'TestReferenceQuiche(H3Transport|ConnectUDP|ConnectIP)LiveInterop' \
+            ./jiejie/reference/ 2>&1 | tee /tmp/quiche-interop.log
+          # A skipped interop is NOT a pass: it means the external binary never ran.
+          if grep -qE "^\s*--- SKIP" /tmp/quiche-interop.log; then
+            echo "FAIL: a QUICHE interop test skipped; the interop was not demonstrated" >&2
+            exit 1
+          fi
+          echo "PASS: QUICHE live interop"

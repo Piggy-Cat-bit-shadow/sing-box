@@ -46,9 +46,9 @@ import (
 //
 // JIEJIE_QUICHE_MASQUE_CLIENT must point at a built masque_client. Without it the
 // tests SKIP with a reason, because a missing external tool means the interop did
-// not happen - never that it passed. The manual reference workflow
-// (.github/workflows/jiejie-masque-reference.yml) always sets it, so a skip there
-// is visible rather than silent.
+// not happen - never that it passed. The deep-check path in
+// .github/workflows/server-linux-amd64.yml (workflow_dispatch with
+// deep_checks=true) always sets it, so a skip there is visible rather than silent.
 //
 // # Flags are taken from the pinned source, not guessed
 //
@@ -93,7 +93,7 @@ func requireQuicheClient(t *testing.T) *quicheClient {
 		t.Skipf("%s is not set, so no Google QUICHE binary was run and NO interop "+
 			"was demonstrated. Build one with "+
 			"scripts/ci/jiejie-quiche-live-interop.sh (and see "+
-			".github/workflows/jiejie-masque-reference.yml, which always sets it). "+
+			".github/workflows/server-linux-amd64.yml deep_checks, which sets it). "+
 			"This is NOT-TESTED, never a pass.", quicheClientEnv)
 	}
 	info, err := os.Stat(path)

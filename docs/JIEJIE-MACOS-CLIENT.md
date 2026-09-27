@@ -10,9 +10,10 @@ actually been verified.
 - **Branch** — `testing`. The client and the server share ONE branch and ONE source
   tree; the former `macos-client` branch was consolidated into `testing` and is no
   longer a development line.
-- **Profiles** — `macos-lite` (`jiejie_client_macos`) and `macos-naive` (the same
-  tags plus `with_naive_outbound`, CGO=1 for Cronet)
-- **Target** — `darwin/arm64` (required), `darwin/amd64` (also built)
+- **Profile** — ONE. `jiejie_client_macos`, built for `darwin/arm64` with CGO=1.
+  It contains NaiveProxy (Cronet) and MASQUE.
+- **Target** — `darwin/arm64` only. Intel builds were removed: this is one product
+  for one architecture.
 
 See [`BUILD-PROFILES.md`](BUILD-PROFILES.md) for the complete profile matrix,
 build commands and reproducibility measurements.
@@ -53,17 +54,18 @@ buffering and framing all live in one place and are consumed by every profile.
 | | Server Minimal | macOS Lite | macOS Naive |
 | --- | --- | --- | --- |
 | branch | `testing` | `testing` | `testing` |
-| platform | Linux amd64 | macOS arm64 / amd64 | macOS arm64 |
+| platform | Linux amd64 | macOS arm64 | macOS arm64 |
 | build tag | `jiejie_server_minimal` | `jiejie_client_macos` | `jiejie_client_macos` + `with_naive_outbound` |
-| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE` |
+| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | same |
 | registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` | same as Lite |
 | CGO | `0` | `0` | `1` (Cronet) |
 | workflow | `server-linux-amd64.yml` | `client-macos.yml` | `client-macos.yml` |
-| artifact | `Jiejie-VPS-linux-amd64-…` | `Jiejie-Client-macOS-arm64-…` | `Jiejie-Client-macOS-arm64-naive-…` |
+| artifact | `Jiejie-Linux-amd64-…` | `Jiejie-macOS-arm64-…` | `Jiejie-macOS-arm64-…` |
 
-All three are built from one commit by
-`.github/workflows/jiejie-profiles.yml`, so a divergence between profiles cannot
-hide between two workflows.
+There is exactly one macOS profile, so the table above collapses to a single macOS
+column. Each product is built from one commit by its own workflow
+(`server-linux-amd64.yml`, `client-macos.yml`), and each workflow builds its binary
+exactly once and reuses it for every check and for the upload.
 
 The three registries are mutually exclusive and complete:
 
@@ -126,29 +128,25 @@ separate from the server one, and the observation that `local` is a mandatory DN
 boot dependency. What was rejected is listed under
 [Historical client work: reviewed and rejected](#historical-client-work-reviewed-and-rejected).
 
-## Build profiles
+## Build profile
 
-Two profiles exist, and the tag sets live in exactly one file each. The build
-script, the workflow and `build-info.sh` all read those files rather than
-repeating the list, so they cannot drift.
+ONE profile, and its tag set lives in exactly one file. The build script, the
+workflow and `build-info.sh` all read that file rather than repeating the list, so
+they cannot drift.
 
-### `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` — lite (default)
-
-```text
-with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0
-```
-
-CGO is **off**. The result is a self-contained binary with no native library
-dependencies.
-
-### `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE` — naive
+### `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`
 
 ```text
 with_gvisor,with_quic,with_utls,with_clash_api,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
 ```
 
-CGO is **on**. This adds the Naive outbound and links `cronet-go`'s prebuilt
-Chromium network stack.
+CGO is **on**, because `with_naive_outbound` links `cronet-go`'s prebuilt Chromium
+network stack.
+
+`build-macos-client.sh` asserts that every required tag is present and refuses to
+build otherwise. That is deliberate: a tag-file edit dropping `with_naive_outbound`
+would still produce a working binary, so nothing else in the pipeline would notice
+that the shipped core silently lost NaiveProxy.
 
 ### Why each tag is present
 
@@ -183,9 +181,10 @@ Chromium network stack.
 | `with_dhcp` | The desktop client does not use DHCP DNS. |
 | `with_wireguard` | The WireGuard endpoint is not part of the client feature set. |
 
-The lite core is **56 MB** against **108 MB** for the upstream default tag set
-built for the same platform — a 48% reduction, achieved entirely by
-registration-level trimming.
+The macOS core is **76 MB** against **108 MB** for the upstream default tag set
+built for the same platform. It is larger than a trimmed CGO-free core would be,
+because it ships NaiveProxy and MASQUE rather than excluding them; the saving
+against upstream still comes entirely from registration-level trimming.
 
 ## Registry
 
@@ -229,22 +228,31 @@ netfilter only) and no server-side protocol inbounds.
 
 ### The Naive decision
 
-`naive` **resolves** in the lite profile, and that is intentional rather than an
-oversight. Upstream ships `include/naive_outbound_stub.go` behind
-`!with_naive_outbound`, which registers the type with a constructor that always
-fails and names the tag that enables it:
+`naive` is a **real, working outbound** in this core. The profile enables
+`with_naive_outbound`, which links the Cronet implementation, so a NaiveProxy node
+works rather than producing an error.
+
+This is worth stating precisely, because the type resolves either way: upstream
+ships `include/naive_outbound_stub.go` behind `!with_naive_outbound`, and that stub
+registers the type with a constructor that always fails with
 
 ```text
 naive outbound is not included in this build, rebuild with -tags with_naive_outbound
 ```
 
-So a GUI offering a Naive node gets an actionable message, not "unknown outbound
-type", and because the stub imports no Cronet code, the CGO dependency stays out
-of the lite binary. `TestClientMacOSNaiveOutboundIsAStubNotAnImplementation`
-asserts that construction *fails*, which is what proves it is the stub.
+So a type-level check cannot distinguish a working implementation from a stub, and a
+regression that dropped the tag would leave most checks passing while users lost
+NaiveProxy. The distinction is asserted three ways:
 
-**The Naive outbound was verified to build and run on darwin/arm64**, so it is a
-tradeoff rather than a blocker. See [Naive status](#naive-status).
+- `TestClientMacOSNaiveOutboundIsARealImplementation` asserts that construction with
+  empty options fails for a REAL reason (missing TLS), **not** with the stub's
+  "not included in this build" message.
+- `scripts/ci/audit-macos-client-registry.sh` requires Cronet symbols and requires
+  the stub string to be absent.
+- The `client-macos.yml` capability step checks `cronet-go.NewNaiveClient` in the
+  shipped binary's symbol table.
+
+See [Naive status](#naive-status).
 
 ### DNS transports
 
@@ -493,17 +501,21 @@ Verified by building and running, not by inference:
 | `sing-box check` on a valid `naive` outbound config | **PASS** |
 | Naive against a real remote NaiveProxy server | **NOT-TESTED** |
 
-The lite flavor deliberately does not enable it. Rationale:
+The macOS core **enables it**. NaiveProxy is a headline capability of this product,
+so it is in the shipped binary rather than behind a second profile.
 
-- Cronet is a **CGO** dependency that links a prebuilt Chromium network stack. The
-  lite profile is deliberately CGO-free so the core is self-contained.
-- It enlarges the binary: 56 MB (lite) → 74 MB (naive) for arm64.
-- A Cronet problem must never block the core itself, which is the whole reason
-  the profiles are separate rather than one profile with a flag.
+The cost is accepted deliberately:
 
-The audit distinguishes the flavors at the symbol level, because both register the
-`naive` *type* and only one links the implementation: it counts `cronet-go`
-symbols and requires zero for lite and non-zero for naive.
+- Cronet is a **CGO** dependency that links a prebuilt Chromium network stack, so
+  the macOS core is CGO=1 and is not self-contained. The alternative would be a
+  second CGO-free core that cannot speak NaiveProxy, which is the split that was
+  removed.
+- The core is ~76 MB for arm64, against ~56 MB for a CGO-free build that excludes
+  Naive and MASQUE.
+
+The audit asserts this at the symbol level, because the `naive` *type* resolves
+whether or not the implementation is linked: it requires `cronet-go` symbols to be
+present and requires the stub's "not included in this build" string to be absent.
 
 ## Usage
 
@@ -651,15 +663,12 @@ Consequences, stated plainly:
 ## Building
 
 ```bash
-# lite core (default), darwin/arm64
-./scripts/ci/build-macos-client.sh arm64 lite dist/sing-box-darwin-arm64
-
-# naive core, darwin/arm64 (CGO on)
-./scripts/ci/build-macos-client.sh arm64 naive dist/sing-box-darwin-arm64-naive
-
-# Intel
-./scripts/ci/build-macos-client.sh amd64 lite dist/sing-box-darwin-amd64
+# THE macOS core, darwin/arm64 (CGO on)
+./scripts/ci/build-macos-client.sh arm64 dist/sing-box-darwin-arm64
 ```
+
+There is one macOS product and one architecture, so there are no flavor or Intel
+variants to select.
 
 The script reads the tag file rather than repeating the tag list, injects the
 version from `release/JIEJIE_VERSION` (otherwise `sing-box version` prints
@@ -698,21 +707,18 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | lint | **PASS** | `golangci-lint` "0 issues" |
 | `go vet` (client tags) | **PASS** | exit 0 over the shipped packages |
 | unit tests (client tags) | **PASS** | `route`, `dns`, `option`, `common`, `protocol`, `transport` |
-| client registry audit tests | **PASS** | 12/12 `TestClientMacOS*` |
-| darwin/arm64 lite build | **PASS** | native build, 56,154,130 bytes |
-| darwin/arm64 naive build | **PASS** | native build, 74,401,618 bytes |
-| darwin/amd64 lite build | **PASS** | cross-build on arm64 host |
+| client registry audit tests | **PASS** | 20/20 `TestClient*` |
+| capability verification | **PASS** | NaiveProxy, MASQUE, gVisor, Hysteria2, TUIC, Clash API, TUN all confirmed in the shipped symbol table |
+| darwin/arm64 build (canonical) | **PASS** | native build, 76,166,402 bytes, arm64 only |
 | `sing-box version` | **PASS** | version, arch and tags all correct |
 | reproducible build | **PASS** | identical SHA-256 across two builds |
-| config check (lite) | **PASS** | full fixture, no warnings |
-| config check (naive) | **PASS** | full fixture |
+| config check | **PASS** | full fixture, no warnings |
 | example config check | **PASS** | checked in CI |
-| runtime smoke (lite) | **PASS** | real process, real API |
-| runtime smoke (naive) | **PASS** | real process, real API |
+| runtime smoke | **PASS** | real process, real API |
 | Clash API `/version`, `/proxies`, `/connections`, `/traffic`, `/configs` | **PASS** | real HTTP against a running process |
 | selector / urltest readable | **PASS** | via Clash API |
 | SIGTERM clean exit | **PASS** | exit 0, no panic |
-| registry symbol audit | **PASS** | both flavors |
+| registry symbol audit | **PASS** | single canonical core |
 | excluded packages absent (`go tool nm`) | **PASS** | masque, openvpn, openconnect, ssh, tor, redirect, resolved, ssmapi, usbip, wireguard, hysteria v1, dhcp, bridge |
 | `jiejie_server_minimal` still builds | **PASS** | Linux amd64 build unaffected |
 | upstream full registry still builds | **PASS** | 108 MB darwin build |
@@ -736,7 +742,7 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | **GUI actually loading this core** | **NOT-TESTED** | no GUI is installed or driven here |
 | **real proxy connectivity** | **NOT-TESTED** | fixture servers are `127.0.0.1` placeholders |
 | **Naive against a real remote server** | **NOT-TESTED** | no remote endpoint available |
-| **darwin/amd64 artifact executed** | **NOT-TESTED** | an arm64 host cannot run it |
+| **darwin/amd64** | **removed** | the product targets Apple Silicon only |
 | **Hysteria2 / TUIC over real WAN** | **NOT-TESTED** | no remote endpoint available |
 
 Nothing in the `NOT-TESTED` rows is claimed as passing.
@@ -770,7 +776,7 @@ retained unchanged:
 
 | change | why it is client-relevant |
 | --- | --- |
-| `sing` replace → `Piggy-Cat-bit-shadow/sing` | Preserves packet batching through the `canceler` timeout wrappers. This sits on the ordinary UDP data path — an idle-timeout wrapper around *every* UDP session — so a tunnel that implemented batching previously lost it silently. Verified to compile into the client build; the lite binary links the patched `sing`. |
+| `sing` replace → `Piggy-Cat-bit-shadow/sing` | Preserves packet batching through the `canceler` timeout wrappers. This sits on the ordinary UDP data path — an idle-timeout wrapper around *every* UDP session — so a tunnel that implemented batching previously lost it silently. Verified to compile into the client build; the macOS core links the patched `sing`. |
 | `route/conn.go` connected-UDP fast path | Removes the per-packet destination lookup and enables connected-socket batch read/write for fixed-destination tunnels. |
 | `adapter/inbound.go` `UDPConnectPacketConn` | The declaration that lets the router opt into the connected path safely. |
 | `adapter/upstream.go` `applyUDPConnect` | Ensures both packet wrappers make the same decision, so the two entry points cannot drift. |
@@ -799,11 +805,11 @@ registry, so it does not enter the client binary. This was verified with
    remote endpoint.
 4. **`dns/transport/mdns` is linked** through the mandatory `local` transport,
    though it is not registered. Removing it would require editing upstream.
-5. **`naive` resolves in the lite profile but cannot construct.** This is
-   deliberate and produces an actionable error, but a GUI that probes types by
-   resolution rather than by construction may misreport Naive as available.
-6. **The amd64 artifact is not executed in CI**, because an arm64 runner cannot
-   run it.
+5. **`naive` is a real, working outbound.** It is no longer a stub, so a GUI that
+   probes types by resolution gets the right answer and the outbound actually
+   constructs.
+6. **Intel Macs are not supported.** There is no darwin/amd64 artifact; the
+   product targets Apple Silicon only.
 7. **`include/*.go` helper functions are unused** under any minimal registry, so
    `golangci-lint`'s `unused` check reports ~19 functions if lint is run with the
    minimal tags. This is pre-existing and profile-independent — the Linux server

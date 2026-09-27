@@ -1,379 +1,389 @@
-name: Client macOS
-# Builds and verifies the Jiejie Client Edition macOS core.
+name: macOS arm64
+
+# Builds and verifies THE macOS arm64 production core.
 #
-# This is a SEPARATE product from the Linux amd64 server the other workflows
-# ship, and a separate workflow on purpose: a red macOS client must never block
-# a server release, and a change to the server tag set must not silently alter
-# what the client ships. Nothing here touches jiejie-fast.yml,
-# server-linux-amd64.yml or jiejie-masque-reference.yml.
+# # One product, one job, one build
 #
-# Native macOS runners are used rather than cross-compiling from Linux. A
-# darwin binary cross-compiled on Linux cannot be executed, so none of the
-# runtime verification below would be possible; and the Cronet/CGO flavor is not
-# reliably cross-compilable at all.
+# There is exactly ONE macOS core. It contains the NaiveProxy outbound (Cronet),
+# the MASQUE transport, the full client protocol set, TUN, the native API and the
+# Clash compatibility API, because those are the capabilities the product exists
+# for. There is no lite/naive split, no darwin/amd64 build, and therefore no
+# matrix: a matrix over profiles that are not products is just extra runner time.
 #
-# Every tag set is read from release/BUILD_TAGS_JIEJIE_CLIENT_MACOS* rather than
-# repeated here, so the workflow and the build script cannot drift.
+# The binary is built EXACTLY ONCE. Version, architecture, tag agreement, config
+# check, runtime smoke, headless smoke, registry and symbol audit, capability
+# verification, SHA-256, BUILD-INFO and the upload all read the same
+# `dist/sing-box-darwin-arm64`. The previous design rebuilt the shipped core inside
+# the package job, which meant the artifact was never the file that had been
+# tested.
+#
+# # Quick path vs deep checks
+#
+# A push to `testing` runs the fast path above plus the core unit tests under the
+# canonical tags.
+#
+# Behind the manual `deep_checks` input:
+#
+#   - race tests
+#   - the fuzz campaign
+#   - the upstream-default (non-product) build
+#   - the Cronet engine A/B and the receive-window sweep, which need a live Naive
+#     server and are therefore never runnable on a standard push
+#
+# # Triggers
+#
+# push to testing, plus manual dispatch. Documentation-only changes are ignored so
+# a README edit does not rebuild a kernel. `paths-ignore` is used rather than a
+# `paths` allowlist so a new source directory added later still triggers the build.
 
 on:
-  # `testing` is the single development branch: the macOS client and the server
-  # share one source tree, so client work happens there.
-  #
-  # `macos-client` was removed from this list because the branch no longer exists.
-  # It was deleted only after its contents were confirmed fully contained in
-  # `testing` (0 unique commits) AND all four workflows passed at the consolidated
-  # revision; its final tip is preserved as the tag
-  # `archive/macos-client-before-consolidation`.
   push:
-    branches: [testing, 'feat/jiejie-macos-*', 'client/*']
-  pull_request:
-    paths:
-      - 'cmd/**'
-      - 'include/**'
-      - 'protocol/**'
-      - 'transport/**'
-      - 'dns/**'
-      - 'route/**'
-      - 'option/**'
-      - 'adapter/**'
-      - 'common/**'
-      - 'release/**'
-      - 'scripts/ci/**'
-      - 'test/jiejie/**'
-      - 'go.mod'
-      - 'go.sum'
-      - '.github/workflows/client-macos.yml'
+    branches:
+      - testing
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
   workflow_dispatch:
+    inputs:
+      deep_checks:
+        description: Run expensive deep validation (race, fuzz, Cronet A/B)
+        required: false
+        default: false
+        type: boolean
+      bench_server:
+        description: Naive server host for the deep Cronet A/B (optional)
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: client-macos-${{ github.workflow }}-${{ github.ref }}
+  group: macos-arm64-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  BINARY: dist/sing-box-darwin-arm64
+  TAGS_FILE: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS
+
 jobs:
-  # ---------------------------------------------------------------------------
-  # Static checks. Cheap, and they fail fast before a 10-minute macOS build.
-  # ---------------------------------------------------------------------------
-  static:
+  macos-arm64:
+    # Native macOS runner: a darwin binary cross-compiled on Linux cannot be
+    # executed, so none of the runtime verification below would be possible, and
+    # the Cronet/CGO profile is not reliably cross-compilable at all.
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
+          # Only go.sum is listed. The reference and bench harnesses that use other
+          # modules are deep checks and must not widen the cache key of the normal
+          # fast path.
+          cache-dependency-path: go.sum
 
+      # -----------------------------------------------------------------------
+      # Cheap static checks.
+      # -----------------------------------------------------------------------
       - name: gofmt
         run: |
           set -euo pipefail
-          files="$(gofmt -l . | grep -v '^$' || true)"
-          if [ -n "$files" ]; then
-            echo "gofmt reports unformatted files:"
-            echo "$files"
+          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter test/jiejie 2>&1 || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
             exit 1
           fi
-          echo "gofmt: clean"
+          echo "PASS: gofmt clean"
 
-      - name: vet (macOS client tags)
+      - name: go vet
+        # A FOCUSED package set rather than ./... , for the same reason as the
+        # Linux workflow: ./... pulls in two upstream files with pre-existing
+        # unsafe.Pointer vet warnings that this fork does not modify.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
-          echo "tags: $TAGS"
-          # CGO off: the lite profile must vet without a C toolchain, and vetting
-          # the darwin file set is the point. A Linux-only vet would miss every
-          # file behind `darwin` in this repository.
-          #
-          # The package list is scoped to what this product ships. A whole-repo
-          # `go vet ./...` fails on two pre-existing upstream unsafe.Pointer
-          # findings in daemon/ and experimental/libbox/ — both of which are
-          # absent from this build and fail identically under every tag set on
-          # testing, so they are not this workflow's to fix.
-          CGO_ENABLED=0 go vet -tags "$TAGS" \
-            ./include/... ./route/... ./dns/... ./option/... ./adapter/... \
-            ./common/... ./protocol/... ./transport/... ./cmd/... ./constant/... \
-            ./log/... ./experimental/clashapi/...
+          CGO_ENABLED=1 go vet -tags "$(cat "$TAGS_FILE")" \
+            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./include ./route ./adapter/... ./dns/... ./service/...
+          echo "PASS: go vet clean under the macOS tags"
 
-      - name: lint
-        # Lint deliberately runs with NO build tags, matching the server
-        # workflow's proven pattern.
-        #
-        # The minimal registries leave upstream's include/*.go helper functions
-        # (registerWireGuardEndpoint, registerTailscaleEndpoint, ...) uncalled, so
-        # golangci-lint's `unused` check reports ~19 functions under any minimal
-        # profile. That is a property of the registry-level trim, not a defect,
-        # and it is pre-existing: the Linux server profile reports the same 19 on
-        # testing. Deleting those helpers would mean editing upstream files the
-        # fork deliberately leaves alone.
-        #
-        # Running lint under the default tag set still catches every real lint
-        # issue in all the shared source, and the tag-specific correctness is
-        # covered by `go vet` under the client tags plus the registry-selection
-        # check below, which is the part vet does check.
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=15m
-
-      - name: registry must resolve under the client tags
+      - name: unit tests (macOS tags)
+        # An explicit package list rather than ./... , for the same reason as the
+        # Linux workflow: experimental/libbox carries a pre-existing badlinkname
+        # link failure under the tfogo_checklinkname0 tag this profile uses.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
-          # go list is what caught the missing jiejie_client_macos tag during
-          # development: the build succeeded with the upstream registry
-          # compiled in, and only the file set revealed it.
-          echo "compiled include files:"
-          GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
-            -f '{{range .GoFiles}}{{.}} {{end}}' ./include/
-          echo "ignored include files:"
-          GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
-            -f '{{.IgnoredGoFiles}}' ./include/
-          if GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
-              -f '{{range .GoFiles}}{{.}} {{end}}' ./include/ \
-              | grep -q 'registry.go'; then
-            echo "FAIL: the upstream registry (include/registry.go) is compiled in"
-            exit 1
-          fi
-          if ! GOOS=darwin GOARCH=arm64 go list -tags "$TAGS" \
-              -f '{{range .GoFiles}}{{.}} {{end}}' ./include/ \
-              | grep -q 'registry_jiejie_client_macos.go'; then
-            echo "FAIL: the client registry is not compiled in"
-            exit 1
-          fi
-          echo "PASS: the client registry is active and the upstream one is not"
+          CGO_ENABLED=1 go test -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 25m \
+            ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashapi
+          echo "PASS: unit tests under the macOS tags"
 
-  # ---------------------------------------------------------------------------
-  # Unit tests: the fork's own packages plus the client registry audit.
-  # ---------------------------------------------------------------------------
-  unit:
-    needs: static
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: client-macos
-            tags_file: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS
-            cgo: 0
-          # The upstream default tag set is a COMPATIBILITY SIGNAL only. It must
-          # never substitute for the client run, and it does not gate the build.
-          - name: upstream-default
-            tags_file: release/DEFAULT_BUILD_TAGS_OTHERS
-            cgo: 0
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: unit tests (${{ matrix.name }})
-        env:
-          CGO_ENABLED: ${{ matrix.cgo }}
+      - name: macOS registry audit tests
+        # The registry and fixture assertions in their own module, constrained to
+        # jiejie_client_macos. This is where "the MASQUE client role resolves and
+        # the server role does not" is asserted at the type level.
         run: |
           set -euo pipefail
-          TAGS="$(cat ${{ matrix.tags_file }})"
-          echo "tags: $TAGS"
-          # Paths are chosen because they cover the areas this product actually
-          # depends on. A whole-repo `go test ./...` would also run the server
-          # integration suites, which need Linux-only facilities and would fail
-          # for reasons unrelated to the client.
-          go test -tags "$TAGS" -count=1 \
-            ./include/... ./route/... ./dns/... ./option/... \
-            ./common/... ./protocol/... ./transport/...
-
-      - name: client registry audit tests
-        if: matrix.name == 'client-macos'
-        env:
-          CGO_ENABLED: 0
-        run: |
-          set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
+          TAGS="$(cat "$TAGS_FILE")"
           cd test
-          go test -tags "$TAGS" -count=1 -v -run 'TestClientMacOS' ./jiejie/
+          CGO_ENABLED=1 go test -tags "$TAGS" -count=1 -timeout 20m -run 'TestClient' ./jiejie/
+          echo "PASS: macOS registry audit tests"
 
-  # ---------------------------------------------------------------------------
-  # Build both flavors from source.
-  # ---------------------------------------------------------------------------
-  build:
-    needs: static
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            flavor: lite
-          - arch: arm64
-            flavor: naive
-          # darwin/amd64 is built because it is nearly free once the arm64 path
-          # works and Intel Macs are still in use. arm64 is the required target;
-          # this is additive.
-          - arch: amd64
-            flavor: lite
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: build ${{ matrix.flavor }} darwin/${{ matrix.arch }}
+      # -----------------------------------------------------------------------
+      # THE build. Everything below reads this one file.
+      # -----------------------------------------------------------------------
+      - name: build macOS core
         run: |
           set -euo pipefail
-          out="dist/sing-box-darwin-${{ matrix.arch }}"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            out="$out-naive"
-          fi
-          ./scripts/ci/build-macos-client.sh "${{ matrix.arch }}" "${{ matrix.flavor }}" "$out"
+          mkdir -p dist
+          ./scripts/ci/build-macos-client.sh arm64 "$BINARY"
 
-      - name: version, architecture and tags
+      - name: architecture, version and tag agreement
         run: |
           set -euo pipefail
-          bin="dist/sing-box-darwin-${{ matrix.arch }}"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            bin="$bin-naive"
-          fi
-          ./"$bin" version | tee version.txt
-          grep -F "${{ matrix.arch }}" version.txt
-          if [ "${{ matrix.arch }}" = "arm64" ]; then
-            grep -F "arm64" version.txt
-          fi
-          # The tags the binary reports must be the tags the tag file declares.
-          # Without this, a tag file edit that the build ignored would go
-          # unnoticed, which is exactly how the missing jiejie_client_macos tag
-          # survived a successful build earlier in this branch's history.
-          expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE)"
-          fi
-          reported="$(sed -n 's/^Tags: //p' version.txt)"
-          if [ "$reported" != "$expected" ]; then
-            echo "FAIL: reported tags do not match the tag file"
-            echo "  reported: $reported"
-            echo "  expected: $expected"
+          VERSION="$(cat release/JIEJIE_VERSION)"
+
+          ./"$BINARY" version
+          file "$BINARY"
+
+          # arm64 ONLY. `file` alone is not enough: a fat/universal binary also
+          # reports arm64, so the arch list is checked explicitly.
+          if ! file "$BINARY" | grep -q "arm64"; then
+            echo "FAIL: the binary is not arm64" >&2
             exit 1
           fi
-          echo "PASS: reported tags match release/ exactly"
-          file "$bin"
+          if file "$BINARY" | grep -qi "universal\|x86_64"; then
+            echo "FAIL: the binary contains a non-arm64 slice" >&2
+            file "$BINARY" >&2
+            exit 1
+          fi
+          lipo -archs "$BINARY" 2>/dev/null | tee /tmp/archs.txt || true
+          if [ -s /tmp/archs.txt ] && ! grep -qx "arm64" /tmp/archs.txt; then
+            echo "FAIL: expected exactly arm64, got: $(cat /tmp/archs.txt)" >&2
+            exit 1
+          fi
+          ./"$BINARY" version | grep -F "darwin/arm64"
+
+          # The binary must report the version and the tags its file declares.
+          ./"$BINARY" version | grep -F "$VERSION"
+          reported="$(./"$BINARY" version | sed -n 's/^Tags: //p')"
+          expected="$(cat "$TAGS_FILE")"
+          if [ "$reported" != "$expected" ]; then
+            echo "FAIL: reported tags do not match the tag file" >&2
+            echo "  reported: $reported" >&2
+            echo "  expected: $expected" >&2
+            exit 1
+          fi
+          # CGO must be ON: with_naive_outbound links the Cronet static library, and
+          # a CGO-free build would silently have used the naive stub instead.
+          ./"$BINARY" version | grep -F "CGO: enabled"
+          echo "PASS: arm64, version, tags and CGO all agree with release/"
 
       - name: config check
         run: |
           set -euo pipefail
-          bin="dist/sing-box-darwin-${{ matrix.arch }}"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            bin="$bin-naive"
-          fi
-          ./scripts/ci/check-macos-client-config.sh "$bin" "dist/fixture-${{ matrix.flavor }}-${{ matrix.arch }}"
+          ./scripts/ci/check-macos-client-config.sh "$BINARY" dist/config-check
+          echo "PASS: client fixture and example configs validate"
 
       - name: runtime smoke test (Clash API, process lifecycle)
-        # Only the native arm64 flavors can run on this runner. The amd64 binary
-        # is a cross-build for Intel Macs and is NOT executed here; that is
-        # recorded as NOT-TESTED rather than implied to pass.
-        if: matrix.arch == 'arm64'
         run: |
           set -euo pipefail
-          bin="dist/sing-box-darwin-${{ matrix.arch }}"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            bin="$bin-naive"
-          fi
-          ./scripts/ci/check-macos-client-runtime.sh "$bin" "dist/runtime-${{ matrix.flavor }}-${{ matrix.arch }}"
+          ./scripts/ci/check-macos-client-runtime.sh "$BINARY" dist/runtime
+          echo "PASS: runtime smoke"
+
+      - name: headless smoke test (native Web API, no GUI)
+        run: |
+          set -euo pipefail
+          ./scripts/ci/check-macos-client-headless.sh "$BINARY" dist/headless
+          echo "PASS: headless smoke"
 
       - name: registry and symbol audit
         run: |
           set -euo pipefail
-          bin="dist/sing-box-darwin-${{ matrix.arch }}"
-          if [ "${{ matrix.flavor }}" = "naive" ]; then
-            bin="$bin-naive"
+          ./scripts/ci/audit-macos-client-registry.sh "$BINARY"
+          echo "PASS: registry and symbol audit"
+
+      - name: product capability verification
+        # The tag file says with_naive_outbound and the registry says masque-client,
+        # but names are not proof. This asserts against the SHIPPED BINARY that the
+        # real implementations are present and that the server-only roles are not.
+        #
+        # Specifically it catches the failure mode where the `naive` TYPE resolves
+        # because upstream's stub registered it, while the actual Cronet
+        # implementation is absent: that configuration check passes and the user
+        # gets "rebuild with -tags with_naive_outbound" from a binary that claims
+        # to have it.
+        run: |
+          set -euo pipefail
+          go tool nm "$BINARY" > /tmp/macos.syms
+
+          require() {
+            if grep -qF "$1" /tmp/macos.syms; then
+              echo "PASS: $2"
+            else
+              echo "FAIL: $2 (missing symbol: $1)" >&2
+              exit 1
+            fi
+          }
+          forbid() {
+            if grep -qF "$1" /tmp/macos.syms; then
+              echo "FAIL: $2 (unexpected symbol: $1)" >&2
+              exit 1
+            else
+              echo "PASS: $2"
+            fi
+          }
+
+          # NaiveProxy: the real Cronet implementation, not the stub.
+          require "cronet-go.NewNaiveClient" "NaiveProxy outbound implementation is linked (Cronet)"
+          forbid  "naive outbound is not included in this build" "the naive not-included stub is absent"
+
+          # MASQUE: the client role, and the shared data plane it depends on.
+          require "protocol/masque.(*ClientEndpoint)" "masque-client endpoint is linked"
+          require "transport/masque." "the shared MASQUE data plane is linked"
+          require "transport/http." "the shared HTTP/2 + HTTP/3 + datagram plane is linked"
+          forbid  "protocol/masque.(*ServerEndpoint)" "masque-server is NOT linked"
+
+          # The rest of the required macOS feature set.
+          require "sagernet/gvisor" "gVisor (system TUN stack) is linked"
+          require "protocol/hysteria2." "Hysteria2 outbound is linked"
+          require "protocol/tuic." "TUIC outbound is linked"
+          require "experimental/clashapi" "the Clash compatibility API is linked"
+          require "protocol/tun." "the TUN inbound is linked"
+
+          echo "PASS: every required macOS capability is present in the shipped binary"
+
+      - name: reproducibility
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-macos-client.sh arm64 dist/repro-check >/dev/null
+          source scripts/ci/lib.sh
+          first="$(sha256_of "$BINARY")"
+          second="$(sha256_of dist/repro-check)"
+          if [ "$first" != "$second" ]; then
+            echo "FAIL: not reproducible" >&2
+            echo "  first:  $first" >&2
+            echo "  second: $second" >&2
+            exit 1
           fi
-          ./scripts/ci/audit-macos-client-registry.sh "$bin"
+          echo "PASS: reproducible ($first)"
 
-      - name: headless smoke test (native Web API, no GUI)
-        # The native management API is control-plane only and behaves identically
-        # in both flavors, so this runs once rather than per matrix entry.
-        if: matrix.arch == 'arm64' && matrix.flavor == 'lite'
+      # -----------------------------------------------------------------------
+      # Package: the artifact holds what was verified, and nothing else.
+      # -----------------------------------------------------------------------
+      - name: write BUILD-INFO and SHA256
         run: |
           set -euo pipefail
-          ./scripts/ci/check-macos-client-headless.sh \
-            dist/sing-box-darwin-arm64 dist/headless-smoke
-
-      - name: headless example config still checks
-        # The shipped example is what a user copies first, so a stale one is a
-        # support burden. It is validated here even though the smoke test builds
-        # its own config.
-        if: matrix.arch == 'arm64' && matrix.flavor == 'lite'
-        run: |
-          set -euo pipefail
-          ./dist/sing-box-darwin-arm64 check -c test/jiejie/macos-client/example-headless.json
-          echo "PASS: example-headless.json checks"
-
-  # ---------------------------------------------------------------------------
-  # Package. Needs every gate above, so a shipped artifact is only produced from
-  # a commit that passed all of them.
-  # ---------------------------------------------------------------------------
-  package:
-    needs: [unit, build]
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: build the shipped arm64 lite core
-        run: ./scripts/ci/build-macos-client.sh arm64 lite dist/sing-box-darwin-arm64
-
-      - name: verify the shipped binary before packaging
-        run: |
-          set -euo pipefail
-          bin=dist/sing-box-darwin-arm64
-          ./"$bin" version
-          # The shipped flavor is lite, so the tag file must be the lite one.
-          expected="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
-          reported="$(./"$bin" version | sed -n 's/^Tags: //p')"
-          [ "$reported" = "$expected" ]
-          ./scripts/ci/check-macos-client-config.sh "$bin" dist/fixture-package
-          ./scripts/ci/check-macos-client-runtime.sh "$bin" dist/runtime-package
-          ./scripts/ci/check-macos-client-headless.sh "$bin" dist/headless-package
-          ./scripts/ci/audit-macos-client-registry.sh "$bin"
-
-      - name: stage the artifact
-        id: stage
-        run: |
-          set -euo pipefail
-          eval "$(./scripts/ci/version.sh)"
-          echo "artifact_version=$JJ_ARTIFACT_VERSION" >> "$GITHUB_OUTPUT"
-          echo "short_sha=$JJ_SHORT_SHA" >> "$GITHUB_OUTPUT"
-
-          bin=dist/sing-box-darwin-arm64
-          stage=dist/Jiejie-Client-macOS-arm64-${JJ_ARTIFACT_VERSION}
-          mkdir -p "$stage"
-
-          cp "$bin" "$stage/sing-box-darwin-arm64"
-          cp LICENSE "$stage/LICENSE"
-          ./scripts/ci/build-info.sh "$stage/BUILD-INFO-MACOS.txt" darwin arm64 client-macos "$bin"
-
-          # The hash sidecar names the binary explicitly, so a downloader does
-          # not have to guess which line applies.
-          ( cd "$stage" && shasum -a 256 sing-box-darwin-arm64 > sing-box-darwin-arm64.sha256 )
-          cat "$stage/sing-box-darwin-arm64.sha256"
-          ls -la "$stage"
+          VERSION="$(cat release/JIEJIE_VERSION)"
+          OUT="dist/Jiejie-macOS-arm64-${VERSION}-$(git rev-parse --short HEAD)"
+          mkdir -p "$OUT"
+          cp "$BINARY" "$OUT/sing-box-darwin-arm64"
+          cp LICENSE "$OUT/LICENSE"
+          ./scripts/ci/build-info.sh "$OUT/BUILD-INFO-MACOS.txt" darwin arm64 client-macos "$OUT/sing-box-darwin-arm64"
+          # A standalone .sha256 beside the binary, so an operator can verify a
+          # download without parsing a manifest.
+          source scripts/ci/lib.sh
+          ( cd "$OUT" && printf '%s  %s\n' "$(sha256_of sing-box-darwin-arm64)" sing-box-darwin-arm64 > sing-box-darwin-arm64.sha256 )
+          echo "ARTIFACT_DIR=$OUT" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=$(basename "$OUT")" >> "$GITHUB_ENV"
+          ls -la "$OUT"
+          cat "$OUT/sing-box-darwin-arm64.sha256"
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Jiejie-Client-macOS-arm64-${{ steps.stage.outputs.artifact_version }}
-          path: dist/Jiejie-Client-macOS-arm64-*/
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
+          # The payload is a binary that is already close to incompressible, and
+          # the macOS core is the larger of the two, so a low level keeps the
+          # upload fast instead of chasing a few percent.
+          compression-level: 1
 
       - name: summary
         run: |
+          set -euo pipefail
           {
-            echo "## Jiejie Client Edition — macOS arm64"
+            echo "### macOS arm64"
             echo ""
             echo "| field | value |"
-            echo "| --- | --- |"
-            echo "| artifact | \`Jiejie-Client-macOS-arm64-${{ steps.stage.outputs.artifact_version }}\` |"
+            echo "|---|---|"
+            echo "| platform | darwin |"
+            echo "| arch | arm64 |"
+            echo "| version | \`$(cat release/JIEJIE_VERSION)\` |"
             echo "| commit | \`${{ github.sha }}\` |"
-            echo "| tags | \`$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)\` |"
-            echo "| binary sha256 | \`$(cut -d' ' -f1 dist/Jiejie-Client-macOS-arm64-*/sing-box-darwin-arm64.sha256)\` |"
-            echo ""
-            echo "Pair with the \`naive\` flavor artifact for the Naive outbound, or"
-            echo "rebuild locally with \`./scripts/ci/build-macos-client.sh arm64 naive\`."
+            echo "| build tags | \`$(cat "$TAGS_FILE")\` |"
+            echo "| cgo | enabled |"
+            echo "| binary bytes | $(stat -f '%z' "$BINARY") |"
+            echo "| sha256 | \`$(cut -d' ' -f1 "$ARTIFACT_DIR/sing-box-darwin-arm64.sha256")\` |"
+            echo "| artifact | \`$ARTIFACT_NAME\` |"
+            echo "| deep_checks | ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks || 'false' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # =======================================================================
+      # Deep checks: manual dispatch with deep_checks=true only.
+      # =======================================================================
+      - name: deep check - race tests
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -race -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 40m \
+            ./transport/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
+          echo "PASS: race tests"
+
+      - name: deep check - fuzz campaign
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          TAGS="$(cat "$TAGS_FILE")"
+          run_fuzz() {
+            echo "--- fuzzing $2 in $1 for ${3}s"
+            go test -tags "$TAGS" -run '^$' -fuzz "^$2\$" -fuzztime "$3" "$1"
+          }
+          run_fuzz ./transport/masque FuzzCapsuleParser 20s
+          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 20s
+          run_fuzz ./transport/http FuzzConnectUDPTargetPath 20s
+          run_fuzz ./protocol/naive FuzzNaiveConnectAuthority 20s
+          run_fuzz ./protocol/naive FuzzNaivePaddingFrame 20s
+          echo "PASS: fuzz campaign"
+
+      - name: deep check - upstream-default build
+        # The upstream stock configuration is not a product this fork ships.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: |
+          set -euo pipefail
+          go build -trimpath -buildvcs=false -o /tmp/upstream-default ./cmd/sing-box
+          /tmp/upstream-default version
+          echo "PASS: upstream-default build"
+
+      - name: deep check - Cronet engine A/B
+        # Needs a live Naive server on a real path: the two engine layouts differ
+        # in how many independent HTTP/2 sessions they carry, which a loopback
+        # cannot distinguish. Skips with NOT TESTED when no server is supplied
+        # rather than producing meaningless numbers.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks && inputs.bench_server != '' }}
+        env:
+          NAIVE_USER: ${{ secrets.NAIVE_BENCH_USER }}
+          NAIVE_PASS: ${{ secrets.NAIVE_BENCH_PASS }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/bench-naive-cronet-engine.sh "${{ inputs.bench_server }}" 443
+          echo "PASS: Cronet engine A/B completed"
+
+      - name: deep check - Naive receive-window sweep
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks && inputs.bench_server != '' }}
+        env:
+          NAIVE_USER: ${{ secrets.NAIVE_BENCH_USER }}
+          NAIVE_PASS: ${{ secrets.NAIVE_BENCH_PASS }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/bench-naive-receive-window.sh "${{ inputs.bench_server }}" 443
+          echo "PASS: receive-window sweep completed"

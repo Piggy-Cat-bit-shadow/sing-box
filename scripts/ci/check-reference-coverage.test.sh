@@ -198,21 +198,21 @@ report "D wrongly-excluded existing test is accepted by the checker" 0 "$rc_d1" 
 
 # Case D part 2: every name the real checker excludes must actually be run by the dedicated
 # reference workflow. This is the assertion that makes a wrong exclusion fail.
-reference_workflow="$repo_root/.github/workflows/jiejie-masque-reference.yml"
+reference_workflow="$repo_root/.github/workflows/server-linux-amd64.yml"
 if [ ! -f "$reference_workflow" ]; then
-  report "D dedicated QUICHE workflow exists" 1 1 "not found at $reference_workflow"
+  report "D deep_checks workflow exists" 1 1 "not found at $reference_workflow"
 else
-  report "D dedicated QUICHE workflow exists" 0 0
+  report "D deep_checks workflow exists" 0 0
 
   real_excluded="$(grep -E '^QUICHE_EXTERNAL=' "$checker" | head -1 | cut -d'"' -f2)"
   unrun=0
   for test_name in $real_excluded; do
     if ! grep -q -- "$test_name" "$reference_workflow"; then
-      echo "FAIL  D $test_name is excluded here but never run by jiejie-masque-reference.yml"
+      echo "FAIL  D $test_name is excluded here but never run by the deep_checks workflow"
       unrun=1
     fi
   done
-  report "D every excluded test is wired into the reference workflow" 0 "$unrun"
+  report "D every excluded test is wired into the deep_checks workflow" 0 "$unrun"
 fi
 
 # ---------------------------------------------------------------------------

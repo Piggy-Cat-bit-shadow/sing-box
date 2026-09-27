@@ -18,18 +18,19 @@ cd "$root"
 
 eval "$(./scripts/ci/version.sh)"
 
-# This fork ships two products: the Server Edition (Linux amd64 VPS) and the
-# Client Edition (macOS). Every flavor each one publishes is listed here.
-# Every flavor the fork ships, in one place. A flavor missing from this case
-# would silently record "unknown" tags in the sidecar, which is worse than
-# failing: the artifact would look documented while claiming nothing.
+# This fork ships exactly TWO products: the Server Edition (Linux amd64 VPS) and
+# the macOS arm64 core. Each has exactly one flavor, listed here in one place. A
+# flavor missing from this case would silently record "unknown" tags in the
+# sidecar, which is worse than failing: the artifact would look documented while
+# claiming nothing.
+#
+# The macOS aliases (macos, client-macos) exist so a caller can name the product
+# rather than the tag file, and so older invocations keep working. There is no
+# lite/naive distinction any more - there is one macOS core.
 tags_file=""
 case "$flavor" in
-  server-minimal) tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
-  # Client Edition macOS. `client-macos` is the lite core; `client-macos-naive`
-  # adds the Naive outbound and links Cronet through CGO.
-  client-macos|lite)       tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS" ;;
-  client-macos-naive|naive) tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE" ;;
+  server-minimal)          tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
+  macos|client-macos)      tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS" ;;
 esac
 if [ -z "$tags_file" ] || [ ! -f "$tags_file" ]; then
   echo "build-info.sh: unknown flavor '$flavor' (no tag file)" >&2

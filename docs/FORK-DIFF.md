@@ -149,36 +149,51 @@ The Server Edition has two workflows. (The Client Edition has its own,
 the three server workflows are unaffected by it, and a red macOS build cannot
 block a server release.)
 
-**Jiejie Fast** (`.github/workflows/jiejie-fast.yml`) is the fast gate on every
-push and pull request:
+There are exactly two workflows, one per product:
 
-* **format-and-lint** — `gofmt` and upstream golangci-lint.
-* **server-tests** — `vet` and unit tests under the production tag set, plus race
-  tests for the server's concurrent state.
-* **build-gate** — the Server Minimal binary must compile, must still exclude the
-  pruned protocols, and must accept `release/jiejie-production-topology.json`.
+```text
+.github/workflows/server-linux-amd64.yml   ->  sing-box-linux-amd64
+.github/workflows/client-macos.yml         ->  sing-box-darwin-arm64
+```
 
-**Linux amd64 server** (`.github/workflows/server-linux-amd64.yml`) is the
-release gate:
+Both are a single job that verifies, builds ONCE, audits that same binary, and
+packages it. Both trigger on `push` to `testing` and on manual dispatch, and both
+accept a `deep_checks` input for the expensive validation that no longer runs on
+every commit.
 
-* **lint-and-unit-tests** — `gofmt`, lint, `vet` and unit tests under **both** the
-  production/minimal tag set and the upstream default tag set. The production tag
-  set is the one that must pass; the upstream run is a compatibility signal and
-  never substitutes for it.
-* **production-minimal-integration** — builds the production binary and runs
-  `TestJiejie*` (AnyTLS fallback, MASQUE H2/H3 masquerade, authenticated CONNECT
-  and CONNECT-UDP, the unauthenticated limiter) and the actual-binary process
-  tests. Test logs stay in the job output and are **not** uploaded as artifacts.
-* **build-production** — needs both jobs above, so the shipped binary is only
-  produced after everything has passed. It builds `sing-box-linux-amd64`, audits
-  dependency pruning with a temporary unstripped copy (deleted immediately and
-  never uploaded), verifies version and tags, runs `sing-box check` against the
-  secret-free production fixture, asserts an excluded protocol is still rejected,
-  enforces the binary size guard, writes `BUILD-INFO-VPS.txt` and the size
-  report, and uploads exactly one artifact.
+**Linux amd64** (`.github/workflows/server-linux-amd64.yml`):
 
-The single published artifact is
-`Jiejie-VPS-linux-amd64-<version>-<sha>`.
+* `gofmt`, focused `go vet`, and unit tests under the **production** tag set only.
+* One build of `dist/sing-box-linux-amd64`, plus an unstripped `*.debug` copy of
+  the same program so the symbol audit has something to read. This is not a second
+  compilation: the Go build cache is warm and only the link step differs.
+* Every later step reads that one binary: version and tag agreement, `sing-box
+  check` against the production fixture, a real runtime smoke test (start, API,
+  mixed inbound, clean SIGTERM), the dependency-pruning and registry audit, the
+  size ceiling, reproducibility, `BUILD-INFO-LINUX.txt`, SHA-256, and the upload.
+
+Deep checks (`workflow_dispatch` with `deep_checks=true`): race tests, the fuzz
+campaign, the upstream-default tag build and its tests, the Caddy/forwardproxy
+reference differential tests, the MASQUE reference interop, and the QUICHE live
+interop.
+
+**macOS arm64** (`.github/workflows/client-macos.yml`):
+
+* `gofmt`, focused `go vet`, and unit tests under the canonical macOS tags.
+* One build of `dist/sing-box-darwin-arm64`. There is no matrix: one product, one
+  architecture. The shipped core contains NaiveProxy (Cronet) and MASQUE.
+* Every later step reads that one binary: arm64-only architecture check, version
+  and tag agreement, CGO check, config check, runtime smoke, headless smoke, the
+  registry and symbol audit, an explicit product-capability check against the
+  binary's symbol table, reproducibility, `BUILD-INFO-MACOS.txt`, SHA-256, and the
+  upload.
+
+Deep checks: race tests, the fuzz campaign, the upstream-default build, and the
+Cronet engine A/B (which needs a live Naive server and otherwise reports NOT
+TESTED).
+
+The published artifacts are `Jiejie-Linux-amd64-<version>-<sha>` and
+`Jiejie-macOS-arm64-<version>-<sha>`.
 
 The production binary is produced by the official Go linker in a single
 `go build` invocation with `-trimpath` and `-ldflags "-s -w"`, which drops the

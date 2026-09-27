@@ -52,33 +52,38 @@ fi
 cd "$root"
 
 # The flavor decides which tag file is used, and therefore whether Cronet is
-# linked. The flavor is derived from the binary name so the audit cannot be
-# pointed at one profile while building another.
-case "$(basename "$binary")" in
-  *-naive*)
-    flavor="naive"
-    tags="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE)"
-    cgo=1
-    ;;
-  *)
-    flavor="lite"
-    tags="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
-    cgo=0
-    ;;
-esac
+# There is exactly ONE macOS core, so there is exactly one tag set. The audit does
+# not derive anything from the binary NAME any more: a name-based flavor guess was
+# only meaningful while a lite/naive pair existed, and keeping it would have meant
+# keeping the ability to audit a profile that no longer ships.
+tags="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# The audit copy is built unstripped on purpose: -s -w removes the symbol table,
-# so `go tool nm` on the shipped artifact yields nothing to audit.
-echo "building unstripped audit copy for flavor=$flavor cgo=$cgo (deleted on exit, never uploaded)"
-GOOS=darwin GOARCH=arm64 CGO_ENABLED="$cgo" go build \
-  -trimpath -buildvcs=false -tags "$tags" \
-  -o "$tmpdir/audit" ./cmd/sing-box
-
+# The symbol analysis needs a symbol table, and the shipped artifact is stripped
+# with -ldflags "-s -w" ... except that it is NOT: scripts/ci/build-macos-client.sh
+# does not pass -s -w, because the macOS core ships unstripped deliberately so an
+# operator can inspect it with `go tool nm` and `go version -m`.
+#
+# So the audit analyses the PASSED BINARY directly, and only falls back to
+# rebuilding if that binary genuinely has no symbols. Rebuilding by default was a
+# real waste: it compiled a second full binary, including the Cronet static
+# library, purely to read a symbol table that was already present in the artifact
+# under audit.
 nm_out="$tmpdir/nm.txt"
-go tool nm "$tmpdir/audit" > "$nm_out"
+go tool nm "$binary" > "$nm_out" 2>/dev/null || true
+
+if [ ! -s "$nm_out" ]; then
+  echo "note: $binary has no readable symbol table; building an unstripped analysis copy"
+  echo "      (this is a stripped artifact; the copy is deleted on exit and never uploaded)"
+  GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build \
+    -trimpath -buildvcs=false -tags "$tags" \
+    -o "$tmpdir/audit" ./cmd/sing-box
+  go tool nm "$tmpdir/audit" > "$nm_out"
+else
+  echo "analysing the shipped binary directly (no rebuild): $binary"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Excluded packages must have no symbols.
@@ -417,32 +422,50 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. The Naive flavor must be distinguishable from the lite one.
+# 4. The product capabilities must genuinely be linked.
 # ---------------------------------------------------------------------------
 #
-# Both profiles register the `naive` TYPE, because upstream's
+# The macOS core is ONE product, so this section asserts what it CONTAINS rather
+# than distinguishing it from a sibling profile. The distinction still matters,
+# because the `naive` TYPE resolves either way: upstream's
 # include/naive_outbound_stub.go registers it behind `!with_naive_outbound` so a
-# user gets an actionable error instead of "unknown outbound type". The
-# difference between the flavors is therefore NOT whether the type resolves; it is
-# whether the REAL Cronet implementation is linked. That is exactly what the
-# symbol table answers and what a type-level check cannot.
+# user gets an actionable error instead of "unknown outbound type". A type-level
+# check therefore cannot tell a real NaiveProxy implementation from a stub, which
+# is precisely what the symbol table answers.
+#
+# NaiveProxy and MASQUE are the two transports this core exists for, so their
+# absence is a hard failure rather than a note.
 echo ""
-echo "== flavor: naive implementation linkage =="
+echo "== product capability: NaiveProxy (Cronet) =="
 naive_symbols="$(grep -c "cronet-go" "$nm_out" || true)"
-if grep -q "with_naive_outbound" <<<"$tags"; then
-  if [ "$naive_symbols" -gt 0 ]; then
-    echo "PASS: flavor=naive, with_naive_outbound is set and Cronet symbols are linked ($naive_symbols)"
-  else
-    echo "FAIL: flavor=naive, with_naive_outbound is set but no Cronet symbols are linked" >&2
-    fail=1
-  fi
+if [ "$naive_symbols" -gt 0 ]; then
+  echo "PASS: with_naive_outbound is set and Cronet symbols are linked ($naive_symbols)"
 else
-  if [ "$naive_symbols" -eq 0 ]; then
-    echo "PASS: flavor=lite, with_naive_outbound is unset and no Cronet symbols are linked"
-  else
-    echo "FAIL: flavor=lite but $naive_symbols Cronet symbols are linked" >&2
-    fail=1
-  fi
+  echo "FAIL: with_naive_outbound is set but NO Cronet symbols are linked; the" >&2
+  echo "      shipped core cannot speak NaiveProxy" >&2
+  fail=1
+fi
+
+# The stub must NOT be what is linked. If both the stub and the real
+# implementation were present the binary would be larger than needed and the
+# resolution order would decide which one a configuration got, which is not a
+# property this audit is willing to leave to chance.
+if grep -qF "naive outbound is not included in this build" "$nm_out"; then
+  echo "FAIL: the naive outbound STUB string is linked, so the real implementation" >&2
+  echo "      may not be the one that resolves" >&2
+  fail=1
+else
+  echo "PASS: the naive not-included stub is absent (the real outbound is linked)"
+fi
+
+echo ""
+echo "== product capability: MASQUE =="
+masque_symbols="$(grep -cF 'sing-box/transport/masque.' "$nm_out" || true)"
+if [ "$masque_symbols" -gt 0 ]; then
+  echo "PASS: the shared MASQUE data plane is linked ($masque_symbols symbols)"
+else
+  echo "FAIL: transport/masque has no symbols; the MASQUE transport is unavailable" >&2
+  fail=1
 fi
 
 echo ""

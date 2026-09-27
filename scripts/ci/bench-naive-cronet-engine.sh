@@ -78,8 +78,8 @@ mkdir -p "$outdir"
 
 # build_variant NAME SINGLE_ENGINE
 #
-# Builds the naive flavor with the engine switch set as requested. The Go build
-# tags are identical between variants on purpose: the ONLY difference is the
+# Builds the macOS core with the engine switch set as requested. The Go build tags
+# are identical between variants on purpose: the ONLY difference is the
 # configuration value, so any measured difference is attributable to the engine
 # layout rather than to the build.
 build_variant() {
@@ -88,7 +88,7 @@ build_variant() {
   echo "building variant $name (single_engine=$single)"
   CGO_ENABLED=1 go build \
     -trimpath -buildvcs=false \
-    -tags "$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE)" \
+    -tags "$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)" \
     -o "$outdir/sing-box-$name" ./cmd/sing-box
 }
 

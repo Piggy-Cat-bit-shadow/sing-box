@@ -837,11 +837,11 @@ reverted.
 | Bazel target | `//quiche:masque_client` |
 | `masque_client` sha256 | `7e84cc4d817bace4bc07f133f51846325c33e0e2c96c1d34d47fe222fedb7777` |
 | Builder | `scripts/ci/jiejie-quiche-live-interop.sh` |
-| Workflow | `.github/workflows/jiejie-masque-reference.yml` (manual + weekly) |
+| Workflow | `.github/workflows/server-linux-amd64.yml`, `deep_checks=true` (manual) |
 
-QUICHE stays an EXTERNAL test-only tool. Root `go.mod` is untouched, the workflow
-re-verifies `go.mod` and `go.sum` are byte-identical after the C++ build, and nothing is
-vendored.
+QUICHE stays an EXTERNAL test-only tool. Root `go.mod` is untouched, the deep-check
+step re-verifies the build did not mutate the module files after the C++ build, and
+nothing is vendored.
 
 **QUICHE HTTP/3 transport interop: PASS locally, NOT-TESTED on GitHub-hosted runners.**
 

@@ -45,9 +45,9 @@ if [ ! -d "$test_dir" ]; then
 fi
 
 # Tests that require an EXTERNAL Google QUICHE binary. Building QUICHE means compiling
-# BoringSSL and Abseil with Bazel, which is why those tests run in
-# .github/workflows/jiejie-masque-reference.yml instead of here. They are excluded BY NAME
-# so the exclusion cannot silently widen into a filter tweak.
+# BoringSSL and Abseil with Bazel, which is why those tests run behind the deep_checks
+# input of .github/workflows/server-linux-amd64.yml rather than here. They are excluded
+# BY NAME so the exclusion cannot silently widen into a filter tweak.
 QUICHE_EXTERNAL="TestReferenceQuicheH3TransportLiveInterop TestReferenceQuicheConnectUDPLiveInterop TestReferenceQuicheConnectIPLiveInterop"
 
 defined="$(grep -rhoE '^func (Test(Reference|SourceIdentity|QuicheOracle)[A-Za-z0-9_]*)' \
@@ -112,4 +112,4 @@ done
 
 echo "reference coverage OK: $total defined tests accounted for"
 echo "  - $checked reported a result in this run"
-echo "  - $excluded excluded by name as QUICHE-external (run by jiejie-masque-reference.yml)"
+echo "  - $excluded excluded by name as QUICHE-external (run by the deep_checks workflow)"

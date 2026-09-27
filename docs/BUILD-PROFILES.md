@@ -1,18 +1,24 @@
 # Build profiles
 
-This fork is **one source tree** that produces **three separate binaries**. The
-profiles differ only in build tags, the registry, platform glue, CI and packaging.
-They do not differ in protocol implementation.
+This fork is **one source tree** that produces **two binaries**, one per product.
+The profiles differ only in build tags, the registry, platform glue, CI and
+packaging. They do not differ in protocol implementation.
 
 ```text
-                    single source tree (branch: testing)
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ↓                     ↓                     ↓
-  Linux Server Minimal   macOS Client Lite   macOS Client Naive
-  jiejie_server_minimal  jiejie_client_macos jiejie_client_macos
-                                               + with_naive_outbound
+              single source tree (branch: testing)
+                          │
+        ┌─────────────────┴─────────────────┐
+        ↓                                   ↓
+  Linux Server Minimal              macOS Client
+  jiejie_server_minimal             jiejie_client_macos
+  linux/amd64, CGO=0                darwin/arm64, CGO=1
+  -> sing-box-linux-amd64           -> sing-box-darwin-arm64
 ```
+
+The macOS core is ONE product. It ships NaiveProxy (Cronet) **and** MASQUE **and**
+the full client protocol set, because those are the capabilities the product is
+for. There is no lite/naive split: a capability that is needed is in the product,
+and a capability that is not needed is not built at all.
 
 ## Why the profiles exist
 
@@ -31,20 +37,23 @@ Sharing one source tree keeps the protocol implementations single-copy. A fix to
 MASQUE framing, Naive padding, HTTP/2 flow control or a buffer ownership bug lands
 once and reaches every profile.
 
-## The three profiles
+## The two profiles
 
-| | Server Minimal | macOS Lite | macOS Naive |
-|---|---|---|---|
-| Tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE` |
-| Target | `linux/amd64` | `darwin/arm64` | `darwin/arm64` |
-| `CGO_ENABLED` | `0` | `0` | `1` |
-| Build tags | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` | `with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0` | Lite tags **+** `with_naive_outbound` |
-| Registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` | same as Lite |
-| Binary size (measured) | 48,605,024 B | 57,934,354 B | 76,166,402 B |
-| SHA-256 (measured) | `be2ccbc2df38…` | `55d8dc6fd953…` | `fa976ee5491c…` |
+| | Server Minimal | macOS Client |
+|---|---|---|
+| Tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
+| Target | `linux/amd64` | `darwin/arm64` |
+| `CGO_ENABLED` | `0` | `1` (Cronet) |
+| Build tags | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` | `with_gvisor,with_quic,with_utls,with_clash_api,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
+| Registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
+| Binary size (measured) | 48,605,024 B | 76,166,402 B |
+| SHA-256 (measured) | `be2ccbc2df38…` | `fa976ee5491c…` |
+| Workflow | `server-linux-amd64.yml` | `client-macos.yml` |
+| Artifact | `Jiejie-Linux-amd64-<version>-<sha>` | `Jiejie-macOS-arm64-<version>-<sha>` |
 
-All three were built twice on a `darwin/arm64` M1 host with Go 1.25.5 and produced
-**bit-identical** binaries. See [Reproducibility](#reproducibility).
+Both were built twice on a `darwin/arm64` M1 host with Go 1.25.5 and produced
+**bit-identical** binaries, including the CGO/Cronet macOS build. See
+[Reproducibility](#reproducibility).
 
 ### Linux Server Minimal
 
@@ -52,26 +61,34 @@ All three were built twice on a `darwin/arm64` M1 host with Go 1.25.5 and produc
 production topology serves, and `direct`/`socks` outbounds. Contains no client
 helpers, no Cronet, no GUI-facing services and no unused protocol trees.
 
-### macOS Client Lite
+### macOS Client
 
-`jiejie_client_macos`. The default desktop core.
+`jiejie_client_macos`. THE macOS core, built for `darwin/arm64`.
 
-Includes: TUN, `mixed`/`http`/`socks` inbounds, DNS (UDP/TCP/DoT/DoH/DoQ/DoH3/
-local/hosts/FakeIP), Reality/VLESS, VMess, AnyTLS, Shadowsocks, ShadowTLS, Snell,
-Trojan, Hysteria2, TUIC, the **MASQUE client** endpoint, the native `api` service,
-and the Clash compatibility API.
+Includes:
 
-Excludes: Cronet, the Naive implementation (the type resolves to a stub with an
-actionable error), the Native Naive server, `masque-server`, OpenVPN, OpenConnect,
-Tailscale, WireGuard, Tor, SSH, and all server-only services.
+- **NaiveProxy** — the Cronet-backed `naive` outbound over HTTP/2 and QUIC/HTTP3
+- **MASQUE** — the `masque-client` endpoint (CONNECT-IP / CONNECT-UDP over H2/H3),
+  with the shared `transport/masque` and `transport/http` data plane
+- TUN (gVisor), `mixed`/`http`/`socks`/`direct` inbounds
+- DNS: UDP, TCP, DoT, DoH, DoQ, DoH3, local, hosts, FakeIP
+- Reality/VLESS, VMess, AnyTLS, Shadowsocks, ShadowTLS, Snell, Trojan, Hysteria2,
+  TUIC, and the `direct`/`block`/`selector`/`urltest` primitives
+- the native `api` service (Web Dashboard) and the Clash compatibility API
 
-Must build **CGO-free**, so it can be cross-compiled and embedded by a GUI.
+Excludes: `masque-server`, the Native Naive **server** inbound, OpenVPN,
+OpenConnect, Tailscale, WireGuard, Tor, SSH, and all server-only services.
 
-### macOS Client Naive
+Builds with **CGO enabled**, because `with_naive_outbound` links the prebuilt
+Cronet static library. That is accepted rather than worked around: the alternative
+would be a second CGO-free core that cannot speak NaiveProxy, which is exactly the
+split this consolidation removed.
 
-Lite plus `with_naive_outbound` and `CGO_ENABLED=1`. Adds the Cronet-backed Naive
-outbound. Cronet is **not** a dependency of Lite: it is a separate profile because
-it is a large CGO static library that most users never need.
+A capability that is required is asserted to be present in the SHIPPED binary, not
+merely requested by a tag name. The workflow checks the symbol table for
+`cronet-go.NewNaiveClient`, `protocol/masque.(*ClientEndpoint)`, `transport/masque`,
+`transport/http`, `sagernet/gvisor`, the Hysteria2 and TUIC outbounds, the Clash API
+and the TUN inbound, and checks that the Naive stub and `masque-server` are absent.
 
 ## What each profile registers
 
@@ -141,8 +158,7 @@ Measured by building each profile twice and comparing:
 
 ```text
 server-minimal  be2ccbc2df38207d5b4b4880551bfa836476c3c5197ac1195956e323634574a3
-macos-lite      55d8dc6fd95304f909d3ba201a148b05e7dfa74375925b72336487bf36491bf4
-macos-naive     fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e
+macos-client    fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e
 ```
 
 Three inputs are removed to make this hold:
@@ -153,41 +169,79 @@ Three inputs are removed to make this hold:
   flag.
 - No timestamp or random id is injected at link time.
 
-`macos-naive` was the expected exception, because it links a prebuilt Cronet static
-library under CGO and an external archive could embed a build id. Measurement shows
-it does not, so all three profiles are held to the same standard rather than
-exempting the CGO leg.
+The macOS profile was the expected exception, because it links a prebuilt Cronet
+static library under CGO and an external archive could embed a build id.
+Measurement shows it does not, so both profiles are held to the same standard
+rather than exempting the CGO leg.
 
-`.github/workflows/jiejie-profiles.yml` builds each profile twice and fails if the
-hashes differ.
+Each workflow rebuilds its binary once and fails if the hashes differ.
 
 ## CI
 
-`jiejie-profiles.yml` is the **cross-product gate**: it builds all three profiles
-from one commit SHA in one run, and its summary job fails unless every profile
-passed. That is the check that makes "one source tree, multiple profiles" true in
-practice rather than only in intent — a divergence cannot hide between two
-workflows if a single status covers all three.
-
-It also fails if the shared packages are duplicated:
+There are exactly two workflows, one per product:
 
 ```text
-protocol/masque, transport/masque, transport/http, protocol/naive
-  → must exist in exactly one place
-  → no file inside the MASQUE packages may be named for a platform
+testing push
+     │
+     ├── Linux amd64   ->  sing-box-linux-amd64
+     │
+     └── macOS arm64   ->  sing-box-darwin-arm64
 ```
 
-Per-profile workflows are kept and are not redundant:
+Each is a **single job**: one checkout, one setup-go with cache, one cache restore,
+one build. Splitting a job adds another runner startup, checkout, setup-go, cache
+restore and dependency resolution, which this workload does not need.
 
-- `server-linux-amd64.yml` carries the server's binary size ceiling, reference
-  coverage and focused checks.
-- `client-macos.yml` carries the macOS launchd, headless and artifact checks.
-- `jiejie-fast.yml` and `jiejie-masque-reference.yml` carry protocol-level tests.
+**The binary is built ONCE per workflow.** Every subsequent step — version and tag
+agreement, config check, runtime smoke, headless smoke, registry and symbol audit,
+capability verification, size ceiling, reproducibility, SHA-256, BUILD-INFO and the
+upload — reads that same file. Nothing re-runs `go build` to inspect something the
+binary already contains; the audit scripts analyse the shipped binary directly.
 
-They fail independently on purpose: a red macOS client must not block a server
-release.
+### Quick path vs deep checks
 
----
+A push runs formatting, focused vet, the core unit tests under the product's tag
+set, one build, and the artifact checks.
+
+Everything expensive is behind a manual input on BOTH workflows:
+
+```yaml
+workflow_dispatch:
+  inputs:
+    deep_checks:
+      description: Run expensive deep validation
+      required: false
+      default: false
+      type: boolean
+```
+
+Linux deep checks: race tests, the fuzz campaign, the upstream-default tag build
+and tests, the Caddy/forwardproxy reference differential tests, the MASQUE
+reference interop, and the QUICHE live interop.
+
+macOS deep checks: race tests, the fuzz campaign, the upstream-default build, and
+the Cronet engine A/B (which needs a live Naive server and otherwise reports NOT
+TESTED).
+
+Both workflows also `cancel-in-progress` on the same branch, so a rapid sequence of
+pushes only builds the newest commit, and both ignore documentation-only changes so
+a README edit does not rebuild a kernel.
+
+### What is deliberately not done
+
+- **No `pull_request` trigger.** This is a personal fork with a single development
+  branch; there is no PR workflow to protect.
+- **No `paths:` allowlist.** `paths-ignore` is used instead, because an allowlist
+  silently stops building when a new source directory is added.
+- **No full `golangci-lint` on every push.** It downloads and compiles a second Go
+  toolchain, which is a poor trade against `gofmt` and `go vet` for an artifact
+  build. The lint configuration is unchanged and still runnable locally or in deep
+  checks.
+- **No duplicate cache.** `setup-go`'s own cache is used with
+  `cache-dependency-path: go.sum`; there is no second `actions/cache` for the same
+  `GOMODCACHE`.
+- **No `go mod download all`** and no `go clean -cache`/`-modcache`. `go test` and
+  `go build` read the module cache on demand.
 
 ## Known pre-existing test results
 

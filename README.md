@@ -2,21 +2,24 @@
 
 基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的个人 fork。
 
-**一套源码，一条开发分支，三个构建 profile。**
+**一套源码，一条开发分支，两个产品。**
 
 ```text
-                single source tree (branch: testing)
+              single source tree (branch: testing)
                           │
-      ┌───────────────────┼───────────────────┐
-      ↓                   ↓                   ↓
- Linux Server Minimal  macOS Client Lite  macOS Client Naive
- jiejie_server_minimal jiejie_client_macos jiejie_client_macos
-                                           + with_naive_outbound
+        ┌─────────────────┴─────────────────┐
+        ↓                                   ↓
+  Linux Server Minimal              macOS Client
+  jiejie_server_minimal             jiejie_client_macos
+  linux/amd64, CGO=0                darwin/arm64, CGO=1
+  -> sing-box-linux-amd64           -> sing-box-darwin-arm64
 ```
 
 Server 与 macOS Client 共享全部协议与 transport 源码（MASQUE、Naive、HTTP/2、
-HTTP/3、QUIC、buffer、framing、安全修复）。三个 profile 只通过 **build tags、
-registry、平台 glue、CI 与打包** 区分，不存在 Server 版和 Mac 版的第二份实现。
+HTTP/3、QUIC、buffer、framing、安全修复）。两者只通过 **build tags、registry、
+平台 glue、CI 与打包** 区分，不存在 Server 版和 Mac 版的第二份实现。
+
+macOS 端是**一个**完整内核：包含 NaiveProxy（Cronet）与 MASQUE，不再区分 lite/naive。
 
 以前 `testing` + `macos-client` 双开发线的状态已经结束：macOS client 的内容全部并入
 `testing`，不再需要跨分支同步。
@@ -25,17 +28,18 @@ registry、平台 glue、CI 与打包** 区分，不存在 Server 版和 Mac 版
 
 ## 构建 profile
 
-| | Server Minimal | macOS Lite | macOS Naive |
-| --- | --- | --- | --- |
-| 平台 | `linux/amd64` | `darwin/arm64` | `darwin/arm64` |
-| build tag | `jiejie_server_minimal` | `jiejie_client_macos` | `jiejie_client_macos` + `with_naive_outbound` |
-| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` | 同 Lite |
-| CGO | `0` | `0` | `1`（Cronet） |
-| tag 文件 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS_NAIVE` |
-| 实测大小 | 48,605,024 B | 57,934,354 B | 76,166,402 B |
+| | Server Minimal | macOS Client |
+| --- | --- | --- |
+| 平台 | `linux/amd64` | `darwin/arm64` |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` + `with_naive_outbound` |
+| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
+| CGO | `0` | `1`（Cronet） |
+| tag 文件 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
+| 实测大小 | 48,605,024 B | 76,166,402 B |
+| artifact | `Jiejie-Linux-amd64-…` | `Jiejie-macOS-arm64-…` |
 
-每个 profile 都可用 `-trimpath -buildvcs=false` **逐字节复现**（连续两次构建
-SHA-256 一致）。
+两个产品都可用 `-trimpath -buildvcs=false` **逐字节复现**（连续两次构建 SHA-256
+一致，包括 CGO/Cronet 的 macOS 内核）。
 
 详细说明见 [`docs/BUILD-PROFILES.md`](docs/BUILD-PROFILES.md)。
 
@@ -47,11 +51,8 @@ SHA-256 一致）。
 # Linux Server Minimal
 ./scripts/ci/build-server.sh linux amd64 dist/sing-box-linux-amd64
 
-# macOS Lite（CGO-free，可交叉编译）
-./scripts/ci/build-macos-client.sh arm64 lite dist/sing-box-darwin-arm64
-
-# macOS Naive（Cronet，需要 CGO）
-./scripts/ci/build-macos-client.sh arm64 naive dist/sing-box-darwin-arm64-naive
+# macOS Client（Cronet，需要 CGO）
+./scripts/ci/build-macos-client.sh arm64 dist/sing-box-darwin-arm64
 ```
 
 构建脚本从 `release/BUILD_TAGS_*` 读取 tag，profile 定义只有一处，不会与 CI 脱节。
@@ -75,24 +76,23 @@ macOS 客户端交付**原生 CLI sing-box core**。主推使用方式是
 **headless daemon + 浏览器 Web Dashboard**，不需要第三方 GUI；也支持被第三方 GUI
 当作外部 core 加载。
 
-### Lite（默认）
+**darwin/arm64，CGO=1（Cronet）**，一个内核包含全部需要的功能：
 
-- **inbound**：`tun`、`mixed`、`socks`、`http`、`direct`
+- **NaiveProxy**：Cronet 实现的 `naive` outbound（HTTP/2 与 QUIC/HTTP3）
+- **MASQUE**：`masque-client` endpoint（CONNECT-IP / CONNECT-UDP over H2 或 H3），
+  使用共享的 `transport/masque` 与 `transport/http` 数据面
+- **inbound**：`tun`（gVisor）、`mixed`、`socks`、`http`、`direct`
 - **outbound**：`direct`、`block`、`selector`、`urltest`、`socks`、`http`、
   Shadowsocks、ShadowTLS、Snell、Trojan、VLESS、VMess、AnyTLS、Hysteria2、TUIC
-- **endpoint**：`masque-client`（CONNECT-IP / CONNECT-UDP over H2 或 H3）
 - **DNS**：UDP、TCP、DoT、DoH、DoQ、DoH3、local、hosts、FakeIP
 - **管理面**：原生 `api` service（Web Dashboard）、Clash 兼容 API
-- 不含：Cronet、Naive 实现、Native Naive server、`masque-server`、
-  OpenVPN / OpenConnect / Tailscale / WireGuard / Tor / SSH
+- 不含：`masque-server`、Native Naive **server** inbound、OpenVPN / OpenConnect /
+  Tailscale / WireGuard / Tor / SSH
 
-Lite 中的 `naive` 类型**可以解析**，但构造时返回明确错误
-（`rebuild with -tags with_naive_outbound`），而不是 `unknown outbound type`。
-
-### Naive（Lite 之上）
-
-在 Lite 基础上增加 `with_naive_outbound` 与 Cronet（CGO）。Cronet 是 Lite 的
-**非必要依赖**，因此单独作为一个 profile。
+NaiveProxy 与 MASQUE 的存在不是靠 tag 名字保证的：CI 会直接检查**最终 binary 的
+symbol table**，确认 `cronet-go.NewNaiveClient`、`masque-client`、
+`transport/masque`、gVisor、Clash API 等确实链接，且 Naive stub 与
+`masque-server` 确实不存在。
 
 ### headless 使用
 
@@ -191,11 +191,19 @@ Naive server，因此标记为 **NOT TESTED**，benchmark 脚本已提交。
 ./scripts/ci/check-macos-client-headless.sh dist/sing-box-darwin-arm64
 ```
 
-CI 中 `.github/workflows/jiejie-profiles.yml` 会**用同一个 commit SHA** 构建全部三个
-profile，并分别执行 tag 校验、可复现性、linkage、配置检查、registry 审计与 smoke
-测试。另有按产品划分的 workflow（`server-linux-amd64.yml`、`client-macos.yml`、
-`jiejie-fast.yml`）承载更深的单项检查，它们**独立失败**：macOS client 变红不应阻塞
-server 发布。
+CI 只有两个 workflow，一个产品一个：
+
+```text
+.github/workflows/server-linux-amd64.yml   ->  sing-box-linux-amd64
+.github/workflows/client-macos.yml         ->  sing-box-darwin-arm64
+```
+
+两者都是**单个 job**，各自只 build 一次，之后所有检查（tag 校验、config check、
+runtime/headless smoke、registry/symbol audit、size、SHA256、BUILD-INFO、上传）
+都复用同一个 binary。
+
+耗时的深度验证（race、fuzz、reference differential、QUICHE interop、Cronet A/B）
+不再在普通 push 上运行，改为手动 `workflow_dispatch` + `deep_checks=true`。
 
 ---
 
@@ -203,7 +211,7 @@ server 发布。
 
 | 文档 | 内容 |
 | --- | --- |
-| [`docs/BUILD-PROFILES.md`](docs/BUILD-PROFILES.md) | 三个 profile、构建、可复现性、CI |
+| [`docs/BUILD-PROFILES.md`](docs/BUILD-PROFILES.md) | 两个 profile、构建、可复现性、CI |
 | [`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md) | macOS 客户端完整说明 |
 | [`docs/JIEJIE-MASQUE-PERFORMANCE.md`](docs/JIEJIE-MASQUE-PERFORMANCE.md) | MASQUE 性能测量与决定 |
 | [`docs/JIEJIE-NAIVE-CLIENT-AUDIT.md`](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) | Naive 客户端审计与未测项 |
