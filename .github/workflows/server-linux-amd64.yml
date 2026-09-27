@@ -265,9 +265,15 @@ jobs:
           echo "PASS: a pruned inbound type is rejected"
 
       - name: runtime smoke test
-        # Starts the real binary and talks to its real API. A config check proves
-        # the configuration parses; this proves the process runs, listens, answers
-        # and shuts down cleanly.
+        # Starts the real binary and talks to it over a real socket. A config check
+        # proves the configuration parses; this proves the process runs, binds its
+        # listener, accepts a connection and shuts down cleanly.
+        #
+        # There is deliberately NO API readiness probe here. Server Minimal
+        # registers no service at all - no Clash API, no native API - because the
+        # production topology uses none (see ServiceRegistry in
+        # include/registry_jiejie_server.go). Readiness is therefore observed the
+        # way an operator would observe it: the listener accepts.
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
@@ -275,33 +281,47 @@ jobs:
           {
             "log": {"level": "info"},
             "inbounds": [
-              {"type": "mixed", "tag": "smoke-in", "listen": "127.0.0.1", "listen_port": 19301}
+              {
+                "type": "shadowsocks", "tag": "smoke-in",
+                "listen": "127.0.0.1", "listen_port": 19301,
+                "method": "2022-blake3-aes-128-gcm",
+                "password": "AAAAAAAAAAAAAAAAAAAAAA==",
+                "network": "tcp"
+              }
             ],
             "outbounds": [{"type": "direct", "tag": "direct"}],
-            "experimental": {"clash_api": {"external_controller": "127.0.0.1:19302"}},
             "route": {"final": "direct"}
           }
           JSON
+
           ./"$BINARY" run -c "$workdir/smoke.json" > "$workdir/smoke.log" 2>&1 &
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT
 
+          # Wait for the listener, polling with a real connect rather than sleeping
+          # a fixed amount, so a slow start is not mistaken for a failure.
           ready=""
           for _ in $(seq 1 100); do
-            if curl -sf http://127.0.0.1:19302/version >/dev/null 2>&1; then ready=1; break; fi
+            if python3 -c "
+          import socket,sys
+          try:
+              socket.create_connection(('127.0.0.1',19301),timeout=1).close()
+          except Exception:
+              sys.exit(1)
+          " 2>/dev/null; then ready=1; break; fi
+            if ! kill -0 $pid 2>/dev/null; then
+              echo "FAIL: the process exited before its listener came up" >&2
+              cat "$workdir/smoke.log" >&2
+              exit 1
+            fi
             sleep 0.2
           done
-          [ -n "$ready" ] || { echo "FAIL: API never became reachable" >&2; cat "$workdir/smoke.log" >&2; exit 1; }
-          echo "PASS: API reachable"
-          curl -sf http://127.0.0.1:19302/version | head -c 200; echo
-
-          # The mixed inbound must accept a real TCP connection.
-          python3 - <<'PY'
-          import socket
-          s = socket.create_connection(("127.0.0.1", 19301), timeout=5)
-          s.close()
-          print("PASS: mixed inbound accepted a TCP connection")
-          PY
+          [ -n "$ready" ] || {
+            echo "FAIL: the inbound listener never accepted a connection" >&2
+            cat "$workdir/smoke.log" >&2
+            exit 1
+          }
+          echo "PASS: the process is up and its inbound accepted a TCP connection"
 
           kill -TERM $pid
           wait $pid || true
@@ -310,7 +330,12 @@ jobs:
             cat "$workdir/smoke.log" >&2
             exit 1
           fi
-          echo "PASS: clean shutdown, no panic"
+          if ! grep -q "sing-box started" "$workdir/smoke.log"; then
+            echo "FAIL: the log does not show a successful start" >&2
+            cat "$workdir/smoke.log" >&2
+            exit 1
+          fi
+          echo "PASS: started cleanly and shut down on SIGTERM with no panic"
 
       - name: dependency pruning and registry audit
         # Reads the symbol table of the binary that was ALREADY built, via the
