@@ -17,12 +17,7 @@
 
 Server 与 macOS Client 共享全部协议与 transport 源码（MASQUE、Naive、HTTP/2、
 HTTP/3、QUIC、buffer、framing、安全修复）。两者只通过 **build tags、registry、
-平台 glue、CI 与打包** 区分，不存在 Server 版和 Mac 版的第二份实现。
-
-macOS 端是**一个**完整内核：包含 NaiveProxy（Cronet）与 MASQUE，不再区分 lite/naive。
-
-以前 `testing` + `macos-client` 双开发线的状态已经结束：macOS client 的内容全部并入
-`testing`，不再需要跨分支同步。
+平台 glue、CI 与打包** 区分，不存在第二份实现。
 
 ---
 
@@ -31,15 +26,26 @@ macOS 端是**一个**完整内核：包含 NaiveProxy（Cronet）与 MASQUE，�
 | | Server Minimal | macOS Client |
 | --- | --- | --- |
 | 平台 | `linux/amd64` | `darwin/arm64` |
-| build tag | `jiejie_server_minimal` | `jiejie_client_macos` + `with_naive_outbound` |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` 等 9 个 |
 | registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
 | CGO | `0` | `1`（Cronet） |
 | tag 文件 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
-| 实测大小 | 48,605,024 B | 76,166,402 B |
-| artifact | `Jiejie-Linux-amd64-…` | `Jiejie-macOS-arm64-…` |
+| 实测大小 | 33,767,608 B | 76,819,170 B |
 
-两个产品都可用 `-trimpath -buildvcs=false` **逐字节复现**（连续两次构建 SHA-256
-一致，包括 CGO/Cronet 的 macOS 内核）。
+macOS tag 完整列表：
+
+```text
+with_gvisor,with_quic,with_utls,with_clash_api,with_naive_outbound,
+with_lxd,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+```
+
+Server tag：
+
+```text
+with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0
+```
+
+两个产品都可用 `-trimpath -buildvcs=false` **逐字节复现**。
 
 详细说明见 [`docs/BUILD-PROFILES.md`](docs/BUILD-PROFILES.md)。
 
@@ -63,18 +69,35 @@ macOS 端是**一个**完整内核：包含 NaiveProxy（Cronet）与 MASQUE，�
 
 面向单台 VPS 的生产二进制，只注册该拓扑真正使用的组件：
 
-- **inbound**：MASQUE over HTTP/2 与 HTTP/3（UDP/443）、AnyTLS、Native Naive
-  （含 UoT v1/v2 与 Web masquerade）、ShadowTLS v3、Shadowsocks 2022
+- **inbound**：MASQUE over HTTP/2 与 HTTP/3（UDP/443）、AnyTLS、ShadowTLS v3、
+  Shadowsocks 2022
 - **outbound**：`direct` 与住宅 SOCKS5 上游
 - 不含客户端组件、Cronet、GUI 相关 service，也不含未使用的协议树
+
+### 组件职责划分
+
+这台 VPS 上的代理能力**不是由一个 sing-box 进程全部承担**的：
+
+| 组件 | 负责 |
+| --- | --- |
+| **Jiejie sing-box Server Core** | MASQUE L4（HTTP CONNECT / CONNECT-UDP，HTTP/3 主路径 + HTTP/2 fallback）、AnyTLS、ShadowTLS v3、Shadowsocks 2022、direct / 住宅 SOCKS5 出口、local DNS → AdGuard Home |
+| **Caddy** | NaiveProxy（`forwardproxy@udpintcp`），含 UoT v2 |
+| **Xray** | VLESS Reality / Vision / XHTTP |
+
+因此 **Native Naive inbound 已从 Server Minimal 裁剪**：NaiveProxy 由 Caddy 提供，
+sing-box 不再注册该 entry point。`protocol/naive` 源码保留（full registry、客户端
+测试与 macOS Naive 仍在使用），只是不再进入本 profile 的 import graph。
+
+同理，MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是
+`masque-client` / `masque-server` L3 endpoint。
 
 ---
 
 ## macOS Client 功能
 
-macOS 客户端交付**原生 CLI sing-box core**。主推使用方式是
-**headless daemon + 浏览器 Web Dashboard**，不需要第三方 GUI；也支持被第三方 GUI
-当作外部 core 加载。
+macOS 客户端交付**原生 CLI sing-box core**，主推使用方式是
+**JiejieBox GUI → mTLS → sing-box `lxd` daemon**。同时也支持 CLI 直接运行、
+浏览器 Web Dashboard，以及被第三方 GUI 当作外部 core 加载。
 
 **darwin/arm64，CGO=1（Cronet）**，一个内核包含全部需要的功能：
 
@@ -83,9 +106,10 @@ macOS 客户端交付**原生 CLI sing-box core**。主推使用方式是
   使用共享的 `transport/masque` 与 `transport/http` 数据面
 - **inbound**：`tun`（gVisor）、`mixed`、`socks`、`http`、`direct`
 - **outbound**：`direct`、`block`、`selector`、`urltest`、`socks`、`http`、
-  Shadowsocks、ShadowTLS、Snell、Trojan、VLESS、VMess、AnyTLS、Hysteria2、TUIC
+  Shadowsocks（含 2022）、ShadowTLS、Snell、Trojan、VLESS（含 Reality / Vision）、
+  VMess、AnyTLS、Hysteria2、TUIC
 - **DNS**：UDP、TCP、DoT、DoH、DoQ、DoH3、local、hosts、FakeIP
-- **管理面**：原生 `api` service（Web Dashboard）、Clash 兼容 API
+- **管理面**：原生 `api` service（Web Dashboard）、Clash 兼容 API、`lxd` daemon
 - 不含：`masque-server`、Native Naive **server** inbound、OpenVPN / OpenConnect /
   Tailscale / WireGuard / Tor / SSH
 
@@ -121,67 +145,13 @@ scripts/macos/uninstall-launchd.sh
 
 ---
 
-## MASQUE
-
-MASQUE 是 Server 与 Client **共享的数据面**，只有 registry 角色不同：
-
-```text
-protocol/masque/       共享实现
-transport/masque/      共享数据面（session、framing、capsule、CONNECT-IP）
-transport/http/        共享 HTTP/2 / HTTP/3 与 datagram 处理
-
-RegisterClientEndpoint()  →  masque-client
-RegisterServerEndpoint()  →  masque-server
-RegisterEndpoint()        →  两者（upstream / server 默认）
-```
-
-- macOS Client 只注册 `masque-client`，**不注册** `masque-server`
-- 因此 macOS 上：
-
-```text
-masque-client  ✅
-masque-server  ❌
-```
-
-已完成的性能工作（均有 benchmark 与 benchstat 数据）：
-
-- **HTTP/3 datagram ingress 去掉一次整包 memcpy**：geomean `-56.69%`
-  （p=0.000, n=10），MTU 尺寸吞吐 `+184%`
-- **packet hot path 状态读取改为 immutable snapshot + atomic.Pointer**：
-  `-95.25%`（p=0.000, n=8），`B/op`、`allocs/op` 均为 0
-- **route lookup**：已 benchmark（1/4/16/64/256 条），依实测**保留线性扫描**
-- **客户端 QUIC congestion control**：新增可配置项，默认仍为 quic-go 行为
-
-细节与未测项见
-[`docs/JIEJIE-MASQUE-PERFORMANCE.md`](docs/JIEJIE-MASQUE-PERFORMANCE.md)。
-
----
-
-## Naive
-
-- **Server Minimal**：Native Naive inbound，含 UoT v1/v2 与 Web masquerade
-- **macOS Naive**：Cronet 实现的 Naive outbound（HTTP/2 与 QUIC/HTTP3）
-
-已移除 macOS 上**无用的 server-only HTTP/3 listener linkage**
-（`protocol/naive/quic` 的 `init()` 只安装 server listener），实测减少 19 个 symbol；
-binary 体积变化很小，收益在正确性——client 不再链接它跑不起来的 server。
-
-Cronet engine 策略（`insecure_concurrency` 在 macOS 默认起 N 个 engine）增加了
-opt-in 的 `insecure_concurrency_single_engine` 开关，**默认行为未改**；A/B 需要真实
-Naive server，因此标记为 **NOT TESTED**，benchmark 脚本已提交。
-
-细节见
-[`docs/JIEJIE-NAIVE-CLIENT-AUDIT.md`](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md)。
-
----
-
 ## 验证
 
 ```bash
-# registry 与 symbol 审计
+# registry 与 symbol 审计（一次 nm 覆盖 registry、symbol、capability）
 ./scripts/ci/audit-macos-client-registry.sh dist/sing-box-darwin-arm64
 
-# 配置检查
+# 配置检查（由上面的审计内部调用，同时验证 fixture 与 example-config.json）
 ./scripts/ci/check-macos-client-config.sh dist/sing-box-darwin-arm64 /tmp/cfg
 
 # 运行时 smoke（启动、Clash API、mixed inbound、SIGTERM）
@@ -202,8 +172,69 @@ CI 只有两个 workflow，一个产品一个：
 runtime/headless smoke、registry/symbol audit、size、SHA256、BUILD-INFO、上传）
 都复用同一个 binary。
 
-耗时的深度验证（race、fuzz、reference suite、Cronet A/B）
-不再在普通 push 上运行，改为手动 `workflow_dispatch` + `deep_checks=true`。
+耗时的深度验证（vet、race、fuzz、reproducibility、reference suite、Cronet A/B）
+不在普通 push 上运行，改为手动 `workflow_dispatch` + `deep_checks=true`。
+
+---
+
+## 更新记录
+
+本轮开发周期内的主要改动。commit hash 可在 GitHub 上直接查看。
+
+### 产品裁剪与 registry
+
+- `f043f6f39` — 从 Server Minimal registry 与 production fixture 移除 Native Naive
+  （NaiveProxy 已由 Caddy 提供），并补上「必须不存在」的 contract 断言。
+- `5af859762` — 新增 macOS minimal client registry 与 build profile。
+- `8f1ba42a9` — 拆分 MASQUE client / server endpoint 注册，使 macOS 只链接 client 角色。
+- `564822086` — 注册原生 `api` service，使 Web Dashboard 可达。
+- `486b7e8e1` — 把 LXD daemon 支持移植进 macOS core（mTLS + `lxd` 子命令）。
+- `387820439` — 移除 dev-only 的 `sing-tun` replace。
+
+### MASQUE / HTTP3
+
+- `a2a7a9a30` — 消除 HTTP/3 CONNECT-UDP 的 deferred activation 竞态。
+- `ecdc966ab` — 拒绝 CONNECT-IP template target 中的反斜杠。
+- `143f886e2` — peer 提前断开时释放 setup-window datagram。
+- `62d59003e` — 在返回成功前完成 CONNECT-UDP target setup。
+- `4fc9984b3` — capsule 路径接受最大的普通 IPv6 包。
+
+### 性能（均有 benchmark 数据）
+
+- `9739c42a8` / `3b8d99a21` — HTTP/3 datagram ingress 去掉一次整包拷贝。
+- `6d94da584` — packet hot path 状态读取改为 immutable snapshot + atomic.Pointer。
+- `01ae0d308` — 批量转发 HTTP/3 CONNECT-UDP 包。
+- `ec2b4b91e` — CONNECT-UDP 使用 connected UDP。
+- `680f5d89d` — 调整生产 HTTP/2 receive window。
+- `6678bf348` — 首次传输后扩大 tunnel buffer。
+- `4130117ae` — 增加 opt-in 的 single Cronet engine 开关（默认行为不变）。
+
+细节与未测项见
+[`docs/JIEJIE-MASQUE-PERFORMANCE.md`](docs/JIEJIE-MASQUE-PERFORMANCE.md)。
+
+### Naive
+
+- `bbcabc9a2e` — UoT v1/v2 数据面与端到端覆盖。
+- `45f6686a61` — Native Naive inbound（认证 CONNECT、Padding、Web masquerade）。
+- `58985a3759` — 与官方 NaiveProxy 客户端的兼容性验证。
+- `23af897bfd` — 停止接受非标准的 `-connect-authority` header。
+- `fb90272a50` — Padding 写路径遵守 `io.Writer` 的 short-write 契约。
+
+### 正确性与依赖
+
+- `7756ee514` — 修复带后缀的开发版本号触发 `invalid deprecated note` panic。
+- `df31ff950` — 上游同步后修复 test module。
+- `d24028a`（`Piggy-Cat-bit-shadow/sing`）— 补回 `EnableUDPFragment`，供上游同步后使用。
+
+### CI
+
+- `89819993c` — 精简产品验证：移除低信息量的 full jiejie suite、upstream-default
+  兼容构建与重复的 macOS step；go vet / reproducibility 移入 deep。
+- `0a3993a8c` — 移除 QUICHE live interop。
+- `d738f6c73` — Linux fast path 只构建 kernel，不再跑协议实验。
+- `c3c654978` — `build-server.sh` 成为唯一构建入口并注入 version。
+
+完整开发历史可用 `git log --no-merges` 查看；本 README 只列主要改动。
 
 ---
 
@@ -213,9 +244,10 @@ runtime/headless smoke、registry/symbol audit、size、SHA256、BUILD-INFO、�
 | --- | --- |
 | [`docs/BUILD-PROFILES.md`](docs/BUILD-PROFILES.md) | 两个 profile、构建、可复现性、CI |
 | [`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md) | macOS 客户端完整说明 |
+| [`docs/JIEJIE-SERVER.md`](docs/JIEJIE-SERVER.md) | 服务端部署说明 |
 | [`docs/JIEJIE-MASQUE-PERFORMANCE.md`](docs/JIEJIE-MASQUE-PERFORMANCE.md) | MASQUE 性能测量与决定 |
 | [`docs/JIEJIE-NAIVE-CLIENT-AUDIT.md`](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) | Naive 客户端审计与未测项 |
-| [`docs/JIEJIE-SERVER.md`](docs/JIEJIE-SERVER.md) | 服务端部署说明 |
+| [`docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md`](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) | MASQUE 参考实现对照审计 |
 
 ---
 
