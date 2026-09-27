@@ -230,6 +230,22 @@ jobs:
           set -euo pipefail
           topology="release/jiejie-production-topology.json"
           [ -f "$topology" ] || { echo "FAIL: $topology is missing" >&2; exit 1; }
+
+          # The topology references TLS material at /tmp/jiejie-fixture, the same
+          # paths the test suite uses. `check` LOADS the certificates rather than
+          # merely parsing the paths, so they must exist for the configuration to
+          # validate. A throwaway self-signed pair is enough: the point is that the
+          # registry resolves every type the topology names and that the TLS
+          # settings are well formed, not that the certificates are the production
+          # ones.
+          mkdir -p /tmp/jiejie-fixture
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout /tmp/jiejie-fixture/key.pem \
+            -out /tmp/jiejie-fixture/cert.pem \
+            -subj "/CN=example.test" \
+            -addext "subjectAltName=DNS:example.test,DNS:localhost,IP:127.0.0.1" \
+            2>/dev/null
+
           echo "checking $topology"
           ./"$BINARY" check -c "$topology"
           echo "PASS: the production topology validates against the shipped registry"
