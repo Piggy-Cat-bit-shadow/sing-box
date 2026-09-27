@@ -60,6 +60,32 @@ The three registries are mutually exclusive and complete:
 `include/quic.go` (upstream full), `include/quic_minimal.go` (server) and
 `include/quic_client_macos.go` (client).
 
+### Control plane vs data plane
+
+The client has two independent planes, and keeping them separate is what makes a
+broken dashboard harmless:
+
+```text
+DATA PLANE   inbound (tun / mixed) -> router -> DNS -> outbound -> network
+             Nothing here depends on the control plane.
+
+CONTROL PLANE  native `api` service  -> gRPC-Web / WebSocket -> Web Dashboard
+               Clash `clash_api`     -> REST / WebSocket     -> third-party GUIs
+```
+
+If the dashboard fails to download, is corrupt, or is unreachable, the data plane
+is unaffected: the core still starts, proxies, resolves DNS and runs TUN. The
+control plane is a consumer of the core, never a dependency of it.
+
+### macOS helper scripts
+
+| script | purpose |
+| --- | --- |
+| `scripts/macos/run-headless.sh` | foreground runner: validates then `exec`s the core |
+| `scripts/macos/launchd.sh` | install / start / stop / restart / status / logs / uninstall |
+| `scripts/macos/install-launchd.sh` | wrapper for `launchd.sh install` |
+| `scripts/macos/uninstall-launchd.sh` | wrapper for `launchd.sh uninstall` |
+
 ## Relationship to the removed iOS/client lines
 
 Commit `5ce3c4d675` ("narrow the fork to VPS-only and remove the iOS/client
@@ -255,16 +281,106 @@ registry does not import never enters the import graph, so the linker drops it a
 its whole dependency tree. **No upstream protocol source is edited or deleted**,
 which is what keeps the upstream full build working — verified by building it.
 
-## Clash API
+## Management planes
 
-The external controller is a hard requirement, because that is how a third-party
-GUI drives an external core.
+sing-box ships **two independent management services**. Both are available in this
+build, they run simultaneously in one process, and they serve different purposes.
+
+| | native `api` | Clash compatibility |
+| --- | --- | --- |
+| config key | `services: [{"type":"api"}]` | `experimental.clash_api` |
+| protocol | gRPC over gRPC-Web, WebSocket, and h2c | REST + WebSocket |
+| dashboard | **yes** — serves the sing-box Web Dashboard | external UI only |
+| role | primary control plane | compatibility |
+
+The native service is the **primary** plane; the Clash API is retained as a
+**compatibility** plane. It is deliberately not removed: third-party GUIs, existing
+dashboards, ecosystem tools and debugging workflows depend on it.
+
+### Native API service
+
+```json
+{
+  "services": [
+    {
+      "type": "api",
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "listen_port": 9090,
+      "dashboard": { "enabled": true, "path": "dashboard" }
+    }
+  ]
+}
+```
+
+`listen` is loopback by default in the shipped example. `secret` is supported: set
+it and the credential is required on the API, which matters if you ever bind a
+non-loopback address. The API also supports TLS (`tls`) and CORS
+(`access_control_allow_origin`), and `access_control_allow_private_network`
+controls whether a browser on a public page may reach a private-network address.
+
+`Dashboard` accepts three forms: `true`, a path string, or an object. The object
+form adds `download_url`, `http_client` and `update_interval`.
+
+Verified to work against a real running process, over real HTTP:
+
+| operation | method | verified |
+| --- | --- | --- |
+| version | `GetVersion` | **PASS** — returns `1.15.0-jiejie-masquerade.5`, grpc-status 0 |
+| groups | `SubscribeGroups` | **PASS** — decodes to the real selector/urltest tree with `type`, `selectable`, `selected` |
+| switch selector | `SelectOutbound` | **PASS** — and the change reads back (`auto` → `direct`) |
+| URL test | `URLTest` | **PASS** |
+| traffic / status | `SubscribeStatus` | **PASS** — streams |
+| logs | `SubscribeLog` | **PASS** — streams |
+| connections | `SubscribeConnections` | **PASS** — streams |
+| close connections | `CloseAllConnections` | **PASS** |
+| outbound list | `SubscribeOutbounds` | **PASS** — streams |
+| clash mode | `SetClashMode` | **PASS** |
+| clear logs | `ClearLogs` | **PASS** |
+
+### Web Dashboard
+
+The dashboard is **not** vendored into this repository. The profile reuses
+upstream's mechanism, which is the right design for all four reasons the task
+cares about:
+
+- the binary stays clean — no front-end source in the tree;
+- the dashboard is independently updatable;
+- it is not coupled to the core;
+- **a dashboard failure cannot stop the core.** The static file server and the
+  download live in the control plane. If the download fails, is corrupt, or the
+  network is unreachable, the core still starts, proxies, resolves DNS and runs
+  TUN. Verified: the core was started with an empty dashboard directory and no
+  reachable archive path and kept serving traffic.
+
+Configuration: `dashboard.enabled`, `path` (default `dashboard`, relative to the
+working directory), `download_url` (default is upstream's
+`sing-box-dashboard` `gh-pages` archive), `http_client`, and `update_interval`
+(default 24h). The download is etag-aware, so an unchanged archive is not
+re-fetched.
+
+Serving: `GET /` redirects `302` to `/dashboard/`, which serves the SPA. If
+`dashboard.path` already contains files **without** an `.etag` marker file, they
+are treated as user-provided and auto-update is disabled — that is how you vendor
+your own UI.
+
+Verified locally against a real download:
+
+| check | result |
+| --- | --- |
+| archive downloads, extracts, serves | **PASS** |
+| `GET /` redirects to `/dashboard/` | **PASS** (302) |
+| `GET /dashboard/` returns real HTML | **PASS** |
+| JS bundle served | **PASS** (1.25 MB, HTTP 200) |
+| dashboard fetch in CI | **NOT-TESTED** — CI must not depend on the public network |
+
+### Clash compatibility API
 
 ```json
 {
   "experimental": {
     "clash_api": {
-      "external_controller": "127.0.0.1:9090",
+      "external_controller": "127.0.0.1:9091",
       "default_mode": "rule"
     }
   }
@@ -275,13 +391,15 @@ Verified to answer, on a real running process, on both flavors:
 
 | endpoint | verified |
 | --- | --- |
-| `GET /version` | yes — returns `{"meta":true,"premium":true,"version":"sing-box 1.15.0-jiejie-masquerade.5"}` |
-| `GET /proxies` | yes — `GLOBAL`, `proxy`, `auto`, `manual-node`, `direct`, `block` |
-| `GET /proxies/select` | yes — type `Selector`, with a populated `all` list |
-| `GET /proxies/urltest` | yes — type `URLTest`, with a populated `all` list |
-| `GET /connections` | yes |
-| `GET /configs` | yes |
-| `GET /traffic` | yes — streams JSON objects |
+| `GET /version` | **PASS** — `{"meta":true,"premium":true,"version":"sing-box 1.15.0-jiejie-masquerade.5"}` |
+| `GET /proxies` | **PASS** — `GLOBAL`, `select`, `auto`, `direct`, `block` |
+| `GET /proxies/select` | **PASS** — type `Selector`, populated `all` |
+| `GET /proxies/urltest` | **PASS** — type `URLTest`, populated `all` |
+| `GET /connections` | **PASS** |
+| `GET /configs` | **PASS** |
+| `GET /traffic` | **PASS** — streams JSON |
+
+Both planes were confirmed working **in the same process**, on separate ports.
 
 ## TUN
 
@@ -326,46 +444,148 @@ The audit distinguishes the flavors at the symbol level, because both register t
 `naive` *type* and only one links the implementation: it counts `cronet-go`
 symbols and requires zero for lite and non-zero for naive.
 
-## GUI usage
+## Usage
 
-This core is designed to be loaded as an **external sing-box executable**. No
-specific GUI is required or assumed — any GUI that can be pointed at an external
-sing-box binary will work, including GUI clients that manage their own TUN device
+Two modes, and the same binary supports both. They are not exclusive: pick one,
+or run the headless mode and point a GUI at it later.
+
+| | Mode A — Headless + Web Dashboard | Mode B — External GUI Core |
+| --- | --- | --- |
+| control | your browser | the GUI |
+| needs a GUI | no | yes |
+| recommended | **yes** | optional |
+| TUN | needs root | GUI manages it |
+| works unattended | yes, via launchd | depends on the GUI |
+
+### Mode A — Headless + Web Dashboard (recommended)
+
+No third-party GUI is required. sing-box serves its own dashboard, and launchd
+keeps it running.
+
+```bash
+chmod +x sing-box-darwin-arm64
+
+# 1. Validate.
+./sing-box-darwin-arm64 check -c config.json
+
+# 2. Set up a working directory OUTSIDE ~/Desktop, ~/Documents and ~/Downloads
+#    (see the TCC note below), then run in the foreground:
+./scripts/macos/run-headless.sh config.json
+
+# 3. Open the dashboard.
+open http://127.0.0.1:9090/
+```
+
+Step 2 can be replaced by a supervised service:
+
+```bash
+./scripts/macos/install-launchd.sh config.json   # install + start
+./scripts/macos/launchd.sh status                # is it running?
+./scripts/macos/launchd.sh restart
+./scripts/macos/launchd.sh logs                  # follow the logs
+./scripts/macos/uninstall-launchd.sh
+```
+
+install-launchd.sh and uninstall-launchd.sh are thin wrappers over
+`scripts/macos/launchd.sh`, which also provides `start`, `stop`, `restart`,
+`status` and `logs`. Run it with no arguments for the full list.
+
+The dashboard gives you: run status and traffic, outbound and selector groups,
+switching a selector, running a URL test, live connections and closing them, and
+logs.
+
+**The dashboard is optional at runtime.** If it fails to download or is corrupt,
+the core still starts and proxies — the control plane and the data plane are
+separate. Nothing about the proxy depends on the UI.
+
+### Mode B — External GUI Core (optional)
+
+Any GUI that can be pointed at an external sing-box executable works. No specific
+GUI is required or assumed, including GUI clients that manage their own TUN device
 and expect only a working sing-box core.
 
 ```bash
-# 1. Make it executable.
 chmod +x sing-box-darwin-arm64
 
-# 2. Confirm it runs and is the right build.
+# Confirm it runs and is the right build.
 ./sing-box-darwin-arm64 version
 #   sing-box version 1.15.0-jiejie-masquerade.5
 #   Environment: go1.25.5 darwin/arm64
 #   Tags: with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0
 #   CGO: disabled
 
-# 3. Validate a configuration before running it.
-./sing-box-darwin-arm64 check -c config.json
-
-# 4. Run it.
-./sing-box-darwin-arm64 run -c config.json
+./sing-box-darwin-arm64 check  -c config.json
+./sing-box-darwin-arm64 run    -c config.json
 
 # Other useful commands:
 ./sing-box-darwin-arm64 format -c config.json      # reformat a config
 ./sing-box-darwin-arm64 generate reality-keypair   # Reality key material
 ```
 
-A starting-point configuration is shipped at
-`test/jiejie/macos-client/example-config.json`. It is validated by CI on every
-run. It contains **no real credentials or endpoints** — the server address is a
-documentation address and the Reality public key is a throwaway generated for the
-example. Replace them.
+GUIs that expect a Clash-style controller should point at
+`experimental.clash_api.external_controller`; GUIs that speak the native API
+should point at the `services` `api` entry. Both are in the shipped examples.
 
-> **Port note.** The example uses `7890` for the mixed inbound and `9090` for the
-> Clash API, which are the conventional sing-box defaults. If the machine already
-> runs a proxy on those ports, the core fails to start with
-> `bind: address already in use`. Change `listen_port` and
-> `external_controller` before running it on such a machine.
+### Example configurations
+
+Two starting points ship and are validated by CI on every run. Neither contains
+real credentials or endpoints — the server address is a documentation address and
+the Reality public key is a throwaway generated for the example.
+
+| file | purpose |
+| --- | --- |
+| `test/jiejie/macos-client/example-headless.json` | Mode A: TUN + mixed, native API with dashboard on `127.0.0.1:9090`, Clash API on `127.0.0.1:9091` |
+| `test/jiejie/macos-client/example-config.json` | Mode B: TUN + mixed, Clash API only, for external-GUI use |
+
+> **Port note.** Both examples use the conventional sing-box ports (`7890` mixed,
+> `9090`/`9091` controllers). If the machine already runs a proxy on those ports,
+> the core fails to start with `bind: address already in use`. Change
+> `listen_port`, `listen_port` and `external_controller` before running on such a
+> machine. This is not hypothetical: it happened while testing this build.
+
+> **TCC note (`~/Desktop`, `~/Documents`, `~/Downloads`).** macOS privacy
+> protection blocks launchd from reading binaries and configs under those
+> directories. The failure is silent and misleading: `launchctl` reports
+> `state = running` with a real pid, while the process is blocked in `dyld`
+> before it ever execs, producing no output, no log lines and no listening port.
+> Keep the binary, the config and the working directory somewhere unprotected,
+> for example `~/.local/share/jiejie/`. Running in the foreground is unaffected,
+> because Terminal already holds the user's grant. `install-launchd.sh` warns
+> when it detects this.
+
+### Privilege model
+
+The two modes have genuinely different requirements, and it is worth being precise
+about which is which.
+
+| mode | root required? | why |
+| --- | --- | --- |
+| mixed / SOCKS / HTTP proxy | **no** | binds an unprivileged port above 1024 on loopback |
+| TUN | **yes — always** | creating a `utun` device goes through the `AF_SYSTEM` / `SYSPROTO_CONTROL` "utun" kernel control, which macOS restricts to root |
+
+Verified on this machine: a mixed-only config runs as uid 501 with no privilege
+escalation. The same binary with a TUN config fails as uid 501 with
+
+```text
+FATAL start inbound/tun[tun-in]: configure tun interface: Connect: operation not permitted
+```
+
+and adding `auto_route` / `strict_route` does not change the failure point — it
+fails at `utun` creation, before any routing is touched. This is a kernel-level
+restriction, not a file-permission problem, so `chmod`/`chown` cannot solve it and
+this project does not attempt to.
+
+Consequences, stated plainly:
+
+- **TUN mode cannot run from a per-user LaunchAgent.** A LaunchAgent runs as your
+  uid and cannot create a `utun`. `install-launchd.sh` refuses a TUN config at
+  install time rather than letting launchd restart-loop on the error forever.
+- TUN mode is therefore either run in the foreground with `sudo`, or installed as
+  a **root LaunchDaemon** in `/Library/LaunchDaemons`.
+- This project does **not** install a root daemon by default. That is a
+  system-wide privileged change and should be a deliberate decision; the emitted
+  plist documents how to adapt it if you want that.
+- No insecure escalation helper is provided, and none is planned.
 
 ## Building
 
@@ -396,6 +616,7 @@ BIN=dist/sing-box-darwin-arm64
 
 ./scripts/ci/check-macos-client-config.sh   "$BIN" /tmp/fixture   # config check
 ./scripts/ci/check-macos-client-runtime.sh  "$BIN" /tmp/runtime   # runtime + Clash API
+./scripts/ci/check-macos-client-headless.sh "$BIN" /tmp/headless  # native Web API + control plane
 ./scripts/ci/audit-macos-client-registry.sh "$BIN"                # registry + symbols
 ```
 
@@ -434,7 +655,23 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | excluded packages absent (`go tool nm`) | **PASS** | masque, openvpn, openconnect, ssh, tor, redirect, resolved, ssmapi, usbip, wireguard, hysteria v1, dhcp, bridge |
 | `jiejie_server_minimal` still builds | **PASS** | Linux amd64 build unaffected |
 | upstream full registry still builds | **PASS** | 108 MB darwin build |
-| **runtime TUN / real system traffic** | **NOT-TESTED** | needs root and host route changes |
+| native `api` service accepted by `check` | **PASS** | `services: [{"type":"api"}]` |
+| native API `GetVersion` over gRPC-Web | **PASS** | real HTTP, grpc-status 0 |
+| native API groups / selector state | **PASS** | `SubscribeGroups` decoded |
+| native API switch selector | **PASS** | read back `auto` → `direct` |
+| native API URLTest / CloseAllConnections / ClearLogs / SetClashMode | **PASS** | grpc-status 0 |
+| native API streaming (`Status`, `Log`, `Connections`, `Outbounds`) | **PASS** | real frames |
+| both management planes in one process | **PASS** | native + Clash on separate ports |
+| Web Dashboard download, extract, serve | **PASS** | real archive from upstream, HTML + 1.25 MB bundle |
+| `GET /` → `/dashboard/` redirect | **PASS** | 302 |
+| core runs with dashboard unavailable | **PASS** | control plane does not gate the data plane |
+| `run-headless.sh` start + SIGINT | **PASS** | exit 0, signal reaches the core |
+| launchd install / start / stop / restart / status / uninstall | **PASS** | real LaunchAgent, real `launchctl` |
+| launchd KeepAlive respawn after SIGKILL | **PASS** | `runs=4`, new pid, API answering again |
+| mixed mode without root | **PASS** | runs as uid 501, no escalation |
+| TUN mode without root | **PASS** (as a documented refusal) | fails with `operation not permitted`, as expected |
+| **runtime TUN / real system traffic** | **NOT-TESTED** | needs root; `sudo` requires a password, so TUN-up could not be exercised |
+| **dashboard fetch inside CI** | **NOT-TESTED** | CI must not depend on the public network |
 | **GUI actually loading this core** | **NOT-TESTED** | no GUI is installed or driven here |
 | **real proxy connectivity** | **NOT-TESTED** | fixture servers are `127.0.0.1` placeholders |
 | **Naive against a real remote server** | **NOT-TESTED** | no remote endpoint available |
@@ -511,6 +748,21 @@ registry, so it does not enter the client binary. This was verified with
    minimal tags. This is pre-existing and profile-independent — the Linux server
    profile reports the same 19 on `testing`. Lint therefore runs with the default
    tag set, as the server workflow already does.
+8. **TUN mode cannot be supervised by a per-user LaunchAgent.** It needs root, so
+   it needs a root LaunchDaemon or a foreground `sudo` run. The project
+   deliberately does not install a root daemon for you.
+9. **The dashboard is fetched from the public internet on first start.** If that
+   fetch is blocked, the dashboard is unavailable until you provide files at
+   `dashboard.path` yourself (drop an `.etag`-less directory there and auto-update
+   is disabled). The core is unaffected either way.
+10. **A LaunchAgent cannot read files under `~/Desktop`, `~/Documents` or
+    `~/Downloads`.** macOS TCC blocks it, and the failure appears as a hang with a
+    running pid. Keep the binary and config elsewhere.
+11. **The dashboard UI itself was not driven in a browser here.** Its HTTP surface
+    (redirect, HTML, JS bundle) was verified over HTTP, but no browser session was
+    automated, so "a human can click through it" is inferred rather than tested.
+12. **`run-headless.sh` is a convenience wrapper, not a supervisor.** It does not
+    restart the core on crash; use launchd for that.
 
 ## Upstream sync
 

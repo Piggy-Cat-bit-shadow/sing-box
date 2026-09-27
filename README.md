@@ -21,17 +21,50 @@
 
 ## Jiejie Client Edition（macOS）
 
-macOS 客户端产品线交付的是**原生 CLI sing-box core**，供第三方 GUI 作为
-**外部 core** 加载。
+macOS 客户端产品线交付的是**原生 CLI sing-box core**。**主推使用方式是 headless
+daemon + 浏览器 Web Dashboard**，不需要任何第三方 GUI；作为可选兼容，也可以被第三方
+GUI 当作外部 core 加载。
 
 - 是：`sing-box-darwin-arm64` 可执行文件，支持 `version` / `check` / `run` /
-  `format` 和 Clash API
+  `format`
+- 同时提供**两套管理接口**：sing-box **原生 API + Web Dashboard**（主），以及
+  **Clash API**（兼容层，供第三方 GUI 与既有生态工具使用）
 - **不是**：Apple App、不是 Swift GUI、不是 NetworkExtension、不是 libbox、不是
   App Store 构建，也不是官方 sing-box 的替代品
 - 目标架构：`darwin/arm64`（必需）、`darwin/amd64`
 - profile：`jiejie_client_macos`（lite，默认）/ `jiejie_client_macos` +
   `with_naive_outbound`（naive）
-- 详细设计、测试矩阵与已知限制：[`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md)
+- 详细设计、权限模型、测试矩阵与已知限制：[`docs/JIEJIE-MACOS-CLIENT.md`](docs/JIEJIE-MACOS-CLIENT.md)
+
+### Mode A — Headless + Web Dashboard（推荐，不需要 GUI）
+
+```bash
+chmod +x sing-box-darwin-arm64
+./sing-box-darwin-arm64 check -c config.json
+
+# 前台运行
+./scripts/macos/run-headless.sh config.json
+
+# 浏览器打开
+open http://127.0.0.1:9090/
+```
+
+安装成常驻服务（登录后自动启动、崩溃自动重启）：
+
+```bash
+./scripts/macos/install-launchd.sh config.json   # 安装并启动
+./scripts/macos/launchd.sh status                # 查看状态
+./scripts/macos/launchd.sh restart
+./scripts/macos/launchd.sh logs
+./scripts/macos/uninstall-launchd.sh
+```
+
+Dashboard 出问题（下载失败 / 损坏 / 断网 / 版本不兼容）**不会**影响 core 启动、
+代理、DNS 和 TUN —— 控制面和数据面是分离的。
+
+### Mode B — External GUI Core（可选）
+
+任何支持指定外部 sing-box 可执行文件的 GUI 都可以使用：
 
 ```bash
 chmod +x sing-box-darwin-arm64
@@ -39,6 +72,25 @@ chmod +x sing-box-darwin-arm64
 ./sing-box-darwin-arm64 check -c config.json
 ./sing-box-darwin-arm64 run   -c config.json
 ```
+
+Clash 型 GUI 指向 `experimental.clash_api.external_controller`；native API 型 GUI
+指向 `services` 里的 `api` 条目。
+
+### 权限模型（重要）
+
+| 模式 | 是否需要 root | 原因 |
+| --- | --- | --- |
+| mixed / SOCKS / HTTP 本地代理 | **不需要** | 只监听 loopback 上 >1024 的端口 |
+| TUN | **需要** | macOS 要求 root 才能通过 `AF_SYSTEM`/`SYSPROTO_CONTROL` 的 `utun` 内核控制创建 utun 设备 |
+
+这是内核级限制，不是文件权限问题；`chmod`/`chown` 无法绕过，本项目也不会提供任何
+不安全的提权 helper。因此 **TUN 模式无法由普通用户 LaunchAgent 运行**——
+`install-launchd.sh` 会在安装时直接拒绝 TUN 配置，而不是让它反复重启失败。
+
+> **TCC 注意**：macOS 隐私保护会阻止 launchd 读取 `~/Desktop`、`~/Documents`、
+> `~/Downloads` 下的文件。此时 `launchctl` 会显示 `state = running` 且有 pid，但
+> 进程其实卡在 `dyld` 中尚未真正 exec，既没有日志也没有监听端口。请把二进制和配置
+> 放到这些目录之外（例如 `~/.local/share/jiejie/`）。
 
 ---
 

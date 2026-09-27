@@ -196,6 +196,45 @@ func TestClientMacOSNaiveOutboundIsAStubNotAnImplementation(t *testing.T) {
 		"the error must name the tag that enables it")
 }
 
+// TestClientMacOSNativeAPIServiceIsRegistered guards the headless control plane.
+//
+// sing-box has TWO management services and this profile needs both:
+//
+//	api    (constant.TypeAPI)  the NATIVE service. It serves a gRPC API over
+//	                           gRPC-Web and WebSocket, and it is the only
+//	                           service that can serve the Web Dashboard.
+//	clash  (experimental)      the COMPATIBILITY service, registered by
+//	                           include/clashapi.go under `with_clash_api`.
+//
+// An earlier revision of this registry did not register the native one, and its
+// comment claimed the Clash API covered it. That was wrong, and the effect was
+// that `services: [{"type": "api"}]` failed with "unknown inbound type: api" and
+// the Web Dashboard was unreachable, which breaks the headless
+// `browser -> localhost` mode entirely.
+func TestClientMacOSNativeAPIServiceIsRegistered(t *testing.T) {
+	t.Parallel()
+	types := include.ServiceRegistry().OptionTypes()
+	require.True(t, hasType(types, "api"),
+		"the native api service must be registered or the Web Dashboard is unreachable; registered: %v", types)
+}
+
+// TestClientMacOSServiceRegistryIsMinimal asserts the trim in the other
+// direction: the large server-side services stay out.
+func TestClientMacOSServiceRegistryIsMinimal(t *testing.T) {
+	t.Parallel()
+	types := include.ServiceRegistry().OptionTypes()
+
+	requireTypesAbsent(t, "service", types, map[string]string{
+		"resolved":   "a systemd/D-Bus service with no meaning on Darwin",
+		"ssm-api":    "out of scope for a client",
+		"derp":       "a Tailscale relay service",
+		"ccm":        "out of scope",
+		"ocm":        "out of scope",
+		"usbip":      "out of scope",
+		"oom-killer": "a server resource-management service",
+	})
+}
+
 // TestClientMacOSEndpointsAreAbsent asserts no endpoint is registered.
 //
 // Registering none is the single largest dependency saving in the profile, so it
