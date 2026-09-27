@@ -15,8 +15,17 @@ import (
 
 func NewServer(startedService *StartedService, secret string) *grpc.Server {
 	server := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(newUnaryAuthInterceptor(secret), UnaryLocaleInterceptor),
-		grpc.ChainStreamInterceptor(newStreamAuthInterceptor(secret), StreamLocaleInterceptor),
+		// The recover interceptors come FIRST in each chain, so a panic inside any
+		// later interceptor or handler is converted into codes.Internal rather than
+		// unwinding the goroutine.
+		//
+		// A gRPC handler runs in its own goroutine, so an unhandled panic there takes
+		// the whole process down - and on a root LaunchDaemon that means the VPN drops
+		// and the only trace is a stack trace on a stderr nobody reads. Ported from
+		// the LXD donor (daemon/server_recover_lx.go), which added it for exactly this
+		// reason; without this wiring the interceptors would be dead code.
+		grpc.ChainUnaryInterceptor(unaryRecoverInterceptor, newUnaryAuthInterceptor(secret), UnaryLocaleInterceptor),
+		grpc.ChainStreamInterceptor(streamRecoverInterceptor, newStreamAuthInterceptor(secret), StreamLocaleInterceptor),
 	)
 	healthServer := health.NewServer()
 	RegisterStartedServiceServer(server, startedService)

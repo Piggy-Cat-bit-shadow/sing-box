@@ -258,7 +258,75 @@ jobs:
           require "experimental/clashapi" "the Clash compatibility API is linked"
           require "protocol/tun." "the TUN inbound is linked"
 
+          # LXD daemon: the launcher runs `<core> lxd --help` and greps for
+          # --state-dir, so the command must exist in the SHIPPED binary. The symbol
+          # check below proves the package is linked; the CLI step after this one
+          # proves the command actually runs.
+          require "sing-box/lxd." "the LXD daemon package is linked"
+
           echo "PASS: every required macOS capability is present in the shipped binary"
+
+      - name: LXD daemon capability verification
+        # The launcher decides whether a core supports daemon mode by running
+        # `<core> lxd --help` and looking for --state-dir. This reproduces exactly that
+        # probe against the SHIPPED binary, so a core whose lxd command is missing or
+        # whose flags were renamed fails here rather than in the launcher UI.
+        #
+        # It also asserts the dependency graph, which is what proves the daemon is
+        # REALLY linked rather than merely referenced: a `lxd` command that shelled out
+        # to something else, or a stub, would not put the package in the graph.
+        run: |
+          set -euo pipefail
+
+          # A. the command runs
+          ./"$BINARY" lxd --help > /tmp/lxd-help.txt 2>&1 || {
+            echo "FAIL: 'sing-box lxd --help' exited non-zero" >&2
+            cat /tmp/lxd-help.txt >&2
+            exit 1
+          }
+          echo "PASS: 'sing-box lxd --help' exits 0"
+
+          # B. the launcher probe flag is present
+          grep -qF -- "--state-dir" /tmp/lxd-help.txt || {
+            echo "FAIL: 'lxd --help' does not advertise --state-dir, which is the flag" >&2
+            echo "      the launcher greps for; it would report no daemon support" >&2
+            exit 1
+          }
+          echo "PASS: --state-dir is advertised"
+
+          # C. the service surface is present
+          grep -qF -- "--service" /tmp/lxd-help.txt || {
+            echo "FAIL: 'lxd --help' does not advertise --service" >&2
+            exit 1
+          }
+          echo "PASS: --service is advertised"
+
+          # D. no unknown-command failure
+          if grep -qF "unknown command" /tmp/lxd-help.txt; then
+            echo "FAIL: 'lxd --help' reports an unknown command" >&2
+            cat /tmp/lxd-help.txt >&2
+            exit 1
+          fi
+          echo "PASS: lxd is a real command, not an unknown one"
+
+          # E. the client-management surface the installer drives
+          ./"$BINARY" lxd client --help > /dev/null 2>&1 || {
+            echo "FAIL: 'lxd client --help' exited non-zero" >&2; exit 1
+          }
+          ./"$BINARY" lxd client add --help > /dev/null 2>&1 || {
+            echo "FAIL: 'lxd client add --help' exited non-zero" >&2; exit 1
+          }
+          echo "PASS: lxd client add/list/remove are reachable"
+
+          # F. the dependency graph contains the daemon package
+          TAGS="$(cat "$TAGS_FILE")"
+          if ! CGO_ENABLED=1 go list -tags "$TAGS" -deps ./cmd/sing-box \
+               | grep -qx 'github.com/sagernet/sing-box/lxd'; then
+            echo "FAIL: github.com/sagernet/sing-box/lxd is not in the production" >&2
+            echo "      dependency graph, so the daemon is not really linked" >&2
+            exit 1
+          fi
+          echo "PASS: github.com/sagernet/sing-box/lxd is in the dependency graph"
 
       - name: reproducibility
         run: |
