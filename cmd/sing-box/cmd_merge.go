@@ -30,7 +30,10 @@ var commandMerge = &cobra.Command{
 }
 
 func init() {
-	mainCommand.AddCommand(commandMerge)
+	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
+	if !productExcludesCommand("merge") {
+		mainCommand.AddCommand(commandMerge)
+	}
 }
 
 func merge(outputPath string) error {

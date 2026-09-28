@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -55,7 +57,10 @@ var commandAPIRoot = &cobra.Command{
 func init() {
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagURL, "url", "", "API service URL (default: $BOX_API_URL)")
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagSecret, "secret", "", "API service secret (default: $BOX_API_SECRET)")
-	mainCommand.AddCommand(commandAPI)
+	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
+	if !productExcludesCommand("api") {
+		mainCommand.AddCommand(commandAPI)
+	}
 }
 
 func runAPI(args []string) error {

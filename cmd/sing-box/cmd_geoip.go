@@ -26,7 +26,10 @@ var commandGeoip = &cobra.Command{
 
 func init() {
 	commandGeoip.PersistentFlags().StringVarP(&commandGeoIPFlagFile, "file", "f", "geoip.db", "geoip file")
-	mainCommand.AddCommand(commandGeoip)
+	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
+	if !productExcludesCommand("geoip") {
+		mainCommand.AddCommand(commandGeoip)
+	}
 }
 
 func geoipPreRun() error {

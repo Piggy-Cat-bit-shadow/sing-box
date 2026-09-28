@@ -29,7 +29,10 @@ var commandFormat = &cobra.Command{
 
 func init() {
 	commandFormat.Flags().BoolVarP(&commandFormatFlagWrite, "write", "w", false, "write result to (source) file instead of stdout")
-	mainCommand.AddCommand(commandFormat)
+	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
+	if !productExcludesCommand("format") {
+		mainCommand.AddCommand(commandFormat)
+	}
 }
 
 func format() error {

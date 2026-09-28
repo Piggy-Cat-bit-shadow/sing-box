@@ -10,5 +10,8 @@ var commandRuleSet = &cobra.Command{
 }
 
 func init() {
-	mainCommand.AddCommand(commandRuleSet)
+	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
+	if !productExcludesCommand("rule-set") {
+		mainCommand.AddCommand(commandRuleSet)
+	}
 }
