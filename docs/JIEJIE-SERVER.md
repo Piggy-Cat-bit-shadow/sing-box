@@ -489,12 +489,22 @@ config that references a removed type now fails at `sing-box check` with
 import already exists upstream: `transport/v2ray.NewQUICServer` returns
 `os.ErrInvalid` when no constructor is registered.
 
-**Native Naive is excluded from this profile.** NaiveProxy is served by Caddy's
-`forwardproxy@udpintcp` on the production host, so the Native Naive inbound is not
-registered and does not enter the import graph. `protocol/naive` source is
-unchanged and still builds under the full registry; only `jiejie_server_minimal`
-leaves it out. A config naming `type: naive` therefore fails `sing-box check` here
-by design.
+**Native Naive IS registered in this profile.** The live production configuration
+on the VPS still declares a `naive` inbound, so this profile registers it and a
+config naming `type: naive` passes `sing-box check`.
+
+An earlier revision excluded it, on the inference that NaiveProxy had moved to
+Caddy's `forwardproxy@udpintcp`. That inference was wrong, and the shipped `.6`
+binary rejected the real server configuration at startup with
+`unknown inbound type: naive`. A deployment may run a Caddy Naive service on a
+separate path; the existence of Caddy does not make the sing-box Native Naive
+inbound redundant. The production configuration is the authority for what this
+profile contains.
+
+Only the INBOUND is registered. `protocol/naive/outbound.go` carries its own
+`with_naive_outbound` build tag, which this profile does not set, so the Naive
+outbound and the Chromium/Cronet client stack stay out of the import graph.
+
 
 Measured artifact sizes (Linux amd64, `-trimpath`, `-ldflags "-s -w"`, no UPX,
 no external strip):

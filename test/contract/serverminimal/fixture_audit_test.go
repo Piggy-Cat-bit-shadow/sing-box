@@ -378,61 +378,68 @@ func TestProductionFixtureHasNoSecrets(t *testing.T) {
 	}
 }
 
-// TestProductionFixtureExcludesNativeNaive pins that Native Naive has LEFT the
-// Server production topology, and that nothing in the fixture still refers to it.
+// TestProductionFixtureDeclaresNativeNaive pins that the production fixture models
+// the Native Naive inbound the live VPS configuration actually declares.
 //
-// # Why this replaced a presence assertion
+// # Why this replaced an absence assertion
 //
-// The fixture used to declare a `naive` inbound on 28438 with a set of routes to
-// 28439, and this test used to assert its exact HTTP/2 flow-control windows. That
-// modelled a NaiveProxy endpoint served by sing-box itself. Production no longer
-// works that way: NaiveProxy is served by Caddy's forwardproxy@udpintcp, and the
-// Native Naive inbound is not used at all.
+// This test previously asserted the OPPOSITE: that the fixture contained no `naive`
+// inbound, that the tag `naive-in` was gone, and that ports 28438/28439 never
+// reappeared. That assertion was derived from the assumption that Caddy
+// forwardproxy@udpintcp had replaced all Native Naive usage in this deployment.
 //
-// A fixture that keeps describing a component production does not run is worse than
-// stale documentation, because the contract tests are what CI trusts. Keeping the
-// old assertion would have forced the dead inbound to stay registered purely to
-// satisfy it, so the test is inverted rather than deleted: the property worth
-// defending now is the ABSENCE.
+// The assumption was wrong. The real server configuration still declares a `naive`
+// inbound, and the Server Minimal binary built while this test demanded its absence
+// rejected that configuration at startup with `unknown inbound type: naive`. A
+// fixture that under-describes production is worse than stale documentation, because
+// the contract tests are what CI trusts - it let CI certify a binary that could not
+// start the server it was built for.
 //
-// This is a real assertion, not a removal. If a `naive` inbound, the `naive-in` tag,
-// or either retired port is reintroduced into the fixture, this fails and says so.
-func TestProductionFixtureExcludesNativeNaive(t *testing.T) {
+// The property worth defending is therefore PRESENCE, together with the shape of the
+// listener. This is a real assertion, not a deletion: if the naive inbound, its tag,
+// or its serving port disappears from the fixture, this fails and says why.
+func TestProductionFixtureDeclaresNativeNaive(t *testing.T) {
 	fixture, path := loadProductionFixture(t)
 
-	for _, inbound := range fixture.Inbounds {
+	var naiveInbounds []int
+	for index, inbound := range fixture.Inbounds {
 		if inbound.Type == "naive" {
-			t.Errorf("%s declares a %q inbound (tag %q); Native Naive is served by "+
-				"Caddy forwardproxy and must not be part of the sing-box production "+
-				"topology", path, inbound.Type, inbound.Tag)
-		}
-		if inbound.Tag == "naive-in" {
-			t.Errorf("%s still carries the retired tag %q on inbound type %q",
-				path, inbound.Tag, inbound.Type)
-		}
-		// The retired Native Naive listener and its UoT target must not come back
-		// under a different tag: the ports themselves are part of the contract.
-		switch inbound.ListenPort {
-		case 28438, 28439:
-			t.Errorf("%s binds retired Native Naive port %d on inbound %q",
-				path, inbound.ListenPort, inbound.Tag)
+			naiveInbounds = append(naiveInbounds, index)
 		}
 	}
+	require.Len(t, naiveInbounds, 1,
+		"%s must declare exactly one native naive inbound, because the live "+
+			"production configuration declares one and this fixture is the contract "+
+			"CI checks the shipped registry against", path)
 
-	// No route may reference the retired tag in any form. A dangling reference is
-	// exactly what this file exists to catch, so it is checked here too rather than
-	// relying on the inbound-side checks above.
+	naiveInbound := fixture.Inbounds[naiveInbounds[0]]
+
+	require.Equal(t, "naive-in", naiveInbound.Tag,
+		"%s must keep the production tag for the native naive inbound", path)
+	require.EqualValues(t, 28438, naiveInbound.ListenPort,
+		"%s must bind the production native naive port", path)
+
+	// The receive windows are part of the Naive listener's contract: they are what
+	// makes the HTTP/2 CONNECT path usable at production RTT. Asserting them here
+	// keeps the flow-control property the retired test protected, now on the inbound
+	// that actually carries it.
+	var streamWindow, connectionWindow int64
+	require.NoError(t, json.Unmarshal(naiveInbound.StreamReceiveWindow, &streamWindow),
+		"%s native naive stream_receive_window must be a plain byte count", path)
+	require.NoError(t, json.Unmarshal(naiveInbound.ConnectionReceiveWindow, &connectionWindow),
+		"%s native naive connection_receive_window must be a plain byte count", path)
+	require.EqualValues(t, 8*1024*1024, streamWindow,
+		"%s must pin the native naive HTTP/2 stream receive window explicitly", path)
+	require.EqualValues(t, 32*1024*1024, connectionWindow,
+		"%s must pin the native naive HTTP/2 connection receive window explicitly", path)
+
+	// The UoT relay port 28439 is NOT asserted. It belonged to a superseded path and
+	// its removal was correct; restoring the inbound must not silently restore a
+	// listener that production no longer runs.
 	for index, rule := range fixture.Route.Rules {
-		for _, tag := range rule.Inbound {
-			if tag == "naive-in" {
-				t.Errorf("%s route rule %d still routes inbound %q, which is no longer "+
-					"an inbound in this topology", path, index, tag)
-			}
-		}
-		if rule.OverridePort == 28439 {
-			t.Errorf("%s route rule %d still targets the retired Native Naive UoT "+
-				"port %d", path, index, rule.OverridePort)
-		}
+		require.NotEqualValues(t, 28439, rule.OverridePort,
+			"%s route rule %d targets the retired UoT port 28439; that path is gone "+
+				"and restoring the naive inbound must not bring it back", path, index)
 	}
 }
 
@@ -458,9 +465,13 @@ func TestProductionFixtureUsesOnlyRealReceiveWindowOwners(t *testing.T) {
 			continue
 		}
 		owners++
-		if inbound.Type != "http" {
-			t.Errorf("%s inbound %q (type %s) sets a receive window; the MASQUE HTTP "+
-				"inbound is the only production listener that pins HTTP/2 flow control",
+		// Two production listeners legitimately pin HTTP/2 flow control: the MASQUE
+		// HTTP inbound and the Native Naive inbound (whose CONNECT is carried over
+		// HTTP/2). Anything else setting a window would be inheriting or overriding
+		// flow control by accident.
+		if inbound.Type != "http" && inbound.Type != "naive" {
+			t.Errorf("%s inbound %q (type %s) sets a receive window; only the MASQUE "+
+				"HTTP and Native Naive inbounds pin HTTP/2 flow control in production",
 				path, inbound.Tag, inbound.Type)
 		}
 

@@ -76,8 +76,10 @@ macOS deep   ✅  ~418s
 | **Caddy** | NaiveProxy（`forwardproxy@udpintcp`，含 UoT v2） |
 | **Xray** | VLESS Reality / Vision / XHTTP |
 
-因此 **Native Naive 不属于 Server Minimal**（见 [AUD-P2-001](#aud-p2-001--native-naive-server-over-inclusion)）。
-`protocol/naive` 源码保留，只是不进入本 profile 的 import graph。
+**Native Naive inbound 属于 Server Minimal**：真实生产配置仍声明 `naive` inbound，
+所以 registry 必须注册它（见 [AUD-P2-002](#aud-p2-002--server-minimal-错误移除生产所需的-native-naive-inbound)）。
+只注册 **inbound**；Naive **outbound** 与 Cronet 客户端栈仍不进入本 profile 的 import graph
+（`protocol/naive/outbound.go` 自带 `with_naive_outbound` tag，本 profile 不设置）。
 MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `masque-*` L3 endpoint。
 
 ### macOS Client
@@ -106,7 +108,7 @@ MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `m
 | **MASQUE / HTTP** | 本 fork 唯一自研的 L4 数据面，server 与 client 共用实现，只用 registry 区分角色 | client/server endpoint 注册拆分；H3 datagram ingress 去 memcpy；hot path 改 immutable snapshot；CONNECT-UDP 竞态修复 | [性能](docs/JIEJIE-MASQUE-PERFORMANCE.md) · [参考审计](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) |
 | **Naive / Cronet** | macOS 客户端核心能力，需与 Caddy 侧实现互通 | 链接真实 Cronet（`cronet-go.NewNaiveClient`）；移除 client 上无用的 server-only H3 listener；新增 opt-in `insecure_concurrency_single_engine`（默认 `false`，**未验证**） | [审计](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) |
 | **LXD** | JiejieBox 需要持久化 daemon + mTLS 控制面，GUI 退出后 VPN 不能断 | 移植 LXD daemon 能力进 macOS core（`lxd/`、`daemon/`、`cmd/sing-box/cmd_lxd_lx.go`）：`lxd --state-dir/--service`、`lxd client add/list/remove` | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
-| **Server Minimal** | 面向单台 VPS 的最小化构建，registry 须与真实职责一致 | `include/registry_jiejie_server.go` 只注册 4 个 inbound；Native Naive 已移除 | [服务端](docs/JIEJIE-SERVER.md) |
+| **Server Minimal** | 面向单台 VPS 的最小化构建，registry 须与真实生产配置一致 | `include/registry_jiejie_server.go` 注册 5 个 inbound（含生产所需的 Native Naive）；Naive outbound 不注册 | [服务端](docs/JIEJIE-SERVER.md) |
 | **macOS Client** | 一个内核包含全部客户端能力，不分 lite/naive | 独立 registry；`masque-client` 只注册 client 角色 | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
 | **CI / build** | 每个 CI 分钟都应产生新的故障信息 | 两 workflow、单 job、单 build；fast 只验证 shipping artifact，deep 保留 vet/race/fuzz/reference/reproducibility | [构建 profile](docs/BUILD-PROFILES.md) |
 | **Dependency fork** | 需要 upstream 尚未吸收的 patch | `go.mod` 中 `replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing` | [§8](#8-upstream) |
@@ -150,7 +152,11 @@ panic 未削弱：真实 stable 版本仍会 panic。
 
 ---
 
-### AUD-P2-001 — Native Naive Server over-inclusion
+### AUD-P2-001 — Native Naive Server over-inclusion  ⚠️ SUPERSEDED
+
+> **此记录的前提已被证伪，结论已作废。** 它假设 Caddy 已完全替代 Native Naive 用法，
+> 而真实生产配置证明该假设错误。保留作为历史审计记录，**不代表当前状态**。
+> 当前状态见 [AUD-P2-002](#aud-p2-002--server-minimal-错误移除生产所需的-native-naive-inbound)。
 
 **Problem**
 Server Minimal 仍注册并链接已退出生产的 Native Naive inbound，production fixture 也仍
@@ -178,6 +184,12 @@ Server Minimal 仍注册并链接已退出生产的 Native Naive inbound，produ
 **二进制影响（实测，like-for-like）** `33,870,008 → 33,767,608 B`（−102,400 B, −0.30%）。
 **核心收益不是体积**，而是 contract correctness、attack surface 缩小、profile 与真实
 生产职责对齐。0.30% 很小，如实记录。
+
+**后续更正（AUD-P2-002）** 本次删除所依据的 production topology 假设是错的：
+fixture 当时被改写为"不含 naive inbound"，于是 CI 反而**认证**了一个无法启动真实
+生产的 binary。体积收益 −102,400 B 无法抵消该后果，已恢复注册并重新增加约
++106,496 B。此记录中"contract correctness / attack surface 缩小"的收益论述
+**在 Native Naive 属生产必需的前提下不成立**。
 
 **Commit** [`f043f6f39`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f043f6f39)
 
@@ -383,6 +395,68 @@ latency is a pass/fail condition.
   makes the contract test fail
 
 **Commit** sing `188cb871422b` · sing-box `6910cb1af`
+
+**Status** CLOSED
+
+---
+
+### AUD-P2-002 — Server Minimal 错误移除生产所需的 Native Naive inbound
+
+**Problem**
+最新上传的 Linux Server Minimal 二进制（`1.15.0-jiejie-masquerade.6`）在真实美国 VPS 上
+执行 `check` 失败：
+
+```
+FATAL decode config: inbounds[5]: unknown inbound type: naive
+```
+
+**Root cause**
+`include/registry_jiejie_server.go` 不注册 Native Naive inbound，且
+`release/jiejie-production-topology.json` 被改写为不含 `naive` inbound。
+两者都基于同一个错误推断："Caddy 的 `forwardproxy@udpintcp` 已替代 Native Naive 用法"。
+
+真实生产配置仍在声明 `type: "naive"`。Caddy Naive 与 sing-box Native Naive **并非互斥**：
+部署可以在另一条路径上运行 Caddy Naive 服务，Caddy 的存在不会使 sing-box 的 Native Naive
+inbound 变得多余。
+
+更严重的是，移除时把 contract 测试从"断言存在"倒转为"断言不存在"
+（`TestRegistryOmitsNativeNaive`、`TestProductionFixtureExcludesNativeNaive`），
+于是 CI 无法再发现该缺失，反而**认证**了一个无法启动真实生产的 binary。
+
+**Impact**
+新二进制无法解析当前生产配置，服务端无法启动。生产配置本身没有错，也不需要修改。
+
+**Fix**
+- `include/registry_jiejie_server.go`：恢复 `protocol/naive` import 与
+  `naive.RegisterInbound(registry)`，inbound 入口 4 → 5。
+- `release/jiejie-production-topology.json`：恢复生产 `naive` inbound（tag `naive-in`、
+  `127.0.0.1:28438`、HTTP/2 receive window、example 凭据、TLS、masquerade）及 4 条
+  代表真实语义的 route rule。**未**恢复已退役的 UoT 端口 28439，使 fixture 与当前生产一致。
+- contract 测试从断言 absence 翻转为断言 presence，并命名生产原因。
+
+**未恢复**
+Naive **outbound** 仍不注册。`protocol/naive/outbound.go` 与 `single_engine_option_test.go`
+自带 `with_naive_outbound` tag，而 inbound 侧无 tag，因此恢复 inbound 不需要该 tag，
+`BUILD_TAGS_JIEJIE_SERVER_MINIMAL` 不变；`go list -deps ./cmd/sing-box` 确认 cronet 为 0。
+socks / direct / mixed / tun / vless / vmess / trojan / hysteria2 / tuic 等仍未注册，
+未回退为 upstream full registry。
+
+**Verification**（全部使用真实 `jiejie_server_minimal` tag 集，非 full build）
+- 复现：修复前二进制对生产形状配置报 `inbounds[5]: unknown inbound type: naive`
+- `sing-box check` 完整 production fixture：**PASS**（rc=0）
+- `TestRegistryProvidesNativeNaiveInbound`：registry 提供 `naive`；移除注册后该测试失败，
+  并复现 VPS 上的同一条 FATAL
+- `TestProductionFixtureDeclaresNativeNaive`：fixture 声明 naive inbound、tag、端口与
+  receive window；且 28439 未被恢复
+- `TestRegistryAuditFindsTheExpectedSet` 额外显式断言 naive **outbound** 不在生产 topology 中
+- 住宅 SOCKS 优化未回归：`protocol/socks`、`route`、`option` 全部 PASS；
+  `tcp_preconnect` / `tcp_tuning` / `ConnectionCopyTuner` / early buffer growth 均保留
+- 依赖裁剪审计 PASS；契约测试 12/12 PASS
+
+**二进制影响（实测）** `33,792,184 → 33,898,680 B`（**+106,496 B, +0.315%**）。
+恢复生产协议必然变大；优先级为 **production correctness > binary size**。
+
+**Commit** 本记录所在提交
 
 **Status** CLOSED
 
