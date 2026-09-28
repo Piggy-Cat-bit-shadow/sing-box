@@ -9703,9 +9703,6 @@
         "header_timeout": {
           "$ref": "#/$defs/Duration"
         },
-        "idle_timeout": {
-          "$ref": "#/$defs/Duration"
-        },
         "max_tracked_ips": {
           "type": "integer"
         }

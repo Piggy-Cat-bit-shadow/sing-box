@@ -240,7 +240,6 @@ func TestNaiveServerLimitsBuildResolvesTimers(t *testing.T) {
 		MaxConnections:      100,
 		MaxConnectionsPerIP: 8,
 		HeaderTimeout:       badoption.Duration(30 * time.Second),
-		IdleTimeout:         badoption.Duration(5 * time.Minute),
 	}
 	require.True(t, options.Enabled())
 
@@ -248,7 +247,6 @@ func TestNaiveServerLimitsBuildResolvesTimers(t *testing.T) {
 	require.Equal(t, 100, limits.MaxConnections)
 	require.Equal(t, 8, limits.MaxConnectionsPerIP)
 	require.Equal(t, 30*time.Second, limits.HeaderTimeout)
-	require.Equal(t, 5*time.Minute, limits.IdleTimeout)
 	require.Equal(t, option.DefaultNaiveMaxTrackedIPs, limits.MaxTrackedIPs,
 		"a per-IP limit without an explicit cap must get the documented default")
 }
@@ -258,7 +256,6 @@ func TestNaiveServerLimitsRejectInvalidValues(t *testing.T) {
 		"negative max_connections": {MaxConnections: -1},
 		"negative per-ip":          {MaxConnectionsPerIP: -1},
 		"negative header_timeout":  {HeaderTimeout: badoption.Duration(-time.Second)},
-		"negative idle_timeout":    {IdleTimeout: badoption.Duration(-time.Second)},
 		"negative max_tracked_ips": {MaxTrackedIPs: -1},
 		"per-ip above global":      {MaxConnections: 4, MaxConnectionsPerIP: 8},
 	} {
@@ -281,8 +278,7 @@ func TestNaiveServerLimitsRoundTripThroughJSON(t *testing.T) {
 		"server_limits": {
 			"max_connections": 64,
 			"max_connections_per_ip": 4,
-			"header_timeout": "20s",
-			"idle_timeout": "10m"
+			"header_timeout": "20s"
 		}
 	}`
 
@@ -293,7 +289,6 @@ func TestNaiveServerLimitsRoundTripThroughJSON(t *testing.T) {
 	require.Equal(t, 64, options.ServerLimits.MaxConnections)
 	require.Equal(t, 4, options.ServerLimits.MaxConnectionsPerIP)
 	require.Equal(t, 20*time.Second, options.ServerLimits.HeaderTimeout.Build())
-	require.Equal(t, 10*time.Minute, options.ServerLimits.IdleTimeout.Build())
 }
 
 // TestNaiveInboundUnconfiguredLimitsLeaveAcceptPathUntouched proves the wrapper

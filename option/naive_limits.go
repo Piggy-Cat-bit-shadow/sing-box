@@ -73,14 +73,18 @@ type NaiveServerLimitsOptions struct {
 	// subject to it: a tunnel that is legitimately idle for longer than this --
 	// which long-lived connections routinely are -- must not be torn down.
 	HeaderTimeout badoption.Duration `json:"header_timeout,omitempty"`
-	// IdleTimeout closes a connection that has carried no traffic for this long.
+	// NOTE: there is deliberately no idle_timeout here.
 	//
-	// This one DOES apply to established tunnels, so it is the setting most
-	// likely to break working traffic if chosen carelessly: an idle-timeout
-	// shorter than the quiet periods of a normal session will disconnect healthy
-	// clients. It is therefore off unless explicitly set, and the zero value must
-	// be understood as "never".
-	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	// HTTP2Options.IdleTimeout already provides one and is wired to
+	// http2.Server.IdleTimeout. Adding a second field for the same behaviour would
+	// give an operator two controls that overlap and can disagree.
+	//
+	// It is worth knowing where that existing timeout does and does not reach: it
+	// applies to the HTTP/2 server's own connection state. It is NOT a general
+	// tunnel idle reaper, and it must not be treated as one, because a Naive
+	// tunnel is legitimately idle for long stretches -- it carries a browsing
+	// session that can sit silent for minutes between requests. Unset means the
+	// library default.
 	// MaxTrackedIPs caps how many distinct source addresses the per-IP limiter
 	// remembers. It is the defence against an attacker filling the limiter's own
 	// map with random addresses, which is why it exists even though the map is
@@ -93,7 +97,6 @@ type NaiveServerLimits struct {
 	MaxConnections      int
 	MaxConnectionsPerIP int
 	HeaderTimeout       time.Duration
-	IdleTimeout         time.Duration
 	MaxTrackedIPs       int
 }
 
@@ -116,8 +119,7 @@ func (o *NaiveServerLimitsOptions) Enabled() bool {
 	}
 	return o.MaxConnections > 0 ||
 		o.MaxConnectionsPerIP > 0 ||
-		o.HeaderTimeout > 0 ||
-		o.IdleTimeout > 0
+		o.HeaderTimeout > 0
 }
 
 // Build resolves the option. A nil or all-zero receiver yields the zero value,
@@ -130,7 +132,6 @@ func (o *NaiveServerLimitsOptions) Build() NaiveServerLimits {
 		MaxConnections:      o.MaxConnections,
 		MaxConnectionsPerIP: o.MaxConnectionsPerIP,
 		HeaderTimeout:       o.HeaderTimeout.Build(),
-		IdleTimeout:         o.IdleTimeout.Build(),
 		MaxTrackedIPs:       o.MaxTrackedIPs,
 	}
 	if limits.MaxConnectionsPerIP > 0 && limits.MaxTrackedIPs <= 0 {
@@ -156,9 +157,6 @@ func (o *NaiveServerLimitsOptions) Validate() error {
 	}
 	if o.HeaderTimeout < 0 {
 		return E.New("header_timeout must not be negative")
-	}
-	if o.IdleTimeout < 0 {
-		return E.New("idle_timeout must not be negative")
 	}
 	// A per-IP limit larger than the global one can never be reached, which
 	// almost always means one of the two was mistyped. It is rejected rather than

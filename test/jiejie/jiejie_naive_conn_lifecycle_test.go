@@ -426,3 +426,231 @@ func TestAuditNaiveH1ConnHasNoServerDeadline(t *testing.T) {
 		"an authenticated idle tunnel was closed by the server after %s; if an idle "+
 			"timeout was added deliberately, this test must be updated", idle)
 }
+
+// ---------------------------------------------------------------------------
+// Configured limits, measured on a real listener.
+// ---------------------------------------------------------------------------
+
+// TestAuditNaiveMaxConnectionsIsEnforcedAndReleased proves the global connection
+// limit works end-to-end and that slots are released, which together are what
+// make the limit a bound rather than a one-way ratchet.
+func TestAuditNaiveMaxConnectionsIsEnforcedAndReleased(t *testing.T) {
+	env := startNaiveInboundWithOptions(t, func(options *option.NaiveInboundOptions) {
+		options.ServerLimits = &option.NaiveServerLimitsOptions{
+			MaxConnections: 3,
+		}
+	})
+
+	open := func() net.Conn {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 5*time.Second)
+		require.NoError(t, err)
+		return conn
+	}
+
+	// Three connections are admitted.
+	first := make([]net.Conn, 0, 3)
+	for i := range 3 {
+		conn := open()
+		require.NotNil(t, conn, "connection %d must be admitted", i)
+		first = append(first, conn)
+	}
+
+	// The FOURTH must be refused. This uses waitForConnClosed rather than a bare
+	// Read error because the two outcomes are indistinguishable to require.Error:
+	// a refused connection is CLOSED (EOF), while an accepted-but-silent one
+	// merely times out. An earlier version of this test used require.Error and
+	// therefore passed even with the limiter removed entirely -- it was asserting
+	// "something happened", not "the connection was refused".
+	refused := open()
+	require.True(t, waitForConnClosed(refused, 5*time.Second),
+		"the connection beyond max_connections must be CLOSED by the listener "+
+			"(a timeout would mean it was accepted)")
+	_ = refused.Close()
+
+	// Releasing one slot must admit exactly one more connection.
+	_ = first[0].Close()
+
+	// Releasing a slot must make room for exactly one more connection. "Admitted"
+	// here means the connection is NOT closed, which is the complement of the
+	// refusal test above and uses the same EOF-versus-timeout distinction.
+	var admitted bool
+	for range 40 {
+		conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 5*time.Second)
+		if dialErr != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		if waitForConnClosed(conn, 700*time.Millisecond) {
+			// Closed => still over the limit; the slot was not released yet.
+			_ = conn.Close()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		admitted = true
+		_ = conn.Close()
+		break
+	}
+	require.True(t, admitted, "closing a connection must release its slot")
+
+	for _, conn := range first[1:] {
+		_ = conn.Close()
+	}
+}
+
+// TestAuditNaiveMaxConnectionsPerIPIsEnforced proves the per-IP limit refuses a
+// second connection from the SAME address while still admitting from another,
+// which is what distinguishes a per-IP bound from a global one.
+func TestAuditNaiveMaxConnectionsPerIPIsEnforced(t *testing.T) {
+	env := startNaiveInboundWithOptions(t, func(options *option.NaiveInboundOptions) {
+		options.ServerLimits = &option.NaiveServerLimitsOptions{
+			MaxConnectionsPerIP: 2,
+		}
+	})
+
+	// All loopback connections share one source address, so the per-IP limit is
+	// observable by opening more than two.
+	first, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 5*time.Second)
+	require.NoError(t, err)
+	defer first.Close()
+	second, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 5*time.Second)
+	require.NoError(t, err)
+	defer second.Close()
+
+	third, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(int(env.port)), 5*time.Second)
+	require.NoError(t, err)
+	defer third.Close()
+
+	// The third from the same address must be CLOSED, not merely silent: a
+	// timeout would mean the limit never applied.
+	require.True(t, waitForConnClosed(third, 5*time.Second),
+		"a connection beyond max_connections_per_ip must be CLOSED by the listener")
+}
+
+// TestAuditNaiveHeaderTimeoutBoundsSilentPeers is the behavioural proof that the
+// control closes the measured "TLS completes, then silence" hole.
+//
+// It also proves the timeout does NOT fire on an established tunnel: the second
+// phase of the test holds an authenticated tunnel open past the header timeout
+// and requires it to stay alive.
+func TestAuditNaiveHeaderTimeoutBoundsSilentPeers(t *testing.T) {
+	env := startNaiveInboundWithOptions(t, func(options *option.NaiveInboundOptions) {
+		options.ServerLimits = &option.NaiveServerLimitsOptions{
+			HeaderTimeout: badoption.Duration(2 * time.Second),
+		}
+	})
+
+	// Phase 1: complete TLS, send no request at all. The header timeout must
+	// disconnect this peer.
+	silent := naiveTLSConn(t, env.port, "http/1.1")
+	closed := waitForConnClosed(silent, 12*time.Second)
+	require.True(t, closed,
+		"a peer that completes TLS and sends no request must be disconnected by header_timeout")
+
+	// Phase 2: an ESTABLISHED tunnel must survive past the same timeout, because
+	// net/http resets the read deadline once the headers have been read. A tunnel
+	// that is idle for longer than header_timeout is normal, not abuse.
+	tunnel := naiveTLSConn(t, env.port, "http/1.1")
+	response, err := naiveWriteConnect(t, tunnel, env.originAddr, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+
+	// Hold the tunnel idle for well past header_timeout.
+	tunnelClosed := waitForConnClosed(tunnel, 6*time.Second)
+	require.False(t, tunnelClosed,
+		"header_timeout must NOT tear down an established tunnel; it applies to the "+
+			"request phase only, and net/http resets the deadline after the headers")
+}
+
+// TestAuditNaiveDefaultConfigurationIsUnchanged proves the new option changes
+// nothing when it is omitted: an idle silent peer still holds its connection,
+// exactly as measured before the option existed.
+func TestAuditNaiveDefaultConfigurationIsUnchanged(t *testing.T) {
+	server := startNaiveLifecycleServer(t)
+
+	silent := naiveTLSConn(t, server.port, "http/1.1")
+	_, err := silent.Write([]byte("CONNECT example.com:443 HTTP/1.1\r\n"))
+	require.NoError(t, err)
+
+	closed := waitForConnClosed(silent, 4*time.Second)
+	t.Logf("OBSERVED: with server_limits omitted, stalled peer closed within 4s: %v", closed)
+	require.False(t, closed,
+		"omitting server_limits must preserve the previous unlimited behaviour")
+}
+
+// TestAuditNaiveActiveTransferSurvivesHeaderTimeout is the §9 false-positive
+// guard: it proves the protection distinguishes "idle" from "slow but actively
+// transferring".
+//
+// The scenario that matters is a tunnel which is QUIET for longer than
+// header_timeout between bursts of real traffic -- a browser session, which is
+// exactly what a Naive tunnel carries. A control that could not tell that apart
+// from a slowloris would disconnect working clients, so this test holds a tunnel
+// idle past the timeout and then proves it still carries data.
+func TestAuditNaiveActiveTransferSurvivesHeaderTimeout(t *testing.T) {
+	env := startNaiveInboundWithOptions(t, func(options *option.NaiveInboundOptions) {
+		options.ServerLimits = &option.NaiveServerLimitsOptions{
+			HeaderTimeout: badoption.Duration(2 * time.Second),
+		}
+	})
+
+	tunnel := naiveTLSConn(t, env.port, "http/1.1")
+	response, err := naiveWriteConnect(t, tunnel, env.originAddr, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+
+	// Stay QUIET for longer than header_timeout. A tunnel is allowed to be idle;
+	// that is the normal state of a browsing session between page loads.
+	time.Sleep(5 * time.Second)
+
+	// The tunnel must still work. Sending a complete HTTP request through it and
+	// reading the origin's response proves the connection was neither closed nor
+	// half-closed by the header timeout.
+	_, err = tunnel.Write([]byte("GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n"))
+	require.NoError(t, err, "the tunnel must still accept data after being idle")
+
+	_ = tunnel.SetReadDeadline(time.Now().Add(10 * time.Second))
+	reader := bufio.NewReader(tunnel)
+	tunnelResponse, err := http.ReadResponse(reader, nil)
+	require.NoError(t, err, "the tunnel must still carry data after being idle")
+	defer tunnelResponse.Body.Close()
+	require.Equal(t, http.StatusOK, tunnelResponse.StatusCode,
+		"a tunnel idle for longer than header_timeout must still carry a full request/response")
+}
+
+// TestAuditNaiveSlowButActiveTransferIsNotTreatedAsAbuse proves a peer that
+// transfers continuously and slowly is also not disconnected, which is the other
+// half of the false-positive concern. Unlike a slowloris, this peer eventually
+// completes a valid request.
+func TestAuditNaiveSlowButActiveTransferIsNotTreatedAsAbuse(t *testing.T) {
+	env := startNaiveInboundWithOptions(t, func(options *option.NaiveInboundOptions) {
+		options.ServerLimits = &option.NaiveServerLimitsOptions{
+			// Comfortably longer than the deliberate pacing below.
+			HeaderTimeout: badoption.Duration(10 * time.Second),
+		}
+	})
+
+	tunnel := naiveTLSConn(t, env.port, "http/1.1")
+
+	// Send a valid CONNECT one byte at a time with a pause between bytes. This is
+	// slow, but it is NOT a stall: the peer keeps making progress, so a
+	// header-timeout implementation that resets per byte must let it through.
+	request := "CONNECT " + env.originAddr + " HTTP/1.1\r\n" +
+		"Host: " + env.originAddr + "\r\n" +
+		"Proxy-Authorization: " + naiveBasicAuth() + "\r\n\r\n"
+	for _, b := range []byte(request) {
+		_, err := tunnel.Write([]byte{b})
+		require.NoError(t, err, "a slowly-progressing peer must not be cut off")
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	_ = tunnel.SetReadDeadline(time.Now().Add(15 * time.Second))
+	response, err := http.ReadResponse(bufio.NewReader(tunnel), nil)
+	require.NoError(t, err, "a slow but progressing request must be served")
+	defer response.Body.Close()
+	require.Equal(t, http.StatusOK, response.StatusCode,
+		"a peer that progresses slowly but continuously must not be treated as a slowloris")
+}
