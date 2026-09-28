@@ -248,7 +248,7 @@ func TestClientMacOSNaiveOutboundRequiresTLS(t *testing.T) {
 //	                           gRPC-Web and WebSocket, and it is the only
 //	                           service that can serve the Web Dashboard.
 //	clash  (experimental)      the COMPATIBILITY service, registered by
-//	                           include/clashapi.go under `with_clash_api`.
+//	                           the LXD daemon or the Clash API.
 //
 // An earlier revision of this registry did not register the native one, and its
 // comment claimed the Clash API covered it. That was wrong, and the effect was
