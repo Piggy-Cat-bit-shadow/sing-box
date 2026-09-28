@@ -142,13 +142,41 @@ contradict the property under test. The functional evidence is the established
 session itself (the server answered `200` and accepted the UoT request header),
 the same standard the TCP subtest uses.
 
+## Blast radius: one mistake, four "known failures"
+
+Auditing every `naivePaddingFrame` call site in `test/jiejie/` found **nine files**
+writing framed payloads over HTTP/1. Four tests were being carried as known
+product failures; all four were the same harness bug:
+
+| Test | Was recorded as | Actually |
+| --- | --- | --- |
+| `TestAuditUoTV2NonConnectMode` | P0 product defect, `unknown address family: 8` | framed H1 write |
+| `TestAuditUoTV2NonConnectMultipleTargets` | same product defect | framed H1 write |
+| `TestAuditLoopbackIsReachableByDefault` | pre-existing loopback audit failure | framed H1 write |
+| `TestAuditRouteRuleBlocksLoopback` | pre-existing loopback audit failure | framed H1 write |
+
+The two loopback audits were never investigated because they were "pre-existing",
+which is exactly how a wrong diagnosis in one place shelters failures in another.
+Several other call sites were **passing for the wrong reason**: the SSRF and
+target-ACL tests framed both the write and the read, so they asserted on a byte
+stream the origin never sent and still saw the rejections they expected.
+
 ## What this changes elsewhere
 
-- `scripts/ci/run-jiejie-suite.sh`: both tests **removed** from `KNOWN_FAILURES`.
-  They are deleted rather than kept as expected failures, because leaving a fixed
-  test on a known-failure list is how a real regression later hides behind the
-  label.
+- `scripts/ci/run-jiejie-suite.sh`: `KNOWN_FAILURES` is now **empty**. All four
+  entries were harness bugs. The variable is kept, empty, rather than deleted, so
+  the next entry is a visible decision in the diff.
+- `docs/BUILD-PROFILES.md` and `docs/JIEJIE-DAEMON-RPC-COMPAT.md` both recorded the
+  false product failure; both are corrected in place with a pointer here.
+- `TestNoHTTP1TunnelWritesPaddedFrames` prevents the class from returning. It is a
+  source-level check because a runtime check can only see the tunnel it was given,
+  while these bugs hid in call sites whose tunnel was refused before the write.
 - No documentation is left claiming a UoT v2 non-connect product defect.
+
+## Suite result
+
+`test/jiejie`: **210 passed, 30 skipped, 0 failed**. Before this audit the same
+suite reported 199 passed with 5 failures.
 
 ## Lesson
 

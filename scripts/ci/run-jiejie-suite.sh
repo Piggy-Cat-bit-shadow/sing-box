@@ -27,25 +27,28 @@ TAGS="with_quic,with_naive_outbound,badlinkname,tfogo_checklinkname0"
 # Comfortably above the measured 699s, so exceeding it means something really is stuck.
 TIMEOUT="${JIEJIE_TIMEOUT:-1200s}"
 
-# Failures that reproduce on the pinned baseline and are not caused by current work.
-# Kept as a list rather than a skip so they still RUN and their output is visible:
-# silently skipping known failures is how a real one hides.
-# TestAuditUoTV2NonConnectMode and TestAuditUoTV2NonConnectMultipleTargets were
-# listed here as "UoT read request: unknown address family: 8". That was a FALSE
-# PRODUCT DIAGNOSIS and they have been REMOVED from this list because they now
-# PASS: the harness was framing an HTTP/1 CONNECT payload as Naive padded data,
-# so the server read the frame's length byte (0x08) as a SOCKS address family.
-# HTTP/1 is a RAW tunnel; the product was correct all along. See
-# TestAuditUoTPaddingContractIsTransportDependent for the contract, and
-# docs/JIEJIE-NAIVE-UOT-FALSE-P0.md for the retraction.
+# EMPTY ON PURPOSE. Every test this list used to hold was a HARNESS bug, not a
+# product bug, and all four now pass:
 #
-# They are deleted rather than kept as "expected failures" on purpose: leaving a
-# fixed test on a known-failure list is how a real regression later hides behind
-# the label.
-KNOWN_FAILURES=(
-  "TestAuditLoopbackIsReachableByDefault"         # loopback reachability audit
-  "TestAuditRouteRuleBlocksLoopback"              # loopback routing audit
-)
+#   TestAuditUoTV2NonConnectMode            "unknown address family: 8"
+#   TestAuditUoTV2NonConnectMultipleTargets same
+#   TestAuditLoopbackIsReachableByDefault   loopback audit
+#   TestAuditRouteRuleBlocksLoopback        loopback audit
+#
+# The cause was one mistake with four symptoms: the harness framed an HTTP/1
+# CONNECT payload as Naive padded data, but HTTP/1 is a RAW tunnel. In the UoT
+# tests the server read the frame's length byte (0x08) as a SOCKS address family;
+# in the loopback audits it made the assertions read a byte stream the origin
+# never sent.
+#
+# The list is kept, EMPTY, rather than deleted: the next entry added here must be
+# a deliberate decision with a reason, and an empty list makes that visible in the
+# diff. A populated list is how a real regression later hides behind a label.
+#
+# Contract: TestAuditUoTPaddingContractIsTransportDependent.
+# Structural guard: TestNoHTTP1TunnelWritesPaddedFrames.
+# Retraction of record: docs/JIEJIE-NAIVE-UOT-FALSE-P0.md.
+KNOWN_FAILURES=()
 
 echo "==> test/jiejie with tags: $TAGS (timeout $TIMEOUT)"
 set +e
