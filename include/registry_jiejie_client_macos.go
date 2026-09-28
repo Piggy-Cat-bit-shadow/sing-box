@@ -25,12 +25,8 @@ import (
 	"github.com/sagernet/sing-box/protocol/mixed"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
-	"github.com/sagernet/sing-box/protocol/snell"
-	"github.com/sagernet/sing-box/protocol/socks"
-	"github.com/sagernet/sing-box/protocol/trojan"
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
-	"github.com/sagernet/sing-box/protocol/vmess"
 	"github.com/sagernet/sing-box/service/api"
 )
 
@@ -98,11 +94,20 @@ func Context(ctx context.Context) context.Context {
 func InboundRegistry() *inbound.Registry {
 	registry := inbound.NewRegistry()
 
-	tun.RegisterInbound(registry)    // the VPN interface: the client's primary mode
-	mixed.RegisterInbound(registry)  // single-port HTTP+SOCKS, the GUI default
-	socks.RegisterInbound(registry)  // explicit SOCKS inbound
-	http.RegisterInbound(registry)   // explicit HTTP inbound (and MASQUE HTTP/2+H3 client-side plumbing)
-	direct.RegisterInbound(registry) // local passthrough listener
+	// Exactly what the production configuration declares, and no more:
+	//
+	//   tun   -> the VPN interface
+	//   mixed -> one port serving HTTP and SOCKS
+	//
+	// `mixed` provides BOTH HTTP and SOCKS on a single port, so the standalone
+	// `socks` and `http` INBOUNDS are not needed and are not registered. Registering
+	// them "because mixed contains them" would be a category error: mixed is a
+	// distinct inbound type with its own handler, not a composition of the other two.
+	//
+	// `direct` as an inbound (a plain local listener with no proxy protocol) is also
+	// absent: the production config does not use it.
+	tun.RegisterInbound(registry)
+	mixed.RegisterInbound(registry)
 
 	registerQUICInbounds(registry)
 
@@ -147,19 +152,27 @@ func OutboundRegistry() *outbound.Registry {
 	group.RegisterSelector(registry)
 	group.RegisterURLTest(registry)
 
-	socks.RegisterOutbound(registry)
+	// `http` is kept: it is the MASQUE client outbound, which the production
+	// configuration uses for its 🇺🇸 美国｜MASQUE node. It is not here as a generic
+	// HTTP proxy.
 	http.RegisterOutbound(registry)
 
 	shadowsocks.RegisterOutbound(registry)
 	shadowtls.RegisterOutbound(registry)
-	snell.RegisterOutbound(registry)
-	trojan.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
-	vmess.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
 
-	registerQUICOutbounds(registry)
 	registerNaiveOutbound(registry)
+
+	// Deliberately NOT registered, because the production configuration does not use
+	// them and nothing else in it depends on them: `socks` (as an upstream proxy),
+	// `snell`, `trojan`, `vmess`, `hysteria2`, `tuic`. Their source stays in the tree
+	// for the Linux server build and for upstream sync; the Go linker drops them from
+	// this binary because nothing references them.
+	//
+	// registerQUICOutbounds (hysteria2, tuic) is intentionally not called. with_quic
+	// REMAINS enabled: MASQUE needs HTTP/3, which is a different consumer of the same
+	// tag.
 
 	return registry
 }
@@ -252,16 +265,14 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 //     separate schemas, and the native dashboard was consequently unreachable
 //     ("unknown inbound type: api").
 //
-//   - `clash` (experimental/clashapi) is the COMPATIBILITY service. It is not
-//     registered here: include/clashapi.go registers it directly under
-//     `with_clash_api`, independently of this file, because it is a build-tag
-//     concern rather than a registry one. It stays because third-party GUIs,
-//     existing dashboards and debugging tools depend on it.
+// It is the ONLY management service in this product. The Clash API was removed
+// from the fork entirely, so there is no compatibility service, no second
+// management plane, and no `clash_api` configuration option.
 //
-// Neither is required for proxying. If either is misconfigured the core's data
-// path — TUN, DNS, routing, outbounds — is unaffected; the control plane fails
-// and the data plane keeps working. That separation is deliberate and is what
-// makes a broken dashboard harmless.
+// The service is not required for proxying. If it is misconfigured the core's
+// data path — TUN, DNS, routing, outbounds — is unaffected; the control plane
+// fails and the data plane keeps working. That separation is deliberate and is
+// what makes a broken dashboard harmless.
 //
 // Everything else upstream registers (ssmapi, resolved, derp, ccm, ocm, usbip,
 // oomkiller) stays out, which is what keeps their dependency trees out of the
