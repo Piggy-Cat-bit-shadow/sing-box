@@ -284,6 +284,48 @@ jobs:
           fi
           echo "PASS: github.com/sagernet/sing-box/lxd is in the dependency graph"
 
+          # G. the COMMAND RPCs are enabled, not just the daemon.
+          #
+          # Separated from the checks above on purpose. Everything up to here proves
+          # the lxd daemon is linked; none of it proves the core can answer the RPCs
+          # the launcher's proxy list calls. Those are gated by with_lx_command, a
+          # DIFFERENT tag, and the omission of exactly that tag is what once shipped
+          # a binary which advertised a daemon and answered
+          # "unknown method GetGroups". Assert the tag is on the artifact.
+          TAGS="$(cat "$TAGS_FILE")"
+          for required in with_lxd with_lx_command; do
+            if ! echo "$TAGS" | tr ',' '\n' | grep -qx "$required"; then
+              echo "FAIL: $required is missing from the client build tags." >&2
+              echo "      with_lxd alone does not enable the command RPCs, so this" >&2
+              echo "      binary cannot list proxies in daemon mode." >&2
+              exit 1
+            fi
+          done
+          echo "PASS: with_lxd and with_lx_command are both enabled"
+
+      - name: JiejieBox daemon RPC contract
+        # Compares this repo's proto and generated server against the launcher's OWN
+        # generated client. This is the check that sees the drift the unit tests
+        # cannot: they compile against this proto and therefore agree with it by
+        # definition, while the launcher is generated from a pinned upstream revision.
+        #
+        # It fails if a method the launcher calls is not declared here, is declared
+        # but not registered by the server, or if the macOS profile stops enabling the
+        # real implementations. It also asserts the Server Minimal profile stays
+        # uncontaminated.
+        run: ./scripts/ci/check-jiejie-daemon-rpc-contract.sh
+
+      - name: command RPC smoke test on the shipped binary
+        # The checks above inspect the source and the tags. This one starts the ACTUAL
+        # binary as a daemon on a real control channel and calls the RPCs through this
+        # repo's generated client, so an artifact problem cannot hide behind a passing
+        # source-level test.
+        #
+        # GetGroups must be RECOGNISED. FailedPrecondition is an accepted outcome (the
+        # handler ran and refused because no config is loaded); Unimplemented and
+        # "unknown method" are not.
+        run: ./scripts/ci/smoke-jiejie-daemon-rpc.sh ./"$BINARY"
+
       - name: write BUILD-INFO and SHA256
         run: |
           set -euo pipefail

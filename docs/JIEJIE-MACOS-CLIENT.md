@@ -355,6 +355,16 @@ which is what keeps the upstream full build working — verified by building it.
 sing-box ships **two independent management services**. Both are available in this
 build, they run simultaneously in one process, and they serve different purposes.
 
+> **Daemon command RPCs.** The launcher's proxy list in daemon mode is served by the
+> `lx_command` RPCs (`GetGroups`, `GetOutbounds`, `URLTestOutbound`), which are gated
+> by `with_lx_command` — a build tag **separate** from `with_lxd`, which gates the
+> daemon process itself. Both are in this build's tags, and both are required:
+> dropping `with_lx_command` leaves a core that advertises a daemon it cannot answer
+> `GetGroups` on, which is exactly the omission that once produced an empty proxy
+> page. See [JIEJIE-DAEMON-RPC-COMPAT.md](JIEJIE-DAEMON-RPC-COMPAT.md) for the full
+> contract, and `scripts/ci/check-jiejie-daemon-rpc-contract.sh` for the guard that
+> fails CI if either tag or any launcher-called RPC goes missing.
+
 | | native `api` | Clash compatibility |
 | --- | --- | --- |
 | config key | `services: [{"type":"api"}]` | `experimental.clash_api` |
