@@ -332,9 +332,6 @@ flowchart TB
             "cache_file": {
               "enabled": true,
               "store_rdrc": true
-            },
-            "clash_api": {
-              "default_mode": "Enhanced"
             }
           }
         }
@@ -406,9 +403,6 @@ flowchart TB
             "cache_file": {
               "enabled": true,
               "store_rdrc": true
-            },
-            "clash_api": {
-              "default_mode": "Enhanced"
             }
           }
         }

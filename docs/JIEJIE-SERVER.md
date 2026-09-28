@@ -402,13 +402,21 @@ tags, and simply not write the new keys.
 | --- | --- |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | upstream default tags — untouched |
 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
-| `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
+| `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 
-The Jiejie set drops optional components the server does not use:
+The Jiejie server set drops optional components the server does not use:
 
 `with_gvisor`, `with_dhcp`, `with_wireguard`, `with_tailscale`, `with_ccm`,
 `with_ocm`, `with_cloudflared`, `with_usbip`, `with_openvpn`,
-`with_openconnect`, `with_clash_api`, `with_naive_outbound`.
+`with_openconnect`, `with_naive_outbound`.
+
+**`with_clash_api` is in neither list, because it no longer exists.** The Clash API
+was removed from the fork outright — `experimental/clashapi/`, the tag, and
+`option.ClashAPIOptions` — so a config that still sets `experimental.clash_api`
+fails as an unknown field on the server too. The Native `api` service is the only
+management plane this fork has. Likewise the LXD daemon (`lxd/`, `with_lxd`) and the
+launcher RPC surface (`with_lx_command`) were removed, and neither is part of the
+server profile.
 
 Tag audit — what is actually true:
 

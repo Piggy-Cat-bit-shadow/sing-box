@@ -12,12 +12,8 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/include"
-	"github.com/sagernet/sing-box/protocol/hysteria2"
 	"github.com/sagernet/sing-box/protocol/masque"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
-	"github.com/sagernet/sing-box/protocol/socks"
-	"github.com/sagernet/sing-box/protocol/trojan"
-	"github.com/sagernet/sing-box/protocol/tuic"
 	"github.com/sagernet/sing-box/protocol/vless"
 
 	"github.com/stretchr/testify/require"
@@ -85,12 +81,12 @@ func TestClientMacOSInboundRegistryResolves(t *testing.T) {
 	t.Parallel()
 	types := include.InboundRegistry().OptionTypes()
 
+	// Exactly the two the production configuration declares. `mixed` serves HTTP
+	// and SOCKS on one port, so the standalone socks/http inbounds are not needed
+	// and are asserted absent below.
 	requireTypesPresent(t, "inbound", types, []string{
-		"tun",    // the VPN interface: the client's primary mode
-		"mixed",  // single-port HTTP+SOCKS, the GUI default
-		"socks",  // explicit SOCKS inbound
-		"http",   // explicit HTTP inbound
-		"direct", // local passthrough listener
+		"tun",   // the VPN interface
+		"mixed", // one port, HTTP+SOCKS
 	})
 }
 
@@ -107,6 +103,11 @@ func TestClientMacOSExcludedInboundsAreAbsent(t *testing.T) {
 		"vless":     "the client connects via the vless outbound, not an inbound",
 		"trojan":    "the client connects via the trojan outbound, not an inbound",
 		"anytls":    "the client connects via the anytls outbound, not an inbound",
+		// Trimmed from the product: the production config uses `mixed` for local
+		// HTTP/SOCKS and does not define standalone listeners.
+		"socks":  "mixed already serves SOCKS on its single port",
+		"http":   "mixed already serves HTTP on its single port",
+		"direct": "no plain local passthrough listener is configured",
 	})
 }
 
@@ -119,26 +120,25 @@ func TestClientMacOSOutboundRegistryResolves(t *testing.T) {
 	t.Parallel()
 	types := include.OutboundRegistry().OptionTypes()
 
+	// The production allowlist. Each entry is used by the real configuration on
+	// this machine, or is a routing primitive that configuration depends on; see
+	// docs/MACOS_REQUIRED_CAPABILITIES.md for the derivation.
 	requireTypesPresent(t, "outbound", types, []string{
 		// routing primitives
 		"direct",
 		"block",
-		// groups: every GUI needs both
+		// groups: the dashboard's group page and delay test need both
 		"selector",
 		"urltest",
-		// plain proxy chaining
-		"socks",
+		// the MASQUE client outbound. Registered as "http" because that is the
+		// type name MASQUE uses, NOT as a generic HTTP proxy.
 		"http",
-		// the Jiejie client protocol set
+		// the production protocol set
 		"shadowsocks",
 		"shadowtls",
-		"snell",
-		"trojan",
 		"vless",
-		"vmess",
 		"anytls",
-		"hysteria2",
-		"tuic",
+		"naive",
 	})
 }
 
@@ -154,9 +154,17 @@ func TestClientMacOSExcludedOutboundsAreAbsent(t *testing.T) {
 	requireTypesAbsent(t, "outbound", types, map[string]string{
 		"tor":       "not part of the Jiejie client feature set; drags in a full Tor client",
 		"ssh":       "not part of the Jiejie client feature set",
-		"hysteria":  "Hysteria v1 is superseded by Hysteria2, which the client does register",
+		"hysteria":  "Hysteria v1 is superseded by Hysteria2",
 		"bridge":    "not part of the client profile",
 		"wireguard": "a stub for a removed outbound; the endpoint form is not in this profile",
+		// Trimmed in this round. The production configuration does not use any of
+		// them, so nothing depends on them and the linker drops their trees.
+		"snell":     "not used by the production configuration",
+		"trojan":    "not used by the production configuration",
+		"vmess":     "not used by the production configuration",
+		"hysteria2": "not used by the production configuration",
+		"tuic":      "not used by the production configuration",
+		"socks":     "not used as an upstream proxy by the production configuration",
 	})
 }
 
@@ -449,11 +457,21 @@ func TestClientMacOSRegistryIsNotTheUpstreamRegistry(t *testing.T) {
 			"the jiejie_client_macos build constraint")
 
 	// The QUIC surface must be the client one, not the full one: Hysteria v1 is
-	// registered by include/quic.go but deliberately not by the client file.
+	// registered by include/quic.go but deliberately not by the client file, and
+	// Hysteria2/TUIC are no longer registered by the macOS product at all because
+	// the production configuration does not use them.
 	require.False(t, hasType(outboundTypes, "hysteria"),
 		"include/quic.go is active; include/quic_client_macos.go must win")
-	require.True(t, hasType(outboundTypes, "hysteria2"),
-		"Hysteria2 must be registered by the client QUIC surface")
+	require.False(t, hasType(outboundTypes, "hysteria2"),
+		"Hysteria2 is not part of the macOS product allowlist")
+	require.False(t, hasType(outboundTypes, "tuic"),
+		"TUIC is not part of the macOS product allowlist")
+
+	// The MASQUE client outbound must still resolve. with_quic stays enabled for
+	// THIS, which is why dropping hysteria2 and tuic must not be done by dropping
+	// the tag.
+	require.True(t, hasType(outboundTypes, "http"),
+		"the MASQUE client outbound (type `http`) must be registered")
 }
 
 // TestClientMacOSRegistryCounts is a coarse change detector.
@@ -465,14 +483,18 @@ func TestClientMacOSRegistryIsNotTheUpstreamRegistry(t *testing.T) {
 func TestClientMacOSRegistryCounts(t *testing.T) {
 	t.Parallel()
 
+	// The lower bound is now the production allowlist size (10). It is deliberately
+	// a floor rather than an equality so a legitimate addition is not a failure,
+	// while a registry that compiled to nothing still trips it.
 	outboundCount := len(include.OutboundRegistry().OptionTypes())
-	require.GreaterOrEqual(t, outboundCount, 15,
+	require.GreaterOrEqual(t, outboundCount, 10,
 		"the client outbound registry looks too small to be the client registry")
 	require.Less(t, outboundCount, 30,
 		"the client outbound registry looks like the upstream full registry")
 
 	inboundCount := len(include.InboundRegistry().OptionTypes())
-	require.GreaterOrEqual(t, inboundCount, 5)
+	require.GreaterOrEqual(t, inboundCount, 2,
+		"the macOS product registers exactly tun and mixed")
 	require.Less(t, inboundCount, 15,
 		"the client inbound registry looks like the upstream full registry")
 
@@ -494,13 +516,12 @@ func TestClientMacOSRegistryCounts(t *testing.T) {
 func TestClientMacOSProtocolPackagesAreReal(t *testing.T) {
 	t.Parallel()
 
+	// Only the packages the macOS product actually registers. The trimmed ones are
+	// asserted absent above, so driving their registration here would contradict
+	// that assertion.
 	register := map[string]func(*outbound.Registry){
-		"socks":       socks.RegisterOutbound,
 		"shadowsocks": shadowsocks.RegisterOutbound,
-		"trojan":      trojan.RegisterOutbound,
 		"vless":       vless.RegisterOutbound,
-		"hysteria2":   hysteria2.RegisterOutbound,
-		"tuic":        tuic.RegisterOutbound,
 	}
 
 	for name, registerOutbound := range register {

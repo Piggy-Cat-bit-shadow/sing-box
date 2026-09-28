@@ -53,7 +53,6 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
 | `with_wireguard`                   | :material-check:     | Build with WireGuard support, see [WireGuard outbound](/configuration/outbound/wireguard/).                                                                                                                                                                                                                                    |
 | `with_utls`                        | :material-check:     | Build with [uTLS](https://github.com/refraction-networking/utls) support for TLS outbound, see [TLS](/configuration/shared/tls#utls).                                                                                                                                                                                          |
 | `with_acme`                        | :material-check:     | Build with ACME TLS certificate issuer support, see [TLS](/configuration/shared/tls/).                                                                                                                                                                                                                                         |
-| `with_clash_api`                   | :material-check:     | Build with Clash API support, see [Experimental](/configuration/experimental#clash-api-fields).                                                                                                                                                                                                                                |
 | `with_v2ray_api`                   | :material-close:️    | Build with V2Ray API support, see [Experimental](/configuration/experimental#v2ray-api-fields).                                                                                                                                                                                                                                |
 | `with_gvisor`                      | :material-close:     | Build with gVisor support, required by the deprecated `gvisor` / `mixed` [Tun stacks](/configuration/inbound/tun#stack).                                                                                                                                                                   |
 | `with_embedded_tor` (CGO required) | :material-close:️    | Build with embedded Tor support, see [Tor outbound](/configuration/outbound/tor/).                                                                                                                                                                                                                                             |
@@ -66,6 +65,19 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
 | `tfogo_checklinkname0`             | :material-check:     | Indicates the build uses the `-checklinkname=0` linker flag. Required together with `badlinkname`.                                                                                                                                                                                                                            |
 
 It is not recommended to change the default build tag list unless you really know what you are adding.
+
+!!! note "This fork"
+
+    The Jiejie fork also defines two product tag files,
+    `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` and
+    `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`. Build those products with
+    `scripts/ci/build-server.sh` and `scripts/ci/build-macos-client.sh`, which read
+    the tag file rather than taking a tag list. The macOS client tag set is
+    `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0`;
+    `with_gvisor` and `with_quic` are both required there (TUN, and MASQUE's HTTP/3
+    path respectively). The fork does **not** build the Clash API — the feature was
+    removed, so there is no `with_clash_api` tag to enable, and the Native `api`
+    service is the only management plane.
 
 ## :material-wrench: Linker Flags
 

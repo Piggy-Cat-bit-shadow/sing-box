@@ -4,9 +4,11 @@ This document describes the macOS Client Edition of the Jiejie sing-box fork: wh
 it is, what it contains, why each part is included or excluded, and what has
 actually been verified.
 
-- **Product** — a native macOS CLI sing-box core. The primary usage is headless
-  daemon plus browser Web Dashboard; loading it as an external core from a
-  third-party GUI is also supported.
+- **Product** — a native macOS CLI sing-box core. It is **headless-first**: the
+  primary usage is a launchd-supervised daemon driven from the command line, with
+  the sing-box Web Dashboard in a browser as its only user interface. There is no
+  bundled GUI and no companion app; the core is driven by the CLI, by launchd, and
+  by its own dashboard.
 - **Branch** — `testing`. The client and the server share ONE branch and ONE source
   tree; the former `macos-client` branch was consolidated into `testing` and is no
   longer a development line.
@@ -33,7 +35,7 @@ sound similar:
 
 ## Architecture
 
-The repository carries ONE source tree that produces three build profiles. They
+The repository carries ONE source tree that produces two build profiles. They
 share every protocol and transport package, and are separated entirely by build
 tags and registries. No profile's build can accidentally select another's
 registry, because the constraints are mutually exclusive.
@@ -41,29 +43,28 @@ registry, because the constraints are mutually exclusive.
 ```text
                      testing  (single source tree)
                           │
-      ┌───────────────────┼───────────────────┐
-      ↓                   ↓                   ↓
- Linux Server Minimal  macOS Lite        macOS Naive
- jiejie_server_minimal jiejie_client_macos jiejie_client_macos
-                                           + with_naive_outbound
+        ┌─────────────────┴─────────────────┐
+        ↓                                   ↓
+ Linux Server Minimal                macOS Client
+ jiejie_server_minimal               jiejie_client_macos
 ```
 
 There is no "Mac copy" of any protocol. MASQUE, Naive, HTTP/2, HTTP/3, QUIC,
-buffering and framing all live in one place and are consumed by every profile.
+buffering and framing all live in one place and are consumed by both profiles.
 
-| | Server Minimal | macOS Lite | macOS Naive |
-| --- | --- | --- | --- |
-| branch | `testing` | `testing` | `testing` |
-| platform | Linux amd64 | macOS arm64 | macOS arm64 |
-| build tag | `jiejie_server_minimal` | `jiejie_client_macos` | `jiejie_client_macos` + `with_naive_outbound` |
-| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | same |
-| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` | same as Lite |
-| CGO | `0` | `0` | `1` (Cronet) |
-| workflow | `server-linux-amd64.yml` | `client-macos.yml` | `client-macos.yml` |
-| artifact | `Jiejie-Linux-amd64-…` | `Jiejie-macOS-arm64-…` | `Jiejie-macOS-arm64-…` |
+| | Server Minimal | macOS Client |
+| --- | --- | --- |
+| branch | `testing` | `testing` |
+| platform | Linux amd64 | macOS arm64 |
+| build tag | `jiejie_server_minimal` | `jiejie_client_macos` |
+| tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
+| registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
+| CGO | `0` | `1` (Cronet) |
+| workflow | `server-linux-amd64.yml` | `client-macos.yml` |
+| artifact | `Jiejie-Linux-amd64-…` | `Jiejie-macOS-arm64-…` |
 
-There is exactly one macOS profile, so the table above collapses to a single macOS
-column. Each product is built from one commit by its own workflow
+There is exactly one macOS profile and one architecture, so there is no lite/naive
+split to choose between. Each product is built from one commit by its own workflow
 (`server-linux-amd64.yml`, `client-macos.yml`), and each workflow builds its binary
 exactly once and reuses it for every check and for the upload.
 
@@ -81,16 +82,22 @@ The three registries are mutually exclusive and complete:
 
 ### Control plane vs data plane
 
-The client has two independent planes, and keeping them separate is what makes a
-broken dashboard harmless:
+The client has exactly **one** control plane, and keeping it separate from the
+data plane is what makes a broken dashboard harmless:
 
 ```text
 DATA PLANE   inbound (tun / mixed) -> router -> DNS -> outbound -> network
              Nothing here depends on the control plane.
 
 CONTROL PLANE  native `api` service  -> gRPC-Web / WebSocket -> Web Dashboard
-               Clash `clash_api`     -> REST / WebSocket     -> third-party GUIs
+               (the ONLY management plane; nothing else is compiled in)
 ```
+
+The native `api` service is the only management plane this product has. The Clash
+API was removed from the fork entirely, so there is no compatibility service, no
+second controller and no `clash_api` configuration option: a config that still
+sets `experimental.clash_api` fails to parse with an unknown-field error instead
+of quietly starting a second listener.
 
 If the dashboard fails to download, is corrupt, or is unreachable, the data plane
 is unaffected: the core still starts, proxies, resolves DNS and runs TUN. The
@@ -137,8 +144,11 @@ they cannot drift.
 ### `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`
 
 ```text
-with_gvisor,with_quic,with_utls,with_clash_api,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
 ```
+
+There is no `with_clash_api` here, and no `with_lxd` / `with_lx_command`: those
+features were removed from the fork outright, so no tag can bring them back.
 
 CGO is **on**, because `with_naive_outbound` links `cronet-go`'s prebuilt Chromium
 network stack.
@@ -150,14 +160,16 @@ that the shipped core silently lost NaiveProxy.
 
 ### Why each tag is present
 
+Every tag in the list is load-bearing. None is "kept for symmetry", and none may be
+dropped as an optimisation:
+
 | tag | why |
 | --- | --- |
-| `with_gvisor` | **Required for TUN on Darwin.** `sing-tun`'s `stack_gvisor*.go` and `tun_darwin_gvisor.go` are gated on it. Without this tag the gVisor stack is unavailable on macOS. |
-| `with_quic` | Hysteria2, TUIC, the v2ray QUIC transport that VLESS needs, and the DoQ/DoH3 DNS transports. |
+| `with_gvisor` | **Required for TUN on Darwin.** `sing-tun`'s `stack_gvisor*.go` and `tun_darwin_gvisor.go` are gated on it, so this is the tag that selects the TUN userspace stack the product ships. It is not a leftover: dropping it removes the Darwin TUN implementation, which is the core capability of the product. |
+| `with_quic` | **Required, not optional.** MASQUE is a first-class transport here and its HTTP/3 path needs QUIC; `with_quic` also carries the v2ray QUIC transport and the DoQ/DoH3 DNS transports. Dropping it would break the MASQUE client, which is one of the two headline capabilities. |
 | `with_utls` | uTLS fingerprinting. Reality depends on it. |
-| `with_clash_api` | The external controller a third-party GUI talks to. A hard requirement. |
+| `with_naive_outbound` | Links the real Cronet-backed NaiveProxy outbound rather than upstream's not-included stub. |
 | `jiejie_client_macos` | Selects this registry. See the note below. |
-| `with_naive_outbound` | Naive only, in the `naive` profile. |
 | `badlinkname`, `tfogo_checklinkname0` | Match the fork's existing profiles. |
 
 > **A trap worth recording.** The profile originally omitted `jiejie_client_macos`.
@@ -181,9 +193,9 @@ that the shipped core silently lost NaiveProxy.
 | `with_dhcp` | The desktop client does not use DHCP DNS. |
 | `with_wireguard` | The WireGuard endpoint is not part of the client feature set. |
 
-The macOS core is **76 MB** against **108 MB** for the upstream default tag set
-built for the same platform. It is larger than a trimmed CGO-free core would be,
-because it ships NaiveProxy and MASQUE rather than excluding them; the saving
+The macOS core is **73,432,802 B** against **108 MB** for the upstream default tag
+set built for the same platform. It is larger than a trimmed CGO-free core would
+be, because it ships NaiveProxy and MASQUE rather than excluding them; the saving
 against upstream still comes entirely from registration-level trimming.
 
 ## Registry
@@ -191,40 +203,54 @@ against upstream still comes entirely from registration-level trimming.
 `include/registry_jiejie_client_macos.go` (`jiejie_client_macos`) and
 `include/quic_client_macos.go` (`with_quic && jiejie_client_macos`).
 
-This is a **client** registry, and it is deliberately much larger than the server
-one. The server serves exactly one known VPS topology and can register almost
-nothing; a GUI core runs whatever the user configured.
+This is a **client** registry, and it is trimmed to the **production allowlist**:
+exactly what the shipped configuration declares. The earlier revision registered a
+"wide client" set — every protocol a hypothetical GUI might name — on the theory
+that a client core must be permissive. That theory was wrong for this product. A
+personal, headless-first core runs one known configuration, and a protocol nothing
+in that configuration references is dependency weight and attack surface with no
+user. The trim is therefore to the set that is actually used, and the audit asserts
+both directions: the allowlist is present, and everything outside it is absent.
 
 ### Inbounds
 
 | type | why |
 | --- | --- |
-| `tun` | The VPN interface. The primary reason a macOS GUI core exists. |
-| `mixed` | Single-port HTTP+SOCKS. The GUI default for local proxy mode. |
-| `socks` | GUIs name it explicitly. |
-| `http` | GUIs name it explicitly. |
-| `direct` | Local passthrough listener. |
+| `tun` | The VPN interface. The whole reason the product exists. |
+| `mixed` | Single-port HTTP+SOCKS, the production local proxy listener. |
 
-No other inbound is registered. In particular no `redirect`/`tproxy` (Linux
-netfilter only) and no server-side protocol inbounds.
+No other inbound is registered. `mixed` already serves BOTH HTTP and SOCKS on one
+port, so `socks` and `http` as separate inbound types are not needed — and
+registering them "because mixed contains them" would be a category error, since
+`mixed` is a distinct inbound type with its own handler, not a composition of the
+other two. `direct` as an inbound (a plain local listener with no proxy protocol)
+is absent because the production configuration does not use it. Also absent: no
+`redirect`/`tproxy` (Linux netfilter only) and no server-side protocol inbounds.
 
 ### Outbounds
 
 | type | why |
 | --- | --- |
-| `direct`, `block` | Routing primitives. `block` is registered here even though the server build drops it: GUI templates define a named `block` outbound and use it as a `route.final` or selector member, which is a configuration error if absent. |
-| `selector`, `urltest` | Group management. Required by every GUI. |
-| `socks`, `http` | Upstream proxy chaining. |
+| `direct`, `block` | Routing primitives. `block` is registered here even though the server build drops it: the production configuration defines a named `block` outbound and uses it as a `route.final` member, which is a configuration error if the type is absent. |
+| `selector`, `urltest` | Group management. The dashboard's group tree and URL test are built on them. |
+| `http` | **The MASQUE client outbound.** Kept for that role specifically, not as a generic HTTP proxy. |
 | `shadowsocks` | SS and SS2022. |
 | `shadowtls` | ShadowTLS v3. |
-| `snell` | Snell. |
-| `trojan` | Trojan. |
 | `vless` | VLESS, including Reality and Vision. |
-| `vmess` | VMess. |
 | `anytls` | AnyTLS. |
-| `hysteria2` | Hysteria2 (via `with_quic`). |
-| `tuic` | TUIC (via `with_quic`). |
 | `naive` | **See below.** |
+
+Removed from the earlier revision, because the production configuration does not use
+them and nothing else in it depends on them: `socks`, `snell`, `trojan`, `vmess`,
+`hysteria2`, `tuic`. Their source stays in the tree for the Linux server build and
+for upstream sync; the Go linker drops them from this binary because nothing
+references them.
+
+> **Dropping `hysteria2`/`tuic` is not done by dropping `with_quic`.** The QUIC
+> outbounds were registered by `registerQUICOutbounds`, which is simply no longer
+> called. `with_quic` itself **stays set**, because MASQUE needs HTTP/3 and that is
+> a different consumer of the same tag. A future edit that removes `with_quic`
+> "because Hysteria2 is gone" would silently break MASQUE.
 
 ### The Naive decision
 
@@ -267,8 +293,12 @@ The area most at risk of being trimmed too far. All of these are registered:
 | `quic` | DoQ. |
 | `h3` | DoH3. |
 | `hosts` | Static host entries. |
-| `fakeip` | The FakeIP pool GUI templates use for sniffed domains. |
+| `fakeip` | The FakeIP pool the production configuration uses for sniffed domains. |
 | `local` | **Required, not optional.** See below. |
+
+`quic` (DoQ) and `h3` (DoH3) come from `include/quic_client_macos.go`, the
+`with_quic && jiejie_client_macos` variant file — which is exactly why `with_quic`
+cannot be dropped from the tag set even though the QUIC *outbounds* are gone.
 
 `local` is a **boot dependency**. `box.go` unconditionally initialises the DNS
 transport manager with a fallback that creates a `C.DNSTypeLocal` transport, so
@@ -295,9 +325,10 @@ on Darwin. `dhcp` and `mdns` are not registered.
 - **Endpoints: `masque-client` only.** MASQUE is a first-class client transport
   (CONNECT-IP / CONNECT-UDP over HTTP/2 or HTTP/3), so the client role is
   registered. The **server** role is not: see below.
-- **Services:** the native `api` service (which serves the Web Dashboard) plus the
-  Clash API, which `with_clash_api` compiles in through `include/clashapi.go`,
-  independently of the registry file.
+- **Services:** exactly one — the native `api` service, which is the whole
+  management plane and the thing that serves the Web Dashboard. Nothing else is
+  registered: the Clash API was removed from the fork, so there is no compatibility
+  service and no `include/clashapi.go`.
 - **Certificate providers: none.** A client consumes CA-signed certificates.
 
 #### Why the MASQUE roles are split
@@ -344,37 +375,52 @@ the fixture fail with `endpoints[0]: unknown endpoint type: masque-client`.
 
 ### Excluded protocols
 
-`tor`, `ssh`, `bridge`, `hysteria` (v1, superseded by Hysteria2), and all
-server-side inbound registration. These remain in the source tree; a package the
-registry does not import never enters the import graph, so the linker drops it and
-its whole dependency tree. **No upstream protocol source is edited or deleted**,
-which is what keeps the upstream full build working — verified by building it.
+`tor`, `ssh`, `bridge`, `hysteria` (v1, superseded by Hysteria2), every outbound
+outside the production allowlist (`socks`, `snell`, `trojan`, `vmess`, `hysteria2`,
+`tuic`), and all server-side inbound registration. These remain in the source tree;
+a package the registry does not import never enters the import graph, so the linker
+drops it and its whole dependency tree. **No upstream protocol source is edited or
+deleted**, which is what keeps the upstream full build working — verified by
+building it.
 
-## Management planes
+## Management plane
 
-sing-box ships **two independent management services**. Both are available in this
-build, they run simultaneously in one process, and they serve different purposes.
+This product has exactly **one** management plane. There is no second controller,
+no compatibility API, and no daemon protocol of its own: the core is a plain
+sing-box CLI process, supervised by launchd, answering on its own Native API.
 
-> **Daemon command RPCs.** The launcher's proxy list in daemon mode is served by the
-> `lx_command` RPCs (`GetGroups`, `GetOutbounds`, `URLTestOutbound`), which are gated
-> by `with_lx_command` — a build tag **separate** from `with_lxd`, which gates the
-> daemon process itself. Both are in this build's tags, and both are required:
-> dropping `with_lx_command` leaves a core that advertises a daemon it cannot answer
-> `GetGroups` on, which is exactly the omission that once produced an empty proxy
-> page. See [JIEJIE-DAEMON-RPC-COMPAT.md](JIEJIE-DAEMON-RPC-COMPAT.md) for the full
-> contract, and `scripts/ci/check-jiejie-daemon-rpc-contract.sh` for the guard that
-> fails CI if either tag or any launcher-called RPC goes missing.
+| | native `api` — the only plane |
+| --- | --- |
+| config key | `services: [{"type":"api"}]` |
+| protocol | gRPC over gRPC-Web, WebSocket, and h2c |
+| dashboard | **yes** — serves the sing-box Web Dashboard at `http://127.0.0.1:9090/` |
+| role | the entire control plane |
 
-| | native `api` | Clash compatibility |
-| --- | --- | --- |
-| config key | `services: [{"type":"api"}]` | `experimental.clash_api` |
-| protocol | gRPC over gRPC-Web, WebSocket, and h2c | REST + WebSocket |
-| dashboard | **yes** — serves the sing-box Web Dashboard | external UI only |
-| role | primary control plane | compatibility |
+Three things that used to sit beside it are **gone from the fork**, not merely
+disabled, and each removal is asserted in CI rather than trusted:
 
-The native service is the **primary** plane; the Clash API is retained as a
-**compatibility** plane. It is deliberately not removed: third-party GUIs, existing
-dashboards, ecosystem tools and debugging workflows depend on it.
+- **The Clash API is removed.** `experimental/clashapi/` is deleted, the
+  `with_clash_api` build tag is gone, and so is `option.ClashAPIOptions`. A
+  configuration that still contains `experimental.clash_api` does not silently
+  ignore it — it fails to parse, which is the honest outcome for a key that no
+  longer means anything. Yacd, MetaCubeXD and every other Clash-dashboard-style
+  front end now have nothing to talk to.
+- **The LXD daemon is removed.** `lxd/`, the `sing-box lxd` subcommand and the
+  `with_lxd` build tag are deleted. There is no on-disk state directory, no mTLS
+  admin plane, and no client registry for a companion GUI to enroll into.
+- **The launcher RPC surface is removed.** The `with_lx_command` tag is gone and
+  the 13 launcher RPCs were dropped from `daemon/started_service.proto`. A core
+  that once advertised a daemon it could not fully answer no longer advertises one
+  at all.
+
+The practical consequence is the product's whole shape: the core is driven by the
+CLI, by launchd, and by `dashboard` in a browser at
+<http://127.0.0.1:9090/>. Anything that wanted a second control surface has to use
+the Native API.
+
+`scripts/ci/audit-macos-client-registry.sh` enforces the removals as build
+properties, not as one-time edits: it fails if `sing-box/lxd.` or
+`sing-box/experimental/clashapi.` reappears in the shipped symbol table.
 
 ### Native API service
 
@@ -405,7 +451,7 @@ Verified to work against a real running process, over real HTTP:
 
 | operation | method | verified |
 | --- | --- | --- |
-| version | `GetVersion` | **PASS** — returns `1.15.0-jiejie-masquerade.5`, grpc-status 0 |
+| version | `GetVersion` | **PASS** — returns `1.15.0-jiejie-masquerade.6`, grpc-status 0 |
 | groups | `SubscribeGroups` | **PASS** — decodes to the real selector/urltest tree with `type`, `selectable`, `selected` |
 | switch selector | `SelectOutbound` | **PASS** — and the change reads back (`auto` → `direct`) |
 | URL test | `URLTest` | **PASS** |
@@ -414,7 +460,7 @@ Verified to work against a real running process, over real HTTP:
 | connections | `SubscribeConnections` | **PASS** — streams |
 | close connections | `CloseAllConnections` | **PASS** |
 | outbound list | `SubscribeOutbounds` | **PASS** — streams |
-| clash mode | `SetClashMode` | **PASS** |
+| clash mode | `SetClashMode` | **PASS** — the RPC name survives upstream; the Clash API service it was written for does not |
 | clear logs | `ClearLogs` | **PASS** |
 
 ### Web Dashboard
@@ -453,39 +499,37 @@ Verified locally against a real download:
 | JS bundle served | **PASS** (1.25 MB, HTTP 200) |
 | dashboard fetch in CI | **NOT-TESTED** — CI must not depend on the public network |
 
-### Clash compatibility API
+### Removed: the Clash compatibility API
+
+An earlier revision of this product shipped the Clash API beside the Native API and
+documented it here, complete with a verified `/version`, `/proxies`,
+`/connections`, `/configs` and `/traffic` table. **That is no longer true, and the
+table has been deleted rather than left to rot.**
+
+The Clash API was removed from the fork: `experimental/clashapi/`, the
+`with_clash_api` build tag and `option.ClashAPIOptions` are all gone. Writing
 
 ```json
-{
-  "experimental": {
-    "clash_api": {
-      "external_controller": "127.0.0.1:9091",
-      "default_mode": "rule"
-    }
-  }
-}
+{ "experimental": { "clash_api": { "external_controller": "127.0.0.1:9091" } } }
 ```
 
-Verified to answer, on a real running process, on both flavors:
+now fails at config decode. That failure is the intended behaviour, not a
+regression: a key that no longer does anything should stop the core loudly rather
+than leave you believing a second controller is listening on 9091. Clash-style
+dashboards (Yacd, MetaCubeXD and the like) are not usable with this build and there
+is no port to point them at.
 
-| endpoint | verified |
-| --- | --- |
-| `GET /version` | **PASS** — `{"meta":true,"premium":true,"version":"sing-box 1.15.0-jiejie-masquerade.5"}` |
-| `GET /proxies` | **PASS** — `GLOBAL`, `select`, `auto`, `direct`, `block` |
-| `GET /proxies/select` | **PASS** — type `Selector`, populated `all` |
-| `GET /proxies/urltest` | **PASS** — type `URLTest`, populated `all` |
-| `GET /connections` | **PASS** |
-| `GET /configs` | **PASS** |
-| `GET /traffic` | **PASS** — streams JSON |
-
-Both planes were confirmed working **in the same process**, on separate ports.
+The capability those dashboards provided is not lost, because the Native API covers
+it: run status and traffic, the selector/urltest group tree, switching a selection,
+running a URL test, live connections and closing them, and logs — all through
+`http://127.0.0.1:9090/`.
 
 ## TUN
 
-TUN is the core capability of a macOS GUI core, and it is **not** trimmed.
+TUN is the core capability of this product, and it is **not** trimmed.
 
 - `protocol/tun` is registered.
-- The gVisor TUN stack is available (`with_gvisor`).
+- The gVisor TUN userspace stack is available (`with_gvisor`).
 - The TUN inbound is present in the config fixture and passes `sing-box check`.
 
 **Runtime TUN is NOT-TESTED.** Creating a `utun` device requires root and
@@ -520,8 +564,10 @@ The cost is accepted deliberately:
   the macOS core is CGO=1 and is not self-contained. The alternative would be a
   second CGO-free core that cannot speak NaiveProxy, which is the split that was
   removed.
-- The core is ~76 MB for arm64, against ~56 MB for a CGO-free build that excludes
-  Naive and MASQUE.
+- The core is **73,432,802 B** for arm64, against roughly 56 MB for a CGO-free build
+  that excludes Naive and MASQUE. The trimmed registry gave back about 2.7 MB of
+  that; the rest is the capabilities themselves, which are the point of the
+  product.
 
 The audit asserts this at the symbol level, because the `naive` *type* resolves
 whether or not the implementation is linked: it requires `cronet-go` symbols to be
@@ -529,14 +575,17 @@ present and requires the stub's "not included in this build" string to be absent
 
 ## Usage
 
-Two modes, and the same binary supports both. They are not exclusive: pick one,
-or run the headless mode and point a GUI at it later.
+There is really one usage mode, plus an escape hatch. The product is
+**headless-first**: a launchd-supervised core you drive from the CLI and watch
+through its own dashboard. The same binary can also be handed to a third-party GUI
+as an external core, and nothing prevents that, but no GUI is required, assumed or
+shipped.
 
 | | Mode A — Headless + Web Dashboard | Mode B — External GUI Core |
 | --- | --- | --- |
-| control | your browser | the GUI |
+| control | your browser, at `127.0.0.1:9090` | the GUI |
 | needs a GUI | no | yes |
-| recommended | **yes** | optional |
+| recommended | **yes — this is the product** | optional escape hatch |
 | TUN | needs root | GUI manages it |
 | works unattended | yes, via launchd | depends on the GUI |
 
@@ -592,10 +641,10 @@ chmod +x sing-box-darwin-arm64
 
 # Confirm it runs and is the right build.
 ./sing-box-darwin-arm64 version
-#   sing-box version 1.15.0-jiejie-masquerade.5
+#   sing-box version 1.15.0-jiejie-masquerade.6
 #   Environment: go1.25.5 darwin/arm64
-#   Tags: with_gvisor,with_quic,with_utls,with_clash_api,jiejie_client_macos,badlinkname,tfogo_checklinkname0
-#   CGO: disabled
+#   Tags: with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+#   CGO: enabled
 
 ./sing-box-darwin-arm64 check  -c config.json
 ./sing-box-darwin-arm64 run    -c config.json
@@ -605,9 +654,15 @@ chmod +x sing-box-darwin-arm64
 ./sing-box-darwin-arm64 generate reality-keypair   # Reality key material
 ```
 
-GUIs that expect a Clash-style controller should point at
-`experimental.clash_api.external_controller`; GUIs that speak the native API
-should point at the `services` `api` entry. Both are in the shipped examples.
+`CGO: enabled` is expected — the Cronet-backed `naive` outbound is a CGO
+dependency. A build reporting `CGO: disabled` is not this product.
+
+There is exactly one place to point a management client: the `services` entry with
+`"type": "api"`, present in the shipped examples, which also serves the dashboard
+on `127.0.0.1:9090`. A GUI that expects only a working sing-box core works
+unmodified. A GUI that expects a Clash-style controller does not: there is no Clash
+API in this build and no `clash_api` key to configure, so there is no compatibility
+endpoint for it to reach.
 
 ### Example configurations
 
@@ -617,14 +672,14 @@ the Reality public key is a throwaway generated for the example.
 
 | file | purpose |
 | --- | --- |
-| `test/jiejie/macos-client/example-headless.json` | Mode A: TUN + mixed, native API with dashboard on `127.0.0.1:9090`, Clash API on `127.0.0.1:9091` |
-| `test/jiejie/macos-client/example-config.json` | Mode B: TUN + mixed, Clash API only, for external-GUI use |
+| `test/jiejie/macos-client/example-headless.json` | Mode A: TUN + mixed, native API with dashboard on `127.0.0.1:9090` — the primary configuration |
+| `test/jiejie/macos-client/example-config.json` | Mode B: TUN + mixed + a `masque-client` endpoint, native API only, for external-core use |
 
 > **Port note.** Both examples use the conventional sing-box ports (`7890` mixed,
-> `9090`/`9091` controllers). If the machine already runs a proxy on those ports,
-> the core fails to start with `bind: address already in use`. Change
-> `listen_port`, `listen_port` and `external_controller` before running on such a
-> machine. This is not hypothetical: it happened while testing this build.
+> and `9090` for the Native API). If the machine already runs a proxy on those
+> ports, the core fails to start with `bind: address already in use`. Change
+> `listen_port` before running on such a machine. This is not hypothetical: it
+> happened while testing this build.
 
 > **TCC note (`~/Desktop`, `~/Documents`, `~/Downloads`).** macOS privacy
 > protection blocks launchd from reading binaries and configs under those
@@ -695,8 +750,8 @@ Every script below can be run locally and is run in CI.
 BIN=dist/sing-box-darwin-arm64
 
 ./scripts/ci/check-macos-client-config.sh   "$BIN" /tmp/fixture   # config check
-./scripts/ci/check-macos-client-runtime.sh  "$BIN" /tmp/runtime   # runtime + Clash API
-./scripts/ci/check-macos-client-headless.sh "$BIN" /tmp/headless  # native Web API + control plane
+./scripts/ci/check-macos-client-runtime.sh  "$BIN" /tmp/runtime   # runtime smoke on the data path
+./scripts/ci/check-macos-client-headless.sh "$BIN" /tmp/headless  # the Native API, the ONLY control plane
 ./scripts/ci/audit-macos-client-registry.sh "$BIN"                # registry + symbols
 ```
 
@@ -717,19 +772,21 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | lint | **PASS** | `golangci-lint` "0 issues" |
 | `go vet` (client tags) | **PASS** | exit 0 over the shipped packages |
 | unit tests (client tags) | **PASS** | `route`, `dns`, `option`, `common`, `protocol`, `transport` |
-| client registry audit tests | **PASS** | 20/20 `TestClient*` |
-| capability verification | **PASS** | NaiveProxy, MASQUE, gVisor, Hysteria2, TUIC, Clash API, TUN all confirmed in the shipped symbol table |
-| darwin/arm64 build (canonical) | **PASS** | native build, 76,166,402 bytes, arm64 only |
+| client registry audit tests | **PASS** | all `TestClient*` |
+| capability verification | **PASS** | NaiveProxy, MASQUE (client role only), gVisor, uTLS, Cronet and TUN all confirmed in the shipped symbol table |
+| darwin/arm64 build (canonical) | **PASS** | native build, **73,432,802 bytes**, arm64 only |
 | `sing-box version` | **PASS** | version, arch and tags all correct |
 | reproducible build | **PASS** | identical SHA-256 across two builds |
 | config check | **PASS** | full fixture, no warnings |
 | example config check | **PASS** | checked in CI |
 | runtime smoke | **PASS** | real process, real API |
-| Clash API `/version`, `/proxies`, `/connections`, `/traffic`, `/configs` | **PASS** | real HTTP against a running process |
-| selector / urltest readable | **PASS** | via Clash API |
 | SIGTERM clean exit | **PASS** | exit 0, no panic |
 | registry symbol audit | **PASS** | single canonical core |
-| excluded packages absent (`go tool nm`) | **PASS** | masque, openvpn, openconnect, ssh, tor, redirect, resolved, ssmapi, usbip, wireguard, hysteria v1, dhcp, bridge |
+| production allowlist present (`go tool nm`) | **PASS** | tun, mixed; direct, block, selector, urltest, http, shadowsocks, shadowtls, vless, anytls, naive; masque-client; the seven DNS transports |
+| removed outbounds absent (`go tool nm`) | **PASS** | socks, snell, trojan, vmess, hysteria2, tuic are not linked |
+| **Clash API package absent** | **PASS** | `sing-box/experimental/clashapi.` has zero symbols in the shipped binary |
+| **LXD daemon package absent** | **PASS** | `sing-box/lxd.` has zero symbols in the shipped binary |
+| excluded packages absent (`go tool nm`) | **PASS** | masque-server, openvpn, openconnect, ssh, tor, redirect, resolved, ssmapi, usbip, wireguard, hysteria v1, dhcp, bridge |
 | `jiejie_server_minimal` still builds | **PASS** | Linux amd64 build unaffected |
 | upstream full registry still builds | **PASS** | 108 MB darwin build |
 | native `api` service accepted by `check` | **PASS** | `services: [{"type":"api"}]` |
@@ -738,7 +795,7 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | native API switch selector | **PASS** | read back `auto` → `direct` |
 | native API URLTest / CloseAllConnections / ClearLogs / SetClashMode | **PASS** | grpc-status 0 |
 | native API streaming (`Status`, `Log`, `Connections`, `Outbounds`) | **PASS** | real frames |
-| both management planes in one process | **PASS** | native + Clash on separate ports |
+| the Native API is the only management plane | **PASS** | no second controller in the binary and no second config surface |
 | Web Dashboard download, extract, serve | **PASS** | real archive from upstream, HTML + 1.25 MB bundle |
 | `GET /` → `/dashboard/` redirect | **PASS** | 302 |
 | core runs with dashboard unavailable | **PASS** | control plane does not gate the data plane |
@@ -749,11 +806,11 @@ go test -tags "$TAGS" ./include/... ./route/... ./dns/... ./option/... \
 | TUN mode without root | **PASS** (as a documented refusal) | fails with `operation not permitted`, as expected |
 | **runtime TUN / real system traffic** | **NOT-TESTED** | needs root; `sudo` requires a password, so TUN-up could not be exercised |
 | **dashboard fetch inside CI** | **NOT-TESTED** | CI must not depend on the public network |
-| **GUI actually loading this core** | **NOT-TESTED** | no GUI is installed or driven here |
+| **GUI actually loading this core** | **NOT-TESTED** | no GUI is installed or driven here, and no GUI is the supported path |
 | **real proxy connectivity** | **NOT-TESTED** | fixture servers are `127.0.0.1` placeholders |
 | **Naive against a real remote server** | **NOT-TESTED** | no remote endpoint available |
 | **darwin/amd64** | **removed** | the product targets Apple Silicon only |
-| **Hysteria2 / TUIC over real WAN** | **NOT-TESTED** | no remote endpoint available |
+| **Hysteria2 / TUIC over real WAN** | **removed, not untested** | the outbounds are not registered, so there is nothing left to test |
 
 Nothing in the `NOT-TESTED` rows is claimed as passing.
 
@@ -808,8 +865,10 @@ registry, so it does not enter the client binary. This was verified with
    tested; actually creating a `utun` device and routing system traffic is not,
    because it needs root and mutates host routes.
 2. **No GUI has been used to load this core.** The binary satisfies the external
-   core contract (`version`, `check`, `run`, `format`, Clash API), which is what a
-   GUI consumes, but the GUI-side integration is untested.
+   core contract (`version`, `check`, `run`, `format`, and the Native API), which
+   is what an external-core GUI consumes, but the GUI-side integration is
+   untested — and it is not the supported path. The supported path is launchd plus
+   the dashboard at `http://127.0.0.1:9090/`.
 3. **No real proxy connectivity was exercised.** All fixture servers are
    `127.0.0.1` placeholders, by design: a smoke test must not depend on a live
    remote endpoint.
@@ -858,5 +917,9 @@ above, and in particular re-check:
 
 - the three registries are still mutually exclusive;
 - `with_gvisor` is still what gates the Darwin TUN files in `sing-tun`;
+- `with_quic` is still present, because MASQUE's HTTP/3 path needs it even though
+  the QUIC outbounds are no longer registered;
 - `local` is still a DNS boot dependency;
+- the removed features have not come back: no `experimental/clashapi`, no `lxd`,
+  and no launcher RPCs in `daemon/started_service.proto`;
 - the `sing` replace still applies and the client build still compiles.
