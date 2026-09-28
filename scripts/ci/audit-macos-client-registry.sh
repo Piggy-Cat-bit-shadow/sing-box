@@ -61,28 +61,61 @@ tags="$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
-# The symbol analysis needs a symbol table, and the shipped artifact is stripped
-# with -ldflags "-s -w" ... except that it is NOT: scripts/ci/build-macos-client.sh
-# does not pass -s -w, because the macOS core ships unstripped deliberately so an
-# operator can inspect it with `go tool nm` and `go version -m`.
+# The shipped macOS artifact is now STRIPPED (-s -w), so `go tool nm` on it yields
+# no Go symbols -- verified: zero symbols matching sing-box. This audit therefore
+# builds its own UNSTRIPPED analysis copy.
 #
-# So the audit analyses the PASSED BINARY directly, and only falls back to
-# rebuilding if that binary genuinely has no symbols. Rebuilding by default was a
-# real waste: it compiled a second full binary, including the Cronet static
-# library, purely to read a symbol table that was already present in the artifact
-# under audit.
+# That copy exists only to be read by this script. It is written to a temporary
+# directory, deleted on exit, and NEVER uploaded: there is exactly one shipped
+# macOS artifact, and it is the stripped one.
+#
+# # Why symbol analysis is still worth doing at all
+#
+# It is no longer the PRIMARY evidence. The layers that decide whether this product
+# works are, in order of strength:
+#
+#   1. registry unit tests        -- do the required types resolve, and do the
+#                                    excluded ones fail to?
+#   2. source/build-graph         -- go list -deps, which needs no build at all
+#   3. config check               -- the shipped binary validating the real fixture
+#   4. RUNTIME smoke             -- the shipped binary actually serving the Native
+#                                    API and the Dashboard
+#
+# This script is layer 5: a static cross-check on the LINKED image, catching the
+# case where a package is present in the graph but its code was dropped (or the
+# reverse). Layers 3 and 4 run against the STRIPPED artifact and are what actually
+# gate the product; this one explains WHY a failure happened.
+#
+# A symbol name was never strong evidence on its own -- which is why the naive
+# outbound check below tests for the real Cronet constructor AND for the absence of
+# the not-included stub's message, rather than for the type being registered.
 nm_out="$tmpdir/nm.txt"
 go tool nm "$binary" > "$nm_out" 2>/dev/null || true
 
-if [ ! -s "$nm_out" ]; then
-  echo "note: $binary has no readable symbol table; building an unstripped analysis copy"
-  echo "      (this is a stripped artifact; the copy is deleted on exit and never uploaded)"
+# The test is for GO symbols, not for a non-empty file.
+#
+# A stripped Go binary still has a symbol table for its C and Objective-C
+# dependencies, so `[ -s "$nm_out" ]` is TRUE on the stripped artifact while every
+# Go symbol is gone. An earlier version of this script tested exactly that, decided
+# the shipped binary was analysable, and then reported every "included package"
+# check as FAILING -- 34 false failures, because it was reading the absence of the
+# symbols it was looking for as evidence the code was missing. That is the same
+# class of error this file has produced before: the check could not distinguish
+# "the thing is absent" from "the measurement did not happen".
+if ! grep -q "sing-box/" "$nm_out"; then
+  echo "note: $binary carries no Go symbols (stripped), so it cannot be audited statically"
+  echo "      building an unstripped analysis copy; it is deleted on exit and never uploaded"
   GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build \
     -trimpath -buildvcs=false -tags "$tags" \
     -o "$tmpdir/audit" ./cmd/sing-box
   go tool nm "$tmpdir/audit" > "$nm_out"
+  if ! grep -q "sing-box/" "$nm_out"; then
+    echo "FAIL: the analysis copy has no Go symbols either; this audit cannot run" >&2
+    exit 1
+  fi
+  echo "analysing the unstripped analysis copy (the shipped artifact is stripped)"
 else
-  echo "analysing the shipped binary directly (no rebuild): $binary"
+  echo "analysing the shipped binary directly (it carries Go symbols, so it is unstripped)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -473,23 +506,39 @@ else
 fi
 
 echo ""
-echo "== product capability: gVisor (the system TUN stack) =="
+echo "== removed dependency: gVisor must be ABSENT =="
 #
-# `with_gvisor` is a build TAG, and a tag name is not proof that the gVisor stack was
-# linked: the tag gates the dependency, but a registry or platform-constraint change
-# could drop it while the tag stays set, and the TUN inbound would then fall back to a
-# stack the product does not intend. This asserts the package is genuinely in the
-# binary. Folded in from the retired "product capability verification" step.
+# with_gvisor was REMOVED from this product. The production configuration declares a
+# tun inbound with no `stack` field, and sing-tun resolves unset to "" -> NewGo, the
+# Go userspace stack; stack="gvisor"/"mixed" (the only paths that reach gVisor) are
+# never configured. Verified against sing-tun's NewStack with the tag absent: <unset>
+# and "go" both still work, while "gvisor" and "mixed" return the documented
+# "rebuild with -tags with_gvisor" error rather than failing silently.
+#
+# This is a NEGATIVE assertion, i.e. the mirror of the one it replaced. It fails if
+# gVisor comes back, which is what keeps a 3.89 MiB dependency from being
+# reintroduced by an upstream sync or a careless tag-file edit.
 gvisor_symbols="$(grep -c "sagernet/gvisor" "$nm_out" || true)"
 if [ "$gvisor_symbols" -gt 0 ]; then
-  echo "PASS: gVisor is linked ($gvisor_symbols symbols); the TUN stack is real"
-else
-  echo "FAIL: with_gvisor is set but NO gVisor symbols are linked; the TUN inbound" >&2
-  echo "      would not have the system stack the product depends on" >&2
+  echo "FAIL: gVisor is linked ($gvisor_symbols symbols); it was removed from this" >&2
+  echo "      product because the tun inbound uses the Go stack" >&2
   fail=1
+else
+  echo "PASS: gVisor is absent (the tun inbound uses the Go stack)"
 fi
 
 echo ""
+echo "== product capability: the TUN stack that IS used =="
+#
+# The positive half. Removing gVisor is only safe if the Go stack is genuinely
+# present, so this asserts sing-tun's own symbols rather than trusting the tag.
+if grep -q "sing-tun" "$nm_out"; then
+  echo "PASS: sing-tun is linked ($(grep -c "sing-tun" "$nm_out") symbols); the tun inbound has a real stack"
+else
+  echo "FAIL: no sing-tun symbols; the tun inbound could not create any stack" >&2
+  fail=1
+fi
+
 echo "== removed feature: LXD daemon package must be ABSENT =="
 #
 # The LXD daemon and the `sing-box lxd` subcommand were removed from this fork, so
