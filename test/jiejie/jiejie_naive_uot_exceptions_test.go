@@ -1,7 +1,6 @@
 package jiejie_test
 
 import (
-	"bufio"
 	"crypto/tls"
 	"encoding/binary"
 	"net"
@@ -41,7 +40,10 @@ func openUoTSessionTo(t *testing.T, port uint16, target string) *uotSession {
 	// is RAW in the reference (serveHijack -> dualStream(..., false)). Framing is
 	// therefore off and the UoT request header is written unwrapped; only the
 	// header's presence is exercised, not a framing consequence.
-	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: false, version: uot.Version}
+	//
+	// The framing is DERIVED from the transport, not asserted by hand, so this
+	// helper cannot drift from the rule the product implements.
+	session := newUoTSession(conn, transportHTTP1, true, uot.Version)
 	addressBytes, err := encodeV2RequestAddr(t, metadata.ParseSocksaddr(target))
 	require.NoError(t, err)
 	_, err = conn.Write(append([]byte{1}, addressBytes...))

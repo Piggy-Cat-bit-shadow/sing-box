@@ -112,6 +112,71 @@ func TestH1FramingAllowlistEntriesStillExist(t *testing.T) {
 	}
 }
 
+// TestUoTSessionFramingIsNeverHandSet enforces the item-9 design: a session's
+// framing must come from framesPayload, never from a literal.
+//
+// The original bug was exactly a hand-set flag (padding: true on an HTTP/1
+// tunnel). A literal cannot express "depends on the transport", so allowing one
+// re-opens the class. This is a source check because the field is legitimate
+// inside the struct literal -- only its VALUE is constrained.
+func TestUoTSessionFramingIsNeverHandSet(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+
+	// Parsing and walking the AST rather than grepping the raw text: the rule is
+	// about a field's VALUE in a composite literal, and prose in comments (this
+	// file explains the rule) must not trip it.
+	fileSet := token.NewFileSet()
+	var offenders []string
+	for _, file := range files {
+		if !strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+		parsed, parseErr := parser.ParseFile(fileSet, file, nil, 0)
+		if parseErr != nil {
+			continue
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			literal, isLiteral := node.(*ast.CompositeLit)
+			if !isLiteral {
+				return true
+			}
+			for _, element := range literal.Elts {
+				keyValue, isKeyValue := element.(*ast.KeyValueExpr)
+				if !isKeyValue {
+					continue
+				}
+				identifier, isIdent := keyValue.Key.(*ast.Ident)
+				if !isIdent || identifier.Name != "padding" {
+					continue
+				}
+				// `true` and `false` parse as *ast.Ident, NOT *ast.BasicLit, so
+				// checking only BasicLit misses the exact mutation this guard
+				// exists to catch. Named identifiers (a derived value held in a
+				// variable) and call expressions are the legitimate forms.
+				switch value := keyValue.Value.(type) {
+				case *ast.BasicLit:
+					offenders = append(offenders, file)
+				case *ast.Ident:
+					if value.Name == "true" || value.Name == "false" {
+						offenders = append(offenders, file)
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	require.Empty(t, offenders,
+		"these files set a session's framing to a LITERAL. Framing depends on the "+
+			"transport, so it must be derived:\n"+
+			"  newUoTSession(conn, transport, requestPaddingHeader, version)\n"+
+			"or, inside a struct literal,\n"+
+			"  transport.framesPayload(requestPaddingHeader)\n\n"+
+			"A literal is what produced the false UoT v2 non-connect P0.\n\n"+
+			"offenders: %v", offenders)
+}
+
 // TestNaivePaddingFrameHasExactlyOneDefinition guards against a second copy of
 // the encoder appearing, which would let one copy be fixed and the other not.
 func TestNaivePaddingFrameHasExactlyOneDefinition(t *testing.T) {

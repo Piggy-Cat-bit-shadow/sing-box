@@ -289,10 +289,15 @@ func dialTracedUoT(t *testing.T, port uint16, echoAddress string, sessionID int,
 		t.Fatal(err)
 	}
 
+	// This helper drives HTTP/2 AND sends a Padding header, so the framing is
+	// derived from those two facts rather than asserted by hand. Deriving it keeps
+	// this helper in step with the product rule: HTTP/2 frames only when Padding
+	// was requested, HTTP/1 never frames.
+	const requestPaddingHeader = true
 	return &uotTraceSession{
 		conn:        pipeWriter,
 		reader:      bufio.NewReader(response.Body),
-		padding:     true,
+		padding:     transportHTTP2.framesPayload(requestPaddingHeader),
 		sessionID:   sessionID,
 		trace:       trace,
 		echoAddress: echoAddress,
@@ -353,9 +358,11 @@ func dialTracedUoTH2(t *testing.T, port uint16, echoAddress string, sessionID in
 	}
 
 	session := &uotTraceSession{
-		conn:        pipeWriter,
-		reader:      bufio.NewReader(response.Body),
-		padding:     padded,
+		conn:   pipeWriter,
+		reader: bufio.NewReader(response.Body),
+		// This helper drives HTTP/2, so framing follows the Padding REQUEST HEADER
+		// the caller asked for; `padded` never means 'framed on HTTP/1' here.
+		padding:     transportHTTP2.framesPayload(padded),
 		sessionID:   sessionID,
 		trace:       trace,
 		echoAddress: echoAddress,
@@ -440,9 +447,11 @@ func dialTracedUoTH1(t *testing.T, port uint16, echoAddress string, sessionID in
 	// Padding" versus "request without", which is a real behavioural axis; only
 	// the framing consequence is removed.
 	session := &uotTraceSession{
-		conn:        tlsConn,
-		reader:      reader,
-		padding:     false,
+		conn:   tlsConn,
+		reader: reader,
+		// HTTP/1 is a RAW tunnel, so framing is derived as false regardless of the
+		// Padding request header this helper may send.
+		padding:     transportHTTP1.framesPayload(true),
 		sessionID:   sessionID,
 		trace:       trace,
 		echoAddress: echoAddress,

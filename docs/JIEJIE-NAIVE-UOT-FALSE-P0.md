@@ -92,8 +92,17 @@ func (transport naiveTransport) framesPayload(requestPaddingHeader bool) bool {
 ```
 
 `newUoTSession` computes the framing from `(transport, requestPaddingHeader)`, so
-a caller can no longer declare an HTTP/1 tunnel that frames. The four
-combinations are pinned by `TestAuditUoTPaddingContractIsTransportDependent`:
+a caller can no longer declare an HTTP/1 tunnel that frames. Two structural guards
+keep it that way, because a runtime check only ever sees the tunnel it was given:
+
+- `TestNoHTTP1TunnelWritesPaddedFrames` fails when a file both opens an HTTP/1
+  tunnel and writes a padding frame. Its allowlist requires a reason naming the
+  mechanism, and a companion test fails on stale entries so the list cannot rot
+  into a rubber stamp.
+- `TestUoTSessionFramingIsNeverHandSet` fails when any session literal sets
+  `padding` to a literal instead of deriving it.
+
+The four combinations are pinned by `TestAuditUoTPaddingContractIsTransportDependent`:
 
 | Transport | Padding header | Framing | Result |
 | --- | --- | --- | --- |
@@ -114,6 +123,15 @@ Each claim was checked by breaking it:
 | **B.** make the server frame HTTP/1 payloads (`usePadding` in the hijack branch) | H1 reference/differential tests fail | 4 fail, incl. `TestJiejieNaiveH1TunnelIsRawByByteComparison` |
 | **C.** have the HTTP/2 helper declare HTTP/1, dropping the frame | the HTTP/2 padded case fails | fails 3/3, "HTTP/2 with a Padding header must frame payloads" |
 | **D.** narrow the `ip_cidr` rule so it no longer covers loopback | the re-enabled security subtest fails | fails |
+| **E.** reintroduce a framed HTTP/1 write in a fixed file | the structural guard reports it | reported |
+| **F.** hand-set `padding: true` again (the original bug, inlined) | the derivation guard reports it | reported |
+
+Mutation F is worth recording because the **first version of that guard did not
+catch it**. The check looked for `*ast.BasicLit` values, but Go parses `true` and
+`false` as `*ast.Ident`, so the literal slipped straight through while the test
+reported PASS. A guard that cannot fail on the mutation it was written for is
+worse than no guard, because it looks like coverage. Both guards are AST-based
+rather than text-based so that prose in comments cannot trip them either.
 
 Mutation B is the one that shows the product-side rule is itself pinned: if
 anyone later "fixes" HTTP/1 to honour padding, the raw-tunnel parity tests catch
