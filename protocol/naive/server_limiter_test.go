@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -400,4 +402,81 @@ func TestLimitedListenerRefusesAndClosesOverLimitConnections(t *testing.T) {
 	_ = firstConn.Close()
 	require.Equal(t, 0, limiter.totalCount(),
 		"closing the accepted connection must release its slot")
+}
+
+// TestServerLimiterIsRaceFreeUnderConcurrentAcquireRelease drives the limiter
+// from many goroutines at once.
+//
+// The -race detector only reports races that actually occur, so a limiter
+// exercised one connection at a time would look race-free while being nothing of
+// the sort. This test creates the contention: N goroutines acquiring and
+// releasing against a small per-IP allowance, which is exactly the shape a real
+// burst of connections produces.
+//
+// It asserts the STRONGER property too: the number of simultaneously admitted
+// connections never exceeds the configured allowance, at any instant. A limiter
+// that is race-free but over-admits is still not a limit.
+func TestServerLimiterIsRaceFreeUnderConcurrentAcquireRelease(t *testing.T) {
+	const (
+		allowance  = 4
+		goroutines = 32
+		iterations = 200
+	)
+	limiter := newServerLimiter(option.NaiveServerLimits{
+		MaxConnections:      allowance,
+		MaxConnectionsPerIP: allowance,
+		MaxTrackedIPs:       64,
+	})
+
+	var (
+		wg sync.WaitGroup
+		// admissions counts every successful acquire over the whole run; inFlight
+		// tracks the instantaneous count. They are separate because admissions is
+		// the "did anything happen at all" signal and inFlight is the "did the
+		// limit hold" signal -- an earlier version reused one counter for both and
+		// therefore always read zero once the run finished.
+		admissions  atomic.Int64
+		refused     atomic.Int64
+		inFlight    atomic.Int64
+		maxInFlight atomic.Int64
+	)
+
+	for range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				release, ok := limiter.acquire("10.0.0.1:1234", time.Now())
+				if !ok {
+					refused.Add(1)
+					continue
+				}
+				admissions.Add(1)
+				current := inFlight.Add(1)
+				// Track the high-water mark of concurrent admissions. If the
+				// limiter ever admits more than the allowance, this observes it.
+				for {
+					observed := maxInFlight.Load()
+					if current <= observed || maxInFlight.CompareAndSwap(observed, current) {
+						break
+					}
+				}
+				// Over-allowance would be visible as a high-water mark above the
+				// configured maximum, so no extra synchronisation is needed.
+				time.Sleep(time.Microsecond)
+				inFlight.Add(-1)
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.LessOrEqual(t, maxInFlight.Load(), int64(allowance),
+		"the limiter admitted more concurrent connections than max_connections_per_ip")
+	require.Positive(t, admissions.Load(), "some acquisitions must succeed")
+	t.Logf("OBSERVED: %d goroutines x %d iterations -> admissions=%d refused=%d peak-in-flight=%d (allowance %d)",
+		goroutines, iterations, admissions.Load(), refused.Load(), maxInFlight.Load(), allowance)
+
+	require.Equal(t, 0, limiter.totalCount(),
+		"every acquisition was released, so the total must return to zero")
 }
