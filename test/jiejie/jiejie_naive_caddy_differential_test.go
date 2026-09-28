@@ -150,26 +150,142 @@ type parityProbe struct {
 	name string
 	run  func(t *testing.T, address string) parityObservation
 
-	// knownDivergence, when set, marks a difference that has been investigated and
-	// is INTENTIONAL on our side. The probe is still run and its two results are
-	// still printed, and the verdict becomes INTENTIONAL-DIFF rather than PASS or DIFF.
-	// Leaving it unset means the probe is expected to match exactly.
+	// expectedDivergence, when set, declares EXACTLY how this probe is allowed to
+	// differ from the reference. The probe is still run, both results are still
+	// printed, and a match produces INTENTIONAL-DIFF rather than DIFF.
 	//
-	// The label is INTENTIONAL-DIFF, and it is NOT an escape hatch for an
-	// unexplained failure. The bar is that all four of these exist and are
-	// recorded in the string:
+	// Leaving it unset means the probe must match the reference exactly.
 	//
-	//   1. pinned-source evidence for what the reference does;
-	//   2. runtime reproduction through this harness;
-	//   3. the exact observed values (filled in automatically below);
-	//   4. an explicit product decision that this fork intends to differ.
+	// # Why this is structured rather than a description
 	//
-	// A difference that cannot meet that bar is a DIFF and fails CI. An earlier
-	// version of this harness labelled the H1 raw-passthrough case as a divergence
-	// on the strength of a misread probe; it has since been proven by byte
-	// comparison that both implementations agree, and the label was removed rather
-	// than kept.
-	knownDivergence string
+	// The previous design carried a free-text `knownDivergence` string, and ANY
+	// difference was accepted as INTENTIONAL-DIFF whenever that string was non-empty.
+	// That is a blanket exemption: once a probe has a divergence label, a completely
+	// different regression in the same probe is also swallowed, and the label's
+	// prose is never checked against what was actually observed.
+	//
+	// Here the expected difference must be stated as data. The observed difference is
+	// matched against it field by field, and anything not declared is a DIFF that
+	// fails CI. A new regression therefore cannot hide behind an old label.
+	//
+	// Rationale is required as well, so the declaration is still auditable by a human;
+	// it just no longer has the power to excuse anything on its own.
+	expectedDivergence *expectedDivergence
+}
+
+// expectedDivergence declares the exact observation difference this fork intends.
+//
+// Every field is a literal expectation, using the same string vocabulary as
+// parityObservation. A field left empty means "must match the reference": it declares
+// nothing, so it cannot excuse a difference.
+type expectedDivergence struct {
+	// referenceStatus and singBoxStatus are the HTTP statuses each side must produce.
+	referenceStatus string
+	singBoxStatus   string
+
+	// referenceError and singBoxError are the error CLASSES each side must produce, in
+	// the vocabulary of errorClass ("none", "dial", "tls", "read-response", ...).
+	referenceError string
+	singBoxError   string
+
+	// referencePadding and singBoxPadding are the padding-header observations each side
+	// must produce ("present", "absent", or a length bucket).
+	referencePadding string
+	singBoxPadding   string
+
+	// referenceTunnel and singBoxTunnel are the tunnel observations each side must
+	// produce ("opened", "closed", ...).
+	referenceTunnel string
+	singBoxTunnel   string
+
+	// rationale records WHY this fork intends to differ, and evidence pins the reference
+	// behaviour. Both are documentation: they are checked for presence, not for content,
+	// and they never widen the match.
+	rationale string
+	evidence  string
+	// referenceCommit pins the reference revision the divergence was verified against.
+	referenceCommit string
+}
+
+// matches reports whether the observed difference is EXACTLY the declared one.
+//
+// It returns the list of ways the observation fails to match the declaration, so a
+// failure explains itself instead of only saying "differs".
+//
+// A declared field only excuses a difference when the observed value equals what was
+// declared. Any field the declaration leaves empty must match the reference, and any
+// field whose observed value is neither the declared one nor a match is a violation.
+func (d *expectedDivergence) matches(reference parityObservation, singBox parityObservation) (bool, []string) {
+	var violations []string
+
+	// check compares one field across both sides.
+	//
+	// declaredReference and declaredSingBox are the values the declaration PREDICTS for
+	// each side, and they are separate arguments: a divergence is precisely the case
+	// where the two sides are expected to differ, so there is no single expected value
+	// to compare both against. An earlier revision of this function took one expected
+	// value and compared both sides to it, which rejected every correctly declared
+	// divergence.
+	//
+	// An empty prediction means "this side must match the reference", so it declares
+	// nothing and cannot excuse a difference.
+	check := func(name string, declaredReference string, declaredSingBox string,
+		referenceValue string, singBoxValue string) {
+		if referenceValue == singBoxValue {
+			// The sides agree. Nothing needs excusing, and if the declaration still
+			// predicted a difference it is stale.
+			if declaredReference != "" && declaredSingBox != "" &&
+				declaredReference != declaredSingBox {
+				violations = append(violations, fmt.Sprintf(
+					"%s: declared a divergence (%q vs %q) but both sides observed %q; "+
+						"the declaration is stale",
+					name, declaredReference, declaredSingBox, referenceValue))
+			}
+			return
+		}
+
+		// The sides differ. That is only allowed if the declaration predicted BOTH
+		// values.
+		if declaredReference == "" && declaredSingBox == "" {
+			violations = append(violations, fmt.Sprintf(
+				"%s: undeclared difference caddy=%q singbox=%q",
+				name, referenceValue, singBoxValue))
+			return
+		}
+		if declaredReference != referenceValue {
+			violations = append(violations, fmt.Sprintf(
+				"%s: caddy observed %q but the declaration expected %q",
+				name, referenceValue, declaredReference))
+		}
+		if declaredSingBox != singBoxValue {
+			violations = append(violations, fmt.Sprintf(
+				"%s: singbox observed %q but the declaration expected %q",
+				name, singBoxValue, declaredSingBox))
+		}
+	}
+
+	check("status", d.referenceStatus, d.singBoxStatus,
+		reference.status, singBox.status)
+	check("error", d.referenceError, d.singBoxError,
+		errorClass(reference), errorClass(singBox))
+	check("padding", d.referencePadding, d.singBoxPadding,
+		reference.paddingHeader, singBox.paddingHeader)
+	check("tunnel", d.referenceTunnel, d.singBoxTunnel,
+		reference.tunnelOpened, singBox.tunnelOpened)
+
+	// The declaration must name a reference commit and give a reason, so an intentional
+	// divergence is still traceable.
+	if d.referenceCommit == "" {
+		violations = append(violations, "the declaration does not name the reference commit it was verified against")
+	}
+	if d.rationale == "" {
+		violations = append(violations, "the declaration does not state why this fork intends to differ")
+	}
+	if d.evidence == "" {
+		violations = append(violations, "the declaration does not record the evidence for the reference behaviour")
+	}
+
+	return len(violations) == 0, violations
 }
 
 // parityObservation is what a probe saw, reduced to comparable strings.
@@ -185,7 +301,41 @@ type parityObservation struct {
 	// framedPassthrough reports whether FRAMED bytes reached the origin.
 	framedPassthrough string
 	// err is a short error classification when something failed.
+	//
+	// It is compared as a CLASS, not as text: see errorClass. Two implementations
+	// describing the same failure will not produce identical Go error strings, so
+	// comparing raw text would either always differ or be loosened until it compares
+	// nothing.
 	err string
+}
+
+// errorClass reduces an observation's err field to a stable class, so the verdict can
+// compare failures without depending on implementation-specific wording.
+//
+// The distinction that matters is between "both sides failed the same WAY" (compatible)
+// and "one side failed differently from the other" (a real difference). Before this
+// existed, equal() ignored err entirely, so a probe where Caddy returned a TLS failure
+// and sing-box returned a read failure could be scored PASS as long as the other fields
+// happened to line up.
+//
+// The err fields set by the probes are already coarse ("dial", "tls", "read-response"),
+// but one of them appends the full error text ("tls: " + err.Error()). That suffix is
+// unstable across Go versions and TLS stacks, so it is stripped here rather than being
+// compared.
+func errorClass(observation parityObservation) string {
+	value := observation.err
+	if value == "" {
+		return "none"
+	}
+	// Strip any ": <detail>" suffix: only the class is compared.
+	if index := strings.Index(value, ":"); index >= 0 {
+		value = value[:index]
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "none"
+	}
+	return value
 }
 
 // ---------------------------------------------------------------------------
@@ -591,33 +741,27 @@ func parityProbes(originAddr, unreachableAddr string, validAuth string) []parity
 			// ProbeResistance is nil). This fork instead hijacks the connection,
 			// sets SO_LINGER to 0 and closes it without any response
 			// (protocol/naive/inbound.go, rejectHTTP), so an unauthenticated
-			// CONNECT produces a reset rather than a challenge.
+			// CONNECT now produces a 407 challenge, matching the reference.
 			//
-			// That is a deliberate anti-probing choice for this deployment, not
-			// an oversight: sending a proxy-auth challenge advertises the port as
-			// a proxy. It is recorded here rather than "fixed", because changing
-			// it would change the fork's security posture and is a product
-			// decision, not a compatibility bug.
-			knownDivergence: "unauthenticated CONNECT: reference " +
-				CaddyReferenceCommit + " returns 407 + Proxy-Authenticate " +
-				"(forwardproxy.go sets the header then returns " +
-				"caddyhttp.Error(StatusProxyAuthRequired)); this fork hijacks the " +
-				"connection, sets SO_LINGER to 0 and closes it with no response " +
-				"(protocol/naive/inbound.go rejectHTTP). INTENTIONAL: challenging " +
-				"advertises the port as a proxy, which this deployment does not " +
-				"do. Verified by runtime reproduction in this harness and by " +
-				"reading the pinned source.",
+			// This probe previously carried a divergence label claiming that this
+			// fork hijacked the connection, set SO_LINGER to 0 and closed it with no
+			// response (rejectHTTP). That is no longer what the code does:
+			// protocol/naive/inbound.go routes an auth failure through
+			// serveWebOrReject with http.StatusProxyAuthRequired, which sends
+			// "407 Proxy Authentication Required" plus the challenge header.
+			//
+			// The label was therefore FALSE and has been removed rather than
+			// reworded. A probe must match the reference unless a divergence is
+			// declared as data, and there is no divergence left to declare here.
 		},
 		{
 			name: "H1 CONNECT wrong auth",
 			run: probeH1Connect(originAddr, map[string]string{
 				"Proxy-Authorization": "Basic " + basicAuthValueOf(naiveParityUser, "definitely-wrong"),
 			}, nil),
-			knownDivergence: "wrong credentials: same behaviour as the no-auth " +
-				"case at reference " + CaddyReferenceCommit + " (reference " +
-				"challenges with 407 + Proxy-Authenticate, this fork resets with no " +
-				"response via rejectHTTP). INTENTIONAL for the same reason: a " +
-				"challenge would advertise the proxy.",
+			// Same as the no-auth case: the fork challenges with 407 like the
+			// reference, so no divergence is declared. The former label claimed a
+			// rejectHTTP reset that the implementation no longer performs.
 		},
 		{
 			name: "H1 CONNECT unreachable target",
@@ -716,16 +860,33 @@ func TestJiejieNaiveCaddyDifferentialCompatibility(t *testing.T) {
 		switch {
 		case referenceObservation.equal(singBoxObservation):
 			result.Verdict = "PASS"
-		case probe.knownDivergence != "":
-			// The evidence bar is enforced, not merely documented: a divergence
-			// label that does not state the reference commit and the observed
-			// values is not accepted.
-			require.Contains(t, probe.knownDivergence, CaddyReferenceCommit,
-				"probe %q claims an intentional divergence but does not name the "+
-					"pinned reference commit it was verified against", probe.name)
-			result.Verdict = "INTENTIONAL-DIFF"
-			result.Reason = probe.knownDivergence + " | observed: " +
-				referenceObservation.difference(singBoxObservation)
+		case probe.expectedDivergence != nil:
+			// The divergence must be EXACTLY the one declared. A label alone is not
+			// enough: the observed difference is matched field by field, so a
+			// regression that happens to land on a probe carrying a label is still a
+			// DIFF rather than being swallowed by it.
+			matched, violations := probe.expectedDivergence.matches(referenceObservation, singBoxObservation)
+			if matched {
+				result.Verdict = "INTENTIONAL-DIFF"
+				result.Reason = fmt.Sprintf(
+					"declared: reference=%s/%s singbox=%s/%s | rationale: %s | evidence: %s | observed: %s",
+					probe.expectedDivergence.referenceStatus,
+					probe.expectedDivergence.referenceError,
+					probe.expectedDivergence.singBoxStatus,
+					probe.expectedDivergence.singBoxError,
+					probe.expectedDivergence.rationale,
+					probe.expectedDivergence.evidence,
+					referenceObservation.difference(singBoxObservation))
+			} else {
+				// The probe declares a divergence, but what happened is NOT it. This
+				// is the case the old free-text design could not distinguish, and it
+				// must fail loudly rather than be reported as intentional.
+				result.Verdict = "DIFF"
+				result.Reason = fmt.Sprintf(
+					"the declared divergence does not describe what was observed: %s | observed: %s",
+					strings.Join(violations, "; "),
+					referenceObservation.difference(singBoxObservation))
+			}
 		default:
 			result.Verdict = "DIFF"
 			result.Reason = referenceObservation.difference(singBoxObservation)
@@ -787,7 +948,12 @@ func (o parityObservation) equal(other parityObservation) bool {
 		o.paddingHeader == other.paddingHeader &&
 		o.tunnelOpened == other.tunnelOpened &&
 		o.rawPassthrough == other.rawPassthrough &&
-		o.framedPassthrough == other.framedPassthrough
+		o.framedPassthrough == other.framedPassthrough &&
+		// The error CLASS is part of the observation. Without this, a probe where the
+		// two implementations failed in different ways could score PASS whenever the
+		// other fields were empty on both sides - which is exactly the case for a
+		// connection that never produced a response.
+		errorClass(o) == errorClass(other)
 }
 
 func (o parityObservation) difference(other parityObservation) string {
@@ -806,6 +972,10 @@ func (o parityObservation) difference(other parityObservation) string {
 	}
 	if o.framedPassthrough != other.framedPassthrough {
 		parts = append(parts, fmt.Sprintf("framed passthrough: caddy=%q singbox=%q", o.framedPassthrough, other.framedPassthrough))
+	}
+	if errorClass(o) != errorClass(other) {
+		parts = append(parts, fmt.Sprintf("error class: caddy=%q singbox=%q (raw: caddy=%q singbox=%q)",
+			errorClass(o), errorClass(other), o.err, other.err))
 	}
 	return strings.Join(parts, "; ")
 }
