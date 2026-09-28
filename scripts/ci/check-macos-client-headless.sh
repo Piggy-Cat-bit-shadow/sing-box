@@ -3,10 +3,10 @@
 #
 # Usage: check-macos-client-headless.sh [binary] [workdir]
 #
-# This is the control-plane counterpart to check-macos-client-runtime.sh. That
-# This script proves the NATIVE
-# management plane works, which is what the Web Dashboard and a headless
-# deployment depend on.
+# This script proves the NATIVE management plane works, which is what the Web
+# Dashboard and a headless deployment depend on. It is the ONLY control-plane
+# smoke test in this product: the Clash API was removed, so there is no second
+# management plane to check.
 #
 # It is deliberately self-contained: it
 # builds its own minimal configuration rather than deriving it from the shared
@@ -33,7 +33,8 @@
 #     reachable, and the download is upstream's code, not this fork's. The
 #     dashboard is tested locally against a real download and reported
 #     separately as NOT-TESTED-in-CI.
-#   - TUN. Needs root; see check-macos-client-runtime.sh for the same boundary.
+#   - TUN. Needs root, which a CI runner must not have; TUN registration and
+#     config parsing are covered by check-macos-client-config.sh instead.
 set -euo pipefail
 
 binary="${1:-dist/sing-box-darwin-arm64}"

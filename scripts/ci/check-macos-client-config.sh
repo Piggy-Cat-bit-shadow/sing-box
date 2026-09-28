@@ -11,7 +11,7 @@
 # Ports are fixed rather than probed. A probe would make the check non-
 # deterministic and could still race between the probe and the bind; the check
 # only parses and validates, it does not bind, so a fixed high port range is
-# correct here. The runtime smoke test (check-macos-client-runtime.sh) is the
+# correct here. The headless smoke test (check-macos-client-headless.sh) is the
 # script that actually binds, and it uses its own port range.
 set -euo pipefail
 
