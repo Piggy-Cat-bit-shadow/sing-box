@@ -141,15 +141,31 @@ Established by reading the code paths, not by inference:
   `connection_receive_window` and `max_concurrent_streams` through
   `HTTP2Options`, and `http2Server()` applies them (each documented in
   `option/naive.go`).
-- There is **no** pre-authentication read deadline and **no** connection-count
-  cap anywhere in the Naive path. Upstream has none either, so this is not
-  something the merge could have absorbed.
+- There is **no** connection-count cap anywhere in the Naive path. Upstream has
+  none either, so this is not something the merge could have absorbed.
+
+### What is already bounded, and what is not
+
+Tracing the actual call chain rather than reading the struct fields:
+
+| Phase | Bounded? | By what |
+|---|---|---|
+| TLS handshake | **yes** | `aTLS.Listener` hands out a `LazyConn` whose `Read` calls `HandshakeContext(context.Background())` → `tls.ServerHandshake`, which applies `C.TCPTimeout` (15s) whenever `HandshakeTimeout() == 0` |
+| Post-handshake idle | only if opted in | `http2.Server.IdleTimeout` is assigned only when `options.IdleTimeout > 0` |
+| Pre-auth request, mid-request | **no** | `http.Server` sets no `ReadHeaderTimeout`/`ReadTimeout`, and `naiveH2Conn.SetReadDeadline` returns `os.ErrInvalid`, so a peer that completes TLS and then stalls mid-request holds the connection |
+| Total connection count | **no** | no such mechanism exists |
+
+An earlier draft of this section claimed there was no pre-authentication deadline
+at all. That was wrong: the handshake is bounded, and I corrected it after
+following `LazyConn` into the dependency. The genuine residual gaps are the
+mid-request stall and the absent connection count.
 
 Not actioned in this round, deliberately: per §10 and §5, adding a limit *and*
 choosing a default would change production behaviour on hosts whose real
-connection concurrency has not been measured. The option surface exists for the
-per-connection axis; the connection-count axis needs a measurement first.
-Reported as an open, evidenced gap rather than closed with a guessed default.
+connection concurrency has not been measured. Reported as an open, evidenced gap
+rather than closed with a guessed default. Note also that the fork exposes
+`idle_timeout` and the receive windows for operators who need to bound a host
+today.
 
 ## §11 DNS cold path
 
