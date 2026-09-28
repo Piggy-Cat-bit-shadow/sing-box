@@ -56,6 +56,12 @@ type NaiveInboundOptions struct {
 	// they bound how much a peer may have in flight toward this server. Do not
 	// copy a client's oversized stream_receive_window here.
 	HTTP2Options HTTP2Options `json:"-"`
+	// ServerLimits bounds the resources a peer may hold BEFORE it authenticates.
+	//
+	// Omitted means unlimited, which is the previous behaviour: no limit is
+	// applied by default because the production topology serves long-lived
+	// tunnels and a guessed limit would silently break them.
+	ServerLimits *NaiveServerLimitsOptions `json:"server_limits,omitempty"`
 	InboundTLSOptionsContainer
 }
 

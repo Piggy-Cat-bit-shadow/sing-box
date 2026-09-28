@@ -7355,6 +7355,9 @@
                 }
               ]
             },
+            "server_limits": {
+              "$ref": "#/$defs/NaiveServerLimitsOptions"
+            },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
             },
@@ -9684,6 +9687,27 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "NaiveServerLimitsOptions": {
+      "type": "object",
+      "properties": {
+        "max_connections": {
+          "type": "integer"
+        },
+        "max_connections_per_ip": {
+          "type": "integer"
+        },
+        "header_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "max_tracked_ips": {
+          "type": "integer"
         }
       },
       "additionalProperties": false

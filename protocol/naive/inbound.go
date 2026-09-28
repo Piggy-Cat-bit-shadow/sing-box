@@ -60,6 +60,12 @@ type Inbound struct {
 	// is kept. It is shared with the HTTP/MASQUE inbounds and has no access to
 	// the proxy data path, so it can never open a tunnel.
 	masquerade http.Handler
+	// limits is the resolved server_limits option. Its zero value means no limits,
+	// which is the default and preserves the previous behaviour exactly.
+	limits option.NaiveServerLimits
+	// limiter enforces the connection counts at accept time. It is nil when no
+	// count limit is configured, so the unlimited path takes no locks.
+	limiter *serverLimiter
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NaiveInboundOptions) (adapter.Inbound, error) {
@@ -95,6 +101,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if err := validateHTTP2Options(options.HTTP2Options); err != nil {
 		return nil, err
 	}
+	// A limit that cannot be honoured must fail at configuration time rather than
+	// be silently ignored at runtime.
+	if err := options.ServerLimits.Validate(); err != nil {
+		return nil, E.Cause(err, "invalid server_limits")
+	}
+	inbound.limits = options.ServerLimits.Build()
+	inbound.limiter = newServerLimiter(inbound.limits)
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServer(ctx, logger, common.PtrValueOrDefault(options.TLS))
 		if err != nil {
@@ -131,6 +144,23 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
 			},
+			// HeaderTimeout bounds the REQUEST phase only.
+			//
+			// This is net/http's own knob rather than a hand-rolled conn wrapper,
+			// and the difference matters: net/http applies the deadline per header
+			// byte and, in its own words, "the connection's read deadline is reset
+			// after reading the headers". That is exactly the required shape - a
+			// peer that stalls mid-header is disconnected, while an established
+			// tunnel keeps no deadline at all.
+			//
+			// A wrapper around the conn cannot do this correctly. The obvious
+			// implementation clears the deadline on the first Read, which a
+			// slow-header peer defeats by sending a single byte: that Read
+			// completes, the deadline is dropped, and the attack proceeds. Only the
+			// HTTP parser knows when the header block is actually complete.
+			//
+			// Unset (0) means no timeout, preserving the previous behaviour.
+			ReadHeaderTimeout: n.limits.HeaderTimeout,
 		}
 		listener := net.Listener(tcpListener)
 		if n.tlsConfig != nil {
@@ -152,6 +182,16 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			// created, started and closed exactly once.
 			tcpTLSConfig := tls.TransportALPNView(n.tlsConfig, n.tcpNextProtos())
 			listener = aTLS.NewListener(tcpListener, tcpTLSConfig)
+		}
+		// The count limits wrap the OUTERMOST listener, so they count every
+		// accepted connection, including one that never completes a handshake and
+		// one that never sends a request. Wrapping inside the TLS layer would miss
+		// both, and those are the cheapest ways to hold a resource.
+		//
+		// A nil limiter means no wrapper, so the accept path is exactly what it was
+		// before this option existed.
+		if n.limiter != nil {
+			listener = &limitedListener{Listener: listener, limiter: n.limiter}
 		}
 		go func() {
 			sErr := n.httpServer.Serve(listener)
