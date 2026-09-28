@@ -70,7 +70,24 @@ if [ -z "$version" ]; then
   exit 2
 fi
 
-ldflags="-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS)"
+# The shipped macOS core is STRIPPED. -s drops the symbol table and -w drops the DWARF
+# debug sections, which together are the single largest removable cost in this binary:
+# measured at 12.38 MiB of __DWARF, and 24.37 MiB (34.8%) of the unstripped 70.03 MiB
+# image once the symbol and string tables go too.
+#
+# The flags live in a macOS-profile-specific file rather than in release/LDFLAGS so that
+# stripping is a property of THIS product. The Linux server, the deep audits and any
+# local debug build keep their symbols, and nothing has to remember which product it is
+# building.
+#
+# The cost is that `go tool nm` no longer works on the shipped artifact. That is
+# deliberate: symbol-name inspection was how the old capability audit worked, and it has
+# been replaced by build-graph + registry + config + RUNTIME evidence.
+# The file holds "-s -w" on one line. Only the trailing newline is stripped: deleting
+# ALL whitespace would fuse the two flags into "-s-w", which the linker does not
+# recognise and reports as a usage error.
+strip_flags="$(tr -d '\n' < release/LDFLAGS_JIEJIE_CLIENT_MACOS)"
+ldflags="-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS) ${strip_flags}"
 
 # Cronet ships prebuilt static libraries, so CGO is mandatory here. Defaulting it on
 # means the workflow does not have to remember, and a caller that explicitly
