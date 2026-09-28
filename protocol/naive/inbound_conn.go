@@ -400,6 +400,22 @@ func (c *naiveConn) Upstream() any           { return c.Conn }
 func (c *naiveConn) ReaderReplaceable() bool { return c.readerReplaceable() }
 func (c *naiveConn) WriterReplaceable() bool { return c.writerReplaceable() }
 
+// EarlyCopyBufferGrowth implements adapter.CopyBufferGrowthTuner.
+//
+// This is what tells the route layer to grow the copy buffer early for the copy that
+// feeds this writer - and for that copy ONLY. The padded writer is the DOWNLOAD
+// destination (target -> client), so the early growth applies there and no longer to
+// the upload direction, where the destination is an ordinary TCP or SOCKS writer with
+// no padding geometry to match.
+//
+// The reason to grow early is the one stated on writerMTU: the padding layer advertises
+// WriterMTU 65278 with 3 bytes of front headroom and 255 of rear, so the ideal pooled
+// buffer is exactly 65536 (3 + 65278 + 255). Until the threshold is crossed the copy
+// loop feeds that writer 32 KiB at a time and the geometry is never exercised. Padding
+// is also bounded to paddingCount frames, so the bulk of a large transfer runs on a
+// writer whose ideal buffer is 64 KiB.
+func (c *naiveConn) EarlyCopyBufferGrowth() bool { return true }
+
 type naiveH2Conn struct {
 	reader io.Reader
 	writer io.Writer
@@ -484,6 +500,14 @@ func (c *naiveH2Conn) RearHeadroom() int                  { return c.rearHeadroo
 func (c *naiveH2Conn) WriterMTU() int                     { return c.writerMTU() }
 func (c *naiveH2Conn) ReaderReplaceable() bool            { return c.readerReplaceable() }
 func (c *naiveH2Conn) WriterReplaceable() bool            { return c.writerReplaceable() }
+
+// EarlyCopyBufferGrowth implements adapter.CopyBufferGrowthTuner.
+//
+// The HTTP/2 tunnel writer is the DOWNLOAD destination and carries the same padding
+// geometry as naiveConn, so it asks for the same early growth on its own copy. This is
+// the direction-aware half of the change: the tuner is found on the writer the copy
+// feeds, so it cannot leak onto the upload direction the way an inbound-type check did.
+func (c *naiveH2Conn) EarlyCopyBufferGrowth() bool { return true }
 
 // hijackedConn returns bytes buffered by the HTTP server before the tunnel
 // starts, then reads from the underlying connection.

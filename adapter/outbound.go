@@ -52,6 +52,33 @@ type ConnectionCopyTuner interface {
 	EarlyConnectionBufferGrowth() bool
 }
 
+// CopyBufferGrowthTuner is an OPTIONAL capability a WRITER may implement to request
+// that the copy feeding it grows its buffer early.
+//
+// # Why this lives on the writer rather than on the connection
+//
+// The route layer copies in two directions, and each direction calls
+// bufio.CopyWithIncreateBuffer(destination, source, increaseBufferAfter, ...). The
+// reason to grow early is a property of the DESTINATION writer: a writer with a large
+// MTU or a padding geometry only benefits from a bigger buffer when the buffer matches
+// that geometry.
+//
+// The threshold used to be derived from the connection's inbound type and then applied
+// to BOTH directions. For Native Naive that was wrong in one of them: the padded writer
+// is on the download side (target -> client), so Naive's own tuning correctly applied
+// there. On the upload side (client -> target) the destination is an ordinary TCP or
+// SOCKS writer with no such geometry, yet it received the Naive threshold too and grew
+// early with nothing to gain.
+//
+// Implementing this interface lets a writer opt IN for exactly the copy that feeds it.
+// A writer that does not implement it - every ordinary net.Conn, every SOCKS conn -
+// keeps bufio.DefaultIncreaseBufferAfter, which is upstream behaviour.
+//
+// Returning false means "use the framework default", never "use zero".
+type CopyBufferGrowthTuner interface {
+	EarlyCopyBufferGrowth() bool
+}
+
 type FlowOutbound interface {
 	Outbound
 	tun.Port

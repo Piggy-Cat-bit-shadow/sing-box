@@ -168,55 +168,85 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
-	// Resolved ONCE per connection, so both copy directions use the same
-	// threshold and the decision is visible at the call site rather than buried in
-	// the goroutine body.
-	increaseBufferAfter := connectionIncreaseBufferAfter(metadata, this)
-	go m.connectionCopy(ctx, conn, remoteConn, false, increaseBufferAfter, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, increaseBufferAfter, &done, onClose)
+	// Each copy direction resolves its OWN threshold, because the reason to grow early
+	// is a property of the WRITER that copy feeds.
+	//
+	// The upload copy (conn -> remoteConn) ends at the outbound's writer; the download
+	// copy (remoteConn -> conn) ends at the inbound's writer. Resolving once and reusing
+	// the value for both - which is what an inbound-type check did - applied the inbound
+	// writer's tuning to the outbound direction as well.
+	uploadIncreaseBufferAfter := connectionIncreaseBufferAfter(this, conn, remoteConn)
+	downloadIncreaseBufferAfter := connectionIncreaseBufferAfter(this, remoteConn, conn)
+	go m.connectionCopy(ctx, conn, remoteConn, false, uploadIncreaseBufferAfter, &done, onClose)
+	go m.connectionCopy(ctx, remoteConn, conn, true, downloadIncreaseBufferAfter, &done, onClose)
 }
 
-// connectionIncreaseBufferAfter reports after how many copied bytes the tunnel copy
-// loop may switch to its larger buffer.
+// connectionIncreaseBufferAfter reports after how many copied bytes the copy loop that
+// feeds DESTINATION may switch to its larger buffer.
 //
-// # Why this is per-protocol rather than a global change
+// # Why the destination writer decides, not the inbound type
 //
-// sing's copy path starts with a pooled ~32 KiB buffer and only switches to the
-// larger geometry once the cumulative byte count reaches IncreaseBufferAfter, which
-// defaults to 512000. For most protocols that is fine.
+// The copy loop is bufio.CopyWithIncreateBuffer(destination, source, threshold, ...).
+// A bigger buffer only pays off when it matches the destination writer's geometry, so
+// the writer is the only correct place to ask. sing's default is
+// bufio.DefaultIncreaseBufferAfter (512000), which is right for an ordinary net.Conn.
 //
-// Native Naive is different, for two reasons that are both about the WRITER rather
-// than about Naive being special:
+// The previous implementation asked a different question: "is this connection's inbound
+// Naive?". For Native Naive that gave the right answer on the download copy, whose
+// destination is Naive's padded writer, and the WRONG answer on the upload copy, whose
+// destination is an ordinary TCP or SOCKS writer. The upload copy grew early for no
+// reason: it had no padding geometry to match, so the larger buffer was pure cost.
 //
-//   - its padding layer advertises WriterMTU 65278 with 3 bytes of front headroom and
-//     255 of rear, so the ideal pooled buffer is exactly 65536 bytes. Until the
-//     threshold is crossed the copy loop is feeding that writer 32 KiB at a time and
-//     the geometry is never exercised;
-//   - it writes in a bounded window: only the first requests are padded
-//     (paddingCount = 8), and after that the writer passes through unchanged. So the
-//     bulk of a large transfer happens on a writer whose ideal buffer is 64 KiB while
-//     the copy loop is still using 32 KiB for the first ~512 KiB.
+// Asking the writer fixes both directions at once and removes the protocol name from
+// this file. Native Naive's padded writer (naiveConn, naiveH2Conn) implements
+// adapter.CopyBufferGrowthTuner and opts in; every other writer - including the SOCKS
+// outbound's - falls through to the default unless it opts in itself.
 //
-// Returning 1 makes the upgrade happen after the FIRST successful transfer instead of
-// after ~512 KiB. It is deliberately not 0: sing's condition is
-// `IncreaseBufferAfter > 0 && n >= IncreaseBufferAfter`, so 0 means "never increase",
-// which is the opposite of the intent. With 1, the first chunk is still read with the
-// current default buffer and every subsequent chunk uses the larger one.
+// # Precedence
 //
-// # Why this does not change other protocols
+// A destination that opts in wins, because it describes the writer in hand. Otherwise
+// an outbound that opted in through adapter.ConnectionCopyTuner is honoured, which is
+// how a chained SOCKS hop requests early growth without a tag or username being
+// hardcoded here. `this` is the dialer actually selected for THIS connection, so a
+// group resolves to the member that served it rather than to the group.
+// connectionIncreaseBufferAfter reports after how many copied bytes the copy loop that
+// feeds DESTINATION may switch to its larger buffer.
 //
-// Every inbound type other than Naive keeps bufio.DefaultIncreaseBufferAfter, so its
-// copy behaviour is byte-for-byte unchanged. Returning the library constant rather than
-// a copied literal means a future change to the default follows here automatically.
-func connectionIncreaseBufferAfter(metadata adapter.InboundContext, dialer N.Dialer) int64 {
-	if metadata.InboundType == C.TypeNaive {
-		return naiveIncreaseBufferAfter
+// # Why the destination writer decides, not the inbound type
+//
+// The copy loop is bufio.CopyWithIncreateBuffer(destination, source, threshold, ...).
+// A bigger buffer only pays off when it matches the destination writer's geometry, so
+// the writer is the only correct place to ask. sing's default is
+// bufio.DefaultIncreaseBufferAfter (512000), which is right for an ordinary net.Conn.
+//
+// The previous implementation asked a different question: "is this connection's inbound
+// Naive?". For Native Naive that gave the right answer on the download copy, whose
+// destination is Naive's padded writer, and the WRONG answer on the upload copy, whose
+// destination is an ordinary TCP or SOCKS writer. The upload copy grew early for no
+// reason: it had no padding geometry to match, so the larger buffer was pure cost.
+//
+// Asking the writer fixes both directions at once and removes the protocol name from this
+// file. Native Naive's padded writer (naiveConn, naiveH2Conn) implements
+// adapter.CopyBufferGrowthTuner and opts in; every other writer - including the SOCKS
+// outbound's - falls through to the default unless it opts in itself.
+//
+// # Precedence
+//
+// A destination that opts in wins, because it describes the writer in hand. Otherwise an
+// outbound that opted in through adapter.ConnectionCopyTuner is honoured, which is how a
+// chained SOCKS hop requests early growth without a tag or username being hardcoded here.
+// `this` is the dialer actually selected for THIS connection, so a group resolves to the
+// member that served it rather than to the group.
+func connectionIncreaseBufferAfter(dialer N.Dialer, destination net.Conn, source net.Conn) int64 {
+	// UnwrapWriter reaches past counter and other transparent wrappers to the writer
+	// that actually performs the writes, which is where the capability lives. This is
+	// the same unwrap the duplex half-close path above uses.
+	destinationWriter, _ := N.UnwrapCountWriter(destination, nil)
+	if tuner, isTuner := N.UnwrapWriter(destinationWriter).(adapter.CopyBufferGrowthTuner); isTuner {
+		if tuner.EarlyCopyBufferGrowth() {
+			return earlyConnectionBufferIncreaseAfter
+		}
 	}
-	// An outbound may opt in through the ConnectionCopyTuner capability, which is how
-	// a chained SOCKS hop requests early growth without a tag or a username being
-	// hardcoded here. `this` is the dialer that was actually selected for THIS
-	// connection, so a group resolves to the member that served it rather than to
-	// the group itself.
 	if tuner, isTuner := dialer.(adapter.ConnectionCopyTuner); isTuner {
 		if tuner.EarlyConnectionBufferGrowth() {
 			return earlyConnectionBufferIncreaseAfter
@@ -225,15 +255,15 @@ func connectionIncreaseBufferAfter(metadata adapter.InboundContext, dialer N.Dia
 	return bufio.DefaultIncreaseBufferAfter
 }
 
-// earlyConnectionBufferIncreaseAfter is the threshold an opted-in outbound requests:
-// upgrade after the first transfer. It must be positive, because the copy loop treats
-// a non-positive value as "never grow".
+// earlyConnectionBufferIncreaseAfter is the threshold an opted-in destination or
+// outbound requests: upgrade after the FIRST successful transfer instead of after
+// bufio.DefaultIncreaseBufferAfter (512000) bytes.
+//
+// It must be positive: sing's condition is
+// `IncreaseBufferAfter > 0 && n >= IncreaseBufferAfter`, so 0 means "never grow", which
+// is the opposite of the intent. With 1 the first chunk is still read with the current
+// default buffer and every subsequent chunk uses the larger one.
 const earlyConnectionBufferIncreaseAfter = 1
-
-// naiveIncreaseBufferAfter is the Native Naive threshold: upgrade after the first
-// transfer. See connectionIncreaseBufferAfter for the reasoning, including why the
-// value must be positive.
-const naiveIncreaseBufferAfter = 1
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
