@@ -8,6 +8,8 @@ github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1/go.mod h1:xomTg6
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2 h1:K72vwLbWdMhzvFGIrdkaTgt+JcXMk8X4VZXl5eplixs=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928052141-188cb871422b h1:vSPjSxPCIuxOnL8nQolOtmWtkTIpH98kvv64FBoiWq0=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928052141-188cb871422b/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
@@ -259,8 +261,6 @@ github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832 h1:KDXMGbzqLmDdKcld
 github.com/sagernet/bbolt v0.0.0-20260915102804-500ee1e84832/go.mod h1:7/qFPFH5fqK5XQeY8EA1Qpaly08Av77p38Zt50ieQww=
 github.com/sagernet/cors v1.2.1 h1:Cv5Z8y9YSD6Gm+qSpNrL3LO4lD3eQVvbFYJSG7JCMHQ=
 github.com/sagernet/cors v1.2.1/go.mod h1:O64VyOjjhrkLmQIjF4KGRrJO/5dVXFdpEmCW/eISRAI=
-github.com/sagernet/cronet-go v0.0.0-20260926101438-c3902ec13951 h1:9nRzDDr+0jFDjSompbQBMfbx1eAGlEqJz2CtxIxo3PI=
-github.com/sagernet/cronet-go v0.0.0-20260926101438-c3902ec13951/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
 github.com/sagernet/cronet-go/all v0.0.0-20260926101438-c3902ec13951 h1:BWy7TlPXO8e1FrILIib1bXdR1GVCyjDlno4cG9E5g5A=
 github.com/sagernet/cronet-go/all v0.0.0-20260926101438-c3902ec13951/go.mod h1:RmHWRu3lTNRrLXki3whHYteLQJ8NgANUQVfxrZu5A0U=
 github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260926100742-df0c319e1c07 h1:pmu1zuUt53Ts74T0Luqd27gDe6u9Zn/66ySYq/pzhVA=
