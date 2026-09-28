@@ -5,7 +5,8 @@ requires a live Naive server is labelled **NOT TESTED** with the reason and the
 harness needed to close it, rather than estimated.
 
 Environment for measurements: `Apple M1`, `darwin/arm64`, `go1.25.5`,
-`github.com/sagernet/cronet-go v0.0.0-20260926101438-c3902ec13951`.
+`github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085320-bbefe0afa06e`
+(a fork of `sagernet/cronet-go`; see section 6).
 
 ---
 
@@ -386,6 +387,18 @@ listed so a future change does not silently regress them:
 - **HTTP/2 production receive-window tuning**
 - **padding and framing correctness** (`audit_padding_test.go`,
   `padding_segmentation_test.go`, `padding_zero_frame_test.go`)
+
+  > **Correction (section 6).** These tests cover the *server-side* codec in
+  > `protocol/naive/inbound_conn.go` only. They pass and always did, and they say
+  > nothing about the codec the macOS client actually runs: the outbound delegates
+  > framing to `cronet-go`, whose `naive_conn.go` had its own, independent
+  > implementation of the same protocol. That client codec chunked payloads at
+  > 65535 and then appended a 3-byte header plus up to 255 bytes of padding,
+  > emitting frames of up to 65793 bytes against the reference ceiling of 65536, and
+  > advertised `writerMTU` 65535 (geometry 65793). A green padding suite in this
+  > repository was therefore not evidence that the client framed correctly. The
+  > client codec is fixed and pinned (section 6); the claim above should be read as
+  > server-side only.
 - **flush contract tests** (`audit_flush_contract_test.go`,
   `audit_write_contract_test.go`)
 - **H3 guard** (`audit_h3_guard_test.go`) — the nil-constructor decision, asserted in
@@ -402,6 +415,142 @@ depends on them.
 
 ---
 
+## 6. The macOS client's Naive codec is a SECOND implementation, and it was wrong
+
+### The structural finding
+
+The Naive padding protocol is implemented **three times**:
+
+| implementation | where | who runs it |
+|---|---|---|
+| `klzgrad/forwardproxy` (reference) | branch `naive`, `d62c80d3` | the authoritative behaviour |
+| Native Naive **inbound** | `protocol/naive/inbound_conn.go` | the server |
+| Naive **outbound** | `cronet-go/naive_conn.go` | **the macOS client** |
+
+The outbound does not use this repository's codec at all. It delegates to
+`cronet.NewNaiveClient` -> `cronet.NewNaiveConn` -> `cronet-go/naive_conn.go`. So the
+padding tests listed in section 5 exercised a code path the client never executes.
+
+This is the reason the earlier work in this area could not have caught the problem:
+every padding test in this repository passes, and did pass, against a client codec
+that had a real framing defect. The two implementations were never compared to each
+other, and neither was compared to the reference.
+
+### What the client codec did wrong
+
+Confirmed by reading the pinned source at `c3902ec13951` and by measuring it:
+
+| defect | consequence |
+|---|---|
+| `maxPaddingChunkSize = 65535` | payload chunked at 65535, then +3 header +up to 255 padding = frames up to **65793** bytes |
+| payload chunked first, padding appended after | the payload budget did not depend on the padding drawn for that frame |
+| `writerMTU()` returned 65535 | advertised geometry 3 + 65535 + 255 = **65793**, larger than the 65536 ceiling |
+| `writeBufferWithPadding` gated at `> 65535` | a payload that fit `writerMTU()` still produced an oversized frame |
+| short write treated as success | `n = len(data)` when `err == nil`, silently dropping the tail |
+| `writePadding++` on the error path | the 8-frame padding window was consumed by frames that never went out |
+| `common.Must` in the framing path | a panic surface in a data-plane function |
+
+Measured before the fix: one 65535-byte write produced a frame of **65723** bytes on
+the wire, against a reference ceiling of 65536.
+
+### What correct looks like
+
+The reference's `flushingIoCopy` AddPadding branch draws the padding FIRST and derives
+the payload budget from it:
+
+```go
+paddingSize := rand.Intn(256)
+maxRead     := 65536 - 3 - paddingSize
+nr, er      := src.Read(buf[3:maxRead])
+if nr != nw { err = io.ErrShortWrite }
+```
+
+So the budget varies per frame: 65533 at padding 0, 65278 at padding 255. The codec
+must never chunk first and pad afterwards, because that is what makes the total
+exceed the ceiling.
+
+### The fix and how it is pinned
+
+`cronet-go` is forked to `Piggy-Cat-bit-shadow/cronet-go` and pinned by a `replace`
+directive. The codec now draws padding first per frame, refuses a frame that would
+exceed the ceiling, returns `io.ErrShortWrite` on a short write, advances the frame
+counter only for frames wholly written, and returns errors instead of panicking. It
+reports `writerMTU()` 65278, `frontHeadroom()` 3 and `rearHeadroom()` 255, which sum
+to exactly one maximal frame.
+
+### The parity contract
+
+Agreement between the inbound and the outbound is NOT sufficient evidence of
+correctness: two implementations can share a mistake and interoperate perfectly while
+both diverge from the reference. Every expectation is therefore derived from the
+reference, and recorded once in a machine-readable document both repositories' tests
+read:
+
+- `cronet-go:testdata/naive_padding_vectors.json`
+- `test/jiejie/reference/naive_padding_vectors.json` (byte-identical mirror)
+
+The file records the reference revision, the two expressions the constants come from,
+seven named invariants, the reachable padding draws, single-frame segmentation cases,
+multi-frame chunking cases and the cases that must be refused.
+`TestSharedVectorFileMatchesThePublishedCopy` asserts the mirror's SHA-256, so the
+copies cannot drift apart silently — which is the same class of failure that hid the
+original bug. `TestEveryDeclaredInvariantHolds` fails both for a declared invariant
+with no implementation and for a check with no declaration, so the document cannot
+accumulate unchecked claims.
+
+### Two further defects found in the same client
+
+**`extra_headers` could override the tunnel's control headers.** The merge loop let a
+user-supplied header replace `Padding`, `Proxy-Authorization`, `-connect-authority`
+and `-force-quic`. Overriding `-connect-authority` would send the tunnel to a host the
+user never configured — a routing-integrity failure, not just a protocol one — and
+overriding `Padding` to the empty string is catastrophic: the server does
+`usePadding := request.Header.Get("Padding") != ""`, so the server would read framed
+bytes as a raw tunnel from the very first frame, with no diagnosable error. These are
+now rejected at configuration time rather than given a precedence rule. The policy
+lives in one place (`cronet.IsReservedNaiveHeader`) and sing-box delegates to it,
+with a test proving both layers agree so they cannot drift. Matching is
+case-insensitive, because `badoption.HTTPHeader.Build()` canonicalises keys and the
+old case-sensitive comparison missed `padding`.
+
+**The DNS bridge never answered over UDP.** The reply path preferred the `net.Conn`
+branch whenever the socket implemented it, and `*net.UDPConn` implements both
+`net.PacketConn` and `net.Conn`. A listening UDP socket is not connected, so `Write`
+was called with no destination, which fails with "destination address required" — and
+the error was discarded. Every Chromium DNS query waited out its timeout with no reply
+and no log. Measured before the fix with a real two-ended loopback pair: the test
+failed with "i/o timeout". The same constant, 512, was also serving as both the UDP
+receive buffer and the response truncation threshold; those are different roles that
+pull in opposite directions, and they are now separate (4096 receive, 512 truncation,
+because exceeding 512 is what sets TC=1 and moves Chromium to TCP).
+
+### Lifecycle
+
+`Start()` recovered nothing, so an engine-creation panic — `ensureLoaded()` calls
+`panic(err)` when the native library is missing — unwound **past** its own deferred
+cleanup. A failed start then left the client stuck in `clientStateStarting`, never
+closed the `started` channel and leaked the engines already created, after which every
+later `Start` returned "start already in progress" and every `Close` blocked forever
+on that channel. `Start` now converts the panic to an error and runs the normal
+cleanup path. The state machine is covered by tests that build clients through an
+unexported seam, so they run without a native build: double and concurrent `Close`,
+`Close` before `Start`, a failed `Start` leaving no stuck state, and a goroutine-leak
+check over 50 create/start/close cycles.
+
+### NOT TESTED
+
+- **Real macOS client against a real remote Naive server.** No VPS was available. The
+  codec is verified against the reference arithmetic and the shared vectors, not
+  against a live server. This is the single largest remaining gap: everything above
+  is evidence about the codec, not about end-to-end throughput.
+- **Single-engine vs multi-engine A/B on a real network**, and the HTTP/2 and QUIC
+  window sweeps. Harnesses committed; defaults unchanged; no numbers.
+- **Outbound early copy-buffer growth.** It was previously blocked on the codec being
+  correct. That precondition is now met, but the benchmark itself has NOT been run, so
+  the option remains as it was.
+
+---
+
 ## Summary
 
 | item | outcome |
@@ -412,4 +561,9 @@ depends on them.
 | Cronet single vs multi engine A/B | **NOT TESTED** — harness committed |
 | HTTP/2 receive window sweep | **NOT TESTED** — harness committed, default unchanged |
 | Naive QUIC CC and window sweep | **NOT TESTED** — default unchanged |
-| preserved optimizations | **verified present** |
+| preserved optimizations | **verified present** (server-side; see section 6) |
+| client codec (`cronet-go`) | **fixed**: frames up to 65793 → ceiling 65536; 6 defects |
+| client/server parity contract | **added**: shared vector file, hash-pinned in both repos |
+| `extra_headers` control override | **fixed**: 5 reserved headers rejected at config time |
+| DNS bridge UDP replies | **fixed**: never sent (silent timeouts) → answered |
+| client lifecycle panic | **fixed**: failed `Start` wedged the client permanently |

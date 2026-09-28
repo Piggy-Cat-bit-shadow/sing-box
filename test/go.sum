@@ -8,8 +8,8 @@ github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1/go.mod h1:xomTg6
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
-github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2 h1:K72vwLbWdMhzvFGIrdkaTgt+JcXMk8X4VZXl5eplixs=
-github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f h1:OtNeqvqSn8Eg195mTCZFe0iF2t77ZHkLQ280V1qnCyA=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928052141-188cb871422b h1:vSPjSxPCIuxOnL8nQolOtmWtkTIpH98kvv64FBoiWq0=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928052141-188cb871422b/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=

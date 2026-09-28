@@ -10,8 +10,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
 filippo.io/hpke v0.4.0 h1:p575VVQ6ted4pL+it6M00V/f2qTZITO0zgmdKCkd5+A=
 filippo.io/hpke v0.4.0/go.mod h1:EmAN849/P3qdeK+PCMkDpDm83vRHM5cDipBJ8xbQLVY=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2 h1:K72vwLbWdMhzvFGIrdkaTgt+JcXMk8X4VZXl5eplixs=
-github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f h1:OtNeqvqSn8Eg195mTCZFe0iF2t77ZHkLQ280V1qnCyA=
+github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928085008-2616b72468d0 h1:cn29vwjYEIb9iIA8UUAq+GPJgpMaowZKMJPa8M78+iY=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928085008-2616b72468d0/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
