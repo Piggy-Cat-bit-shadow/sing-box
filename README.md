@@ -1,7 +1,7 @@
 # Jiejie sing-box
 
 基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 的长期维护 fork，围绕
-**Linux Server Minimal**、**macOS Client**、**MASQUE**、**Naive/Cronet**、**LXD**，
+**Linux Server Minimal**、**macOS Client**、**MASQUE**、**Naive/Cronet**，
 以及一组经过验证的 correctness / performance 修复。
 
 本 README 同时是一份**工程状态说明 + 修复台账**。目标是：只读这一页，就能知道这个
@@ -22,7 +22,7 @@ Upstream ahead  0 commits  (merge-base == upstream/testing)
 | Profile | Platform | Size | Tags |
 | --- | --- | --- | --- |
 | Linux Server Minimal | `linux/amd64`, CGO=0 | **33,767,608 B** | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
-| macOS Client | `darwin/arm64`, CGO=1 | **77,060,690 B** | `with_gvisor,with_quic,with_utls,with_clash_api,with_naive_outbound,with_lxd,with_lx_command,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
+| macOS Client | `darwin/arm64`, CGO=1 | **73,432,802 B** | `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 
 CI（最近一次实测）：
 
@@ -93,18 +93,36 @@ MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `m
 
 ### macOS Client
 
-原生 CLI core，主推 **JiejieBox GUI → mTLS → `sing-box lxd` daemon**；同时支持 CLI
-直接运行、浏览器 Web Dashboard、被第三方 GUI 当作外部 core 加载。
+原生 CLI core，**headless 优先**：由 launchd 托管、命令行驱动，唯一的界面是 Native API
+在 `http://127.0.0.1:9090/` 提供的 sing-box Web Dashboard。没有配套 GUI 应用，也没有
+自有 daemon 协议——它就是一个普通的 sing-box CLI 进程。
 
 | 类别 | 内容 |
 | --- | --- |
 | 平台 / 传输 | TUN/gVisor、QUIC、uTLS、Cronet |
 | 数据面 | Naive/Cronet、MASQUE client |
-| inbound | `tun`、`mixed`、`socks`、`http`、`direct` |
-| outbound | Shadowsocks / SS2022、ShadowTLS、Snell、Trojan、VLESS、VMess、AnyTLS、Hysteria2、TUIC、HTTP、SOCKS、`direct`、`block`、`selector`、`urltest` |
+| inbound | `tun`、`mixed` |
+| outbound | Shadowsocks / SS2022、ShadowTLS、VLESS、AnyTLS、Naive、HTTP（即 MASQUE client outbound）、`direct`、`block`、`selector`、`urltest` |
 | DNS | UDP、TCP、DoT、DoH、DoQ、DoH3、local、hosts、FakeIP |
-| 管理面 | native API、Clash API、LXD daemon |
+| 管理面 | **仅有 Native API**（唯一的控制面） |
 | 明确不含 | `masque-server`、Native Naive server、Tailscale / WireGuard / OpenVPN / OpenConnect / Tor / SSH |
+
+registry 是**生产白名单**：只注册生产配置真正用到的东西。相比早先的"宽客户端"设计，
+`socks` / `snell` / `trojan` / `vmess` / `hysteria2` / `tuic` outbound 与 `socks` /
+`http` / `direct` inbound 均已不再注册——源码留在树里供 Linux server 构建与 upstream
+同步使用，Go linker 因为无引用而把它们从本 binary 中丢弃。注意 **`with_quic` 仍保留**：
+去掉的是 QUIC outbound 的注册调用，而 MASQUE 的 HTTP/3 路径依赖同一个 tag。
+
+**三项能力已从本 fork 中彻底删除**（不是禁用），CI 以符号表负向断言守住：
+
+| 已删除 | 内容 | 后果 |
+| --- | --- | --- |
+| **Clash API** | `experimental/clashapi/`、`option.ClashAPIOptions`、`with_clash_api` | 配置里写 `experimental.clash_api` 会以 unknown field 失败；Yacd / MetaCubeXD 之类 Clash 面板没有可连的端口 |
+| **LXD daemon** | `lxd/`、`sing-box lxd` 子命令、`with_lxd` | 没有 state 目录、没有 mTLS 管理面、没有供配套 GUI 注册的客户端体系 |
+| **Launcher RPC** | `with_lx_command`，以及从 `daemon/started_service.proto` 移除的 13 个 launcher RPC | core 不再对外宣称一个它答不全的 daemon |
+
+这些能力并未丢失：运行状态与流量、selector / urltest 分组树、切换节点、URL test、
+实时连接与断开、日志，全部由 Native API 在 `http://127.0.0.1:9090/` 提供。
 
 ---
 
@@ -116,9 +134,9 @@ MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `m
 | --- | --- | --- | --- |
 | **MASQUE / HTTP** | 本 fork 唯一自研的 L4 数据面，server 与 client 共用实现，只用 registry 区分角色 | client/server endpoint 注册拆分；H3 datagram ingress 去 memcpy；hot path 改 immutable snapshot；CONNECT-UDP 竞态修复 | [性能](docs/JIEJIE-MASQUE-PERFORMANCE.md) · [参考审计](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) |
 | **Naive / Cronet** | macOS 客户端核心能力，需与服务端 Native Naive 实现互通 | 链接真实 Cronet（`cronet-go.NewNaiveClient`）；移除 client 上无用的 server-only H3 listener；新增 opt-in `insecure_concurrency_single_engine`（默认 `false`，**未验证**）。注意：`protocol/naive` **同时**包含真实的服务端实现（`inbound.go`），不是纯客户端/测试代码 | [审计](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) · [服务端](docs/JIEJIE-NAIVE-SERVER.md) |
-| **LXD** | JiejieBox 需要持久化 daemon + mTLS 控制面，GUI 退出后 VPN 不能断 | 移植 LXD daemon 能力进 macOS core（`lxd/`、`daemon/`、`cmd/sing-box/cmd_lxd_lx.go`）：`lxd --state-dir/--service`、`lxd client add/list/remove` | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
+| **LXD / launcher RPC** | 曾经为配套 GUI 提供持久化 daemon + mTLS 控制面 | **已整体移除**：`lxd/`、`daemon/` 中的 launcher 契约、`cmd/sing-box/cmd_lxd_lx.go`、`with_lxd` 与 `with_lx_command` 均已删除，`daemon/started_service.proto` 去掉 13 个 launcher RPC。管理面收敛为 Native API 一个 | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
 | **Server Minimal** | 面向单台 VPS 的最小化构建，registry 须与真实生产配置一致 | `include/registry_jiejie_server.go` 注册 5 个 inbound：HTTP/MASQUE、AnyTLS、**Native Naive**、ShadowTLS v3、SS2022；Naive outbound 不注册 | [服务端](docs/JIEJIE-SERVER.md) |
-| **macOS Client** | 一个内核包含全部客户端能力，不分 lite/naive | 独立 registry；`masque-client` 只注册 client 角色 | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
+| **macOS Client** | headless 优先的个人 CLI core，registry 收敛为生产白名单 | 独立 registry；`masque-client` 只注册 client 角色；去掉不在生产配置中的 6 个 outbound 与 3 个 inbound；Clash API 已从 fork 中删除，Native API 成为唯一控制面 | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
 | **CI / build** | 每个 CI 分钟都应产生新的故障信息 | 两 workflow、单 job、单 build；fast 只验证 shipping artifact，deep 保留 vet/race/fuzz/reference/reproducibility | [构建 profile](docs/BUILD-PROFILES.md) |
 | **Dependency fork** | 需要 upstream 尚未吸收的 patch | `go.mod` 中 `replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing` | [§8](#8-upstream) |
 
@@ -305,9 +323,9 @@ socks / direct / mixed / tun / vless / vmess / trojan / hysteria2 / tuic 等仍�
 
 | Record | Method | Result | Status |
 | --- | --- | --- | --- |
-| **macOS product integrity** | 对最终 binary 逐一验证 registry / symbol / config / runtime | 5 inbound、15 outbound、`masque-client`、8 DNS transport、native API、Clash API、gVisor、uTLS、Cronet、LXD 全部链接且可解析；`masque-server` correctly pruned；Native Naive **server** correctly absent；XHTTP not in this tree | `over-pruning: NO` · `over-inclusion: NO` · PASS |
+| **macOS product integrity** | 对最终 binary 逐一验证 registry / symbol / config / runtime | 2 inbound（tun、mixed）、生产白名单 outbound、`masque-client`、7 个 DNS transport（DoQ/DoH3 另由 `with_quic` 提供）、native API、gVisor、uTLS、Cronet 全部链接且可解析；`masque-server` correctly pruned；Native Naive **server** correctly absent；`sing-box/lxd.` 与 `sing-box/experimental/clashapi.` 符号数为 0；XHTTP not in this tree | `over-pruning: NO` · `over-inclusion: NO` · PASS |
 | **Server product integrity** | registry 与 dependency graph 对照真实生产职责 | `protocol/naive` 保留源码但不在 graph 中；profile 与生产职责一致 | `over-pruning: NO` · `over-inclusion: NO` · PASS |
-| **Fuzz** | 13 targets；高风险 remote parser 全部检查 | `parseAuthority` 23 个对抗输入 → 0 panic；LXD admin plane 有 body 上限与 panic recovery；**No HIGH gap found**，故未新增 target | PASS |
+| **Fuzz** | 13 targets；高风险 remote parser 全部检查 | `parseAuthority` 23 个对抗输入 → 0 panic；**No HIGH gap found**，故未新增 target。（早先记录中的 "LXD admin plane body 上限与 panic recovery" 已随 LXD 一并移除） | PASS |
 | **Memory** | MASQUE hot path benchmark + `-race` lifecycle/ownership/shutdown | 相关 benchmark **0 allocs/op**；含显式 goroutine 累积与 queued buffer 释放断言；**本轮未发现已确认的 leak** | PASS |
 
 上述 integrity 审计是"本轮未发现 over-pruning / leak"，不等于"绝对不存在"。
