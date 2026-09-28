@@ -200,3 +200,5 @@ require (
 )
 
 replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928052141-188cb871422b
+
+replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.0-20260928082747-4368ca99975a

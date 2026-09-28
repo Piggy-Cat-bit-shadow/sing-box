@@ -85,6 +85,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, E.New("reality is not supported on naive outbound")
 	}
 
+	// Reject a reserved-header collision at configuration time. cronet-go also
+	// refuses it in NewNaiveClient, but failing here means the operator sees a
+	// configuration error naming the offending header instead of a runtime failure
+	// that depends on the native library loading first.
+	if err := validateReservedExtraHeaders(options.ExtraHeaders.Build()); err != nil {
+		return nil, err
+	}
+
 	serverAddress := options.ServerOptions.Build()
 
 	var serverName string
@@ -181,27 +189,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// engine on iOS. Setting it true is what makes the single-engine + isolation-key
 	// shape selectable on macOS for the A/B described in
 	// docs/JIEJIE-NAIVE-CLIENT-AUDIT.md.
-	client, err := cronet.NewNaiveClient(cronet.NaiveClientOptions{
-		Context:                  ctx,
-		Logger:                   logger,
-		ServerAddress:            serverAddress,
-		ServerName:               serverName,
-		Username:                 options.Username,
-		Password:                 options.Password,
-		InsecureConcurrency:      options.InsecureConcurrency,
-		TestForceSingleEngine:    options.InsecureConcurrencySingleEngine,
-		ExtraHeaders:             extraHeaders,
-		ReceiveWindow:            options.ReceiveWindow.Value(),
-		TrustedRootCertificates:  trustedRootCertificates,
-		Dialer:                   outboundDialer,
-		DNSResolver:              dnsResolver,
-		ECHEnabled:               echEnabled,
-		ECHConfigList:            echConfigList,
-		ECHQueryServerName:       echQueryServerName,
-		QUIC:                     options.QUIC,
-		QUICCongestionControl:    quicCongestionControl,
-		QUICSessionReceiveWindow: options.QUICSessionReceiveWindow.Value(),
+	clientOptions := buildCronetNaiveClientOptions(cronetNaiveClientParams{
+		ctx:                     ctx,
+		logger:                  logger,
+		serverAddress:           serverAddress,
+		serverName:              serverName,
+		options:                 options,
+		extraHeaders:            extraHeaders,
+		trustedRootCertificates: trustedRootCertificates,
+		dialer:                  outboundDialer,
+		dnsResolver:             dnsResolver,
+		echEnabled:              echEnabled,
+		echConfigList:           echConfigList,
+		echQueryServerName:      echQueryServerName,
+		quicCongestionControl:   quicCongestionControl,
 	})
+	client, err := cronet.NewNaiveClient(clientOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -281,4 +284,82 @@ type naiveDialer struct {
 
 func (d *naiveDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	return d.NaiveClient.DialEarly(ctx, destination)
+}
+
+// cronetNaiveClientParams carries everything buildCronetNaiveClientOptions needs.
+//
+// The fields are unexported and the struct is internal: it exists to make the
+// configuration -> Cronet mapping a pure function that a test can call, not to
+// become part of any interface.
+type cronetNaiveClientParams struct {
+	ctx                     context.Context
+	logger                  logger.ContextLogger
+	serverAddress           M.Socksaddr
+	serverName              string
+	options                 option.NaiveOutboundOptions
+	extraHeaders            map[string]string
+	trustedRootCertificates string
+	dialer                  N.Dialer
+	dnsResolver             cronet.DNSResolverFunc
+	echEnabled              bool
+	echConfigList           []byte
+	echQueryServerName      string
+	quicCongestionControl   cronet.QUICCongestionControl
+}
+
+// buildCronetNaiveClientOptions maps a validated sing-box configuration onto
+// cronet.NaiveClientOptions.
+//
+// It is a pure function with no side effects, which is what makes the plumbing
+// testable: previously this mapping lived inline in NewOutbound, so a test could
+// only assert that the option struct held a bool - it could not show that the value
+// reached the Cronet constructor at all. The mapping is deliberately kept
+// mechanical (no validation, no defaults beyond the switch statements already
+// performed by the caller) so that reading it is enough to see every field.
+func buildCronetNaiveClientOptions(params cronetNaiveClientParams) cronet.NaiveClientOptions {
+	return cronet.NaiveClientOptions{
+		Context:       params.ctx,
+		Logger:        params.logger,
+		ServerAddress: params.serverAddress,
+		ServerName:    params.serverName,
+		Username:      params.options.Username,
+		Password:      params.options.Password,
+		// InsecureConcurrency sets how many isolated sessions/pools to use;
+		// TestForceSingleEngine sets how many Cronet engines back them. They are
+		// independent: cronet-go decides with
+		//   singleEngine: TestForceSingleEngine || runtime.GOOS == "ios"
+		//   engineCount := 1; if concurrency > 1 && !singleEngine { engineCount = concurrency }
+		// so leaving the switch false preserves the upstream macOS layout of N
+		// engines.
+		InsecureConcurrency:      params.options.InsecureConcurrency,
+		TestForceSingleEngine:    params.options.InsecureConcurrencySingleEngine,
+		ExtraHeaders:             params.extraHeaders,
+		ReceiveWindow:            params.options.ReceiveWindow.Value(),
+		TrustedRootCertificates:  params.trustedRootCertificates,
+		Dialer:                   params.dialer,
+		DNSResolver:              params.dnsResolver,
+		ECHEnabled:               params.echEnabled,
+		ECHConfigList:            params.echConfigList,
+		ECHQueryServerName:       params.echQueryServerName,
+		QUIC:                     params.options.QUIC,
+		QUICCongestionControl:    params.quicCongestionControl,
+		QUICSessionReceiveWindow: params.options.QUICSessionReceiveWindow.Value(),
+	}
+}
+
+// validateReservedExtraHeaders rejects extra_headers entries that would override a
+// Naive control header.
+//
+// The check delegates to cronet.IsReservedNaiveHeader so the reserved set has
+// exactly one definition, shared with the code that builds the CONNECT request.
+// Duplicating the list here would let the two drift, which is how the original
+// override bug would come back.
+func validateReservedExtraHeaders(extraHeaders map[string][]string) error {
+	for key := range extraHeaders {
+		if cronet.IsReservedNaiveHeader(key) {
+			return E.New("extra_headers must not override the reserved Naive control header ",
+				key, "; it would change protocol behaviour instead of adding a request header")
+		}
+	}
+	return nil
 }
