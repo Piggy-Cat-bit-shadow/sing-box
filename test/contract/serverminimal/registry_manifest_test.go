@@ -75,41 +75,54 @@ func TestRegistryProvidesEveryFixtureInbound(t *testing.T) {
 	}
 }
 
-// TestRegistryOmitsNativeNaive proves the SHIPPED Server Minimal registry no longer
-// provides the Native Naive inbound.
+// TestRegistryProvidesNativeNaiveInbound proves the SHIPPED Server Minimal registry
+// provides the Native Naive inbound, and that the live production configuration can
+// therefore be decoded by it.
 //
-// # Why absence is the contract
+// # Why presence is the contract
 //
-// NaiveProxy in this deployment is served by Caddy's forwardproxy@udpintcp, not by
-// sing-box. The Native Naive inbound was therefore linked into every production
-// binary while being unreachable in practice: it added a listener implementation, a
-// UoT data path and an HTTP/2 masquerade to the attack surface and the binary, for a
-// capability the topology does not use.
+// The production server configuration declares a `naive` inbound. An earlier revision
+// of this profile removed the registration on the inference that NaiveProxy had moved
+// to Caddy's forwardproxy@udpintcp, and the shipped `.6` binary then rejected the real
+// configuration with `unknown inbound type: naive`. The inference was wrong: a
+// deployment may run a Caddy Naive service on a separate path, and Caddy's existence
+// does not make the sing-box inbound redundant.
 //
-// Removing the registration is the fix; deleting protocol/naive is NOT, because the
-// source is still used by the full/upstream registry, by the client-side tests, and
-// as the reference the macOS Naive work is checked against.
-//
-// This test is what makes the removal stick: re-adding the import or the
-// RegisterInbound call fails here, and the failure names the reason rather than
-// leaving a future reader to guess whether it was deliberate.
-func TestRegistryOmitsNativeNaive(t *testing.T) {
+// This test is what makes the restoration stick. Removing the import or the
+// RegisterInbound call fails here, and the failure names the production reason rather
+// than leaving a future reader to guess.
+func TestRegistryProvidesNativeNaiveInbound(t *testing.T) {
 	requireJiejieMinimalRegistry(t)
 
 	registry := include.InboundRegistry()
 
-	if _, loaded := registry.CreateOptions("naive"); loaded {
-		t.Error("the Server Minimal registry still provides the \"naive\" inbound. " +
-			"Native Naive is served by Caddy forwardproxy in this deployment, so " +
-			"registering it links a listener the topology never starts")
+	if _, loaded := registry.CreateOptions("naive"); !loaded {
+		t.Error("the Server Minimal registry does not provide the \"naive\" inbound. " +
+			"The live production configuration declares one, so a binary built from " +
+			"this profile fails to start with `unknown inbound type: naive`")
 	}
 
-	// The ShadowTLS detour must still point at an inbound that the fixture actually
-	// declares, proving the removal did not break the chain it is part of.
+	// The fixture must actually exercise it, otherwise this test would pass while the
+	// thing it protects stayed unverified.
+	topology := loadProductionTopology(t)
+
+	var nativeNaive int
+	for _, inbound := range topology.Inbounds {
+		if inbound.Type == "naive" {
+			nativeNaive++
+			require.True(t, topologyProvidesTag(topology, inbound.Tag),
+				"the fixture declares a naive inbound with tag %q; that tag must be "+
+					"reachable so the contract test really links the two", inbound.Tag)
+		}
+	}
+	require.Equal(t, 1, nativeNaive,
+		"the production fixture must declare exactly one native naive inbound, so "+
+			"that the registry contract above is exercised against a real shape")
+
+	// The ShadowTLS detour must still point at an inbound the fixture declares.
 	//
 	// A detour names a TAG, not a type, so it is checked against the fixture's own
 	// inbound tags rather than against CreateOptions, which resolves types.
-	topology := loadProductionTopology(t)
 	declaredTags := make(map[string]bool, len(topology.Inbounds))
 	for _, inbound := range topology.Inbounds {
 		declaredTags[inbound.Tag] = true
@@ -123,11 +136,19 @@ func TestRegistryOmitsNativeNaive(t *testing.T) {
 	}
 	require.NotEmpty(t, shadowTLSDetour,
 		"the fixture must declare a shadowtls inbound with a detour")
-	require.NotEqual(t, "naive-in", shadowTLSDetour,
-		"the ShadowTLS detour must not point at the removed Native Naive inbound")
 	require.True(t, declaredTags[shadowTLSDetour],
 		"the ShadowTLS detour %q is not declared by any inbound in the fixture",
 		shadowTLSDetour)
+}
+
+// topologyProvidesTag reports whether any inbound in the topology carries this tag.
+func topologyProvidesTag(topology productionTopology, tag string) bool {
+	for _, inbound := range topology.Inbounds {
+		if inbound.Tag == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRegistryProvidesEveryFixtureOutbound proves each outbound type,
@@ -272,6 +293,16 @@ func TestRegistryAuditFindsTheExpectedSet(t *testing.T) {
 	for _, outbound := range topology.Outbounds {
 		usedOutboundTypes[outbound.Type] = true
 	}
+
+	// The Native Naive INBOUND is required by production; the Naive OUTBOUND is not.
+	// Those are different things, and restoring the inbound must not drag the outbound
+	// (and the Chromium/Cronet client stack behind it) into a server build. This is
+	// asserted explicitly rather than left to the loop below, so the intent survives a
+	// future reader who sees `naive` in the link graph and assumes the whole protocol
+	// came back.
+	require.False(t, usedOutboundTypes["naive"],
+		"the production topology must not use a naive OUTBOUND: this deployment needs "+
+			"the Native Naive INBOUND only")
 	outboundRegistry := include.OutboundRegistry()
 	for _, outboundType := range outboundRegistry.OptionTypes() {
 		require.True(t, usedOutboundTypes[outboundType],
