@@ -153,17 +153,10 @@
               "$ref": "#/$defs/Duration"
             },
             "resolvers": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "override_domain": {
               "type": "string"
@@ -202,17 +195,10 @@
               "$ref": "#/$defs/Duration"
             },
             "resolvers": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "override_domain": {
               "type": "string"
@@ -245,17 +231,10 @@
               "$ref": "#/$defs/Duration"
             },
             "resolvers": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "override_domain": {
               "type": "string"
@@ -3690,6 +3669,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -3892,6 +3880,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -4433,17 +4430,10 @@
               "type": "string"
             },
             "data_ciphers": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "data_ciphers_fallback": {
               "type": "string"
@@ -4522,17 +4512,10 @@
               }
             },
             "routes": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/IPPrefix"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/IPPrefix"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/IPPrefix"
+              }
             },
             "route_gateway": {
               "$ref": "#/$defs/IPAddress"
@@ -4544,17 +4527,10 @@
               "type": "boolean"
             },
             "redirect_gateway_flags": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "redirect_private": {
               "type": "boolean"
@@ -4797,17 +4773,10 @@
               "type": "string"
             },
             "data_ciphers": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "data_ciphers_fallback": {
               "type": "string"
@@ -5012,17 +4981,10 @@
               "type": "boolean"
             },
             "advertise_tags": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "listen_port": {
               "type": "integer",
@@ -5461,6 +5423,15 @@
         },
         "disable_path_mtu_discovery": {
           "type": "boolean"
+        },
+        "quic_congestion_control": {
+          "type": "string",
+          "enum": [
+            "default",
+            "cubic",
+            "bbr",
+            "reno"
+          ]
         }
       },
       "additionalProperties": false
@@ -5634,6 +5605,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "additionalProperties": false
@@ -6078,17 +6058,10 @@
           "type": "string"
         },
         "stun_servers": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "ip_version": {
           "type": "integer",
@@ -6123,17 +6096,10 @@
           "type": "string"
         },
         "stun_servers": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "ip_version": {
           "type": "integer",
@@ -6320,6 +6286,15 @@
                   }
                 }
               ]
+            },
+            "fallback": {
+              "$ref": "#/$defs/ServerOptions"
+            },
+            "fallback_for_alpn": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ServerOptions"
+              }
             }
           },
           "required": [
@@ -6556,6 +6531,71 @@
                 "$ref": "#/$defs/User"
               }
             },
+            "masquerade": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "file"
+                        },
+                        "directory": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "proxy"
+                        },
+                        "url": {
+                          "type": "string"
+                        },
+                        "rewrite_host": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "string"
+                        },
+                        "status_code": {
+                          "type": "integer"
+                        },
+                        "headers": {
+                          "$ref": "#/$defs/HTTPHeader"
+                        },
+                        "content": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              ]
+            },
             "domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -6584,6 +6624,20 @@
                   }
                 }
               ]
+            },
+            "max_header_bytes": {
+              "type": "integer"
+            },
+            "bbr_profile": {
+              "type": "string",
+              "enum": [
+                "conservative",
+                "standard",
+                "aggressive"
+              ]
+            },
+            "unauthenticated_limits": {
+              "$ref": "#/$defs/UnauthenticatedLimitsOptions"
             },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
@@ -6624,6 +6678,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -6771,6 +6834,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -6936,6 +7008,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             },
             "masquerade": {
               "anyOf": [
@@ -7206,8 +7287,107 @@
                 "reno"
               ]
             },
+            "quic_disable_path_manager": {
+              "type": "boolean"
+            },
+            "masquerade": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "file"
+                        },
+                        "directory": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "proxy"
+                        },
+                        "url": {
+                          "type": "string"
+                        },
+                        "rewrite_host": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "const": "string"
+                        },
+                        "status_code": {
+                          "type": "integer"
+                        },
+                        "headers": {
+                          "$ref": "#/$defs/HTTPHeader"
+                        },
+                        "content": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              ]
+            },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
+            },
+            "idle_timeout": {
+              "$ref": "#/$defs/Duration"
+            },
+            "keep_alive_period": {
+              "$ref": "#/$defs/Duration"
+            },
+            "stream_receive_window": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "connection_receive_window": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "max_concurrent_streams": {
+              "type": "integer"
             }
           },
           "required": [
@@ -8330,6 +8510,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -11446,30 +11635,16 @@
           "type": "integer"
         },
         "addresses": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "resolve_domains": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "dnssec": {
           "type": "string",
@@ -11497,17 +11672,10 @@
       "type": "object",
       "properties": {
         "routes": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/IPPrefix"
-            },
-            {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/IPPrefix"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IPPrefix"
+          }
         },
         "dns": {
           "anyOf": [
@@ -11529,46 +11697,25 @@
           }
         },
         "search_domains": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "dhcp_options": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "redirect_gateway": {
           "type": "boolean"
         },
         "redirect_gateway_flags": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "block_outside_dns": {
           "type": "boolean"
@@ -11909,192 +12056,6 @@
           "type": "object",
           "properties": {
             "type": {
-              "const": "http"
-            },
-            "tag": {
-              "type": "string"
-            },
-            "detour": {
-              "type": "string",
-              "x-tag-reference": "outbound"
-            },
-            "bind_interface": {
-              "type": "string"
-            },
-            "inet4_bind_address": {
-              "$ref": "#/$defs/IPAddress"
-            },
-            "inet6_bind_address": {
-              "$ref": "#/$defs/IPAddress"
-            },
-            "bind_address_no_port": {
-              "type": "boolean"
-            },
-            "protect_path": {
-              "type": "string"
-            },
-            "routing_mark": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0,
-                  "maximum": 4294967295
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "reuse_addr": {
-              "type": "boolean"
-            },
-            "netns": {
-              "type": "string",
-              "x-tag-reference": "network_namespace"
-            },
-            "connect_timeout": {
-              "$ref": "#/$defs/Duration"
-            },
-            "tcp_fast_open": {
-              "type": "boolean"
-            },
-            "tcp_multi_path": {
-              "type": "boolean"
-            },
-            "disable_tcp_keep_alive": {
-              "type": "boolean"
-            },
-            "tcp_keep_alive": {
-              "$ref": "#/$defs/Duration"
-            },
-            "tcp_keep_alive_interval": {
-              "$ref": "#/$defs/Duration"
-            },
-            "udp_fragment": {
-              "type": "boolean"
-            },
-            "domain_resolver": {
-              "$ref": "#/$defs/DomainResolver"
-            },
-            "network_strategy": {
-              "type": "string",
-              "enum": [
-                "default",
-                "fallback",
-                "hybrid"
-              ]
-            },
-            "network_type": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/InterfaceType"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/InterfaceType"
-                  }
-                }
-              ]
-            },
-            "fallback_network_type": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/InterfaceType"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/$defs/InterfaceType"
-                  }
-                }
-              ]
-            },
-            "fallback_delay": {
-              "$ref": "#/$defs/Duration"
-            },
-            "server": {
-              "type": "string"
-            },
-            "server_port": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 65535
-            },
-            "username": {
-              "type": "string"
-            },
-            "password": {
-              "type": "string"
-            },
-            "tls": {
-              "$ref": "#/$defs/OutboundTLSOptions"
-            },
-            "path": {
-              "type": "string"
-            },
-            "headers": {
-              "$ref": "#/$defs/HTTPHeader"
-            },
-            "version": {
-              "type": "integer",
-              "enum": [
-                0,
-                1,
-                2,
-                3
-              ]
-            },
-            "disable_version_fallback": {
-              "type": "boolean"
-            },
-            "idle_timeout": {
-              "$ref": "#/$defs/Duration"
-            },
-            "keep_alive_period": {
-              "$ref": "#/$defs/Duration"
-            },
-            "stream_receive_window": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "connection_receive_window": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                {
-                  "type": "string"
-                }
-              ]
-            },
-            "max_concurrent_streams": {
-              "type": "integer"
-            },
-            "initial_packet_size": {
-              "type": "integer"
-            },
-            "disable_path_mtu_discovery": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {
               "const": "hysteria"
             },
             "tag": {
@@ -12208,17 +12169,10 @@
               "maximum": 65535
             },
             "server_ports": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "hop_interval": {
               "$ref": "#/$defs/Duration"
@@ -12332,6 +12286,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -12456,17 +12419,10 @@
               "maximum": 65535
             },
             "server_ports": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "hop_interval": {
               "$ref": "#/$defs/Duration"
@@ -12583,6 +12539,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             },
             "bbr_profile": {
               "type": "string",
@@ -12731,6 +12696,9 @@
             },
             "insecure_concurrency": {
               "type": "integer"
+            },
+            "insecure_concurrency_single_engine": {
+              "type": "boolean"
             },
             "extra_headers": {
               "$ref": "#/$defs/HTTPHeader"
@@ -13681,6 +13649,12 @@
                   "additionalProperties": false
                 }
               ]
+            },
+            "tcp_preconnect": {
+              "$ref": "#/$defs/SOCKSOutboundPreconnectOptions"
+            },
+            "tcp_tuning": {
+              "$ref": "#/$defs/SOCKSOutboundTuningOptions"
             }
           },
           "required": [
@@ -13843,17 +13817,10 @@
               ]
             },
             "host_key_algorithms": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "client_version": {
               "type": "string"
@@ -14608,6 +14575,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -15398,17 +15374,10 @@
           "type": "boolean"
         },
         "dhcp_lease_files": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "auto_detect_interface": {
           "type": "boolean"
@@ -16615,6 +16584,33 @@
         }
       ]
     },
+    "SOCKSOutboundPreconnectOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "min_idle": {
+          "type": "integer"
+        },
+        "max_idle": {
+          "type": "integer"
+        },
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SOCKSOutboundTuningOptions": {
+      "type": "object",
+      "properties": {
+        "early_buffer_growth": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "ServerOptions": {
       "type": "object",
       "properties": {
@@ -17107,6 +17103,15 @@
                         "disable_path_mtu_discovery": {
                           "type": "boolean"
                         },
+                        "quic_congestion_control": {
+                          "type": "string",
+                          "enum": [
+                            "default",
+                            "cubic",
+                            "bbr",
+                            "reno"
+                          ]
+                        },
                         "url": {
                           "type": "string"
                         }
@@ -17288,6 +17293,15 @@
                           },
                           "disable_path_mtu_discovery": {
                             "type": "boolean"
+                          },
+                          "quic_congestion_control": {
+                            "type": "string",
+                            "enum": [
+                              "default",
+                              "cubic",
+                              "bbr",
+                              "reno"
+                            ]
                           },
                           "url": {
                             "type": "string"
@@ -18363,6 +18377,30 @@
       },
       "additionalProperties": false
     },
+    "UnauthenticatedLimitsOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_concurrent_per_ip": {
+          "type": "integer"
+        },
+        "requests_per_second": {
+          "type": "number"
+        },
+        "burst": {
+          "type": "integer"
+        },
+        "idle_timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "max_tracked_ips": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
     "User": {
       "type": "object",
       "properties": {
@@ -18589,17 +18627,10 @@
           "type": "string"
         },
         "allowed_ips": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/IPPrefix"
-            },
-            {
-              "type": "array",
-              "items": {
-                "$ref": "#/$defs/IPPrefix"
-              }
-            }
-          ]
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/IPPrefix"
+          }
         },
         "persistent_keepalive_interval": {
           "type": "integer",
