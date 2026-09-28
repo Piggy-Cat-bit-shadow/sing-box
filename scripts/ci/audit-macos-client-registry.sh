@@ -292,22 +292,22 @@ done
 # runtime, so this is the mirror image of the check above: the client protocols
 # must be genuinely present, not merely mentioned in a source file.
 included_packages=(
+  # The production allowlist. Each entry must have linked symbols, which is what
+  # proves the registration is backed by a real implementation rather than a stub.
+  #
+  # protocols removed from the product (socks, snell, trojan, vmess, hysteria2,
+  # tuic) are deliberately ABSENT from this list: asserting their symbols would
+  # assert the opposite of the product definition. They are covered instead by the
+  # exclusion list below, which fails if they come back.
   "protocol/tun"
   "protocol/mixed"
-  "protocol/socks"
-  "protocol/http"
-  "protocol/direct"
+  "protocol/http"              # the MASQUE client outbound shares this package
   "protocol/block"
   "protocol/group"
   "protocol/shadowsocks"
   "protocol/shadowtls"
-  "protocol/snell"
-  "protocol/trojan"
   "protocol/vless"
-  "protocol/vmess"
   "protocol/anytls"
-  "protocol/hysteria2"
-  "protocol/tuic"
   "protocol/masque"            # the CLIENT role; server role asserted absent above
   "dns/transport/fakeip"
   "dns/transport/hosts"

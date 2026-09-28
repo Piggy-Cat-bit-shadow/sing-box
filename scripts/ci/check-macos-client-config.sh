@@ -61,23 +61,12 @@ config="$outdir/jiejie-macos-client.json"
 
 sed \
   -e "s|__CACHE_FILE__|$outdir/cache.db|g" \
-  -e "s/__CLASH_PORT__/19090/g" \
   -e "s/__MIXED_PORT__/19080/g" \
-  -e "s/__SOCKS_IN_PORT__/19081/g" \
-  -e "s/__HTTP_IN_PORT__/19082/g" \
-  -e "s/__DIRECT_IN_PORT__/19083/g" \
-  -e "s/__ECHO_PORT__/19084/g" \
-  -e "s/__SOCKS_UPSTREAM_PORT__/19085/g" \
-  -e "s/__HTTP_UPSTREAM_PORT__/19086/g" \
   -e "s/__VLESS_PORT__/19087/g" \
-  -e "s/__VMESS_PORT__/19088/g" \
-  -e "s/__TROJAN_PORT__/19089/g" \
   -e "s/__SS_PORT__/19091/g" \
   -e "s/__SHADOWTLS_PORT__/19092/g" \
-  -e "s/__SNELL_PORT__/19093/g" \
   -e "s/__ANYTLS_PORT__/19094/g" \
-  -e "s/__HYSTERIA2_PORT__/19095/g" \
-  -e "s/__TUIC_PORT__/19096/g" \
+    -e "s/__NAIVE_PORT__/19098/g" \
   -e "s/__MASQUE_PORT__/19097/g" \
   "$tmpl" > "$config"
 
