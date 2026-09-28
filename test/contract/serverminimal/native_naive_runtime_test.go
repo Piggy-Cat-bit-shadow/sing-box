@@ -2,19 +2,78 @@ package serverminimal_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	badjson "github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/common/rw"
 
 	"github.com/stretchr/testify/require"
 )
+
+// fixtureCertificates generates a throwaway CA and leaf certificate and returns their
+// paths.
+//
+// The production fixture deliberately points its TLS paths at /tmp placeholder
+// locations, because it must not carry real key material. Construction reads the
+// certificate, so a test that builds the inbound must supply real files at those
+// paths rather than weakening the fixture. The fixture's own bytes are never
+// modified: only the in-memory copy this test decodes is redirected.
+func fixtureCertificates(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	dir := t.TempDir()
+
+	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "sing-box contract test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caKey.Public(), caKey)
+	require.NoError(t, err)
+
+	leafKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "naive contract test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"naive.contract.test", "localhost"},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caTemplate, leafKey.Public(), caKey)
+	require.NoError(t, err)
+
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	chain := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
+	require.NoError(t, rw.WriteFile(certPath, chain))
+	require.NoError(t, rw.WriteFile(keyPath,
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(leafKey)})))
+	return certPath, keyPath
+}
 
 // This file proves the Server Minimal profile can actually BUILD the Native Naive
 // inbound, not merely resolve its type name.
@@ -31,6 +90,14 @@ import (
 // through Nginx Stream by SNI. "The binary can build this inbound" is therefore a
 // production property, asserted here through the real registry and the real config
 // decoder rather than through a hand-built options literal.
+
+// mustMarshal marshals a value or fails the test.
+func mustMarshal(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return encoded
+}
 
 // loadFixtureInboundJSON returns the raw JSON of the fixture's named inbound.
 func loadFixtureInboundJSON(t *testing.T, tag string) []byte {
@@ -78,6 +145,20 @@ func buildFixtureInbound(t *testing.T, tag string) adapter.Inbound {
 	require.NoError(t, json.Unmarshal(raw, &fields), "parse the fixture inbound")
 	delete(fields, "type")
 	delete(fields, "tag")
+
+	// Construction loads the TLS certificate, and the fixture intentionally points at
+	// placeholder paths so that it never carries key material. Point this in-memory
+	// copy at freshly generated files instead of weakening the fixture on disk.
+	certPath, keyPath := fixtureCertificates(t)
+	var tlsOptions map[string]json.RawMessage
+	if rawTLS, hasTLS := fields["tls"]; hasTLS {
+		require.NoError(t, json.Unmarshal(rawTLS, &tlsOptions))
+		tlsOptions["certificate_path"] = mustMarshal(t, certPath)
+		tlsOptions["key_path"] = mustMarshal(t, keyPath)
+		fields["tls"] = mustMarshal(t, tlsOptions)
+	} else {
+		t.Fatalf("the production naive inbound must serve TLS; none found in the fixture")
+	}
 	optionsJSON, err := json.Marshal(fields)
 	require.NoError(t, err)
 
