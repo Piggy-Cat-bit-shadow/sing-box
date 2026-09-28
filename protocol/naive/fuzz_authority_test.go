@@ -100,21 +100,29 @@ func FuzzNaiveConnectAuthority(fuzz *testing.F) {
 		// unresolvable and the dial fails. What would be dangerous is a malformed
 		// authority silently becoming a REAL address, because then the routed and
 		// logged target would differ from the requested one.
-		//
-		// This is asserted by re-encoding the destination and re-parsing it: a
-		// well-formed result must be stable, so any instability indicates the
-		// authority was not understood in the way it was reported.
 		if hasAddr {
 			if !destination.Addr.IsValid() {
 				t.Fatalf("an address destination must carry a valid address "+
 					"(from %q / %q)", urlHost, requestHost)
 			}
-			// An address destination must not have consumed a port that the
-			// authority never expressed, which is what a misplaced bracket would
-			// cause.
-			if strings.Count(urlHost, ":") == 0 && destination.Port != 0 {
+			// An address destination must not have consumed a port that the value
+			// it was actually parsed FROM never expressed, which is what a
+			// misplaced bracket would cause.
+			//
+			// The colon count must be taken over that same value. An earlier
+			// version counted colons in urlHost unconditionally, which is wrong
+			// whenever the URL authority is EMPTY: the parser then falls back to
+			// requestHost, so a port legitimately coming from a requestHost like
+			// "host:443" was reported as "a port appeared for an authority with no
+			// colon". The fuzzer found exactly that (urlHost=""), and the finding
+			// was in this assertion rather than in the parser.
+			parsedFrom := urlHost
+			if parsedFrom == "" {
+				parsedFrom = requestHost
+			}
+			if strings.Count(parsedFrom, ":") == 0 && destination.Port != 0 {
 				t.Fatalf("a port appeared (%d) for an authority with no colon "+
-					"(from %q)", destination.Port, urlHost)
+					"(from %q / %q)", destination.Port, urlHost, requestHost)
 			}
 		}
 	})
