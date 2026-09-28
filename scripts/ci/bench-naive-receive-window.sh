@@ -26,11 +26,18 @@
 # The sweep is 4, 8, 16, 32, 64 and 128 MiB (the current default), because the
 # question is where throughput stops improving. For each value:
 #
-#   single-stream throughput
-#   multi-stream throughput (4 and 8 parallel streams)
+#   1, 4 and 8 stream throughput, one batch per stream count
 #   RSS and private memory
-#   first-byte and total latency
-#   stalls (transfers that failed or hit the timeout)
+#   first-byte latency (max time_starttransfer within the batch)
+#   client failures (non-zero curl exit, non-2xx status, zero-byte transfer)
+#   sing-box log stalls, reported separately as a secondary signal
+#
+# Throughput comes from ONE batch: the bytes and the wall time are taken from the same
+# run of `n` parallel downloads, and the divisor is max(time_total) because the slowest
+# stream bounds the batch. A previous revision measured bytes in one batch and the time
+# in a SECOND batch and divided one by the other, which is not a throughput at all: it
+# mixes two independent samples of a variable system. It also only swept 1 and 4
+# streams while this header promised 8.
 #
 # # The signal that decides it
 #
@@ -118,36 +125,107 @@ JSON
     sleep 0.1
   done
 
+  # measure_streams runs ONE batch of `streams` parallel downloads and derives the
+  # throughput from THAT batch alone.
+  #
+  # A previous revision measured bytes in one batch and elapsed time in a SECOND
+  # batch, then divided one by the other. That number is not a throughput: it mixes
+  # two independent samples of a variable system, so it can report a figure no single
+  # run ever produced. Bytes and time must come from the same batch.
+  #
+  # For one parallel batch the wall clock is bounded by the SLOWEST stream, so
+  # max(time_total) is the correct divisor, not the sum. Every curl also reports its
+  # own exit status, HTTP code and byte count, so a failed or stalled transfer is
+  # visible instead of silently contributing zero bytes.
   measure_streams() {
     local streams="$1"
-    local total
-    total="$(seq 1 "$streams" | xargs -P "$streams" -I{} \
-      curl -s -o /dev/null -w '%{size_download}\n' \
+    local raw_file="$outdir/raw-$window-$streams.txt"
+
+    # %{exitcode} cannot be emitted by curl's -w, so each line carries the fields curl
+    # can report and the shell records the exit status separately by wrapping the call.
+    seq 1 "$streams" | xargs -P "$streams" -I{} \
+      sh -c 'curl -s -o /dev/null \
+        -w "%{http_code} %{size_download} %{time_total} %{time_starttransfer}\n" \
         --proxy "socks5h://127.0.0.1:18081" \
-        --max-time 120 -w '%{size_download} %{time_total}\n' "$url" 2>/dev/null \
-      | awk '{b+=$1} END {print b+0}')"
-    # Throughput needs the elapsed time too; the slowest stream bounds the wall
-    # clock for a parallel download, so the max time_total is the right divisor.
-    local elapsed
-    elapsed="$(seq 1 "$streams" | xargs -P "$streams" -I{} \
-      curl -s -o /dev/null -w '%{time_total}\n' \
-        --proxy "socks5h://127.0.0.1:18081" \
-        --max-time 120 "$url" 2>/dev/null | sort -rn | head -1)"
-    python3 -c "
+        --max-time 120 "$1"; echo " exit=$?"' _ "$url" \
+      > "$raw_file" 2>/dev/null
+
+    python3 - "$raw_file" "$streams" <<'PYTHON'
 import sys
-total=float('${total:-0}'); elapsed=float('${elapsed:-0}' or 0)
-print(f'{total/elapsed/1e6:.2f}' if elapsed>0 else 'n/a')"
+
+path, streams = sys.argv[1], int(sys.argv[2])
+total_bytes = 0
+max_time = 0.0
+max_starttransfer = 0.0
+failures = []
+
+with open(path) as handle:
+    for index, line in enumerate(handle):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        # Expected shape: "<http> <bytes> <total> <starttransfer> exit=<code>"
+        if len(parts) < 5:
+            failures.append(f"stream{index}: unparsable output {line!r}")
+            continue
+        try:
+            http_code = int(parts[0])
+            size = float(parts[1])
+            elapsed = float(parts[2])
+            starttransfer = float(parts[3])
+        except ValueError:
+            failures.append(f"stream{index}: unparsable numbers {line!r}")
+            continue
+        exit_code = parts[4].split("=", 1)[-1]
+
+        if exit_code != "0":
+            failures.append(f"stream{index}: curl exit {exit_code}")
+            continue
+        if http_code < 200 or http_code >= 300:
+            failures.append(f"stream{index}: HTTP {http_code}")
+            continue
+        # A truncated transfer must not be counted as a fast one.
+        if index == 0 and size <= 0:
+            failures.append(f"stream{index}: zero bytes")
+
+        total_bytes += size
+        max_time = max(max_time, elapsed)
+        max_starttransfer = max(max_starttransfer, starttransfer)
+
+if failures:
+    print("n/a " + "; ".join(failures[:3]))
+else:
+    throughput = total_bytes / max_time / 1e6 if max_time > 0 else 0.0
+    print(f"{throughput:.2f} {max_starttransfer:.3f}")
+PYTHON
   }
 
-  one="$(measure_streams 1)"
-  four="$(measure_streams 4)"
+  # One batch per stream count, and the throughput of each batch comes from that batch
+  # alone. Every count is measured once: re-running a count to "get the time" is the
+  # mistake this replaced.
+  one_stats="$(measure_streams 1)"
+  four_stats="$(measure_streams 4)"
+  eight_stats="$(measure_streams 8)"
+
+  one="$(echo "$one_stats" | awk '{print $1}')"
+  four="$(echo "$four_stats" | awk '{print $1}')"
+  eight="$(echo "$eight_stats" | awk '{print $1}')"
+
+  # A stall is now reported by the transfers themselves: a non-zero curl exit, a
+  # non-2xx status, or output the parser could not read. Grepping the sing-box log for
+  # "timeout" is a useful SECONDARY signal but cannot see a client-side failure at all,
+  # so it is reported separately rather than as the stall count.
+  client_failures="$(printf '%s\n%s\n%s\n' "$one_stats" "$four_stats" "$eight_stats" \
+    | grep -c 'n/a' || true)"
+  log_stalls="$(grep -c -i "timeout\|stall" "$outdir/window-$window.log" 2>/dev/null || echo 0)"
 
   rss="$(ps -o rss= -p "$pid" | tr -d ' ')"
   private="$(footprint -p "$pid" 2>/dev/null | grep -i 'physical footprint' | head -1 | sed 's/.*: *//' || echo n/a)"
-  stalls="$(grep -c -i "timeout\|stall" "$outdir/window-$window.log" 2>/dev/null || echo 0)"
 
-  printf '%-10s %-14s %-14s %-12s %-10s %s\n' \
-    "$window" "$one" "$four" "${rss:-n/a}" "$private" "$stalls"
+  printf '%-10s %-13s %-13s %-13s %-12s %-10s %s\n' \
+    "$window" "$one" "$four" "$eight" "${rss:-n/a}" "$private" \
+    "client=$client_failures log=$log_stalls"
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true

@@ -164,8 +164,10 @@ which this environment does not have.
 | thread count | NOT TESTED | NOT TESTED |
 | FD count | NOT TESTED | NOT TESTED |
 | startup latency | NOT TESTED | NOT TESTED |
-| first CONNECT latency | NOT TESTED | NOT TESTED |
-| 1 / 4 / 8 / 16 stream throughput | NOT TESTED | NOT TESTED |
+| first request latency (end-to-end, NOT CONNECT alone) | NOT TESTED | NOT TESTED |
+| 1 / 4 / 8 / 16 stream throughput (single batch) | NOT TESTED | NOT TESTED |
+| per-batch transfer failures | NOT TESTED | NOT TESTED |
+| Cronet engine / H2 session / pool count | NOT DIRECTLY VERIFIED | NOT DIRECTLY VERIFIED |
 | long-running stability | NOT TESTED | NOT TESTED |
 | reconnect after network change | NOT TESTED | NOT TESTED |
 | CPU % | NOT TESTED | NOT TESTED |
@@ -187,10 +189,27 @@ without a server it prints **NOT TESTED** and exits 0 — it does not fabricate
 figures.
 
 **Decision rule, recorded in advance so it cannot be fitted to the result:** adopt
-single-engine as the macOS default only if throughput and first-CONNECT latency show
+single-engine as the macOS default only if throughput and first-request latency show
 no meaningful regression **and** the session count still reaches
 `insecure_concurrency`. Resource savings alone are not sufficient, because the point
 of `insecure_concurrency` is connection isolation.
+
+> ### Session/pool isolation: NOT DIRECTLY VERIFIED
+>
+> The harness does **not** observe the Cronet engine count, the HTTP/2 session count,
+> the network isolation keys, or the connection pool count. There is no API available
+> to it that reports those, so the second half of the decision rule above is
+> **unverified by measurement**.
+>
+> What the harness does report is the *inputs* the isolation depends on: the
+> `insecure_concurrency` and `insecure_concurrency_single_engine` values actually
+> passed to the build, and the `-network-isolation-key` construction at
+> `cronet-go/naive_client.go` (section above). That is a code-path claim, not an
+> observation.
+>
+> **Do not read a favourable throughput row as evidence that session isolation holds.**
+> Adopting single-engine requires either an observable session signal or a separate
+> verification; the decision rule cannot be satisfied by this harness alone.
 
 ---
 

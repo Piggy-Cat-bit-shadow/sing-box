@@ -30,9 +30,18 @@
 #   thread count                from the process table
 #   FD count                    from lsof
 #   startup latency             time to the API becoming reachable
-#   first CONNECT latency       time to the first successful proxied request
-#   1/4/8/16 stream throughput  parallel curl download throughput
-#   CPU %                       sampled during the throughput phase
+#   first request latency       END-TO-END time for the first proxied request,
+#                               including target connect and target TLS. It is NOT
+#                               CONNECT establishment on its own, and the field name
+#                               says so.
+#   1/4/8/16 stream throughput  from ONE parallel batch per stream count: bytes and
+#                               wall time come from the SAME batch, and wall time is
+#                               max(time_total) because the slowest stream bounds it.
+#                               A failed stream is reported, not counted as zero bytes.
+#   CPU %                       max and median of 10 samples taken WHILE 4 concurrent
+#                               downloads run
+#   failures                    per-batch count of non-zero curl exits, non-2xx
+#                               statuses and zero-byte transfers
 #
 # # What it deliberately does NOT do
 #
@@ -46,6 +55,12 @@
 # "NOT TESTED" rather than producing numbers from a loopback fixture, because a
 # loopback has no RTT, no loss and no BDP, which is exactly what a congestion and
 # windowing comparison is about.
+#
+# It also cannot observe Cronet engine count, HTTP/2 session count, network isolation
+# keys or connection pool count. The single-engine decision rule requires the session
+# count to still reach insecure_concurrency, so that half of the rule is NOT DIRECTLY
+# VERIFIED by this harness - see docs/JIEJIE-NAIVE-CLIENT-AUDIT.md. Do not read a
+# favourable throughput row as evidence that isolation holds.
 set -euo pipefail
 
 server_host="${1:-}"
@@ -170,31 +185,132 @@ run_variant() {
   printf 'startup_seconds=%s\n' "$ready"
   sample_process "$pid" "idle"
 
-  # First CONNECT latency through the proxy.
-  local connect_latency
-  connect_latency="$(curl -s -o /dev/null -w '%{time_total}' \
-    --proxy "socks5h://127.0.0.1:18080" \
-    --max-time 30 "https://$server_host/" 2>/dev/null || echo "n/a")"
-  printf 'first_connect_seconds=%s\n' "$connect_latency"
+    # First request latency through the proxy, END TO END.
+    #
+    # This is curl's total time for one request, which includes the local proxy, the
+    # Naive connection, the target connect, the target TLS handshake, the request and
+    # the response. It is NOT the CONNECT establishment time on its own, and a previous
+    # revision labelled it "first_connect_seconds", claiming a precision it did not
+    # have. The field is renamed to say what is actually measured.
+    local first_request_latency
+    first_request_latency="$(curl -s -o /dev/null -w '%{time_total}' \
+      --proxy "socks5h://127.0.0.1:18080" \
+      --max-time 30 "https://$server_host/" 2>/dev/null || echo "n/a")"
+    printf 'first_request_seconds=%s\n' "$first_request_latency"
 
-  # Throughput at each stream count. A fixed payload keeps the comparison about
-  # transfer efficiency rather than about what the server happened to serve.
-  local url="${BENCH_URL:-https://$server_host/}"
-  for streams in $streams_sweep; do
-    local bytes_total
-    bytes_total="$(seq 1 "$streams" | xargs -P "$streams" -I{} \
-      curl -s -o /dev/null -w '%{size_download}\n' \
-        --proxy "socks5h://127.0.0.1:18080" \
-        --max-time 60 "$url" 2>/dev/null | paste -sd+ - | bc 2>/dev/null || echo 0)"
-    printf 'streams=%s bytes_downloaded=%s\n' "$streams" "${bytes_total:-0}"
-    sample_process "$pid" "streams=$streams"
+    # Throughput at each stream count.
+    #
+    # ONE batch of `streams` parallel downloads produces BOTH the bytes and the time,
+    # so the result is a real throughput. A previous revision summed size_download but
+    # never measured elapsed time at all, and printed the byte count under a name that
+    # implied throughput: for a fixed payload at streams=8 that was simply
+    # 8 x object_size, unchanged by any performance work.
+    #
+    # For one parallel batch the wall clock is bounded by the SLOWEST stream, so
+    # max(time_total) is the divisor, not the sum. Each transfer also reports its own
+    # exit status and HTTP code, so a failed or stalled stream is reported instead of
+    # contributing zero bytes to a total that still looks plausible.
+    local url="${BENCH_URL:-https://$server_host/}"
+    for streams in $streams_sweep; do
+      local raw_file="$outdir/cronet-raw-$name-$streams.txt"
+
+      seq 1 "$streams" | xargs -P "$streams" -I{} \
+        sh -c 'curl -s -o /dev/null \
+          -w "%{http_code} %{size_download} %{time_total} %{time_starttransfer}\n" \
+          --proxy "socks5h://127.0.0.1:18080" \
+          --max-time 60 "$1"; echo " exit=$?"' _ "$url" \
+        > "$raw_file" 2>/dev/null || true
+
+      local parsed mbps starttransfer bytes_total failures
+      parsed="$(python3 - "$raw_file" <<'PYTHON'
+import sys
+
+path = sys.argv[1]
+total_bytes = 0.0
+max_time = 0.0
+max_starttransfer = 0.0
+failures = []
+
+with open(path) as handle:
+    for index, line in enumerate(handle):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            failures.append("stream%d: unparsable %r" % (index, line))
+            continue
+        try:
+            http_code = int(parts[0])
+            size = float(parts[1])
+            elapsed = float(parts[2])
+            starttransfer = float(parts[3])
+        except ValueError:
+            failures.append("stream%d: unparsable numbers %r" % (index, line))
+            continue
+        exit_code = parts[4].split("=", 1)[-1]
+
+        if exit_code != "0":
+            failures.append("stream%d: curl exit %s" % (index, exit_code))
+            continue
+        if not 200 <= http_code < 300:
+            failures.append("stream%d: HTTP %d" % (index, http_code))
+            continue
+        if size <= 0:
+            failures.append("stream%d: zero bytes" % index)
+            continue
+
+        total_bytes += size
+        max_time = max(max_time, elapsed)
+        max_starttransfer = max(max_starttransfer, starttransfer)
+
+if failures:
+    print("n/a 0.000 0 %d failure(s): %s" % (len(failures), "; ".join(failures[:3])))
+elif max_time <= 0:
+    print("n/a 0.000 0 no timing recorded")
+else:
+    print("%.2f %.3f %d" % (total_bytes / max_time / 1e6, max_starttransfer,
+                            int(total_bytes)))
+PYTHON
+)"
+      mbps="$(echo "$parsed" | awk '{print $1}')"
+      starttransfer="$(echo "$parsed" | awk '{print $2}')"
+      bytes_total="$(echo "$parsed" | awk '{print $3}')"
+      failures="$(echo "$parsed" | cut -d' ' -f4-)"
+
+      # Bytes, wall time and throughput all come from the SAME batch.
+      printf 'streams=%s throughput_MBps=%s bytes_downloaded=%s first_byte_seconds=%s failures=%s\n' \
+        "$streams" "$mbps" "${bytes_total:-0}" "$starttransfer" "$failures"
+      sample_process "$pid" "streams=$streams"
+    done
+
+
+  # CPU during a SUSTAINED transfer.
+  #
+  # The previous revision sampled once, AFTER every transfer had finished, and labelled
+  # the result "cpu during a sustained transfer". An idle process reports a lifetime
+  # average, not transfer CPU, so that number described the setup phase.
+  #
+  # Here a background download runs for the sampling window and ps is polled while it
+  # is in flight. `ps -o %cpu` is a decaying average, so the samples are taken during
+  # real work and the maximum is reported; the median is reported too, because a single
+  # max is easy to over-read.
+  local cpu_samples cpu_max cpu_median
+  cpu_samples="$(mktemp)"
+  ( seq 1 4 | xargs -P 4 -I{} curl -s -o /dev/null \
+      --proxy "socks5h://127.0.0.1:18080" --max-time 25 "$url" ) &
+  local load_pid=$!
+  for _ in $(seq 1 10); do
+    ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' >> "$cpu_samples" || true
+    sleep 0.4
   done
+  wait "$load_pid" 2>/dev/null || true
 
-  # CPU during a sustained transfer, sampled rather than averaged over the whole
-  # run so the setup phase does not dilute it.
-  local cpu
-  cpu="$(ps -o %cpu= -p "$pid" | tr -d ' ')"
-  printf 'cpu_percent=%s\n' "$cpu"
+  cpu_max="$(sort -rn "$cpu_samples" 2>/dev/null | head -1)"
+  cpu_median="$(sort -n "$cpu_samples" 2>/dev/null | awk '{v[NR]=$1} END {if(NR==0) print "n/a"; else print v[int((NR+1)/2)]}')"
+  rm -f "$cpu_samples"
+  printf 'cpu_percent_max=%s cpu_percent_median=%s cpu_samples=%s\n' \
+    "${cpu_max:-n/a}" "${cpu_median:-n/a}" "10x400ms during 4 concurrent downloads"
 
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
