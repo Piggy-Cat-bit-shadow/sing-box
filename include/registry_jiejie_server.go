@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/anytls"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/http"
+	"github.com/sagernet/sing-box/protocol/naive"
 	"github.com/sagernet/sing-box/protocol/shadowsocks"
 	"github.com/sagernet/sing-box/protocol/shadowtls"
 	"github.com/sagernet/sing-box/protocol/socks"
@@ -52,23 +53,28 @@ func Context(ctx context.Context) context.Context {
 	return box.Context(ctx, InboundRegistry(), OutboundRegistry(), EndpointRegistry(), DNSTransportRegistry(), ServiceRegistry(), CertificateProviderRegistry())
 }
 
-// InboundRegistry registers the four public entry points, and nothing else.
+// InboundRegistry registers the production entry points, and nothing else.
 //
-// # Native Naive is deliberately NOT registered
+// # Native Naive IS registered
 //
-// NaiveProxy in this deployment is served by Caddy's forwardproxy@udpintcp, not by
-// sing-box. The Native Naive inbound used to be registered here and was therefore
-// linked into every production binary while never being started by the topology: it
-// contributed a klzgrad-compatible CONNECT listener, a UoT v1/v2 data path and an
-// HTTP/2 Web masquerade to both the attack surface and the binary size, for a
-// capability production had already moved to Caddy.
+// The live production configuration on the VPS still declares a `naive` inbound, so
+// this profile must register it. An earlier revision of this file removed the
+// registration on the reasoning that NaiveProxy had moved to Caddy's
+// forwardproxy@udpintcp; the shippped `.6` binary then rejected the real server
+// configuration with `unknown inbound type: naive`. The inference was wrong: the
+// deployment may run a Caddy Naive service on a separate path, and the existence of
+// Caddy does not make the sing-box Native Naive inbound redundant. The production
+// configuration is the authority for what this profile must contain, not an
+// assumption about which component replaced which.
 //
-// Removing the registration removes the whole import graph behind it; the Go linker
-// then drops the package. protocol/naive itself is UNCHANGED and still compiled by
-// the full/upstream registry, by the client-side tests, and as the reference the
-// macOS Naive work is measured against. Only this profile stops linking it.
+// Registering this inbound deliberately does NOT pull in the Naive OUTBOUND or the
+// Chromium/Cronet client stack. protocol/naive/outbound.go and its tests carry their
+// own `with_naive_outbound` build tag, while inbound.go and inbound_conn.go carry
+// none, so a server build compiles only the listener side. This profile does not set
+// that tag, and `go list -deps ./cmd/sing-box` confirms cronet is absent from the
+// link graph.
 //
-// The socks and direct inbounds are likewise NOT registered. Both previously
+// The socks and direct inbounds are deliberately NOT registered. Both previously
 // existed only so the integration tests could use an in-process client, which let
 // the test harness dictate the production binary. The tests now use real protocol
 // clients (HTTP/2, quic-go HTTP/3, sing-anytls, sing-shadowtls, sing-shadowsocks)
@@ -78,6 +84,7 @@ func InboundRegistry() *inbound.Registry {
 
 	http.RegisterInbound(registry)        // MASQUE over HTTP/2 (behind Nginx Stream) and HTTP/3 (UDP/443)
 	anytls.RegisterInbound(registry)      // AnyTLS, with native fallback to the Nginx web root
+	naive.RegisterInbound(registry)       // Native Naive, required by the live production configuration
 	shadowtls.RegisterInbound(registry)   // ShadowTLS v3; detour targets the ss2022-in inbound
 	shadowsocks.RegisterInbound(registry) // Shadowsocks 2022, the ShadowTLS detour target
 
