@@ -296,14 +296,14 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		cacheKey := c.newCacheKey(transport, question, message, options)
 		operation.cacheKey = cacheKey
 		exchangeKey := dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
-		cond, loaded := c.cacheLock.LoadOrStore(exchangeKey, make(chan struct{}))
-		if !loaded {
-			operation.releaseCond = func() {
-				c.cacheLock.Delete(exchangeKey)
-				close(cond)
-			}
-		}
 		for {
+			cond, loaded := c.cacheLock.LoadOrStore(exchangeKey, make(chan struct{}))
+			if !loaded {
+				operation.releaseCond = func() {
+					c.cacheLock.Delete(exchangeKey)
+					close(cond)
+				}
+			}
 			response, ttl, isStale := c.loadResponse(cacheKey)
 			if response != nil {
 				if isStale && !options.DisableOptimisticCache {
@@ -323,6 +323,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 				break
 			}
 			if !allowWait {
+				operation.release()
 				return nil, nil, exchangeWait, nil
 			}
 			select {
@@ -336,7 +337,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 			}
 			cacheKey = c.newCacheKey(transport, question, message, options)
 			operation.cacheKey = cacheKey
-			loaded = false
+			exchangeKey = dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
 		}
 	}
 
