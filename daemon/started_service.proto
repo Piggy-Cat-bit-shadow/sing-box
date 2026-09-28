@@ -52,6 +52,32 @@ service StartedService {
   rpc SubmitOpenVPNChallengeResponse(OpenVPNChallengeSubmission) returns (google.protobuf.Empty) {}
   rpc CancelOpenVPNChallenge(OpenVPNChallengeCancel) returns (google.protobuf.Empty) {}
   rpc SubscribeNotifications(google.protobuf.Empty) returns (stream NotificationEvent) {}
+
+  // lx:begin lx_command
+  //
+  // The unary command surface JiejieBox / singbox-launcher drives its proxy UI
+  // with. SubscribeGroups/SubscribeOutbounds above are STREAMS: they push updates
+  // but cannot answer a one-shot question, so a client that has just paired (or
+  // that missed a broadcast) has no way to ask for the current state. These three
+  // are the pull counterparts.
+  //
+  // The RPCs are declared UNCONDITIONALLY — the descriptor is part of the wire
+  // contract and must be identical in every build — while the HANDLERS are gated:
+  // started_service_command_lx.go provides real implementations under
+  // with_lx_command, and started_service_command_lx_stub.go answers
+  // codes.Unimplemented without it.
+  //
+  // That split is deliberate. A build without the tag registers the method and
+  // refuses it with a DETERMINISTIC Unimplemented, instead of the method being
+  // absent from the descriptor. Absence produces "unknown method GetGroups" at the
+  // transport layer, which a capability probe cannot distinguish from a typo, a
+  // version skew or a broken proxy; a served Unimplemented is an unambiguous
+  // "this build does not include it". singbox-launcher's probe in
+  // core/daemon_rpc_compat.go relies on exactly that distinction.
+  rpc GetGroups(google.protobuf.Empty) returns (Groups) {}
+  rpc GetOutbounds(google.protobuf.Empty) returns (OutboundList) {}
+  rpc URLTestOutbound(URLTestOutboundRequest) returns (URLTestOutboundResponse) {}
+  // lx:end lx_command
 }
 
 message Version {
@@ -133,6 +159,42 @@ message GroupItem {
 message URLTestRequest {
   string outboundTag = 1;
 }
+
+// lx:begin lx_command
+//
+// URLTestOutbound measures ONE node and returns its latency synchronously.
+//
+// It is not a replacement for URLTest above: that RPC triggers a whole group and
+// writes the result to the history asynchronously, so the caller never learns the
+// outcome. A launcher that wants to show a per-node delay needs the value in the
+// reply.
+//
+// Field numbers are the wire ABI and are copied verbatim from the reference
+// (SagerNet/sing-box 94c41b50): 1, 2, 3 and 1, 2. Renumbering them for tidiness
+// would silently break every already-shipped client.
+message URLTestOutboundRequest {
+  string outboundTag = 1;
+  string link = 2;
+  uint32 timeout = 3;
+}
+
+// The error model is Variant B: EVERY application-level outcome — an unknown tag,
+// a dial failure, a timeout — is reported in the `error` field of this message and
+// the handler still returns a nil gRPC error. Transport-level status is reserved
+// for a call that could not be made at all (service not started).
+//
+// The reason is that a client must not have to handle two failure channels. If
+// some failures arrived as gRPC status and others as this payload, every caller
+// would need both branches and would get it wrong somewhere.
+//
+// `delay` is meaningful if and only if `error == ""`. In particular delay 0 with
+// an empty error is a SUCCESS at 0 ms — a fast local node — and must not be read
+// as a failure.
+message URLTestOutboundResponse {
+  uint32 delay = 1;
+  string error = 2;
+}
+// lx:end lx_command
 
 message SelectOutboundRequest {
   string groupTag = 1;

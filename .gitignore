@@ -26,3 +26,7 @@ AGENTS.md
 /.ghcache/
 /.golangci-cache/
 /.gopath/
+
+# Cache file created when sing-box runs from the source tree (default path is
+# relative, see experimental/cachefile/cache.go). Never a source artifact.
+cache.db

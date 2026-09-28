@@ -57,6 +57,9 @@ const (
 	StartedService_SubmitOpenVPNChallengeResponse_FullMethodName = "/daemon.StartedService/SubmitOpenVPNChallengeResponse"
 	StartedService_CancelOpenVPNChallenge_FullMethodName         = "/daemon.StartedService/CancelOpenVPNChallenge"
 	StartedService_SubscribeNotifications_FullMethodName         = "/daemon.StartedService/SubscribeNotifications"
+	StartedService_GetGroups_FullMethodName                      = "/daemon.StartedService/GetGroups"
+	StartedService_GetOutbounds_FullMethodName                   = "/daemon.StartedService/GetOutbounds"
+	StartedService_URLTestOutbound_FullMethodName                = "/daemon.StartedService/URLTestOutbound"
 )
 
 // StartedServiceClient is the client API for StartedService service.
@@ -105,6 +108,30 @@ type StartedServiceClient interface {
 	SubmitOpenVPNChallengeResponse(ctx context.Context, in *OpenVPNChallengeSubmission, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CancelOpenVPNChallenge(ctx context.Context, in *OpenVPNChallengeCancel, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SubscribeNotifications(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[NotificationEvent], error)
+	// lx:begin lx_command
+	//
+	// The unary command surface JiejieBox / singbox-launcher drives its proxy UI
+	// with. SubscribeGroups/SubscribeOutbounds above are STREAMS: they push updates
+	// but cannot answer a one-shot question, so a client that has just paired (or
+	// that missed a broadcast) has no way to ask for the current state. These three
+	// are the pull counterparts.
+	//
+	// The RPCs are declared UNCONDITIONALLY — the descriptor is part of the wire
+	// contract and must be identical in every build — while the HANDLERS are gated:
+	// started_service_command_lx.go provides real implementations under
+	// with_lx_command, and started_service_command_lx_stub.go answers
+	// codes.Unimplemented without it.
+	//
+	// That split is deliberate. A build without the tag registers the method and
+	// refuses it with a DETERMINISTIC Unimplemented, instead of the method being
+	// absent from the descriptor. Absence produces "unknown method GetGroups" at the
+	// transport layer, which a capability probe cannot distinguish from a typo, a
+	// version skew or a broken proxy; a served Unimplemented is an unambiguous
+	// "this build does not include it". singbox-launcher's probe in
+	// core/daemon_rpc_compat.go relies on exactly that distinction.
+	GetGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Groups, error)
+	GetOutbounds(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*OutboundList, error)
+	URLTestOutbound(ctx context.Context, in *URLTestOutboundRequest, opts ...grpc.CallOption) (*URLTestOutboundResponse, error)
 }
 
 type startedServiceClient struct {
@@ -697,6 +724,36 @@ func (c *startedServiceClient) SubscribeNotifications(ctx context.Context, in *e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StartedService_SubscribeNotificationsClient = grpc.ServerStreamingClient[NotificationEvent]
 
+func (c *startedServiceClient) GetGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Groups, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Groups)
+	err := c.cc.Invoke(ctx, StartedService_GetGroups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetOutbounds(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*OutboundList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(OutboundList)
+	err := c.cc.Invoke(ctx, StartedService_GetOutbounds_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) URLTestOutbound(ctx context.Context, in *URLTestOutboundRequest, opts ...grpc.CallOption) (*URLTestOutboundResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(URLTestOutboundResponse)
+	err := c.cc.Invoke(ctx, StartedService_URLTestOutbound_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // StartedServiceServer is the server API for StartedService service.
 // All implementations must embed UnimplementedStartedServiceServer
 // for forward compatibility.
@@ -743,6 +800,30 @@ type StartedServiceServer interface {
 	SubmitOpenVPNChallengeResponse(context.Context, *OpenVPNChallengeSubmission) (*emptypb.Empty, error)
 	CancelOpenVPNChallenge(context.Context, *OpenVPNChallengeCancel) (*emptypb.Empty, error)
 	SubscribeNotifications(*emptypb.Empty, grpc.ServerStreamingServer[NotificationEvent]) error
+	// lx:begin lx_command
+	//
+	// The unary command surface JiejieBox / singbox-launcher drives its proxy UI
+	// with. SubscribeGroups/SubscribeOutbounds above are STREAMS: they push updates
+	// but cannot answer a one-shot question, so a client that has just paired (or
+	// that missed a broadcast) has no way to ask for the current state. These three
+	// are the pull counterparts.
+	//
+	// The RPCs are declared UNCONDITIONALLY — the descriptor is part of the wire
+	// contract and must be identical in every build — while the HANDLERS are gated:
+	// started_service_command_lx.go provides real implementations under
+	// with_lx_command, and started_service_command_lx_stub.go answers
+	// codes.Unimplemented without it.
+	//
+	// That split is deliberate. A build without the tag registers the method and
+	// refuses it with a DETERMINISTIC Unimplemented, instead of the method being
+	// absent from the descriptor. Absence produces "unknown method GetGroups" at the
+	// transport layer, which a capability probe cannot distinguish from a typo, a
+	// version skew or a broken proxy; a served Unimplemented is an unambiguous
+	// "this build does not include it". singbox-launcher's probe in
+	// core/daemon_rpc_compat.go relies on exactly that distinction.
+	GetGroups(context.Context, *emptypb.Empty) (*Groups, error)
+	GetOutbounds(context.Context, *emptypb.Empty) (*OutboundList, error)
+	URLTestOutbound(context.Context, *URLTestOutboundRequest) (*URLTestOutboundResponse, error)
 	mustEmbedUnimplementedStartedServiceServer()
 }
 
@@ -919,6 +1000,18 @@ func (UnimplementedStartedServiceServer) CancelOpenVPNChallenge(context.Context,
 
 func (UnimplementedStartedServiceServer) SubscribeNotifications(*emptypb.Empty, grpc.ServerStreamingServer[NotificationEvent]) error {
 	return status.Error(codes.Unimplemented, "method SubscribeNotifications not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetGroups(context.Context, *emptypb.Empty) (*Groups, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetGroups not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetOutbounds(context.Context, *emptypb.Empty) (*OutboundList, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetOutbounds not implemented")
+}
+
+func (UnimplementedStartedServiceServer) URLTestOutbound(context.Context, *URLTestOutboundRequest) (*URLTestOutboundResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method URLTestOutbound not implemented")
 }
 func (UnimplementedStartedServiceServer) mustEmbedUnimplementedStartedServiceServer() {}
 func (UnimplementedStartedServiceServer) testEmbeddedByValue()                        {}
@@ -1545,6 +1638,60 @@ func _StartedService_SubscribeNotifications_Handler(srv interface{}, stream grpc
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type StartedService_SubscribeNotificationsServer = grpc.ServerStreamingServer[NotificationEvent]
 
+func _StartedService_GetGroups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetGroups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetGroups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetGroups(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetOutbounds_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetOutbounds(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetOutbounds_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetOutbounds(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_URLTestOutbound_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(URLTestOutboundRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).URLTestOutbound(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_URLTestOutbound_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).URLTestOutbound(ctx, req.(*URLTestOutboundRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // StartedService_ServiceDesc is the grpc.ServiceDesc for StartedService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1639,6 +1786,18 @@ var StartedService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CancelOpenVPNChallenge",
 			Handler:    _StartedService_CancelOpenVPNChallenge_Handler,
+		},
+		{
+			MethodName: "GetGroups",
+			Handler:    _StartedService_GetGroups_Handler,
+		},
+		{
+			MethodName: "GetOutbounds",
+			Handler:    _StartedService_GetOutbounds_Handler,
+		},
+		{
+			MethodName: "URLTestOutbound",
+			Handler:    _StartedService_URLTestOutbound_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
