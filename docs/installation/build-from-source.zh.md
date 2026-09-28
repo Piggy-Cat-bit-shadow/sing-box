@@ -58,7 +58,6 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
 | `with_utls`                        | :material-check:  | Build with [uTLS](https://github.com/refraction-networking/utls) support for TLS outbound, see [TLS](/zh/configuration/shared/tls#utls).                                                                                                                                                                                          |
 | `with_acme`                        | :material-check:  | Build with ACME TLS certificate issuer support, see [TLS](/zh/configuration/shared/tls/).                                                                                                                                                                                                                                         |
 | `with_v2ray_api`                   | :material-close:️ | Build with V2Ray API support, see [Experimental](/zh/configuration/experimental#v2ray-api-fields).                                                                                                                                                                                                                                |
-| `with_gvisor`                      | :material-close:  | 构建 gVisor 支持，已弃用的 `gvisor` / `mixed` [Tun 栈](/zh/configuration/inbound/tun#stack) 需要。                                                                                                                                                                   |
 | `with_embedded_tor` (CGO required) | :material-close:️ | Build with embedded Tor support, see [Tor outbound](/zh/configuration/outbound/tor/).                                                                                                                                                                                                                                             |
 | `with_tailscale`                   | :material-check:  | 构建 Tailscale 支持，参阅 [Tailscale 端点](/zh/configuration/endpoint/tailscale)。                                                                                                                                                                                                                                                         |
 | `with_ccm`                         | :material-check:  | 构建 Claude Code Multiplexer 服务支持。                                                                                                                                                                                                                                                                                              |
@@ -76,8 +75,8 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
     与 `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`。请用 `scripts/ci/build-server.sh` 与
     `scripts/ci/build-macos-client.sh` 构建这两个产品——它们直接读取标签文件，不需要在
     命令行传标签列表。macOS 客户端的标签为
-    `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0`，
-    其中 `with_gvisor` 与 `with_quic` 都是必需的（分别对应 TUN 与 MASQUE 的 HTTP/3 路径），
+    `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0`，
+    其中 `with_quic` 是必需的（对应 MASQUE 的 HTTP/3 路径）；`with_gvisor` 已移除，因为生产配置的 tun 使用默认的 Go 栈，
     不能当作可选标签删掉。
 
     本 fork **不构建** Clash API：该功能已被移除，不存在 `with_clash_api` 标签，配置里的

@@ -402,7 +402,7 @@ tags, and simply not write the new keys.
 | --- | --- |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | upstream default tags — untouched |
 | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
-| `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
+| `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` | `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 
 The Jiejie server set drops optional components the server does not use:
 

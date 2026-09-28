@@ -46,9 +46,9 @@ once and reaches every profile.
 | Tag file | `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` | `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` |
 | Target | `linux/amd64` | `darwin/arm64` |
 | `CGO_ENABLED` | `0` | `1` (Cronet) |
-| Build tags | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` | `with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
+| Build tags | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` | `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 | Registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
-| Binary size (measured) | 48,605,024 B | 73,432,802 B |
+| Binary size (measured) | 48,605,024 B | 43,075,954 B |
 | SHA-256 (measured) | `be2ccbc2df38…` | `fa976ee5491c…` |
 | Workflow | `server-linux-amd64.yml` | `client-macos.yml` |
 | Artifact | `Jiejie-Linux-amd64-<version>-<sha>` | `Jiejie-macOS-arm64-<version>-<sha>` |
@@ -110,12 +110,18 @@ merely requested by a tag name. The workflow checks the symbol table for
 stub, `masque-server`, `sing-box/lxd.` and `sing-box/experimental/clashapi.` are
 absent.
 
-`with_gvisor` and `with_quic` are both **required**, and neither is a leftover from
-a removed feature:
+`with_quic` is **required**; `with_gvisor` is deliberately **absent**. Both
+decisions are measured, and they are not symmetric:
 
-- `with_gvisor` is what selects the TUN userspace stack. The stack itself lives in
-  the `sing-tun` dependency and its Darwin files are gated on this tag, so it is
-  not "unused code kept for symmetry" — it is the tag that makes TUN work.
+- `with_gvisor` was removed in the second slimming round. An earlier revision of
+  this document claimed it was required for TUN, which is wrong: the production
+  configuration declares a `tun` inbound with **no `stack` field**, and `sing-tun`
+  resolves that to `""` → `NewGo`, the Go userspace stack. Only `stack: "gvisor"`
+  or `stack: "mixed"` reach gVisor, and neither is configured. Verified against
+  `tun.NewStack` with the tag absent — `<unset>` and `"go"` still work, while
+  `"gvisor"`/`"mixed"` return the documented *"rebuild with -tags with_gvisor"*
+  error rather than failing silently. Removing it saved **4,088,992 B (3.89 MiB)**.
+  The build script now refuses to require it, and the audit fails if it comes back.
 - `with_quic` is required for **MASQUE HTTP/3**. The QUIC *outbounds* (hysteria2,
   tuic) were removed by simply not calling `registerQUICOutbounds`; the tag stays,
   because MASQUE is a different consumer of it. Dropping `with_quic` "because
@@ -199,11 +205,11 @@ Measured hashes, for reference:
 ```text
 Linux amd64   18e72cc1f6e966cdf73ebcdfc8d63530be3fa244b4ad7c6013d105fb9123deab   local, 33,870,008 B
 macOS arm64   fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e   superseded, 76,166,402 B
-macOS arm64   73,432,802 B                                                        current, after the registry trim
+macOS arm64   43,075,954 B                                                        current, after the registry trim
 ```
 
 The macOS hash from the wider registry is kept only as a historical marker: the
-shipped binary is now the trimmed one at **73,432,802 B**. Sizes are recorded rather
+shipped binary is now the trimmed one at **43,075,954 B**. Sizes are recorded rather
 than hashes for the current build because the macOS core is CGO and its bytes vary
 across machines (see below) — the size does not, which is what makes it a useful
 guard.
@@ -333,11 +339,11 @@ by diffing the sorted failure lists:
 ```bash
 # before
 git checkout 49579cf32 && cd test && \
-  go test -tags "with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
+  go test -tags "with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
     -count=1 ./jiejie/ 2>&1 | grep '^--- FAIL' | sort > /tmp/before.txt
 # after
 git checkout testing && cd test && \
-  go test -tags "with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
+  go test -tags "with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0" \
     -count=1 ./jiejie/ 2>&1 | grep '^--- FAIL' | sort > /tmp/after.txt
 comm -13 <(sed 's/ ([0-9.]*s)//' /tmp/before.txt | sort) \
          <(sed 's/ ([0-9.]*s)//' /tmp/after.txt | sort)   # empty

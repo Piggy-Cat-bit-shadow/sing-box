@@ -144,7 +144,7 @@ they cannot drift.
 ### `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`
 
 ```text
-with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
 ```
 
 There is no `with_clash_api` here, and no `with_lxd` / `with_lx_command`: those
@@ -165,7 +165,6 @@ dropped as an optimisation:
 
 | tag | why |
 | --- | --- |
-| `with_gvisor` | **Required for TUN on Darwin.** `sing-tun`'s `stack_gvisor*.go` and `tun_darwin_gvisor.go` are gated on it, so this is the tag that selects the TUN userspace stack the product ships. It is not a leftover: dropping it removes the Darwin TUN implementation, which is the core capability of the product. |
 | `with_quic` | **Required, not optional.** MASQUE is a first-class transport here and its HTTP/3 path needs QUIC; `with_quic` also carries the v2ray QUIC transport and the DoQ/DoH3 DNS transports. Dropping it would break the MASQUE client, which is one of the two headline capabilities. |
 | `with_utls` | uTLS fingerprinting. Reality depends on it. |
 | `with_naive_outbound` | Links the real Cronet-backed NaiveProxy outbound rather than upstream's not-included stub. |
@@ -193,7 +192,7 @@ dropped as an optimisation:
 | `with_dhcp` | The desktop client does not use DHCP DNS. |
 | `with_wireguard` | The WireGuard endpoint is not part of the client feature set. |
 
-The macOS core is **73,432,802 B** against **108 MB** for the upstream default tag
+The macOS core is **43,075,954 B** against **108 MB** for the upstream default tag
 set built for the same platform. It is larger than a trimmed CGO-free core would
 be, because it ships NaiveProxy and MASQUE rather than excluding them; the saving
 against upstream still comes entirely from registration-level trimming.
@@ -529,7 +528,7 @@ running a URL test, live connections and closing them, and logs — all through
 TUN is the core capability of this product, and it is **not** trimmed.
 
 - `protocol/tun` is registered.
-- The gVisor TUN userspace stack is available (`with_gvisor`).
+- The Go TUN userspace stack is available. `with_gvisor` is absent by design; see below.
 - The TUN inbound is present in the config fixture and passes `sing-box check`.
 
 **Runtime TUN is NOT-TESTED.** Creating a `utun` device requires root and
@@ -539,10 +538,30 @@ smoke test therefore cover registration, parsing and the startup path, and the
 runtime smoke test removes only the TUN inbound so it can bind. This boundary is
 stated rather than papered over.
 
-Note that the fixture and example do **not** set the `stack` option. It is
-deprecated as of sing-box 1.15.0 (removal scheduled for 1.17.0) and upstream's
-guidance is to remove it to get `sing-tun`'s own TCP/IP stack. `with_gvisor`
-remains required regardless, because it gates the Darwin TUN implementation files.
+Note that the fixture, the example and the **production configuration** all omit the
+`stack` option. It is deprecated as of sing-box 1.15.0 (removal scheduled for
+1.17.0) and upstream's guidance is to remove it to get `sing-tun`'s own TCP/IP
+stack -- which is exactly what happens here.
+
+An earlier revision of this document claimed `with_gvisor` was required anyway
+"because it gates the Darwin TUN implementation files". That was wrong, and
+measurement settled it. `sing-tun` selects the stack by NAME:
+
+```
+switch stack {
+case "", "go":  return NewGo(options)      // <- what this product uses
+case "gvisor":  return NewGVisor(options)  // <- needs with_gvisor
+case "mixed":   return NewMixed(options)   // <- needs with_gvisor
+case "system":  return NewSystem(options)
+}
+```
+
+With the tag absent, `<unset>` and `"go"` still work; only `"gvisor"` and `"mixed"`
+fail, and they fail with an actionable "rebuild with -tags with_gvisor" message
+from `stack_gvisor_stub.go` rather than silently. No configuration here selects
+them, so the tag was removed and the binary shrank by 4,088,992 B.
+`stack_gvisor*.go` and `tun_darwin_gvisor.go` gate the *gVisor* stack, not TUN
+itself.
 
 ## Naive status
 
@@ -564,7 +583,7 @@ The cost is accepted deliberately:
   the macOS core is CGO=1 and is not self-contained. The alternative would be a
   second CGO-free core that cannot speak NaiveProxy, which is the split that was
   removed.
-- The core is **73,432,802 B** for arm64, against roughly 56 MB for a CGO-free build
+- The core is **43,075,954 B** for arm64, against roughly 56 MB for a CGO-free build
   that excludes Naive and MASQUE. The trimmed registry gave back about 2.7 MB of
   that; the rest is the capabilities themselves, which are the point of the
   product.
@@ -643,7 +662,7 @@ chmod +x sing-box-darwin-arm64
 ./sing-box-darwin-arm64 version
 #   sing-box version 1.15.0-jiejie-masquerade.6
 #   Environment: go1.25.5 darwin/arm64
-#   Tags: with_gvisor,with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+#   Tags: with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
 #   CGO: enabled
 
 ./sing-box-darwin-arm64 check  -c config.json
@@ -916,7 +935,7 @@ Never reset or force-push. After every sync, re-run the full verification set
 above, and in particular re-check:
 
 - the three registries are still mutually exclusive;
-- `with_gvisor` is still what gates the Darwin TUN files in `sing-tun`;
+- `with_gvisor` is gone, because the tun stack in use (`<unset>` -> Go) does not need it;
 - `with_quic` is still present, because MASQUE's HTTP/3 path needs it even though
   the QUIC outbounds are no longer registered;
 - `local` is still a DNS boot dependency;
