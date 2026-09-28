@@ -154,13 +154,9 @@ func New(options Options) (*Box, error) {
 		return nil, err
 	}
 	var needCacheFile bool
-	var needClashAPI bool
 	var needV2RayAPI bool
 	if experimentalOptions.CacheFile != nil && experimentalOptions.CacheFile.Enabled || options.PlatformLogWriter != nil {
 		needCacheFile = true
-	}
-	if experimentalOptions.ClashAPI != nil {
-		needClashAPI = true
 	}
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
@@ -179,7 +175,7 @@ func New(options Options) (*Box, error) {
 	logFactory, err := log.New(log.Options{
 		Context:        ctx,
 		Options:        common.PtrValueOrDefault(options.Log),
-		Observable:     needClashAPI && experimentalOptions.ClashAPI.ExternalController != "",
+		Observable:     needAPIService,
 		DefaultWriter:  defaultLogWriter,
 		BaseTime:       createdAt,
 		PlatformWriter: options.PlatformLogWriter,
@@ -245,16 +241,19 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
 	}
-	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
+	// The traffic manager and the routing-mode manager are created for the Native
+	// API, which subscribes to traffic and drives SetClashMode. The Clash API used
+	// to be a second reason to create them; it no longer exists.
+	if needAPIService || options.PlatformLogWriter != nil {
 		trafficManager := trafficcontrol.NewManager()
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)
 		internalServices = append(internalServices, trafficManager)
-		var clashDefaultMode string
-		if experimentalOptions.ClashAPI != nil {
-			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
-		}
-		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
+		// The Native API is the only control plane, and it manages the routing mode
+		// through this manager. The default mode is derived from the route rules
+		// themselves (CalculateModeList) rather than from a now-removed Clash API
+		// option, so an operator sets it by defining rules, not by config.
+		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), "", clashmode.CalculateModeList(options.Options))
 		service.MustRegisterPtr(ctx, clashMode)
 		internalServices = append(internalServices, clashMode)
 	}
@@ -429,13 +428,6 @@ func New(options Options) (*Box, error) {
 		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
 		internalServices = append(internalServices, cacheFile)
-	}
-	if needClashAPI {
-		clashServer, err := experimental.NewClashServer(ctx, logFactory.(log.ObservableFactory), common.PtrValueOrDefault(experimentalOptions.ClashAPI))
-		if err != nil {
-			return nil, E.Cause(err, "create clash-server")
-		}
-		internalServices = append(internalServices, clashServer)
 	}
 	if needV2RayAPI {
 		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
