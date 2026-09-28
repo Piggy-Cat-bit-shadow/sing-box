@@ -6,12 +6,12 @@ name: macOS arm64
 #
 # There is exactly ONE macOS core. It contains the NaiveProxy outbound (Cronet),
 # the MASQUE transport, the full client protocol set, TUN, the native API and the
-# Clash compatibility API, because those are the capabilities the product exists
+# Native API, because those are the capabilities the product exists
 # for. There is no lite/naive split, no darwin/amd64 build, and therefore no
 # matrix: a matrix over profiles that are not products is just extra runner time.
 #
 # The binary is built EXACTLY ONCE. Version, architecture, tag agreement, runtime
-# smoke, headless smoke, the product registry/capability audit, the LXD CLI probe,
+# smoke, headless smoke, and the product registry/capability audit all read the
 # SHA-256, BUILD-INFO and the upload all read the same
 # `dist/sing-box-darwin-arm64`. The previous design rebuilt the shipped core inside
 # the package job, which meant the artifact was never the file that had been
@@ -136,7 +136,7 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=1 go test -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 25m \
             ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
-            ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashapi
+            ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashmode
           echo "PASS: unit tests under the macOS tags"
 
       - name: build macOS core
@@ -187,12 +187,6 @@ jobs:
           echo "PASS: arm64, version, tags and CGO all agree with release/"
 
 
-      - name: runtime smoke test (Clash API, process lifecycle)
-        run: |
-          set -euo pipefail
-          ./scripts/ci/check-macos-client-runtime.sh "$BINARY" dist/runtime
-          echo "PASS: runtime smoke"
-
       - name: headless smoke test (native Web API, no GUI)
         run: |
           set -euo pipefail
@@ -203,8 +197,8 @@ jobs:
         # ONE `go tool nm` over the SHIPPED binary, covering everything a name cannot
         # prove: excluded packages, included packages, the registry role split, the
         # Naive real-vs-stub distinction, the exact Cronet constructor, gVisor, the
-        # MASQUE client/server split and the shared transport plane, Hysteria2, TUIC,
-        # the Clash API, TUN and the LXD daemon package.
+        # MASQUE client/server split and the shared transport plane, TUN, and the
+        # ABSENCE of the removed Clash API and LXD daemon packages.
         #
         # It also runs `sing-box check` against the real client fixture and
         # example-config.json, which is where the standalone `config check` step used
@@ -213,118 +207,14 @@ jobs:
         #
         # The former `product capability verification` step ran a SECOND `go tool nm`
         # over the same binary to assert a mostly-overlapping set. Its unique
-        # assertions (exact `cronet-go.NewNaiveClient`, gVisor linkage, the LXD daemon
-        # package) were merged into the script rather than dropped; the binary's symbol
+        # assertions (exact `cronet-go.NewNaiveClient`, gVisor linkage) were merged into
+        # the script rather than dropped; the binary's symbol
         # table is now read once.
         run: |
           set -euo pipefail
           ./scripts/ci/audit-macos-client-registry.sh "$BINARY"
           echo "PASS: product registry and capability audit"
 
-
-      - name: LXD daemon capability verification
-        # The launcher decides whether a core supports daemon mode by running
-        # `<core> lxd --help` and looking for --state-dir. This reproduces exactly that
-        # probe against the SHIPPED binary, so a core whose lxd command is missing or
-        # whose flags were renamed fails here rather than in the launcher UI.
-        #
-        # It also asserts the dependency graph, which is what proves the daemon is
-        # REALLY linked rather than merely referenced: a `lxd` command that shelled out
-        # to something else, or a stub, would not put the package in the graph.
-        run: |
-          set -euo pipefail
-
-          # A. the command runs
-          ./"$BINARY" lxd --help > /tmp/lxd-help.txt 2>&1 || {
-            echo "FAIL: 'sing-box lxd --help' exited non-zero" >&2
-            cat /tmp/lxd-help.txt >&2
-            exit 1
-          }
-          echo "PASS: 'sing-box lxd --help' exits 0"
-
-          # B. the launcher probe flag is present
-          grep -qF -- "--state-dir" /tmp/lxd-help.txt || {
-            echo "FAIL: 'lxd --help' does not advertise --state-dir, which is the flag" >&2
-            echo "      the launcher greps for; it would report no daemon support" >&2
-            exit 1
-          }
-          echo "PASS: --state-dir is advertised"
-
-          # C. the service surface is present
-          grep -qF -- "--service" /tmp/lxd-help.txt || {
-            echo "FAIL: 'lxd --help' does not advertise --service" >&2
-            exit 1
-          }
-          echo "PASS: --service is advertised"
-
-          # D. no unknown-command failure
-          if grep -qF "unknown command" /tmp/lxd-help.txt; then
-            echo "FAIL: 'lxd --help' reports an unknown command" >&2
-            cat /tmp/lxd-help.txt >&2
-            exit 1
-          fi
-          echo "PASS: lxd is a real command, not an unknown one"
-
-          # E. the client-management surface the installer drives
-          ./"$BINARY" lxd client --help > /dev/null 2>&1 || {
-            echo "FAIL: 'lxd client --help' exited non-zero" >&2; exit 1
-          }
-          ./"$BINARY" lxd client add --help > /dev/null 2>&1 || {
-            echo "FAIL: 'lxd client add --help' exited non-zero" >&2; exit 1
-          }
-          echo "PASS: lxd client add/list/remove are reachable"
-
-          # F. the dependency graph contains the daemon package
-          TAGS="$(cat "$TAGS_FILE")"
-          if ! CGO_ENABLED=1 go list -tags "$TAGS" -deps ./cmd/sing-box \
-               | grep -qx 'github.com/sagernet/sing-box/lxd'; then
-            echo "FAIL: github.com/sagernet/sing-box/lxd is not in the production" >&2
-            echo "      dependency graph, so the daemon is not really linked" >&2
-            exit 1
-          fi
-          echo "PASS: github.com/sagernet/sing-box/lxd is in the dependency graph"
-
-          # G. the COMMAND RPCs are enabled, not just the daemon.
-          #
-          # Separated from the checks above on purpose. Everything up to here proves
-          # the lxd daemon is linked; none of it proves the core can answer the RPCs
-          # the launcher's proxy list calls. Those are gated by with_lx_command, a
-          # DIFFERENT tag, and the omission of exactly that tag is what once shipped
-          # a binary which advertised a daemon and answered
-          # "unknown method GetGroups". Assert the tag is on the artifact.
-          TAGS="$(cat "$TAGS_FILE")"
-          for required in with_lxd with_lx_command; do
-            if ! echo "$TAGS" | tr ',' '\n' | grep -qx "$required"; then
-              echo "FAIL: $required is missing from the client build tags." >&2
-              echo "      with_lxd alone does not enable the command RPCs, so this" >&2
-              echo "      binary cannot list proxies in daemon mode." >&2
-              exit 1
-            fi
-          done
-          echo "PASS: with_lxd and with_lx_command are both enabled"
-
-      - name: JiejieBox daemon RPC contract
-        # Compares this repo's proto and generated server against the launcher's OWN
-        # generated client. This is the check that sees the drift the unit tests
-        # cannot: they compile against this proto and therefore agree with it by
-        # definition, while the launcher is generated from a pinned upstream revision.
-        #
-        # It fails if a method the launcher calls is not declared here, is declared
-        # but not registered by the server, or if the macOS profile stops enabling the
-        # real implementations. It also asserts the Server Minimal profile stays
-        # uncontaminated.
-        run: ./scripts/ci/check-jiejie-daemon-rpc-contract.sh
-
-      - name: command RPC smoke test on the shipped binary
-        # The checks above inspect the source and the tags. This one starts the ACTUAL
-        # binary as a daemon on a real control channel and calls the RPCs through this
-        # repo's generated client, so an artifact problem cannot hide behind a passing
-        # source-level test.
-        #
-        # GetGroups must be RECOGNISED. FailedPrecondition is an accepted outcome (the
-        # handler ran and refused because no config is loaded); Unimplemented and
-        # "unknown method" are not.
-        run: ./scripts/ci/smoke-jiejie-daemon-rpc.sh ./"$BINARY"
 
       - name: write BUILD-INFO and SHA256
         run: |

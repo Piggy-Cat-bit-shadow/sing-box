@@ -4,11 +4,11 @@
 # Usage: check-macos-client-headless.sh [binary] [workdir]
 #
 # This is the control-plane counterpart to check-macos-client-runtime.sh. That
-# script proves the Clash compatibility API works; this one proves the NATIVE
+# This script proves the NATIVE
 # management plane works, which is what the Web Dashboard and a headless
 # deployment depend on.
 #
-# Unlike the runtime smoke test, this one is deliberately self-contained: it
+# It is deliberately self-contained: it
 # builds its own minimal configuration rather than deriving it from the shared
 # fixture, because the native `api` service is a control-plane concern and
 # mixing it into the data-path fixture would make both harder to reason about.
@@ -24,7 +24,6 @@
 #   - URLTest is accepted
 #   - SubscribeStatus, SubscribeLog, SubscribeConnections, SubscribeOutbounds stream
 #   - CloseAllConnections and ClearLogs are accepted
-#   - the Clash compatibility API still works in the same process
 #   - SIGTERM shuts the process down cleanly
 #   - no panic in the log
 #
@@ -51,7 +50,6 @@ fi
 mkdir -p "$workdir"
 
 api_port=19690
-clash_port=19691
 mixed_port=19680
 
 config="$workdir/headless.json"
@@ -71,9 +69,6 @@ cat > "$config" <<JSON
       "dashboard": {"enabled": true, "path": "$dashboard_dir"}
     }
   ],
-  "experimental": {
-    "clash_api": {"external_controller": "127.0.0.1:$clash_port", "default_mode": "rule"}
-  },
   "inbounds": [
     {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $mixed_port}
   ],
@@ -115,8 +110,7 @@ for _ in $(seq 1 200); do
   if curl -sS -m 2 -o /dev/null -X POST \
        -H "Content-Type: application/grpc-web+proto" \
        --data-binary @/dev/null \
-       "http://127.0.0.1:$api_port/daemon.StartedService/GetVersion" 2>/dev/null \
-     && curl -sS -m 2 -o /dev/null "http://127.0.0.1:$clash_port/version" 2>/dev/null; then
+         "http://127.0.0.1:$api_port/daemon.StartedService/GetVersion" 2>/dev/null; then
     ready=1
     break
   fi
@@ -128,17 +122,16 @@ if [ "$ready" -ne 1 ]; then
   cat "$workdir/sing-box.log" >&2
   exit 1
 fi
-echo "PASS: native api ($api_port) and clash api ($clash_port) both reachable"
+echo "PASS: native api ($api_port) reachable"
 
 # The gRPC-Web assertions run in Python: hand-rolling length-prefixed protobuf
 # frames in shell is unreadable and easy to get subtly wrong, and Python 3 is
 # guaranteed present on macOS runners.
-API_PORT="$api_port" CLASH_PORT="$clash_port" MIXED_PORT="$mixed_port" \
+API_PORT="$api_port" MIXED_PORT="$mixed_port" \
 python3 - "$binary" "$dashboard_dir" <<'PY'
 import json, os, signal, struct, subprocess, sys, threading, time, urllib.request
 
 api = int(os.environ["API_PORT"])
-clash = int(os.environ["CLASH_PORT"])
 mixed = int(os.environ["MIXED_PORT"])
 binary, dashboard_dir = sys.argv[1], sys.argv[2]
 
@@ -315,23 +308,6 @@ check(ok_call("daemon.StartedService/CloseAllConnections")[0],
 check(ok_call("daemon.StartedService/ClearLogs")[0], "ClearLogs is accepted")
 check(ok_call("daemon.StartedService/SetClashMode", s1(3, "Global"))[0],
       "SetClashMode is accepted")
-
-# --- clash compatibility in the same process ------------------------------
-try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{clash}/version", timeout=5) as r:
-        cv = json.load(r)
-    check(isinstance(cv.get("version"), str) and cv["version"],
-          "the Clash compatibility API answers in the same process",
-          cv.get("version"))
-except Exception as e:
-    check(False, "the Clash compatibility API answers in the same process", str(e))
-
-try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{clash}/proxies", timeout=5) as r:
-        p = json.load(r)["proxies"]
-    check("select" in p, "Clash /proxies reports the selector", f"keys={sorted(p)}")
-except Exception as e:
-    check(False, "Clash /proxies reports the selector", str(e))
 
 # --- data plane still binds ------------------------------------------------
 try:

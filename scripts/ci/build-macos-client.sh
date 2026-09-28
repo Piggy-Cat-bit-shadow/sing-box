@@ -48,7 +48,9 @@ tags="$(cat "$tags_file")"
 # The product requirement, asserted rather than assumed. A tag-file edit that
 # dropped the Naive outbound would still produce a working binary, so nothing else
 # in the pipeline would notice that the shipped core lost a headline capability.
-for required in with_gvisor with_quic with_utls with_clash_api with_naive_outbound with_lxd jiejie_client_macos; do
+# with_gvisor is required even though no Go file in THIS repo mentions it: the TUN
+# userspace stack lives in sing-tun and is selected by this tag.
+for required in with_gvisor with_quic with_utls with_naive_outbound jiejie_client_macos; do
   if ! grep -q "$required" <<<"$tags"; then
     echo "$tags_file is missing $required; the macOS core would lose a required capability" >&2
     exit 2

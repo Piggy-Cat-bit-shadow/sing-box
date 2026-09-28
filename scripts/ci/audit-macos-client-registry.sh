@@ -313,7 +313,6 @@ included_packages=(
   "dns/transport/hosts"
   "dns/transport/local"
   "dns/transport/quic"
-  "experimental/clashapi"
 )
 
 echo ""
@@ -491,17 +490,26 @@ else
 fi
 
 echo ""
-echo "== product capability: LXD daemon package =="
+echo "== removed feature: LXD daemon package must be ABSENT =="
 #
-# The launcher decides whether a core supports daemon mode by running
-# `<core> lxd --help` and grepping for --state-dir. That runtime probe lives in its own
-# CI step; this is the cheaper static half, proving the package is linked at all, so a
-# failure points at linkage rather than at argument parsing.
+# The LXD daemon and the `sing-box lxd` subcommand were removed from this fork, so
+# the package must not be linked at all. This is a negative assertion: it fails if
+# the package comes back, which is what makes the removal a property of the build
+# rather than a one-time edit.
 if grep -qF "sing-box/lxd." "$nm_out"; then
-  echo "PASS: the LXD daemon package is linked"
-else
-  echo "FAIL: sing-box/lxd. has no symbols; the daemon subcommand cannot exist" >&2
+  echo "FAIL: sing-box/lxd. is linked; the LXD daemon was removed from this fork" >&2
   fail=1
+else
+  echo "PASS: the LXD daemon package is absent"
+fi
+
+echo ""
+echo "== removed feature: Clash API must be ABSENT =="
+if grep -qF "sing-box/experimental/clashapi." "$nm_out"; then
+  echo "FAIL: experimental/clashapi is linked; the Clash API was removed from this fork" >&2
+  fail=1
+else
+  echo "PASS: the Clash API package is absent"
 fi
 
 echo ""
