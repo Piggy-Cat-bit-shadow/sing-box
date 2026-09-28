@@ -2143,16 +2143,3 @@ func (s *StartedService) readOutbounds() *OutboundList {
 	}
 	return &list
 }
-
-// unimplemented is the single refusal used by the JiejieBox command surface for
-// methods this build does not provide. It lives in the untagged file because both
-// the with_lx_command implementations and the !with_lx_command stubs return it.
-//
-// codes.Unimplemented is not an arbitrary choice: singbox-launcher's capability
-// probe (core/daemon_rpc_compat.go) classifies exactly this code as "the method is
-// not in this build" and treats any other status as "the method exists and rejected
-// the request". A plain errors.New or codes.Unknown would be misread as the latter,
-// and the UI would offer a control the daemon cannot honour.
-func unimplemented(method string) error {
-	return status.Error(codes.Unimplemented, method+" is not included in this build, rebuild with -tags with_lx_command")
-}

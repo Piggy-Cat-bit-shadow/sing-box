@@ -11,9 +11,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// lx: SPEC 103 — a gRPC handler runs in its own goroutine, so a panic there
-// takes the whole daemon down with the stack in a stderr a Windows service
-// does not have. The recover interceptors log it and answer codes.Internal.
+// A gRPC handler runs in its own goroutine, so a panic there takes the whole
+// daemon down -- and with it the Native API the dashboard depends on, leaving no
+// way to see why. These interceptors log the panic with its stack and answer
+// codes.Internal instead, so one bad request cannot take the control plane down
+// and the failure is visible in the log stream.
+//
+// They are generic control-plane infrastructure, not feature-specific: every
+// build that serves the Native API installs them, and daemon/server.go chains
+// them ahead of the auth interceptors.
 
 func unaryRecoverInterceptor(ctx context.Context, request any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (response any, err error) {
 	defer func() {
