@@ -151,12 +151,8 @@ func (s *StartedService) URLTestOutbound(ctx context.Context, request *URLTestOu
 		return &URLTestOutboundResponse{Error: "outbound or endpoint not found: " + tag}, nil
 	}
 
-	testCtx := ctx
-	if request.Timeout > 0 {
-		var cancel context.CancelFunc
-		testCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Timeout)*time.Millisecond)
-		defer cancel()
-	}
+	testCtx, cancelTest := urlTestContext(ctx, request.Timeout)
+	defer cancelTest()
 
 	// An empty link means "use the default"; urltest.URLTest substitutes
 	// https://www.gstatic.com/generate_204 itself (common/urltest/urltest.go:102).
@@ -270,4 +266,24 @@ func (s *StartedService) SetEndpointEnabled(ctx context.Context, request *SetEnd
 
 func (s *StartedService) SubscribeDNSQueries(request *SubscribeDNSQueriesRequest, server grpc.ServerStreamingServer[DnsQueryEvent]) error {
 	return unimplemented("SubscribeDNSQueries")
+}
+
+// urlTestContext derives the context a single-node URL test runs under.
+//
+// It is a named function rather than an inline WithTimeout so the relationship it
+// encodes is directly testable: the request timeout is a CHILD deadline layered on
+// top of the caller's context, never a replacement for it. A client that cancels —
+// or simply disconnects — must always be able to abort an in-flight test, however
+// long a timeout the request asked for.
+//
+// Taking the call context as a parameter is deliberate. The failure mode this
+// guards against is the handler reaching for a longer-lived context (the service
+// context, or context.Background()) instead of the one it was given, which would
+// make a test outlive its caller; with the context as an explicit argument that
+// substitution is a visible change at the call site rather than a subtle one.
+func urlTestContext(callContext context.Context, timeoutMillis uint32) (context.Context, context.CancelFunc) {
+	if timeoutMillis > 0 {
+		return context.WithTimeout(callContext, time.Duration(timeoutMillis)*time.Millisecond)
+	}
+	return context.WithCancel(callContext)
 }
