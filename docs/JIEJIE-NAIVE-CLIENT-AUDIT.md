@@ -274,6 +274,77 @@ measurably ahead on a high-BDP path, it stays. Run without a server it reports
 
 ---
 
+## 3b. SERVER-side HTTP/2 windows (Native Naive inbound): ceilings, not allocations
+
+The production fixture `release/jiejie-production-topology.json` sets the Native Naive
+inbound (`inbounds[3]`, tag `naive-in`) to:
+
+| Option | Value |
+|---|---|
+| `connection_receive_window` | `33554432` (32 MiB) |
+| `stream_receive_window` | `8388608` (8 MiB) |
+
+These are applied in `protocol/naive/inbound.go` `http2Server()` and validated by
+`validateHTTP2Options`.
+
+### Both windows are flow-control CEILINGS
+
+Setting 32 MiB does **not** allocate 32 MiB. The authoritative evidence is in
+`golang.org/x/net v0.57.0`:
+
+- `http2/flow.go` — `inflow` is `struct { avail, unsent int32 }`. Two integers; there is
+  no backing buffer anywhere in the type.
+- `http2/server.go` — the connection starts at `initialWindowSize`, not at the
+  configured value, and the difference is granted as additional *tokens*:
+
+  ```go
+  sc.flow.add(initialWindowSize)
+  sc.inflow.init(initialWindowSize)
+  // Each connection starts with initialWindowSize inflow tokens.
+  // If a higher value is configured, we add more tokens.
+  if diff := conf.MaxUploadBufferPerConnection - initialWindowSize; diff > 0 {
+      sc.sendWindowUpdate(nil, int(diff))
+  }
+  ```
+
+- Body bytes are buffered only as DATA actually arrives and only if
+  `takeInflows(&sc.inflow, &st.inflow, f.Length)` succeeds; the buffer is a `dataBuffer`
+  of pooled chunks whose largest size class is 16 KiB, growing on demand. Exceeding the
+  window is a protocol error, not an overrun.
+
+**Correction to a previous claim:** an earlier note in this audit described the large
+window as a per-connection allocation. That was wrong, and the browser-side section
+above already states the opposite for Chromium. Both sides are ceilings.
+
+### What is genuinely worth attention
+
+The exposure is real but it is the **connection** window, not the stream window, and it
+is the opposite of the naive intuition:
+
+1. **Per-connection buffered body can reach the connection window (32 MiB).** Once DATA
+   arrives and the handler (the tunnel) stalls, real `dataBuffer` bytes can accumulate up
+   to `connection_receive_window` — and the connection ceiling, not the 8 MiB stream
+   ceiling, is the binding term. Lowering `connection_receive_window` is therefore the
+   single highest-leverage dial for the 1 GiB memory target. **NOT MEASURED:** no
+   benchmark or soak has established the actual steady-state figure on the production
+   path.
+2. **Stream concurrency IS bounded.** `max_concurrent_streams` is unset, so x/net applies
+   `defaultMaxStreams = 250` (`http2/server.go`). A client cannot open unlimited streams.
+3. **No connection-count ceiling on this inbound.** The `unauthenticated_limits`
+   (`max_concurrent_per_ip = 8`) in the fixture apply to `inbounds[0]`/`[1]`, **not** to
+   the naive inbound, which has none. Connection count is bounded only by OS file
+   descriptors.
+4. **`IdleTimeout` is unset**, so the http2 layer never reaps idle connections.
+5. **`ReadIdleTimeout` is unset**, so no health-check ping is sent and dead peers are not
+   reaped by ping.
+6. **`WriteByteTimeout` is unset**, so a peer that stops reading can block the write path
+   indefinitely. Control-frame flooding is still bounded by x/net's
+   `maxQueuedControlFrames = 10000`.
+
+Items 3-6 are **observations, not changes**: none of them is touched by this work, and
+changing any of them would alter production behaviour and therefore needs its own
+measurement and its own decision.
+
 ## 4. Naive QUIC windows and congestion control
 
 `quic_congestion_control` for the **Cronet** Naive outbound already existed and
