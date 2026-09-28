@@ -86,6 +86,11 @@ trap 'rm -rf "$tmpdir"' EXIT
 # reverse). Layers 3 and 4 run against the STRIPPED artifact and are what actually
 # gate the product; this one explains WHY a failure happened.
 #
+# The rebuild is cheap in practice (about 12s with a warm build cache, measured
+# locally) because only the final link differs from the production build; the audit
+# therefore stays on the CI fast path rather than being moved to deep_checks. It
+# never runs twice: the shipped artifact is built once, and this copy is a link.
+#
 # A symbol name was never strong evidence on its own -- which is why the naive
 # outbound check below tests for the real Cronet constructor AND for the absence of
 # the not-included stub's message, rather than for the type being registered.

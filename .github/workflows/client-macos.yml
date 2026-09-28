@@ -196,7 +196,7 @@ jobs:
       - name: product registry and capability audit
         # ONE `go tool nm` over the SHIPPED binary, covering everything a name cannot
         # prove: excluded packages, included packages, the registry role split, the
-        # Naive real-vs-stub distinction, the exact Cronet constructor, gVisor, the
+        # Naive real-vs-stub distinction, the exact Cronet constructor, the
         # MASQUE client/server split and the shared transport plane, TUN, and the
         # ABSENCE of the removed Clash API and LXD daemon packages.
         #
@@ -207,7 +207,7 @@ jobs:
         #
         # The former `product capability verification` step ran a SECOND `go tool nm`
         # over the same binary to assert a mostly-overlapping set. Its unique
-        # assertions (exact `cronet-go.NewNaiveClient`, gVisor linkage) were merged into
+        # assertions (exact `cronet-go.NewNaiveClient`) were merged into
         # the script rather than dropped; the binary's symbol
         # table is now read once.
         run: |
@@ -261,6 +261,18 @@ jobs:
             echo "| build tags | \`$(cat "$TAGS_FILE")\` |"
             echo "| cgo | enabled |"
             echo "| binary bytes | $(stat -f '%z' "$BINARY") |"
+            # The artifact must be STRIPPED. This is asserted rather than assumed
+            # because the strip flags live in a separate product file, and a tag-file
+            # or script edit could drop them while every functional test still passed
+            # -- the binary would simply be 24 MiB larger than it should be. A DWARF
+            # segment count of zero is the direct evidence.
+            if [ "$(otool -l "$BINARY" | grep -c 'segname __DWARF')" -eq 0 ]; then
+              echo "| stripped | yes (no \`__DWARF\`) |"
+            else
+              echo "| stripped | **NO — __DWARF present** |"
+              echo "FAIL: the shipped macOS binary carries DWARF debug info" >&2
+              exit 1
+            fi
             echo "| sha256 | \`$(cut -d' ' -f1 "$ARTIFACT_DIR/sing-box-darwin-arm64.sha256")\` |"
             echo "| artifact | \`$ARTIFACT_NAME\` |"
             echo "| deep_checks | ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks || 'false' }} |"
