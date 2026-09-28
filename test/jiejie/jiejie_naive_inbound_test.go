@@ -92,6 +92,19 @@ func startNaiveInboundWithNetwork(t *testing.T, network string) uint16 {
 
 func startNaiveInboundWithNetworkAndMasquerade(t *testing.T, network string, withMasquerade bool) *naiveTestEnv {
 	t.Helper()
+	return startNaiveInboundTuned(t, network, withMasquerade, nil)
+}
+
+// startNaiveInboundTuned is the same environment with a hook that can adjust the
+// inbound options before the instance starts.
+//
+// The hook exists so resource-control tests can configure a short, test-only
+// bound instead of sleeping for a production timeout. Without it those tests
+// would either be unusably slow or would have to hand-build an inbound and stop
+// exercising the real configuration path -- which is how the earlier round ended
+// up asserting a timeout that the running code never applied.
+func startNaiveInboundTuned(t *testing.T, network string, withMasquerade bool, tune func(*option.NaiveInboundOptions)) *naiveTestEnv {
+	t.Helper()
 	requireFullNaiveRegistry(t)
 	_, certPem, keyPem := createSelfSignedCertificate(t, "naive.test")
 	port := reserveTCPPort(t)
@@ -130,6 +143,9 @@ func startNaiveInboundWithNetworkAndMasquerade(t *testing.T, network string, wit
 				RewriteHost: true,
 			},
 		}
+	}
+	if tune != nil {
+		tune(inboundOptions)
 	}
 
 	startInstance(t, option.Options{
@@ -594,4 +610,11 @@ func TestJiejieNaiveHTTP2Connect(t *testing.T) {
 	body := naiveReadPaddingFrame(t, response.Body)
 	require.Contains(t, string(body), "origin-ok",
 		"the HTTP/2 tunnel must carry data through padding frames")
+}
+
+// startNaiveInboundWithOptions starts the standard TCP Naive inbound with a hook
+// that can adjust its options before startup.
+func startNaiveInboundWithOptions(t *testing.T, tune func(*option.NaiveInboundOptions)) *naiveTestEnv {
+	t.Helper()
+	return startNaiveInboundTuned(t, "tcp", false, tune)
 }
