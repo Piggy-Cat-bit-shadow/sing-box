@@ -113,6 +113,9 @@ type liveFixture struct {
 	harness *startedServiceGRPCHarness
 	server  *httptest.Server
 	testURL string
+	// cachePath is kept so lifecycle tests can reload the SAME config: a second
+	// instance sharing one relative cache file would fail to initialize.
+	cachePath string
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
@@ -151,7 +154,7 @@ func newLiveFixture(t *testing.T) *liveFixture {
 	), "the fixture config must start; a failure here means the fixture itself is "+
 		"wrong, not that the RPC under test failed")
 
-	return &liveFixture{harness: harness, server: server, testURL: server.URL}
+	return &liveFixture{harness: harness, server: server, testURL: server.URL, cachePath: cachePath}
 }
 
 // getGroups fetches the group snapshot through the real client stub.
