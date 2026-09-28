@@ -328,6 +328,66 @@ H2 / H1 的 tunnel 与 proxy 共 4 个调用点改用传输层 peer（H3 用 QUI
 
 ---
 
+### Residential SOCKS chain optimization
+
+**Problem**
+Every residential TCP flow paid the full SOCKS5 setup on its critical path: TCP
+connect, greeting, method negotiation, username/password authentication, and only
+then the CONNECT. The residential proxy is reached across the public internet, so
+that setup is several round trips before the user's first byte. Separately, the
+copy path used the framework default buffer threshold, which is tuned for a single
+hop rather than for a chained one.
+
+**Root cause**
+The SOCKS5 client handshake was a single function that could not stop between
+authentication and the command, so no authenticated connection could be prepared
+ahead of a request. And the copy threshold was keyed on the INBOUND type only, so an
+outbound had no way to request different copy behaviour.
+
+**Fix**
+Two independent, default-off options on the SOCKS outbound.
+
+- `tcp_preconnect` keeps a small pool of connections that have completed greeting
+  and authentication and are parked BEFORE their command. A flow then issues only
+  its CONNECT. Each pre-authenticated connection is **single-use** and executes
+  exactly one CONNECT; once it has, it is a tunnel and is never reused.
+- `tcp_tuning.early_buffer_growth` lets the route layer grow the copy buffer early
+  for connections through this outbound, via a new optional
+  `adapter.ConnectionCopyTuner` capability.
+
+Supporting refactor in the sing fork: `ClientHandshake5` was split into
+`ClientNegotiate5` and `ClientCommand5`, with the original preserved as their
+composition, so the boundary the pool needs exists without duplicating any protocol
+code.
+
+**Deliberately not done**
+No DNS change, and no remote-DNS mode. The chain still resolves on the VPS with
+`ipv4_only` and hands the SOCKS proxy an **address**, so the residential provider
+never resolves a target domain. Residential UDP stays rejected, and the pool is TCP
+CONNECT only. No profiler, no timing instrumentation, no benchmark requiring a real
+VPS or residential proxy.
+
+**Verification**
+Deterministic tests against an in-process counting SOCKS5 server; no wall-clock
+latency is a pass/fail condition.
+
+- preconnect disabled: 0 background connections; behaviour identical to before
+- `min_idle: 2`: 2 accepted, 2 greeting, 2 auth, **0 CONNECT** - parked, not commanded
+- consume: no re-greet, no re-auth, correct target, not returned to the pool
+- empty pool: cold path immediately, never waits for a refill
+- stale connection: request still succeeds via exactly one cold fallback
+- bad credentials: bounded attempts with backoff, not a tight loop
+- `max_idle` never exceeded; `Close` closes every socket and the loop exits
+- the SOCKS CONNECT carries the IPv4 address, never a domain
+- the production fixture's residential rule ORDER is asserted, and reordering it
+  makes the contract test fail
+
+**Commit** sing `188cb871422b` · sing-box `6910cb1af`
+
+**Status** CLOSED
+
+---
+
 ### Secondary repair records
 
 格式同上（Problem / Root cause / Fix / Verification / Commit / Status），此处压缩为表，
