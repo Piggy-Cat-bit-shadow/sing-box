@@ -176,7 +176,7 @@ absence is **not** a defect and is asserted by the CI dependency audit.
 | TrustTunnel | removed when the fork narrowed to VPS-only |
 | Reality, XHTTP and other Xray-side protocols | not used by this topology |
 | Cronet / Chromium client stack | server build; the Naive OUTBOUND is tag-gated out |
-| Caddy, forwardproxy | replaced by Native Naive |
+| Caddy, forwardproxy | a separate NaiveProxy service on its own path; its presence does NOT remove the sing-box Native Naive inbound, which the production config still declares |
 | DNS over TLS/HTTPS/QUIC, hosts, systemd-resolved | the server resolves through AdGuard Home over UDP |
 
 `github.com/sagernet/cronet-go` is asserted absent from the built binary by CI, and

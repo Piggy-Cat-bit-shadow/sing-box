@@ -541,15 +541,18 @@ func loadTestCertificate(certPath, keyPath string) (*tls.Config, error) {
 //
 // This test used to compare the runtime config against
 // release/jiejie-production-topology.json, on the theory that the two must not
-// drift. That was right while Native Naive was part of the Server Minimal profile.
-// NaiveProxy is now served by Caddy's forwardproxy@udpintcp, so the fixture
-// deliberately contains no naive inbound and none of these rules.
+// drift. It was decoupled for a while, when the fixture was believed to have no
+// naive inbound.
 //
-// The runtime tests still matter - they exercise protocol/naive, which this fork
-// keeps because the full registry and the macOS Naive work depend on it - so the
-// shape they rely on is asserted against the config they actually build. Reading a
-// fixture that no longer describes them would have asserted nothing about production
-// while still failing whenever production changed.
+// That belief was wrong: Native Naive IS part of the Server Minimal profile, because
+// the live production configuration declares a `naive` inbound. The fixture now
+// declares it again, and TestProductionFixtureDeclaresNativeNaive pins it there.
+//
+// This test stays decoupled on purpose. It asserts the rule shape that
+// startSelfHostedWebInstance builds for the self-hosted web path on port 28439,
+// which is a path production no longer runs and which the restored fixture correctly
+// does NOT describe. Reading the fixture here would therefore assert nothing about
+// this code while failing whenever production legitimately changes.
 //
 // Rule ORDER is the security property, and it is asserted as raw JSON: the parsed
 // option.Rule is a wrapped union whose fields differ per action, so unmarshalling
