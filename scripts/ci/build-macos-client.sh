@@ -48,9 +48,23 @@ tags="$(cat "$tags_file")"
 # The product requirement, asserted rather than assumed. A tag-file edit that
 # dropped the Naive outbound would still produce a working binary, so nothing else
 # in the pipeline would notice that the shipped core lost a headline capability.
-# with_gvisor is required even though no Go file in THIS repo mentions it: the TUN
-# userspace stack lives in sing-tun and is selected by this tag.
-for required in with_gvisor with_quic with_utls with_naive_outbound jiejie_client_macos; do
+# with_gvisor is deliberately absent, and that is a measured decision rather than an
+# omission. The production configuration declares a tun inbound with NO `stack` field,
+# and sing-tun resolves unset to "" -> NewGo, the Go userspace stack. The gVisor stack
+# is reached only by stack="gvisor" or stack="mixed", which this deployment never sets.
+# Verified against sing-tun's NewStack with the tag absent:
+#
+#   <unset> -> OK                     go -> OK
+#   gvisor  -> "gVisor is not included in this build, rebuild with -tags with_gvisor"
+#   mixed   -> (same)
+#
+# The unset case -- the one this deployment uses -- behaves identically with and
+# without the tag, so removing it cannot change the stack in use. It removes
+# 4,088,992 bytes (3.89 MiB) of code that is never executed.
+#
+# with_quic IS still required: MASQUE needs HTTP/3, a different consumer of that tag
+# from hysteria2/tuic, both of which are unregistered in this product.
+for required in with_quic with_utls with_naive_outbound jiejie_client_macos; do
   if ! grep -q "$required" <<<"$tags"; then
     echo "$tags_file is missing $required; the macOS core would lose a required capability" >&2
     exit 2
