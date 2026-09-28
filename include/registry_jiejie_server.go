@@ -55,24 +55,36 @@ func Context(ctx context.Context) context.Context {
 
 // InboundRegistry registers the production entry points, and nothing else.
 //
-// # Native Naive IS registered
+// # Native Naive is a production capability of this profile
 //
-// The live production configuration on the VPS still declares a `naive` inbound, so
-// this profile must register it. An earlier revision of this file removed the
-// registration on the reasoning that NaiveProxy had moved to Caddy's
-// forwardproxy@udpintcp; the shippped `.6` binary then rejected the real server
-// configuration with `unknown inbound type: naive`. The inference was wrong: the
-// deployment may run a Caddy Naive service on a separate path, and the existence of
-// Caddy does not make the sing-box Native Naive inbound redundant. The production
-// configuration is the authority for what this profile must contain, not an
-// assumption about which component replaced which.
+// Native Naive is the NaiveProxy server in this deployment. It is NOT a
+// compatibility shim kept so that an old configuration still parses, and Caddy is NOT
+// the current NaiveProxy data plane: TCP/443 reaches this inbound through Nginx
+// Stream by SNI, and Nginx Stream's target is what defines the live backend.
+//
+// protocol/naive is therefore a first-class part of this profile, alongside MASQUE,
+// AnyTLS, ShadowTLS and Shadowsocks 2022 - not a fallback. It carries a substantial
+// body of fork-specific work: UoT v1/v2 over the CONNECT tunnel, HTTP/1.1 and HTTP/2
+// compatibility, padding framing, the Web masquerade, target ACL / SSRF hardening,
+// ALPN isolation between the TCP and QUIC listeners, HTTP/2 resource controls, and
+// connection lifecycle and half-close fixes.
+//
+// An earlier revision of this file removed the registration, reasoning that Caddy's
+// forwardproxy@udpintcp had replaced Native Naive. That assumption did not match the
+// deployment and contradicted the maintained server implementation in this tree; the
+// shipped `.6` binary then rejected the real server configuration with
+// `unknown inbound type: naive`. The lesson is recorded here because it is why this
+// comment names a CAPABILITY rather than a component: a claim about which daemon owns
+// a protocol must be checked against the live configuration, not inferred from a
+// document that described a migration plan.
 //
 // Registering this inbound deliberately does NOT pull in the Naive OUTBOUND or the
 // Chromium/Cronet client stack. protocol/naive/outbound.go and its tests carry their
 // own `with_naive_outbound` build tag, while inbound.go and inbound_conn.go carry
 // none, so a server build compiles only the listener side. This profile does not set
 // that tag, and `go list -deps ./cmd/sing-box` confirms cronet is absent from the
-// link graph.
+// link graph. "Native Naive inbound is required" and "with_naive_outbound" are
+// different statements and must not be conflated.
 //
 // The socks and direct inbounds are deliberately NOT registered. Both previously
 // existed only so the integration tests could use an in-process client, which let
@@ -84,7 +96,7 @@ func InboundRegistry() *inbound.Registry {
 
 	http.RegisterInbound(registry)        // MASQUE over HTTP/2 (behind Nginx Stream) and HTTP/3 (UDP/443)
 	anytls.RegisterInbound(registry)      // AnyTLS, with native fallback to the Nginx web root
-	naive.RegisterInbound(registry)       // Native Naive, required by the live production configuration
+	naive.RegisterInbound(registry)       // Native Naive: the NaiveProxy server for this deployment (Nginx Stream -> here)
 	shadowtls.RegisterInbound(registry)   // ShadowTLS v3; detour targets the ss2022-in inbound
 	shadowsocks.RegisterInbound(registry) // Shadowsocks 2022, the ShadowTLS detour target
 

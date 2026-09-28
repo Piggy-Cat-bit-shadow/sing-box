@@ -64,7 +64,7 @@ macOS deep   ✅  ~418s
 | 类别 | 内容 |
 | --- | --- |
 | MASQUE L4 | HTTP CONNECT、CONNECT-UDP、HTTP/3 主路径、HTTP/2 fallback |
-| 其它 inbound | AnyTLS、ShadowTLS v3、Shadowsocks 2022 |
+| 其它 inbound | **Native Naive**、AnyTLS、ShadowTLS v3、Shadowsocks 2022 |
 | outbound | `direct`、住户 SOCKS5 |
 | DNS | `udp`、`local`（`box.go` 启动依赖） |
 
@@ -72,14 +72,23 @@ macOS deep   ✅  ~418s
 
 | 组件 | 负责 |
 | --- | --- |
-| **Jiejie sing-box Server Core** | 上表内容 |
-| **Caddy** | NaiveProxy（`forwardproxy@udpintcp`，含 UoT v2） |
+| **Jiejie sing-box Server Core** | 上表内容，**含 NaiveProxy 服务端（Native Naive inbound）** |
 | **Xray** | VLESS Reality / Vision / XHTTP |
 
-**Native Naive inbound 属于 Server Minimal**：真实生产配置仍声明 `naive` inbound，
-所以 registry 必须注册它（见 [AUD-P2-002](#aud-p2-002--server-minimal-错误移除生产所需的-native-naive-inbound)）。
-只注册 **inbound**；Naive **outbound** 与 Cronet 客户端栈仍不进入本 profile 的 import graph
-（`protocol/naive/outbound.go` 自带 `with_naive_outbound` tag，本 profile 不设置）。
+**Native Naive 是本 profile 的正式生产能力，不是兼容性补丁。** 它是本部署的
+NaiveProxy 服务端：TCP/443 经 Nginx Stream 按 SNI 送达该 inbound。`protocol/naive`
+承载大量 fork-specific 工作（UoT v1/v2、HTTP/1.1/H2 兼容、padding、Web masquerade、
+target ACL / SSRF hardening、ALPN isolation、H2 资源控制、生命周期与 half-close 修复），
+全部编入本 profile。见 [Native Naive 服务端](docs/JIEJIE-NAIVE-SERVER.md)——该文档明确描述
+其 **without Caddy** 的拓扑。
+
+**Caddy 不是当前 NaiveProxy 数据面。** 历史迁移文档
+[JIEJIE-NAIVE-MIGRATION.md](docs/JIEJIE-NAIVE-MIGRATION.md) 中的 "Caddy" 一律指
+**迁移前的旧后端或回滚目标**，已标记为 HISTORICAL / MIGRATION COMPLETED。
+
+只注册 Naive **inbound**；Naive **outbound** 与 Cronet 客户端栈仍不进入本 profile 的
+import graph（`protocol/naive/outbound.go` 自带 `with_naive_outbound` tag，本 profile 不设置）。
+"需要 Native Naive inbound" 与 "with_naive_outbound" 是两个不同概念。
 MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `masque-*` L3 endpoint。
 
 ### macOS Client
@@ -106,9 +115,9 @@ MASQUE 在本产品中是 **L4 HTTP proxy 模型**（`type: http`），不是 `m
 | 领域 | 为什么存在 | 主要差异 | 文档 |
 | --- | --- | --- | --- |
 | **MASQUE / HTTP** | 本 fork 唯一自研的 L4 数据面，server 与 client 共用实现，只用 registry 区分角色 | client/server endpoint 注册拆分；H3 datagram ingress 去 memcpy；hot path 改 immutable snapshot；CONNECT-UDP 竞态修复 | [性能](docs/JIEJIE-MASQUE-PERFORMANCE.md) · [参考审计](docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md) |
-| **Naive / Cronet** | macOS 客户端核心能力，需与 Caddy 侧实现互通 | 链接真实 Cronet（`cronet-go.NewNaiveClient`）；移除 client 上无用的 server-only H3 listener；新增 opt-in `insecure_concurrency_single_engine`（默认 `false`，**未验证**） | [审计](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) |
+| **Naive / Cronet** | macOS 客户端核心能力，需与服务端 Native Naive 实现互通 | 链接真实 Cronet（`cronet-go.NewNaiveClient`）；移除 client 上无用的 server-only H3 listener；新增 opt-in `insecure_concurrency_single_engine`（默认 `false`，**未验证**）。注意：`protocol/naive` **同时**包含真实的服务端实现（`inbound.go`），不是纯客户端/测试代码 | [审计](docs/JIEJIE-NAIVE-CLIENT-AUDIT.md) · [服务端](docs/JIEJIE-NAIVE-SERVER.md) |
 | **LXD** | JiejieBox 需要持久化 daemon + mTLS 控制面，GUI 退出后 VPN 不能断 | 移植 LXD daemon 能力进 macOS core（`lxd/`、`daemon/`、`cmd/sing-box/cmd_lxd_lx.go`）：`lxd --state-dir/--service`、`lxd client add/list/remove` | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
-| **Server Minimal** | 面向单台 VPS 的最小化构建，registry 须与真实生产配置一致 | `include/registry_jiejie_server.go` 注册 5 个 inbound（含生产所需的 Native Naive）；Naive outbound 不注册 | [服务端](docs/JIEJIE-SERVER.md) |
+| **Server Minimal** | 面向单台 VPS 的最小化构建，registry 须与真实生产配置一致 | `include/registry_jiejie_server.go` 注册 5 个 inbound：HTTP/MASQUE、AnyTLS、**Native Naive**、ShadowTLS v3、SS2022；Naive outbound 不注册 | [服务端](docs/JIEJIE-SERVER.md) |
 | **macOS Client** | 一个内核包含全部客户端能力，不分 lite/naive | 独立 registry；`masque-client` 只注册 client 角色 | [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) |
 | **CI / build** | 每个 CI 分钟都应产生新的故障信息 | 两 workflow、单 job、单 build；fast 只验证 shipping artifact，deep 保留 vet/race/fuzz/reference/reproducibility | [构建 profile](docs/BUILD-PROFILES.md) |
 | **Dependency fork** | 需要 upstream 尚未吸收的 patch | `go.mod` 中 `replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing` | [§8](#8-upstream) |
@@ -152,251 +161,59 @@ panic 未削弱：真实 stable 版本仍会 panic。
 
 ---
 
-### AUD-P2-001 — Native Naive Server over-inclusion  ⚠️ SUPERSEDED
+### AUD-P2-001 — Native Naive incorrectly removed from Server Minimal  ❌ 结论已被推翻
 
-> **此记录的前提已被证伪，结论已作废。** 它假设 Caddy 已完全替代 Native Naive 用法，
-> 而真实生产配置证明该假设错误。保留作为历史审计记录，**不代表当前状态**。
-> 当前状态见 [AUD-P2-002](#aud-p2-002--server-minimal-错误移除生产所需的-native-naive-inbound)。
+> **此审计的结论是错误的，且已被 `f043f6f39` 实际执行、造成生产故障。**
+> 保留此记录是为了留下一份"错误审计"的样本：它展示了错误的拓扑假设如何被
+> 固化成契约测试，进而让 CI 认证一个无法启动的二进制。
+> 当前正确状态见 [AUD-P2-002](#aud-p2-002--server-minimal-错误移除生产所需的-native-naive-inbound)。
 
-**Problem**
-Server Minimal 仍注册并链接已退出生产的 Native Naive inbound，production fixture 也仍
-描述它（`naive-in`、`28438`、`28439` 及 5 条 route rule）。NaiveProxy 已改由 Caddy 提供，
-所以每个生产 binary 都多带一个从不启动的 listener、UoT 数据面与 HTTP/2 masquerade。
+**Problem（当时的主张）**
+Server Minimal 注册并链接了 Native Naive inbound，production fixture 也描述它。
+当时主张 NaiveProxy 已改由 Caddy 提供，因此该 listener、UoT 数据面与 HTTP/2
+masquerade 属于"从不启动的多余组件"。
 
-**Root cause**
-注册与 fixture 都早于"NaiveProxy 迁到 Caddy"这一变化，未同步。属 fork 配置问题，
-非 upstream 代码问题。
+**Root cause（真正的根因）**
+审计依据的是**错误/过期的生产拓扑假设**："Caddy 已取代 Native Naive"。
+
+该假设与真实部署不符，也与本仓库中长期维护的 Native Naive 服务端实现相矛盾——
+`protocol/naive/inbound.go` 是真实的服务端实现，`docs/JIEJIE-NAIVE-SERVER.md`
+明确描述其 **without Caddy** 的拓扑，仓库内还有 52 个专项 Naive 测试文件。
+
+换言之：**审计把一个正在生产使用、且经过大量专项优化的能力，判定成了死代码。**
+
+**Impact**
+发布的 Server Minimal 二进制拒绝真实生产配置：
+
+```
+FATAL decode config: inbounds[5]: unknown inbound type: naive
+```
 
 **Fix**
-从 Server Minimal registry 移除 `protocol/naive` import 与 `naive.RegisterInbound`；
-从 production fixture 移除 naive inbound 及全部相关 route rule（inbounds 6→5，rules 9→4）。
+在 production Server Minimal profile 中恢复 Native Naive 注册；把 Native Naive
+恢复到 production fixture contract；并让 CI 在它再次被移除时失败。
 
-**Not changed**
-`protocol/naive` 源码完整保留（23 个文件）——full registry、客户端测试、macOS Naive
-仍在使用；macOS Cronet Naive outbound 完全不变。
+**关于 −102,400 B 体积结果**
+该测量本身是真实的（like-for-like，`33,870,008 → 33,767,608 B`），但**必须明确**：
 
-**Verification**
-- dependency graph：`protocol/naive` 已不在 619 个包中
-- contract 测试改为断言 **absence**（`TestRegistryOmitsNativeNaive`、
-  `TestProductionFixtureExcludesNativeNaive`），且在源码修改**之前**先失败
-- runtime smoke PASS；pruning audit PASS（23 pruned / 5 required）；CI 全绿
+> 这是一次建立在错误生产拓扑假设上的裁剪实验，
+> **不是有效的生产优化成果。**
 
-**二进制影响（实测，like-for-like）** `33,870,008 → 33,767,608 B`（−102,400 B, −0.30%）。
-**核心收益不是体积**，而是 contract correctness、attack surface 缩小、profile 与真实
-生产职责对齐。0.30% 很小，如实记录。
+当时"核心收益不是体积，而是 contract correctness、attack surface 缩小"的论述
+**方向恰好相反**：移除 Native Naive **破坏**了 production contract，
+使 CI 认证了一个无法启动真实生产的二进制。体积收益 −102,400 B 远不足以抵消该后果
+（恢复成本约 +106,496 B）。
 
-**后续更正（AUD-P2-002）** 本次删除所依据的 production topology 假设是错的：
-fixture 当时被改写为"不含 naive inbound"，于是 CI 反而**认证**了一个无法启动真实
-生产的 binary。体积收益 −102,400 B 无法抵消该后果，已恢复注册并重新增加约
-+106,496 B。此记录中"contract correctness / attack surface 缩小"的收益论述
-**在 Native Naive 属生产必需的前提下不成立**。
+同样不能用"移除 Native Naive 缩小了 attack surface"来论证：它移除的是一个
+**在生产中实际接收 TCP/443 流量的** listener，不是不可达代码。
+
+**Not changed（当时唯一做对的部分）**
+`protocol/naive` 源码未被删除，因此本轮恢复无需重写实现。这一点值得保留：
+**审计结论是错的，但它没有破坏实现本身。**
 
 **Commit** [`f043f6f39`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f043f6f39)
 
-**Status** CLOSED
-
----
-
-<details>
-<summary>Earlier audit records（CONNECT-IP · upstream merge · badhttp/XFF · 注释修正）</summary>
-
-### Naive test decoupling
-
-**Problem**
-`TestJiejieNaiveSelfHostedWebRuleShapeMatchesProduction` 依赖已删除的
-production naive fixture，因此在上面的清理后失败——它断言的 production 形状已不存在。
-
-**Root cause**
-该测试把"runtime 测试用的规则语义"和"production fixture 里存在 naive"绑在了一起。
-前者仍然有价值（`protocol/naive` 仍在 full registry 中），后者已不成立。
-
-**Fix**
-抽取共享 `selfHostedWebRules()`，让 runtime test 与 shape test 验证**同一份规则定义**，
-不再要求 production profile 存在 Naive。规则**顺序**（security 属性）继续断言。
-
-**Verification**
-- 交换 deny / rewrite 顺序 → 测试真实失败并给出原因
-- 整个 jiejie suite 在 production minimal tags 下首次全绿（56.6s）
-- 无测试为满足自身而把 Native Naive 加回生产 registry
-
-**Commit** [`3d873c4f5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/3d873c4f5)
-
-**Status** CLOSED
-
----
-
-### CONNECT-IP target audit（相邻路径完整审计）
-
-**Problem**
-`ecdc966ab` 已修复 target 分类器不接受反斜杠的问题。本轮目标：确认**相邻解析路径**
-没有被同一问题绕过。
-
-**Root cause（历史修复）**
-分类器拒绝 `:` 与 `/`，但不拒绝 `\`，于是 `/masque?target=a\b` 产出 `Domain = "a\b"`。
-实测无 traversal / injection（Go resolver 视为未知主机），属 validation gap 而非可利用逃逸。
-
-**Fix（历史）** `ContainsAny(target, ":/")` → `ContainsAny(target, ":/\\")`。
-
-**Verification（本轮）**
-完整链路：request → `EscapedPath` → regex 捕获（仍是转义态）→ **一次** `PathUnescape`
-→ 分类器 → `Scope.Domain` → **原样**传入 `dnsRouter.Lookup`。
-
-- raw 与 single-encoded 分隔符 → **拒绝**
-- double/triple-encoded → 接受为**字面 percent 序列**（`a%252Fb` → `a%2Fb`，不含分隔符），
-  实测惰性且正确
-- 只有**一次** `PathUnescape`，下游不再 decode
-- 全链路无 `path.Clean` / `filepath.Clean`（不存在 filesystem 与 URL 语义分歧）
-- `parseAuthority` 23 个对抗输入 → 0 panic
-
-**结果** `NO ADJACENT BUG FOUND`。新增
-`TestTemplateEncodingMatrixIsTheWholeAttackSurface` 与 `TestTemplateNeverDecodesTwice`
-防止未来引入 double decode；注入该缺陷后两者均真实失败，`template.go` 未改动。
-
-**Commits** [`ecdc966ab`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ecdc966ab)（历史修复）、
-[`b3218f340`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b3218f340)（审计回归测试）
-
-**Status** PASS / CLOSED
-
----
-
-### Upstream merge-conflict per-function audit
-
-**Problem**
-历史上多次 upstream merge 都做过人工 conflict resolution，需确认没有覆盖掉 upstream 修复。
-
-**Method** `git show --remerge-diff` 找出真正发生人工 resolution 的文件（而非仅凭 commit
-message 推断），再逐个函数比对 merge-base / upstream / 当前 fork。
-
-**结果** 3 个 upstream merges · **77** 个真实 conflict-resolution 文件（其中 **38** 个在
-priority path）· `common/badhttp`、`transport/http`、`transport/masque` 均完成**完整逐函数**
-比对。
-
-**关键事实** `upstream/testing == merge-base`，即 upstream 自 base 以来**没有任何新 commit**，
-因此不存在"未吸收的 upstream 修复"。
-
-**结论** `Lost upstream fix: NO`
-
-本轮保留的 fork fixes（均为 fork 自己引入，且经 revert 验证）：`common/badhttp` XFF
-hardening、`transport/http` deferred activation（延迟 200 OK 至 target setup 完成）、
-`transport/masque` memcpy removal。
-
-**Status** PASS / CLOSED
-
----
-
-### badhttp / XFF hardening
-
-**Problem**
-MASQUE 与通用 HTTP inbound 曾通过 `badhttp.ForwardedSource` 解析 source，取
-`X-Forwarded-For` 的第一个有效项。任何能连上 listener 的客户端都能借此选择
-`metadata.Source` —— 而它参与 `source_ip_cidr` 路由规则、unauthenticated limiter、
-日志与审计。
-
-**Root cause**
-`ForwardedSource` 被放在默认路径上，而两个部署都没有可校验该 header 的前端
-（Nginx Stream 在 L4 转发、不添加该 header；HTTP/3 直接终结 QUIC）。
-
-**Fix**
-H2 / H1 的 tunnel 与 proxy 共 4 个调用点改用传输层 peer（H3 用 QUIC peer，否则
-`request.RemoteAddr`）。新增 `PeerAddress`；`SourceAddress` 改为返回 peer；
-`ForwardedSource` 保留并标记 deprecated。
-
-**Verification**
-- revert 该修改 → 伪造地址重新进入 `metadata.Source`，测试失败
-- 覆盖单条 / 多条 / 畸形列表 / `Forwarded`(RFC 7239) / `X-Real-IP` / 全部同时 /
-  IPv6 值
-- 本轮另确认：live MASQUE path（`transport/http/server_h2.go`）**不依赖**
-  `badhttp.SourceAddress`
-
-**Commit** [`a3cb8abf5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a3cb8abf5)
-
-**Status** CLOSED
-
----
-
-### Naive inbound 注释修正
-
-**Problem**
-`protocol/naive/inbound.go` 的安全说明中有一句支撑性事实错误：
-声称 `badhttp.SourceAddress` "has no other caller in this repository"。实际有 6 个。
-
-**Root cause**
-该注释在思考 merge conflict 时写下，未复查。
-
-**Fix**
-仅修正注释：列明真实 callers，并说明该 helper 已被本 fork 硬化（同样不读 XFF），
-且 Naive 直接读 `RemoteAddr` 的真正原因（需要在 hijack 之前取地址）。
-**安全决策本身未变。**
-
-**Verification** 逐个检查全部非测试调用点；与 `upstream/testing` 比对 helper 语义。
-
-**Commit** [`b3a1f53db`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b3a1f53db)
-
-**Status** CLOSED
-
----
-
-</details>
-
----
-
-### Residential SOCKS chain optimization
-
-**Problem**
-Every residential TCP flow paid the full SOCKS5 setup on its critical path: TCP
-connect, greeting, method negotiation, username/password authentication, and only
-then the CONNECT. The residential proxy is reached across the public internet, so
-that setup is several round trips before the user's first byte. Separately, the
-copy path used the framework default buffer threshold, which is tuned for a single
-hop rather than for a chained one.
-
-**Root cause**
-The SOCKS5 client handshake was a single function that could not stop between
-authentication and the command, so no authenticated connection could be prepared
-ahead of a request. And the copy threshold was keyed on the INBOUND type only, so an
-outbound had no way to request different copy behaviour.
-
-**Fix**
-Two independent, default-off options on the SOCKS outbound.
-
-- `tcp_preconnect` keeps a small pool of connections that have completed greeting
-  and authentication and are parked BEFORE their command. A flow then issues only
-  its CONNECT. Each pre-authenticated connection is **single-use** and executes
-  exactly one CONNECT; once it has, it is a tunnel and is never reused.
-- `tcp_tuning.early_buffer_growth` lets the route layer grow the copy buffer early
-  for connections through this outbound, via a new optional
-  `adapter.ConnectionCopyTuner` capability.
-
-Supporting refactor in the sing fork: `ClientHandshake5` was split into
-`ClientNegotiate5` and `ClientCommand5`, with the original preserved as their
-composition, so the boundary the pool needs exists without duplicating any protocol
-code.
-
-**Deliberately not done**
-No DNS change, and no remote-DNS mode. The chain still resolves on the VPS with
-`ipv4_only` and hands the SOCKS proxy an **address**, so the residential provider
-never resolves a target domain. Residential UDP stays rejected, and the pool is TCP
-CONNECT only. No profiler, no timing instrumentation, no benchmark requiring a real
-VPS or residential proxy.
-
-**Verification**
-Deterministic tests against an in-process counting SOCKS5 server; no wall-clock
-latency is a pass/fail condition.
-
-- preconnect disabled: 0 background connections; behaviour identical to before
-- `min_idle: 2`: 2 accepted, 2 greeting, 2 auth, **0 CONNECT** - parked, not commanded
-- consume: no re-greet, no re-auth, correct target, not returned to the pool
-- empty pool: cold path immediately, never waits for a refill
-- stale connection: request still succeeds via exactly one cold fallback
-- bad credentials: bounded attempts with backoff, not a tight loop
-- `max_idle` never exceeded; `Close` closes every socket and the loop exits
-- the SOCKS CONNECT carries the IPv4 address, never a domain
-- the production fixture's residential rule ORDER is asserted, and reordering it
-  makes the contract test fail
-
-**Commit** sing `188cb871422b` · sing-box `6910cb1af`
-
-**Status** CLOSED
+**Status** ❌ REVERSED — 结论错误，已由 AUD-P2-002 恢复
 
 ---
 
@@ -415,13 +232,22 @@ FATAL decode config: inbounds[5]: unknown inbound type: naive
 `release/jiejie-production-topology.json` 被改写为不含 `naive` inbound。
 两者都基于同一个错误推断："Caddy 的 `forwardproxy@udpintcp` 已替代 Native Naive 用法"。
 
-真实生产配置仍在声明 `type: "naive"`。Caddy Naive 与 sing-box Native Naive **并非互斥**：
-部署可以在另一条路径上运行 Caddy Naive 服务，Caddy 的存在不会使 sing-box 的 Native Naive
-inbound 变得多余。
+**该推断与事实不符。当前生产 NaiveProxy 服务端就是 sing-box Native Naive inbound，
+不是 Caddy。** TCP/443 经 Nginx Stream 按 SNI 送达该 inbound；Caddy 不是当前
+NaiveProxy 数据面。这一点有仓库自身证据支持：`protocol/naive/inbound.go` 是真实服务端
+实现，`docs/JIEJIE-NAIVE-SERVER.md` 明确描述 **without Caddy** 的拓扑，
+`docs/JIEJIE-NAIVE-MIGRATION.md` 是一次已完成的迁移（原先正是 Caddy → Native Naive）。
 
 更严重的是，移除时把 contract 测试从"断言存在"倒转为"断言不存在"
 （`TestRegistryOmitsNativeNaive`、`TestProductionFixtureExcludesNativeNaive`），
 于是 CI 无法再发现该缺失，反而**认证**了一个无法启动真实生产的 binary。
+
+**性质澄清**
+本次不是"为了让旧配置能 check 而临时恢复兼容性"。Native Naive 是 Server Minimal
+**正式的生产核心能力**，与 MASQUE、AnyTLS、ShadowTLS、SS2022 同级，且承载大量
+fork-specific 优化（UoT v1/v2、padding、masquerade、target ACL / SSRF hardening、
+ALPN isolation、H2 资源控制、生命周期与 half-close 修复）。本轮**只修 registry 与文档
+描述，未修改、未回退 `protocol/naive` 的任何实现**。
 
 **Impact**
 新二进制无法解析当前生产配置，服务端无法启动。生产配置本身没有错，也不需要修改。
