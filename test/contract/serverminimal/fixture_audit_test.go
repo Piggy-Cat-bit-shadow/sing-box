@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // This file audits the production fixture for dangling references.
@@ -494,4 +496,95 @@ func TestProductionFixtureUsesOnlyRealReceiveWindowOwners(t *testing.T) {
 	if owners == 0 {
 		t.Logf("%s: no inbound pins HTTP/2 flow control; nothing to verify", path)
 	}
+}
+
+// TestProductionResidentialChainOrdering pins the residential chain's routing
+// contract, which is a DNS and privacy invariant rather than a preference.
+//
+// The chain is:
+//
+//	Residential-AnyTLS client
+//	  -> AnyTLS to the VPS
+//	  -> VPS resolves the target with ipv4_only
+//	  -> residential-socks (SOCKS5)
+//	  -> the residential exit reaches the IPv4 target
+//
+// Two properties make that work, and BOTH are order-dependent:
+//
+//  1. Residential UDP is REJECTED. The residential exit is IPv4-only for TCP; a
+//     datagram path would either leak or fail silently.
+//  2. The TCP `resolve` with `strategy: ipv4_only` must come BEFORE the rule that
+//     routes to the SOCKS outbound. A resolve action needs the destination to still
+//     be a DOMAIN, so if the routing rule ran first the SOCKS proxy would receive a
+//     hostname and resolve it itself - moving DNS off the VPS and onto the
+//     residential provider, which is exactly what this design forbids.
+//
+// This test fails if the rules are reordered, if the strategy changes, if the UDP
+// reject is removed, or if the destination outbound changes.
+func TestProductionResidentialChainOrdering(t *testing.T) {
+	fixture, path := loadProductionFixture(t)
+
+	var (
+		udpRejectIndex  = -1
+		resolveIndex    = -1
+		routingIndex    = -1
+		resolveStrategy string
+		routingOutbound string
+	)
+
+	for index, rule := range fixture.Route.Rules {
+		if !containsString(rule.User, "residential") {
+			continue
+		}
+		switch {
+		case rule.Action == "reject" && containsString(rule.Network, "udp"):
+			if udpRejectIndex == -1 {
+				udpRejectIndex = index
+			}
+		case rule.Action == "resolve":
+			if resolveIndex == -1 {
+				resolveIndex = index
+				resolveStrategy = rule.Strategy
+			}
+		case rule.Outbound != "":
+			if routingIndex == -1 {
+				routingIndex = index
+				routingOutbound = rule.Outbound
+			}
+		}
+	}
+
+	require.GreaterOrEqual(t, udpRejectIndex, 0,
+		"%s must reject UDP for the residential user: the residential exit is "+
+			"IPv4 TCP only, and a datagram path would leak or fail silently", path)
+	require.GreaterOrEqual(t, resolveIndex, 0,
+		"%s must resolve the residential destination on the VPS before routing it", path)
+	require.GreaterOrEqual(t, routingIndex, 0,
+		"%s must route the residential user to a SOCKS outbound", path)
+
+	require.Equal(t, "ipv4_only", resolveStrategy,
+		"%s must resolve ipv4_only: the residential exit is IPv4 only, so an AAAA "+
+			"result would produce a connection the exit cannot make", path)
+
+	require.Equal(t, "residential-socks", routingOutbound,
+		"%s must route the residential user through the residential SOCKS outbound", path)
+
+	// The ordering that keeps DNS on the VPS.
+	require.Less(t, resolveIndex, routingIndex,
+		"%s resolves AFTER routing to the SOCKS outbound. A resolve action needs the "+
+			"destination to still be a domain, so this order would hand the SOCKS "+
+			"proxy a hostname and move DNS to the residential provider", path)
+	require.Less(t, udpRejectIndex, routingIndex,
+		"%s must reject residential UDP before it reaches the SOCKS outbound", path)
+}
+
+// containsString is a small helper so this file does not depend on slices.Contains
+// ordering semantics.
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
