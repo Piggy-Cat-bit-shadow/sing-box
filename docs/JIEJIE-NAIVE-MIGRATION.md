@@ -1,10 +1,18 @@
-# Native Naive 迁移与回滚手册（准备稿，未执行）
+# Native Naive 迁移与回滚手册（HISTORICAL — 迁移已完成）
 
-本文准备把生产 Naive 服务端从 **Caddy** 切换为 **sing-box Native Naive**，
-并准备回滚步骤。
-
-> **状态：本文中的任何命令都尚未在生产 VPS 上执行。**
-> 迁移动作需要人工确认后手动执行。本文不是"已经完成"的记录。
+> ## 状态：MIGRATION COMPLETED / 历史迁移记录
+>
+> **本文描述的是"从 Caddy 切换到 sing-box Native Naive"的迁移过程，该迁移已经完成。**
+> 本文件现在是历史记录与回滚预案，**不再是当前状态的描述**。
+>
+> 当前生产 NaiveProxy 服务端就是 **sing-box Native Naive inbound**（见
+> [JIEJIE-NAIVE-SERVER.md](JIEJIE-NAIVE-SERVER.md)，其中明确写明 "without Caddy"）。
+> 本文中出现的 "Caddy" 一律指**迁移前的旧后端**或**回滚目标**，
+> **不代表当前数据面**。
+>
+> 请勿把本文的 "切换前指向 Caddy 的 Naive 后端" 误读为 "现在仍由 Caddy 负责"。
+> 这一误读曾导致 Server Minimal 错误移除 Native Naive 注册（见 README 的
+> AUD-P2-002），使发布的二进制拒绝真实生产配置。
 
 ---
 

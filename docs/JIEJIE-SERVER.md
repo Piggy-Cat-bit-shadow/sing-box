@@ -489,21 +489,29 @@ config that references a removed type now fails at `sing-box check` with
 import already exists upstream: `transport/v2ray.NewQUICServer` returns
 `os.ErrInvalid` when no constructor is registered.
 
-**Native Naive IS registered in this profile.** The live production configuration
-on the VPS still declares a `naive` inbound, so this profile registers it and a
-config naming `type: naive` passes `sing-box check`.
+**Native Naive is a production inbound of this profile.** It is the NaiveProxy
+server in this deployment, reached at TCP/443 through Nginx Stream by SNI, and it is
+registered here as a first-class capability alongside MASQUE, AnyTLS, ShadowTLS and
+Shadowsocks 2022. See [JIEJIE-NAIVE-SERVER.md](JIEJIE-NAIVE-SERVER.md) for the
+implementation this profile runs, which is documented as working **without Caddy**.
 
-An earlier revision excluded it, on the inference that NaiveProxy had moved to
-Caddy's `forwardproxy@udpintcp`. That inference was wrong, and the shipped `.6`
-binary rejected the real server configuration at startup with
-`unknown inbound type: naive`. A deployment may run a Caddy Naive service on a
-separate path; the existence of Caddy does not make the sing-box Native Naive
-inbound redundant. The production configuration is the authority for what this
-profile contains.
+This is not a compatibility shim for an old configuration. `protocol/naive` carries
+substantial fork-specific work - UoT v1/v2 inside the CONNECT tunnel, HTTP/1.1 and
+HTTP/2 compatibility, padding framing, the Web masquerade, target ACL / SSRF
+hardening, ALPN isolation, HTTP/2 resource controls, and connection lifecycle and
+half-close fixes - and all of it is compiled into this profile.
+
+An earlier revision EXCLUDED the inbound, on the inference that Caddy's
+`forwardproxy@udpintcp` had replaced Native Naive. That inference did not match the
+deployment and contradicted the maintained implementation in this tree; the shipped
+`.6` binary rejected the real server configuration at startup with
+`unknown inbound type: naive`. Caddy is not the current NaiveProxy data plane.
 
 Only the INBOUND is registered. `protocol/naive/outbound.go` carries its own
 `with_naive_outbound` build tag, which this profile does not set, so the Naive
 outbound and the Chromium/Cronet client stack stay out of the import graph.
+"Native Naive inbound is required" and "with_naive_outbound" are different
+statements.
 
 
 Measured artifact sizes (Linux amd64, `-trimpath`, `-ldflags "-s -w"`, no UPX,
