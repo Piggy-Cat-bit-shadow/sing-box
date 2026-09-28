@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
+
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -333,9 +334,16 @@ func TestURLTestOutboundReportsUnknownTagInPayload(t *testing.T) {
 func TestURLTestOutboundHonoursCallerCancellation(t *testing.T) {
 	fixture := newLiveFixture(t)
 
-	// A short-but-real timeout, applied as a child deadline on the call ctx.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
+	// The ctx is ALREADY CANCELLED before the call is made, so the outcome does not
+	// depend on beating a deadline against a fast loopback server. An earlier
+	// version used a 1ms timeout and was flaky: the local round trip sometimes
+	// finished first, which is a property of the test machine, not of the code.
+	//
+	// Cancelling up front is also the stronger assertion. It proves the handler
+	// consults the CALL ctx at all: an implementation using context.Background()
+	// would ignore an already-dead ctx entirely and return a successful measurement.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
 	start := time.Now()
 	_, err := fixture.harness.client.URLTestOutbound(ctx, &URLTestOutboundRequest{
@@ -346,11 +354,13 @@ func TestURLTestOutboundHonoursCallerCancellation(t *testing.T) {
 	})
 	elapsed := time.Since(start)
 
-	require.Error(t, err, "an already-expired call ctx must fail the RPC")
-	require.Equal(t, codes.DeadlineExceeded, status.Code(err),
-		"the call must fail with the CALLER'S deadline; got %v. Any other code "+
-			"means the handler ignored the gRPC ctx and ran the test against the "+
-			"service context instead.", err)
+	require.Error(t, err,
+		"a cancelled call ctx must fail the RPC; a successful response here means "+
+			"the handler ignored the gRPC ctx and ran the test against the service "+
+			"context, which is exactly the bug this asserts against")
+	require.Equal(t, codes.Canceled, status.Code(err),
+		"the call must fail because the CALLER cancelled, not for some unrelated "+
+			"reason; got %v", err)
 	require.Less(t, elapsed, drainTimeout,
 		"the call must return promptly after cancellation rather than running the "+
 			"full test")

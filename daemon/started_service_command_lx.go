@@ -6,6 +6,8 @@ import (
 	"context"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/protocol/group"
@@ -187,4 +189,85 @@ func (s *StartedService) URLTestOutbound(ctx context.Context, request *URLTestOu
 		Delay: delay,
 	})
 	return &URLTestOutboundResponse{Delay: uint32(delay)}, nil
+}
+
+// --- declared for descriptor compatibility; deliberately NOT implemented here ---
+//
+// These back subsystems this fork does not have. They are answered Unimplemented
+// even in a with_lx_command build, and NOT copied from the reference, because a
+// faithful port would need the corresponding adapter interface:
+//
+//   GetChains / SetChainPositionEnabled / GetChainCloneConfig
+//       an outbound-chain (multi-hop) manager. This fork has no adapter.ChainManager
+//       and no chain clone state, so there is nothing to report and nothing to
+//       toggle. Faking a chain list would make the UI offer a feature that does
+//       not route anything.
+//
+//   GetRules
+//       a rule provider. The reference reads the running route rules through an
+//       adapter this fork does not expose. The rules still work; only the
+//       introspection endpoint is absent.
+//
+//   GetPool / GetDNSGroups / SubscribeDNSQueries
+//       urltest rotation pools and DNS server groups (SPEC 019 v2 / 035). Both are
+//       lx-only subsystems absent here, including the DnsGroupPath/attempt tracing
+//       the DNS event stream depends on.
+//
+//   GetRunningConfig
+//       serializing the live config. Valuable, but the reference implementation is
+//       entangled with chain state and would need a careful, separate review; it is
+//       reported NOT PORTED rather than half-written.
+//
+//   GetURLViaOutbound
+//       a diagnostic HTTP probe with body limits. Genuinely useful and a good
+//       candidate for a follow-up, but out of scope for restoring the proxy list,
+//       and it must not be rushed: it returns an arbitrary remote body into the
+//       process.
+//
+//   SetEndpointEnabled
+//       endpoint enable/disable, which needs the endpoint lifecycle state
+//       (never_built / building / up / asleep / torn_down) that this fork's
+//       adapter.Endpoint does not expose.
+//
+// Answering Unimplemented keeps the launcher's capability probe honest: it reports
+// these as absent capabilities and never renders a control that cannot work.
+
+func (s *StartedService) GetRules(ctx context.Context, empty *emptypb.Empty) (*RuleList, error) {
+	return nil, unimplemented("GetRules")
+}
+
+func (s *StartedService) GetPool(ctx context.Context, request *GetPoolRequest) (*PoolList, error) {
+	return nil, unimplemented("GetPool")
+}
+
+func (s *StartedService) GetDNSGroups(ctx context.Context, empty *emptypb.Empty) (*DnsGroupList, error) {
+	return nil, unimplemented("GetDNSGroups")
+}
+
+func (s *StartedService) GetRunningConfig(ctx context.Context, empty *emptypb.Empty) (*RunningConfig, error) {
+	return nil, unimplemented("GetRunningConfig")
+}
+
+func (s *StartedService) GetURLViaOutbound(ctx context.Context, request *GetURLViaOutboundRequest) (*GetURLViaOutboundResponse, error) {
+	return nil, unimplemented("GetURLViaOutbound")
+}
+
+func (s *StartedService) GetChains(ctx context.Context, empty *emptypb.Empty) (*ChainList, error) {
+	return nil, unimplemented("GetChains")
+}
+
+func (s *StartedService) SetChainPositionEnabled(ctx context.Context, request *SetChainPositionEnabledRequest) (*SetChainPositionEnabledResponse, error) {
+	return nil, unimplemented("SetChainPositionEnabled")
+}
+
+func (s *StartedService) GetChainCloneConfig(ctx context.Context, request *GetChainCloneConfigRequest) (*RunningConfig, error) {
+	return nil, unimplemented("GetChainCloneConfig")
+}
+
+func (s *StartedService) SetEndpointEnabled(ctx context.Context, request *SetEndpointEnabledRequest) (*SetEndpointEnabledResponse, error) {
+	return nil, unimplemented("SetEndpointEnabled")
+}
+
+func (s *StartedService) SubscribeDNSQueries(request *SubscribeDNSQueriesRequest, server grpc.ServerStreamingServer[DnsQueryEvent]) error {
+	return unimplemented("SubscribeDNSQueries")
 }

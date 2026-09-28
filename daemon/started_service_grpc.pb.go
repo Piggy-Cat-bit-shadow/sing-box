@@ -60,6 +60,16 @@ const (
 	StartedService_GetGroups_FullMethodName                      = "/daemon.StartedService/GetGroups"
 	StartedService_GetOutbounds_FullMethodName                   = "/daemon.StartedService/GetOutbounds"
 	StartedService_URLTestOutbound_FullMethodName                = "/daemon.StartedService/URLTestOutbound"
+	StartedService_GetRules_FullMethodName                       = "/daemon.StartedService/GetRules"
+	StartedService_GetPool_FullMethodName                        = "/daemon.StartedService/GetPool"
+	StartedService_GetDNSGroups_FullMethodName                   = "/daemon.StartedService/GetDNSGroups"
+	StartedService_GetRunningConfig_FullMethodName               = "/daemon.StartedService/GetRunningConfig"
+	StartedService_GetURLViaOutbound_FullMethodName              = "/daemon.StartedService/GetURLViaOutbound"
+	StartedService_GetChains_FullMethodName                      = "/daemon.StartedService/GetChains"
+	StartedService_SetChainPositionEnabled_FullMethodName        = "/daemon.StartedService/SetChainPositionEnabled"
+	StartedService_GetChainCloneConfig_FullMethodName            = "/daemon.StartedService/GetChainCloneConfig"
+	StartedService_SetEndpointEnabled_FullMethodName             = "/daemon.StartedService/SetEndpointEnabled"
+	StartedService_SubscribeDNSQueries_FullMethodName            = "/daemon.StartedService/SubscribeDNSQueries"
 )
 
 // StartedServiceClient is the client API for StartedService service.
@@ -132,6 +142,38 @@ type StartedServiceClient interface {
 	GetGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Groups, error)
 	GetOutbounds(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*OutboundList, error)
 	URLTestOutbound(ctx context.Context, in *URLTestOutboundRequest, opts ...grpc.CallOption) (*URLTestOutboundResponse, error)
+	// The remaining methods singbox-launcher's generated client can call. They are
+	// declared here so the SERVED DESCRIPTOR matches the launcher's, and answered
+	// with codes.Unimplemented by started_service_command_lx_stub.go because the
+	// underlying capability does not exist in this fork:
+	//
+	//	GetRules / GetDNSGroups / SubscribeDNSQueries / GetPool / GetRunningConfig
+	//	GetURLViaOutbound / GetChains / SetChainPositionEnabled /
+	//	GetChainCloneConfig / SetEndpointEnabled
+	//
+	// Declaring them is not cosmetic. A method the launcher calls but this core's
+	// descriptor omits is answered at the TRANSPORT layer with
+	// "unknown method <Name>", which the launcher's capability probe
+	// (core/daemon_rpc_compat.go) cannot distinguish from a broken connection or a
+	// version skew. A served Unimplemented is an unambiguous "this build does not
+	// include it", and the launcher then degrades to its Clash HTTP fallback and
+	// says so. Same reason as the three above — this is the deterministic-refusal
+	// half of the contract.
+	//
+	// Porting a real implementation for any of these requires the corresponding
+	// adapter interface (a chain manager, a rules provider, a DNS-group provider)
+	// and must NOT be faked behind the descriptor: a UI that offers a control the
+	// core silently ignores is worse than one that knows the feature is absent.
+	GetRules(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RuleList, error)
+	GetPool(ctx context.Context, in *GetPoolRequest, opts ...grpc.CallOption) (*PoolList, error)
+	GetDNSGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DnsGroupList, error)
+	GetRunningConfig(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RunningConfig, error)
+	GetURLViaOutbound(ctx context.Context, in *GetURLViaOutboundRequest, opts ...grpc.CallOption) (*GetURLViaOutboundResponse, error)
+	GetChains(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ChainList, error)
+	SetChainPositionEnabled(ctx context.Context, in *SetChainPositionEnabledRequest, opts ...grpc.CallOption) (*SetChainPositionEnabledResponse, error)
+	GetChainCloneConfig(ctx context.Context, in *GetChainCloneConfigRequest, opts ...grpc.CallOption) (*RunningConfig, error)
+	SetEndpointEnabled(ctx context.Context, in *SetEndpointEnabledRequest, opts ...grpc.CallOption) (*SetEndpointEnabledResponse, error)
+	SubscribeDNSQueries(ctx context.Context, in *SubscribeDNSQueriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DnsQueryEvent], error)
 }
 
 type startedServiceClient struct {
@@ -754,6 +796,115 @@ func (c *startedServiceClient) URLTestOutbound(ctx context.Context, in *URLTestO
 	return out, nil
 }
 
+func (c *startedServiceClient) GetRules(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RuleList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RuleList)
+	err := c.cc.Invoke(ctx, StartedService_GetRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetPool(ctx context.Context, in *GetPoolRequest, opts ...grpc.CallOption) (*PoolList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PoolList)
+	err := c.cc.Invoke(ctx, StartedService_GetPool_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetDNSGroups(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*DnsGroupList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DnsGroupList)
+	err := c.cc.Invoke(ctx, StartedService_GetDNSGroups_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetRunningConfig(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*RunningConfig, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunningConfig)
+	err := c.cc.Invoke(ctx, StartedService_GetRunningConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetURLViaOutbound(ctx context.Context, in *GetURLViaOutboundRequest, opts ...grpc.CallOption) (*GetURLViaOutboundResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetURLViaOutboundResponse)
+	err := c.cc.Invoke(ctx, StartedService_GetURLViaOutbound_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetChains(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ChainList, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChainList)
+	err := c.cc.Invoke(ctx, StartedService_GetChains_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) SetChainPositionEnabled(ctx context.Context, in *SetChainPositionEnabledRequest, opts ...grpc.CallOption) (*SetChainPositionEnabledResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetChainPositionEnabledResponse)
+	err := c.cc.Invoke(ctx, StartedService_SetChainPositionEnabled_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) GetChainCloneConfig(ctx context.Context, in *GetChainCloneConfigRequest, opts ...grpc.CallOption) (*RunningConfig, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RunningConfig)
+	err := c.cc.Invoke(ctx, StartedService_GetChainCloneConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) SetEndpointEnabled(ctx context.Context, in *SetEndpointEnabledRequest, opts ...grpc.CallOption) (*SetEndpointEnabledResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetEndpointEnabledResponse)
+	err := c.cc.Invoke(ctx, StartedService_SetEndpointEnabled_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *startedServiceClient) SubscribeDNSQueries(ctx context.Context, in *SubscribeDNSQueriesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[DnsQueryEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StartedService_ServiceDesc.Streams[20], StartedService_SubscribeDNSQueries_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SubscribeDNSQueriesRequest, DnsQueryEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StartedService_SubscribeDNSQueriesClient = grpc.ServerStreamingClient[DnsQueryEvent]
+
 // StartedServiceServer is the server API for StartedService service.
 // All implementations must embed UnimplementedStartedServiceServer
 // for forward compatibility.
@@ -824,6 +975,38 @@ type StartedServiceServer interface {
 	GetGroups(context.Context, *emptypb.Empty) (*Groups, error)
 	GetOutbounds(context.Context, *emptypb.Empty) (*OutboundList, error)
 	URLTestOutbound(context.Context, *URLTestOutboundRequest) (*URLTestOutboundResponse, error)
+	// The remaining methods singbox-launcher's generated client can call. They are
+	// declared here so the SERVED DESCRIPTOR matches the launcher's, and answered
+	// with codes.Unimplemented by started_service_command_lx_stub.go because the
+	// underlying capability does not exist in this fork:
+	//
+	//	GetRules / GetDNSGroups / SubscribeDNSQueries / GetPool / GetRunningConfig
+	//	GetURLViaOutbound / GetChains / SetChainPositionEnabled /
+	//	GetChainCloneConfig / SetEndpointEnabled
+	//
+	// Declaring them is not cosmetic. A method the launcher calls but this core's
+	// descriptor omits is answered at the TRANSPORT layer with
+	// "unknown method <Name>", which the launcher's capability probe
+	// (core/daemon_rpc_compat.go) cannot distinguish from a broken connection or a
+	// version skew. A served Unimplemented is an unambiguous "this build does not
+	// include it", and the launcher then degrades to its Clash HTTP fallback and
+	// says so. Same reason as the three above — this is the deterministic-refusal
+	// half of the contract.
+	//
+	// Porting a real implementation for any of these requires the corresponding
+	// adapter interface (a chain manager, a rules provider, a DNS-group provider)
+	// and must NOT be faked behind the descriptor: a UI that offers a control the
+	// core silently ignores is worse than one that knows the feature is absent.
+	GetRules(context.Context, *emptypb.Empty) (*RuleList, error)
+	GetPool(context.Context, *GetPoolRequest) (*PoolList, error)
+	GetDNSGroups(context.Context, *emptypb.Empty) (*DnsGroupList, error)
+	GetRunningConfig(context.Context, *emptypb.Empty) (*RunningConfig, error)
+	GetURLViaOutbound(context.Context, *GetURLViaOutboundRequest) (*GetURLViaOutboundResponse, error)
+	GetChains(context.Context, *emptypb.Empty) (*ChainList, error)
+	SetChainPositionEnabled(context.Context, *SetChainPositionEnabledRequest) (*SetChainPositionEnabledResponse, error)
+	GetChainCloneConfig(context.Context, *GetChainCloneConfigRequest) (*RunningConfig, error)
+	SetEndpointEnabled(context.Context, *SetEndpointEnabledRequest) (*SetEndpointEnabledResponse, error)
+	SubscribeDNSQueries(*SubscribeDNSQueriesRequest, grpc.ServerStreamingServer[DnsQueryEvent]) error
 	mustEmbedUnimplementedStartedServiceServer()
 }
 
@@ -1012,6 +1195,46 @@ func (UnimplementedStartedServiceServer) GetOutbounds(context.Context, *emptypb.
 
 func (UnimplementedStartedServiceServer) URLTestOutbound(context.Context, *URLTestOutboundRequest) (*URLTestOutboundResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method URLTestOutbound not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetRules(context.Context, *emptypb.Empty) (*RuleList, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRules not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetPool(context.Context, *GetPoolRequest) (*PoolList, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPool not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetDNSGroups(context.Context, *emptypb.Empty) (*DnsGroupList, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetDNSGroups not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetRunningConfig(context.Context, *emptypb.Empty) (*RunningConfig, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRunningConfig not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetURLViaOutbound(context.Context, *GetURLViaOutboundRequest) (*GetURLViaOutboundResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetURLViaOutbound not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetChains(context.Context, *emptypb.Empty) (*ChainList, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetChains not implemented")
+}
+
+func (UnimplementedStartedServiceServer) SetChainPositionEnabled(context.Context, *SetChainPositionEnabledRequest) (*SetChainPositionEnabledResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetChainPositionEnabled not implemented")
+}
+
+func (UnimplementedStartedServiceServer) GetChainCloneConfig(context.Context, *GetChainCloneConfigRequest) (*RunningConfig, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetChainCloneConfig not implemented")
+}
+
+func (UnimplementedStartedServiceServer) SetEndpointEnabled(context.Context, *SetEndpointEnabledRequest) (*SetEndpointEnabledResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetEndpointEnabled not implemented")
+}
+
+func (UnimplementedStartedServiceServer) SubscribeDNSQueries(*SubscribeDNSQueriesRequest, grpc.ServerStreamingServer[DnsQueryEvent]) error {
+	return status.Error(codes.Unimplemented, "method SubscribeDNSQueries not implemented")
 }
 func (UnimplementedStartedServiceServer) mustEmbedUnimplementedStartedServiceServer() {}
 func (UnimplementedStartedServiceServer) testEmbeddedByValue()                        {}
@@ -1692,6 +1915,179 @@ func _StartedService_URLTestOutbound_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StartedService_GetRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetRules(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetPool_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPoolRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetPool(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetPool_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetPool(ctx, req.(*GetPoolRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetDNSGroups_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetDNSGroups(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetDNSGroups_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetDNSGroups(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetRunningConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetRunningConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetRunningConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetRunningConfig(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetURLViaOutbound_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetURLViaOutboundRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetURLViaOutbound(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetURLViaOutbound_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetURLViaOutbound(ctx, req.(*GetURLViaOutboundRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetChains_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetChains(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetChains_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetChains(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_SetChainPositionEnabled_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetChainPositionEnabledRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).SetChainPositionEnabled(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_SetChainPositionEnabled_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).SetChainPositionEnabled(ctx, req.(*SetChainPositionEnabledRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_GetChainCloneConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetChainCloneConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).GetChainCloneConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_GetChainCloneConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).GetChainCloneConfig(ctx, req.(*GetChainCloneConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_SetEndpointEnabled_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetEndpointEnabledRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StartedServiceServer).SetEndpointEnabled(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StartedService_SetEndpointEnabled_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StartedServiceServer).SetEndpointEnabled(ctx, req.(*SetEndpointEnabledRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StartedService_SubscribeDNSQueries_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SubscribeDNSQueriesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StartedServiceServer).SubscribeDNSQueries(m, &grpc.GenericServerStream[SubscribeDNSQueriesRequest, DnsQueryEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StartedService_SubscribeDNSQueriesServer = grpc.ServerStreamingServer[DnsQueryEvent]
+
 // StartedService_ServiceDesc is the grpc.ServiceDesc for StartedService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1799,6 +2195,42 @@ var StartedService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "URLTestOutbound",
 			Handler:    _StartedService_URLTestOutbound_Handler,
 		},
+		{
+			MethodName: "GetRules",
+			Handler:    _StartedService_GetRules_Handler,
+		},
+		{
+			MethodName: "GetPool",
+			Handler:    _StartedService_GetPool_Handler,
+		},
+		{
+			MethodName: "GetDNSGroups",
+			Handler:    _StartedService_GetDNSGroups_Handler,
+		},
+		{
+			MethodName: "GetRunningConfig",
+			Handler:    _StartedService_GetRunningConfig_Handler,
+		},
+		{
+			MethodName: "GetURLViaOutbound",
+			Handler:    _StartedService_GetURLViaOutbound_Handler,
+		},
+		{
+			MethodName: "GetChains",
+			Handler:    _StartedService_GetChains_Handler,
+		},
+		{
+			MethodName: "SetChainPositionEnabled",
+			Handler:    _StartedService_SetChainPositionEnabled_Handler,
+		},
+		{
+			MethodName: "GetChainCloneConfig",
+			Handler:    _StartedService_GetChainCloneConfig_Handler,
+		},
+		{
+			MethodName: "SetEndpointEnabled",
+			Handler:    _StartedService_SetEndpointEnabled_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -1902,6 +2334,11 @@ var StartedService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "SubscribeNotifications",
 			Handler:       _StartedService_SubscribeNotifications_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "SubscribeDNSQueries",
+			Handler:       _StartedService_SubscribeDNSQueries_Handler,
 			ServerStreams: true,
 		},
 	},

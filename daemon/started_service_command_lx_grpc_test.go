@@ -146,7 +146,6 @@ func TestJiejieDaemonRPCContract(t *testing.T) {
 			"URLTestOutbound must be registered; got %v", err)
 		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	})
-
 }
 
 // TestJiejieDaemonRPCContractStartedService is the "once it is up, it really
