@@ -312,18 +312,44 @@ func (n *Inbound) Close() error {
 // peer may have in flight toward this server -- it is an admission control, not a
 // client tuning knob, and a large value works against the 1 GiB target host
 // rather than for it.
-// validateHTTP2Options range-checks the values that are later narrowed to
-// fixed-width types, so an out-of-range option is a configuration error instead
-// of a silent wrap.
+// validateHTTP2Options range-checks the values before they reach the HTTP/2 server.
 //
-// The bounds are the ones the target types can represent:
+// The bounds are NOT simply "whatever fits the target type". They are the bounds
+// golang.org/x/net/http2 itself accepts, because that library silently replaces an
+// out-of-range value with a default instead of reporting an error:
 //
-//	MaxConcurrentStreams    -> uint32  : 0 .. MaxUint32
-//	StreamReceiveWindow     -> int32   : 0 .. MaxInt32
-//	ConnectionReceiveWindow -> int32   : 0 .. MaxInt32
+//	// x/net/http2/config.go
+//	func setDefault[T ~int|~int32|~uint32|~int64](v *T, minval, maxval, defval T) {
+//		if *v < minval || *v > maxval {
+//			*v = defval
+//		}
+//	}
+//	setDefault(&conf.MaxUploadBufferPerConnection, initialWindowSize, math.MaxInt32, 1<<20)
+//	setDefault(&conf.MaxUploadBufferPerStream,     1,               math.MaxInt32, 1<<20)
 //
-// Zero always means "unset, use the upstream default" and is accepted for all
-// three.
+// So the two receive windows have DIFFERENT legal ranges, and validating them with
+// one shared rule is wrong in both directions:
+//
+//	ConnectionReceiveWindow -> [65535, MaxInt32]   (initialWindowSize = 65535)
+//	StreamReceiveWindow     -> [1,     MaxInt32]
+//
+// A connection window below 65535 - including 1, 32768 and 65534 - is silently
+// discarded by x/net and replaced with 1 MiB, so the operator's configured value
+// would not be the value in effect. That is a deterministic configuration bug, and
+// it is the reason this function rejects those values instead of accepting them.
+//
+// The stream window's lower bound really is 1: x/net accepts it, so it is accepted
+// here too. Applying the connection window's floor to it would reject a legal
+// configuration.
+//
+// Zero always means "unset, use the upstream default" and is accepted for every
+// field.
+//
+// # Keeping this in step with the dependency
+//
+// These constants mirror a specific x/net version; the module version is stated in
+// TestHTTP2WindowBoundsMatchXNet so a dependency bump that changes the ranges fails
+// a test rather than silently drifting.
 func validateHTTP2Options(options option.HTTP2Options) error {
 	if options.MaxConcurrentStreams < 0 {
 		return E.New("max_concurrent_streams must not be negative, got ",
@@ -337,23 +363,56 @@ func validateHTTP2Options(options option.HTTP2Options) error {
 	for _, window := range []struct {
 		name  string
 		value *byteformats.MemoryBytes
+		// min is the smallest NON-ZERO value x/net/http2 accepts for this field.
+		min uint64
+		// minReason explains the floor in operator terms.
+		minReason string
 	}{
-		{"stream_receive_window", options.StreamReceiveWindow},
-		{"connection_receive_window", options.ConnectionReceiveWindow},
+		{
+			// x/net uses initialWindowSize (65535) as the floor here, NOT 1.
+			name:  "connection_receive_window",
+			value: options.ConnectionReceiveWindow,
+			min:   http2InitialWindowSize,
+			minReason: " below the HTTP/2 initial window of 65535 would be silently " +
+				"discarded by the HTTP/2 library and replaced with its 1 MiB default, " +
+				"so the configured value would not be the value in effect",
+		},
+		{
+			// x/net accepts 1 here, so this only guards the upper end.
+			name:  "stream_receive_window",
+			value: options.StreamReceiveWindow,
+			min:   1,
+		},
 	} {
 		if window.value == nil {
 			continue
 		}
-		// Value() returns uint64, so only the upper bound is meaningful; there
-		// is no negative case to check.
-		if window.value.Value() > math.MaxInt32 {
+		// Value() returns uint64, so there is no negative case to check.
+		value := window.value.Value()
+		if value == 0 {
+			// An explicit 0 is the same as unset.
+			continue
+		}
+		if value < window.min {
+			return E.New(window.name, " must be either 0 (use the default) or at least ",
+				window.min, ", got ", value, window.minReason)
+		}
+		if value > math.MaxInt32 {
 			return E.New(window.name, " must not exceed ", int64(math.MaxInt32),
-				", got ", window.value.Value(),
+				", got ", value,
 				"; a larger value would wrap when narrowed to the HTTP/2 window")
 		}
 	}
 	return nil
 }
+
+// http2InitialWindowSize is x/net/http2's initialWindowSize: the smallest
+// MaxUploadBufferPerConnection that library accepts, and the floor this fork
+// enforces for connection_receive_window.
+//
+// The value is fixed by RFC 7540 section 6.9.2 and is not tunable, so it does not
+// drift with the dependency even though the bounds around it are version-specific.
+const http2InitialWindowSize = 65535
 
 func (n *Inbound) http2Server() *http2.Server {
 	options := n.options.HTTP2Options

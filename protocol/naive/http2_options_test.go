@@ -2,6 +2,7 @@ package naive
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -256,10 +257,22 @@ func TestHTTP2OptionsRejectOutOfRangeValues(t *testing.T) {
 			StreamReceiveWindow:     bytesOf(t, "0"),
 			ConnectionReceiveWindow: bytesOf(t, "0"),
 		}), "zero windows mean upstream default and must be accepted")
+
+		// The two windows have DIFFERENT lower bounds, because x/net/http2 applies
+		// different floors to them. A one-byte STREAM window is genuinely legal
+		// (MaxUploadBufferPerStream accepts [1, MaxInt32]); a one-byte CONNECTION
+		// window is not (MaxUploadBufferPerConnection accepts
+		// [65535, MaxInt32]) and would be silently replaced with 1 MiB.
+		//
+		// A previous revision of this test asserted that a one-byte window is legal
+		// for BOTH, which encoded the very assumption that made the connection
+		// window bug invisible.
 		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
-			StreamReceiveWindow:     bytesOf(t, "1"),
+			StreamReceiveWindow: bytesOf(t, "1"),
+		}), "a one-byte stream window is within x/net's range and must be accepted")
+		require.Error(t, validateHTTP2Options(option.HTTP2Options{
 			ConnectionReceiveWindow: bytesOf(t, "1"),
-		}), "one-byte windows are representable and must be accepted")
+		}), "a one-byte connection window is below x/net's floor and must be rejected")
 	})
 
 	t.Run("one below the limit is accepted", func(t *testing.T) {
@@ -272,6 +285,17 @@ func TestHTTP2OptionsRejectOutOfRangeValues(t *testing.T) {
 			StreamReceiveWindow:     bytesOf(t, "2147483646"),
 			ConnectionReceiveWindow: bytesOf(t, "2147483646"),
 		}), "one below the window maximum must be accepted")
+	})
+
+	t.Run("just above the connection floor is accepted", func(t *testing.T) {
+		// The connection window's lower boundary, from above. The floor itself and
+		// one above it must both pass, so the floor cannot be off by one.
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			ConnectionReceiveWindow: bytesOf(t, "65535"),
+		}), "the connection window floor itself must be accepted")
+		require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+			ConnectionReceiveWindow: bytesOf(t, "65536"),
+		}), "one above the connection window floor must be accepted")
 	})
 
 	t.Run("unset stays unset", func(t *testing.T) {
@@ -393,4 +417,190 @@ func TestProductionReceiveWindowsExceedUpstreamDefaults(t *testing.T) {
 	const paddedFrameSize = 65536
 	require.GreaterOrEqual(t, int64(productionStreamReceiveWindow)/paddedFrameSize, int64(128),
 		"the stream window should hold at least 128 maximum-size padded frames")
+}
+
+// memoryBytesOf parses a byte-size literal into the option type, so the tests below
+// state their boundary values as the strings an operator would actually write.
+func memoryBytesOf(t *testing.T, literal string) *byteformats.MemoryBytes {
+	t.Helper()
+	var value byteformats.MemoryBytes
+	require.NoError(t, value.UnmarshalJSON([]byte(literal)),
+		"parse memory literal %q", literal)
+	return &value
+}
+
+// TestHTTP2WindowBoundsMatchXNet pins this fork's window validation to the bounds
+// golang.org/x/net/http2 actually enforces.
+//
+// # Why this test exists
+//
+// x/net does not report an out-of-range upload buffer. It substitutes a default:
+//
+//	func setDefault[T](v *T, minval, maxval, defval T) {
+//		if *v < minval || *v > maxval {
+//			*v = defval
+//		}
+//	}
+//
+//	MaxUploadBufferPerConnection: [initialWindowSize, MaxInt32] -> default 1<<20
+//	MaxUploadBufferPerStream:     [1,               MaxInt32] -> default 1<<20
+//
+// The two floors differ, so a single shared rule is wrong for one of them. Before
+// this fix the validator only checked `<= MaxInt32`, which accepted a
+// connection_receive_window of 1, 32768 or 65534 - every one of which x/net quietly
+// threw away and replaced with 1 MiB. The operator's configuration was therefore not
+// the configuration in effect, with no error anywhere.
+//
+// This test states the ranges as data so a dependency bump that changes them fails
+// here, next to the module version, instead of silently drifting.
+func TestHTTP2WindowBoundsMatchXNet(t *testing.T) {
+	// The module version these bounds were derived from:
+	//
+	//	golang.org/x/net v0.57.0 http2/config.go setConfigDefaults
+	//
+	// RFC 7540 section 6.9.2 fixes the initial window at 65535, which is the
+	// connection floor. The stream floor of 1 is x/net's own choice.
+	const (
+		xNetVersion       = "v0.57.0"
+		connectionFloor   = 65535
+		streamFloor       = 1
+		xNetDefaultWindow = 1 << 20
+	)
+
+	require.Equal(t, connectionFloor, http2InitialWindowSize,
+		"http2InitialWindowSize must stay at the RFC 7540 initial window size, which "+
+			"is the floor x/net/http2 applies to MaxUploadBufferPerConnection "+
+			"(x/net %s)", xNetVersion)
+	require.Equal(t, uint64(xNetDefaultWindow), uint64(1<<20),
+		"the x/net default this fork must not silently fall back to")
+
+	// The floor the fork enforces must equal the floor x/net enforces. If a future
+	// x/net lowered its connection floor, this fork would start rejecting
+	// configurations the library would honour.
+	var accepted option.HTTP2Options
+	for _, value := range []uint64{connectionFloor} {
+		accepted = option.HTTP2Options{
+			ConnectionReceiveWindow: memoryBytesOf(t, strconv.FormatUint(value, 10)),
+		}
+		require.NoError(t, validateHTTP2Options(accepted),
+			"connection_receive_window=%d is x/net's own floor and must be accepted", value)
+	}
+
+	// And the stream floor must stay permissive, because x/net accepts it.
+	require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+		StreamReceiveWindow: memoryBytesOf(t, strconv.Itoa(streamFloor)),
+	}), "stream_receive_window=%d is within x/net's range and must stay accepted",
+		streamFloor)
+}
+
+// TestConnectionReceiveWindowBelowXNetFloorIsRejected is the regression test for the
+// silent-substitution bug.
+//
+// Each rejected value below is one x/net would have silently replaced with 1 MiB:
+// the operator would set 32768, the server would use 1048576, and nothing in the
+// configuration path would mention it.
+func TestConnectionReceiveWindowBelowXNetFloorIsRejected(t *testing.T) {
+	for _, value := range []string{"1", "2", "32768", "65534"} {
+		value := value
+		t.Run("connection_receive_window="+value, func(t *testing.T) {
+			err := validateHTTP2Options(option.HTTP2Options{
+				ConnectionReceiveWindow: memoryBytesOf(t, value),
+			})
+			require.Error(t, err,
+				"connection_receive_window=%s is below the HTTP/2 initial window, so "+
+					"x/net/http2 would silently substitute 1 MiB and the configured "+
+					"value would not be in effect", value)
+			require.Contains(t, err.Error(), "connection_receive_window")
+			// The message must name the floor so an operator can fix the config
+			// without reading the HTTP/2 library.
+			require.Contains(t, err.Error(), "65535",
+				"the error must state the minimum accepted value")
+		})
+	}
+}
+
+// TestConnectionReceiveWindowAtBoundaries proves the exact boundary behaves: the
+// floor is accepted and one below it is not, so the comparison cannot be off by one.
+func TestConnectionReceiveWindowAtBoundaries(t *testing.T) {
+	require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+		ConnectionReceiveWindow: memoryBytesOf(t, "65535"),
+	}), "the floor itself must be accepted")
+
+	require.Error(t, validateHTTP2Options(option.HTTP2Options{
+		ConnectionReceiveWindow: memoryBytesOf(t, "65534"),
+	}), "one below the floor must be rejected")
+
+	require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+		ConnectionReceiveWindow: memoryBytesOf(t, strconv.Itoa(math.MaxInt32)),
+	}), "MaxInt32 is x/net's upper bound and must be accepted")
+
+	require.Error(t, validateHTTP2Options(option.HTTP2Options{
+		ConnectionReceiveWindow: memoryBytesOf(t, strconv.FormatInt(math.MaxInt32+1, 10)),
+	}), "one above MaxInt32 must be rejected")
+}
+
+// TestStreamReceiveWindowKeepsItsOwnLowerBound proves the connection window's floor
+// was NOT copied onto the stream window.
+//
+// x/net accepts MaxUploadBufferPerStream = 1, so rejecting it here would refuse a
+// legal configuration. Sharing one validation rule between the two windows is the
+// mistake this guards against.
+func TestStreamReceiveWindowKeepsItsOwnLowerBound(t *testing.T) {
+	for _, value := range []string{"1", "65534", "65535"} {
+		value := value
+		t.Run("stream_receive_window="+value, func(t *testing.T) {
+			require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+				StreamReceiveWindow: memoryBytesOf(t, value),
+			}), "stream_receive_window=%s is within x/net's [1, MaxInt32] range for "+
+				"MaxUploadBufferPerStream and must stay accepted", value)
+		})
+	}
+
+	require.Error(t, validateHTTP2Options(option.HTTP2Options{
+		StreamReceiveWindow: memoryBytesOf(t, strconv.FormatInt(math.MaxInt32+1, 10)),
+	}), "the stream window still cannot exceed MaxInt32")
+}
+
+// TestZeroWindowMeansUnset proves an explicit 0 is treated as unset for both windows,
+// so a zero cannot trip the new lower bound.
+func TestZeroWindowMeansUnset(t *testing.T) {
+	// An omitted field leaves the pointer nil, which is how "unset" reaches the
+	// validator. `"0B"` is the explicit zero an operator can also write.
+	for _, testCase := range []struct {
+		name  string
+		value *byteformats.MemoryBytes
+	}{
+		{"omitted", nil},
+		{"explicit 0", memoryBytesOf(t, "0")},
+	} {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			require.NoError(t, validateHTTP2Options(option.HTTP2Options{
+				ConnectionReceiveWindow: testCase.value,
+				StreamReceiveWindow:     testCase.value,
+			}), "an unset or zero window must not be read as below the floor")
+		})
+	}
+
+	inbound := &Inbound{}
+	inbound.options.HTTP2Options.ConnectionReceiveWindow = memoryBytesOf(t, "0")
+	inbound.options.HTTP2Options.StreamReceiveWindow = memoryBytesOf(t, "0")
+	server := inbound.http2Server()
+	require.Zero(t, server.MaxUploadBufferPerConnection,
+		"an unset connection window must stay unset so x/net applies its own default")
+	require.Zero(t, server.MaxUploadBufferPerStream,
+		"an unset stream window must stay unset so x/net applies its own default")
+}
+
+// TestConnectionReceiveWindowReachesServer proves an ACCEPTED value is the value the
+// server actually receives, which is the property the bug violated.
+func TestConnectionReceiveWindowReachesServer(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.options.HTTP2Options.ConnectionReceiveWindow = memoryBytesOf(t, "65535")
+	require.NoError(t, validateHTTP2Options(inbound.options.HTTP2Options))
+
+	server := inbound.http2Server()
+	require.EqualValues(t, 65535, server.MaxUploadBufferPerConnection,
+		"the accepted value must reach the HTTP/2 server unchanged; if the validator "+
+			"and the server disagreed, x/net would silently replace it at runtime")
 }
