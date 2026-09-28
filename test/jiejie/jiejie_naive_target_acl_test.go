@@ -779,12 +779,13 @@ func TestJiejieTargetACLUoTV2ConnectTargetIsChecked(t *testing.T) {
 	target := metadata.ParseSocksaddr("127.0.0.1:" + strconv.Itoa(int(forbiddenOrigin.port())))
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, target))
-	_, err := conn.Write(naivePaddingFrame(append([]byte{1}, writer.data...), 0))
+	// HTTP/1: raw tunnel -- the UoT request header is not framed.
+	_, err := conn.Write(append([]byte{1}, writer.data...))
 	require.NoError(t, err)
 
 	length := make([]byte, 2)
 	binary.BigEndian.PutUint16(length, 4)
-	_, err = conn.Write(naivePaddingFrame(append(length, []byte("ping")...), 0))
+	_, err = conn.Write(append(length, []byte("ping")...))
 	require.NoError(t, err)
 
 	// A v2 connect session expects a CONNECT reply code before data flows; read
@@ -882,7 +883,8 @@ func writeUoTDatagram(t *testing.T, conn net.Conn, target metadata.Socksaddr, pa
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
 	body = append(body, length...)
 	body = append(body, payload...)
-	_, err := conn.Write(naivePaddingFrame(body, 0))
+	// HTTP/1: raw tunnel, so the request body is written verbatim.
+	_, err := conn.Write(body)
 	require.NoError(t, err)
 }
 
@@ -1401,6 +1403,7 @@ func writeUoTDatagramRaw(conn net.Conn, target metadata.Socksaddr, payload []byt
 	binary.BigEndian.PutUint16(length, uint16(len(payload)))
 	body = append(body, length...)
 	body = append(body, payload...)
-	_, err := conn.Write(naivePaddingFrame(body, 0))
+	// HTTP/1: raw tunnel, so the request body is written verbatim.
+	_, err := conn.Write(body)
 	return err
 }

@@ -30,9 +30,19 @@ TIMEOUT="${JIEJIE_TIMEOUT:-1200s}"
 # Failures that reproduce on the pinned baseline and are not caused by current work.
 # Kept as a list rather than a skip so they still RUN and their output is visible:
 # silently skipping known failures is how a real one hides.
+# TestAuditUoTV2NonConnectMode and TestAuditUoTV2NonConnectMultipleTargets were
+# listed here as "UoT read request: unknown address family: 8". That was a FALSE
+# PRODUCT DIAGNOSIS and they have been REMOVED from this list because they now
+# PASS: the harness was framing an HTTP/1 CONNECT payload as Naive padded data,
+# so the server read the frame's length byte (0x08) as a SOCKS address family.
+# HTTP/1 is a RAW tunnel; the product was correct all along. See
+# TestAuditUoTPaddingContractIsTransportDependent for the contract, and
+# docs/JIEJIE-NAIVE-UOT-FALSE-P0.md for the retraction.
+#
+# They are deleted rather than kept as "expected failures" on purpose: leaving a
+# fixed test on a known-failure list is how a real regression later hides behind
+# the label.
 KNOWN_FAILURES=(
-  "TestAuditUoTV2NonConnectMode"                  # UoT read request: unknown address family: 8
-  "TestAuditUoTV2NonConnectMultipleTargets"       # same family-resolution defect
   "TestAuditLoopbackIsReachableByDefault"         # loopback reachability audit
   "TestAuditRouteRuleBlocksLoopback"              # loopback routing audit
 )

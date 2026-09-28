@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
@@ -137,8 +138,8 @@ func TestAuditDomainResolvingToLoopbackIsStillRuled(t *testing.T) {
 		// Stage 3: the tunnel is driven and the ORIGIN COUNTER is the authoritative
 		// observation. The routing rule must stop the dial, so the counter stays put.
 		before := origin.conns.Load()
-		_, _ = conn.Write(naivePaddingFrame(
-			[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+		// HTTP/1 CONNECT is a raw tunnel: the HTTP request is written verbatim.
+		_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 		_, _ = readPaddingFrameRaw2(bufio.NewReader(conn))
 
 		require.Zero(t, origin.conns.Load()-before,
@@ -185,8 +186,8 @@ func TestAuditDomainResolvingToLoopbackIsStillRuled(t *testing.T) {
 
 		// CONNECT was accepted. The rule may still block the request later, so the
 		// tunnel is driven and the ORIGIN COUNTER is the authoritative check.
-		_, _ = conn.Write(naivePaddingFrame(
-			[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+		// HTTP/1 CONNECT is a raw tunnel: the HTTP request is written verbatim.
+		_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 		body, readErr := readPaddingFrameRaw2(bufio.NewReader(conn))
 
 		require.Zero(t, origin.conns.Load()-before,
@@ -207,28 +208,46 @@ func TestAuditDomainResolvingToLoopbackIsStillRuled(t *testing.T) {
 	// The previous version had NO assertion here. It sent the frames, logged whatever
 	// came back, and finished - so it passed whether the rule held or not.
 	t.Run("UoT via domain", func(t *testing.T) {
-		// This subtest is EXPECTED TO FAIL against the current implementation, and it
-		// is reported as a FAILURE rather than skipped or softened.
+		// The security property: a UoT datagram whose destination is a DOMAIN that
+		// resolves to loopback must be stopped by the ip_cidr rule AFTER resolution.
+		// The UDP packet counter on the origin is the authoritative observation -- a
+		// datagram arriving would prove the rule was applied to the request string
+		// instead of the resolved address.
 		//
-		// UoT non-connect mode is broken at HEAD, independently of anything changed
-		// here: the server answers "UoT read request: unknown address family: 8" and
-		// closes the tunnel before any datagram is delivered. This was reproduced at
-		// the untouched baseline commit with the pre-existing test
-		// TestAuditUoTV2NonConnectMode, which fails with the identical error, so it is
-		// a product defect in the UoT v2 non-connect path and not a defect in this
-		// harness.
+		// This subtest was previously SKIPPED as a "known product failure", on the
+		// grounds that UoT v2 non-connect was broken at HEAD. That diagnosis was
+		// WRONG and has been retracted: the harness was framing an HTTP/1 payload as
+		// Naive padded data, so the server read the frame's length byte (0x08) as a
+		// SOCKS address family and answered "unknown address family: 8". The product
+		// path was correct; see TestAuditUoTPaddingContractIsTransportDependent.
 		//
-		// The consequence for THIS test is that the UDP-socket assertion below cannot
-		// currently be satisfied by a working datagram path. Making it pass by skipping
-		// would remove a security check on a code path that is already broken, so the
-		// check is kept and the failure is surfaced. See the UoT finding in the
-		// accompanying report.
-		_ = udpOrigin.port() // retained: the UDP counter is the check once UoT works
-		t.Skip("KNOWN FAILURE (pre-existing, reproduced at the baseline commit): UoT " +
-			"v2 non-connect mode is broken - the server rejects the datagram with " +
-			"\"unknown address family\" before it reaches any target, so this " +
-			"subtest's UDP-socket assertion cannot be evaluated. The TCP subtest " +
-			"above does cover the ip_cidr-on-resolved-address property.")
+		// Skipping a security check because its own helper wrote the wrong wire
+		// format would have left this property unverified indefinitely, so the check
+		// is restored rather than deleted.
+		before := udpOrigin.packets.Load()
+
+		// What the tunnel must prove is that it is FUNCTIONAL, so the zero count below
+		// is attributable to the rule. There is no permitted UDP target to use as a
+		// positive control: the rule rejects all of 127.0.0.0/8, and every UDP origin
+		// in this harness lives on loopback. A "control datagram that must be
+		// delivered" would therefore contradict the property under test.
+		//
+		// The functional evidence is instead the established session itself: the
+		// server answered 200 and accepted the UoT request header (openUoTNonConnect
+		// asserts both), which it only does for a well-formed v2 non-connect request.
+		// That is the same standard the TCP subtest in this file uses.
+		rejectedSession := openUoTNonConnect(t, port)
+		defer rejectedSession.Close()
+
+		// The property: "localhost" resolves to 127.0.0.1, which the ip_cidr rule
+		// covers, so the datagram must be dropped AFTER resolution.
+		rejectedSession.writeNonConnectDatagram(t, "localhost:"+strconv.Itoa(int(udpOrigin.port())), []byte("probe"))
+
+		// Give the router time to resolve and rule on it.
+		require.Never(t, func() bool { return udpOrigin.packets.Load() > before },
+			1*time.Second, 50*time.Millisecond,
+			"a UoT datagram to a domain resolving to loopback reached the UDP origin; "+
+				"the ip_cidr rule must apply to the RESOLVED address, not the request string")
 	})
 
 }

@@ -3,6 +3,7 @@ package jiejie_test
 import (
 	"bufio"
 	"encoding/binary"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -80,10 +81,11 @@ func TestAuditAuthenticatedClientReach(t *testing.T) {
 				t.Logf("UoT %-22s -> encode error %v", target.name, err)
 				return
 			}
-			_, _ = conn.Write(naivePaddingFrame(append([]byte{1}, writer.data...), 0))
+			// HTTP/1: raw tunnel, so the UoT request header goes out verbatim.
+			_, _ = conn.Write(append([]byte{1}, writer.data...))
 			length := make([]byte, 2)
 			binary.BigEndian.PutUint16(length, 4)
-			_, _ = conn.Write(naivePaddingFrame(append(length, []byte("ping")...), 0))
+			_, _ = conn.Write(append(length, []byte("ping")...))
 			t.Logf("UoT %-22s -> accepted into the data path", target.name)
 		})
 	}
@@ -104,10 +106,13 @@ func TestAuditLoopbackIsReachableByDefault(t *testing.T) {
 	defer response.Body.Close()
 	require.Equal(t, http.StatusOK, response.StatusCode)
 
-	_, err = conn.Write(naivePaddingFrame(
-		[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+	// HTTP/1 CONNECT is a RAW tunnel, so the HTTP request is written verbatim and
+	// the response is read verbatim. This test originally framed both, which meant
+	// it asserted on a byte stream the origin never sent.
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 	require.NoError(t, err)
-	body := naiveReadPaddingFrame(t, bufio.NewReader(conn))
+	body, readErr := io.ReadAll(bufio.NewReader(conn))
+	require.NoError(t, readErr)
 	t.Logf("DEFAULT: authenticated client reached loopback origin, got %q",
 		string(body[:minInt(20, len(body))]))
 	require.Contains(t, string(body), "origin-ok",
@@ -164,11 +169,11 @@ func TestAuditRouteRuleBlocksLoopback(t *testing.T) {
 	if err == nil {
 		defer response.Body.Close()
 		if response.StatusCode == http.StatusOK {
-			_, _ = conn.Write(naivePaddingFrame(
-				[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+			// HTTP/1: raw tunnel, written and read verbatim.
+			_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 			// A rejected route closes the tunnel, so the read may simply fail.
 			// Either an error or a body without the origin's content is a pass.
-			body, readErr := readPaddingFrameRaw2(bufio.NewReader(conn))
+			body, readErr := io.ReadAll(bufio.NewReader(conn))
 			if readErr != nil {
 				t.Logf("loopback tunnel closed after route reject: %v", readErr)
 			} else {
@@ -224,10 +229,11 @@ func TestAuditRouteRuleBlocksLoopback(t *testing.T) {
 	require.NoError(t, controlErr)
 	defer controlResponse.Body.Close()
 	require.Equal(t, http.StatusOK, controlResponse.StatusCode)
-	_, controlErr = controlConn.Write(naivePaddingFrame(
-		[]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 0))
+	// HTTP/1: raw tunnel, written and read verbatim.
+	_, controlErr = controlConn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
 	require.NoError(t, controlErr)
-	controlBody := naiveReadPaddingFrame(t, bufio.NewReader(controlConn))
+	controlBody, controlReadErr := io.ReadAll(bufio.NewReader(controlConn))
+	require.NoError(t, controlReadErr)
 	require.Contains(t, string(controlBody), "origin-ok",
 		"a rule that does NOT cover loopback must still allow the same destination: "+
 			"this proves the earlier block came from the rule, not from unreachability")

@@ -41,7 +41,11 @@ func TestAuditConnectAuthorityCannotOverrideTarget(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.StatusCode)
 
 	// Send data through the tunnel and see WHICH target received it.
-	_, err = conn.Write(naivePaddingFrame([]byte("AUTHORITY-PROBE"), 0))
+	//
+	// HTTP/1 is a RAW tunnel: the probe goes out verbatim. Framing it would put
+	// a Naive frame header in front of the bytes the origin is expected to see,
+	// so the test would be asserting about a different byte stream than it reads.
+	_, err = conn.Write([]byte("AUTHORITY-PROBE"))
 	require.NoError(t, err)
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, _ = io.ReadAll(conn)

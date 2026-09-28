@@ -460,7 +460,8 @@ func TestJiejieTargetACLSelfIPUoTIsRejected(t *testing.T) {
 	writer := &sliceWriter{}
 	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(
 		writer, metadata.ParseSocksaddr("93.184.216.34:443")))
-	_, err = conn.Write(naivePaddingFrame(append([]byte{0}, writer.data...), 0))
+	// HTTP/1: the UoT request header is written raw.
+	_, err = conn.Write(append([]byte{0}, writer.data...))
 	require.NoError(t, err)
 
 	_ = writeUoTDatagramRaw(conn, metadata.ParseSocksaddr(

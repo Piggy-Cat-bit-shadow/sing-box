@@ -316,19 +316,23 @@ which are constrained to `jiejie_client_macos` and pass.
 
 ### `test/jiejie` under the server tag set
 
-Four additional failures, also **pre-existing and verified identical on
+Two additional failures, also **pre-existing and verified identical on
 `49579cf32`**:
 
 ```text
 TestAuditLoopbackIsReachableByDefault
 TestAuditRouteRuleBlocksLoopback
-TestAuditUoTV2NonConnectMode
-TestAuditUoTV2NonConnectMultipleTargets
 ```
 
-These are Naive UoT server audit tests that fail with an `EOF` during the UoT
-handshake. They are unrelated to the build-profile work and were not investigated
-further; they are recorded so the server baseline is not mistaken for a clean run.
+These are Naive loopback audit tests, unrelated to the build-profile work. They are
+recorded so the server baseline is not mistaken for a clean run.
+
+> **Correction (UoT).** An earlier revision of this page also listed
+> `TestAuditUoTV2NonConnectMode` and `TestAuditUoTV2NonConnectMultipleTargets` here
+> as pre-existing Naive UoT failures with an `EOF` during the handshake. That was
+> **wrong**. Both were failures of the TEST HARNESS, not the product: they framed an
+> HTTP/1 CONNECT payload as Naive padded data, and HTTP/1 is a raw tunnel. They now
+> pass. See [JIEJIE-NAIVE-UOT-FALSE-P0.md](JIEJIE-NAIVE-UOT-FALSE-P0.md).
 
 ### What is green
 

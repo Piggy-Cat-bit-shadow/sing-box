@@ -100,13 +100,82 @@ func startUDPEchoServer(t *testing.T) string {
 }
 
 // uotSession is one open UoT tunnel.
+// naiveTransport names the HTTP version a tunnel was established over.
+//
+// It exists because Naive's wire format is transport-dependent, and the two
+// properties that vary are easily conflated:
+//
+//   - the Padding REQUEST HEADER, which a client may send on any transport, and
+//     which the response mirrors unconditionally;
+//   - the padding PAYLOAD FRAMING, which the server applies ONLY on HTTP/2 and
+//     HTTP/3.
+//
+// Keeping them as one boolean is what produced a false "unknown address family:
+// 8" report: a test set a single padding flag on an HTTP/1 tunnel, framed a UoT
+// request header that HTTP/1 sends raw, and the server read the frame's length
+// byte as a SOCKS address family.
+type naiveTransport uint8
+
+const (
+	transportHTTP1 naiveTransport = iota
+	transportHTTP2
+	transportHTTP3
+)
+
+func (transport naiveTransport) String() string {
+	switch transport {
+	case transportHTTP1:
+		return "HTTP/1"
+	case transportHTTP2:
+		return "HTTP/2"
+	case transportHTTP3:
+		return "HTTP/3"
+	default:
+		return "unknown"
+	}
+}
+
+// framesPayload reports whether THE SERVER frames the tunnel payload on this
+// transport, given whether the request carried a Padding header.
+//
+// This is the single place the transport rule lives, and it is derived rather
+// than passed in, so a caller cannot declare an HTTP/1 tunnel that frames. The
+// authority is protocol/naive/inbound.go, where the hijack branch constructs
+//
+//	naiveConn{Conn: conn, paddingConn: paddingConn{enabled: false}}
+//
+// with a literal false, matching the reference's
+// "serveHijack -> dualStream(..., false)".
+func (transport naiveTransport) framesPayload(requestPaddingHeader bool) bool {
+	return transport != transportHTTP1 && requestPaddingHeader
+}
+
 type uotSession struct {
-	conn    net.Conn
-	reader  *bufio.Reader
+	conn   net.Conn
+	reader *bufio.Reader
+	// transport is the HTTP version this tunnel runs over. It decides whether
+	// the payload is framed, so it is recorded rather than assumed.
+	transport naiveTransport
+	// padding reports whether the SERVER frames this tunnel's payload. It is
+	// derived from transport and the request's Padding header by newUoTSession,
+	// never set directly: setting it by hand is how an HTTP/1 tunnel came to be
+	// written with Naive frames.
 	padding bool
 	// version records which UoT protocol version this session speaks, so the
 	// unpadded reader knows whether a v1 address prefix precedes the length.
 	version uint8
+}
+
+// newUoTSession builds a session whose framing is DERIVED from its transport and
+// the Padding header the request actually carried.
+func newUoTSession(conn net.Conn, transport naiveTransport, requestPaddingHeader bool, version uint8) *uotSession {
+	return &uotSession{
+		conn:      conn,
+		reader:    bufio.NewReader(conn),
+		transport: transport,
+		padding:   transport.framesPayload(requestPaddingHeader),
+		version:   version,
+	}
 }
 
 // dialUoT opens an authenticated CONNECT to the UoT magic address for the given
@@ -127,21 +196,16 @@ func dialUoT(t *testing.T, port uint16, version uint8, udpTarget string, usePadd
 	require.Equal(t, http.StatusOK, response.StatusCode,
 		"an authenticated UoT CONNECT to %s must be accepted", magic)
 
-	// This helper drives the tunnel over HTTP/1, and HTTP/1 is a RAW tunnel in
-	// the reference: its CONNECT branch ends in
+	// This helper drives the tunnel over HTTP/1. HTTP/1 is a RAW tunnel, so the
+	// request may still CARRY a Padding header (the response header is
+	// unconditional) while the payload carries no Naive frame: neither UoT's own
+	// header nor its datagrams are framed here. The framing flag is therefore
+	// DERIVED from the transport rather than copied from usePadding, which is
+	// what keeps the request header and the wire framing from being conflated.
 	//
-	//	serveHijack -> dualStream(targetConn, clientConn, clientConn, false)
-	//
-	// with a literal false for padding. The Padding header only takes effect on
-	// HTTP/2 and HTTP/3. So although the request may still CARRY a Padding header
-	// (the response header is unconditional), the payload carries no Naive frame
-	// on this transport, and neither UoT's own header nor its datagrams are
-	// framed here.
-	//
-	// The flag is therefore forced off for HTTP/1 rather than following
-	// usePadding. UoT itself is unaffected: it has its own protocol framing
-	// inside the tunnel, which is independent of Naive's padding layer.
-	session := &uotSession{conn: conn, reader: bufio.NewReader(conn), padding: false, version: version}
+	// UoT itself is unaffected: it has its own protocol framing inside the
+	// tunnel, which is independent of Naive's padding layer.
+	session := newUoTSession(conn, transportHTTP1, usePadding, version)
 
 	if version == uot.Version {
 		// UoT v2 connect mode: isConnect=1 followed by the destination.

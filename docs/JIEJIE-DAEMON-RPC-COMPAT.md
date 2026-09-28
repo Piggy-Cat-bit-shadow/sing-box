@@ -179,10 +179,14 @@ Run on macOS arm64, `go1.25.5`, against launcher HEAD `854c468c`
 
 ### The `test/jiejie` failures
 
-Three of the four documented baseline failures reproduced:
-`TestAuditLoopbackIsReachableByDefault`, `TestAuditRouteRuleBlocksLoopback`,
-`TestAuditUoTV2NonConnectMode`, `TestAuditUoTV2NonConnectMultipleTargets` — the
-fourth, `TestAuditUoTV2NonConnectMultipleTargets`, also failed.
+The two documented baseline failures reproduced:
+`TestAuditLoopbackIsReachableByDefault` and `TestAuditRouteRuleBlocksLoopback`.
+
+(`TestAuditUoTV2NonConnectMode` and `TestAuditUoTV2NonConnectMultipleTargets` were
+reported as failing in an earlier run of this document. They were NOT product
+failures — the test harness framed an HTTP/1 payload as Naive padded data. They have
+since been fixed and pass; see
+[JIEJIE-NAIVE-UOT-FALSE-P0.md](JIEJIE-NAIVE-UOT-FALSE-P0.md).)
 
 One additional failure appeared, `TestAuditConnectAuthorityCannotOverrideTarget`,
 and it is **NOT** related to this work:

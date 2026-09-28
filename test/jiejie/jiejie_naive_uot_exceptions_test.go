@@ -234,10 +234,11 @@ func TestJiejieNaiveUoTSilentTargetDoesNotLeakResources(t *testing.T) {
 				conn.Close()
 				continue
 			}
-			_, _ = tlsConn.Write(naivePaddingFrame(append([]byte{1}, addressBytes...), 0))
+			// HTTP/1: raw tunnel, so the UoT request header is written verbatim.
+			_, _ = tlsConn.Write(append([]byte{1}, addressBytes...))
 			length := make([]byte, 2)
 			binary.BigEndian.PutUint16(length, 4)
-			_, _ = tlsConn.Write(naivePaddingFrame(append(length, []byte("ping")...), 0))
+			_, _ = tlsConn.Write(append(length, []byte("ping")...))
 			// Do not wait for a reply: these targets never answer. Give the server
 			// a moment to process, then drop the client hard.
 			time.Sleep(5 * time.Millisecond)
