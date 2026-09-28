@@ -2,6 +2,7 @@ package option
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/sagernet/sing/common/byteformats"
@@ -20,10 +21,16 @@ import (
 //	ConnectionReceiveWindow -> int32 (MaxInt32)
 //	InitialPacketSize    -> uint16   (MaxUint16)
 //
-// The receive windows need extra care: MemoryBytes.UnmarshalJSON parses a bare
-// number into an int64 and stores it as uint64, so "-1" becomes
-// 18446744073709551615 and the sign is gone before sing-box sees it. The old
-// downstream min(v, MaxInt32) then turned that into about 2 GiB.
+// The receive windows need extra care. MemoryBytes.UnmarshalJSON used to parse a
+// bare number into an int64 and store it as uint64, so "-1" became
+// 18446744073709551615 with the sign gone before sing-box saw it, and the old
+// downstream min(v, MaxInt32) turned that into about 2 GiB.
+//
+// That parser now rejects a negative literal outright and also rejects a value that
+// would overflow, so a negative window is caught at PARSE time rather than being
+// reinterpreted downstream. The tests below therefore distinguish two layers: the
+// parser must refuse a negative literal, and ResolveServerResources must still
+// refuse an out-of-range value that reaches it by any other route.
 
 // memoryBytesFrom parses a byte-size literal the way a configuration would.
 func memoryBytesFrom(t *testing.T, literal string) *byteformats.MemoryBytes {
@@ -98,17 +105,33 @@ func TestHTTP2ReceiveWindowBounds(t *testing.T) {
 			require.Contains(t, err.Error(), window.name)
 		})
 
-		t.Run(window.name+" negative is rejected", func(t *testing.T) {
-			// This is the case the task called out. "-1" parses SUCCESSFULLY into
-			// uint64 max, so the rejection has to come from the upper bound, and
-			// the error has to be produced rather than a ~2 GiB window.
+		t.Run(window.name+" negative is rejected at parse time", func(t *testing.T) {
+			// The parser is the FIRST line of defence and is where this is now
+			// caught: a negative literal would otherwise become an enormous
+			// unsigned value with the sign silently gone.
+			var memory byteformats.MemoryBytes
+			err := memory.UnmarshalJSON([]byte("-1"))
+			require.Error(t, err,
+				"a negative byte literal must be refused by the parser; converting "+
+					"it to uint64 yields a huge value and loses the sign")
+		})
+
+		t.Run(window.name+" negative never reaches resolution", func(t *testing.T) {
+			// The second layer, which still matters because a value can reach
+			// ResolveServerResources from a struct built in code rather than parsed
+			// from JSON. uint64 max is what "-1" used to become.
+			var huge uint64 = math.MaxUint64
+			var memory byteformats.MemoryBytes
+			require.NoError(t, memory.UnmarshalJSON([]byte(`"18446744073709551615b"`)),
+				"the fixture must be a literal the parser accepts")
+			require.Equal(t, huge, memory.Value())
+
 			var http2 HTTP2Options
-			window.set(&http2, memoryBytesFrom(t, "-1"))
+			window.set(&http2, &memory)
 			err := resolveWith(t, http2, QUICOptions{})
 			require.Error(t, err,
-				"a negative window parses to a huge unsigned number and must be "+
-					"refused; clamping it to about 2 GiB is exactly the silent "+
-					"misbehaviour this guards against")
+				"an out-of-range window must be refused rather than clamped to about "+
+					"2 GiB, which is exactly the silent misbehaviour this guards against")
 			require.Contains(t, err.Error(), window.name)
 		})
 	}
