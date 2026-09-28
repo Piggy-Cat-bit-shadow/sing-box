@@ -128,6 +128,25 @@ The unit tests cannot catch the original bug on their own: they compile against
 compares against the launcher's own generated method set, and the binary smoke test,
 which inspects the artifact, can see drift.
 
+### These guards were verified by mutation, not by inspection
+
+Each guard was checked by breaking the thing it protects and confirming the failure:
+
+| Mutation | Caught by |
+| --- | --- |
+| remove `GetGroups` from the proto | the contract guard and the build |
+| drop `with_lx_command` from the macOS profile | the contract guard |
+| `GetGroups` returns an empty group list | five tests, including the parity and roundtrip ones |
+| URL test derived from `context.Background()` | the context-derivation test |
+| `readGroups` caches its snapshot | the select-roundtrip test |
+
+The fourth is worth noting because the FIRST attempt at it was not caught. The
+outcome test (`TestURLTestOutboundIsBoundedByItsContext`) passed against the
+mutation, because cancellation also reaches the dial through the request context
+the dialer threads down. That is why `urlTestContext` exists as a named helper: it
+makes "which context did the test run under" directly assertable. A guard that has
+not been mutation-checked is a guess.
+
 ## If you change the daemon RPC surface
 
 1. Edit `daemon/started_service.proto`. Field numbers and method names are the wire
