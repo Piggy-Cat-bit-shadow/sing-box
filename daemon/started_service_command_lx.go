@@ -1,0 +1,190 @@
+//go:build with_lx_command
+
+package daemon
+
+import (
+	"context"
+	"time"
+
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/protocol/group"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+)
+
+// The unary command surface that JiejieBox / singbox-launcher drives its proxy UI
+// with. See started_service_command_lx_stub.go for the build-tag twin and
+// daemon/started_service.proto for why the RPCs are declared unconditionally while
+// these handlers are gated.
+//
+// Ported from SagerNet/sing-box 94c41b50 (SPEC 014/015/019) and then ADAPTED to
+// this fork's architecture. Two adaptations matter and are called out at the sites
+// below: this fork's group.RealTag takes (detour, network) rather than
+// (outboundManager, detour), and this fork has no adapter.IdleStateReporter, so the
+// WG/AWG endpoint-state field is deliberately left unfilled rather than ported with
+// a subsystem that does not exist here.
+
+// GetGroups returns a pull snapshot of the group list.
+//
+// This is the RPC whose absence produced, on a real machine:
+//
+//	cannot read the proxies of group "🌍 国外流量": daemon GetGroups:
+//	rpc error: code = Unimplemented desc = unknown method GetGroups
+//
+// It deliberately does NOT build a second group enumeration. readGroups() is the
+// single source that also feeds SubscribeGroups, so the stream and the unary call
+// cannot disagree about the same instance — which is what the parity test asserts.
+//
+// A unary call is needed at all because SubscribeGroups only PUSHES: a client that
+// has just paired, or that missed a broadcast during a reconnect, has no way to ask
+// for the current state, and would otherwise show an empty proxy list while the
+// tunnel is demonstrably up.
+//
+// Error model: FailedPrecondition when the service is not started, matching
+// GetOutbounds and the other snapshots. An empty group list is a SUCCESS with an
+// empty list, not NotFound — "this config defines no groups" is a valid answer, and
+// reporting it as an error would make the UI show a failure for a working core.
+func (s *StartedService) GetGroups(ctx context.Context, empty *emptypb.Empty) (*Groups, error) {
+	s.serviceAccess.RLock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED {
+		s.serviceAccess.RUnlock()
+		return nil, status.Error(codes.FailedPrecondition, "service is not started")
+	}
+	groups := s.readGroups()
+	s.serviceAccess.RUnlock()
+	return groups, nil
+}
+
+// GetOutbounds returns a pull snapshot of the flat outbound and endpoint list.
+//
+// It exists alongside GetGroups because the two answer different questions:
+// SubscribeGroups/GetGroups cover only the nodes INSIDE a group, whereas standalone
+// outbounds that belong to no group appear only here.
+//
+// The builder is shared with SubscribeOutbounds rather than duplicated, via
+// readOutbounds(). The reference chose to duplicate it to avoid touching upstream
+// code; this fork has already diverged from upstream substantially, so sharing is
+// both cheaper and safer here — a duplicate would be free to drift, and the parity
+// test would only catch that after the fact.
+func (s *StartedService) GetOutbounds(ctx context.Context, empty *emptypb.Empty) (*OutboundList, error) {
+	s.serviceAccess.RLock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED {
+		s.serviceAccess.RUnlock()
+		return nil, status.Error(codes.FailedPrecondition, "service is not started")
+	}
+	list := s.readOutbounds()
+	s.serviceAccess.RUnlock()
+	return list, nil
+}
+
+// URLTestOutbound measures a single node and returns its latency synchronously.
+//
+// Unlike URLTest above — which kicks off a whole group and writes the result to the
+// history asynchronously, so the caller never learns the value — this returns the
+// delay in the reply, which is what a per-node latency badge needs.
+//
+// CANCELLATION. The test is parented to the gRPC per-call ctx, NOT to
+// boxService.ctx. gRPC cancels this ctx automatically when the caller cancels or
+// the connection drops, so:
+//
+//   - the user closing the proxy page aborts the in-flight dial;
+//   - a new round of testing supersedes the old one instead of racing it;
+//   - a broken daemon connection does not leave a dial running against a client
+//     that has gone away.
+//
+// Parenting to boxService.ctx would make the test outlive its caller: cancellation
+// could not reach the dial, and the only remaining lever would be tearing down the
+// whole connection. A caller-supplied Timeout is layered ON TOP of the call ctx as a
+// child deadline, never as a replacement — so a request that specifies no timeout is
+// still bounded by the caller's own cancellation.
+func (s *StartedService) URLTestOutbound(ctx context.Context, request *URLTestOutboundRequest) (*URLTestOutboundResponse, error) {
+	s.serviceAccess.RLock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED {
+		s.serviceAccess.RUnlock()
+		return nil, status.Error(codes.FailedPrecondition, "service is not started")
+	}
+	boxService := s.instance
+	s.serviceAccess.RUnlock()
+
+	// The lock is released BEFORE the network operation. Holding serviceAccess across
+	// urltest.URLTest would let one latency test — bounded only by the caller's
+	// timeout, potentially tens of seconds — block StartOrReloadService, CloseService
+	// and every other reader. Only the instance POINTER is taken under the lock; the
+	// test itself runs outside it.
+	//
+	// The pointer stays valid for the duration because a reload does not free the old
+	// instance underneath an in-flight call: the dialers it holds are reference-
+	// counted through boxService.ctx, and the test ctx is derived from the gRPC call,
+	// so a reload during a test causes the test to fail fast rather than use freed
+	// state. The lifecycle tests in started_service_command_lx_test.go exercise
+	// exactly this window.
+	tag := request.OutboundTag
+
+	// Resolve in BOTH managers: outbound first, then endpoint. An adapter.Endpoint
+	// embeds adapter.Outbound, so either resolution yields an N.Dialer for
+	// urltest.URLTest and an adapter.Outbound for history keying. An endpoint that is
+	// also an outbound would otherwise be invisible to a per-node test.
+	//
+	// The endpoint manager is reached through the service context, as the rest of
+	// this file does, rather than through a struct field.
+	var detour N.Dialer
+	var realTagSource adapter.Outbound
+	if outbound, isLoaded := boxService.outboundManager.Outbound(tag); isLoaded {
+		detour = outbound
+		realTagSource = outbound
+	} else if endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx); endpointManager != nil {
+		if endpoint, isLoaded := endpointManager.Get(tag); isLoaded {
+			detour = endpoint
+			realTagSource = endpoint
+		}
+	}
+	if detour == nil {
+		// Variant B: an unknown tag is an APPLICATION outcome, reported in the
+		// payload, so the client has exactly one failure channel to handle.
+		return &URLTestOutboundResponse{Error: "outbound or endpoint not found: " + tag}, nil
+	}
+
+	testCtx := ctx
+	if request.Timeout > 0 {
+		var cancel context.CancelFunc
+		testCtx, cancel = context.WithTimeout(ctx, time.Duration(request.Timeout)*time.Millisecond)
+		defer cancel()
+	}
+
+	// An empty link means "use the default"; urltest.URLTest substitutes
+	// https://www.gstatic.com/generate_204 itself (common/urltest/urltest.go:102).
+	// Resolving it here would create a SECOND definition of that default, free to
+	// drift from the one the group path uses.
+	delay, err := urltest.URLTest(testCtx, request.Link, detour)
+
+	// The history key must be the one readGroups/readOutbounds already use, or the
+	// value written here would never be the value displayed: GetGroups would keep
+	// reporting the previous delay while this RPC returned a fresh one. This fork's
+	// RealTag takes (detour, network) — the reference's takes
+	// (outboundManager, detour) — so the call is adapted rather than copied.
+	realTag := group.RealTag(realTagSource, N.NetworkTCP)
+	if realTag == "" {
+		// RealTag returns "" when a group resolves to no selection. Falling back to
+		// the requested tag keeps the history entry addressable instead of writing to
+		// the empty key, which every later lookup would also hit.
+		realTag = tag
+	}
+	historyStorage := boxService.urlTestHistoryStorage
+	if err != nil {
+		// A failed test must REMOVE the stale figure. Leaving it would show the last
+		// good latency for a node that has just failed, which is worse than showing
+		// nothing: the UI would report a dead node as healthy.
+		historyStorage.DeleteURLTestHistory(realTag)
+		return &URLTestOutboundResponse{Error: err.Error()}, nil
+	}
+	historyStorage.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+		Time:  time.Now(),
+		Delay: delay,
+	})
+	return &URLTestOutboundResponse{Delay: uint32(delay)}, nil
+}

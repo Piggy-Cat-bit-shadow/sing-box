@@ -626,9 +626,19 @@ func (s *StartedService) readGroups() *Groups {
 			}
 			g.Items = append(g.Items, &item)
 		}
-		if len(g.Items) == 0 {
-			continue
-		}
+		// Every group is emitted, whatever its size.
+		//
+		// This used to `continue` on len(g.Items) == 0, which silently hides
+		// single-node selectors whose only member failed to resolve AND empty groups.
+		// The reference documents the same drop as a regression against Clash, whose
+		// /proxies returned group.All() unfiltered (SagerNet/sing-box 94c41b50,
+		// SPEC 015 §3.5): the UI then shows a proxy list that is missing groups the
+		// configuration demonstrably defines, with no error to explain the absence.
+		//
+		// readGroups() is the single source feeding both SubscribeGroups and
+		// GetGroups, so emitting every group fixes the stream and the unary snapshot
+		// together — which is why this is the right place for the fix rather than a
+		// filter in either caller.
 		gs.Group = append(gs.Group, &g)
 	}
 	return &gs
@@ -1171,34 +1181,13 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 	var lastSendTime time.Time
 	for {
 		s.serviceAccess.RLock()
-		boxService := s.instance
 		started := s.serviceStatus.Status == ServiceStatus_STARTED
 		s.serviceAccess.RUnlock()
 		var list OutboundList
 		if started {
-			historyStorage := boxService.urlTestHistoryStorage
-			for _, ob := range boxService.outboundManager.Outbounds() {
-				item := &GroupItem{
-					Tag:  ob.Tag(),
-					Type: ob.Type(),
-				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(ob, N.NetworkTCP)); history != nil {
-					item.UrlTestTime = history.Time.Unix()
-					item.UrlTestDelay = int32(history.Delay)
-				}
-				list.Outbounds = append(list.Outbounds, item)
-			}
-			for _, ep := range boxService.endpointManager.Endpoints() {
-				item := &GroupItem{
-					Tag:  ep.Tag(),
-					Type: ep.Type(),
-				}
-				if history := historyStorage.LoadURLTestHistory(group.RealTag(ep, N.NetworkTCP)); history != nil {
-					item.UrlTestTime = history.Time.Unix()
-					item.UrlTestDelay = int32(history.Delay)
-				}
-				list.Outbounds = append(list.Outbounds, item)
-			}
+			// The same builder GetOutbounds uses, so the stream and the unary
+			// snapshot cannot disagree about the same instance.
+			list = *s.readOutbounds()
 		}
 		err = server.Send(&list)
 		if err != nil {
@@ -2117,4 +2106,40 @@ func (s *StartedService) Instance() *Instance {
 	s.serviceAccess.RLock()
 	defer s.serviceAccess.RUnlock()
 	return s.instance
+}
+
+// readOutbounds builds the OutboundList shared by SubscribeOutbounds and
+// GetOutbounds.
+//
+// The caller holds at least a read lock on serviceAccess, so instance is stable for
+// the duration of the build.
+func (s *StartedService) readOutbounds() *OutboundList {
+	boxService := s.instance
+	historyStorage := boxService.urlTestHistoryStorage
+	var list OutboundList
+	appendItem := func(detour adapter.Outbound) {
+		item := &GroupItem{
+			Tag:  detour.Tag(),
+			Type: detour.Type(),
+		}
+		if history := historyStorage.LoadURLTestHistory(group.RealTag(detour, N.NetworkTCP)); history != nil {
+			item.UrlTestTime = history.Time.Unix()
+			item.UrlTestDelay = int32(history.Delay)
+		}
+		// NOTE: the reference fills EndpointState/IdleSinceSeconds here from
+		// adapter.IdleStateReporter (WG/AWG suspend, SPEC 097/106). This fork has no
+		// such adapter interface and no idle-suspend subsystem, so the fields are
+		// left at their zero values rather than ported along with a feature that does
+		// not exist here. The proto fields are absent for the same reason.
+		list.Outbounds = append(list.Outbounds, item)
+	}
+	for _, outbound := range boxService.outboundManager.Outbounds() {
+		appendItem(outbound)
+	}
+	if endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx); endpointManager != nil {
+		for _, endpoint := range endpointManager.Endpoints() {
+			appendItem(endpoint)
+		}
+	}
+	return &list
 }
