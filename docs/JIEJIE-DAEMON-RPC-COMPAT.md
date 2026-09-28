@@ -158,3 +158,53 @@ not been mutation-checked is a guess.
 5. If it is on the proxy-UI critical path, confirm
    `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS` enables the real implementation, and run
    `scripts/ci/smoke-jiejie-daemon-rpc.sh` against the built binary.
+
+## Verification record
+
+Run on macOS arm64, `go1.25.5`, against launcher HEAD `854c468c`
+(`internal/daemonpb/SYNC_REV` = `94c41b50`).
+
+| Check | Result |
+| --- | --- |
+| `scripts/ci/check-jiejie-daemon-rpc-contract.sh` | PASS — 55/55 launcher-called methods declared and registered (was 45/55) |
+| `scripts/ci/smoke-jiejie-daemon-rpc.sh` on the macOS arm64 build | PASS — `GetGroups`, `GetOutbounds`, `URLTestOutbound` all recognized; none unknown, none Unimplemented |
+| `go test ./daemon/` (macOS client tags) | PASS |
+| `go test -race ./daemon/` (macOS client tags) | PASS, no data races, stable over repeated runs |
+| `go test ./lxd/` (with_lxd) | PASS |
+| `go test ./cmd/sing-box/` | PASS |
+| `BenchmarkGetGroupsSnapshot` (10 groups x 100 nodes) | 70,067 ns/op, 1000 nodes |
+| Server Minimal build | PASS — no `with_lxd`, no `with_lx_command`, no naive outbound, Cronet absent from the graph |
+| `check release/jiejie-production-topology.json` | PASS |
+| `test/jiejie` suite | 199 passed, 30 skipped, 5 failed (see below) |
+
+### The `test/jiejie` failures
+
+Three of the four documented baseline failures reproduced:
+`TestAuditLoopbackIsReachableByDefault`, `TestAuditRouteRuleBlocksLoopback`,
+`TestAuditUoTV2NonConnectMode`, `TestAuditUoTV2NonConnectMultipleTargets` — the
+fourth, `TestAuditUoTV2NonConnectMultipleTargets`, also failed.
+
+One additional failure appeared, `TestAuditConnectAuthorityCannotOverrideTarget`,
+and it is **NOT** related to this work:
+
+- it is a Naive inbound authority audit — the failing test file contains zero
+  references to the daemon surface;
+- `test/jiejie` compiles with its own tag set
+  (`with_quic,with_naive_outbound,badlinkname,tfogo_checklinkname0`), which has
+  never contained `with_lx_command`, so the build-tag change cannot reach it;
+- it passes 3/3 when run in isolation, so it is load-dependent in the full suite;
+- the failure is a backend origin server refusing a connection
+  (`dial tcp 127.0.0.1:<port>: connect: connection refused`) in the Naive path.
+
+It is reported here rather than fixed, and rather than silently added to the
+known-baseline list: adding a flaky test to a skip list is how a real regression
+hides. It is not counted as a PASS anywhere in this document.
+
+### Not tested
+
+- **Real JiejieBox GUI against a rebuilt core.** No GUI session was available. The
+  real-binary gRPC smoke test above proves `GetGroups` is no longer an unknown
+  method on a shipped artifact, which is the defect; it does not prove a rendered
+  proxy list in the app.
+- **End-to-end latency through a real remote node.** The URL test is exercised
+  against a local HTTP server only; no VPS was available.
