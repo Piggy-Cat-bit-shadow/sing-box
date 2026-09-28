@@ -3,6 +3,7 @@ package socks
 import (
 	"context"
 	"net"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -33,6 +34,9 @@ type Outbound struct {
 	client    *socks.Client
 	resolve   bool
 	uotClient *uot.Client
+	// earlyBufferGrowth is reported through the copy-tuning capability so the route
+	// layer can size its buffers for a chained hop. Off unless opted in.
+	earlyBufferGrowth bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SOCKSOutboundOptions) (adapter.Outbound, error) {
@@ -57,6 +61,39 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		client:    socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
 		resolve:   version == socks.Version4,
 	}
+
+	if preconnect := options.TCPPreconnect; preconnect != nil && preconnect.Enabled {
+		// The pool is SOCKS5 TCP CONNECT only. Enabling it for another version is a
+		// configuration error rather than a silent no-op, so an operator cannot
+		// believe a pool is active when it is not.
+		if version != socks.Version5 {
+			return nil, E.New("socks: tcp_preconnect requires version 5, got ", version)
+		}
+		preconnectOptions := socks.PreconnectOptions{
+			MinIdle:     preconnect.MinIdle,
+			MaxIdle:     preconnect.MaxIdle,
+			IdleTimeout: time.Duration(preconnect.IdleTimeout),
+		}
+		// Defaults apply only to parameters the operator omitted, so a bare
+		// `"enabled": true` yields a small bounded pool rather than zero or unbounded.
+		if preconnectOptions.MinIdle == 0 {
+			preconnectOptions.MinIdle = socks.DefaultPreconnectMinIdle
+		}
+		if preconnectOptions.MaxIdle == 0 {
+			preconnectOptions.MaxIdle = socks.DefaultPreconnectMaxIdle
+		}
+		if preconnectOptions.IdleTimeout == 0 {
+			preconnectOptions.IdleTimeout = socks.DefaultPreconnectIdleTimeout
+		}
+		if err = outbound.client.EnablePreconnect(preconnectOptions); err != nil {
+			return nil, err
+		}
+	}
+
+	if tuning := options.TCPTuning; tuning != nil {
+		outbound.earlyBufferGrowth = tuning.EarlyBufferGrowth
+	}
+
 	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
 	if uotOptions.Enabled {
 		outbound.uotClient = &uot.Client{
@@ -65,6 +102,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	return outbound, nil
+}
+
+// EarlyConnectionBufferGrowth implements adapter.ConnectionCopyTuner.
+//
+// It reports whether the copy path may switch to a large buffer after the first
+// transfer for connections through THIS outbound. Returning false keeps the
+// framework default, so an ordinary SOCKS outbound is unaffected.
+func (h *Outbound) EarlyConnectionBufferGrowth() bool {
+	return h.earlyBufferGrowth
+}
+
+// Close releases the preconnect pool, so a reload or a removed outbound leaves no
+// goroutine and no socket behind.
+func (h *Outbound) Close() error {
+	return h.client.Close()
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

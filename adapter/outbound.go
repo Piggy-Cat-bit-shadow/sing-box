@@ -31,6 +31,27 @@ type OutboundWithMultiplex interface {
 	MultiplexEnabled() bool
 }
 
+// ConnectionCopyTuner is an OPTIONAL capability an outbound may implement to tune
+// how the route layer copies bytes for connections through it.
+//
+// It exists for a CHAINED hop: when the final outbound is itself a proxy, the
+// connection carries an extra segment, and waiting for the framework's default byte
+// threshold before growing the copy buffer delays the point at which the larger
+// buffer starts paying off.
+//
+// It is deliberately a capability rather than a check on a tag or a username. A tag
+// is configuration, so keying on one would make behaviour depend on what an operator
+// happened to name an outbound; keying on the capability means only an outbound that
+// explicitly opted in is affected, and every other outbound - including every other
+// SOCKS outbound - keeps the default.
+//
+// Implementations report the setting the operator chose. Returning false means "use
+// the framework default", never "use zero".
+type ConnectionCopyTuner interface {
+	Outbound
+	EarlyConnectionBufferGrowth() bool
+}
+
 type FlowOutbound interface {
 	Outbound
 	tun.Port

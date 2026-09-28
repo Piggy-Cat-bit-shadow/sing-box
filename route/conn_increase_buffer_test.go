@@ -29,14 +29,14 @@ import (
 func TestIncreaseBufferAfterIsNaiveOnly(t *testing.T) {
 	require.Equal(t, int64(1), connectionIncreaseBufferAfter(adapter.InboundContext{
 		InboundType: C.TypeNaive,
-	}), "Native Naive must upgrade its copy buffer after the first transfer")
+	}, nil), "Native Naive must upgrade its copy buffer after the first transfer")
 
 	// The contrast, stated explicitly: the Naive threshold must NOT be the library
 	// default. If a future change made them equal, the optimization would be silently
 	// gone while every other test still passed.
 	naiveThreshold := connectionIncreaseBufferAfter(adapter.InboundContext{
 		InboundType: C.TypeNaive,
-	})
+	}, nil)
 	require.NotEqual(t, int64(bufio.DefaultIncreaseBufferAfter), naiveThreshold,
 		"the Naive threshold must differ from the library default; if it is equal the "+
 			"optimization has been silently reverted")
@@ -61,7 +61,7 @@ func TestIncreaseBufferAfterLeavesOtherProtocolsAlone(t *testing.T) {
 	} {
 		t.Run(inboundType, func(t *testing.T) {
 			require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
-				connectionIncreaseBufferAfter(adapter.InboundContext{InboundType: inboundType}),
+				connectionIncreaseBufferAfter(adapter.InboundContext{InboundType: inboundType}, nil),
 				"inbound type %q must keep the library default copy threshold", inboundType)
 		})
 	}
@@ -72,12 +72,12 @@ func TestIncreaseBufferAfterLeavesOtherProtocolsAlone(t *testing.T) {
 // register.
 func TestIncreaseBufferAfterUnknownAndEmptyUseTheDefault(t *testing.T) {
 	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
-		connectionIncreaseBufferAfter(adapter.InboundContext{}),
+		connectionIncreaseBufferAfter(adapter.InboundContext{}, nil),
 		"an empty inbound type must fall back to the library default rather than "+
 			"assuming Naive")
 
 	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
-		connectionIncreaseBufferAfter(adapter.InboundContext{InboundType: "not-a-real-inbound"}),
+		connectionIncreaseBufferAfter(adapter.InboundContext{InboundType: "not-a-real-inbound"}, nil),
 		"an unknown inbound type must fall back to the library default")
 }
 
@@ -142,4 +142,112 @@ func indexOf(t *testing.T, haystack string, needle string) int {
 		"the route source must still contain %q; this test is reading the wrong code "+
 			"if it does not", needle)
 	return index
+}
+
+// --- Outbound capability tuning (chained SOCKS hop) -------------------------
+//
+// The threshold can now also be requested by the SELECTED OUTBOUND through
+// adapter.ConnectionCopyTuner, which is how a chained residential SOCKS hop opts in
+// without this file hardcoding a tag or a username.
+//
+// A tag was rejected as the key: it is operator-chosen configuration, so keying on one
+// would make copy behaviour depend on a naming choice. The capability means only an
+// outbound that explicitly asked for it is affected.
+
+// tunerOutbound is a minimal Outbound that reports a copy-tuning preference.
+type tunerOutbound struct {
+	adapter.Outbound
+	early bool
+}
+
+func (t tunerOutbound) EarlyConnectionBufferGrowth() bool { return t.early }
+
+// nonTunerOutbound implements Outbound WITHOUT the capability.
+type nonTunerOutbound struct {
+	adapter.Outbound
+}
+
+// TestOutboundCopyTunerOptsIn proves an outbound that implements the capability and
+// returns true gets the early threshold.
+func TestOutboundCopyTunerOptsIn(t *testing.T) {
+	metadata := adapter.InboundContext{InboundType: C.TypeAnyTLS}
+	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
+		connectionIncreaseBufferAfter(metadata, nil),
+		"without a tuning outbound the default must apply")
+
+	require.Equal(t, int64(earlyConnectionBufferIncreaseAfter),
+		connectionIncreaseBufferAfter(metadata, tunerOutbound{early: true}),
+		"an opted-in outbound must get the early threshold")
+}
+
+// TestOutboundCopyTunerOptsOut is the negative half, and the more important one:
+// implementing the capability while reporting false must NOT change behaviour. This is
+// what keeps an ordinary SOCKS outbound - which implements the capability but leaves
+// the option off - at the library default.
+func TestOutboundCopyTunerOptsOut(t *testing.T) {
+	metadata := adapter.InboundContext{InboundType: C.TypeAnyTLS}
+	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
+		connectionIncreaseBufferAfter(metadata, tunerOutbound{early: false}),
+		"a SOCKS outbound with the option off must keep the library default")
+}
+
+// TestOutboundWithoutCapabilityUsesDefault covers an outbound that does not implement
+// the capability at all.
+func TestOutboundWithoutCapabilityUsesDefault(t *testing.T) {
+	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
+		connectionIncreaseBufferAfter(
+			adapter.InboundContext{InboundType: C.TypeAnyTLS}, nonTunerOutbound{}),
+		"an outbound without the capability must keep the library default")
+}
+
+// TestNaiveStillWinsOverOutboundTuning pins the precedence: the Naive inbound rule is
+// checked first and is unchanged by this feature, so the existing Native Naive
+// optimization cannot regress because a SOCKS outbound was selected behind it.
+func TestNaiveStillWinsOverOutboundTuning(t *testing.T) {
+	require.Equal(t, int64(1),
+		connectionIncreaseBufferAfter(
+			adapter.InboundContext{InboundType: C.TypeNaive}, tunerOutbound{early: false}),
+		"Native Naive must keep its early growth even when the outbound does not opt in")
+
+	require.Equal(t, int64(1),
+		connectionIncreaseBufferAfter(
+			adapter.InboundContext{InboundType: C.TypeNaive}, tunerOutbound{early: true}),
+		"and when it does")
+}
+
+// TestGroupResolvesToTheSelectedMember is requirement: a route through a
+// selector/urltest must tune according to the MEMBER that served the connection, not
+// according to the group.
+//
+// The route layer passes the dialer that was actually selected, so this asserts the
+// property at the point the decision is made: whatever `this` is, its capability is
+// what counts. A group that reports false while its selected member reports true must
+// therefore yield the early threshold, which is what the pair of assertions shows.
+func TestGroupResolvesToTheSelectedMember(t *testing.T) {
+	metadata := adapter.InboundContext{InboundType: C.TypeAnyTLS}
+
+	group := nonTunerOutbound{}          // the group itself: no tuning
+	member := tunerOutbound{early: true} // the member that served the connection
+
+	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
+		connectionIncreaseBufferAfter(metadata, group),
+		"the group itself must not enable tuning")
+
+	require.Equal(t, int64(earlyConnectionBufferIncreaseAfter),
+		connectionIncreaseBufferAfter(metadata, member),
+		"the SELECTED member's opt-in must be honoured; the route layer passes the "+
+			"member, so a group cannot mask it")
+
+	// The inverse: a member that declines must not inherit tuning from anywhere.
+	require.Equal(t, int64(bufio.DefaultIncreaseBufferAfter),
+		connectionIncreaseBufferAfter(metadata, tunerOutbound{early: false}),
+		"a member that declines must keep the default")
+}
+
+// TestEarlyThresholdIsPositive reuses the reasoning from the Naive test: sing's
+// condition is `IncreaseBufferAfter > 0 && n >= IncreaseBufferAfter`, so a non-positive
+// value means "never grow" rather than "grow immediately".
+func TestEarlyThresholdIsPositive(t *testing.T) {
+	require.Positive(t, earlyConnectionBufferIncreaseAfter,
+		"a non-positive threshold would disable growth entirely")
 }

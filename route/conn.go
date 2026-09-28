@@ -171,7 +171,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// Resolved ONCE per connection, so both copy directions use the same
 	// threshold and the decision is visible at the call site rather than buried in
 	// the goroutine body.
-	increaseBufferAfter := connectionIncreaseBufferAfter(metadata)
+	increaseBufferAfter := connectionIncreaseBufferAfter(metadata, this)
 	go m.connectionCopy(ctx, conn, remoteConn, false, increaseBufferAfter, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, increaseBufferAfter, &done, onClose)
 }
@@ -208,12 +208,27 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 // Every inbound type other than Naive keeps bufio.DefaultIncreaseBufferAfter, so its
 // copy behaviour is byte-for-byte unchanged. Returning the library constant rather than
 // a copied literal means a future change to the default follows here automatically.
-func connectionIncreaseBufferAfter(metadata adapter.InboundContext) int64 {
+func connectionIncreaseBufferAfter(metadata adapter.InboundContext, dialer N.Dialer) int64 {
 	if metadata.InboundType == C.TypeNaive {
 		return naiveIncreaseBufferAfter
 	}
+	// An outbound may opt in through the ConnectionCopyTuner capability, which is how
+	// a chained SOCKS hop requests early growth without a tag or a username being
+	// hardcoded here. `this` is the dialer that was actually selected for THIS
+	// connection, so a group resolves to the member that served it rather than to
+	// the group itself.
+	if tuner, isTuner := dialer.(adapter.ConnectionCopyTuner); isTuner {
+		if tuner.EarlyConnectionBufferGrowth() {
+			return earlyConnectionBufferIncreaseAfter
+		}
+	}
 	return bufio.DefaultIncreaseBufferAfter
 }
+
+// earlyConnectionBufferIncreaseAfter is the threshold an opted-in outbound requests:
+// upgrade after the first transfer. It must be positive, because the copy loop treats
+// a non-positive value as "never grow".
+const earlyConnectionBufferIncreaseAfter = 1
 
 // naiveIncreaseBufferAfter is the Native Naive threshold: upgrade after the first
 // transfer. See connectionIncreaseBufferAfter for the reasoning, including why the

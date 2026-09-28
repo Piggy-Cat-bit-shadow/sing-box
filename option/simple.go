@@ -274,6 +274,39 @@ type SOCKSOutboundOptions struct {
 	Password   string             `json:"password,omitempty"`
 	Network    NetworkList        `json:"network,omitempty"`
 	UDPOverTCP *UDPOverTCPOptions `json:"udp_over_tcp,omitempty"`
+	// TCPPreconnect keeps a small pool of already-authenticated SOCKS5 TCP
+	// connections so greeting and authentication happen before a user request needs
+	// them. Absent or disabled means the previous behaviour exactly.
+	TCPPreconnect *SOCKSOutboundPreconnectOptions `json:"tcp_preconnect,omitempty"`
+	// TCPTuning carries copy-path tuning for a chained SOCKS hop.
+	TCPTuning *SOCKSOutboundTuningOptions `json:"tcp_tuning,omitempty"`
+}
+
+// SOCKSOutboundPreconnectOptions configures the authenticated idle connection pool.
+//
+// The pool is SOCKS5 TCP CONNECT only. It never applies to SOCKS4, to UDP
+// ASSOCIATE, to BIND or to UoT.
+type SOCKSOutboundPreconnectOptions struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// MinIdle is the parked-connection count the pool maintains. It is the steady
+	// state; the pool does not try to keep MaxIdle connections ready.
+	MinIdle int `json:"min_idle,omitempty"`
+	// MaxIdle bounds parked connections, including those still being established.
+	MaxIdle int `json:"max_idle,omitempty"`
+	// IdleTimeout closes a parked connection that has waited this long.
+	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+}
+
+// SOCKSOutboundTuningOptions opts a chained SOCKS hop into copy-path tuning.
+//
+// Kept separate from preconnect because they are independent concerns: one is when
+// the connection is established, the other is how bytes move once it is.
+type SOCKSOutboundTuningOptions struct {
+	// EarlyBufferGrowth lets the copy path switch to a large buffer after the first
+	// transfer instead of waiting for the default threshold. It is intended for a
+	// chained hop (client -> VPS -> residential proxy) and is off by default, so an
+	// ordinary SOCKS outbound is unaffected.
+	EarlyBufferGrowth bool `json:"early_buffer_growth,omitempty"`
 }
 
 type _HTTPOutboundOptions struct {
