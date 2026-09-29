@@ -524,10 +524,20 @@ func BenchmarkDataplaneCapsuleFallback(b *testing.B) {
 // BenchmarkDataplaneCapsuleFallbackAfterUnsupported measures the path when the transport REPORTS
 // itself datagram-capable but rejects every send.
 //
-// This is the case §80 asks about: whether an unsupported capability is discovered once or on
-// every packet. The metric recorded is `sendattempts/op`, so the answer is explicit rather than
-// inferred -- 1.0 means every packet is still being offered to the datagram transport before
-// falling back.
+// # This state does not occur in production, and the benchmark says so
+//
+// The capability is decided ONCE, at session construction, from the peer's SETTINGS
+// (newSession caches the DatagramStream only when DatagramsEnabled() is true; the HTTP/3 stream
+// reads EnableDatagrams from ClientConn.Settings and stores it in a field). So a session either has
+// a usable datagram path or never touches one, and the "capable but refusing" combination below
+// cannot arise from a real peer.
+//
+// It is measured anyway because the alternative was asserting the answer. `sendattempts/op` is
+// recorded at 1.0, which is the cost of the hypothetical: one wasted call per packet. If a future
+// change made the capability dynamic -- re-checking SETTINGS per packet, say -- this benchmark is
+// where that cost would become visible instead of being argued about.
+//
+// Recorded as NO CHANGE: the capability is already decided once, which is what the design requires.
 func BenchmarkDataplaneCapsuleFallbackAfterUnsupported(b *testing.B) {
 	packet := buildBenchIPv4Packet(1280, 6,
 		netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("93.184.216.34"))
