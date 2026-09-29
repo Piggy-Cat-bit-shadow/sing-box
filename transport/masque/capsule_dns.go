@@ -537,42 +537,48 @@ func parsePREF64(payload []byte) ([]netip.Prefix, error) {
 	return prefixes, nil
 }
 
-// SelectNameservers returns the nameservers this assignment wants used, in the order
-// the draft's service priorities express.
+// hasUsableResolver reports whether any configuration carries a nameserver that could
+// actually answer.
 //
-// The draft allows several DNS configurations when different servers own separate
-// internal domains. For a client with a single resolver chain there is one usable
-// view: the nameservers of the lowest-numbered configuration that carries any, with
-// each nameserver's priority ordering them. The full configuration list is retained
-// on the assignment so this policy can be revisited without re-parsing.
-func (a *DNSAssignment) SelectNameservers() []DNSNameserver {
+// # Why the flattening rule was removed
+//
+// This replaced SelectNameservers, which returned "the nameservers of the lowest-numbered
+// configuration, ranked by a GLOBAL priority". That rule was wrong in a way that mattered:
+// it discarded the configuration boundaries, so the runtime could send a query for a public
+// name to a resolver that had only claimed an internal domain.
+//
+// The policy now lives where it belongs. Which configuration answers is decided by longest
+// matching internal domain, and which resolver within it by priority -- both in
+// protocol/masque, which is the layer that knows the query. Keeping a second, weaker
+// selection rule here would be a competing source of truth for the same question, which is
+// exactly the kind of dead abstraction that looks implemented and is not.
+//
+// What remains here is the one question this layer CAN answer without a query: is there
+// anything usable at all. The endpoint uses it to tell "the server sent nothing" from "the
+// server sent something", and the runtime model applies the real policy.
+func (a *DNSAssignment) hasUsableResolver() bool {
 	if a == nil {
-		return nil
+		return false
 	}
-	var selected []DNSNameserver
-	bestPriority := uint16(0)
 	for _, configuration := range a.Configurations {
 		for _, nameserver := range configuration.Nameservers {
-			if nameserver.AuthenticationDomainName == "" &&
-				len(nameserver.IPv4Addresses)+len(nameserver.IPv6Addresses) == 0 {
-				// Nothing reachable and nothing to authenticate: unusable.
+			if nameserver.ServicePriority == 0 {
+				// The draft requires a non-zero service priority, so this cannot be used.
 				continue
 			}
-			if len(selected) == 0 || nameserver.ServicePriority < bestPriority {
-				bestPriority = nameserver.ServicePriority
-				selected = []DNSNameserver{nameserver}
-			} else if nameserver.ServicePriority == bestPriority {
-				selected = append(selected, nameserver)
+			if len(nameserver.IPv4Addresses)+len(nameserver.IPv6Addresses) > 0 ||
+				nameserver.AuthenticationDomainName != "" {
+				return true
 			}
 		}
 	}
-	return selected
+	return false
 }
 
-// Empty reports whether this assignment carries nothing usable, which is how a
-// cleared or useless assignment is distinguished from a valid one.
+// Empty reports whether this assignment carries nothing usable, which is how a cleared or
+// useless assignment is distinguished from a valid one.
 func (a *DNSAssignment) Empty() bool {
-	return a == nil || len(a.SelectNameservers()) == 0
+	return !a.hasUsableResolver()
 }
 
 // encodeDNSAssign builds a DNS_ASSIGN capsule payload from configurations.

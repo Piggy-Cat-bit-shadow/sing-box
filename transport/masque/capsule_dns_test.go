@@ -497,22 +497,39 @@ func TestDNSAssignRejectsTruncatedInputs(t *testing.T) {
 	require.Len(t, decoded, 1)
 }
 
-func TestDNSAssignSelectNameserversByPriority(t *testing.T) {
+// TestDNSAssignUsableResolverDetection covers the only selection question this layer can
+// answer without a query.
+//
+// Which CONFIGURATION answers a name, and which RESOLVER within it, both depend on the query
+// and are decided in protocol/masque, where the runtime model lives. Asserting a flattening
+// rule here would be a second, weaker answer to the same question.
+func TestDNSAssignUsableResolverDetection(t *testing.T) {
 	t.Parallel()
 
-	assignment := &DNSAssignment{Configurations: []DNSConfiguration{{
+	require.True(t, (&DNSAssignment{Configurations: []DNSConfiguration{{
 		Nameservers: []DNSNameserver{
 			{ServicePriority: 10, IPv4Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.10")}},
-			{ServicePriority: 1, IPv4Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")}},
-			{ServicePriority: 1, IPv4Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.2")}},
 		},
-	}}}
+	}}}).hasUsableResolver())
 
-	selected := assignment.SelectNameservers()
-	require.Len(t, selected, 2, "the two lowest-priority nameservers must be selected")
-	for _, nameserver := range selected {
-		require.EqualValues(t, 1, nameserver.ServicePriority)
-	}
+	// A priority of zero is not usable: the draft requires a non-zero service priority.
+	require.False(t, (&DNSAssignment{Configurations: []DNSConfiguration{{
+		Nameservers: []DNSNameserver{
+			{ServicePriority: 0, IPv4Addresses: []netip.Addr{netip.MustParseAddr("192.0.2.1")}},
+		},
+	}}}).hasUsableResolver())
+
+	// A name-only nameserver IS usable, because same-connection DoH reaches it by name.
+	require.True(t, (&DNSAssignment{Configurations: []DNSConfiguration{{
+		Nameservers: []DNSNameserver{
+			{ServicePriority: 1, AuthenticationDomainName: "dns.example.test."},
+		},
+	}}}).hasUsableResolver())
+
+	// Neither an address nor a name: nothing to reach.
+	require.False(t, (&DNSAssignment{Configurations: []DNSConfiguration{{
+		Nameservers: []DNSNameserver{{ServicePriority: 1}},
+	}}}).hasUsableResolver())
 }
 
 func TestDNSAssignmentEmpty(t *testing.T) {

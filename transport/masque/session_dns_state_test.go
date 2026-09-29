@@ -67,9 +67,9 @@ func TestDNSAssignReplacesRatherThanAccumulates(t *testing.T) {
 		"three assignments must leave exactly one configuration, not three")
 
 	// The surviving configuration must be the LAST one.
-	selected := third.SelectNameservers()
-	require.Len(t, selected, 1)
-	require.Equal(t, netip.MustParseAddr("192.0.2.3"), selected[0].IPv4Addresses[0],
+	require.Len(t, third.Configurations[0].Nameservers, 1)
+	require.Equal(t, netip.MustParseAddr("192.0.2.3"),
+		third.Configurations[0].Nameservers[0].IPv4Addresses[0],
 		"the most recent assignment must be the one in effect")
 }
 
@@ -259,7 +259,10 @@ func TestDNSAndPREF64UpdatesAreIndividuallyAtomic(t *testing.T) {
 
 		// Every published value must be internally whole: exactly the nameserver this
 		// test constructed, not a partially built one.
-		nameservers := state.configuration.DNS.SelectNameservers()
+		if len(state.configuration.DNS.Configurations) == 0 {
+			continue
+		}
+		nameservers := state.configuration.DNS.Configurations[0].Nameservers
 		if len(nameservers) == 0 {
 			continue
 		}
@@ -308,7 +311,11 @@ func TestDNSHandlersAreRaceFree(t *testing.T) {
 			for range 20000 {
 				state := current.loadState()
 				if state.configuration.DNS != nil {
-					_ = state.configuration.DNS.SelectNameservers()
+					// Read the same shape the runtime does: the configuration list and
+					// the resolvers within it, plus the emptiness predicate.
+					for _, configuration := range state.configuration.DNS.Configurations {
+						_ = len(configuration.Nameservers)
+					}
 					_ = state.configuration.DNS.Empty()
 				}
 				_ = len(state.configuration.PREF64)
@@ -343,10 +350,11 @@ func TestServiceParametersSurviveReplacement(t *testing.T) {
 
 	state := current.loadState()
 	require.NotNil(t, state.configuration.DNS)
-	selected := state.configuration.DNS.SelectNameservers()
-	require.Len(t, selected, 1)
-	require.Equal(t, []byte{0x02, 'h', '2'}, selected[0].ServiceParameters[dnsmessage.SVCParamALPN])
-	require.Equal(t, "resolver.example.", selected[0].AuthenticationDomainName)
+	require.Len(t, state.configuration.DNS.Configurations, 1)
+	nameservers := state.configuration.DNS.Configurations[0].Nameservers
+	require.Len(t, nameservers, 1)
+	require.Equal(t, []byte{0x02, 'h', '2'}, nameservers[0].ServiceParameters[dnsmessage.SVCParamALPN])
+	require.Equal(t, "resolver.example.", nameservers[0].AuthenticationDomainName)
 }
 
 func itoaHex(value int) string {

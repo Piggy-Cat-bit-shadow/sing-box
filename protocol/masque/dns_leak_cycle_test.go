@@ -287,9 +287,9 @@ func TestUnreachableAssignmentIsRefusedWholesale(t *testing.T) {
 				{
 					Nameservers: []masque.DNSNameserver{
 						// Inside the routes.
-						{IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:db8::53")}},
-						// OUTSIDE the routes: must poison the whole configuration.
-						{IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:dead::53")}},
+						{ServicePriority: 1, IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:db8::53")}},
+						// OUTSIDE the routes: must be dropped rather than installed.
+						{ServicePriority: 2, IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:dead::53")}},
 					},
 				},
 			},
@@ -333,7 +333,10 @@ func TestReachableAssignmentIsInstalled(t *testing.T) {
 			Configurations: []masque.DNSConfiguration{
 				{
 					Nameservers: []masque.DNSNameserver{
-						{IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:db8::53")}},
+						// ServicePriority is required to be non-zero by the draft, so a
+						// zero here would make the assignment unusable for a reason that
+						// has nothing to do with reachability.
+						{ServicePriority: 1, IPv6Addresses: []netip.Addr{netip.MustParseAddr("2001:db8::53")}},
 					},
 				},
 			},

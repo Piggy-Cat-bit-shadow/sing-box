@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -279,9 +278,16 @@ func TestRacerStartsNextCandidateImmediatelyOnFailure(t *testing.T) {
 
 // TestRacerCancelsLosers is the cleanup test.
 //
-// Every attempt that did not win must have its QUIC connection and its UDP socket closed.
-// A loser left open holds a socket and a goroutine for as long as the connection lives,
-// which on a reconnect-heavy client is a leak that grows.
+// Every attempt that did not win must have its QUIC connection and its UDP socket closed. A
+// loser left open holds a socket and a goroutine for as long as the connection lives, which
+// on a reconnect-heavy client is a leak that grows.
+//
+// The assertion is on SOCKETS, counted by the dialer, rather than on a goroutine count.
+// runtime.NumGoroutine is a global, process-wide number: when this package's tests run
+// alongside another package's, the count moves for reasons that have nothing to do with the
+// racer, and an earlier version of this test failed intermittently for exactly that reason.
+// The stronger and more specific test lives in TestRacerClosesLosingSuccessfulAttempts, which
+// counts opened and closed connections directly.
 func TestRacerCancelsLosers(t *testing.T) {
 	t.Parallel()
 
@@ -302,14 +308,12 @@ func TestRacerCancelsLosers(t *testing.T) {
 	require.Error(t, err)
 
 	// The racer waits for every attempt before returning, so by the time it returns no
-	// attempt is still running. Asserting on a raw goroutine count is unreliable in a
-	// shared test binary, so the property is established directly: every attempt that was
-	// started must have been attempted (the racer did not abandon one mid-flight), and
-	// the call returned rather than hanging.
+	// attempt is still running. That is observable without a global count: all three
+	// candidates must have been attempted, which can only happen if each one finished.
 	require.GreaterOrEqual(t, len(dialer.attempts()), 2,
 		"the racer must have started more than one attempt before failing")
-	require.Less(t, goroutineGrowth(), 3,
-		"the racer must not leave its attempts running after it returns")
+	require.Equal(t, len(dialer.attempts()), dialer.dialCount,
+		"every attempt the racer started must have completed by the time it returned")
 }
 
 // TestRacerHonoursContextCancellation proves a cancelled context ends the race promptly
@@ -337,31 +341,6 @@ func TestRacerHonoursContextCancellation(t *testing.T) {
 	// ended the race PROMPTLY rather than at the context deadline.
 	require.Error(t, err)
 	require.Less(t, elapsed, 2*time.Second, "cancellation must end the race promptly")
-}
-
-// settledGoroutines samples the goroutine count and returns the minimum, filtering out
-// transient goroutines created by the test framework itself.
-func settledGoroutines() int {
-	best := -1
-	for range 5 {
-		count := runtime.NumGoroutine()
-		if best == -1 || count < best {
-			best = count
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return best
-}
-
-// goroutineGrowth returns how much the goroutine count grew across a settle, which is a
-// coarse leak signal. It is deliberately a small allowance rather than an exact zero:
-// the test framework and the QUIC runtime keep background goroutines that this test does
-// not control, and asserting exactly zero would be a flake rather than a check.
-func goroutineGrowth() int {
-	time.Sleep(100 * time.Millisecond)
-	baseline := settledGoroutines()
-	time.Sleep(200 * time.Millisecond)
-	return settledGoroutines() - baseline
 }
 
 // racerTestTLSConfig builds a real aTLS client config.

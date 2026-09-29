@@ -55,6 +55,13 @@ func dnsAssignSeeds() [][]byte {
 		seeds = append(seeds, full[:length])
 	}
 	seeds = append(seeds, full)
+	// The multi-configuration shape, plus its truncations, so the nested counts and the
+	// configuration boundaries are explored rather than only the flat single-config case.
+	multi := dnsAssignMultiConfigurationVector()
+	for length := 0; length < len(multi); length++ {
+		seeds = append(seeds, multi[:length])
+	}
+	seeds = append(seeds, multi)
 
 	// Impossible counts, which are the classic way to make a parser allocate: a
 	// nameserver count and an address count that cannot possibly be backed by the
@@ -70,6 +77,68 @@ func dnsAssignSeeds() [][]byte {
 	// A declared SVC parameter length with nothing behind it.
 	seeds = append(seeds, []byte{1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255})
 	return seeds
+}
+
+// dnsAssignMultiConfigurationVector is a valid payload carrying SEVERAL configurations with
+// distinct internal domains and per-nameserver metadata.
+//
+// It is a seed in its own right because the multi-configuration shape is where the runtime
+// model does its most interesting work: configuration boundaries, longest-match internal
+// domination, and per-resolver authentication domains, dohpaths, ports and ALPN lists. A
+// corpus of single-configuration messages would barely exercise the decoder's nested counts.
+func dnsAssignMultiConfigurationVector() []byte {
+	assignment := DNSAssignment{
+		Configurations: []DNSConfiguration{
+			{
+				InternalDomains: []string{"corp.example."},
+				SearchDomains:   []string{"corp.example."},
+				Nameservers: []DNSNameserver{
+					{
+						ServicePriority:          1,
+						IPv4Addresses:            []netip.Addr{netip.MustParseAddr("10.0.0.53")},
+						AuthenticationDomainName: "corp-dns.example.",
+						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
+							dnsmessage.SVCParamKey(1): {0x02, 'h', '2', 0x02, 'h', '3'},
+							dnsmessage.SVCParamKey(3): {0x20, 0xfb},
+							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+						},
+					},
+					{
+						ServicePriority: 2,
+						IPv6Addresses:   []netip.Addr{netip.MustParseAddr("2001:db8::53")},
+					},
+				},
+			},
+			{
+				InternalDomains: []string{"example."},
+				Nameservers: []DNSNameserver{
+					{
+						ServicePriority: 1,
+						IPv4Addresses:   []netip.Addr{netip.MustParseAddr("192.0.2.53")},
+					},
+				},
+			},
+			{
+				// No internal domains: the default configuration.
+				Nameservers: []DNSNameserver{
+					{
+						ServicePriority:          1,
+						AuthenticationDomainName: "public-dns.example.",
+						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
+							dnsmessage.SVCParamKey(1): {0x02, 'h', '3'},
+							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+						},
+					},
+				},
+			},
+		},
+	}
+	encoded, err := encodeDNSAssign(assignment.Configurations)
+	if err != nil {
+		panic(err)
+	}
+	defer encoded.Release()
+	return bytes.Clone(capsulePayloadForSeed(encoded.Bytes()))
 }
 
 // dnsAssignFullVector is one complete, valid DNS_ASSIGN payload used as a fuzz seed and as
