@@ -199,7 +199,9 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928085008-2616b72468d0
+// Adds WriteOwnedBuffer, the geometry-based ownership hand-off for a cached first payload.
+// Additive: no existing API changed.
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260929205859-3f609c65d21a
 
 // Adds async read/write buffer pinning (correctness: the native side retains the pointer
 // until its completion callback) and the EarlyCopyBufferGrowth capability the upload copy
