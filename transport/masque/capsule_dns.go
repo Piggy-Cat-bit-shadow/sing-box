@@ -175,9 +175,28 @@ func validateDomainName(name string, allowEmpty bool) error {
 // which is worth mirroring: a validating encoder is what stops this implementation
 // from emitting configurations a conforming peer must reject.
 func (c DNSConfiguration) validate() error {
+	// The count bounds live here rather than only in the parser so the encoder and the
+	// parser enforce ONE rule set. Keeping them in the parser alone allowed the parser to
+	// accept what the encoder refused, which the DNS_ASSIGN round-trip fuzzer found
+	// immediately: a configuration the parser had accepted could not be re-encoded, so a
+	// message's validity depended on which side read it.
+	if len(c.Nameservers) > maxDNSNameserversPerConfig {
+		return E.New("too many nameservers in one configuration (maximum ",
+			maxDNSNameserversPerConfig, ")")
+	}
+	if len(c.InternalDomains) > maxDNSDomainsPerConfig {
+		return E.New("too many internal domains (maximum ", maxDNSDomainsPerConfig, ")")
+	}
+	if len(c.SearchDomains) > maxDNSDomainsPerConfig {
+		return E.New("too many search domains (maximum ", maxDNSDomainsPerConfig, ")")
+	}
 	for index, nameserver := range c.Nameservers {
 		if nameserver.ServicePriority == 0 {
 			return E.New("nameserver ", index, ": service priority must not be zero")
+		}
+		if len(nameserver.ServiceParameters) > maxSVCParamsPerNameserver {
+			return E.New("nameserver ", index, ": too many SVC parameters (maximum ",
+				maxSVCParamsPerNameserver, ")")
 		}
 		var serviceParametersLen int
 		var hasALPN, hasNoDefaultALPN bool
