@@ -86,6 +86,29 @@ type session struct {
 	// take ownership. Decided ONCE here rather than per packet: a stream's capability cannot change
 	// while the connection lives, and the packet path may not pay for a type assertion.
 	ownedDatagrams transportHTTP.OwnedDatagramSender
+	// batchOwnedDatagrams is the BATCHED ownership-transferring send capability, or nil when this
+	// stream cannot take ownership in batches. Also resolved once, for the same reason.
+	//
+	// It is kept alongside ownedDatagrams rather than replacing it: batch is an additional
+	// capability, and a stream may well offer one without the other. When only batch is available
+	// the single-packet path keeps using ownedDatagrams, and when only ownedDatagrams is available
+	// the loop below is exactly what it was before batching existed.
+	batchOwnedDatagrams transportHTTP.BatchOwnedDatagramSender
+	// batchScratch is a reusable slice for the batched send path.
+	//
+	// # Why this exists, and what it cost not to have it
+	//
+	// The first version of the batch path allocated a fresh slice per batch, and the measurement
+	// was unambiguous: batch=2 was 46% SLOWER and batch=4 30% slower than the per-packet loop
+	// (p<0.001, isolated benchmark). One allocation of 32 B/op cost ~40 ns, which is far more than
+	// the ~13 ns/packet the batch reclaims from the send queue. Batching only pays if the batch
+	// itself is free to assemble.
+	//
+	// The slice is only ever used inside writeBatchOwned, which is single-threaded with respect to
+	// itself: writePackets is called from the device loop, and the transport takes ownership of the
+	// buffers (not of this slice) before returning. It is reused rather than pooled because it
+	// belongs to exactly one session.
+	batchScratch   []*buf.Buffer
 	reader         *std_bufio.Reader
 	handler        sessionHandler
 	packetHeadroom func() int
@@ -100,21 +123,24 @@ func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionH
 	// incapable, which is the safe default: the capsule path always works.
 	var datagrams transportHTTP.DatagramStream
 	var ownedDatagrams transportHTTP.OwnedDatagramSender
+	var batchOwnedDatagrams transportHTTP.BatchOwnedDatagramSender
 	if capable, isDatagramStream := stream.(transportHTTP.DatagramStream); isDatagramStream && capable.DatagramsEnabled() {
 		datagrams = capable
 		// Resolved once, alongside the capability that makes it meaningful. A stream that cannot
 		// take ownership simply leaves this nil and the copying path is used unchanged.
 		ownedDatagrams = transportHTTP.AsOwnedDatagramSender(capable)
+		batchOwnedDatagrams = transportHTTP.AsBatchOwnedDatagramSender(capable)
 	}
 	current := &session{
-		ctx:            sessionCtx,
-		cancel:         cancel,
-		stream:         stream,
-		datagrams:      datagrams,
-		ownedDatagrams: ownedDatagrams,
-		reader:         std_bufio.NewReader(stream),
-		handler:        handler,
-		packetHeadroom: packetHeadroom,
+		ctx:                 sessionCtx,
+		cancel:              cancel,
+		stream:              stream,
+		datagrams:           datagrams,
+		ownedDatagrams:      ownedDatagrams,
+		batchOwnedDatagrams: batchOwnedDatagrams,
+		reader:              std_bufio.NewReader(stream),
+		handler:             handler,
+		packetHeadroom:      packetHeadroom,
 	}
 	return current
 }
@@ -433,7 +459,38 @@ func classifyWrappedDatagramError(err error) (datagramErrorKind, int) {
 //
 // Getting the first case wrong would be a double release of a pooled buffer, which corrupts
 // unrelated traffic later rather than failing here.
+//
+// # The batch fast path
+//
+// A CONNECT-IP sender does not produce packets one at a time. sing-tun's dispatch stage collects a
+// whole read burst and hands it over in a single call, so this function routinely receives several
+// buffers at once -- measured at a mean of ~4 and reaching the tens on a loaded link.
+//
+// Sending those individually repeats, once per packet, the transport's send-queue lock and its send
+// scheduling signal. One signal already makes the connection drain the whole queue, so the
+// repetitions bought nothing. The batch path below charges both once for the group.
+//
+// # Why the batch is attempted FIRST and falls back to the loop
+//
+// The batch is all-or-nothing, so any refusal -- an oversized packet, a peer that does not accept
+// datagrams, a stream that has failed -- rejects the WHOLE group and leaves every buffer with this
+// function, exactly as if the batch had never been attempted. That makes the fallback safe by
+// construction: the loop below runs on the complete, unmodified input and performs the same
+// per-packet classification it always did, so the too-large and unsupported handling is not
+// duplicated or re-derived here.
+//
+// A batch of one is NOT sent through this path: the transport charges the same fixed cost for a
+// single-element batch as for a plain send, and the measurement showed a small regression at
+// batch=1. Single packets therefore take the original loop, unchanged.
 func (s *session) writePackets(buffers []*buf.Buffer) error {
+	// len>1 only: see the batch=1 note above.
+	if s.batchOwnedDatagrams != nil && len(buffers) > 1 {
+		if s.writeBatchOwned(buffers) {
+			return nil
+		}
+		// The batch was refused and every buffer is still ours and unmodified. Fall through to the
+		// per-packet loop, which is what classifies the failure.
+	}
 	capsules := buffers[:0]
 	for i, buffer := range buffers {
 		datagram := transportHTTP.PrependContextID(buffer)
@@ -486,4 +543,71 @@ func (s *session) writePackets(buffers []*buf.Buffer) error {
 	s.writeAccess.Lock()
 	defer s.writeAccess.Unlock()
 	return transportHTTP.WriteDatagramCapsules(s.stream, capsules)
+}
+
+// writeBatchOwned attempts to send the whole group with one ownership-transferring call.
+//
+// It reports whether the batch was accepted. A false return means every buffer the caller holds is
+// still owned by this function and byte-identical to what the caller passed in, so the caller can
+// safely run the per-packet loop over the same slice.
+//
+// # The context ID must be undone here, and this was a real bug
+//
+// The transport's rollback only removes the quarter stream ID that HTTP/3 added. It knows nothing
+// about the 1-byte context ID this function prepends, so a refused batch comes back with the
+// context ID still attached. The fallback loop then prepends a SECOND one, shifting the inner IP
+// header by a byte -- and packetAddresses reads the version nibble from the wrong offset, rejects
+// the packet as invalid, and the packet is dropped with no error.
+//
+// That is exactly what happened before this was fixed: a refused batch of two packets produced no
+// PTB, no capsule fallback and no error. Every packet was silently discarded. The Advance below is
+// what restores the caller's view.
+//
+// # PrependContextID can CONSUME a buffer, which is why substitution refuses the batch
+//
+// When a buffer has no headroom for the context-ID byte, PrependContextID allocates a replacement
+// and RELEASES the original. If the batch were then refused, the caller's slice would hold
+// released -- possibly recycled -- buffers, and the fallback loop would double-release them: silent
+// heap corruption rather than a failure at the call site.
+//
+// So a substitution is detected and the batch is refused BEFORE it is attempted, and the caller's
+// slice is updated to the replacement at the index where it happened.
+//
+// # Why substitution is not on the hot path
+//
+// The device feeding this path reserves PacketHeadroom (>= 9) bytes precisely so the single-byte
+// context ID fits, so substitution does not happen in production. It is a correctness guard for a
+// caller with a differently-shaped pool.
+func (s *session) writeBatchOwned(buffers []*buf.Buffer) bool {
+	// Reused, not allocated: see the batchScratch field.
+	if cap(s.batchScratch) < len(buffers) {
+		s.batchScratch = make([]*buf.Buffer, len(buffers))
+	}
+	prepared := s.batchScratch[:len(buffers)]
+	for i, buffer := range buffers {
+		prepared[i] = transportHTTP.PrependContextID(buffer)
+		if prepared[i] != buffer {
+			// A replacement was allocated and the original released. Any prefix already applied to
+			// the earlier buffers must be undone before returning, and the caller's slice takes the
+			// replacement at this index so it does not keep a pointer to freed memory.
+			for j := range i {
+				buffers[j].Advance(1)
+			}
+			buffers[i] = prepared[i]
+			buffers[i].Advance(1)
+			return false
+		}
+	}
+	if s.batchOwnedDatagrams.SendDatagramsOwned(prepared) == nil {
+		return true
+	}
+	// The batch was refused. Ownership of every buffer is still ours, but each still carries the
+	// context ID, so remove it to restore exactly what the caller passed in.
+	//
+	// This is also what makes the fallback correct: without it the loop would prepend a second
+	// context ID and every packet in the batch would be silently dropped.
+	for _, buffer := range buffers {
+		buffer.Advance(1)
+	}
+	return false
 }

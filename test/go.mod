@@ -220,4 +220,4 @@ replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-
 
 // Must match the replace in the root go.mod: this is a SEPARATE module, so it
 // does not inherit it, and transport/http now calls the owned-datagram API.
-replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929161343-393ae9ae9df7
+replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929220002-d29e441af4d8

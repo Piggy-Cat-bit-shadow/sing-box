@@ -211,4 +211,4 @@ replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-
 // Adds the ownership-transferring DATAGRAM API (SendDatagramOwned) used by the MASQUE
 // zero-copy outbound path. Based on v0.61.0-sing-box-mod.7 with one additive commit;
 // SendDatagram and every other API are unchanged.
-replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929161343-393ae9ae9df7
+replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929220002-d29e441af4d8

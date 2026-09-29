@@ -809,6 +809,15 @@ type copyCountingStream struct {
 	ownedCalls int
 	// legacyCalls counts sends that took the copying path.
 	legacyCalls int
+	// batchCalls counts batched owned sends, and batchedPayloads how many payloads those carried.
+	batchCalls      int
+	batchedPayloads int
+	// refuseBatch, when set, makes every batched send fail, so the fallback to the per-packet loop
+	// can be exercised without a real QUIC connection.
+	refuseBatch bool
+	// refuseAt, when > 0, makes every owned send of a larger payload fail with
+	// DatagramTooLargeError at that ceiling, which is how the oversize classification is reached.
+	refuseAt int
 	// sink accumulates a byte so the compiler cannot elide the work.
 	sink byte
 }
@@ -834,6 +843,7 @@ func (s *copyCountingStream) SendDatagram(payload []byte) error {
 	s.copies++
 	s.legacyCalls++
 	if len(copied) > 0 {
+		s.sink ^= copied[0]
 		s.sink ^= copied[len(copied)-1]
 	}
 	s.access.Unlock()
@@ -841,10 +851,22 @@ func (s *copyCountingStream) SendDatagram(payload []byte) error {
 }
 
 // SendDatagramOwned models the owned API: read the bytes, no copy, release once.
+//
+// On a refusal it returns WITHOUT releasing, which is the contract the owned path depends on: the
+// caller must get its buffer back so it can build a PTB or fall back to capsules.
 func (s *copyCountingStream) SendDatagramOwned(buffer *buf.Buffer) error {
 	s.access.Lock()
+	if s.refuseAt > 0 && buffer.Len() > s.refuseAt {
+		ceiling := s.refuseAt
+		s.access.Unlock()
+		return &transportHTTP.DatagramTooLargeError{MaxPayloadSize: ceiling}
+	}
 	s.ownedCalls++
 	if payload := buffer.Bytes(); len(payload) > 0 {
+		// Sample the FIRST byte as well as the last. The first byte is what a stray context ID
+		// displaces -- with a mis-restored prefix the payload starts one byte early and the IP
+		// version nibble is no longer 0x45, which the digest below would otherwise miss entirely.
+		s.sink ^= payload[0]
 		s.sink ^= payload[len(payload)-1]
 	}
 	s.access.Unlock()
@@ -852,10 +874,61 @@ func (s *copyCountingStream) SendDatagramOwned(buffer *buf.Buffer) error {
 	return nil
 }
 
+// setRefuseOwnedAbove makes subsequent owned sends of payloads larger than ceiling fail, modelling
+// a transport that cannot carry them.
+func (s *copyCountingStream) setRefuseOwnedAbove(ceiling int) {
+	s.access.Lock()
+	s.refuseAt = ceiling
+	s.access.Unlock()
+}
+
+// digest returns a summary of the bytes this stream has seen, so two runs that carry the same
+// payloads can be compared without recording them all.
+func (s *copyCountingStream) digest() byte {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.sink
+}
+
+// SendDatagramsOwned models the batched owned API: read every payload, no copy, release each once.
+func (s *copyCountingStream) SendDatagramsOwned(buffers []*buf.Buffer) error {
+	s.access.Lock()
+	if s.refuseBatch {
+		s.access.Unlock()
+		return E.New("batch refused")
+	}
+	s.batchCalls++
+	s.batchedPayloads += len(buffers)
+	for _, buffer := range buffers {
+		if payload := buffer.Bytes(); len(payload) > 0 {
+			s.sink ^= payload[0]
+			s.sink ^= payload[len(payload)-1]
+		}
+	}
+	s.access.Unlock()
+	for _, buffer := range buffers {
+		buffer.Release()
+	}
+	return nil
+}
+
+// setRefuseBatch makes subsequent batched sends fail, so the fallback path is reachable.
+func (s *copyCountingStream) setRefuseBatch(refuse bool) {
+	s.access.Lock()
+	s.refuseBatch = refuse
+	s.access.Unlock()
+}
+
 func (s *copyCountingStream) stats() (copies, ownedCalls, legacyCalls int) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	return s.copies, s.ownedCalls, s.legacyCalls
+}
+
+func (s *copyCountingStream) batchStats() (calls, payloads int) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.batchCalls, s.batchedPayloads
 }
 
 // BenchmarkDataplaneOutboundSendPath compares the copying and owned send paths over the real
@@ -902,6 +975,118 @@ func BenchmarkDataplaneOutboundSendPath(b *testing.B) {
 					b.Fatalf("expected %d copying sends, got %d", b.N, legacy)
 				}
 				b.ReportMetric(float64(copies)/float64(b.N), "payloadcopies/op")
+			})
+		}
+	}
+}
+
+// BenchmarkDataplaneOutboundBatchSize measures the outbound path at the batch sizes production
+// actually produces.
+//
+// # Why these sizes
+//
+// A separate measurement of sing-tun's dispatch cadence (frames per engine turn, a share belonging
+// to our flow) gives a mean batch of ~4 for a shared link and ~16-57 for a saturated one, with
+// batches of 1 being a small minority. The sizes below bracket that range.
+//
+// # What is being compared
+//
+// `perpacket` disables the batch capability, so writePackets runs exactly the loop it ran before
+// batching existed. `batched` uses the batch path. Nothing else differs: same buffers, same route
+// snapshot, same send call underneath.
+func BenchmarkDataplaneOutboundBatchSize(b *testing.B) {
+	packet := buildBenchIPv4Packet(1280, 6,
+		netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("93.184.216.34"))
+	for _, batchSize := range []int{1, 2, 4, 8, 16, 32} {
+		for _, mode := range []string{"perpacket", "batched"} {
+			b.Run(benchSizeName(batchSize)+"/"+mode, func(b *testing.B) {
+				sink := &copyCountingStream{}
+				current := benchSession(sink, &benchDiscardStream{}, &benchHandler{})
+				current.session.ownedDatagrams = transportHTTP.AsOwnedDatagramSender(sink)
+				if mode == "batched" {
+					current.session.batchOwnedDatagrams = transportHTTP.AsBatchOwnedDatagramSender(sink)
+				} else {
+					current.session.batchOwnedDatagrams = nil
+				}
+
+				b.ReportAllocs()
+				b.SetBytes(int64(1280 * batchSize))
+				b.ResetTimer()
+				for b.Loop() {
+					// The buffers are consumed and released by the path, so they are rebuilt here.
+					// That cost is identical for both modes and is therefore not what differs.
+					buffers := newBenchPacketBuffers(batchSize, packet)
+					if err := current.client.WritePacketBuffers(buffers, false); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*batchSize), "ns/packet")
+			})
+		}
+	}
+}
+
+// BenchmarkDataplaneOutboundBatchSizeIsolated removes the fixture cost that masks the dataplane.
+//
+// # Why a second batch benchmark exists
+//
+// In BenchmarkDataplaneOutboundBatchSize the buffers are rebuilt every iteration, and that rebuild
+// (a slice allocation plus one pooled buf.NewSize per packet) is charged to both modes. Measured
+// separately it dominates the numbers: at batch 8 it is hundreds of ns per iteration against a
+// dataplane cost measured at ~14 ns/packet. The fixture therefore buries the thing under test and
+// produces high variance and one spurious +77% reading.
+//
+// This benchmark pre-builds the packet bytes ONCE and reuses them, so the only per-iteration work
+// is the path itself. It is not a production-shaped benchmark -- the allocation is real and does
+// happen in production -- but it is the only way to see whether the batch path itself is faster.
+// The production-shaped numbers remain in the benchmark above; these two belong together.
+func BenchmarkDataplaneOutboundBatchSizeIsolated(b *testing.B) {
+	packet := buildBenchIPv4Packet(1280, 6,
+		netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("93.184.216.34"))
+	// Pre-build the payload BYTES once, and the buffer objects once per mode, so neither the bytes
+	// nor the buffers are part of the measurement loop.
+	for _, batchSize := range []int{1, 2, 4, 8, 16, 32} {
+		for _, mode := range []string{"perpacket", "batched"} {
+			b.Run(benchSizeName(batchSize)+"/"+mode, func(b *testing.B) {
+				sink := &copyCountingStream{}
+				current := benchSession(sink, &benchDiscardStream{}, &benchHandler{})
+				current.session.ownedDatagrams = transportHTTP.AsOwnedDatagramSender(sink)
+				if mode == "batched" {
+					current.session.batchOwnedDatagrams = transportHTTP.AsBatchOwnedDatagramSender(sink)
+				} else {
+					current.session.batchOwnedDatagrams = nil
+				}
+
+				// A pool of reusable buffers, refilled to the exact hand-off shape each iteration.
+				// Acquiring from buf's own pool is what the real caller does, so this keeps the
+				// release path honest while removing the per-iteration slice allocation.
+				build := func() []*buf.Buffer {
+					buffers := make([]*buf.Buffer, 0, batchSize)
+					for range batchSize {
+						buffer := buf.NewSize(PacketHeadroom + len(packet))
+						buffer.Resize(PacketHeadroom, 0)
+						common.Must1(buffer.Write(packet))
+						buffers = append(buffers, buffer)
+					}
+					return buffers
+				}
+
+				b.ReportAllocs()
+				b.SetBytes(int64(1280 * batchSize))
+				b.ResetTimer()
+				for b.Loop() {
+					// Stop the clock for the setup: this benchmark measures the PATH, not the
+					// fixture, and the production-shaped benchmark already covers the total.
+					b.StopTimer()
+					buffers := build()
+					b.StartTimer()
+					if err := current.client.WritePacketBuffers(buffers, false); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*batchSize), "ns/packet")
 			})
 		}
 	}

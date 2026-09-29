@@ -92,6 +92,43 @@ type h3OwnedDatagramStream interface {
 	SendDatagramOwned(payload http3.OwnedDatagramPayload) error
 }
 
+// h3BatchOwnedDatagramStream is the BATCHED owned-send capability of the HTTP/3 datagram stream.
+type h3BatchOwnedDatagramStream interface {
+	SendDatagramsOwned(payloads []http3.OwnedDatagramPayload) error
+}
+
+// BatchOwnedDatagramSender is the OPTIONAL capability of sending several datagrams whose ownership
+// transfers together.
+//
+// # Ownership is all-or-nothing, matching the transport
+//
+// On a nil return every buffer in the slice has been handed over and will be released by the
+// transport exactly once; the caller must not touch any of them again. On error NONE has been
+// taken and the caller still owns every buffer, with its bytes exactly as passed in.
+//
+// The caller cannot act on a partial transfer, so no partial transfer is ever reported as success.
+type BatchOwnedDatagramSender interface {
+	SendDatagramsOwned(buffers []*buf.Buffer) error
+}
+
+// AsBatchOwnedDatagramSender reports the batched owned-send capability of a stream, or nil when the
+// stream cannot take ownership in batches.
+//
+// Like AsOwnedDatagramSender this is resolved ONCE per session, so the packet path never pays for a
+// type assertion per packet.
+func AsBatchOwnedDatagramSender(stream DatagramStream) BatchOwnedDatagramSender {
+	if sender, ok := stream.(BatchOwnedDatagramSender); ok {
+		return sender
+	}
+	if sender, ok := stream.(h3BatchOwnedDatagramStream); ok {
+		// A POINTER, so the reusable conversion slice survives between calls. Returning a value
+		// here would give every batch a fresh copy of the struct and with it a fresh allocation,
+		// which is exactly the cost this path cannot afford.
+		return &ownedH3BatchSender{sender: sender}
+	}
+	return nil
+}
+
 // AsOwnedDatagramSender reports the owned-send capability of a datagram stream, or nil when the
 // stream cannot take ownership.
 //
@@ -118,4 +155,30 @@ type ownedH3Sender struct {
 
 func (s ownedH3Sender) SendDatagramOwned(buffer *buf.Buffer) error {
 	return s.sender.SendDatagramOwned(ownedBuffer{buffer: buffer})
+}
+
+// ownedH3BatchSender forwards a slice of *buf.Buffer to the HTTP/3 batched owned path.
+//
+// The adapter slice is built here rather than by the caller because the HTTP/3 layer must not learn
+// about sing-box's buffer type. It is REUSED across calls: the first version allocated it per
+// batch, and that single 32 B/op allocation cost about 40 ns -- more than the ~13 ns/packet the
+// batch reclaims from the send queue, which made the whole batch path a net loss.
+//
+// Reuse is safe because the transport copies the payload descriptors it needs during the call and
+// never retains the slice: on both the success and the refusal path, ownership is settled before
+// SendDatagramsOwned returns.
+type ownedH3BatchSender struct {
+	sender  h3BatchOwnedDatagramStream
+	scratch []http3.OwnedDatagramPayload
+}
+
+func (s *ownedH3BatchSender) SendDatagramsOwned(buffers []*buf.Buffer) error {
+	if cap(s.scratch) < len(buffers) {
+		s.scratch = make([]http3.OwnedDatagramPayload, len(buffers))
+	}
+	payloads := s.scratch[:len(buffers)]
+	for i, buffer := range buffers {
+		payloads[i] = ownedBuffer{buffer: buffer}
+	}
+	return s.sender.SendDatagramsOwned(payloads)
 }

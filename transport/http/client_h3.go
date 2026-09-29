@@ -436,6 +436,34 @@ func (s *http3RequestDatagramStream) SendDatagramOwned(payload http3.OwnedDatagr
 	return err
 }
 
+// SendDatagramsOwned is the batched counterpart of SendDatagramOwned.
+//
+// # All-or-nothing, for the same reason as the queue
+//
+// Either every payload is accepted (nil return, and the transport owns all of them) or none is and
+// the caller still owns all of them. The caller cannot act on a partial result: it would not know
+// which of its buffers were taken.
+//
+// # Error translation is identical to the single-packet path
+//
+// A batch fails on its first rejected payload, and reports it with exactly the same error the
+// single-packet path would have produced for that payload -- including the too-large ceiling
+// adjustment, so a PTB built from a batch failure matches one built from an individual failure.
+func (s *http3RequestDatagramStream) SendDatagramsOwned(payloads []http3.OwnedDatagramPayload) error {
+	if !s.datagramsEnabled {
+		return ErrDatagramUnsupported
+	}
+	err := s.stream.SendDatagramsOwned(payloads)
+	if err == nil {
+		return nil
+	}
+	var tooLarge *quic.DatagramTooLargeError
+	if errors.As(err, &tooLarge) {
+		return &DatagramTooLargeError{MaxPayloadSize: int(tooLarge.MaxDatagramPayloadSize) - VarintLen(uint64(s.stream.StreamID()/4))}
+	}
+	return err
+}
+
 func (s *http3RequestDatagramStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return s.stream.ReceiveDatagram(ctx)
 }
