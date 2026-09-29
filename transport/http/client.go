@@ -85,6 +85,9 @@ type ClientOptions struct {
 	HTTP3ConnDialer HTTP3ConnDialer
 }
 
+// http3Authority is set when this client is configured for HTTP/3, and is the authority
+// that generic HTTP/3 requests are validated against. See Client.validateSameOrigin.
+
 type http3Client interface {
 	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
 	OpenTunnel(ctx context.Context, request tunnelRequest) (DatagramStream, error)
@@ -114,6 +117,10 @@ type Client struct {
 	http3                           http3Client
 	http3Broken                     atomic.Int64
 	http3Backoff                    atomic.Int64
+	// http3Authority is the authority this client's HTTP/3 connection is authenticated
+	// for. Generic HTTP/3 requests are validated against it so an authenticated
+	// connection cannot be turned into a cross-origin tunnel.
+	http3Authority string
 }
 
 func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outboundDialer N.Dialer, serverOptions option.ServerOptions, tlsOptions option.OutboundTLSOptions, options ClientOptions) (*Client, error) {
@@ -206,6 +213,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 			return nil, err
 		}
 		client.http3 = http3
+		// Record the authority this connection is authenticated for. The generic request
+		// path validates against it, so an authenticated connection cannot be used to
+		// reach an origin its certificate does not cover.
+		client.http3Authority = client.authorityOverride
+		if client.http3Authority == "" {
+			client.http3Authority = options.Server.String()
+		}
 	}
 	return client, nil
 }

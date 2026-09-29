@@ -31,13 +31,16 @@ type http3ClientImpl struct {
 	dialer N.Dialer
 	// connDialer, when set, replaces the UDP-dial + QUIC-handshake step. See
 	// HTTP3ConnDialer. nil means dial directly, which is the previous behaviour.
-	connDialer    HTTP3ConnDialer
-	tlsConfig     aTLS.Config
-	server        M.Socksaddr
-	authority     string
-	headers       http.Header
-	authorization string
-	quicConfig    *quic.Config
+	connDialer HTTP3ConnDialer
+	tlsConfig  aTLS.Config
+	server     M.Socksaddr
+	authority  string
+	// http3Authority is the authority this connection is authenticated for. It is what
+	// the generic request path validates against; see Client.validateSameOrigin.
+	http3Authority string
+	headers        http.Header
+	authorization  string
+	quicConfig     *quic.Config
 	// congestionControl is resolved once in newHTTP3Client. nil means "keep
 	// quic-go's default sender", which is what an unset option selects.
 	congestionControl func(conn *quic.Conn) congestion.CongestionControl
@@ -152,41 +155,16 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 }
 
 func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {
-	clientConn, err := c.acquire(ctx)
+	// The shared primitive does the connection acquisition, stream opening, request
+	// sending, response reading and cleanup. What remains here is exactly the
+	// CONNECT-specific part: a tunnel is only usable with StatusOK.
+	//
+	// Keeping the interpretation here rather than inside the primitive is deliberate. A
+	// tunnel needs 200; an ordinary request accepts any status. Folding both into one
+	// function would mean a mode flag, and the two paths would then be impossible to reason
+	// about independently.
+	stream, clientConn, response, err := c.openRequestStream(ctx, request)
 	if err != nil {
-		return nil, nil, err
-	}
-	stream, err := clientConn.OpenRequestStream(ctx)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		return nil, nil, E.Cause1(ErrHTTP3Unavailable, err)
-	}
-	stop := context.AfterFunc(ctx, func() {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
-	})
-	var response *http.Response
-	err = stream.SendRequestHeader(request)
-	if err == nil {
-		response, err = stream.ReadResponse()
-	}
-	if err == nil {
-		select {
-		case <-clientConn.ReceivedSettings():
-		case <-clientConn.Context().Done():
-			err = context.Cause(clientConn.Context())
-		case <-ctx.Done():
-			err = ctx.Err()
-		}
-	}
-	if !stop() {
-		err = ctx.Err()
-	}
-	if err != nil {
-		stream.CancelRead(0)
-		stream.Close()
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
