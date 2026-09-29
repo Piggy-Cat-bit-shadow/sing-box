@@ -445,11 +445,7 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		if cachedBuffer != nil {
 			wrotePayload = true
 			dataLen := cachedBuffer.Len()
-			var handedOver bool
-			err, handedOver = writeCachedBuffer(destinationWriter, cachedBuffer)
-			if !handedOver {
-				cachedBuffer.Release()
-			}
+			err = deliverCachedBuffer(destinationWriter, cachedBuffer)
 			if err == nil {
 				for _, counter := range readCounters {
 					counter(int64(dataLen))
@@ -511,9 +507,34 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 //
 // # Ownership
 //
-// On success the writer consumes the buffer, matching N.ExtendedWriter.WriteBuffer's contract
-// everywhere else in sing (the copy loops call it and do not release). The bool exists so the
-// caller knows NOT to release, rather than relying on a Release being harmless.
+// Ownership transfers to the writer the moment WriteBuffer is ENTERED, and the error result does
+// not change that. The bool therefore reports only whether the buffer was handed to WriteBuffer at
+// all, so the caller knows not to release it.
+//
+// # Why the error return must NOT return false, and what it used to do
+//
+// An earlier revision returned `err, false` when WriteBuffer failed, on the reasoning that a failed
+// write had not consumed the buffer. That is wrong, and it was a double release on the wire.
+//
+// Every N.ExtendedWriter implementation in sing releases the buffer itself, unconditionally:
+//
+//	ExtendedWriterWrapper.WriteBuffer:  defer buffer.Release(); return common.Error(w.Write(...))
+//	ChunkWriter.WriteBuffer:            defer buffer.Release() on the oversized branch
+//	naiveConn.WriteBuffer:              defer buffer.Release()
+//	naiveH2Conn.WriteBuffer:            defer buffer.Release()
+//
+// The release is a defer, so it runs on BOTH the nil and the non-nil return. There is no
+// implementation in which a failed WriteBuffer leaves the buffer with the caller, so "the writer
+// rejected it, take it back" describes a contract that does not exist.
+//
+// Returning false made the caller Release a buffer the writer had already released. That is not a
+// benign double free: buf.Buffer.Release() zeroes the struct and returns the backing array to the
+// pool, so the second Release is a no-op on an already-cleared struct while the ARRAY has already
+// been handed to whoever allocates next. The corruption therefore shows up later, in unrelated
+// traffic, rather than at this call -- which is exactly why it survived.
+//
+// Note that the failure paths ABOVE this point (no ExtendedWriter, MTU, headroom) are a different
+// case and return false correctly: they never enter WriteBuffer, so they never transfer ownership.
 func writeCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) (error, bool) {
 	writer := N.UnwrapWriter(destinationWriter)
 	extendedWriter, isExtended := writer.(N.ExtendedWriter)
@@ -546,11 +567,31 @@ func writeCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) (e
 			return err, false
 		}
 	}
-	err := extendedWriter.WriteBuffer(cachedBuffer)
-	if err != nil {
-		return err, false
+	// From here the buffer is the writer's, whatever WriteBuffer returns. See the Ownership section
+	// above: every implementation releases it with a defer, so the error result must NOT be used to
+	// decide whether ownership moved.
+	return extendedWriter.WriteBuffer(cachedBuffer), true
+}
+
+// deliverCachedBuffer writes the cached first payload and settles its ownership.
+//
+// # Why this is its own function
+//
+// The ownership rule has two halves: the helper decides WHETHER the writer took the buffer, and the
+// caller decides whether to release based on that answer. The second half is the one that is easy
+// to get wrong, and it is the one that cannot be checked by observing the buffer: once a writer has
+// released it, buf.Buffer.Release() is a silent no-op on the zeroed struct, so an extra caller
+// release leaves no trace on the buffer or the pool. A test can only see it by driving the real
+// decision, which is why the decision lives here with a name rather than inline in the copy loop.
+//
+// The rule: release ONLY when the writer never entered WriteBuffer. A writer that entered it owns
+// the buffer whatever it returned.
+func deliverCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) error {
+	err, handedOver := writeCachedBuffer(destinationWriter, cachedBuffer)
+	if !handedOver {
+		cachedBuffer.Release()
 	}
-	return nil, true
+	return err
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
