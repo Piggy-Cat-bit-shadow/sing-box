@@ -355,3 +355,107 @@ func racerTestTLSConfig(t *testing.T) tls.Config {
 	require.NoError(t, err)
 	return config
 }
+
+// TestRacerCascadesHardFailuresButStaggersSilence pins the two timing behaviours together.
+//
+// They are easy to conflate and both are intended:
+//
+//	a HARD failure launches the next candidate at once, because a refusal is information and
+//	waiting out the delay would add latency to the case that can be detected fastest. With
+//	every candidate refusing, they are therefore all tried almost immediately;
+//
+//	the fallback delay decides when a SILENT candidate is joined by the next one, because
+//	silence is not information.
+//
+// # Making a candidate genuinely silent
+//
+// A connected UDP socket pointing at a closed loopback port is NOT silent: the kernel returns
+// ICMP port unreachable, which QUIC surfaces at once as "connection refused" -- a hard failure,
+// and so the very case that cascades by design. Silence requires a socket that accepts packets
+// and discards them.
+func TestRacerCascadesHardFailuresButStaggersSilence(t *testing.T) {
+	t.Parallel()
+
+	_, silentPort := startSilentUDPPort(t)
+
+	dialer := &scriptedDialer{
+		hardFail:   map[string]bool{"192.0.2.1": true},
+		silentPort: silentPort,
+	}
+	const fallbackDelay = 400 * time.Millisecond
+	racer := newHandshakeRacer(fallbackDelay)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"),
+		racerTestTLSConfig(t), nil),
+		[]netip.Addr{
+			netip.MustParseAddr("192.0.2.1"), // hard failure
+			netip.MustParseAddr("192.0.2.2"), // silent
+			netip.MustParseAddr("192.0.2.3"), // only reachable via the timer
+		}, false)
+
+	attempts := dialer.attemptTimes()
+	require.GreaterOrEqual(t, len(attempts), 2, "a hard failure must be followed by another attempt")
+	require.Less(t, attempts[1].Sub(attempts[0]), fallbackDelay/2,
+		"a hard failure must launch the next candidate at once rather than waiting out the delay")
+
+	if len(attempts) < 3 {
+		t.Skip("the silent candidate did not stay silent long enough to observe the timer")
+	}
+	require.GreaterOrEqual(t, attempts[2].Sub(attempts[1]), fallbackDelay/2,
+		"a candidate reached only by the TIMER must wait a full delay, because silence is what the timer is for")
+}
+
+// startSilentUDPPort binds a UDP port whose packets are read and discarded, so the kernel
+// accepts them and no ICMP error is generated. That is what a blackholed path looks like, and
+// it is the only way to exercise the fallback TIMER rather than the immediate-launch path.
+func startSilentUDPPort(t *testing.T) (*net.UDPConn, uint16) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			if _, _, readErr := conn.ReadFromUDP(buffer); readErr != nil {
+				return
+			}
+		}
+	}()
+	return conn, uint16(conn.LocalAddr().(*net.UDPAddr).Port)
+}
+
+// scriptedDialer fails or stalls per address, and records when each dial happened.
+type scriptedDialer struct {
+	access     sync.Mutex
+	hardFail   map[string]bool
+	silentPort uint16
+	times      []time.Time
+}
+
+func (d *scriptedDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	d.access.Lock()
+	d.times = append(d.times, time.Now())
+	hardFail, silentPort := d.hardFail[destination.Addr.String()], d.silentPort
+	d.access.Unlock()
+
+	if hardFail {
+		return nil, errTestDialFailed
+	}
+	if silentPort != 0 {
+		return net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(silentPort)})
+	}
+	return net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: closedUDPPort})
+}
+
+func (d *scriptedDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, errTestDialFailed
+}
+
+func (d *scriptedDialer) attemptTimes() []time.Time {
+	d.access.Lock()
+	defer d.access.Unlock()
+	return append([]time.Time(nil), d.times...)
+}

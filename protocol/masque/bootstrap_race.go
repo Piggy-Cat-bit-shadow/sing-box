@@ -243,6 +243,16 @@ func (r *handshakeRacer) dialWithWinner(
 			// An attempt failed outright. Start the next candidate immediately rather
 			// than waiting for the timer: a refusal is information, whereas the timer
 			// exists for silence.
+			//
+			// The timer is deliberately NOT reset here. A hard failure cascading through the
+			// remaining candidates is the intended behaviour -- with every candidate refusing,
+			// they are all tried at once rather than at fallback-delay intervals -- and the
+			// timer is left for the case it exists for. There is no stale-timer hazard to
+			// guard against: the loop is single-threaded, so a failure handled here cannot be
+			// followed in the same iteration by the timer also firing. An earlier version of
+			// this comment claimed otherwise and a Reset was added for it; the Reset changed
+			// nothing, and the test written to justify it passed with and without it, which is
+			// how the claim was caught.
 			if len(remaining) > 0 {
 				launch(raceCtx, remaining[0])
 				remaining = remaining[1:]
