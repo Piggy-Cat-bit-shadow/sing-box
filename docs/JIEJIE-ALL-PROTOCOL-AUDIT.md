@@ -8,7 +8,7 @@ with two measured fixes and four findings recorded as NO CHANGE with their reaso
 | | |
 |---|---|
 | sing-box before | `08861f136` (`BASE_HEAD`) |
-| sing-box after | `50bbed43e` |
+| sing-box after | `baa97e945` |
 | sing before | `2616b72468d064bcb69a4f392528a2495f6e70fd` (`SING_BASE_SHA`) |
 | sing after | `3f609c65d21a` (`SING_FINAL_SHA`) |
 | sing branch | `jiejie-common-datapath` |
@@ -328,4 +328,29 @@ Only those with a genuine protocol reason:
 | Every perf change has a benchmark | **PASS** |
 | Unprofitable complexity reverted | **PASS** — 7 NO CHANGE, 2 REJECT |
 | Production tests green | **PASS** |
-| macOS / Linux CI green | see run IDs in the session report |
+| macOS / Linux CI green | **PASS** — [macOS](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36634933317), [Linux](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36634937915), both on `baa97e945` |
+
+## A CI failure this round found
+
+The first macOS deep-check run failed, and it was worth recording because the cause was a test from
+the **previous** round rather than anything in this one:
+
+```text
+--- FAIL: TestOwnedDatagramDeliversExactBytes
+    the server must have reached its datagram loop
+```
+
+`TestOwnedDatagramDeliversExactBytes` asserted `server.started()` **synchronously**, immediately
+after `OpenTunnelWithInfo` returned. That is a race by construction: the client returns as soon as
+it has read the 200, while the server's handler runs on its own goroutine and only then reaches the
+datagram loop. The flag is necessarily unset at that moment.
+
+It passed locally and failed in CI, which runs the suite under `-race` on a loaded runner. The fix
+is a bounded wait: it still fails if the server never gets there — the property the test exists for
+— and no longer fails because the scheduler had not run the handler yet. Verified with 50
+consecutive `-race` runs of the affected tests.
+
+The pattern is worth naming, because it has now happened twice in this series: an asynchronous
+hand-off makes "already happened" an unsafe assumption, so a test must WAIT for the condition
+rather than sample it. Both occurrences were caught only by running the suite the way CI does --
+under `-race`, on a loaded runner.
