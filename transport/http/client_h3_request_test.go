@@ -283,12 +283,19 @@ func TestRoundTripHTTP3SendsRequestBody(t *testing.T) {
 	t.Parallel()
 
 	const query = "dns-wire-query-bytes"
-	var received string
-	var receiveErr error
+	// The handler runs on a different goroutine from the test, so what it observes is
+	// handed over through a channel rather than through shared variables. Writing to plain
+	// variables here is a data race, and an intermittent one: it only shows up when the
+	// read happens to overlap the handler, which is exactly the kind of flake that gets
+	// attributed to something else.
+	type receivedRequest struct {
+		body string
+		err  error
+	}
+	received := make(chan receivedRequest, 1)
 	server := startCountingH3Server(t, func(writer http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
-		receiveErr = err
-		received = string(body)
+		received <- receivedRequest{body: string(body), err: err}
 		writer.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(writer, "ok")
 	})
@@ -303,8 +310,11 @@ func TestRoundTripHTTP3SendsRequestBody(t *testing.T) {
 	require.NoError(t, err)
 	defer response.Body.Close()
 
-	require.NoError(t, receiveErr)
-	require.Equal(t, query, received,
+	// The response arriving means the handler has already sent its body, so this receive
+	// is not a race against the handler completing.
+	observed := <-received
+	require.NoError(t, observed.err)
+	require.Equal(t, query, observed.body,
 		"the request body must arrive intact, which is what makes DoH POST possible")
 }
 

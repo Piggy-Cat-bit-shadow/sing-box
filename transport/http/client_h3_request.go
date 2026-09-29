@@ -230,16 +230,20 @@ func (c *http3ClientImpl) openRequestStream(ctx context.Context, request *http.R
 	// Cancelling the context cancels THIS stream only. The shared ClientConn is untouched,
 	// so one cancelled DoH query cannot take down the CONNECT-IP tunnel or any other
 	// in-flight request.
+	//
+	// The stream reset is what unblocks the response read below: ReadResponse does not
+	// observe a context itself, so the AfterFunc is what makes cancellation return
+	// promptly instead of waiting for a response that will never arrive.
 	stop := context.AfterFunc(ctx, func() {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
+		stream.CancelRead(h3StreamErrorCodeRequestCanceled)
+		stream.CancelWrite(h3StreamErrorCodeRequestCanceled)
 	})
 	response, err := readRequestResponse(ctx, clientConn, stream, request)
 	if err == nil && !stop() {
 		err = ctx.Err()
 	}
 	if err != nil {
-		stream.CancelRead(0)
+		stream.CancelRead(h3StreamErrorCodeRequestCanceled)
 		stream.Close()
 		if ctx.Err() != nil {
 			return nil, nil, nil, ctx.Err()
@@ -294,6 +298,20 @@ const h3StreamErrorCodeRequestCanceled = 0x010c
 // RoundTrip consumes and closes the request body as part of its contract, and it records the
 // request on the response. The caller handed us a request it may still reference, so the body
 // is swapped on a shallow copy and the original is left as the caller wrote it.
+// # Cancellation
+//
+// quic-go cancels the request stream when the request's context ends, including while the
+// body is still being written, so a cancelled request returns promptly without this function
+// wrapping it. That was verified rather than assumed: the leak tests cancel in-flight
+// requests and assert they return well before their own deadline, and the assertion holds
+// with this function calling RoundTrip directly.
+//
+// An earlier version of this function ran RoundTrip on a goroutine and selected on the
+// context as well. It was reverted once measured, because it added a goroutine to every
+// request while changing nothing observable -- the failure it was written to prevent turned
+// out to be a bug in the TEST, which cancelled its context only after the call had already
+// returned. Keeping the wrapper would have meant carrying a goroutine per DoH query to guard
+// against a problem that does not exist.
 func roundTripWithBody(ctx context.Context, clientConn *http3.ClientConn, request *http.Request) (*http.Response, error) {
 	bodyRequest := *request
 	if bodyRequest.ContentLength == 0 {
