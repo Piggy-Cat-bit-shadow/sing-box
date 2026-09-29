@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/tls"
@@ -36,6 +37,32 @@ type tlsDialer interface {
 	DialTLSContext(ctx context.Context, destination M.Socksaddr) (aTLS.Conn, error)
 }
 
+// HTTP3ConnDialer is an optional seam that lets a caller supply the already-dialed QUIC
+// connection the HTTP/3 client should use, instead of this package dialing one itself.
+//
+// # Why it exists, and how narrow it is meant to stay
+//
+// The MASQUE client needs to choose among several resolved candidate addresses for its
+// server, and to decide the winner at QUIC HANDSHAKE COMPLETION rather than at socket
+// creation. That decision needs the candidate list and the racing policy, neither of
+// which this package has or should have.
+//
+// What this package owns and MUST keep owning is everything that happens AFTER a
+// connection exists: the congestion-control installation ordering, the
+// transport.NewClientConn wrapping, the single-connection memoization, and the lifetime
+// and cleanup of both the QUIC connection and its underlying UDP socket. Duplicating any
+// of that inside a protocol package would mean two implementations of connection setup
+// that could drift apart.
+//
+// So the seam is exactly one function replacing exactly one step. It receives the dialer
+// and the QUIC configuration this client would have used, and returns a connected QUIC
+// connection plus the raw socket underneath it. It is responsible for closing any
+// candidate it did not choose.
+//
+// nil (the default, and every non-MASQUE caller) preserves the existing path verbatim:
+// dial UDP, then qtls.DialEarly, then install congestion control.
+type HTTP3ConnDialer func(ctx context.Context, dialer N.Dialer, server M.Socksaddr, tlsConfig aTLS.Config, quicConfig *quic.Config) (net.Conn, *quic.Conn, error)
+
 type ClientOptions struct {
 	Dialer                 N.Dialer
 	HTTP1Dialer            N.Dialer
@@ -51,6 +78,11 @@ type ClientOptions struct {
 	DisableVersionFallback bool
 	HTTP2Options           option.HTTP2Options
 	HTTP3Options           option.QUICOptions
+	// HTTP3ConnDialer optionally replaces the UDP-dial + QUIC-handshake step of the
+	// HTTP/3 client. See HTTP3ConnDialer in client_h3.go for what it is for and why it
+	// is deliberately narrow. nil keeps the existing behaviour, which is every caller
+	// except the MASQUE client.
+	HTTP3ConnDialer HTTP3ConnDialer
 }
 
 type http3Client interface {

@@ -28,7 +28,10 @@ func init() {
 }
 
 type http3ClientImpl struct {
-	dialer        N.Dialer
+	dialer N.Dialer
+	// connDialer, when set, replaces the UDP-dial + QUIC-handshake step. See
+	// HTTP3ConnDialer. nil means dial directly, which is the previous behaviour.
+	connDialer    HTTP3ConnDialer
 	tlsConfig     aTLS.Config
 	server        M.Socksaddr
 	authority     string
@@ -82,6 +85,7 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		authorization:     authorization,
 		quicConfig:        quicConfig,
 		congestionControl: congestionControl,
+		connDialer:        options.HTTP3ConnDialer,
 		transport:         &http3.Transport{EnableDatagrams: true, DisableCompression: true},
 	}, nil
 }
@@ -96,20 +100,46 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		c.rawConn.Close()
 		c.rawConn = nil
 	}
-	rawConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, c.server)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	// The dial happens INSIDE each branch, not before them.
+	//
+	// Dialing first and then asking the hook would create a UDP socket the hook path
+	// never uses: it would be overwritten by the hook's return value and leak, because
+	// nothing closes it. That is what the first version of this seam did, and the
+	// regression test caught it by asserting that the client's own dialer is not called
+	// when a hook is set.
+	var (
+		rawConn  net.Conn
+		quicConn *quic.Conn
+		err      error
+	)
+	if c.connDialer != nil {
+		// The caller owns candidate selection and returns only a connection whose QUIC
+		// handshake has COMPLETED, so this path's winner is the racer's winner. Every
+		// step after this point is unchanged, which is what keeps the congestion-control
+		// ordering and the memoization identical to the default path.
+		rawConn, quicConn, err = c.connDialer(ctx, c.dialer, c.server, c.tlsConfig, c.quicConfig)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, E.Cause1(ErrHTTP3Unavailable, err)
 		}
-		return nil, E.Cause1(ErrHTTP3Unavailable, err)
-	}
-	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
-	if err != nil {
-		rawConn.Close()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	} else {
+		rawConn, err = c.dialer.DialContext(ctx, N.NetworkUDP, c.server)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, E.Cause1(ErrHTTP3Unavailable, err)
 		}
-		return nil, E.Cause1(ErrHTTP3Unavailable, err)
+		quicConn, err = qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
+		if err != nil {
+			rawConn.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, E.Cause1(ErrHTTP3Unavailable, err)
+		}
 	}
 	// The congestion control must be installed on the conn BEFORE the HTTP/3
 	// client conn starts using it. SetCongestionControl swaps the sender, so
