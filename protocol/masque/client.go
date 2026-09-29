@@ -58,14 +58,18 @@ type ClientEndpoint struct {
 	// the configured DNS rules, which is exactly the behaviour that existed before
 	// this option.
 	innerQueryOptions adapter.DNSQueryOptions
-	client            *masque.Client
-	deviceOptions     *device.Options
-	device            device.Device
-	mtu               uint32
-	onDemand          bool
-	stateAccess       sync.Mutex
-	deviceStarted     bool
-	state             atomic.Pointer[clientState]
+	// assignedDNS is the endpoint-local transport that resolves through a nameserver the
+	// server assigned. It is nil when no DNS_ASSIGN has been accepted, which is what
+	// makes the resolver precedence fall through to the ordinary DNS rules.
+	assignedDNS   *assignedDNSTransport
+	client        *masque.Client
+	deviceOptions *device.Options
+	device        device.Device
+	mtu           uint32
+	onDemand      bool
+	stateAccess   sync.Mutex
+	deviceStarted bool
+	state         atomic.Pointer[clientState]
 }
 
 type clientState struct {
@@ -156,8 +160,12 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		ctx:               ctx,
 		dnsRouter:         service.FromContext[adapter.DNSRouter](ctx),
 		innerQueryOptions: innerQueryOptions,
-		mtu:               options.MTU,
-		onDemand:          options.OnDemand,
+		// Built unconditionally but installed only when an assignment arrives. It holds
+		// the DEVICE as its dialer, which is what makes every assigned query go through
+		// the tunnel rather than the host stack.
+		assignedDNS: newAssignedDNSTransport(logger, nil, tag),
+		mtu:         options.MTU,
+		onDemand:    options.OnDemand,
 	}
 	clientEndpoint.state.Store(&clientState{})
 	clientEndpoint.deviceOptions = newDeviceOptions(ctx, logger, clientEndpoint, options.MASQUEEndpointOptions, time.Duration(options.UDPTimeout), nil)
@@ -187,6 +195,10 @@ func (c *ClientEndpoint) Start(stage adapter.StartStage) error {
 		tunnelDevice.SetPacketWriter(c.writePacketBuffers)
 		c.device = tunnelDevice
 		c.deviceOptions = nil
+		// The assigned-DNS transport dials through the device, so it can only be given
+		// its dialer once the device exists. Until an assignment arrives it stays
+		// inactive, and its fail-closed behaviour covers the window before this point.
+		c.assignedDNS.dialer = tunnelDevice
 	case adapter.StartStatePostStart:
 		c.client.Start()
 	}
@@ -222,7 +234,110 @@ func (c *ClientEndpoint) UpdateConfiguration(configuration masque.Configuration)
 		localAddresses: configuration.Address,
 		routes:         configuration.Routes,
 	})
+	// Resolver precedence, applied here because this is where a new configuration and
+	// its routes arrive together:
+	//
+	//	explicit inner_domain_resolver   (highest)
+	//	server-pushed DNS_ASSIGN
+	//	normal DNS Router rules          (default)
+	//
+	// A configured inner resolver always wins, and the server's assignment is still
+	// parsed and VALIDATED but not installed. That is a security property rather than a
+	// convenience: the operator's explicit choice is the trusted one, and a server must
+	// not be able to override where the client's DNS goes.
+	c.installAssignedDNS(configuration)
 	return nil
+}
+
+// installAssignedDNS decides whether the server's assignment becomes the resolver.
+//
+// The reachability check is the important part. A nameserver outside the advertised
+// routes would be reached by the ordinary routing table rather than through the tunnel,
+// so installing it would produce exactly the cleartext DNS leak that accepting a
+// server-assigned resolver is meant to avoid. An unreachable assignment is refused and
+// the resolver falls through to the ordinary rules.
+func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) {
+	if c.innerQueryOptions.Transport != nil {
+		// An explicit resolver is configured. Record that the assignment was seen and
+		// ignored, at debug level so a server that pushes one does not produce noise.
+		if configuration.DNS != nil && !configuration.DNS.Empty() {
+			c.logger.Debug("server DNS assignment received but an explicit inner resolver is configured; ignoring it")
+		}
+		return
+	}
+	if configuration.DNS == nil || configuration.DNS.Empty() {
+		// Withdrawn, or nothing usable. Clearing is correct rather than leaving the
+		// previous resolver installed.
+		c.assignedDNS.clear()
+		return
+	}
+
+	selected := configuration.DNS.SelectNameservers()
+	// Every nameserver in the selected configuration must be routable through the
+	// tunnel. A configuration with none reachable is refused as a whole rather than
+	// partially installed: a partial resolver would answer some queries through the
+	// tunnel and send the rest somewhere else.
+	var reachable masque.DNSConfiguration
+	for _, nameserver := range selected {
+		if !nameserverReachable(nameserver, configuration.Routes) {
+			c.logger.Warn("ignoring server DNS assignment: nameserver ",
+				nameserverAddressString(nameserver),
+				" is not reachable through the advertised routes")
+			c.assignedDNS.clear()
+			return
+		}
+		reachable.Nameservers = append(reachable.Nameservers, nameserver)
+	}
+	reachable.InternalDomains = dnsInternalDomains(configuration.DNS)
+	reachable.SearchDomains = dnsSearchDomains(configuration.DNS)
+	c.assignedDNS.apply(reachable, configuration.PREF64)
+	c.logger.Debug("using server-assigned DNS resolver (", len(reachable.Nameservers),
+		" nameservers, generation ", configuration.DNS.Generation, ")")
+}
+
+// nameserverReachable reports whether every address of a nameserver lies inside the
+// advertised routes. An address-less nameserver (reachable only by name) is NOT treated
+// as reachable, because resolving that name would itself need a resolver.
+func nameserverReachable(nameserver masque.DNSNameserver, routes []masque.AddressRange) bool {
+	addresses := append(append([]netip.Addr(nil), nameserver.IPv4Addresses...), nameserver.IPv6Addresses...)
+	if len(addresses) == 0 {
+		return false
+	}
+	for _, address := range addresses {
+		if !isReachableThroughRoutes(address, routes) {
+			return false
+		}
+	}
+	return true
+}
+
+func nameserverAddressString(nameserver masque.DNSNameserver) string {
+	if len(nameserver.IPv4Addresses) > 0 {
+		return nameserver.IPv4Addresses[0].String()
+	}
+	if len(nameserver.IPv6Addresses) > 0 {
+		return nameserver.IPv6Addresses[0].String()
+	}
+	if nameserver.AuthenticationDomainName != "" {
+		return nameserver.AuthenticationDomainName
+	}
+	return "<none>"
+}
+
+func dnsInternalDomains(assignment *masque.DNSAssignment) []string {
+	var domains []string
+	for _, configuration := range assignment.Configurations {
+		domains = append(domains, configuration.InternalDomains...)
+	}
+	return domains
+}
+
+func dnsSearchDomains(assignment *masque.DNSAssignment) []string {
+	var domains []string
+	for _, configuration := range assignment.Configurations {
+		domains = append(domains, configuration.SearchDomains...)
+	}
+	return domains
 }
 
 func (c *ClientEndpoint) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {
@@ -338,7 +453,7 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 		return nil, err
 	}
 	if destination.IsDomain() {
-		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, c.innerQueryOptions)
+		destinationAddresses, lookupErr := c.lookupInner(ctx, destination.Fqdn)
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
@@ -348,6 +463,31 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return c.device.DialContext(ctx, network, destination)
+}
+
+// lookupInner resolves a domain reached through the tunnel, applying the resolver
+// precedence in one place so the TCP and UDP paths cannot disagree about it.
+//
+//	explicit inner_domain_resolver   (highest)
+//	server-pushed DNS_ASSIGN
+//	normal DNS Router rules          (default)
+//
+// The assigned resolver is installed into the query options as a TRANSPORT rather than
+// replacing the router, so the DNS client's cache, TTL handling, negative cache,
+// singleflight and optimistic cache all still apply. Only the wire changes: instead of
+// the configured upstream, the query goes to the server-assigned nameserver through the
+// tunnel.
+//
+// Fail-closed is inherited rather than re-implemented: if the assigned transport cannot
+// reach its nameserver, its Exchange returns an error and the lookup FAILS. There is no
+// path here that would retry the query against a host resolver, which is the leak the
+// assigned transport exists to prevent.
+func (c *ClientEndpoint) lookupInner(ctx context.Context, domain string) ([]netip.Addr, error) {
+	queryOptions := c.innerQueryOptions
+	if queryOptions.Transport == nil && c.assignedDNS.active() {
+		queryOptions.Transport = c.assignedDNS
+	}
+	return c.dnsRouter.Lookup(ctx, domain, queryOptions)
 }
 
 // dialResolved connects to one of the addresses the resolver returned.
@@ -419,9 +559,9 @@ func (c *ClientEndpoint) ListenPacketWithDestination(ctx context.Context, destin
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsDomain() {
-		// Same inner resolver as the TCP path: it answers the same question and
-		// must not disagree with it about which server resolves tunnelled names.
-		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, c.innerQueryOptions)
+		// Same precedence as the TCP path: both go through lookupInner so they cannot
+		// disagree about which server resolves tunnelled names.
+		destinationAddresses, lookupErr := c.lookupInner(ctx, destination.Fqdn)
 		if lookupErr != nil {
 			return nil, netip.Addr{}, lookupErr
 		}
