@@ -131,6 +131,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 
+	// Chromium's DNS goes through this bridge rather than the system resolver, so a Naive
+	// connection cannot leak a query past sing-box's DNS policy.
+	//
+	// # There is no second lookup on the socket path
+	//
+	// The obvious worry is a double resolution: Chromium resolves the server name here, and then
+	// the custom socket factory dials it again. That does not happen, and the socket callback's
+	// contract is what settles it -- cronet-go documents the address it receives as an
+	// "IP address string (e.g. \"1.2.3.4\" or \"::1\")" for BOTH the TCP and UDP factories. Chromium
+	// resolves once through this bridge and hands the dialer an address, not a name.
+	//
+	// So the resolution happens exactly once, through the policy below, and the dial layer receives
+	// the result. The two layers are not two authorities.
 	dnsRouter := service.FromContext[adapter.DNSRouter](ctx)
 	var dnsResolver cronet.DNSResolverFunc
 	if dnsRouter != nil {
