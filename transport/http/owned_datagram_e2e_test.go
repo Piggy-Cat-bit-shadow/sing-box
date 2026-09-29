@@ -63,6 +63,29 @@ func (s *ownedPathServer) started() bool {
 	return s.loopStarted
 }
 
+// awaitStarted waits until the server has entered its datagram loop, or reports that it did not.
+//
+// # Why this cannot be a synchronous check
+//
+// The client's OpenTunnelWithInfo returns as soon as it has read the 200 response. The server's
+// handler runs on a DIFFERENT goroutine and only then reaches the datagram loop, so the flag is
+// necessarily unset at the moment the tunnel is established. Asserting it immediately is a race
+// that passes on a fast local machine and fails under load -- which is exactly what happened in CI,
+// where the deep-check job runs the whole suite with -race.
+//
+// Waiting for the condition is the honest form: it still fails if the server never gets there, and
+// it no longer fails merely because the scheduler had not run the handler yet.
+func (s *ownedPathServer) awaitStarted(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if s.started() {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return s.started()
+}
+
 func startOwnedPathServer(t *testing.T) *ownedPathServer {
 	t.Helper()
 	server := &ownedPathServer{}
@@ -181,7 +204,9 @@ func TestOwnedDatagramDeliversExactBytes(t *testing.T) {
 	stream := ownedPathTunnel(t, server.address)
 	sender := AsOwnedDatagramSender(stream)
 	require.NotNil(t, sender)
-	require.True(t, server.started(), "the server must have reached its datagram loop")
+	require.True(t, server.awaitStarted(5*time.Second),
+		"the server must reach its datagram loop; the handler runs on its own goroutine, so this "+
+			"waits rather than assuming the scheduler already ran it")
 
 	// 512 bytes plus framing stays under the datagram ceiling a loopback QUIC connection reports.
 	const packets = 16
