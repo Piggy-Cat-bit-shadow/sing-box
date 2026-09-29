@@ -33,7 +33,19 @@ type Outbound struct {
 	logger    logger.ContextLogger
 	client    *socks.Client
 	resolve   bool
-	uotClient *uot.Client
+	// targetQueryOptions is the resolver policy for a TARGET domain, as opposed to the proxy
+	// server's hostname.
+	//
+	// SOCKS4 carries only an IPv4 address, so a domain target MUST be resolved locally before it
+	// can be sent. That resolution is a workaround for the protocol's limit, not a tunnel policy,
+	// so it has to follow the same resolver the operator configured for this outbound -- the one
+	// the server hostname already uses. Querying with empty options instead would silently bypass
+	// DialerOptions.DomainResolver and send the target through the default DNS path.
+	//
+	// Resolved once at construction: the options are fixed for the outbound's lifetime, and the
+	// per-connection path must not re-derive them.
+	targetQueryOptions adapter.DNSQueryOptions
+	uotClient          *uot.Client
 	// earlyBufferGrowth is reported through the copy-tuning capability so the route
 	// layer can size its buffers for a chained hop. Off unless opted in.
 	earlyBufferGrowth bool
@@ -54,12 +66,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	// The outbound dialer is a ResolveDialer whenever the server is a domain, but it is built
+	// unconditionally, so the type assertion is guarded rather than assumed.
+	var targetQueryOptions adapter.DNSQueryOptions
+	if resolveDialer, isResolveDialer := outboundDialer.(dialer.ResolveDialer); isResolveDialer {
+		targetQueryOptions = resolveDialer.QueryOptions()
+	}
 	outbound := &Outbound{
-		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
-		logger:    logger,
-		client:    socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
-		resolve:   version == socks.Version4,
+		Adapter:            outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
+		dnsRouter:          service.FromContext[adapter.DNSRouter](ctx),
+		logger:             logger,
+		client:             socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
+		resolve:            version == socks.Version4,
+		targetQueryOptions: targetQueryOptions,
 	}
 
 	if preconnect := options.TCPPreconnect; preconnect != nil && preconnect.Enabled {
@@ -136,7 +155,7 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if h.resolve && destination.IsDomain() {
-		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, h.targetQueryOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +173,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 		return h.uotClient.ListenPacket(ctx, destination)
 	}
 	if h.resolve && destination.IsDomain() {
-		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, h.targetQueryOptions)
 		if err != nil {
 			return nil, err
 		}
