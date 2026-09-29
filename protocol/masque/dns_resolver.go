@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -207,10 +208,16 @@ func (t *configurationDNSTransport) exchangeWith(ctx context.Context, resolver d
 // of them are ways to reach the same resolver; using only the first would treat a resolver whose
 // first address is stale as entirely unusable and never contact the rest.
 //
-// The native transport handles the truncated-answer retry over TCP internally, using the same
-// dialer, so the retry stays inside the tunnel. When the TCP path is not routable the retry
-// fails -- which is a legitimate failure reported to the caller, never a reason to leave the
-// tunnel.
+// # Why each attempt gets a protocol-constrained dialer
+//
+// The native UDP transport retries a truncated answer over TCP, dialing through whatever dialer it
+// was given. Handing it the raw device dialer would let that retry reach the tunnel even when the
+// server's ROUTE_ADVERTISEMENT never permitted TCP to that address -- the tunnel would carry a
+// flow the server said it does not route, and the failure would surface as a confusing timeout
+// rather than as the policy refusal it is.
+//
+// So the dialer is wrapped per address to permit exactly the protocols advertised for it. A TCP
+// retry is then refused up front, with a reason, when TCP was not advertised.
 func (t *configurationDNSTransport) exchangePlain(ctx context.Context, resolver dnsResolverSnapshot, message *mDNS.Msg) (*mDNS.Msg, error) {
 	if resolver.plain == nil {
 		return nil, E.New("assigned DNS resolver ", resolver.describe(), " has no plain DNS capability")
@@ -220,7 +227,12 @@ func (t *configurationDNSTransport) exchangePlain(ctx context.Context, resolver 
 		serverAddress := M.SocksaddrFrom(address, resolver.dnsPort())
 		// A short-lived transport per attempt. It owns only this query's sockets, so a
 		// snapshot replacement never has to retire anything.
-		native := dnsTransport.NewUDPRaw(t.logger, dns.NewTransportAdapter(assignedDNSType, "masque-assigned", nil), t.dialer, serverAddress)
+		native := dnsTransport.NewUDPRaw(
+			t.logger,
+			dns.NewTransportAdapter(assignedDNSType, "masque-assigned", nil),
+			newAssignedResolverDialer(t.dialer, resolver, address),
+			serverAddress,
+		)
 		response, err := native.Exchange(ctx, message)
 		closeErr := native.Close()
 		if err == nil {
@@ -247,6 +259,97 @@ func (t *configurationDNSTransport) exchangePlain(ctx context.Context, resolver 
 // transport/http than the single call it needs, and so the path can be doubled in tests.
 type dohExecutor interface {
 	RoundTripExistingHTTP3(ctx context.Context, request *http.Request) (*http.Response, error)
+}
+
+// buildDoHRequestURL assembles the DoH request URL without re-escaping the path.
+//
+// # The bug this exists to prevent
+//
+// A dohpath is a URI Template, and its expansion is already a valid ":path": a server that
+// advertises `/%E4%B8%AD/dns-query` means that percent-encoded octet sequence, not the literal
+// characters `%`, `E`, `4`.
+//
+// The obvious construction --
+//
+//	&url.URL{Scheme: "https", Host: authority, Path: requestPath}
+//
+// gets this wrong. Assigning to Path marks the string as DECODED, so url.String() escapes it
+// again, and every '%' in the template becomes '%25':
+//
+//	/dns%2Dquery  ->  /dns%252Dquery
+//	/%E4%B8%AD     ->  /%25E4%25B8%25AD
+//
+// The request still reaches the right origin, which is what makes this fail quietly: the server
+// answers 404 or a wrong resource, and the operator sees a DNS failure with no hint that the path
+// was mangled. Setting RawPath alongside Path tells url.String() the path is already encoded, so
+// it is emitted verbatim.
+//
+// A template whose escapes are not valid percent-encoding is rejected rather than passed through,
+// because it cannot be a ":path" and copying it verbatim would send a malformed request line.
+func buildDoHRequestURL(authority string, requestPath string) (string, error) {
+	decodedPath, err := url.PathUnescape(requestPath)
+	if err != nil {
+		return "", E.Cause(err, "dohpath is not valid percent-encoding: ", requestPath)
+	}
+	requestURL := &url.URL{
+		Scheme:   "https",
+		Host:     authority,
+		Path:     decodedPath,
+		RawPath:  requestPath,
+		RawQuery: "",
+	}
+	return requestURL.String(), nil
+}
+
+// assignedResolverDialer permits only the transports the server advertised for one address.
+//
+// # What it constrains
+//
+// A ROUTE_ADVERTISEMENT may route an address for UDP only. The native DNS transport's
+// truncated-answer retry dials TCP through the same dialer it was given for UDP, so without this
+// wrapper a UDP-only route still produces TCP traffic in the tunnel. That traffic is not merely
+// wasted: the server has stated it does not route it, so the flow is dropped and the caller sees a
+// timeout that looks like packet loss.
+//
+// # Why the permission is per-ADDRESS
+//
+// A nameserver structure may list several addresses with different route coverage, so an address
+// whose TCP is unadvertised must not inherit permission from a sibling address that has it. The
+// permission is therefore computed once, for the single address this dialer was built for.
+//
+// Only TCP is refused. UDP was already validated by reachableForProtocol when the address was
+// selected for this attempt, so re-checking it here would add a refusal path that can never
+// legitimately fire -- and if it ever did, plain DNS would stop working entirely.
+type assignedResolverDialer struct {
+	N.Dialer
+	// tcpPermitted is true when this address is reachable under a route that permits TCP (or
+	// permits all protocols).
+	tcpPermitted bool
+	// address is retained so the refusal names the address it applies to.
+	address netip.Addr
+}
+
+func newAssignedResolverDialer(dialerInstance N.Dialer, resolver dnsResolverSnapshot, address netip.Addr) N.Dialer {
+	tcpPermitted := false
+	for _, permitted := range resolver.plain.tcpAddresses {
+		if permitted == address {
+			tcpPermitted = true
+			break
+		}
+	}
+	return &assignedResolverDialer{
+		Dialer:       dialerInstance,
+		tcpPermitted: tcpPermitted,
+		address:      address,
+	}
+}
+
+func (d *assignedResolverDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if !d.tcpPermitted && network == N.NetworkTCP {
+		return nil, E.New("assigned DNS resolver address ", d.address,
+			" is not advertised as reachable over TCP, so the truncated-answer retry is refused")
+	}
+	return d.Dialer.DialContext(ctx, network, destination)
 }
 
 // exchangeDoH issues one RFC 8484 POST on the tunnel's own HTTP/3 connection.
@@ -285,8 +388,11 @@ func (t *configurationDNSTransport) exchangeDoH(ctx context.Context, resolver dn
 		return nil, err
 	}
 
-	requestURL := &url.URL{Scheme: "https", Host: authority, Path: requestPath}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(packed))
+	requestURL, err := buildDoHRequestURL(authority, requestPath)
+	if err != nil {
+		return nil, E.Cause(err, "build DoH request URL")
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(packed))
 	if err != nil {
 		return nil, E.Cause(err, "build DoH request")
 	}

@@ -4,11 +4,9 @@ package http
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"sync"
 	"testing"
@@ -21,21 +19,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// End-to-end test of the property Stage 6 and Stage 7 exist for: a CONNECT-IP tunnel and
+// End-to-end test of the property the same-connection API exists for: a CONNECT-IP tunnel and
 // the DoH requests that ride along with it must travel on ONE QUIC connection.
 //
 // # Why this cannot be inferred from the unit tests
 //
-// The unit tests prove the plumbing: that acquire() memoizes, that the generic path calls it,
+// The unit tests prove the plumbing: that acquire() memoizes, that the generic path uses it,
 // that DoH selects the generic path. All of those could hold while the real system still
 // opened two connections -- for instance if the tunnel and the DoH client were built from
 // different Client values, or if a connection reset between them.
 //
-// So this test runs against a REAL HTTP/3 server that accepts a CONNECT-IP request and
-// ordinary requests on the same listener, and counts the QUIC connections the server
-// accepted. One is the only acceptable answer. The server is not mocked: it is a real
-// quic-go http3.Server with a real TLS handshake, and the count is taken from the server's
-// own ConnContext callback rather than from anything the client reports about itself.
+// So these tests drive the PRODUCTION tunnel path -- OpenTunnelWithInfo, the same call the
+// MASQUE session makes -- against a REAL HTTP/3 server, and count the QUIC connections the
+// server accepted rather than anything the client reports about itself. One is the only
+// acceptable answer.
+//
+// # Why the tunnel is exercised with REAL BYTES at the end
+//
+// A CONNECT-IP tunnel and an ordinary HTTP request have different lifecycles, and an earlier
+// defect forced both through one shape that closed the write side when the request was sent.
+// That is correct for a request and fatal for a tunnel: the first proxy write then failed with
+// "write on closed stream". A test that stops at the 200 cannot see it, so these tests also
+// write through the tunnel and read the echo back after the DoH traffic has run. The defect
+// being guarded against here is subtler still -- a tunnel whose write side is closed by cleanup
+// SHARED with the request path -- and it is only observable the same way.
 
 // countingTunnelServer is a real HTTP/3 server that serves both an extended CONNECT tunnel
 // and ordinary requests, and counts the QUIC connections it accepts.
@@ -90,15 +97,29 @@ func startCountingTunnelServer(t *testing.T, dohAnswer []byte) *countingTunnelSe
 			server.access.Unlock()
 
 			if request.Method == http.MethodConnect {
-				// A CONNECT-IP stream is answered with 200 and then stays open as the
-				// tunnel. The handler must NOT return, or the stream would be closed;
-				// it blocks until the request context is cancelled.
+				// A CONNECT-IP stream is answered with 200 and then STAYS OPEN as the tunnel:
+				// it echoes payload back. The handler must NOT return after the 200, or the
+				// stream would be closed and the tunnel would be dead on its write side --
+				// which is exactly the regression these tests cover.
 				writer.WriteHeader(http.StatusOK)
 				if flusher, isFlusher := writer.(http.Flusher); isFlusher {
 					flusher.Flush()
 				}
-				<-request.Context().Done()
-				return
+				buffer := make([]byte, 4096)
+				for {
+					read, readErr := request.Body.Read(buffer)
+					if read > 0 {
+						if _, writeErr := writer.Write(buffer[:read]); writeErr != nil {
+							return
+						}
+						if flusher, isFlusher := writer.(http.Flusher); isFlusher {
+							flusher.Flush()
+						}
+					}
+					if readErr != nil {
+						return
+					}
+				}
 			}
 			writer.Header().Set("Content-Type", "application/dns-message")
 			writer.WriteHeader(http.StatusOK)
@@ -131,74 +152,68 @@ func startCountingTunnelServer(t *testing.T, dohAnswer []byte) *countingTunnelSe
 	return server
 }
 
-// testTLSClientConfig builds a client TLS config that trusts the server's certificate.
-func testTLSClientConfig(t *testing.T) *tls.Config {
+// newSameConnClient builds a real transport/http client pointed at a loopback server.
+//
+// It is assembled from the client's own fields rather than through NewClientWithTLS, which
+// resolves a full outbound dialer from the service registry -- a configuration-layer concern.
+// The tunnel and request branches are reachable with the fields set, exactly as the other
+// HTTP/3 tests in this package do it.
+func newSameConnClient(t *testing.T, address string) *Client {
 	t.Helper()
-	return &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{http3.NextProtoH3},
+	client := dialerForTunnel(t, address)
+	// The tunnel path falls back to HTTP/2 and HTTP/1 when HTTP/3 is unavailable, and the
+	// fallback must fail here rather than silently produce a tunnel this test did not ask for.
+	client.tlsDialer = nil
+	return client
+}
+
+// writeAndReadThroughTunnel writes a payload to the tunnel and reads the echo back.
+//
+// This is the assertion that matters for a shared lifecycle: a tunnel whose write side was
+// closed by some other stream's cleanup accepts no bytes at all, and a read-only check would
+// not notice.
+func writeAndReadThroughTunnel(t *testing.T, tunnel io.ReadWriteCloser, payload string) {
+	t.Helper()
+	_, err := tunnel.Write([]byte(payload))
+	require.NoError(t, err,
+		"the tunnel must remain writable; a write side closed by shared cleanup fails here with 'write on closed stream'")
+
+	buffer := make([]byte, len(payload))
+	if deadlineSetter, isDeadlineSetter := tunnel.(interface{ SetReadDeadline(time.Time) error }); isDeadlineSetter {
+		_ = deadlineSetter.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}
+	_, err = io.ReadFull(tunnel, buffer)
+	require.NoError(t, err, "the tunnel must remain readable")
+	require.Equal(t, payload, string(buffer), "the echo must carry exactly what was written")
 }
 
 // TestTunnelAndDoHShareOneConnection is the Stage 7 acceptance test.
 //
-// It opens a CONNECT-IP tunnel, then issues several DoH requests, and requires the server to
-// have accepted exactly ONE QUIC connection for all of them. A second connection would mean
-// the coalescing the draft asks for is not happening, and the privacy property the design
-// claims -- that inner DNS queries and tunnel traffic are indistinguishable as one flow --
-// would be false.
+// It opens a CONNECT-IP tunnel through the production path, then issues several DoH requests,
+// and requires the server to have accepted exactly ONE QUIC connection for all of them. A
+// second connection would mean the coalescing the draft asks for is not happening, and the
+// privacy property the design claims -- that inner DNS queries and tunnel traffic are
+// indistinguishable as one flow -- would be false.
 func TestTunnelAndDoHShareOneConnection(t *testing.T) {
 	t.Parallel()
 
 	answer := []byte("dns-wire-response")
 	server := startCountingTunnelServer(t, answer)
+	client := newSameConnClient(t, server.address)
 
-	clientConn, err := quic.DialAddr(context.Background(),
-		server.address, testTLSClientConfig(t), &quic.Config{
-			HandshakeIdleTimeout: 5 * time.Second,
-			EnableDatagrams:      true,
-		})
+	// 1. Open a CONNECT-IP tunnel. This is the production call the MASQUE session makes, so the
+	//    connection beneath it is the one acquire() memoizes rather than one this test built.
+	tunnel, tunnelTransport, err := client.OpenTunnelWithInfo(context.Background(), "connect-ip", "/")
 	require.NoError(t, err)
-	defer clientConn.CloseWithError(0, "")
+	require.Equal(t, TunnelTransportHTTP3, tunnelTransport,
+		"the tunnel must be established over HTTP/3, which is the fact a same-connection DoH decision depends on")
+	defer tunnel.Close()
 
-	// Build the same shape transport/http uses: one ClientConn wrapping this QUIC
-	// connection, which is what acquire() memoizes in production.
-	transport := &http3.Transport{}
-	http3Conn := transport.NewClientConn(clientConn)
+	// The tunnel works BEFORE the requests, so the comparison at the end is meaningful.
+	writeAndReadThroughTunnel(t, tunnel, "tunnel-before")
 
-	// Wait for the server's SETTINGS, which advertise Extended CONNECT and datagrams.
-	select {
-	case <-http3Conn.ReceivedSettings():
-	case <-time.After(5 * time.Second):
-		t.Fatal("server settings were not received")
-	}
-	require.True(t, http3Conn.Settings().EnableDatagrams,
-		"the server must advertise datagrams for a CONNECT-IP tunnel")
-
-	impl := &http3ClientImpl{
-		transport: transport,
-		conn:      http3Conn,
-		authority: server.address,
-	}
-	client := &Client{http3: impl, http3Authority: server.address}
-
-	// 1. Open a CONNECT-IP tunnel on the shared connection.
-	tunnelURL := &url.URL{Scheme: "https", Host: server.address, Path: "/.well-known/masque/ip/*/*/"}
-	tunnelRequest, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, tunnelURL.String(), nil)
-	require.NoError(t, err)
-	tunnelRequest.Proto = "connect-ip"
-	tunnelRequest.Host = server.address
-	tunnelRequest.Header.Set("Capsule-Protocol", "?1")
-
-	tunnelResponse, err := client.RoundTripHTTP3(context.Background(), tunnelRequest)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, tunnelResponse.StatusCode,
-		"the tunnel must be established on the shared connection")
-	defer tunnelResponse.Body.Close()
-
-	// 2. Issue DoH requests. The FIRST one must reuse the connection the tunnel is on,
-	//    which is the whole claim: these are separate HTTP/3 streams, not a second
-	//    connection.
+	// 2. Issue DoH requests. Every one must reuse the connection the tunnel is on, which is the
+	//    whole claim: these are separate HTTP/3 streams, not a second connection.
 	const dohRequestCount = 8
 	var waitGroup sync.WaitGroup
 	errors := make(chan error, dohRequestCount)
@@ -206,14 +221,13 @@ func TestTunnelAndDoHShareOneConnection(t *testing.T) {
 		waitGroup.Add(1)
 		go func() {
 			defer waitGroup.Done()
-			requestURL := "https://" + server.address + "/dns-query"
 			request, requestErr := http.NewRequestWithContext(context.Background(), http.MethodPost,
-				requestURL, stringReader("query-"+strconv.Itoa(index)))
+				"https://"+server.address+"/dns-query", stringReader("query-"+strconv.Itoa(index)))
 			if requestErr != nil {
 				errors <- requestErr
 				return
 			}
-			response, roundTripErr := client.RoundTripHTTP3(context.Background(), request)
+			response, roundTripErr := client.RoundTripExistingHTTP3(context.Background(), request)
 			if roundTripErr != nil {
 				errors <- roundTripErr
 				return
@@ -244,9 +258,16 @@ func TestTunnelAndDoHShareOneConnection(t *testing.T) {
 	require.Equal(t, dohRequestCount, requests,
 		"each DoH request must be its own HTTP/3 stream on the shared connection")
 
-	// The connection is still usable after all of that, which is what proves the DoH
-	// streams did not disturb the tunnel.
-	require.NoError(t, clientConn.Context().Err(), "the shared connection must still be alive")
+	// 4. THE assertion this test was missing: the tunnel is still writable AND still readable
+	//    afterwards. A request lifecycle that closed more than its own stream -- or cleanup
+	//    shared between the two lifecycles -- leaves a tunnel that can be read but never
+	//    written again, and only a real write after the requests can see that.
+	writeAndReadThroughTunnel(t, tunnel, "tunnel-after")
+
+	// And the connection itself must still be alive, since it is what both lifecycles sit on.
+	clientConn, live := client.http3.(*http3ClientImpl).existingConn()
+	require.True(t, live, "the shared connection must still be memoized and alive")
+	require.NoError(t, clientConn.Context().Err(), "the shared connection must not have been closed by either lifecycle")
 }
 
 // stringReader is a tiny io.Reader for bodies, avoiding strings.NewReader so that the
@@ -273,37 +294,25 @@ func stringReader(value string) *simpleReader {
 // TestDoHRequestDoesNotCreateASecondConnectionWhenTunnelExists is the negative half.
 //
 // It asserts that the connection count stays at one across many sequential requests, so a
-// per-request connection (a plausible regression if acquire() were ever bypassed) is caught
-// even though every individual request would still succeed.
+// per-request connection (a plausible regression if the request path stopped using the
+// memoized connection) is caught even though every individual request would still succeed.
 func TestDoHRequestDoesNotCreateASecondConnectionWhenTunnelExists(t *testing.T) {
 	t.Parallel()
 
 	server := startCountingTunnelServer(t, []byte("answer"))
+	client := newSameConnClient(t, server.address)
 
-	clientConn, err := quic.DialAddr(context.Background(),
-		server.address, testTLSClientConfig(t), &quic.Config{
-			HandshakeIdleTimeout: 5 * time.Second,
-			EnableDatagrams:      true,
-		})
+	tunnel, tunnelTransport, err := client.OpenTunnelWithInfo(context.Background(), "connect-ip", "/")
 	require.NoError(t, err)
-	defer clientConn.CloseWithError(0, "")
-
-	transport := &http3.Transport{}
-	http3Conn := transport.NewClientConn(clientConn)
-	select {
-	case <-http3Conn.ReceivedSettings():
-	case <-time.After(5 * time.Second):
-		t.Fatal("server settings were not received")
-	}
-
-	impl := &http3ClientImpl{transport: transport, conn: http3Conn, authority: server.address}
-	client := &Client{http3: impl, http3Authority: server.address}
+	require.Equal(t, TunnelTransportHTTP3, tunnelTransport,
+		"the negative case is only meaningful if the tunnel really is on HTTP/3")
+	defer tunnel.Close()
 
 	for range 5 {
 		request, requestErr := http.NewRequestWithContext(context.Background(), http.MethodPost,
 			"https://"+server.address+"/dns-query", stringReader("q"))
 		require.NoError(t, requestErr)
-		response, roundTripErr := client.RoundTripHTTP3(context.Background(), request)
+		response, roundTripErr := client.RoundTripExistingHTTP3(context.Background(), request)
 		require.NoError(t, roundTripErr)
 		_, _ = io.ReadAll(response.Body)
 		require.NoError(t, response.Body.Close())
@@ -311,4 +320,8 @@ func TestDoHRequestDoesNotCreateASecondConnectionWhenTunnelExists(t *testing.T) 
 
 	require.Equal(t, 1, server.connectionCount(),
 		"sequential requests must never open another connection")
+
+	// The tunnel must have survived the requests: a per-request connection is one failure mode,
+	// and a request path that tears down what it shares is the other.
+	writeAndReadThroughTunnel(t, tunnel, "still-alive")
 }

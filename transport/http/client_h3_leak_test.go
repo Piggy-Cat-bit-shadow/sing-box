@@ -28,13 +28,13 @@ import (
 // shared across a connection, so a leaked stream on the SHARED connection eventually stalls
 // the CONNECT-IP tunnel as well. That is why an unclosed response body is not merely untidy.
 
-// TestRoundTripHTTP3CancellationDoesNotLeakStreams issues many requests that are cancelled
+// TestRoundTripExistingHTTP3CancellationDoesNotLeakStreams issues many requests that are cancelled
 // before they complete and requires the goroutine count to return to where it started.
 //
 // A cancellation path that left a reader goroutine blocked would be invisible to a
 // single-request test and fatal to a long-running one, so the check is on the aggregate
 // across many iterations rather than on any single one.
-func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
+func TestRoundTripExistingHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 	t.Parallel()
 
 	// A handler that never answers, so every request below is genuinely cancelled
@@ -52,6 +52,7 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 		}
 	})
 	client := newGenericTestClient(t, server)
+	ensureH3Connection(t, client)
 
 	// Each iteration is bounded by its own deadline, so a request that failed to observe
 	// cancellation fails this test quickly and says so, rather than hanging until the
@@ -73,14 +74,14 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 		done := make(chan outcome, 1)
 		started := time.Now()
 		go func() {
-			response, roundTripErr := client.RoundTripHTTP3(ctx, request)
+			response, roundTripErr := client.RoundTripExistingHTTP3(ctx, request)
 			if roundTripErr == nil && response != nil {
 				_ = response.Body.Close()
 			}
 			done <- outcome{elapsed: time.Since(started)}
 		}()
 		// Cancel once the request is certainly in flight. The connection is already
-		// established by the warm-up above, so this is not a race with the handshake.
+		// established by ensureH3Connection above, so this is not a race with the handshake.
 		time.Sleep(20 * time.Millisecond)
 		cancel()
 		select {
@@ -130,18 +131,18 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		"https://"+server.address+"/dns-query", nil)
 	require.NoError(t, err)
-	response, err := client.RoundTripHTTP3(context.Background(), request)
+	response, err := client.RoundTripExistingHTTP3(context.Background(), request)
 	require.NoError(t, err, "the shared connection must survive repeated cancellation")
 	require.NoError(t, response.Body.Close())
 }
 
-// TestRoundTripHTTP3AbandonedBodyDoesNotStallTheConnection is the flow-control test.
+// TestRoundTripExistingHTTP3AbandonedBodyDoesNotStallTheConnection is the flow-control test.
 //
 // Closing the response body is a contract the caller must honour, and this test makes the
 // consequence concrete: after many requests whose bodies were properly closed, the
 // connection still serves traffic. If each response leaked flow-control credit, the
 // connection would eventually stall and this would time out.
-func TestRoundTripHTTP3AbandonedBodyDoesNotStallTheConnection(t *testing.T) {
+func TestRoundTripExistingHTTP3AbandonedBodyDoesNotStallTheConnection(t *testing.T) {
 	t.Parallel()
 
 	server := startCountingH3Server(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -150,12 +151,13 @@ func TestRoundTripHTTP3AbandonedBodyDoesNotStallTheConnection(t *testing.T) {
 		_, _ = writer.Write(make([]byte, 64<<10))
 	})
 	client := newGenericTestClient(t, server)
+	ensureH3Connection(t, client)
 
 	for index := range 30 {
 		request, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 			"https://"+server.address+"/dns-query", nil)
 		require.NoError(t, err)
-		response, err := client.RoundTripHTTP3(context.Background(), request)
+		response, err := client.RoundTripExistingHTTP3(context.Background(), request)
 		require.NoError(t, err, "request %d must succeed", index)
 		// Read less than the full body and close: the abandoned remainder must not
 		// hold credit against the shared connection.
@@ -167,13 +169,13 @@ func TestRoundTripHTTP3AbandonedBodyDoesNotStallTheConnection(t *testing.T) {
 		"thirty requests with partly-read bodies must not have needed another connection")
 }
 
-// TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses runs many concurrent requests and
+// TestRoundTripExistingHTTP3ConcurrentRequestsDoNotLeakResponses runs many concurrent requests and
 // checks that they all complete and share one connection.
 //
 // Concurrency is where a leak is most likely: a response body that is only closed on the
 // happy path, or a stream only released when the caller reads to EOF, would still pass a
 // sequential test.
-func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
+func TestRoundTripExistingHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 	t.Parallel()
 
 	server := startCountingH3Server(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -181,6 +183,7 @@ func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 		_, _ = io.WriteString(writer, "answer")
 	})
 	client := newGenericTestClient(t, server)
+	ensureH3Connection(t, client)
 
 	const concurrency = 32
 	var waitGroup sync.WaitGroup
@@ -195,7 +198,7 @@ func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 				failures <- err
 				return
 			}
-			response, err := client.RoundTripHTTP3(context.Background(), request)
+			response, err := client.RoundTripExistingHTTP3(context.Background(), request)
 			if err != nil {
 				failures <- err
 				return
@@ -220,7 +223,7 @@ func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 		"each concurrent request must have had its own stream")
 }
 
-// TestRoundTripHTTP3ErrorPathsDoNotLeakStreams drives the failure paths.
+// TestRoundTripExistingHTTP3ErrorPathsDoNotLeakStreams drives the failure paths.
 //
 // A non-2xx status is a valid response the caller interprets, not a transport failure, so
 // this is the path where "it worked" and "it cleaned up" could most easily diverge: nothing
@@ -237,7 +240,7 @@ func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 // The server counts the streams it serves and the connections it accepts, which are facts
 // about the code under test. Twenty requests must produce twenty streams on ONE connection,
 // and that stays true no matter what the rest of the process is doing.
-func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
+func TestRoundTripExistingHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 	t.Parallel()
 
 	server := startCountingH3Server(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -246,13 +249,14 @@ func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 		_, _ = io.WriteString(writer, "upstream failed")
 	})
 	client := newGenericTestClient(t, server)
+	ensureH3Connection(t, client)
 
 	const requestCount = 20
 	for index := range requestCount {
 		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 			"https://"+server.address+"/dns-query", strings.NewReader("query"))
 		require.NoError(t, err)
-		response, err := client.RoundTripHTTP3(context.Background(), request)
+		response, err := client.RoundTripExistingHTTP3(context.Background(), request)
 		require.NoError(t, err, "a non-2xx status is not a transport error")
 		require.Equal(t, http.StatusBadGateway, response.StatusCode)
 		_, _ = io.ReadAll(response.Body)
@@ -265,12 +269,12 @@ func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 		"%d requests must share one connection, which is the property the coalescing depends on", requestCount)
 }
 
-// TestRoundTripHTTP3BodyCloseIsIdempotent proves a double close is harmless.
+// TestRoundTripExistingHTTP3BodyCloseIsIdempotent proves a double close is harmless.
 //
 // Callers routinely close in a defer and again on an error path. A body that panicked or
 // double-released its stream on the second close would be a latent crash in production code
 // that happens to be written that way.
-func TestRoundTripHTTP3BodyCloseIsIdempotent(t *testing.T) {
+func TestRoundTripExistingHTTP3BodyCloseIsIdempotent(t *testing.T) {
 	t.Parallel()
 
 	server := startCountingH3Server(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -278,11 +282,12 @@ func TestRoundTripHTTP3BodyCloseIsIdempotent(t *testing.T) {
 		_, _ = io.WriteString(writer, "answer")
 	})
 	client := newGenericTestClient(t, server)
+	ensureH3Connection(t, client)
 
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet,
 		"https://"+server.address+"/dns-query", nil)
 	require.NoError(t, err)
-	response, err := client.RoundTripHTTP3(context.Background(), request)
+	response, err := client.RoundTripExistingHTTP3(context.Background(), request)
 	require.NoError(t, err)
 	_, _ = io.ReadAll(response.Body)
 	require.NoError(t, response.Body.Close())

@@ -211,26 +211,28 @@ func (c *http3ClientImpl) connectCandidateAt(ctx context.Context, address netip.
 	return rawConn, quicConn, nil
 }
 
+// openStream establishes a CONNECT tunnel: one HTTP/3 stream carrying payload in both directions
+// for as long as the tunnel lives.
+//
+// # This is not a request, and must not be treated as one
+//
+// Every step here -- acquire a connection, open a stream, send a CONNECT header, read the response
+// -- looks like the start of an ordinary request, and that resemblance is the hazard. For an
+// ordinary request the response is the END: the write side is finished once the request has been
+// sent and closing it is correct cleanup. For a CONNECT the 200 is the BEGINNING, and closing the
+// write side there leaves a stream that can be read but never written, so the first proxy write
+// fails with "write on closed stream".
+//
+// The two therefore do not share an implementation. openConnectStream owns the CONNECT lifecycle
+// and returns the stream LIVE; ordinary requests go through ClientConn.RoundTrip, which manages its
+// own. What they DO share is the connection, how it is acquired, and the same-origin policy.
 func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {
-	// The shared primitive does the connection acquisition, stream opening, request
-	// sending, response reading and cleanup. What remains here is exactly the
-	// CONNECT-specific part: a tunnel is only usable with StatusOK.
-	//
-	// Keeping the interpretation here rather than inside the primitive is deliberate. A
-	// tunnel needs 200; an ordinary request accepts any status. Folding both into one
-	// function would mean a mode flag, and the two paths would then be impossible to reason
-	// about independently.
-	stream, clientConn, response, err := c.openRequestStream(ctx, request)
+	stream, clientConn, err := c.openConnectStream(ctx, request)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
 		return nil, nil, E.Cause(err, "HTTP/3 CONNECT")
-	}
-	if response.StatusCode != http.StatusOK {
-		stream.CancelRead(0)
-		stream.Close()
-		return nil, nil, statusError(response)
 	}
 	return stream, clientConn, nil
 }

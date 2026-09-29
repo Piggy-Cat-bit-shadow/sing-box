@@ -723,3 +723,76 @@ func TestTransportEnvironmentIsPerConfiguration(t *testing.T) {
 	require.Equal(t, first.Environment(), firstAfter.Environment(),
 		"an unrelated configuration changing must not invalidate this configuration's cached answers")
 }
+
+// TestDoHExecutorRequiresAnHTTP3Session proves the request-time guard agrees with the compile-time
+// capability.
+//
+// # Why a second check is needed at all
+//
+// The capability compiled into a snapshot decides whether an addressless DoH resolver is USABLE,
+// and it consults the session transport. The executor handed to the DNS transport is what actually
+// carries the query. Written with only a liveness check it would answer a different question --
+// "does this client hold a live HTTP/3 connection?" instead of "was THIS session established over
+// HTTP/3?".
+//
+// Those come apart precisely when transport/http falls back. After a fallback the client still
+// holds the HTTP/3 connection it opened while trying, while the tunnel runs over HTTP/2. An
+// executor that accepted the held connection would put inner DNS on a connection the tunnel traffic
+// does not share, which is what draft-06 §3.5's coalescing requirement exists to prevent -- and
+// every query would still succeed, so nothing would look wrong.
+//
+// # Why liveness is stubbed here
+//
+// A live QUIC connection is what makes this test meaningful: with liveness false the session check
+// is unreachable and the test would pass even with the guard deleted. The h3ConnectionProbe seam
+// exists for exactly this, and both branches below keep it TRUE while only the session transport
+// changes -- so the ONLY thing that can refuse the executor is the session check under test.
+func TestDoHExecutorRequiresAnHTTP3Session(t *testing.T) {
+	t.Parallel()
+
+	router := &recordingRouter{}
+	endpoint := lookupEndpoint(t, router, adapter.DNSQueryOptions{})
+	endpoint.httpClient = &transportHTTP.Client{}
+	// A live, correctly-authenticated HTTP/3 connection exists THROUGHOUT.
+	endpoint.h3ConnectionProbe = func() (string, bool) { return "masque.example", true }
+
+	// Nothing has reported a transport yet, so the zero value is Unknown.
+	require.Nil(t, endpoint.dohExecutor(),
+		"an unreported session transport must not be treated as HTTP/3")
+
+	// The tunnel is carried over HTTP/2 while the HTTP/3 connection is still held. This is the
+	// state a fallback leaves behind, and the one the liveness check cannot detect.
+	endpoint.UpdateTunnelTransport(context.Background(), transportHTTP.TunnelTransportHTTP2)
+	require.Nil(t, endpoint.dohExecutor(),
+		"an HTTP/2 session must not be offered the held HTTP/3 connection: the query would leave the tunnel")
+
+	// The tunnel comes back over HTTP/3, so the very same held connection is now the right one.
+	endpoint.UpdateTunnelTransport(context.Background(), transportHTTP.TunnelTransportHTTP3)
+	require.NotNil(t, endpoint.dohExecutor(),
+		"once the session IS HTTP/3, the held connection is the tunnel's own and must be used")
+
+	// And the session ending withdraws it again.
+	endpoint.UpdateTunnelTransport(context.Background(), transportHTTP.TunnelTransportUnknown)
+	require.Nil(t, endpoint.dohExecutor(),
+		"a finished session must not leave its executor behind")
+}
+
+// TestDoHExecutorRequiresALiveConnection is the other half: session truth without a connection is
+// equally unusable.
+//
+// The session can be recorded as HTTP/3 while the connection has since died. Handing out an
+// executor then would make every DoH query fail instead of letting the resolver fall back to plain
+// DNS through the tunnel, which the server may well have advertised.
+func TestDoHExecutorRequiresALiveConnection(t *testing.T) {
+	t.Parallel()
+
+	router := &recordingRouter{}
+	endpoint := lookupEndpoint(t, router, adapter.DNSQueryOptions{})
+	endpoint.httpClient = &transportHTTP.Client{}
+	// The connection is gone, while the session transport still says HTTP/3.
+	endpoint.h3ConnectionProbe = func() (string, bool) { return "", false }
+	endpoint.UpdateTunnelTransport(context.Background(), transportHTTP.TunnelTransportHTTP3)
+
+	require.Nil(t, endpoint.dohExecutor(),
+		"an HTTP/3 session whose connection is no longer live must not offer a DoH executor")
+}

@@ -695,16 +695,36 @@ func (c *ClientEndpoint) lookupInner(ctx context.Context, domain string) ([]neti
 
 // dohExecutor returns the same-connection DoH executor, or nil when it cannot be used.
 //
+// # Two conditions, and the second is the one that is easy to drop
+//
 // draft-06 §3.5 asks for DoH to be coalesced over the connection the tunnel already uses, which
-// presupposes that the tunnel IS that connection. The configured protocol version is not the
-// same fact: transport/http falls back to HTTP/2, so an endpoint configured for version 3 can
-// have an HTTP/2 tunnel while the HTTP/3 code path still exists. Reporting the capability from
-// the client that owns the connection is what keeps a DNS query from creating a second one.
+// presupposes that the tunnel IS that connection. Two separate facts have to hold:
+//
+//  1. a live HTTP/3 connection exists that a request could ride on (a resource);
+//  2. THIS session was established over HTTP/3                      (session truth).
+//
+// The first alone is not enough, and the gap is not theoretical: transport/http falls back from
+// HTTP/3 to HTTP/2, so after a fallback the client still HOLDS the HTTP/3 connection it opened
+// while trying, and the tunnel now runs over HTTP/2. Handing out an executor then would put DNS on
+// a connection the tunnel traffic does not share -- which is exactly what the coalescing
+// requirement exists to prevent, and it would do so while every individual query still succeeded,
+// so nothing would look broken.
+//
+// The session transport is read from the session because it was recorded at the branch that
+// actually opened the tunnel; it is the only thing that knows which protocol won.
+//
+// Liveness goes through h3ConnectionState rather than reading httpClient directly. That helper is
+// the ONE place the two are asked about, so the compile-time capability and the runtime executor
+// cannot drift apart -- and it is the seam tests use to put the endpoint in a chosen state without
+// a live QUIC connection.
 func (c *ClientEndpoint) dohExecutor() dohExecutor {
 	if c.httpClient == nil {
 		return nil
 	}
-	if _, live := c.httpClient.HTTP3ConnectionState(); !live {
+	if c.sessionTransport.Load() != uint32(transportHTTP.TunnelTransportHTTP3) {
+		return nil
+	}
+	if _, live := c.h3ConnectionState(); !live {
 		return nil
 	}
 	return c.httpClient

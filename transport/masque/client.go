@@ -527,17 +527,11 @@ func (s *clientSession) handleDNSAssign(configurations []DNSConfiguration) error
 		}
 		s.configuration.DNS = nil
 	} else {
-		var generation uint64
-		if s.configuration.DNS != nil {
-			generation = s.configuration.DNS.Generation
-		}
 		// A fresh value rather than a mutation, so nothing a reader already holds can
-		// observe the change. The generation advances so a consumer can tell two
-		// assignments apart without deep-comparing them, which is what the DNS
-		// transport environment uses for cache isolation.
+		// observe the change: a reader takes the pointer and the value it gets stays
+		// valid and unchanged for as long as it holds it.
 		s.configuration.DNS = &DNSAssignment{
 			Configurations: configurations,
-			Generation:     generation + 1,
 		}
 	}
 	configuration := s.configuration

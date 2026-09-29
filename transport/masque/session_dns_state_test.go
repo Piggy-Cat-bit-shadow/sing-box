@@ -73,13 +73,15 @@ func TestDNSAssignReplacesRatherThanAccumulates(t *testing.T) {
 		"the most recent assignment must be the one in effect")
 }
 
-// TestDNSAssignGenerationIncrements proves the generation counter advances on every
-// accepted capsule.
+// TestDNSAssignPublishesAnImmutableSnapshot proves the property a generation counter was once
+// used to approximate: a reader holding an assignment never sees it change underneath it.
 //
-// The assigned-DNS transport uses this to isolate DNS cache entries between different
-// resolver environments. If it did not increment, a query cached against the old
-// nameserver could be served after the server replaced it.
-func TestDNSAssignGenerationIncrements(t *testing.T) {
+// The concern behind the counter was real. The DNS transport environment is derived from an
+// assignment, and if an accepted capsule MUTATED that value in place, a consumer which had
+// already built an environment from it would silently begin describing a resolver the server had
+// replaced. A counter could only ever detect that after the fact; publishing a fresh value
+// prevents it.
+func TestDNSAssignPublishesAnImmutableSnapshot(t *testing.T) {
 	t.Parallel()
 
 	current := &clientSession{}
@@ -87,15 +89,23 @@ func TestDNSAssignGenerationIncrements(t *testing.T) {
 	require.NoError(t, current.handleDNSAssign([]DNSConfiguration{{
 		Nameservers: []DNSNameserver{testNameserver(t, "192.0.2.1", 1)},
 	}}))
-	generation1 := current.loadState().configuration.DNS.Generation
+	first := current.loadState().configuration.DNS
+	require.NotNil(t, first)
+	require.Equal(t, netip.MustParseAddr("192.0.2.1"),
+		first.Configurations[0].Nameservers[0].IPv4Addresses[0])
 
 	require.NoError(t, current.handleDNSAssign([]DNSConfiguration{{
 		Nameservers: []DNSNameserver{testNameserver(t, "192.0.2.2", 1)},
 	}}))
-	generation2 := current.loadState().configuration.DNS.Generation
+	second := current.loadState().configuration.DNS
 
-	require.Greater(t, generation2, generation1,
-		"each accepted assignment must advance the generation")
+	require.NotSame(t, first, second,
+		"an accepted capsule must publish a NEW assignment rather than mutating the old one")
+	require.Equal(t, netip.MustParseAddr("192.0.2.1"),
+		first.Configurations[0].Nameservers[0].IPv4Addresses[0],
+		"the value an earlier reader holds must not change when a new assignment arrives")
+	require.Equal(t, netip.MustParseAddr("192.0.2.2"),
+		second.Configurations[0].Nameservers[0].IPv4Addresses[0])
 }
 
 // TestDNSAssignEmptyWithdrawsConfiguration covers the withdrawal case.
@@ -239,30 +249,32 @@ func TestDNSAndPREF64UpdatesAreIndividuallyAtomic(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for generation := 2; !stop.Load(); generation++ {
-			_ = publish(generation%maxTag + 1)
+		for tag := 2; !stop.Load(); tag++ {
+			_ = publish(tag%maxTag + 1)
 		}
 	}()
 
-	lastGeneration := uint64(0)
+	// Each iteration must observe a whole, self-consistent snapshot. Because a new assignment
+	// is published as a new pointer rather than by mutation, a reader can legitimately see an
+	// OLDER assignment than one it saw before only if the pointer went backwards -- which
+	// cannot happen -- so the check is on internal consistency rather than on a counter.
+	//
+	// The tag is recovered from the address the snapshot carries, so the two structures that
+	// must agree (the configuration and, when present, the PREF64 list) are verified against
+	// ONE another rather than each against a remembered number.
 	for range 20000 {
 		state := current.loadState()
 		if state.configuration.DNS == nil {
 			continue
 		}
-		// The generation is monotonically non-decreasing: a reader can never observe an
-		// assignment older than one it has already seen.
-		generation := state.configuration.DNS.Generation
-		require.GreaterOrEqual(t, generation, lastGeneration,
-			"the published assignment generation went backwards")
-		lastGeneration = generation
+		assignment := state.configuration.DNS
 
 		// Every published value must be internally whole: exactly the nameserver this
-		// test constructed, not a partially built one.
-		if len(state.configuration.DNS.Configurations) == 0 {
+		// test constructed, with nothing partially built.
+		if len(assignment.Configurations) == 0 {
 			continue
 		}
-		nameservers := state.configuration.DNS.Configurations[0].Nameservers
+		nameservers := assignment.Configurations[0].Nameservers
 		if len(nameservers) == 0 {
 			continue
 		}

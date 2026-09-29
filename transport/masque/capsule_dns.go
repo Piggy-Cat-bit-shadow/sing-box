@@ -121,12 +121,14 @@ type DNSConfiguration struct {
 // servers are responsible for separate internal domains". The client-facing view
 // flattens that to the single configuration it will actually use; see
 // DNSAssignment.SelectNameservers.
+//
+// There is deliberately no generation counter here. An accepted capsule produces a NEW
+// DNSAssignment value and consumers hold it behind an atomic pointer, so "which assignment is
+// this?" is answered by pointer identity. A counter would be a second and weaker answer to the
+// same question, and it invites "is this newer than what I hold?" comparisons that a snapshot
+// model never needs to make.
 type DNSAssignment struct {
 	Configurations []DNSConfiguration
-	// Generation increments on every accepted capsule, so consumers (and the DNS
-	// transport environment) can tell one assignment from the next without comparing
-	// the contents.
-	Generation uint64
 }
 
 // dnsNameProfile mirrors the reference's IDNA profile.

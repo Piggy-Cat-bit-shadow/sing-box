@@ -1,6 +1,8 @@
 package masque
 
 import (
+	"net/url"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -93,7 +95,76 @@ func ExpandDohPathForPost(template string) (string, error) {
 		// been removed by this point.
 		return "", E.New("dohpath ", template, " expands to an invalid path ", expanded)
 	}
+	// The expansion becomes the request's ":path" verbatim, so it must be a valid path in the
+	// sense RFC 3986 §3.3 defines. Nothing upstream checks this: the template is valid UTF-8 and
+	// every expression is well formed, but the LITERAL text between expressions can still carry
+	// bytes that cannot appear in a path at all.
+	//
+	// Catching it here rather than at request time is the difference between refusing an
+	// advertisement the server sent and failing every query against it. Two classes of byte are
+	// refused:
+	//
+	//   - a control character, space, or DEL, which RFC 3986 excludes from a URI entirely and the
+	//     URL parser rejects outright -- "/\x01{dns}" expands to a path that will not even parse;
+	//   - a malformed percent-escape such as the lone "%" in "/%{dns}", whose escape cannot be
+	//     decoded.
+	//
+	// A "%" is only a problem when it does not begin a valid escape, so "/a%20b" passes: the check
+	// is on the escape, not on the character.
+	if invalid := invalidPathByte(expanded); invalid != "" {
+		return "", E.New("dohpath ", template, " expands to ", expanded,
+			", which is not a valid HTTP path: ", invalid)
+	}
+	if _, err = url.PathUnescape(expanded); err != nil {
+		return "", E.Cause(err, "dohpath ", template,
+			" expands to ", expanded, ", which is not valid percent-encoding")
+	}
 	return expanded, nil
+}
+
+// invalidPathByte reports the first byte of a path that RFC 3986 permits neither literally nor as
+// the start of a percent-escape, or "" when the path is acceptable.
+//
+// The permitted set for a path is pchar plus "/", where pchar is:
+//
+//	unreserved    ALPHA / DIGIT / "-" / "." / "_" / "~"
+//	pct-encoded   "%" HEXDIG HEXDIG
+//	sub-delims    "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+//	":" / "@"
+//
+// Bytes outside that set can appear only percent-encoded. The check runs on the RAW expansion
+// rather than on a decoded form because the expansion is what goes on the wire: whether a byte is
+// legal depends on how it is written, and "%20" and a literal space are different inputs even
+// though they would decode alike.
+//
+// A "%" is passed through here and validated by the PathUnescape call that follows, so the two
+// checks cannot disagree about what a well-formed escape is.
+func invalidPathByte(expanded string) string {
+	for index := 0; index < len(expanded); index++ {
+		character := expanded[index]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			character == '-', character == '.', character == '_', character == '~',
+			character == '!', character == '$', character == '&', character == '\'',
+			character == '(', character == ')', character == '*', character == '+',
+			character == ',', character == ';', character == '=',
+			character == ':', character == '@', character == '/', character == '%':
+			continue
+		case character < 0x20 || character == 0x7f:
+			return "control character " + strconv.QuoteRune(rune(character)) + " is not permitted in a URI"
+		case character == ' ':
+			return "a space is not permitted in a URI and must be percent-encoded"
+		case character < 0x80:
+			return "character " + strconv.QuoteRune(rune(character)) + " is not permitted in a URI path"
+		default:
+			// A byte at or above 0x80 can only be part of a multi-byte sequence, since the
+			// template was validated as UTF-8 before this point.
+			return "a non-ASCII byte is not permitted in a URI and must be percent-encoded"
+		}
+	}
+	return ""
 }
 
 // templateReferencesDohPathVariable reports whether a template mentions the `dns` variable.
@@ -244,30 +315,76 @@ func validateTemplateExpression(expression string, template string) error {
 	return nil
 }
 
-// isValidTemplateVariableName reports whether a name matches RFC 6570 section 2.3: a varname is
-// a dot-separated sequence of varchar, where varchar is ALPHA / DIGIT / "_" / pct-encoded.
+// isValidTemplateVariableName reports whether a name matches RFC 6570 section 2.3.
+//
+// # The grammar, and why "." is not simply allowed through
+//
+// RFC 6570 §2.3 gives the varname production as:
+//
+//	varname = varchar *( ["."] varchar )
+//	varchar = ALPHA / DIGIT / "_" / pct-encoded
+//
+// The dot is a SEPARATOR between varchar components, not a member of varchar. Treating it as an
+// ordinary character -- which an earlier version of this function did -- accepts `.dns`, `dns.`,
+// `dns..foo` and a bare `.`, none of which the grammar can produce. That matters because the whole
+// point of parsing the template strictly is to refuse advertisements this client does not really
+// understand, and a name that cannot be written in the grammar is exactly that.
+//
+// A pct-encoded octet is a varchar component in its own right, so `%2E` (an encoded dot) is valid
+// and denotes a literal dot rather than a separator.
 func isValidTemplateVariableName(name string) bool {
 	if name == "" {
 		return false
 	}
-	for index := 0; index < len(name); index++ {
-		character := name[index]
+	index := 0
+	for {
+		// One component. It must be non-empty, which is what rejects a leading dot, a doubled
+		// dot, and a lone ".".
+		if !consumeTemplateVarchar(name, &index) {
+			return false
+		}
+		if index == len(name) {
+			return true
+		}
+		if name[index] != '.' {
+			// consumeTemplateVarchar stops only at a delimiter, so this is unreachable; it is
+			// kept so a future change to that helper cannot silently accept a stray byte.
+			return false
+		}
+		// Consume the separator and require ANOTHER component. The requirement is enforced by
+		// the loop rather than by the loop condition, because "index < len(name)" would
+		// happily exit on a trailing dot.
+		index++
+		if index == len(name) {
+			return false
+		}
+	}
+}
+
+// consumeTemplateVarchar advances past one varchar component -- ALPHA / DIGIT / "_" /
+// pct-encoded -- and reports whether it consumed at least one octet.
+func consumeTemplateVarchar(name string, index *int) bool {
+	start := *index
+	for *index < len(name) && name[*index] != '.' {
+		character := name[*index]
 		switch {
 		case character >= 'a' && character <= 'z',
 			character >= 'A' && character <= 'Z',
 			character >= '0' && character <= '9',
-			character == '_', character == '.':
-			continue
+			character == '_':
+			*index++
 		case character == '%':
-			if index+2 >= len(name) || !isHexDigit(name[index+1]) || !isHexDigit(name[index+2]) {
+			// A pct-encoded octet must be complete: "%" alone or a truncated "%4" is not a
+			// varchar.
+			if *index+2 >= len(name) || !isHexDigit(name[*index+1]) || !isHexDigit(name[*index+2]) {
 				return false
 			}
-			index += 2
+			*index += 3
 		default:
 			return false
 		}
 	}
-	return true
+	return *index > start
 }
 
 // isHexDigit reports whether a byte is a hexadecimal digit.

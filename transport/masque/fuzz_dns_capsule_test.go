@@ -3,7 +3,10 @@ package masque
 import (
 	"bytes"
 	"net/netip"
+	"net/url"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	E "github.com/sagernet/sing/common/exceptions"
 
@@ -725,5 +728,123 @@ func FuzzDNSAssignSVCB(fuzz *testing.F) {
 		reparsed, reparseErr := parseDNSAssign(capsulePayload(t, encoded.Bytes()))
 		require.NoError(t, reparseErr)
 		require.Equal(t, normalizeDNSConfigurations(configurations), normalizeDNSConfigurations(reparsed))
+	})
+}
+
+// FuzzDohPathExpansion drives the dohpath URI Template parser with arbitrary text.
+//
+// # The properties that must hold for EVERY input, valid or not
+//
+// The parser is the boundary between a server's advertisement and the request path this client
+// sends, so the invariants are about what an ACCEPTED template is allowed to produce:
+//
+//   - the expansion is a usable ":path": absolute, and free of the characters that would change how
+//     the request is addressed ("?" would start a query, "#" a fragment, and neither can come from
+//     a template whose expressions have been deleted);
+//   - the expansion contains no brace, because every expression is removed and RFC 6570 reserves
+//     braces in a template;
+//   - the expansion is valid UTF-8, since the template it came from was checked as text;
+//   - expansion is DETERMINISTIC: the same template must not produce two different paths.
+//
+// A rejection is always an acceptable outcome -- the parser's job is to refuse what it cannot
+// interpret -- so an error is never a failure here. The fuzz target is searching for accepted
+// values that break one of the invariants above.
+//
+// The seeds are the shapes that historically broke this code: the draft's own example, literal
+// suffixes (which a "truncate at the first brace" implementation got wrong), expressions that
+// expand to nothing, and malformed escapes and var names.
+func FuzzDohPathExpansion(fuzz *testing.F) {
+	for _, seed := range []string{
+		"/dns-query{?dns}",
+		"/dns-query",
+		"/q{?dns}suffix",
+		"{?dns}",
+		"/dns-query{dns}",
+		"dns-query{?dns}",
+		"/dns-query{&dns}",
+		"/dns-query{/dns}",
+		"/dns-query{.dns}",
+		"/dns-query{;dns}",
+		"/dns-query{?other,dns}",
+		"/dns-query{?dns*}",
+		"/dns-query{?dns:3}",
+		"/dns-query{?dns,}",
+		"/dns-query{}",
+		"/dns-query{{dns}}",
+		"/dns-query{?dns",
+		"/dns-query?dns}",
+		"/dns-query{+dns}",
+		"/dns-query{#dns}",
+		"/dns-query{?.dns}",
+		"/dns-query{?dns.}",
+		"/dns-query{?dns..query}",
+		"/dns-query{?.}",
+		"/dns-query{?d-ns}",
+		"/dns-query{?dn%2}",
+		"/dns-query{?dn%ZZ}",
+		"/dns-query{?dn%2Es}",
+		"/%E4%B8%AD/dns-query{?dns}",
+		"/dns%2Dquery{?dns}",
+		"/a%20b{?dns}",
+		"/dns-query\x80{?dns}",
+		"",
+		"/",
+		"{?dns}suffix",
+		"/q{?dns}{?dns}",
+	} {
+		fuzz.Add(seed)
+	}
+	fuzz.Fuzz(func(t *testing.T, template string) {
+		expanded, err := ExpandDohPathForPost(template)
+		if err != nil {
+			return
+		}
+		require.NotEmpty(t, expanded, "an empty expansion is refused, so it can never be returned")
+		require.True(t, strings.HasPrefix(expanded, "/"),
+			"an accepted template must expand to an absolute path, got %q from %q", expanded, template)
+		require.NotContains(t, expanded, "{",
+			"every expression is deleted during expansion, so no brace can survive: %q from %q",
+			expanded, template)
+		require.NotContains(t, expanded, "}",
+			"every expression is deleted during expansion, so no brace can survive: %q from %q",
+			expanded, template)
+		require.NotContains(t, expanded, "?",
+			"a ? would start a query string, changing what is addressed: %q from %q",
+			expanded, template)
+		require.NotContains(t, expanded, "#",
+			"a # would start a fragment, which is never sent to the server: %q from %q",
+			expanded, template)
+		require.True(t, utf8.ValidString(expanded),
+			"an accepted template is valid UTF-8, so its expansion must be too: %q from %q",
+			expanded, template)
+
+		// Determinism: expansion depends on the template alone, so a second call must agree. A
+		// parser carrying state between calls would show up here.
+		again, againErr := ExpandDohPathForPost(template)
+		require.Equal(t, err, againErr)
+		require.Equal(t, expanded, again)
+
+		// The expansion is used as the ":path" of a request to a FIXED origin, so that is what
+		// must be checked. Parsing the expansion on its own would be the wrong question: a path
+		// beginning "//" is read as a protocol-relative reference with an AUTHORITY component, so
+		// "/{dns}/%00" -> "//%00" is rejected as a standalone URL even though the same string is
+		// an ordinary path once an origin is present. A test built on the wrong shape would
+		// demand a rule the protocol does not have.
+		//
+		// What must hold is that the request URL keeps the configured origin and carries exactly
+		// this path -- including a leading "//", which must not be allowed to introduce a new
+		// host.
+		requestURL := "https://doh.example:443" + expanded
+		parsed, parseErr := url.Parse(requestURL)
+		require.NoError(t, parseErr,
+			"an accepted expansion must be usable in a request URL: %q from %q", expanded, template)
+		require.Equal(t, "doh.example:443", parsed.Host,
+			"the configured origin must survive expansion: %q from %q", expanded, template)
+		require.Equal(t, "https", parsed.Scheme,
+			"the scheme must survive expansion: %q from %q", expanded, template)
+		require.Empty(t, parsed.RawQuery,
+			"a query string would change what is addressed: %q from %q", expanded, template)
+		require.Empty(t, parsed.Fragment,
+			"a fragment is never sent to the server: %q from %q", expanded, template)
 	})
 }

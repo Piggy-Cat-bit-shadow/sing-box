@@ -234,6 +234,12 @@ successful branch of `openTunnel` used, through an additive `OpenTunnelWithInfo`
 remains a wrapper, so existing callers are untouched. The MASQUE session records it per session
 and reports `Unknown` when the session ends, so the fact cannot outlive what it describes.
 
+C is checked in **two** places, and both are needed. The compile-time capability decides whether an
+addressless DoH resolver is *usable*, and it consults C. The request-time executor that actually
+carries a query consults C as well, alongside B. Checking only B there would reintroduce the very
+conflation the table describes -- and because every individual query would still succeed, the
+mistake would be invisible until someone noticed the second connection.
+
 The DoH path then uses an **existing-connection-only** call. It never dials: a DNS query must
 never be the reason a second QUIC connection appears.
 
@@ -270,6 +276,39 @@ unusable forever; one compiled on HTTP/3 would keep offering DoH after a fallbac
 The endpoint therefore keeps the last assignment and recomputes the capability when the session
 transport or the routes change, publishing a new immutable snapshot. The server does not resend
 `DNS_ASSIGN` and should not have to: the assignment did not change, our ability to use it did.
+
+## CONNECT is a tunnel, not a request
+
+The CONNECT-IP tunnel and the DoH requests that ride beside it share one HTTP/3 connection, but
+they do not share a lifecycle, and treating them as one is a defect that fails loudly in
+production and silently in review.
+
+An ordinary HTTP request and a CONNECT begin identically -- acquire a connection, open a stream,
+send headers, read a response -- and that resemblance is the trap. For an ordinary request the
+response is the **end**: the write side is finished once the request has been sent, and closing it
+is correct cleanup. For a CONNECT the 200 is the **beginning**: the stream becomes the tunnel, and
+closing the write side there leaves something that can be read but never written. The first proxy
+write then fails with `write on closed stream`.
+
+So the two paths are separate implementations rather than one function with a mode:
+
+| | CONNECT | ordinary request |
+|---|---|---|
+| stream owner | the tunnel, opened by `openConnectStream` | quic-go's `ClientConn.RoundTrip` |
+| write side at 200 | **stays open** | finished |
+| response | becomes the tunnel | is the response |
+| setup context | bounds setup only, then detached | applies to the request |
+
+What they *do* share is the connection, how it is acquired, and the same-origin policy.
+
+One consequence deserves naming: the setup context bounds **setup** -- acquiring the connection,
+opening the stream, sending headers, reading the response. Once the tunnel is handed to the caller
+that context has no further authority, because the caller's `DialContext` typically cancels its own
+setup context on return; leaving the cancellation wired up would tear down a healthy tunnel.
+
+The regression is pinned by tests that write **real payload** after the 200 and read it back, run
+against a real quic-go HTTP/3 server. A test that stops at the 200 passes against the broken code,
+because the failure happens on the first write after it.
 
 ## SVCB validation
 
@@ -363,9 +402,37 @@ wrong), an empty expression, nested braces, unterminated or stray braces, the `*
 modifiers, invalid variable names including invalid percent escapes, and any template that is not
 valid UTF-8 -- a URI Template is a sequence of characters, so invalid UTF-8 cannot be one.
 
+A variable name must also match RFC 6570 §2.3, where the dot is a **separator** between non-empty
+components rather than an ordinary character. `.dns`, `dns.`, `dns..foo` and a bare `.` are
+therefore refused; `dns.query` and the pct-encoded `dn%2Es` are not.
+
+The **expansion** is validated too, because it becomes the request's `:path` verbatim and nothing
+upstream constrains the literal text between expressions. A template that expands to a raw control
+character, a space, a non-ASCII byte, or a `%` that begins no valid escape is refused: those are
+bytes RFC 3986 §3.3 does not permit in a path, so the advertisement is unusable rather than merely
+unusual. `/dns%20query{?dns}` is unaffected -- the check is on the escape, not on the character.
+
+An expansion of `//...` is **accepted**. It is an ordinary path once an origin is present, and it
+cannot relocate the request, because the origin is fixed before the path is attached.
+
 Nothing is invented. An empty template, a missing leading slash, or a template with no `dns`
 variable is refused: guessing a path the server did not send is worse than reporting that its
 advertisement cannot be used.
+
+## Plain DNS and the advertised protocol set
+
+Plain DNS runs through the native sing-box UDP transport over the tunnel, trying every advertised
+address in turn.
+
+That transport retries a truncated answer over TCP (RFC 1035 §4.2.1), dialing through whatever
+dialer it was given. It therefore receives a dialer **constrained to the protocols advertised for
+that one address**, taken from `ROUTE_ADVERTISEMENT`. Without it a UDP-only route would still
+produce TCP traffic the server never said it routes; the server drops it and the caller sees a
+timeout that looks like packet loss. The refusal is now explicit and happens before the dial.
+
+The constraint is per address, not per resolver: a nameserver may list several addresses with
+different route coverage, and an address whose TCP is unadvertised must not inherit permission from
+a sibling that has it.
 
 ## DoH wire details
 
@@ -433,12 +500,14 @@ production can reach it. These call real entry points:
 | **DNS capability transitions** (ALPN, origin+port, session truth, mandatory) | `protocol/masque/dns_capability_test.go` |
 | **Bootstrap and racer** | `protocol/masque/bootstrap_cache_test.go`, `bootstrap_race_test.go`, `bootstrap_race_ownership_test.go` |
 | **Tunnel transport report** (against a real HTTP/3 server) | `transport/http/tunnel_transport_test.go` |
+| **CONNECT lifecycle** (writable after 200, bidirectional, tunnel + DoH coexist) | `transport/http/client_h3_connect_lifecycle_test.go` |
 | **dohpath URI-template subset** | `transport/masque/capsule_dohpath_test.go` |
 | Capsule codecs and bounds | `transport/masque/capsule_dns_test.go` |
 | Server emission and ordering | `transport/masque/server_dns_test.go` |
-| Fuzzing (capsules, SVCB, PREF64, round trip) | `transport/masque/fuzz_dns_capsule_test.go` |
+| Fuzzing (capsules, SVCB, PREF64, round trip, dohpath) | `transport/masque/fuzz_dns_capsule_test.go` |
 | Generic H3 requests and same-origin | `transport/http/client_h3_request_test.go` |
 | One-connection proof against a real server | `transport/http/client_h3_same_conn_test.go` |
+| DoH request URL construction (no re-escaping) | `protocol/masque/dns_request_url_test.go` |
 
 ## Known limitations
 
