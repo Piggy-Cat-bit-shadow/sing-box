@@ -216,8 +216,10 @@ Unexpected dependencies: **NONE**. The only dependency change is the quic-go rep
 
 | | Result |
 |---|---|
-| quic-go fork (`./...`) | **PASS** |
-| macOS arm64 + Linux amd64 | see run IDs in the session report |
+| quic-go fork (`./...`) | **PASS** (`go test ./...` on the fork branch) |
+| Linux amd64 | **PASS** — [36600041218](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36600041218) on `32ae337e9` |
+| macOS arm64 | **PASS** — [36600035076](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36600035076) on `32ae337e9` |
+| jiejie contract suite | **226 passed / 30 skipped / 0 failed** |
 
 ## Production
 
