@@ -586,3 +586,121 @@ respectively), which is the evidence that neither path takes a lock.
 package appears in the outbound profile; the inbound path's only per-packet costs are the
 buffer wrapper the API requires and a slice the device interface requires. Per the task's stop
 condition, this is where optimisation ends rather than where it continues.
+
+---
+
+## 10. Convergence round: metadata, queueing and allocation
+
+The zero-copy work (§8-9) removed the payload copies. This round attacked what remained:
+per-packet metadata, the send-queue hand-off, and ownership bookkeeping.
+
+### 10.1 Per-packet frame metadata: one allocation, retained by design
+
+`wire.DatagramFrame` is heap-allocated per datagram. Two reductions were possible and one was
+taken.
+
+**Taken: the owner no longer costs a closure.** `SendDatagramOwned` originally stored the
+release callback as a method value, `f.SetRelease(owner.Release)`. A method value on an interface
+receiver boxes into a heap closure -- escape analysis reports
+`owner.Release escapes to heap` -- at 16 bytes per datagram. Storing the interface directly
+costs two words inside a frame the queue already holds:
+
+| | allocs | bytes |
+|---|---|---|
+| bound method value | 16 / 8 frames | 512 B/op |
+| stored interface | 8 / 8 frames | 384 B/op |
+
+That is **2 allocs, 64 B per packet -> 1 alloc, 48 B per packet**.
+
+**NOT taken: pooling the frame itself, and this is a correctness decision rather than a
+performance one.** `DatagramFrame.Release()` fires during packet serialization, when the payload
+is copied into the outgoing buffer. The frame, however, is still referenced long after that:
+
+```text
+packet_packer.go:740        pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
+packet_packer.go:1045-1055  copied into shortHeaderPacket.Frames
+sent_packet_handler.go:346  p.Frames = frames          <- retained in flight
+sent_packet_handler.go:552  putPacket(p.packet)        <- only dropped on ACK
+ackhandler/packet.go:59-63  p.Frames = nil
+```
+
+Datagram frames carry no `Handler`, so `OnAcked`/`OnLost` are no-ops -- the frame is *useless*
+after send, but it is not *unreferenced*. Recycling it at `Release()` would hand a live frame
+back to a pool while `sentPacketHandler` still holds it, and a later `getFrame()` could rewrite
+`Data`/`owner` underneath the ack handler. The existing ownership tests compare payload bytes
+across the boundary, so they would not catch it.
+
+Payload lifetime is not frame lifetime. The allocation stays.
+
+### 10.2 Batch enqueue: -5% to -14.5%, and the measurement that decided it
+
+**The batch size was measured before anything was built.** sing-tun's dispatch stage flushes a
+whole burst at once, and the production config omits `stack`, which resolves to the Go engine
+(`sing-tun/stack.go:52`) where `Flush()` runs once per event-loop turn over up to
+`goReadBatch = 64` frames. Modelling frames-per-turn over 200k turns:
+
+| scenario | mean batch | >= 2 |
+|---|---|---|
+| small reads, single flow | 3.6 | 95.6% |
+| moderate reads, shared TUN | 4.0 | 89.4% |
+| saturated single flow | 57 | 100% |
+
+Batches are overwhelmingly >= 2, so the work was justified. Per packet, `datagramQueue.Add` did
+one lock and one scheduling signal; those are now charged once per batch.
+
+| batch | before | after | delta | p |
+|---|---|---|---|---|
+| 1 | 239.1n | 226.6n | (unchanged path) | -- |
+| 2 | 267.8n | 272.0n | ~ | 0.382 |
+| 4 | 342.9n | 325.2n | **-5.13%** | 0.001 |
+| 8 | 475.5n | 435.5n | **-8.42%** | 0.000 |
+| 16 | 757.0n | 666.4n | **-11.96%** | 0.000 |
+| 32 | 1.259µ | 1.076µ | **-14.54%** | 0.000 |
+
+A batch of one keeps the original per-packet loop, because the transport charges the same fixed
+cost either way.
+
+**The false start is the instructive part.** The first version allocated a scratch slice per
+batch. At 32 B/op that single allocation cost ~40 ns against the ~13 ns/packet the batch
+reclaims, and the result was that batch=2 was **46% slower**. Both the session and the transport
+adapter now reuse their scratch slices, giving 0 B/op and 0 allocs/op. A batch API is only worth
+having if assembling the batch is free.
+
+### 10.3 What was measured and deliberately NOT changed
+
+**Inbound packet-sized allocation: NO CHANGE.** `HandleDatagramFrame` does
+`make([]byte, len(f.Data))`, measured at **168 ns / 1280 B / 1 alloc**, against **35 ns** for a
+pooled variant. The pool is 4.8x faster, so cost is not the objection -- safety is.
+
+`ReceiveDatagram(ctx) ([]byte, error)` returns a slice that sing-box wraps with **unmanaged**
+`buf.As` and hands to the device, where `processInboundBuffers` passes `packetBuffer.Bytes()`
+into an **asynchronous** return path. A pooled buffer would be recycled while the device still
+holds it, overwriting a packet queued for transmission. Removing the allocation needs an owned
+*receive* API so the pool learns when the consumer is done -- a new lifecycle contract, not a
+change to this function.
+
+**Oversize / `DatagramTooLarge` learned ceiling: REJECTED.** The cost is real (~316 ns and 6
+allocs versus ~106 ns and 2), but quic-go computes its limit as
+`min(peerMaxDatagramFrameSize, maxPayloadSizeEstimate)` and the estimate is **raise-only**
+(`connection.go:2169`: `if maxPayloadSize > current`). "Too large" is therefore a transient
+statement about the current estimate, not a stable property. A ceiling that ratchets down would
+latch a temporary reduction and permanently refuse packets the connection could carry once PMTU
+recovered -- trading a self-healing path for a permanently degraded one.
+
+**Lock-free queueing: not attempted.** Mutex and block profiles at 1/4/16 senders show no
+contention inside `writePackets`; the delay is `Client.activeSession`'s access mutex and the
+benchmark fixture's own sink lock. The batch path takes no lock of its own.
+
+### 10.4 Long-run allocation
+
+1,000,000 packets through both paths:
+
+```text
+PER-PACKET : totalAlloc=72087368 (72.1 B/packet) heapDelta=32536  numGC=21
+BATCHED    : totalAlloc=72068104 (72.1 B/packet) heapDelta=11928  numGC=21
+```
+
+The heap does not grow with packet count. Total allocation is identical in both modes, and that
+72 B/packet is the **fixture** constructing pooled buffers -- with the fixture excluded the
+dataplane path is **0.00 allocs/op**. Batching reduces time, not allocation, and this is recorded
+as such rather than presented as a memory win.
