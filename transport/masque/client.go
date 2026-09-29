@@ -156,6 +156,14 @@ type clientSession struct {
 type sessionState struct {
 	configuration Configuration
 	ready         bool
+	// routes is the precompiled form of configuration.Routes, built when the snapshot is
+	// PUBLISHED and read without a lock on the packet path. Compiling here rather than per packet
+	// is what turns a linear scan into a binary search for free: a capsule arrives rarely, a
+	// packet arrives constantly.
+	//
+	// It is derived state, so it must be built from the SAME routes value the snapshot carries.
+	// publishStateLocked is the only place that pairs them.
+	routes routeMatcher
 }
 
 // publishStateLocked rebuilds and publishes the snapshot. The caller MUST hold
@@ -167,9 +175,12 @@ type sessionState struct {
 // published. That is the invariant that makes the shallow copy sufficient, and it
 // is asserted by TestSessionSnapshotDoesNotAliasPublishedSlices.
 func (s *clientSession) publishStateLocked() {
+	configuration := s.configuration
 	s.state.Store(&sessionState{
-		configuration: s.configuration,
+		configuration: configuration,
 		ready:         s.ready,
+		// Derived from the same value the snapshot carries, so the two cannot disagree.
+		routes: compileRouteMatcher(configuration.Routes),
 	})
 }
 
@@ -457,7 +468,9 @@ func (c *Client) WritePacketBuffers(packetBuffers []*buf.Buffer, forwarded bool)
 			continue
 		}
 		errorType := tun.ICMPErrorNoRoute
-		routed := !configuration.RoutesAdvertised || RoutesContain(configuration.Routes, destination, protocol)
+		// The precompiled matcher from the SAME snapshot the configuration came from, so the
+		// routing decision stays lock-free and consistent with the routes it was built for.
+		routed := !configuration.RoutesAdvertised || state.routes.contains(destination, protocol)
 		if routed && forwarded && !decrementHopLimit(packetBuffer.Bytes()) {
 			routed = false
 			errorType = tun.ICMPErrorHopLimitExceeded

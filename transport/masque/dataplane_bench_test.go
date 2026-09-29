@@ -641,3 +641,56 @@ func BenchmarkCapsuleWriterContention(b *testing.B) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Route matching on the packet path
+// ---------------------------------------------------------------------------
+
+// BenchmarkDataplaneOutboundRouteCounts measures the REAL packet path as the number of advertised
+// routes grows, which is the measurement that decides whether route matching is worth its
+// complexity.
+//
+// # Why the sweep matters more than any single number
+//
+// The route scan is linear, so its share of the packet path depends entirely on how many ranges
+// the peer advertised. A benchmark at one route would show the scan as negligible and a benchmark
+// at 256 would show it as dominant; neither answers the question. The realistic range is the
+// middle: a default route plus a handful of split-tunnel prefixes, or a peer that splits a /8 into
+// per-site ranges.
+//
+// # What the packet does
+//
+// Every packet is addressed INSIDE the LAST range, so the lookup cannot stop early. That is the
+// worst case for a scan and the case a miss-only benchmark would hide, since a miss also scans
+// everything but gives no evidence the match itself was found.
+func BenchmarkDataplaneOutboundRouteCounts(b *testing.B) {
+	for _, routes := range []int{1, 4, 16, 64} {
+		b.Run("routes"+itoaBench(routes), func(b *testing.B) {
+			set, _, hit, _ := benchRouteSet(routes)
+			packet := buildBenchIPv4Packet(1280, 6, netip.MustParseAddr("10.0.0.2"), hit)
+			sink := &benchDatagramSink{}
+			current := benchSession(sink, &benchDiscardStream{}, &benchHandler{})
+			current.configuration.Routes = set
+			current.configuration.RoutesAdvertised = true
+			current.publishStateLocked()
+			// The client must own the session for WritePacketBuffers to reach it.
+			current.client.current = current
+
+			b.ReportAllocs()
+			b.SetBytes(1280)
+			b.ResetTimer()
+			for b.Loop() {
+				buffers := newBenchPacketBuffers(1, packet)
+				if err := current.client.WritePacketBuffers(buffers, false); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+
+			count, _ := sink.stats()
+			if count != b.N {
+				b.Fatalf("expected %d datagrams, got %d: the packet was not routed", b.N, count)
+			}
+		})
+	}
+}
