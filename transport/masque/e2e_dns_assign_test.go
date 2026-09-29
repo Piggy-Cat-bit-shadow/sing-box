@@ -56,7 +56,7 @@ func TestServerEmittedDNSCapsulesAreAcceptedByTheClientParser(t *testing.T) {
 						AuthenticationDomainName: "dns.example.test.",
 						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
 							dnsmessage.SVCParamKey(1): {0x02, 'h', '2'},
-							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+							dnsmessage.SVCParamKey(7): []byte("/dns-query{?dns}"),
 						},
 					},
 				},
@@ -84,7 +84,7 @@ func TestServerEmittedDNSCapsulesAreAcceptedByTheClientParser(t *testing.T) {
 	// same-connection DoH on the client.
 	nameserver := configurations[0].Nameservers[0]
 	require.Equal(t, "dns.example.test.", nameserver.AuthenticationDomainName)
-	require.Equal(t, []byte("/dns-query{?dns}"), nameserver.ServiceParameters[dnsmessage.SVCParamKey(9)],
+	require.Equal(t, []byte("/dns-query{?dns}"), nameserver.ServiceParameters[dnsmessage.SVCParamKey(7)],
 		"the dohpath must survive the server-client round trip")
 
 	prefixes, err := parsePREF64(capsules[3].payload)

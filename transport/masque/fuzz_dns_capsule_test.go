@@ -100,7 +100,7 @@ func dnsAssignMultiConfigurationVector() []byte {
 						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
 							dnsmessage.SVCParamKey(1): {0x02, 'h', '2', 0x02, 'h', '3'},
 							dnsmessage.SVCParamKey(3): {0x20, 0xfb},
-							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+							dnsmessage.SVCParamKey(7): []byte("/dns-query{?dns}"),
 						},
 					},
 					{
@@ -126,7 +126,7 @@ func dnsAssignMultiConfigurationVector() []byte {
 						AuthenticationDomainName: "public-dns.example.",
 						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
 							dnsmessage.SVCParamKey(1): {0x02, 'h', '3'},
-							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+							dnsmessage.SVCParamKey(7): []byte("/dns-query{?dns}"),
 						},
 					},
 				},
@@ -160,7 +160,7 @@ func dnsAssignFullVector() []byte {
 						ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
 							dnsmessage.SVCParamKey(1): []byte{0},
 							dnsmessage.SVCParamKey(3): {0x20, 0xfb},
-							dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+							dnsmessage.SVCParamKey(7): []byte("/dns-query{?dns}"),
 						},
 					},
 				},

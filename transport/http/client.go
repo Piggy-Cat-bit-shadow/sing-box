@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"slices"
@@ -37,31 +38,40 @@ type tlsDialer interface {
 	DialTLSContext(ctx context.Context, destination M.Socksaddr) (aTLS.Conn, error)
 }
 
-// HTTP3ConnDialer is an optional seam that lets a caller supply the already-dialed QUIC
-// connection the HTTP/3 client should use, instead of this package dialing one itself.
+// HTTP3CandidateConnector establishes ONE HTTP/3 candidate.
 //
-// # Why it exists, and how narrow it is meant to stay
+// It performs the whole of connection setup -- the UDP dial, the QUIC handshake start, and the
+// congestion-control installation -- in this package's own order, and returns the connected
+// QUIC connection plus the socket underneath it.
 //
-// The MASQUE client needs to choose among several resolved candidate addresses for its
-// server, and to decide the winner at QUIC HANDSHAKE COMPLETION rather than at socket
-// creation. That decision needs the candidate list and the racing policy, neither of
-// which this package has or should have.
+// # Why this is a closure rather than exposed configuration
 //
-// What this package owns and MUST keep owning is everything that happens AFTER a
-// connection exists: the congestion-control installation ordering, the
-// transport.NewClientConn wrapping, the single-connection memoization, and the lifetime
-// and cleanup of both the QUIC connection and its underlying UDP socket. Duplicating any
-// of that inside a protocol package would mean two implementations of connection setup
-// that could drift apart.
+// A caller that wants to choose among several addresses needs to build candidates itself, but it
+// must not need to know HOW a candidate is built. An earlier seam handed out the dialer, the TLS
+// config and the QUIC config instead, and the consequence was real: the caller called
+// DialEarly itself and could only return after the handshake completed, so congestion control
+// was installed AFTER the handshake had already exchanged packets under the default controller.
 //
-// So the seam is exactly one function replacing exactly one step. It receives the dialer
-// and the QUIC configuration this client would have used, and returns a connected QUIC
-// connection plus the raw socket underneath it. It is responsible for closing any
-// candidate it did not choose.
+// With a closure, the ordering lives here, once, and a caller cannot get it wrong.
+type HTTP3CandidateConnector func(ctx context.Context, address netip.Addr) (net.Conn, *quic.Conn, error)
+
+// HTTP3ConnDialer is an optional seam that replaces candidate SELECTION.
 //
-// nil (the default, and every non-MASQUE caller) preserves the existing path verbatim:
-// dial UDP, then qtls.DialEarly, then install congestion control.
-type HTTP3ConnDialer func(ctx context.Context, dialer N.Dialer, server M.Socksaddr, tlsConfig aTLS.Config, quicConfig *quic.Config) (net.Conn, *quic.Conn, error)
+// # What this package still owns
+//
+// Everything that happens around a connection: the congestion-control installation ordering, the
+// transport.NewClientConn wrapping, the single-connection memoization, and the lifetime and
+// cleanup of both the QUIC connection and its UDP socket.
+//
+// # What the hook owns
+//
+// Which candidate to use, and when to give up on one. It receives the server address and a
+// connector, and returns the winning connection. It is responsible for closing any candidate it
+// creates and does not choose.
+//
+// nil -- the default, and every non-MASQUE caller -- preserves the existing path verbatim:
+// connect one candidate and use it.
+type HTTP3ConnDialer func(ctx context.Context, server M.Socksaddr, connectCandidate HTTP3CandidateConnector) (net.Conn, *quic.Conn, error)
 
 type ClientOptions struct {
 	Dialer                 N.Dialer

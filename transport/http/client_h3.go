@@ -30,12 +30,16 @@ func init() {
 
 type http3ClientImpl struct {
 	dialer N.Dialer
-	// connDialer, when set, replaces the UDP-dial + QUIC-handshake step. See
-	// HTTP3ConnDialer. nil means dial directly, which is the previous behaviour.
+	// connDialer, when set, replaces candidate SELECTION. See HTTP3ConnDialer. nil means
+	// connect one candidate and use it, which is the previous behaviour.
 	connDialer HTTP3ConnDialer
-	tlsConfig  aTLS.Config
-	server     M.Socksaddr
-	authority  string
+	// connectCandidate builds one candidate at a chosen address, and is the ONLY place the
+	// UDP dial, the QUIC start and the congestion-control installation happen. It is handed
+	// to the hook so a caller racing candidates cannot get that ordering wrong.
+	connectCandidate HTTP3CandidateConnector
+	tlsConfig        aTLS.Config
+	server           M.Socksaddr
+	authority        string
 	// http3Authority is the authority this connection is authenticated for. It is what
 	// the generic request path validates against; see Client.validateSameOrigin.
 	http3Authority string
@@ -80,7 +84,7 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		}
 		headers.Del("Host")
 	}
-	return &http3ClientImpl{
+	impl := &http3ClientImpl{
 		dialer:            dialer,
 		tlsConfig:         options.TLSConfig,
 		server:            options.Server,
@@ -91,7 +95,10 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 		congestionControl: congestionControl,
 		connDialer:        options.HTTP3ConnDialer,
 		transport:         &http3.Transport{EnableDatagrams: true, DisableCompression: true},
-	}, nil
+	}
+	// Bound after construction so it closes over the fully built value.
+	impl.connectCandidate = impl.connectCandidateAt
+	return impl, nil
 }
 
 // existingConn returns the live, memoized ClientConn WITHOUT dialing.
@@ -126,55 +133,82 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		c.rawConn.Close()
 		c.rawConn = nil
 	}
-	// The dial happens INSIDE each branch, not before them.
+
+	// One connector, used by BOTH paths, so a raced candidate and a plain one are built the
+	// same way. That is what keeps the congestion-control ordering identical whether or not a
+	// hook is installed: the connector is the only place it happens.
 	//
-	// Dialing first and then asking the hook would create a UDP socket the hook path
-	// never uses: it would be overwritten by the hook's return value and leak, because
-	// nothing closes it. That is what the first version of this seam did, and the
-	// regression test caught it by asserting that the client's own dialer is not called
-	// when a hook is set.
+	// The UDP dial happens INSIDE the connector rather than before the branch, because dialing
+	// first would create a socket that a hook choosing its own candidate never uses -- it would
+	// be overwritten and leak. An earlier version did exactly that, and the regression test
+	// caught it by asserting this client's dialer is not called when a hook is set.
 	var (
 		rawConn  net.Conn
 		quicConn *quic.Conn
 		err      error
 	)
 	if c.connDialer != nil {
-		// The caller owns candidate selection and returns only a connection whose QUIC
-		// handshake has COMPLETED, so this path's winner is the racer's winner. Every
-		// step after this point is unchanged, which is what keeps the congestion-control
-		// ordering and the memoization identical to the default path.
-		rawConn, quicConn, err = c.connDialer(ctx, c.dialer, c.server, c.tlsConfig, c.quicConfig)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, E.Cause1(ErrHTTP3Unavailable, err)
-		}
+		// The caller owns candidate SELECTION and returns only a connection whose QUIC
+		// handshake has COMPLETED, so this path's winner is the racer's winner. Everything
+		// after this point is unchanged, which keeps the memoization and the wrapping
+		// identical to the default path.
+		rawConn, quicConn, err = c.connDialer(ctx, c.server, c.candidateConnector())
 	} else {
-		rawConn, err = c.dialer.DialContext(ctx, N.NetworkUDP, c.server)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, E.Cause1(ErrHTTP3Unavailable, err)
-		}
-		quicConn, err = qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
-		if err != nil {
-			rawConn.Close()
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, E.Cause1(ErrHTTP3Unavailable, err)
-		}
+		rawConn, quicConn, err = c.candidateConnector()(ctx, c.server.Addr)
 	}
-	// The congestion control must be installed on the conn BEFORE the HTTP/3
-	// client conn starts using it. SetCongestionControl swaps the sender, so
-	// applying it here - immediately after the handshake and before any stream is
-	// opened - means not a single packet is sent under the default sender.
-	httpclient.ApplyClientCongestionControl(quicConn, c.congestionControl)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, E.Cause1(ErrHTTP3Unavailable, err)
+	}
 	c.conn = c.transport.NewClientConn(quicConn)
 	c.rawConn = rawConn
 	return c.conn, nil
+}
+
+// candidateConnector returns the connector, binding it on first use if construction did not.
+//
+// Binding in the constructor is the normal path. The lazy fallback exists because a zero-value
+// http3ClientImpl is constructible (tests do it), and a nil connector would otherwise panic
+// inside acquire rather than dialing. That was a real crash, not a hypothetical one.
+func (c *http3ClientImpl) candidateConnector() HTTP3CandidateConnector {
+	if c.connectCandidate != nil {
+		return c.connectCandidate
+	}
+	return c.connectCandidateAt
+}
+
+// connectCandidateAt establishes ONE HTTP/3 candidate at the given address.
+//
+// It is the single definition of how a candidate is built, and it performs the three steps in
+// the order that matters:
+//
+//	UDP dial -> qtls.DialEarly -> ApplyClientCongestionControl
+//
+// The congestion control is installed here, BEFORE the handshake has been waited for, because it
+// is not a post-connection option: the first flight sets the initial window and the pacing
+// behaviour. A racer that built candidates itself could only apply it after HandshakeComplete,
+// which is the defect this closure exists to make impossible.
+//
+// A per-address connector is used rather than a fixed destination so a caller can race several
+// addresses, each getting its own socket and its own QUIC connection.
+func (c *http3ClientImpl) connectCandidateAt(ctx context.Context, address netip.Addr) (net.Conn, *quic.Conn, error) {
+	destination := c.server
+	if address.IsValid() {
+		destination = M.SocksaddrFrom(address, c.server.Port)
+	}
+	rawConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, destination)
+	if err != nil {
+		return nil, nil, E.Cause(err, "dial UDP to ", destination)
+	}
+	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, nil, E.Cause(err, "QUIC dial to ", destination)
+	}
+	httpclient.ApplyClientCongestionControl(quicConn, c.congestionControl)
+	return rawConn, quicConn, nil
 }
 
 func (c *http3ClientImpl) openStream(ctx context.Context, request *http.Request) (*http3.RequestStream, *http3.ClientConn, error) {

@@ -245,7 +245,7 @@ func TestDNSAssignFullTunnelDraftExample(t *testing.T) {
 			AuthenticationDomainName: "masque.example.org.",
 			ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
 				dnsmessage.SVCParamKey(1): []byte{0x02, 'h', '2', 0x02, 'h', '3'}, // alpn=h2,h3
-				dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),             // dohpath
+				dnsmessage.SVCParamKey(7): []byte("/dns-query{?dns}"),             // dohpath
 			},
 		}},
 		// An empty internal domain means the DNS root: this nameserver resolves
@@ -267,7 +267,7 @@ func TestDNSAssignFullTunnelDraftExample(t *testing.T) {
 	require.Equal(t, []byte{0x02, 'h', '2', 0x02, 'h', '3'},
 		nameserver.ServiceParameters[dnsmessage.SVCParamKey(1)])
 	require.Equal(t, []byte("/dns-query{?dns}"),
-		nameserver.ServiceParameters[dnsmessage.SVCParamKey(9)])
+		nameserver.ServiceParameters[dnsmessage.SVCParamKey(7)])
 	require.Equal(t, []string{""}, decoded[0].InternalDomains,
 		"an empty internal domain means the DNS root and must survive the round trip")
 }

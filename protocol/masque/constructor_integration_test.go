@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 	http "github.com/sagernet/sing-box/transport/http"
@@ -225,13 +226,17 @@ func TestConstructorHookRacesTheResolvedCandidates(t *testing.T) {
 	hook := http3ConnDialerOf(t, clientEndpoint)
 	require.NotNil(t, hook)
 
-	// Drive the hook. It will fail to handshake (nothing is listening), but the point is
-	// that it RESOLVED first: the lookup count proves the bootstrap path ran.
+	// Drive the hook. It will fail to connect (nothing is listening), but the point is that it
+	// RESOLVED first: the lookup count proves the bootstrap plane ran.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, _, _ = hook(ctx, clientEndpoint.bootstrapProbeDialer(t), M.ParseSocksaddr("masque.example:443"),
-		newRacerTestTLSConfig(t), nil)
+	// The connector is supplied BY the transport in production. Here it is a stub, because
+	// this test is about the hook consulting the bootstrap resolver, not about QUIC setup.
+	connector := func(ctx context.Context, address netip.Addr) (net.Conn, *quic.Conn, error) {
+		return nil, nil, errTestDialFailed
+	}
+	_, _, _ = hook(ctx, M.ParseSocksaddr("masque.example:443"), connector)
 
 	require.GreaterOrEqual(t, router.lookupCount(), 1,
 		"invoking the hook must consult the bootstrap resolver; a hook that never resolves would race an empty candidate list")
@@ -335,7 +340,7 @@ func TestBootstrapCacheIsPerEndpoint(t *testing.T) {
 	_, err = firstBootstrap.resolveCandidates(context.Background(), "first.example")
 	require.NoError(t, err)
 
-	require.Equal(t, 0, secondBootstrap.cache.cachedCount(),
+	require.Equal(t, 0, secondBootstrap.cache.cachedForTest(),
 		"one endpoint's resolution must not populate another endpoint's cache")
 }
 

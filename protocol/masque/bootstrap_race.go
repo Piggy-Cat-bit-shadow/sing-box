@@ -2,7 +2,6 @@ package masque
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -13,10 +12,8 @@ import (
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	aTLS "github.com/sagernet/sing/common/tls"
 
 	"github.com/sagernet/quic-go"
-	qtls "github.com/sagernet/sing-quic"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -109,14 +106,11 @@ func newHandshakeRacer(fallbackDelay time.Duration) *handshakeRacer {
 // return would see them, so the guarantee was not real. The wait is now inline.
 func (r *handshakeRacer) dial(
 	ctx context.Context,
-	dialer N.Dialer,
-	server M.Socksaddr,
-	tlsConfig aTLS.Config,
-	quicConfig *quic.Config,
+	connectCandidate connectCandidateFunc,
 	candidates []netip.Addr,
 	preferIPv6 bool,
 ) (net.Conn, *quic.Conn, error) {
-	rawConn, quicConn, _, err := r.dialWithWinner(ctx, dialer, nil, server, tlsConfig, quicConfig, candidates, preferIPv6)
+	rawConn, quicConn, _, err := r.dialWithWinner(ctx, connectCandidate, candidates, preferIPv6)
 	return rawConn, quicConn, err
 }
 
@@ -128,11 +122,7 @@ func (r *handshakeRacer) dial(
 // package rather than widening a shared API.
 func (r *handshakeRacer) dialWithWinner(
 	ctx context.Context,
-	dialer N.Dialer,
-	candidateDialer candidateDialer,
-	server M.Socksaddr,
-	tlsConfig aTLS.Config,
-	quicConfig *quic.Config,
+	connectCandidate connectCandidateFunc,
 	candidates []netip.Addr,
 	preferIPv6 bool,
 ) (net.Conn, *quic.Conn, netip.Addr, error) {
@@ -140,9 +130,9 @@ func (r *handshakeRacer) dialWithWinner(
 		return nil, nil, netip.Addr{}, E.New("no bootstrap candidates to race")
 	}
 	if len(candidates) == 1 {
-		// A single candidate is dialled directly: there is nothing to race, and starting
-		// a racer would add a goroutine and a timer for no benefit.
-		rawConn, quicConn, err := r.dialOne(ctx, dialer, candidateDialer, server, tlsConfig, quicConfig, candidates[0])
+		// A single candidate is dialled directly: there is nothing to race, and starting a
+		// racer would add a goroutine and a timer for no benefit.
+		rawConn, quicConn, err := r.dialOne(ctx, connectCandidate, candidates[0])
 		if err != nil {
 			return nil, nil, netip.Addr{}, err
 		}
@@ -188,7 +178,7 @@ func (r *handshakeRacer) dialWithWinner(
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rawConn, quicConn, err := r.dialOne(attemptCtx, dialer, candidateDialer, server, tlsConfig, quicConfig, address)
+			rawConn, quicConn, err := r.dialOne(attemptCtx, connectCandidate, address)
 			if err != nil {
 				outstanding.Add(-1)
 				// A failed attempt cannot deliver while nobody is receiving, which is
@@ -297,65 +287,36 @@ func closeAttempt(quicConn *quic.Conn, rawConn net.Conn) {
 
 // dialOne performs one candidate attempt.
 //
-// It returns only after the QUIC handshake COMPLETES, which is the entire point of this
-// type. DialEarly returning is not enough: for a 0-RTT resumption it returns before the
-// peer has confirmed the connection.
-func (r *handshakeRacer) dialOne(
-	ctx context.Context,
-	dialer N.Dialer,
-	candidateDialer candidateDialer,
-	server M.Socksaddr,
-	tlsConfig aTLS.Config,
-	quicConfig *quic.Config,
-	address netip.Addr,
-) (net.Conn, *quic.Conn, error) {
-	// # Where the candidate is actually built
+// It returns only after the QUIC handshake COMPLETES, which is the entire point of this type.
+// DialEarly returning is not enough: for a 0-RTT resumption it returns before the peer has
+// confirmed the connection.
+func (r *handshakeRacer) dialOne(ctx context.Context, connectCandidate connectCandidateFunc, address netip.Addr) (net.Conn, *quic.Conn, error) {
+	// The CANDIDATE IS BUILT BY THE TRANSPORT, through the closure it supplied.
 	//
-	// The transport supplies a candidate dialer that performs the UDP dial, the QUIC
-	// handshake start and the CONGESTION-CONTROL INSTALLATION in the right order. That order
-	// is the reason this indirection exists: a racer that called DialEarly itself would only
-	// return after the handshake completed, so the configured congestion control would be
-	// applied AFTER the handshake had already exchanged packets under the default one.
+	// That closure performs the UDP dial, the QUIC handshake start and the congestion-control
+	// installation, in the transport's own order. This package never sees a TLS config, a QUIC
+	// config or a dialer, so it cannot duplicate connection setup or get the ordering wrong --
+	// which an earlier version did, by calling DialEarly itself and leaving congestion control
+	// to be installed after the handshake had already exchanged packets.
 	//
-	// When no candidate dialer is available (a client without HTTP/3 support, or a test
-	// driving the racer directly), the legacy path below is used so the racer still works --
-	// but without congestion-control ordering, which is why the production hook always
-	// supplies one.
-	if candidateDialer != nil {
-		rawConn, quicConn, err := candidateDialer.DialHTTP3Candidate(ctx, server, address)
-		if err == nil {
-			return r.awaitHandshake(ctx, rawConn, quicConn, address)
-		}
-		if !errors.Is(err, errNoCandidateDialer) {
-			return nil, nil, err
-		}
-		// No transport-supplied primitive: fall through and build the candidate here. The
-		// connection still works; it simply does not get congestion control installed before
-		// the handshake, which is why the production hook always supplies one.
+	// A nil closure means no transport supplied one, which happens only when a caller drives the
+	// racer directly (tests). It is reported rather than worked around, because there is no
+	// correct way to build a candidate here.
+	if connectCandidate == nil {
+		return nil, nil, E.New("no HTTP/3 candidate connector was supplied")
 	}
-
-	destination := M.SocksaddrFrom(address, server.Port)
-	rawConn, err := dialer.DialContext(ctx, N.NetworkUDP, destination)
+	rawConn, quicConn, err := connectCandidate(ctx, address)
 	if err != nil {
-		// A failed UDP dial is not a race outcome worth distinguishing: the socket was
-		// never created, so there is nothing to close.
-		return nil, nil, E.Cause(err, "dial UDP to ", address)
-	}
-	quicConn, err := qtls.DialEarly(ctx, rawConn, tlsConfig, quicConfig)
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, nil, E.Cause(err, "QUIC dial to ", address)
+		return nil, nil, err
 	}
 	return r.awaitHandshake(ctx, rawConn, quicConn, address)
 }
 
-// candidateDialer builds one HTTP/3 candidate with the transport's own configuration.
+// connectCandidateFunc establishes ONE candidate, fully configured.
 //
-// It is declared here as a one-method interface so this package depends on the CAPABILITY
-// rather than on transport/http's concrete client, and so a test can supply its own.
-type candidateDialer interface {
-	DialHTTP3Candidate(ctx context.Context, server M.Socksaddr, address netip.Addr) (net.Conn, *quic.Conn, error)
-}
+// It is declared as a plain function type rather than an interface so the transport can hand one
+// over without this package depending on any of its types, and so a test can supply a closure.
+type connectCandidateFunc func(ctx context.Context, address netip.Addr) (net.Conn, *quic.Conn, error)
 
 // awaitHandshake waits for a candidate's handshake to COMPLETE, which is the whole point of
 // this type: DialEarly returning is not enough, because for a 0-RTT resumption it returns
@@ -471,16 +432,17 @@ func interleaveCandidates(candidates []netip.Addr, preferIPv6 bool) []netip.Addr
 // lets the recovery ordering prefer the address that demonstrably worked, rather than
 // whichever one DNS happened to list first. Without this the promotion mechanism existed but
 // nothing on the QUIC path ever fed it.
-func masqueConnDialer(racer *handshakeRacer, dialer *bootstrapDialer, strategy C.DomainStrategy, candidates candidateDialer) transportHTTP.HTTP3ConnDialer {
+func masqueConnDialer(racer *handshakeRacer, dialer *bootstrapDialer, strategy C.DomainStrategy) transportHTTP.HTTP3ConnDialer {
 	return func(
 		ctx context.Context,
-		transportDialer N.Dialer,
 		server M.Socksaddr,
-		tlsConfig aTLS.Config,
-		quicConfig *quic.Config,
+		connectCandidate transportHTTP.HTTP3CandidateConnector,
 	) (net.Conn, *quic.Conn, error) {
 		if server.Fqdn == "" {
-			return nil, nil, E.New("no bootstrap candidates: the server address is not a hostname")
+			return nil, nil, E.New("bootstrap candidates require a hostname server address")
+		}
+		if connectCandidate == nil {
+			return nil, nil, E.New("the transport supplied no HTTP/3 candidate connector")
 		}
 		candidateAddresses, err := dialer.resolveCandidates(ctx, server.Fqdn)
 		if err != nil {
@@ -489,12 +451,12 @@ func masqueConnDialer(racer *handshakeRacer, dialer *bootstrapDialer, strategy C
 		// The strategy decides which family leads, and the racer interleaves the rest so the
 		// other family is attempted second rather than after every preferred address.
 		preferIPv6 := preferIPv6FromStrategy(strategy, candidateAddresses)
-		rawConn, quicConn, winner, err := racer.dialWithWinner(ctx, transportDialer, candidates, server, tlsConfig, quicConfig, candidateAddresses, preferIPv6)
+		rawConn, quicConn, winner, err := racer.dialWithWinner(ctx, connectCandidateFunc(connectCandidate), candidateAddresses, preferIPv6)
 		if err != nil {
 			return nil, nil, err
 		}
-		// Record the address that actually completed a handshake. This is the only place the
-		// client learns something the DNS layer cannot know.
+		// Record the address that actually completed a handshake: the only fact here that the
+		// DNS layer cannot know.
 		dialer.cache.promote(winner)
 		return rawConn, quicConn, nil
 	}

@@ -64,16 +64,37 @@ const (
 // live router.
 type bootstrapResolution func(ctx context.Context) ([]netip.Addr, error)
 
-// bootstrapCache remembers addresses the MASQUE server has answered on, so a reconnect
-// can proceed when the resolver is temporarily unusable.
+// bootstrapCache remembers where the MASQUE server was last reached, so a reconnect can
+// proceed when DNS is temporarily unusable.
+//
+// # The whole model, deliberately
+//
+//	lastFresh   the most recent successful DNS answer
+//	lastWinner  the address that most recently completed a QUIC handshake
+//
+// That is all of it. There is no TTL engine, no persistent cache, no union of historical
+// addresses, and no accumulation: the sing-box DNS router already owns DNS caching, and this
+// owns exactly one thing it cannot know -- which address the SERVER actually answered on.
+//
+// # Why a fresh success REPLACES rather than merges
+//
+// An earlier version returned `fresh ++ (cached \ fresh)`, carrying over addresses the fresh
+// answer had not mentioned, on the theory that a resolver answering with a subset should not
+// discard addresses that still work. The effect on a WITHDRAWN address is a stale-DNS hazard:
+// when the operator removes an address from the record, the recovery state puts it back and we
+// keep dialling something the resolver no longer publishes, with no TTL to expire it.
+//
+// A successful DNS answer is authoritative about where the server is. The cache exists only to
+// cover the case where that answer cannot be obtained.
 type bootstrapCache struct {
 	access sync.Mutex
-	// candidates is the last known-good set, in preference order. The first entry is the
-	// most recently successful address.
-	candidates []netip.Addr
-	// winner is the address the last successful connection used, if any.
-	winner netip.Addr
-	// maxCandidates bounds the list.
+	// lastFresh is the most recent successful resolution.
+	lastFresh []netip.Addr
+	// lastWinner is the address that most recently completed a handshake. It is preferred
+	// when falling back, and only while it is still part of lastFresh.
+	lastWinner netip.Addr
+	// maxCandidates bounds the list, because a hostname resolving to more addresses than
+	// this is either misconfigured or hostile.
 	maxCandidates int
 }
 
@@ -81,61 +102,43 @@ func newBootstrapCache() *bootstrapCache {
 	return &bootstrapCache{maxCandidates: defaultMaxBootstrapCandidates}
 }
 
-// resolve produces the candidate list for a connection attempt.
+// resolve produces the candidate list for one connection attempt.
 //
-// # Fresh-first ordering
+//	fresh answer non-empty -> use it, and remember it
+//	fresh failed/empty     -> use the remembered answer, winner first
+//	nothing remembered     -> report the real error, and invent nothing
 //
-// A successful fresh lookup is ordered FIRST and the cached entries follow, deduplicated.
-// The cached winner is deliberately NOT promoted ahead of a fresh answer: after a network
-// change the previous winner may be entirely unreachable -- a working IPv6 address on the
-// old Wi-Fi says nothing about the new one -- so a fresh answer is the better guess about
-// what works now.
-//
-// # Cold start
-//
-// With nothing cached, a failed fresh lookup is returned as a failure. There is no
-// invented address and no silent fallback.
-//
-// # Recovery
-//
-// With a cache present, a fresh lookup that fails, times out, or returns nothing falls
-// back to the cache. This is the case that makes the difference: a resolver outage
-// during a reconnect storm would otherwise be unrecoverable.
+// The fresh lookup is always attempted, on every connection, because a server can move and a
+// network can change. Reusing a remembered list without asking DNS again would keep dialling an
+// address that is no longer published, and it would fail silently: a stale address that still
+// answers looks exactly like success.
 func (c *bootstrapCache) resolve(ctx context.Context, fresh bootstrapResolution) ([]netip.Addr, error) {
 	freshCtx, cancel := context.WithTimeout(ctx, bootstrapFreshTimeout)
 	defer cancel()
 
 	freshAddresses, freshErr := fresh(freshCtx)
 	if len(freshAddresses) > 0 {
-		// Fresh answers lead, and the cached addresses that the fresh answer did not
-		// mention follow.
-		//
-		// Returning only the fresh set would be wrong in the case the draft's ordering
-		// rule exists for: a resolver that answers with a SUBSET of what previously
-		// worked -- which is exactly what a partially recovered network produces -- would
-		// discard addresses that are still reachable. The merge is the whole point of
-		// keeping a cache.
-		return c.recordFreshSnapshot(freshAddresses), nil
+		return c.recordFresh(freshAddresses), nil
 	}
 
 	c.access.Lock()
 	defer c.access.Unlock()
-	if len(c.candidates) == 0 {
-		// Cold start: nothing to fall back to. Report the real error rather than a
-		// synthesised one, and do not invent an address.
+	if len(c.lastFresh) == 0 {
+		// Nothing to fall back to. Report the real error rather than a synthesised one, and
+		// do not invent an address.
 		if freshErr == nil {
 			freshErr = E.New("bootstrap resolution returned no addresses")
 		}
 		return nil, freshErr
 	}
-	// Recovery: the cache is the fallback. The fresh error is not returned, because the
-	// point of the fallback is that the caller can proceed.
-	ordered := make([]netip.Addr, 0, len(c.candidates))
-	if c.winner.IsValid() {
-		ordered = append(ordered, c.winner)
+	// Recovery. The last known-good address goes first when it is still one of the addresses
+	// DNS last published, because it is the one that demonstrably worked.
+	ordered := make([]netip.Addr, 0, len(c.lastFresh))
+	if c.lastWinner.IsValid() {
+		ordered = append(ordered, c.lastWinner)
 	}
-	for _, address := range c.candidates {
-		if address == c.winner {
+	for _, address := range c.lastFresh {
+		if address == c.lastWinner {
 			continue
 		}
 		ordered = append(ordered, address)
@@ -143,29 +146,20 @@ func (c *bootstrapCache) resolve(ctx context.Context, fresh bootstrapResolution)
 	return ordered, nil
 }
 
-// recordFreshSnapshot replaces the cache with a successful fresh resolution and returns the
+// recordFresh replaces the remembered answer with a successful resolution and returns the
 // candidate list the caller should use.
 //
-// # Why this REPLACES rather than merges
-//
-// The previous version returned `fresh ++ (cached \ fresh)`, carrying over addresses the fresh
-// answer had not mentioned. The intent was to survive a resolver answering with a subset, but
-// the effect on a WITHDRAWN address is a stale-DNS hazard: if the operator removes an address
-// from the record, the recovery cache puts it straight back and we keep dialling something the
-// resolver no longer publishes. There is no TTL on this memory, so nothing would ever expire
-// it.
-//
-// A successful DNS answer is authoritative. It is the current truth about where the server is,
-// and the cache exists only to cover the case where that truth cannot be obtained. So a fresh
-// success replaces the snapshot outright, and the cache is consulted ONLY when the fresh
-// lookup fails, times out, or returns nothing.
-func (c *bootstrapCache) recordFreshSnapshot(fresh []netip.Addr) []netip.Addr {
+// It is called with FRESH addresses only, so the remembered answer always reflects a resolution
+// that actually succeeded rather than an accumulation of historical guesses. A winner that the
+// fresh answer no longer lists is dropped, so recovery stops preferring an address the resolver
+// has withdrawn.
+func (c *bootstrapCache) recordFresh(fresh []netip.Addr) []netip.Addr {
 	c.access.Lock()
 	defer c.access.Unlock()
 	snapshot := make([]netip.Addr, 0, len(fresh))
 	seen := make(map[netip.Addr]struct{}, len(fresh))
 	for _, address := range fresh {
-		if _, loaded := seen[address]; loaded {
+		if _, duplicate := seen[address]; duplicate {
 			continue
 		}
 		seen[address] = struct{}{}
@@ -175,53 +169,35 @@ func (c *bootstrapCache) recordFreshSnapshot(fresh []netip.Addr) []netip.Addr {
 		snapshot = snapshot[:c.maxCandidates]
 	}
 	// The snapshot IS the candidate list: the caller iterates it, so it must be the same list
-	// the cache holds, not a copy that could drift.
-	c.candidates = append([]netip.Addr(nil), snapshot...)
-	// A winner that DNS no longer publishes is no longer worth preferring.
-	if c.winner.IsValid() {
-		if _, stillPresent := seen[c.winner]; !stillPresent {
-			c.winner = netip.Addr{}
+	// the cache holds rather than a copy that could drift.
+	c.lastFresh = snapshot
+	if c.lastWinner.IsValid() {
+		if _, stillListed := seen[c.lastWinner]; !stillListed {
+			c.lastWinner = netip.Addr{}
 		}
 	}
 	return snapshot
 }
 
-// promote records that an address actually completed a connection.
+// promote records that an address completed a QUIC handshake.
 //
-// # What it deliberately does NOT do
-//
-// It does not reorder c.candidates. The previous version moved the winner to the front of
-// the stored list, which directly contradicted this type's own documented rule that a FRESH
-// resolution leads and the cache only supplies the remainder. Because recordAndMerge
-// preserves the stored list when it merges, a promoted address would have been carried to
-// the front of the fresh result too -- so a stale winner could outrank a fresh answer, which
-// is the exact failure the fresh-first rule exists to prevent ("a working IPv6 address on
-// the old Wi-Fi says nothing about the new one").
-//
-// The winner is remembered separately, in c.winner, which is what the FALLBACK path uses to
-// order recovery. That is sufficient: on a fresh success the fresh order wins, and on a
-// fresh failure the winner goes first.
+// This is the only thing this cache learns that the DNS layer cannot know, and it only affects
+// the FALLBACK ordering: a fresh answer always leads, because after a network change the
+// previous winner may be an address on the network we just left.
 func (c *bootstrapCache) promote(address netip.Addr) {
 	if !address.IsValid() {
 		return
 	}
 	c.access.Lock()
 	defer c.access.Unlock()
-	c.winner = address
+	c.lastWinner = address
 }
 
-// cachedCount reports the number of remembered addresses. It exists for tests.
-func (c *bootstrapCache) cachedCount() int {
+// hasRecovery reports whether a fallback is possible at all.
+func (c *bootstrapCache) hasRecovery() bool {
 	c.access.Lock()
 	defer c.access.Unlock()
-	return len(c.candidates)
-}
-
-// hasCache reports whether recovery is possible at all.
-func (c *bootstrapCache) hasCache() bool {
-	c.access.Lock()
-	defer c.access.Unlock()
-	return len(c.candidates) > 0
+	return len(c.lastFresh) > 0
 }
 
 // bootstrapDialer wraps a dialer so a domain destination is resolved through the

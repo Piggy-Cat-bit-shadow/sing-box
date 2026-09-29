@@ -83,20 +83,21 @@ func TestRacerSingleCandidateSkipsTheRace(t *testing.T) {
 	t.Parallel()
 
 	racer := newHandshakeRacer(50 * time.Millisecond)
-	_, _, err := racer.dial(context.Background(), &recordingDialer{fail: true},
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
+	_, _, err := racer.dial(context.Background(), testCandidateConnector(&recordingDialer{fail: true}, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil),
 		[]netip.Addr{netip.MustParseAddr("192.0.2.1")}, false)
 	require.Error(t, err, "a single unreachable candidate must fail")
-	require.Contains(t, err.Error(), "dial UDP",
-		"the single-candidate path must report the dial failure directly")
+	// The connector's error surfaces as itself: connection setup belongs to the transport, so
+	// the racer does not re-word it. What matters is that the REAL failure is reported rather
+	// than a synthesised timeout, which is what an operator can act on.
+	require.Contains(t, err.Error(), "dial failed")
 }
 
 func TestRacerNoCandidates(t *testing.T) {
 	t.Parallel()
 
 	racer := newHandshakeRacer(50 * time.Millisecond)
-	_, _, err := racer.dial(context.Background(), &recordingDialer{},
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil, nil, false)
+	_, _, err := racer.dial(context.Background(), testCandidateConnector(&recordingDialer{}, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil),
+		nil, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "no bootstrap candidates")
 }
@@ -171,9 +172,7 @@ func TestRacerDoesNotTreatUDPConnectAsSuccess(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, _, err := racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
+	_, _, err := racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
 		false)
 	elapsed := time.Since(start)
 
@@ -181,12 +180,16 @@ func TestRacerDoesNotTreatUDPConnectAsSuccess(t *testing.T) {
 		"a socket that was created but never handshook must NOT be returned as a winner")
 	require.GreaterOrEqual(t, len(dialer.attempts()), 1, "at least one candidate was tried")
 
-	// The reported error is the REAL cause from the last attempt, not a synthesised
-	// context error. That is deliberate: "connection refused" tells an operator something
-	// actionable, whereas "context deadline exceeded" hides it.
-	require.Contains(t, err.Error(), "QUIC",
-		"the failure must name the QUIC attempt rather than a generic timeout")
+	// The reported error is the REAL cause from the last attempt, not a synthesised context
+	// error. That is deliberate: "connection refused" tells an operator something actionable,
+	// whereas "context deadline exceeded" hides it.
+	//
+	// The wording now comes from the connector (the QUIC stack), because connection setup
+	// belongs to the transport. What this asserts is that the race surfaces the LAST REAL
+	// failure rather than replacing it with a generic one.
 	require.NotContains(t, err.Error(), "no bootstrap candidates")
+	require.NotContains(t, err.Error(), "context deadline exceeded",
+		"a hard failure must be reported as itself, not smoothed into a timeout")
 
 	// The race respected its context and did not hang. It fails FAST here because a closed
 	// loopback port refuses the connection immediately, which the racer treats as a
@@ -211,9 +214,7 @@ func TestRacerStaggersTheSecondCandidate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
 	defer cancel()
 
-	_, _, _ = racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")},
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")},
 		false)
 
 	attempts := dialer.attempts()
@@ -237,9 +238,7 @@ func TestRacerPrefersIPv6WhenAsked(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 
-	_, _, _ = racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")},
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")},
 		true)
 
 	attempts := dialer.attempts()
@@ -265,9 +264,7 @@ func TestRacerStartsNextCandidateImmediatelyOnFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
 	defer cancel()
 
-	_, _, _ = racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
 		false)
 
 	attempts := dialer.attempts()
@@ -297,13 +294,11 @@ func TestRacerCancelsLosers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	_, _, err := racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{
-			netip.MustParseAddr("192.0.2.1"),
-			netip.MustParseAddr("192.0.2.2"),
-			netip.MustParseAddr("192.0.2.3"),
-		},
+	_, _, err := racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("192.0.2.2"),
+		netip.MustParseAddr("192.0.2.3"),
+	},
 		false)
 	require.Error(t, err)
 
@@ -331,9 +326,7 @@ func TestRacerHonoursContextCancellation(t *testing.T) {
 	}()
 
 	start := time.Now()
-	_, _, err := racer.dial(ctx, dialer,
-		M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil,
-		[]netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
+	_, _, err := racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")},
 		false)
 	elapsed := time.Since(start)
 

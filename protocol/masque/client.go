@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -60,10 +59,17 @@ type ClientEndpoint struct {
 	// the configured DNS rules, which is exactly the behaviour that existed before
 	// this option.
 	innerQueryOptions adapter.DNSQueryOptions
-	// assignedDNS is the endpoint-local transport that resolves through a nameserver the
-	// server assigned. It is nil when no DNS_ASSIGN has been accepted, which is what
-	// makes the resolver precedence fall through to the ordinary DNS rules.
-	assignedDNS   *assignedDNSTransport
+	// dnsAssignment is the DNS_ASSIGN configuration currently in force, or nil when none
+	// has been received. It is an IMMUTABLE snapshot replaced wholesale: a lookup captures
+	// it once and uses that value for its whole lifetime, so a capsule arriving mid-lookup
+	// cannot produce a mixed answer.
+	dnsAssignment atomic.Pointer[dnsAssignmentSnapshot]
+	// pref64 holds the NAT64 prefixes in force. It is deliberately separate from the DNS
+	// assignment: PREF64 does not affect any answer or any transport, so it must not be able
+	// to invalidate the DNS cache.
+	pref64 pref64Store
+	// dnsTag is the transport tag assigned lookups are reported under.
+	dnsTag        string
 	client        *masque.Client
 	deviceOptions *device.Options
 	device        device.Device
@@ -176,22 +182,15 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	// through untouched and the hook stays nil, so this endpoint behaves exactly as it did
 	// before the recovery path existed rather than acquiring a degraded one.
 	httpDialer := outboundDialer
-	var (
-		http3ConnDialer http.HTTP3ConnDialer
-		candidateHolder *candidateDialerHolder
-	)
+	var http3ConnDialer http.HTTP3ConnDialer
 	if bootstrapDialer != nil {
 		httpDialer = bootstrapDialer
-		// The candidate primitive lives on the HTTP client, which does not exist yet: the
-		// client needs this hook in order to be constructed. A small holder breaks the cycle
-		// without weakening either side -- by the time the hook runs, the client is built, and
-		// a nil candidate dialer only means the racer falls back to its own DialEarly.
-		candidateHolder = &candidateDialerHolder{}
+		// The transport supplies the candidate connector per call, through the hook's own
+		// parameter, so nothing is stored here and there is no construction cycle to break.
 		http3ConnDialer = masqueConnDialer(
 			newHandshakeRacer(N.DefaultFallbackDelay),
 			bootstrapDialer,
 			bootstrapResolver.strategy(),
-			candidateHolder,
 		)
 	}
 
@@ -215,10 +214,6 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if err != nil {
 		return nil, err
 	}
-	// The holder was needed before the client existed; now it can be filled.
-	if candidateHolder != nil {
-		candidateHolder.set(http3CandidateDialer(httpClient))
-	}
 	clientEndpoint := &ClientEndpoint{
 		endpointBase: endpointBase{
 			Adapter: endpoint.NewAdapterWithDialerOptions(C.TypeMASQUEClient, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
@@ -228,22 +223,13 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		ctx:               ctx,
 		dnsRouter:         service.FromContext[adapter.DNSRouter](ctx),
 		innerQueryOptions: innerQueryOptions,
-		// Built unconditionally but installed only when an assignment arrives. It holds
-		// the DEVICE as its dialer, which is what makes every assigned query go through
-		// the tunnel rather than the host stack.
-		assignedDNS:     newAssignedDNSTransport(logger, nil, tag),
-		httpClient:      httpClient,
-		httpDialer:      httpDialer,
-		http3ConnDialer: http3ConnDialer,
-		mtu:             options.MTU,
-		onDemand:        options.OnDemand,
+		dnsTag:            tag,
+		httpClient:        httpClient,
+		httpDialer:        httpDialer,
+		http3ConnDialer:   http3ConnDialer,
+		mtu:               options.MTU,
+		onDemand:          options.OnDemand,
 	}
-	// The assigned resolver sends DoH queries on the SAME connection as the tunnel, which
-	// is what draft-ietf-masque-connect-ip-dns-06 §3.5 asks for when the proxy is
-	// authoritative for the DoH origin. Passing the client here is what makes that
-	// possible; the transport still holds the device as its dialer, so the UDP path stays
-	// inside the tunnel.
-	clientEndpoint.assignedDNS.setDoHClient(httpClient)
 	clientEndpoint.state.Store(&clientState{})
 	clientEndpoint.deviceOptions = newDeviceOptions(ctx, logger, clientEndpoint, options.MASQUEEndpointOptions, time.Duration(options.UDPTimeout), nil)
 	clientEndpoint.client, err = masque.NewClient(masque.ClientOptions{
@@ -272,10 +258,6 @@ func (c *ClientEndpoint) Start(stage adapter.StartStage) error {
 		tunnelDevice.SetPacketWriter(c.writePacketBuffers)
 		c.device = tunnelDevice
 		c.deviceOptions = nil
-		// The assigned-DNS transport dials through the device, so it can only be given
-		// its dialer once the device exists. Until an assignment arrives it stays
-		// inactive, and its fail-closed behaviour covers the window before this point.
-		c.assignedDNS.dialer = tunnelDevice
 	case adapter.StartStatePostStart:
 		c.client.Start()
 	}
@@ -326,99 +308,61 @@ func (c *ClientEndpoint) UpdateConfiguration(configuration masque.Configuration)
 	return nil
 }
 
-// installAssignedDNS decides whether the server's assignment becomes the resolver.
+// installAssignedDNS publishes the server's DNS assignment as a new immutable snapshot.
 //
-// The reachability check is the important part. A nameserver outside the advertised
-// routes would be reached by the ordinary routing table rather than through the tunnel,
-// so installing it would produce exactly the cleartext DNS leak that accepting a
-// server-assigned resolver is meant to avoid. An unreachable assignment is refused and
-// the resolver falls through to the ordinary rules.
+// # Claims are published even when their resolvers are unusable
+//
+// Every configuration is compiled and published, INCLUDING one whose resolvers cannot currently
+// be used. That is a privacy property, not tidiness.
+//
+// A configuration's internal domains are a CLAIM: the server is saying "names under here are
+// mine, and must be resolved by my nameserver". Whether that nameserver is reachable right now
+// is a separate question, answered by compileResolver once the routes and the client's
+// transport capability are known. If unreachability deleted the claim, the name would become
+// unclaimed -- and an unclaimed name goes to the ordinary DNS rules -- so a temporarily
+// unreachable internal resolver would silently send `internal.corp` to a public resolver. That
+// is the split-DNS leak this design exists to prevent.
+//
+// So the configuration keeps its claim, its resolvers are marked unusable, and a query for a
+// claimed name fails closed instead. `decide` is what makes that distinction, and it is
+// deliberately answered without reference to usability.
 func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) {
 	if c.innerQueryOptions.Transport != nil {
-		// An explicit resolver is configured. Record that the assignment was seen and
-		// ignored, at debug level so a server that pushes one does not produce noise.
+		// An explicit resolver is configured. Record that the assignment was seen and ignored,
+		// at debug level so a server that pushes one does not produce noise.
 		if configuration.DNS != nil && !configuration.DNS.Empty() {
 			c.logger.Debug("server DNS assignment received but an explicit inner resolver is configured; ignoring it")
 		}
 		return
 	}
+	// PREF64 is stored SEPARATELY and always, including on a DNS withdrawal.
+	//
+	// It has no effect on any answer or transport, so it must not participate in the DNS
+	// snapshot's identity: a PREF64-only update that invalidated the DNS cache would discard
+	// answers it cannot possibly have changed.
+	c.pref64.publish(configuration.PREF64)
+
 	if configuration.DNS == nil || configuration.DNS.Empty() {
-		// Withdrawn, or nothing usable. Clearing is correct rather than leaving the
-		// previous resolver installed.
-		c.assignedDNS.clear()
+		// Withdrawn. Storing nil is what makes every name unclaimed again, and an in-flight
+		// lookup keeps using the snapshot it captured.
+		c.dnsAssignment.Store(nil)
 		return
 	}
 
-	// # Claims are installed even when their resolvers are not usable
-	//
-	// Every configuration is published, INCLUDING one whose resolvers cannot currently be
-	// used. That is deliberate and it is a privacy property rather than tidiness.
-	//
-	// A configuration's internal domains are a CLAIM: the server is saying "names under here
-	// are mine, and must be resolved by my nameserver". Whether we can reach that nameserver
-	// right now is a separate question, answered once the routes and the client's transport
-	// capability are known. If unreachability deleted the claim, the name would become
-	// unclaimed, and an unclaimed name is resolved by the ordinary DNS rules -- so a
-	// temporary inability to reach an internal resolver would silently send `internal.corp`
-	// to a public resolver. That is the split-DNS leak this design exists to prevent.
-	//
-	// So the configuration is published with its claim intact and its resolvers marked
-	// unusable. A query for a claimed name then finds the claim, finds no usable resolver, and
-	// FAILS -- which is the correct outcome.
-	//
-	// The wire types are passed through unchanged; usability is computed by the runtime model,
-	// where the routes and the client's capability are both available.
-	capability := c.resolverCapability(configuration.Routes)
-	c.assignedDNS.apply(configuration.DNS.Configurations, configuration.PREF64, capability)
-	c.logger.Debug("using server-assigned DNS resolver (", len(configuration.DNS.Configurations),
-		" configurations, generation ", configuration.DNS.Generation, ")")
+	snapshot := compileDNSAssignment(configuration.DNS.Configurations, c.resolverCapability(configuration.Routes))
+	// A single pointer store: readers see either the old snapshot or the new one, never a
+	// mixture, and an in-flight lookup is unaffected by the replacement.
+	c.dnsAssignment.Store(snapshot)
+	c.logger.Debug("using server-assigned DNS resolver (", len(snapshot.configurations), " configurations)")
 }
 
-// candidateDialerHolder breaks the construction cycle between the HTTP client and the
-// handshake hook that client needs.
+// Pref64Prefixes reports the NAT64 prefixes currently in force.
 //
-// The hook is a field of the client, and the client's single-candidate primitive is what the
-// hook wants to delegate to, so one of them has to be supplied late. This holder is that
-// indirection: the hook is given the holder immediately, and the holder is filled in once the
-// client exists. The hook is not invoked until a connection is dialed, which is long after
-// construction, so the fill always happens first.
-type candidateDialerHolder struct {
-	dialer candidateDialer
-}
-
-func (h *candidateDialerHolder) set(dialer candidateDialer) {
-	h.dialer = dialer
-}
-
-// DialHTTP3Candidate implements candidateDialer.
-func (h *candidateDialerHolder) DialHTTP3Candidate(ctx context.Context, server M.Socksaddr, address netip.Addr) (net.Conn, *quic.Conn, error) {
-	if h.dialer == nil {
-		// No candidate primitive: report it so the racer falls back to its own DialEarly
-		// rather than failing the connection.
-		return nil, nil, errNoCandidateDialer
-	}
-	return h.dialer.DialHTTP3Candidate(ctx, server, address)
-}
-
-// errNoCandidateDialer signals that no transport-supplied candidate primitive exists, so the
-// racer should build the candidate itself.
-var errNoCandidateDialer = E.New("no HTTP/3 candidate dialer available")
-
-// http3CandidateDialer extracts the transport's single-candidate primitive, or nil when the
-// client has no HTTP/3 support.
-func http3CandidateDialer(client *http.Client) candidateDialer {
-	if client == nil {
-		return nil
-	}
-	provided := client.HTTP3CandidateDialer()
-	if provided == nil {
-		return nil
-	}
-	dialer, isDialer := provided.(candidateDialer)
-	if !isDialer {
-		return nil
-	}
-	return dialer
+// This is state EXPOSURE only: this client performs no DNS64 synthesis, so the prefixes do not
+// affect resolution. They are reported so the configuration surface is honest about what the
+// server sent rather than silently discarding it.
+func (c *ClientEndpoint) Pref64Prefixes() []netip.Prefix {
+	return c.pref64.snapshot()
 }
 
 // resolverCapability describes what this client can currently do, which decides whether an
@@ -574,59 +518,94 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 	return c.device.DialContext(ctx, network, destination)
 }
 
-// lookupInner resolves a domain reached through the tunnel, applying the resolver precedence
-// in one place so the TCP and UDP paths cannot disagree about it.
+// lookupInner resolves a domain the endpoint is about to carry through the tunnel.
 //
-// # The precedence, and the distinction that makes it safe
+// # The precedence
 //
-//	explicit inner_domain_resolver        (highest: the operator's choice is the trusted one)
+//	explicit inner_domain_resolver   (highest: the operator's choice is the trusted one)
 //	        >
 //	DNS_ASSIGN, when it CLAIMS this name
 //	        >
-//	normal DNS Router rules               (default)
+//	normal DNS Router rules          (default)
 //
-// The middle line is the one that matters, and it is why the decision is made on the CLAIM
-// rather than on the assignment's mere presence.
+// # One lookup, one snapshot
 //
-//	draft-06 §3.5: "Sending an empty string as an internal domain indicates the DNS root"
-//	draft-06 §3.6.2: a split-tunnel configuration claims "internal.corp.example" and nothing
-//	                 else, so public names must resolve normally
+// The snapshot is captured ONCE, at the top, and everything below uses that captured value.
 //
-// An earlier version asked only "is an assignment active". That made every name assigned-DNS
-// traffic, so in a split tunnel a public name was sent to the internal resolver -- which then
-// refused it, because no configuration claimed it. Public resolution broke, and the failure
-// looked like a server fault rather than a routing mistake.
+// This matters because a single lookup issues an A and an AAAA query CONCURRENTLY. Reading the
+// assignment again inside the transport would let a capsule arriving mid-lookup send the A query
+// through one assignment and the AAAA query through the next, producing mixed-family answers
+// that came from two different configurations. Capturing once makes that impossible rather than
+// unlikely.
 //
 // # Claimed and unclaimed are different, and a claimed failure must NOT fall back
 //
-//	UNCLAIMED name -> the ordinary rules. The server never said this was its business.
-//	CLAIMED name   -> the assigned resolver, or FAILURE. Never the ordinary rules.
+//	UNCLAIMED  -> the server never said this name was its business, so the ordinary rules apply
+//	CLAIMED    -> the assigned configuration answers it, or the lookup FAILS
 //
-// The second rule is the privacy invariant of split DNS. A claimed name belongs to a resolver
-// the server nominated; if that resolver is unreachable, unsupported, or erroring, sending the
-// query to a public resolver would leak an internal name -- and would do so precisely when the
-// internal path is broken, which is when it is least expected. So a claimed name never falls
-// through. `assignedDNS.claimsName` answers the ownership question WITHOUT reference to
-// usability, which is what stops a temporarily unreachable resolver from quietly converting an
-// internal name into a public one.
+// The second rule is the privacy invariant of split DNS: a name the server claimed belongs to a
+// resolver it nominated, and handing it to a public resolver when that resolver is unreachable
+// would leak an internal name at exactly the moment the internal path is broken.
+//
+// # What precedes the first DNS_ASSIGN is unknowable
+//
+// draft-06 has no capsule announcing that an assignment is coming, so before the first
+// DNS_ASSIGN arrives the client cannot know which names WILL be claimed. Until then every name
+// is unclaimed and resolves normally. That is a protocol limitation, not a gap this code can
+// close, and no timer or readiness gate is invented here to pretend otherwise.
 func (c *ClientEndpoint) lookupInner(ctx context.Context, domain string) ([]netip.Addr, error) {
-	// 1. An explicit resolver wins outright: the operator has already said where queries go,
-	//    and a server must not be able to override that.
+	// 1. An explicit resolver wins outright. The server's assignment is still parsed and
+	//    validated, but it must not be able to override the operator's own choice.
 	if c.innerQueryOptions.Transport != nil {
 		return c.dnsRouter.Lookup(ctx, domain, c.innerQueryOptions)
 	}
 
-	// 2. The server's assignment, but ONLY for names it claims.
-	if c.assignedDNS.claimsName(domain) {
+	// 2. Capture the assignment ONCE for this whole lookup.
+	snapshot := c.dnsAssignment.Load()
+	decision := snapshot.decide(domain)
+
+	switch {
+	case !decision.claimed:
+		// Nobody claimed it, so the ordinary rules decide -- this is what makes a split tunnel
+		// resolve public names.
+		return c.dnsRouter.Lookup(ctx, domain, c.innerQueryOptions)
+
+	case !decision.usable:
+		// Claimed, but nothing can serve it. Fail closed and do NOT consult the ordinary rules.
+		c.logger.Debug("assigned DNS configuration claims ", domain, " but has no usable resolver")
+		return nil, E.New("the server-assigned DNS configuration for ", domain,
+			" has no usable resolver, and the name is not resolved by any other means")
+
+	default:
+		// Claimed and serveable. The transport is bound to THIS configuration, so the choice
+		// made here cannot drift if a new assignment is published while the query is in flight.
 		queryOptions := c.innerQueryOptions
-		queryOptions.Transport = c.assignedDNS
-		// No fallback here by construction: the router will use this transport, and if it
-		// fails the lookup fails.
+		queryOptions.Transport = newConfigurationDNSTransport(
+			c.logger,
+			c.device,
+			c.dnsTag,
+			decision.configuration,
+			c.dohExecutor(),
+		)
 		return c.dnsRouter.Lookup(ctx, domain, queryOptions)
 	}
+}
 
-	// 3. Unclaimed. The ordinary rules, which is the entire point of a split tunnel.
-	return c.dnsRouter.Lookup(ctx, domain, c.innerQueryOptions)
+// dohExecutor returns the same-connection DoH executor, or nil when it cannot be used.
+//
+// draft-06 §3.5 asks for DoH to be coalesced over the connection the tunnel already uses, which
+// presupposes that the tunnel IS that connection. The configured protocol version is not the
+// same fact: transport/http falls back to HTTP/2, so an endpoint configured for version 3 can
+// have an HTTP/2 tunnel while the HTTP/3 code path still exists. Reporting the capability from
+// the client that owns the connection is what keeps a DNS query from creating a second one.
+func (c *ClientEndpoint) dohExecutor() dohExecutor {
+	if c.httpClient == nil {
+		return nil
+	}
+	if _, live := c.httpClient.HTTP3ConnectionState(); !live {
+		return nil
+	}
+	return c.httpClient
 }
 
 // dialResolved connects to one of the addresses the resolver returned.

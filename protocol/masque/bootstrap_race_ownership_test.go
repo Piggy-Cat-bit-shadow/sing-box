@@ -188,11 +188,10 @@ func TestRacerClosesLosingSuccessfulAttempts(t *testing.T) {
 	first := host
 	second := host
 
-	rawConn, quicConn, err := racer.dial(context.Background(), dialer,
-		M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
-			HandshakeIdleTimeout: 5 * time.Second,
-			MaxIdleTimeout:       30 * time.Second,
-		},
+	rawConn, quicConn, err := racer.dial(context.Background(), testCandidateConnector(dialer, M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       30 * time.Second,
+	}),
 		[]netip.Addr{first, second}, false)
 	require.NoError(t, err, "at least one attempt must win")
 	require.NotNil(t, rawConn)
@@ -241,11 +240,10 @@ func TestRacerDualSuccessStress(t *testing.T) {
 
 	for index := range iterations {
 		racer := newHandshakeRacer(5 * time.Millisecond)
-		rawConn, quicConn, err := racer.dial(context.Background(), dialer,
-			M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
-				HandshakeIdleTimeout: 5 * time.Second,
-				MaxIdleTimeout:       30 * time.Second,
-			},
+		rawConn, quicConn, err := racer.dial(context.Background(), testCandidateConnector(dialer, M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
+			HandshakeIdleTimeout: 5 * time.Second,
+			MaxIdleTimeout:       30 * time.Second,
+		}),
 			[]netip.Addr{host, host}, false)
 		require.NoError(t, err, "iteration %d must produce a winner", index)
 		_ = quicConn.CloseWithError(0, "")
@@ -272,11 +270,10 @@ func TestRacerWinnerIsTheOnlyOpenConnectionWhenLosersAreSlow(t *testing.T) {
 
 	// Several candidates at one address: the first wins almost immediately and the
 	// rest complete their handshakes afterwards, into a race that is already decided.
-	rawConn, quicConn, err := racer.dial(context.Background(), dialer,
-		M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
-			HandshakeIdleTimeout: 5 * time.Second,
-			MaxIdleTimeout:       30 * time.Second,
-		},
+	rawConn, quicConn, err := racer.dial(context.Background(), testCandidateConnector(dialer, M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       30 * time.Second,
+	}),
 		[]netip.Addr{host, host, host, host}, false)
 	require.NoError(t, err)
 
@@ -304,11 +301,10 @@ func TestRacerReturnsOnlyAfterLosersAreClosed(t *testing.T) {
 	dialer := &trackingDialer{tracker: tracker, base: &netDialerShim{}}
 	racer := newHandshakeRacer(1 * time.Millisecond)
 
-	rawConn, quicConn, err := racer.dial(context.Background(), dialer,
-		M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
-			HandshakeIdleTimeout: 5 * time.Second,
-			MaxIdleTimeout:       30 * time.Second,
-		},
+	rawConn, quicConn, err := racer.dial(context.Background(), testCandidateConnector(dialer, M.SocksaddrFrom(host, port), racerTestTLSConfig(t), &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       30 * time.Second,
+	}),
 		[]netip.Addr{host, host, host}, false)
 	require.NoError(t, err)
 
@@ -344,13 +340,11 @@ func TestRacerAlternatesAddressFamilies(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancel()
 
-	_, _, _ = racer.dial(ctx, dialer, M.ParseSocksaddr("masque.example:443"),
-		racerTestTLSConfig(t), nil,
-		[]netip.Addr{
-			netip.MustParseAddr("2001:db8::1"),
-			netip.MustParseAddr("2001:db8::2"),
-			netip.MustParseAddr("192.0.2.1"),
-		}, true)
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("2001:db8::2"),
+		netip.MustParseAddr("192.0.2.1"),
+	}, true)
 
 	attempts := dialer.attempts()
 	require.GreaterOrEqual(t, len(attempts), 2, "the race must attempt more than one candidate")
@@ -376,13 +370,11 @@ func TestRacerAlternatesAddressFamiliesMirrored(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancel()
 
-	_, _, _ = racer.dial(ctx, dialer, M.ParseSocksaddr("masque.example:443"),
-		racerTestTLSConfig(t), nil,
-		[]netip.Addr{
-			netip.MustParseAddr("192.0.2.1"),
-			netip.MustParseAddr("192.0.2.2"),
-			netip.MustParseAddr("2001:db8::1"),
-		}, false)
+	_, _, _ = racer.dial(ctx, testCandidateConnector(dialer, M.ParseSocksaddr("masque.example:443"), racerTestTLSConfig(t), nil), []netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("192.0.2.2"),
+		netip.MustParseAddr("2001:db8::1"),
+	}, false)
 
 	attempts := dialer.attempts()
 	require.GreaterOrEqual(t, len(attempts), 2)

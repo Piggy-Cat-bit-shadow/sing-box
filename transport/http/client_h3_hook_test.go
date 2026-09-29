@@ -81,10 +81,12 @@ func TestHTTP3HookIsUsedWhenSet(t *testing.T) {
 	impl := &http3ClientImpl{
 		dialer: dialer,
 		server: M.ParseSocksaddr("127.0.0.1:443"),
-		connDialer: func(ctx context.Context, hookDialer N.Dialer, server M.Socksaddr, tlsConfig aTLS.Config, quicConfig *quic.Config) (net.Conn, *quic.Conn, error) {
+		connDialer: func(ctx context.Context, server M.Socksaddr, connectCandidate HTTP3CandidateConnector) (net.Conn, *quic.Conn, error) {
 			hookCalled = true
 			receivedServer = server
-			// Deliberately does NOT dial: the hook owns that.
+			require.NotNil(t, connectCandidate,
+				"the hook must receive a connector, or it cannot build a candidate at all")
+			// Deliberately does NOT connect: the hook owns candidate selection.
 			return nil, nil, context.DeadlineExceeded
 		},
 	}

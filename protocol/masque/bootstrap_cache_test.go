@@ -165,35 +165,50 @@ func TestBootstrapFreshAnswerLeadsTheCache(t *testing.T) {
 	require.Equal(t, netip.MustParseAddr("198.51.100.1"), addresses[0],
 		"a fresh answer must lead even when a cached winner exists; the network may "+
 			"have changed since the winner was recorded")
-	require.Contains(t, addresses, netip.MustParseAddr("192.0.2.1"),
-		"the cached address must still be offered behind the fresh answer")
+	require.NotContains(t, addresses, netip.MustParseAddr("192.0.2.1"),
+		"the previous winner is NOT carried along: a fresh answer is the whole candidate list, because after a network change the old address may be on the network we just left")
 }
 
-// TestBootstrapMergesAndDeduplicates proves the fresh and cached sets are merged without
-// duplicates, which matters because a duplicate costs an extra connection attempt.
-func TestBootstrapMergesAndDeduplicates(t *testing.T) {
+// TestBootstrapFreshAnswerReplacesTheSnapshot proves a successful resolution REPLACES what was
+// remembered rather than merging with it.
+//
+// The previous behaviour returned `fresh ++ (cached \ fresh)`, carrying over addresses the fresh
+// answer had not mentioned. That is a stale-DNS hazard: when an operator removes an address from
+// the record the recovery state puts it straight back, and we keep dialling something the
+// resolver no longer publishes, with no TTL to expire it.
+//
+// A successful DNS answer is authoritative about where the server is; the remembered set exists
+// only to cover the case where that answer cannot be obtained.
+func TestBootstrapFreshAnswerReplacesTheSnapshot(t *testing.T) {
 	t.Parallel()
 
 	cache := newBootstrapCache()
 	_, err := cache.resolve(context.Background(), staticResolve("192.0.2.1", "192.0.2.2"))
 	require.NoError(t, err)
 
-	// A second resolution repeats one address and adds another.
-	addresses, err := cache.resolve(context.Background(), staticResolve("192.0.2.2", "192.0.2.3"))
+	// A second resolution mentions only one of them. The withdrawn address must NOT come back.
+	addresses, err := cache.resolve(context.Background(), staticResolve("192.0.2.3"))
+	require.NoError(t, err)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.3")}, addresses,
+		"the fresh answer is the whole candidate list; a withdrawn address must not be reintroduced")
+
+	// And the remembered set is the fresh answer, so a later recovery offers only that.
+	recovered, err := cache.resolve(context.Background(), failingResolve(errTestDialFailed))
+	require.NoError(t, err)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.3")}, recovered)
+}
+
+// TestBootstrapDeduplicatesWithinAFreshAnswer proves a repeated address costs one attempt.
+func TestBootstrapDeduplicatesWithinAFreshAnswer(t *testing.T) {
+	t.Parallel()
+
+	cache := newBootstrapCache()
+	addresses, err := cache.resolve(context.Background(), staticResolve("192.0.2.1", "192.0.2.1", "192.0.2.2"))
 	require.NoError(t, err)
 	require.Equal(t, []netip.Addr{
-		netip.MustParseAddr("192.0.2.2"),
-		netip.MustParseAddr("192.0.2.3"),
 		netip.MustParseAddr("192.0.2.1"),
-	}, addresses, "fresh answers lead, cached ones follow, no duplicates")
-
-	seen := make(map[netip.Addr]int)
-	for _, address := range addresses {
-		seen[address]++
-	}
-	for address, count := range seen {
-		require.Equal(t, 1, count, "address %s appeared %d times", address, count)
-	}
+		netip.MustParseAddr("192.0.2.2"),
+	}, addresses, "a duplicate costs an extra connection attempt, so it is removed")
 }
 
 // TestBootstrapCacheIsBounded proves a hostile or misconfigured resolver cannot make the
@@ -210,9 +225,9 @@ func TestBootstrapCacheIsBounded(t *testing.T) {
 		_, err := cache.resolve(context.Background(), staticResolve(addresses...))
 		require.NoError(t, err)
 	}
-	require.LessOrEqual(t, cache.cachedCount(), defaultMaxBootstrapCandidates,
+	require.LessOrEqual(t, cache.cachedForTest(), defaultMaxBootstrapCandidates,
 		"the cache must stay within its bound")
-	require.Positive(t, cache.cachedCount())
+	require.Positive(t, cache.cachedForTest())
 }
 
 // TestBootstrapPromoteMovesWinnerToTheFrontOfFallback covers winner promotion, and
@@ -254,7 +269,7 @@ func TestBootstrapCacheSurvivesRepeatedRecovery(t *testing.T) {
 		require.NoError(t, resolveErr, "recovery attempt %d must succeed", attempt)
 		require.Len(t, addresses, 1, "recovery attempt %d must still have the address", attempt)
 	}
-	require.True(t, cache.hasCache())
+	require.True(t, cache.hasRecovery())
 }
 
 // TestBootstrapDialerPassesThroughIPDestinations proves the wrapper only changes
@@ -273,7 +288,7 @@ func TestBootstrapDialerPassesThroughIPDestinations(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, dialer.dials)
 	require.Equal(t, "192.0.2.7", dialer.last.Addr.String())
-	require.Equal(t, 0, cache.cachedCount(),
+	require.Equal(t, 0, cache.cachedForTest(),
 		"an IP destination must not populate the bootstrap cache")
 }
 
@@ -291,7 +306,7 @@ func TestBootstrapDialerResolvesAndPromotes(t *testing.T) {
 	require.Equal(t, 1, dialer.dials)
 	require.Equal(t, "192.0.2.1", dialer.last.Addr.String(),
 		"the domain must have been resolved before dialling")
-	require.Equal(t, 1, cache.cachedCount())
+	require.Equal(t, 1, cache.cachedForTest())
 }
 
 // TestBootstrapDialerForwardsResolutionErrors proves a hard resolution failure is
@@ -340,10 +355,17 @@ func TestBootstrapCacheIsRaceFree(t *testing.T) {
 			defer wg.Done()
 			for range 500 {
 				_, _ = cache.resolve(context.Background(), failingResolve(errTestDialFailed))
-				_ = cache.hasCache()
-				_ = cache.cachedCount()
+				_ = cache.hasRecovery()
+				_ = cache.cachedForTest()
 			}
 		}()
 	}
 	wg.Wait()
+}
+
+// cachedForTest reports how many addresses are remembered, for assertions.
+func (c *bootstrapCache) cachedForTest() int {
+	c.access.Lock()
+	defer c.access.Unlock()
+	return len(c.lastFresh)
 }
