@@ -694,3 +694,55 @@ func BenchmarkDataplaneOutboundRouteCounts(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDataplaneOversizePacketsRepeated measures the oversize path when the SAME too-large
+// packet recurs, which is the state a learned ceiling would target.
+//
+// # Why the optimisation was considered and REJECTED
+//
+// Every oversize packet costs a failed SendDatagram before the ICMP Packet Too Big is built
+// (~400-690ns against ~140ns for a normal packet, and 6 allocations against 2). The obvious fix is
+// a session-local ceiling: learn the largest payload the transport accepted, and short-circuit
+// packets above it straight to the PTB.
+//
+// It is rejected because the premise does not hold. quic-go computes its limit as
+//
+//	min(peerMaxDatagramFrameSize, maxPayloadSizeEstimate)
+//
+// and maxPayloadSizeEstimate is an atomic that is only ever RAISED, as path MTU discovery
+// succeeds (connection.go: only stores when the new estimate is larger). A "too large" result is
+// therefore not a stable property of the connection: it is a transient statement about the current
+// estimate, and it can legitimately stop being true a moment later.
+//
+// A ceiling that only ratchets down -- which is what "learned lower ceiling" means -- would latch
+// a temporary reduction and permanently refuse packets the connection could carry once PMTU
+// recovered. That trades a correct, self-healing path for a fast, permanently-degraded one, on a
+// condition (persistent MTU mismatch) that a correctly configured tunnel does not produce at all.
+//
+// The measurement is kept so the decision is revisitable with numbers rather than re-argued: if
+// this cost ever shows up in a production profile, the figure is here.
+//
+// Recorded as REJECTED / NO CHANGE.
+func BenchmarkDataplaneOversizePacketsRepeated(b *testing.B) {
+	packet := buildBenchIPv4Packet(1400, 6,
+		netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("93.184.216.34"))
+	sink := &benchDatagramSink{refuseAt: 1300}
+	handler := &benchHandler{}
+	current := benchSession(sink, &benchDiscardStream{}, handler)
+
+	b.ReportAllocs()
+	b.SetBytes(1400)
+	b.ResetTimer()
+	for b.Loop() {
+		buffers := newBenchPacketBuffers(1, packet)
+		if err := current.client.WritePacketBuffers(buffers, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+
+	if handler.replies == 0 {
+		b.Fatal("an oversized packet must produce a PTB reply")
+	}
+	b.ReportMetric(1, "sendattempts/op")
+}
