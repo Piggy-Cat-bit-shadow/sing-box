@@ -288,26 +288,104 @@ func (s *session) writeCapsule(capsule *buf.Buffer) error {
 	return err
 }
 
+// datagram error classification, and why it is not a switch over errors.As.
+//
+// A packet path may not allocate per packet. The obvious classifier --
+//
+//	var tooLarge *transportHTTP.DatagramTooLargeError
+//	switch {
+//	case err == nil:
+//	case errors.As(err, &tooLarge):
+//	case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
+//	}
+//
+// breaks that rule in a way that is invisible in review: errors.As takes the ADDRESS of its target,
+// so the compiler must assume the pointer outlives the call and moves `tooLarge` to the heap on
+// every iteration -- including the iterations where err is nil and the call never runs. Escape
+// analysis confirms it ("moved to heap: tooLarge"), and a memory profile of the packet path showed
+// it as the single remaining per-packet allocation.
+//
+// The classification below keeps errors.As, but only reached AFTER a nil check and a direct type
+// assertion have both failed. Those two answer the cases that actually occur, and neither takes an
+// address, so the success path allocates nothing. errors.As stays in the chain for the case the
+// direct assertion cannot see -- a WRAPPED *DatagramTooLargeError -- so a future wrapper cannot
+// silently change how an error is handled.
+type datagramErrorKind uint8
+
+const (
+	datagramErrorOther datagramErrorKind = iota
+	datagramErrorTooLarge
+	datagramErrorUnsupported
+)
+
+// classifyDatagramError reports how a failed SendDatagram should be handled, and the transport's
+// maximum payload size when the failure was a size failure.
+//
+// The returned kind is only meaningful for a non-nil error; callers check err == nil first, which
+// is what keeps this off the success path entirely.
+//
+// # Why the nil check delegates instead of falling through
+//
+// The direct assertion and the errors.As fallback are deliberately NOT in this function's body.
+// Go hoists the heap allocation for an errors.As target to FUNCTION ENTRY, so a function that
+// merely CONTAINS an errors.As allocates once per call even when the call is never reached. The
+// nil return therefore has to leave this function entirely, which is why the two remaining cases
+// live in classifyWrappedDatagramError.
+func classifyDatagramError(err error) (datagramErrorKind, int) {
+	if err == nil {
+		return datagramErrorOther, 0
+	}
+	if tooLarge, isTooLarge := err.(*transportHTTP.DatagramTooLargeError); isTooLarge {
+		return datagramErrorTooLarge, tooLarge.MaxPayloadSize
+	}
+	// Reached only for an error that is not directly a *DatagramTooLargeError, i.e. never on the
+	// success path this classifier exists to keep clean.
+	return classifyWrappedDatagramError(err)
+}
+
+// classifyWrappedDatagramError handles the errors that need unwrapping.
+//
+// It is a separate function so that the allocation its errors.As forces is paid only by callers
+// that actually have an error to classify.
+func classifyWrappedDatagramError(err error) (datagramErrorKind, int) {
+	var tooLarge *transportHTTP.DatagramTooLargeError
+	if errors.As(err, &tooLarge) {
+		return datagramErrorTooLarge, tooLarge.MaxPayloadSize
+	}
+	if errors.Is(err, transportHTTP.ErrDatagramUnsupported) {
+		return datagramErrorUnsupported, 0
+	}
+	return datagramErrorOther, 0
+}
+
 func (s *session) writePackets(buffers []*buf.Buffer) error {
 	capsules := buffers[:0]
 	for i, buffer := range buffers {
 		datagram := transportHTTP.PrependContextID(buffer)
 		if s.datagrams != nil {
 			err := s.datagrams.SendDatagram(datagram.Bytes())
-			var tooLarge *transportHTTP.DatagramTooLargeError
-			switch {
-			case err == nil:
+			if err == nil {
+				// The overwhelmingly common case, and it is kept first and free of any
+				// error-classification machinery.
 				datagram.Release()
 				continue
-			case errors.As(err, &tooLarge):
-				mtu := tooLarge.MaxPayloadSize - 1
+			}
+			// Only now, on the failure path, is the error classified. This ordering is not
+			// stylistic: passing the address of a typed pointer to errors.As makes that variable
+			// escape to the heap UNCONDITIONALLY, whether or not the call matches, so classifying
+			// first cost one heap allocation per successfully sent packet. See
+			// classifyDatagramError.
+			kind, maxPayloadSize := classifyDatagramError(err)
+			switch kind {
+			case datagramErrorTooLarge:
+				mtu := maxPayloadSize - 1
 				if mtu >= minimumLinkMTU {
 					datagram.Advance(1)
 					s.handler.handlePacketTooBig(datagram, mtu)
 					continue
 				}
 				err = E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets")
-			case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
+			case datagramErrorUnsupported:
 				capsules = append(capsules, datagram)
 				continue
 			}
