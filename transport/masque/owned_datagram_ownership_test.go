@@ -449,3 +449,64 @@ func (s *plainRecorder) snapshot() ([][]byte, int) {
 	copy(out, s.serialized)
 	return out, len(s.serialized)
 }
+
+// ---------------------------------------------------------------------------
+// Headroom: the requirement the zero-copy path depends on
+// ---------------------------------------------------------------------------
+
+// TestPacketHeadroomFitsTheWorstCaseFraming proves the headroom budget covers the largest prefix
+// the protocol can produce, not merely the one seen in practice.
+//
+// # Why the worst case is 9 bytes and not 2
+//
+// A short-lived connection uses a 1-byte quarter stream ID, so a budget sized from observation
+// would be 2 bytes. But the quarter stream ID is a QUIC varint over streamID/4, so it grows to 8
+// bytes as a connection ages. A budget sized for the common case would make the zero-copy path
+// silently stop working on long-lived connections -- falling back to a full copy per packet, with
+// no error and no log. Sizing for the maximum is what makes the fast path a property of the code
+// rather than of how long the connection happens to have been up.
+func TestPacketHeadroomFitsTheWorstCaseFraming(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 9, ownedDatagramHeadroom,
+		"the owned DATAGRAM path must reserve the MASQUE context ID plus the largest HTTP/3 quarter "+
+			"stream ID varint")
+	require.GreaterOrEqual(t, PacketHeadroom, ownedDatagramHeadroom,
+		"PacketHeadroom must cover the owned datagram path")
+	require.GreaterOrEqual(t, PacketHeadroom, capsuleHeadroom,
+		"PacketHeadroom must ALSO cover the capsule fallback, because a session can switch to it at "+
+			"any time without the buffers being rebuilt")
+
+	// And the arithmetic must hold on a real buffer, not just on the constants.
+	payload := []byte("worst-case-payload")
+	buffer := newOwnedTestBuffer(payload)
+	contextID := transportHTTP.PrependContextID(buffer)
+	require.GreaterOrEqual(t, contextID.Start(), http3QuarterStreamIDMaxLength,
+		"after the context ID is prepended, the headroom left must still accept the largest "+
+			"quarter stream ID")
+	header := contextID.ExtendHeader(http3QuarterStreamIDMaxLength)
+	require.NotNil(t, header)
+	require.Len(t, header, http3QuarterStreamIDMaxLength)
+	contextID.Release()
+}
+
+// TestRaisingHeadroomKeepsTheBufferInTheSamePoolClass is the §24 cost check.
+//
+// The headroom went from 6 to 9 bytes. That is negligible memory, but the buffer pool allocates by
+// power-of-two size class, so three extra bytes COULD have pushed every packet buffer into the next
+// class -- doubling the memory per packet for a three-byte gain. This asserts the class is
+// unchanged, which is the fact that makes the increase free rather than a trade.
+func TestRaisingHeadroomKeepsTheBufferInTheSamePoolClass(t *testing.T) {
+	t.Parallel()
+
+	for _, mtu := range []int{1280, 1400, 1500} {
+		previous := buf.NewSize(capsuleHeadroom + mtu)
+		current := buf.NewSize(PacketHeadroom + mtu)
+		require.Equal(t, cap(previous.Bytes()), cap(current.Bytes()),
+			"mtu %d: raising the headroom from %d to %d must not change the pool size class, "+
+				"otherwise every packet buffer costs more memory than the bytes saved",
+			mtu, capsuleHeadroom, PacketHeadroom)
+		previous.Release()
+		current.Release()
+	}
+}

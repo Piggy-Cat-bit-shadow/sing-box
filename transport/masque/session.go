@@ -16,9 +16,43 @@ import (
 const (
 	upgradeToken       = "connect-ip"
 	DefaultMTU         = 1280
-	PacketHeadroom     = transportHTTP.CapsuleHeadroom
 	QUICPacketOverhead = 51
 	minimumLinkMTU     = 1280
+
+	// masqueContextIDMaxLength is the largest MASQUE Context ID this client can frame.
+	//
+	// The client uses Context ID 0, which is a 1-byte varint. The constant is stated separately
+	// from the value in use so the headroom budget below reads as a protocol sum rather than as an
+	// assumption, and so a future second context ID has an obvious place to be accounted for.
+	masqueContextIDMaxLength = 1
+	// http3QuarterStreamIDMaxLength is the largest HTTP/3 quarter stream ID varint.
+	//
+	// RFC 9000 varints reach 8 bytes, and HTTP/3 divides the stream ID by four, so a long-lived
+	// connection WILL eventually use a multi-byte value. Sizing the headroom for the common case
+	// would make the zero-copy path silently stop working -- falling back to a full copy per
+	// packet -- once a connection had served enough requests, which is the worst kind of
+	// regression: invisible, and only on long-lived connections.
+	http3QuarterStreamIDMaxLength = 8
+
+	// ownedDatagramHeadroom is what the zero-copy HTTP/3 DATAGRAM path must be able to prepend
+	// without reallocating: the MASQUE Context ID, then the HTTP/3 quarter stream ID.
+	//
+	// It is the requirement the pooled buffers must satisfy for the fast path to be taken. A buffer
+	// with less headroom is not an error -- the HTTP/3 layer falls back to copying -- but it costs
+	// a packet-sized allocation and copy, so it is a performance cliff rather than a failure.
+	ownedDatagramHeadroom = masqueContextIDMaxLength + http3QuarterStreamIDMaxLength
+
+	// capsuleHeadroom is what the CAPSULE fallback must be able to prepend: the capsule type, the
+	// payload-length varint, and the MASQUE Context ID.
+	capsuleHeadroom = transportHTTP.CapsuleHeadroom
+
+	// PacketHeadroom is the front headroom the tunnel requires of every packet buffer.
+	//
+	// It is the MAXIMUM of the paths a packet can take, so that a buffer satisfying it never
+	// reallocates on either. The two paths are not alternatives chosen per packet -- a session can
+	// fall back from datagrams to capsules at any time -- so both requirements have to hold
+	// simultaneously.
+	PacketHeadroom = max(capsuleHeadroom, ownedDatagramHeadroom)
 	// maxPacketSize bounds one MASQUE inner IP packet.
 	//
 	// IPv4 Total Length counts the whole packet, so the largest ordinary IPv4 packet is

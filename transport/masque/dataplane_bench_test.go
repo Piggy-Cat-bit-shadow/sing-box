@@ -786,3 +786,123 @@ func BenchmarkDataplaneInboundSliceAllocation(b *testing.B) {
 		current.handleIngressDatagram(packet)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Owned DATAGRAM path: the copy-reduction evidence
+// ---------------------------------------------------------------------------
+
+// copyCountingStream is a datagram stream with BOTH capabilities, so a benchmark can measure the
+// same workload through either path and attribute the difference to the copies alone.
+//
+// # Why counting copies rather than only timing
+//
+// A timing difference can come from anywhere -- a branch, a cache effect, benchmark noise. The task
+// asks for zero full-payload copies before QUIC packetization, and that is a structural claim, so
+// it is measured structurally: this fixture models quic-go's copying behaviour faithfully by
+// performing the same `make` + `copy`, and the owned behaviour by simply reading the bytes. The
+// counter reports how many packet-sized copies the transport performed.
+type copyCountingStream struct {
+	access sync.Mutex
+	// copies counts full-payload copies performed by the transport, modelling quic-go.
+	copies int
+	// ownedCalls counts sends that took the ownership path.
+	ownedCalls int
+	// legacyCalls counts sends that took the copying path.
+	legacyCalls int
+	// sink accumulates a byte so the compiler cannot elide the work.
+	sink byte
+}
+
+func (s *copyCountingStream) DatagramsEnabled() bool { return true }
+
+func (s *copyCountingStream) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (s *copyCountingStream) Write(p []byte) (int, error) { return len(p), nil }
+
+func (s *copyCountingStream) Close() error { return nil }
+
+func (s *copyCountingStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// SendDatagram models quic-go's copying API: one full-payload copy, then the caller releases.
+func (s *copyCountingStream) SendDatagram(payload []byte) error {
+	copied := make([]byte, len(payload))
+	copy(copied, payload)
+	s.access.Lock()
+	s.copies++
+	s.legacyCalls++
+	if len(copied) > 0 {
+		s.sink ^= copied[len(copied)-1]
+	}
+	s.access.Unlock()
+	return nil
+}
+
+// SendDatagramOwned models the owned API: read the bytes, no copy, release once.
+func (s *copyCountingStream) SendDatagramOwned(buffer *buf.Buffer) error {
+	s.access.Lock()
+	s.ownedCalls++
+	if payload := buffer.Bytes(); len(payload) > 0 {
+		s.sink ^= payload[len(payload)-1]
+	}
+	s.access.Unlock()
+	buffer.Release()
+	return nil
+}
+
+func (s *copyCountingStream) stats() (copies, ownedCalls, legacyCalls int) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.copies, s.ownedCalls, s.legacyCalls
+}
+
+// BenchmarkDataplaneOutboundSendPath compares the copying and owned send paths over the real
+// production entry point, at every packet size that matters.
+//
+// # What the two sub-benchmarks differ by
+//
+// Nothing except the send call. Both drive Client.WritePacketBuffers with the same pooled buffers,
+// the same routing and the same context-ID prepend; `copying` uses the stream's SendDatagram and
+// `owned` uses SendDatagramOwned. The reported `payloadcopies/op` metric is the structural
+// measurement the task asks for: it must be 1 on the copying path and 0 on the owned one.
+func BenchmarkDataplaneOutboundSendPath(b *testing.B) {
+	for _, size := range benchPacketSizes {
+		for _, mode := range []string{"copying", "owned"} {
+			b.Run(benchSizeName(size)+"/"+mode, func(b *testing.B) {
+				packet := buildBenchIPv4Packet(size, 6,
+					netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("93.184.216.34"))
+				sink := &copyCountingStream{}
+				current := benchSession(sink, &benchDiscardStream{}, &benchHandler{})
+				// Select the path explicitly, so each sub-benchmark measures only its own.
+				if mode == "owned" {
+					current.ownedDatagrams = sink
+				} else {
+					current.ownedDatagrams = nil
+				}
+
+				b.ReportAllocs()
+				b.SetBytes(int64(size))
+				b.ResetTimer()
+				for b.Loop() {
+					buffers := newBenchPacketBuffers(1, packet)
+					if err := current.client.WritePacketBuffers(buffers, false); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StopTimer()
+
+				copies, ownedCalls, legacy := sink.stats()
+				if mode == "owned" {
+					if ownedCalls != b.N {
+						b.Fatalf("expected %d owned sends, got %d", b.N, ownedCalls)
+					}
+				} else if legacy != b.N {
+					b.Fatalf("expected %d copying sends, got %d", b.N, legacy)
+				}
+				b.ReportMetric(float64(copies)/float64(b.N), "payloadcopies/op")
+			})
+		}
+	}
+}
