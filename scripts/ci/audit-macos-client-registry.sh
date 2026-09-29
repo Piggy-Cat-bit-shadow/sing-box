@@ -544,6 +544,56 @@ else
   fail=1
 fi
 
+echo ""
+echo "== removed dependency: unused QUIC protocols must be ABSENT =="
+#
+# Hysteria2, TUIC and the v2ray QUIC transport were unregistered first and then
+# genuinely unlinked. The distinction matters and is why these are asserted on the
+# LINKED IMAGE rather than on the registry: an unregistered type still links if a
+# package import keeps it alive, which is exactly what was happening before.
+for pkg in protocol/hysteria2 protocol/tuic transport/v2rayquic; do
+  count="$(grep -c "sing-box/$pkg\." "$nm_out" || true)"
+  if [ "$count" -gt 0 ]; then
+    echo "FAIL: $pkg is linked ($count symbols); it is not part of this product" >&2
+    fail=1
+  else
+    echo "PASS: $pkg absent"
+  fi
+done
+
+echo ""
+echo "== removed dependency: CLI-only packages must be ABSENT =="
+#
+# The geosite/geoip/maxminddb/adguard-converter trees existed only to serve CLI
+# commands this product does not ship, and are now excluded by build constraint.
+#
+# `schema` is deliberately NOT listed: option structs implement DescribeSchema, so it
+# is a runtime dependency even though the `schema` COMMAND is gone. Listing it would
+# assert a removal that should not happen.
+for pkg in common/geosite maxminddb-golang convertor/adguard; do
+  count="$(grep -c "$pkg" "$nm_out" || true)"
+  if [ "$count" -gt 0 ]; then
+    echo "FAIL: $pkg is linked ($count symbols); it served only removed CLI tooling" >&2
+    fail=1
+  else
+    echo "PASS: $pkg absent"
+  fi
+done
+
+echo ""
+echo "== runtime rule-set infrastructure must be PRESENT =="
+#
+# The counterweight to the checks above. Asserting only removals would let a future
+# trim delete common/srs and still pass, while silently breaking remote rule-sets --
+# a core production capability.
+srs_symbols="$(grep -c "sing-box/common/srs\." "$nm_out" || true)"
+if [ "$srs_symbols" -gt 0 ]; then
+  echo "PASS: common/srs is linked ($srs_symbols symbols); runtime rule-sets work"
+else
+  echo "FAIL: common/srs has no symbols; remote rule-sets would not parse" >&2
+  fail=1
+fi
+
 echo "== removed feature: LXD daemon package must be ABSENT =="
 #
 # The LXD daemon and the `sing-box lxd` subcommand were removed from this fork, so
