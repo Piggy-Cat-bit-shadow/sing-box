@@ -102,9 +102,22 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 	// The server's stream count is a fact about this code: every request that reached the
 	// server, cancelled or not, opened exactly one stream, and all of them shared one
 	// connection. That is checkable regardless of what else is running.
+	//
+	// The stream count is a RANGE rather than an exact number, and the reason is worth
+	// stating. A request that is cancelled can lose a genuine race against stream creation:
+	// under -race on a loaded machine, the cancellation occasionally lands before the stream
+	// is opened, so that request never reaches the server at all. Observed once in CI as 24
+	// against 25. Asserting equality would therefore be asserting that a race never happens,
+	// which is not something this test can promise -- or should.
+	//
+	// What IS checkable is that no request opened more than one stream and that cancellation
+	// did not multiply connections. An implementation that retried a cancelled request, or
+	// reconnected, would break both.
 	const requestCount = 25
-	require.Equal(t, requestCount, server.streamCount(),
-		"every cancelled request must still have opened exactly one stream on the shared connection")
+	require.LessOrEqual(t, server.streamCount(), requestCount,
+		"no cancelled request may open more than one stream; a retry would show up here")
+	require.GreaterOrEqual(t, server.streamCount(), requestCount-2,
+		"almost every request must have reached the server; a much lower count would mean cancellation is discarding requests rather than cancelling them")
 	require.Equal(t, 1, server.connectionCount(),
 		"cancellation must never open a second connection; the tunnel depends on there being only one")
 
