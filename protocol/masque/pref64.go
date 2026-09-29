@@ -46,16 +46,13 @@ type pref64Store struct {
 //
 // An EMPTY capsule is a WITHDRAWAL, not a no-op: draft-06 §4.2 says "An empty PREF64 capsule
 // invalidates any previously received NAT64 Prefixes", which is why an empty non-nil slice is
-// meaningful and distinct from publishing nothing at all.
+// meaningful and distinct from publishing nothing at all. A withdrawal arrives as an empty
+// prefix list through this same call, so no separate clear path exists -- and none should, since
+// two ways to express the same state is how they drift apart.
 func (s *pref64Store) publish(prefixes []netip.Prefix) {
 	s.access.Lock()
 	defer s.access.Unlock()
 	s.state = &pref64State{prefixes: append([]netip.Prefix(nil), prefixes...)}
-}
-
-// clear withdraws all prefixes.
-func (s *pref64Store) clear() {
-	s.publish(nil)
 }
 
 // snapshot returns the current prefix set, which the caller must not modify.
