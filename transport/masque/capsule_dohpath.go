@@ -2,6 +2,7 @@ package masque
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -56,6 +57,13 @@ const dohPathVariable = "dns"
 func ExpandDohPathForPost(template string) (string, error) {
 	if template == "" {
 		return "", E.New("dohpath is empty")
+	}
+	// RFC 9461 §5 defines dohpath as a URI Template, and a URI Template is a sequence of
+	// characters: invalid UTF-8 cannot be one. Checking explicitly is better than relying on
+	// string([]byte) to produce something that merely looks like text, because the resulting
+	// request path would be a byte sequence no conforming server wrote.
+	if !utf8.ValidString(template) {
+		return "", E.New("dohpath is not valid UTF-8")
 	}
 	if !DohPathIsRelative(template) {
 		return "", E.New("dohpath must be a relative URI Template, got ", template)
@@ -161,7 +169,11 @@ func stripTemplateExpressions(template string) (string, error) {
 			if end < 0 {
 				return "", E.New("dohpath has an unterminated expression: ", template)
 			}
-			// Skip the whole expression, braces included: no variables are defined.
+			expression := template[index+1 : index+end]
+			if err := validateTemplateExpression(expression, template); err != nil {
+				return "", err
+			}
+			// Valid, so the whole expression expands to nothing and is dropped.
 			index += end
 		case '}':
 			return "", E.New("dohpath has a closing brace with no opening brace: ", template)
@@ -170,4 +182,104 @@ func stripTemplateExpressions(template string) (string, error) {
 		}
 	}
 	return builder.String(), nil
+}
+
+// validateTemplateExpression checks one expression against the supported subset.
+//
+// # The subset, stated rather than approximated
+//
+// RFC 6570 is large and this client needs exactly one of its behaviours: expanding a DoH template
+// with NO variables defined, as RFC 8484 §4.1 specifies for POST. Rather than accept whatever
+// looks brace-shaped, the parser recognises a strict subset and refuses the rest, so an
+// advertisement it cannot interpret is reported instead of half-understood.
+//
+// Supported, because a DoH server legitimately uses them and they are unambiguous:
+//
+//	{dns}                  simple expansion
+//	{?dns}                 form-style query expansion -- the draft's example
+//	{&dns}                 form-style continuation
+//	{/dns} {.dns} {;dns}   reserved-path and path-parameter expansions
+//	{dns,other}            several names in one expression
+//
+// Refused:
+//
+//	{+dns} {#dns}          reserved-character handling, which changes the path if got wrong
+//	{}                     an empty expression
+//	{{dns}}                a nested brace
+//	unterminated or stray braces
+//	{dns:3} {dns*}         modifiers that alter the produced value
+//	an invalid variable name
+//
+// # Why refusing beats guessing
+//
+// Expansion with no variables defined deletes the expression, so a parser that accepted anything
+// brace-shaped would produce a plausible path from a template it did not understand. The result
+// is a request to the right origin and the wrong resource, surfacing as a DNS failure far from
+// its cause.
+func validateTemplateExpression(expression string, template string) error {
+	if expression == "" {
+		return E.New("dohpath has an empty expression: ", template)
+	}
+	if strings.ContainsAny(expression, "{}") {
+		return E.New("dohpath expression contains a brace: ", expression)
+	}
+	body := expression
+	if strings.IndexByte("+#./;?&", body[0]) >= 0 {
+		if body[0] == '+' || body[0] == '#' {
+			return E.New("dohpath uses the unsupported operator ", string(body[0]), ": ", template)
+		}
+		body = body[1:]
+	}
+	if body == "" {
+		return E.New("dohpath expression names no variable: ", expression)
+	}
+	for _, name := range strings.Split(body, ",") {
+		if strings.ContainsAny(name, "*:") {
+			return E.New("dohpath uses an unsupported modifier in expression ", expression)
+		}
+		if !isValidTemplateVariableName(name) {
+			return E.New("dohpath has an invalid variable name ", name, " in expression ", expression)
+		}
+	}
+	return nil
+}
+
+// isValidTemplateVariableName reports whether a name matches RFC 6570 section 2.3: a varname is
+// a dot-separated sequence of varchar, where varchar is ALPHA / DIGIT / "_" / pct-encoded.
+func isValidTemplateVariableName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index := 0; index < len(name); index++ {
+		character := name[index]
+		switch {
+		case character >= 'a' && character <= 'z',
+			character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9',
+			character == '_', character == '.':
+			continue
+		case character == '%':
+			if index+2 >= len(name) || !isHexDigit(name[index+1]) || !isHexDigit(name[index+2]) {
+				return false
+			}
+			index += 2
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isHexDigit reports whether a byte is a hexadecimal digit.
+func isHexDigit(character byte) bool {
+	switch {
+	case character >= '0' && character <= '9':
+		return true
+	case character >= 'a' && character <= 'f':
+		return true
+	case character >= 'A' && character <= 'F':
+		return true
+	default:
+		return false
+	}
 }

@@ -673,6 +673,30 @@ func svcbEdgeCaseSeeds() [][]byte {
 	seeds = append(seeds, configuration(svcParam(7, []byte("dns-query{?dns}")), ""))
 	// A dohpath with an unterminated expression.
 	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{?dns")), ""))
+	// A h2-only resolver carrying a dohpath: it must not be given an HTTP/3 request.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '2'}), svcParam(7, []byte("/dns-query{?dns}"))...), ""))
+	// An h3 resolver carrying no dohpath: there is no resource to POST to.
+	seeds = append(seeds, configuration(svcParam(1, []byte{0x02, 'h', '3'}), ""))
+	// A non-default port alongside a dohpath, which must be part of the origin.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '3'}),
+			append(svcParam(3, []byte{0x20, 0xFB}), svcParam(7, []byte("/dns-query{?dns}"))...)...), ""))
+	// mandatory listing ECH: recognised, but not implemented, so it cannot be honoured.
+	mandatoryECH := append(svcParam(0, []byte{0x00, 0x05}), svcParam(5, []byte{0x01, 0x02})...)
+	mandatoryECH = append(svcParam(1, []byte{0x02, 'h', '3'}), mandatoryECH...)
+	seeds = append(seeds, configuration(mandatoryECH, ""))
+	// A dohpath that is not valid UTF-8.
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query\x80{?dns}")), ""))
+	// Malformed URI Template expressions: nested braces, an empty expression, and an
+	// unsupported operator.
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{{dns}}")), ""))
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{}")), ""))
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{+dns}")), ""))
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{?dns:3}")), ""))
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{?dns*}")), ""))
+	// An absolute dohpath must not be accepted as a relative template.
+	seeds = append(seeds, configuration(svcParam(7, []byte("//evil.example/dns-query{?dns}")), ""))
 	return seeds
 }
 
