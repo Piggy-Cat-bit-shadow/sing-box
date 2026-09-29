@@ -128,7 +128,7 @@ func TestInnerLookupUsesAssignedResolverWhenNoExplicitOneIsConfigured(t *testing
 
 	router := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("2001:db8::1")}}
 	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{})
-	assigned.apply(dohAssignment(t, "", "2001:db8::53"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "", "2001:db8::53")), nil)
 
 	addresses, err := endpoint.lookupInner(context.Background(), "inner.example.test")
 	require.NoError(t, err)
@@ -151,7 +151,7 @@ func TestExplicitInnerResolverWinsOverTheAssignment(t *testing.T) {
 	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{Transport: explicit})
 	// An assignment exists and is active, so this is a real contest rather than a
 	// comparison against nothing.
-	assigned.apply(dohAssignment(t, "", "2001:db8::53"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "", "2001:db8::53")), nil)
 	require.True(t, assigned.active())
 
 	_, err := endpoint.lookupInner(context.Background(), "inner.example.test")
@@ -189,7 +189,7 @@ func TestWithdrawnAssignmentFallsBackToOrdinaryRules(t *testing.T) {
 
 	router := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("2001:db8::4")}}
 	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{})
-	assigned.apply(dohAssignment(t, "", "2001:db8::53"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "", "2001:db8::53")), nil)
 
 	_, err := endpoint.lookupInner(context.Background(), "before.example.test")
 	require.NoError(t, err)
@@ -221,7 +221,7 @@ func TestAssignedResolverIsNeverUsedForBootstrap(t *testing.T) {
 	bootstrapOptions := adapter.DNSQueryOptions{}
 	router := &recordingRouter{}
 	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{})
-	assigned.apply(dohAssignment(t, "", "2001:db8::53"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "", "2001:db8::53")), nil)
 
 	// The endpoint's bootstrap options are a separate field, and an assignment must not
 	// reach into it. Reading it here is what would notice if a future change wired the
@@ -247,13 +247,13 @@ func TestAssignedResolverEnvironmentChangesWithEachAssignment(t *testing.T) {
 	router := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("2001:db8::5")}}
 	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{})
 
-	assigned.apply(dohAssignment(t, "https://dns.example.test/dns-query", "2001:db8::53"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "https://dns.example.test/dns-query", "2001:db8::53")), nil)
 	_, err := endpoint.lookupInner(context.Background(), "first.example.test")
 	require.NoError(t, err)
 	firstEnvironment := router.environmentAt(0)
 
 	// A different nameserver, so a cached answer must not carry over.
-	assigned.apply(dohAssignment(t, "https://dns.example.test/dns-query", "2001:db8::54"), nil)
+	assigned.apply(oneConfiguration(dohAssignment(t, "https://dns.example.test/dns-query", "2001:db8::54")), nil)
 	_, err = endpoint.lookupInner(context.Background(), "second.example.test")
 	require.NoError(t, err)
 	secondEnvironment := router.environmentAt(1)
@@ -264,13 +264,14 @@ func TestAssignedResolverEnvironmentChangesWithEachAssignment(t *testing.T) {
 		"a new assignment must produce a new environment so the cache cannot serve the previous resolver's answer")
 }
 
-// TestUnreachableAssignmentIsRefusedWholesale is the leak test at the endpoint level.
+// TestUnreachableAssignmentNeverInstallsTheUnreachableResolver is the leak test at the
+// endpoint level.
 //
 // A nameserver outside the advertised routes would be reached by the ordinary routing table,
-// which is exactly the cleartext leak accepting an assignment is meant to avoid. A
-// configuration with an unreachable nameserver must be refused AS A WHOLE rather than
-// partially installed, because a partial install would answer some queries through the
-// tunnel and send the rest somewhere else -- the worst of both.
+// which is exactly the cleartext leak accepting an assignment is meant to avoid. The
+// reachability decision is per RESOLVER, so the unreachable one is dropped while a reachable
+// sibling in the same configuration still answers -- but the unreachable address must never
+// appear in the installed state.
 func TestUnreachableAssignmentIsRefusedWholesale(t *testing.T) {
 	t.Parallel()
 
@@ -296,13 +297,24 @@ func TestUnreachableAssignmentIsRefusedWholesale(t *testing.T) {
 	}
 	endpoint.installAssignedDNS(configuration)
 
-	require.False(t, assigned.active(),
-		"a configuration containing an unreachable nameserver must be refused entirely, not partially installed")
+	require.True(t, assigned.active(),
+		"the reachable resolver in the configuration must still be installed")
+
+	state := assigned.state.Load()
+	require.NotNil(t, state)
+	for _, configuration_ := range state.configurations {
+		for _, resolver := range configuration_.resolvers {
+			for _, address := range resolver.addresses {
+				require.NotEqual(t, "2001:dead::53", address.String(),
+					"the unreachable address must never be installed: a query to it would leave the tunnel in cleartext")
+			}
+		}
+	}
 
 	_, err := endpoint.lookupInner(context.Background(), "leak.example.test")
 	require.NoError(t, err)
-	require.Nil(t, router.transportAt(0),
-		"with the assignment refused, inner lookups must use the ordinary rules")
+	require.Same(t, assigned, router.transportAt(0),
+		"inner lookups must still use the assigned resolver, via its reachable member")
 }
 
 // TestReachableAssignmentIsInstalled proves the previous test's negative is not vacuous:
@@ -398,7 +410,7 @@ func TestServerEmittedAssignmentDrivesTheClientResolver(t *testing.T) {
 	// And the dohpath must have survived into the transport, because it is what selects
 	// same-connection DoH. If it were lost, queries would still be answered over UDP and
 	// nothing would fail -- the coalescing would just silently not happen.
-	require.Contains(t, assigned.Environment(), "dohpath=/dns-query{?dns}",
+	require.Contains(t, assigned.Environment(), "cfg0.dohpath=/dns-query{?dns}",
 		"the dohpath must reach the transport so DoH is selected rather than plain UDP")
 
 	// The queries must travel through the tunnel device, not anywhere else.

@@ -63,9 +63,10 @@ type assignedDNSTransport struct {
 	// state is the immutable, published view of the current assignment.
 	state atomic.Pointer[assignedDNSState]
 
-	// generation identifies the assignment currently in force, used by Environment so
-	// the DNS cache cannot serve a response resolved by a previous nameserver.
-	generation atomic.Uint64
+	// nextGeneration allocates the generation stamped into each published snapshot. The
+	// value itself lives INSIDE the state, so a reader can never observe a resolver list
+	// and a generation that disagree.
+	nextGeneration uint64
 
 	// dohClient issues DoH requests on the SAME HTTP/3 connection the CONNECT-IP tunnel
 	// uses. It is nil until the endpoint publishes one, and the DoH path is only taken
@@ -84,22 +85,6 @@ type assignedDNSTransport struct {
 // the DoH path can be tested with a double that counts connections.
 type dohRoundTripper interface {
 	RoundTripHTTP3(ctx context.Context, request *http.Request) (*http.Response, error)
-}
-
-// assignedDNSState is one assignment's worth of immutable resolver configuration.
-type assignedDNSState struct {
-	// nameservers in the order the draft's service priorities expressed.
-	nameservers []netip.Addr
-	// TLSName is the authentication domain, when the resolver is encrypted.
-	tlsName string
-	// DoHPath is the SVCB dohpath template, when one was provided.
-	dohPath string
-	// UseTLS reports whether the encrypted transports were advertised.
-	useTLS bool
-	// Port overrides the default port when the SVCB "port" parameter was present.
-	port uint16
-	// PREF64 is the NAT64 prefix set in force at this generation.
-	pref64 []netip.Prefix
 }
 
 const (
@@ -133,87 +118,133 @@ func newAssignedDNSTransport(logger logger.ContextLogger, transportDialer N.Dial
 // configuration type: the transport exists only as the endpoint's internal resolver.
 const assignedDNSType = "masque-assigned"
 
-// apply installs a new assignment atomically and bumps the generation.
+// apply installs a new assignment atomically.
 //
-// The caller has already validated reachability. An empty nameserver list CLEARS the
-// resolver, which is how a withdrawn assignment is represented rather than leaving the
-// previous one installed.
-func (t *assignedDNSTransport) apply(configuration masque.DNSConfiguration, pref64 []netip.Prefix) {
-	state := &assignedDNSState{
-		dohPath: serviceParameterString(configuration, dnsmessage.SVCParamKey(9)), // dohpath
-		pref64:  append([]netip.Prefix(nil), pref64...),
-	}
-	if port := serviceParameterUint16(configuration, dnsmessage.SVCParamKey(3)); port != 0 {
-		state.port = port
-	}
-	for _, nameserver := range configuration.Nameservers {
-		state.nameservers = append(state.nameservers, nameserver.IPv4Addresses...)
-		state.nameservers = append(state.nameservers, nameserver.IPv6Addresses...)
-		if nameserver.AuthenticationDomainName != "" {
-			state.tlsName = nameserver.AuthenticationDomainName
-			if alpn, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamALPN]; loaded && len(alpn) > 0 {
-				// An ALPN list means the encrypted transports were advertised.
-				state.useTLS = true
-			}
-		}
-	}
+// The whole assignment is published as ONE immutable snapshot, and the generation is
+// allocated inside it. Storing the state and bumping a separate counter were two
+// independent atomic operations, so a reader could observe the new resolver list alongside
+// the old generation -- and since Environment() keys the DNS cache on the generation, that
+// torn pair would let an answer be attributed to an assignment that did not produce it.
+//
+// An assignment with no configurations CLEARS the resolver, which is how a withdrawal is
+// represented rather than leaving the previous one installed.
+func (t *assignedDNSTransport) apply(configurations []masque.DNSConfiguration, pref64 []netip.Prefix) {
 	t.access.Lock()
-	t.state.Store(state)
-	t.generation.Add(1)
+	// The generation is allocated and published together, so a reader can never observe the
+	// new resolver list with the previous generation.
+	t.nextGeneration++
+	t.state.Store(buildAssignedDNSState(configurations, pref64, t.nextGeneration))
 	t.access.Unlock()
 }
 
 // clear removes the assignment.
 func (t *assignedDNSTransport) clear() {
-	t.access.Lock()
-	t.state.Store(&assignedDNSState{})
-	t.generation.Add(1)
-	t.access.Unlock()
+	t.apply(nil, nil)
 }
 
-// active reports whether an assignment with a usable nameserver is in force.
+// active reports whether an assignment with a usable resolver is in force.
 func (t *assignedDNSTransport) active() bool {
 	state := t.state.Load()
-	return state != nil && len(state.nameservers) > 0
+	return state != nil && state.hasResolvers()
 }
 
 // ServerAddresses implements adapter.DNSTransportWithConfiguration.
+//
+// Every address of every resolver is reported, across configurations, because the framework
+// asks one question ("which servers does this transport talk to?") and the answer is the
+// union. Per-query routing uses selectForName, not this list.
 func (t *assignedDNSTransport) ServerAddresses() []netip.Addr {
 	state := t.state.Load()
 	if state == nil {
 		return nil
 	}
-	return state.nameservers
+	var addresses []netip.Addr
+	for _, endpoint := range state.allEndpoints() {
+		addresses = append(addresses, endpoint.addresses...)
+	}
+	return addresses
 }
 
 // SearchDomains implements adapter.DNSTransportWithConfiguration.
+//
+// # Why this is not nil any more
+//
+// It used to return nil unconditionally while SearchDomains was parsed, stored and
+// documented as supported -- state that existed and was never read.
+//
+// The framework's interface is static: it asks for the search domains of THIS TRANSPORT,
+// not of one configuration. The assignment can legitimately carry different search domains
+// per configuration, so the honest view is the union, in configuration order, deduplicated.
+// Reporting one configuration's list would silently impose it on names belonging to
+// another, and reporting nothing would discard what the server sent.
 func (t *assignedDNSTransport) SearchDomains() []string {
-	return nil
+	state := t.state.Load()
+	if state == nil {
+		return nil
+	}
+	var domains []string
+	seen := make(map[string]struct{})
+	for _, configuration := range state.configurations {
+		for _, domain := range configuration.searchDomains {
+			if _, loaded := seen[domain]; loaded {
+				continue
+			}
+			seen[domain] = struct{}{}
+			domains = append(domains, domain)
+		}
+	}
+	return domains
 }
 
 // Environment implements adapter.DNSTransportWithEnvironment.
 //
-// The DNS cache keys on this value, so including the assignment generation plus the
-// resolver identity means a response resolved by one nameserver can never be served
-// after the server installs another. Without it the cache would happily answer from
-// the previous resolver's data, which is both wrong and a privacy problem: the whole
-// reason for the assignment is that a particular resolver should answer.
+// The DNS cache keys on this value, so it must change whenever the resolver that would
+// answer changes. It reports the generation, every resolver's own identity, and the
+// configuration boundaries, so two assignments that differ in ANY of those produce
+// different cache keys.
+//
+// The metadata is reported PER RESOLVER rather than one value for the whole assignment. A
+// single `auth=` line could only ever describe one nameserver, and reporting the last one
+// seen would make two different assignments -- one where resolver A authenticates as
+// a.example and one where it authenticates as b.example -- look like the same key.
 func (t *assignedDNSTransport) Environment() []string {
 	state := t.state.Load()
 	if state == nil {
 		return nil
 	}
-	environment := make([]string, 0, 4+len(state.nameservers))
+	environment := make([]string, 0, 8)
 	environment = append(environment, "masque-assigned")
-	environment = append(environment, "generation="+strconv.FormatUint(t.generation.Load(), 10))
-	if state.tlsName != "" {
-		environment = append(environment, "auth="+state.tlsName)
+	environment = append(environment, "generation="+strconv.FormatUint(state.generation, 10))
+	if len(state.pref64) > 0 {
+		// PREF64 is reported because it is part of the assignment's identity even though it
+		// does not yet participate in resolution; a change to it is still a change the
+		// cache must not conflate with the previous assignment.
+		for _, prefix := range state.pref64 {
+			environment = append(environment, "pref64="+prefix.String())
+		}
 	}
-	if state.dohPath != "" {
-		environment = append(environment, "dohpath="+state.dohPath)
-	}
-	for _, address := range state.nameservers {
-		environment = append(environment, "ns="+address.String())
+	for index, configuration := range state.configurations {
+		prefix := "cfg" + strconv.Itoa(index)
+		for _, domain := range configuration.internalDomains {
+			environment = append(environment, prefix+".internal="+domain)
+		}
+		for _, domain := range configuration.searchDomains {
+			environment = append(environment, prefix+".search="+domain)
+		}
+		for _, endpoint := range configuration.resolvers {
+			for _, address := range endpoint.addresses {
+				environment = append(environment, prefix+".ns="+address.String())
+			}
+			if endpoint.authenticationDomainName != "" {
+				environment = append(environment, prefix+".auth="+endpoint.authenticationDomainName)
+			}
+			if endpoint.dohPath != "" {
+				environment = append(environment, prefix+".dohpath="+endpoint.dohPath)
+			}
+			if endpoint.port != 0 {
+				environment = append(environment, prefix+".port="+strconv.Itoa(int(endpoint.port)))
+			}
+		}
 	}
 	return environment
 }
@@ -224,28 +255,59 @@ func (t *assignedDNSTransport) Close() error { return nil }
 
 func (t *assignedDNSTransport) Reset() {}
 
-// Exchange sends one query through the tunnel.
+// Exchange sends one query through the tunnel, to the resolver responsible for its name.
+//
+// # Configuration selection before resolver selection
+//
+// The name decides WHICH configuration answers; the priority orders the resolvers within
+// that configuration. The previous implementation skipped the first step entirely and
+// ranked every resolver in the assignment against every other, so a resolver for
+// `corp.example.` could answer a public name purely because it had a lower priority number.
+//
+// # Transport capability is binding
+//
+// A resolver that advertises only encrypted transports must not be reached in cleartext.
+// When `no-default-alpn` is present the server has explicitly said the default transport is
+// not offered, so falling back to plain UDP/53 would violate the assignment rather than
+// degrade gracefully. In that case an unsupported transport is a FAILURE for that resolver,
+// and the next resolver in the same configuration is tried. If none can be used, the query
+// fails closed.
 func (t *assignedDNSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	state := t.state.Load()
-	if state == nil || len(state.nameservers) == 0 {
+	if state == nil || !state.hasResolvers() {
 		// Fail closed. Returning a "no upstream" error rather than falling through to
 		// a host resolver is the entire point of this type.
 		return nil, E.New("no MASQUE DNS assignment in effect")
 	}
+	var name string
+	if len(message.Question) > 0 {
+		name = message.Question[0].Name
+	}
+	lookup := state.selectForName(name)
+	if !lookup.found {
+		// The assignment carries configurations, but none of them covers this name and
+		// there is no default. Refusing is correct: answering from a resolver that never
+		// claimed the name is exactly the misrouting this model exists to prevent.
+		return nil, E.New("no assigned DNS configuration covers ", name)
+	}
+
 	packed, err := message.Pack()
 	if err != nil {
 		return nil, E.Cause(err, "pack DNS query")
 	}
+	// Resolvers of the CHOSEN configuration, by priority, so a resolver that cannot be used
+	// falls back within its own configuration instead of jumping to an unrelated one.
 	var lastErr error
-	for _, address := range state.nameservers {
-		response, exchangeErr := t.exchangeWith(ctx, state, address, packed)
+	for _, endpoint := range lookup.configuration.resolversByPreference() {
+		response, exchangeErr := t.exchangeWith(ctx, endpoint, packed)
 		if exchangeErr == nil {
 			return response, nil
 		}
 		lastErr = exchangeErr
-		t.logger.DebugContext(ctx, "assigned DNS nameserver ", address, " failed: ", exchangeErr)
+		t.logger.DebugContext(ctx, "assigned DNS resolver ",
+			endpoint.describe(), " failed: ", exchangeErr)
 	}
-	return nil, E.Cause(lastErr, "all assigned DNS nameservers failed")
+	return nil, E.Cause(lastErr, "all assigned DNS resolvers for ", name, " failed")
 }
 
 func (t *assignedDNSTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
@@ -269,48 +331,200 @@ func (t *assignedDNSTransport) ExchangeAsync(ctx context.Context, message *mDNS.
 // separate transport with its own certificate story. Claiming to support a transport that
 // cannot actually be completed would mean silently ignoring the ALPN parameters, which is
 // worse than refusing -- and the UDP path is always available and always inside the tunnel.
-func (t *assignedDNSTransport) exchangeWith(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
-	if state.dohPath != "" {
-		if response, err := t.exchangeDoH(ctx, state, address, query); err == nil {
-			return response, nil
-		} else if t.dohClient == nil {
-			// No same-connection HTTP/3 client yet. Fall through to UDP so the query is
-			// still answered inside the tunnel; the event is logged because it means the
-			// coalescing the draft asks for is not happening.
-			t.logger.DebugContext(ctx, "assigned DNS DoH unavailable, using UDP through tunnel: ", err)
-		} else {
-			return nil, err
+func (t *assignedDNSTransport) exchangeWith(ctx context.Context, endpoint assignedResolverEndpoint, query []byte) (*mDNS.Msg, error) {
+	transport, err := endpoint.selectTransport(t.dohClient != nil)
+	if err != nil {
+		// The resolver's advertised capabilities cannot be honoured. This is returned
+		// rather than worked around: see selectTransport for why silently downgrading is
+		// not an option when no-default-alpn is present.
+		return nil, err
+	}
+	t.logger.DebugContext(ctx, "assigned DNS resolver ", endpoint.describe(),
+		" selected transport ", transport)
+	switch transport {
+	case assignedTransportDoH:
+		return t.exchangeDoH(ctx, endpoint, query)
+	case assignedTransportPlainUDP:
+		return t.exchangeUDP(ctx, endpoint, query)
+	default:
+		return nil, E.New("assigned DNS resolver ", endpoint.describe(),
+			": transport ", transport, " is not implemented by this client")
+	}
+}
+
+// assignedTransport names a DNS transport this client can actually use.
+type assignedTransport string
+
+const (
+	assignedTransportPlainUDP assignedTransport = "udp"
+	assignedTransportDoH      assignedTransport = "doh"
+	// assignedTransportDoT is recognised and deliberately NOT implemented. Naming it lets
+	// the client report "this resolver wants DoT and I cannot do DoT" instead of pretending
+	// the resolver has no usable transport at all, which would be a misleading error.
+	assignedTransportDoT assignedTransport = "dot"
+)
+
+// selectTransport decides how a query reaches this resolver.
+//
+// # The rule
+//
+//	dohpath advertised, same-connection DoH available   -> DoH
+//	no-default-alpn present                             -> encrypted only (DoH or nothing)
+//	otherwise                                           -> DoH when available, else plain UDP
+//
+// # Why no-default-alpn is binding rather than advisory
+//
+// The parameter means "do not use the default transport for this ALPN", and its whole
+// purpose is to tell a client that unencrypted DNS is NOT offered. Falling back to plain
+// UDP/53 in that case does not degrade gracefully; it sends the query in cleartext to a
+// server that explicitly said not to, which is a privacy failure the parameter exists to
+// prevent. So when it is present and the advertised transports cannot be used, this returns
+// an error and the caller tries the next resolver in the same configuration.
+//
+// # Why DoT is refused rather than attempted
+//
+// This client has no DoT transport. Reporting that plainly is better than silently using
+// something else, because the resolver's operator chose DoT deliberately. Implementing DoT
+// is out of scope for this round; refusing is not the same as ignoring.
+//
+// sameH3DoHAvailable reports whether the same-connection DoH path can be used at all. It is
+// passed in rather than read here so the decision is a pure function of the endpoint's
+// metadata plus one boolean, which is what makes it directly testable.
+func (e assignedResolverEndpoint) selectTransport(sameH3DoHAvailable bool) (assignedTransport, error) {
+	if len(e.addresses) == 0 {
+		return "", E.New("assigned DNS resolver ", e.describe(), " has no address")
+	}
+
+	// 1. The best available transport: same-connection DoH.
+	if e.dohPath != "" && e.authenticationDomainName != "" && sameH3DoHAvailable {
+		return assignedTransportDoH, nil
+	}
+
+	// 2. Whether the DEFAULT transport is still permitted.
+	//
+	// This is decided by no-default-alpn alone. An ALPN list without it names transports the
+	// resolver ALSO offers; it does not withdraw unencrypted DNS. Reading it as a
+	// restriction would refuse resolvers that explicitly still allow the default, which
+	// would break plain DNS for no reason.
+	if !e.noDefaultALPN {
+		return assignedTransportPlainUDP, nil
+	}
+
+	// 3. Encrypted-only. Nothing may fall through to cleartext.
+	if len(e.alpn) == 0 {
+		// Encrypted-only was demanded but no protocol was named, so there is nothing to
+		// check the client against. Refuse rather than assume.
+		return "", E.New("assigned DNS resolver ", e.describe(),
+			" requires no-default-alpn but advertises no ALPN")
+	}
+	if e.offersDoH() {
+		if e.dohPath == "" {
+			return "", E.New("assigned DNS resolver ", e.describe(),
+				" offers DoH but advertises no dohpath, so there is no resource to query")
+		}
+		if e.authenticationDomainName == "" {
+			return "", E.New("assigned DNS resolver ", e.describe(),
+				" offers DoH but advertises no authentication domain name")
+		}
+		// DoH is advertised, has a path and a name, but the same-connection client is not
+		// available yet. That is a transient state rather than a capability gap.
+		return "", E.New("assigned DNS resolver ", e.describe(),
+			" offers DoH but no same-connection HTTP/3 client is available")
+	}
+	if e.offersDoT() {
+		return "", E.New("assigned DNS resolver ", e.describe(),
+			" offers DoT, which this client does not implement")
+	}
+	return "", E.New("assigned DNS resolver ", e.describe(),
+		" advertises ALPN ", e.alpn, " with no-default-alpn; none of those transports can be used")
+}
+
+// offersDoH reports whether the advertised ALPN list includes a DoH protocol.
+func (e assignedResolverEndpoint) offersDoH() bool {
+	for _, protocol := range e.alpn {
+		if protocol == "h2" || protocol == "h3" {
+			return true
 		}
 	}
-	return t.exchangeUDP(ctx, state, address, query)
+	return false
+}
+
+// offersDoT reports whether the advertised ALPN list includes DoT.
+func (e assignedResolverEndpoint) offersDoT() bool {
+	for _, protocol := range e.alpn {
+		if protocol == "dot" {
+			return true
+		}
+	}
+	return false
+}
+
+// describe renders a resolver for logs and errors. It reports the metadata that belongs to
+// THIS resolver, which is what makes a misrouting bug legible in a log.
+func (e assignedResolverEndpoint) describe() string {
+	description := ""
+	if len(e.addresses) > 0 {
+		description = e.addresses[0].String()
+	} else if e.authenticationDomainName != "" {
+		description = e.authenticationDomainName
+	} else {
+		description = "<no address>"
+	}
+	if e.authenticationDomainName != "" {
+		description += " (" + e.authenticationDomainName + ")"
+	}
+	return description
+}
+
+// dnsPort is the port plain DNS should be sent to.
+func (e assignedResolverEndpoint) dnsPort() uint16 {
+	if e.port != 0 {
+		return e.port
+	}
+	return assignedDNSDefaultPort
+}
+
+// dohPort is the port a DoH request should be addressed to.
+//
+// The dohpath is an HTTP resource, so its default is the HTTPS port; using the plain DNS
+// default of 53 would send an HTTPS request to the DNS port.
+func (e assignedResolverEndpoint) dohPort() uint16 {
+	if e.port != 0 {
+		return e.port
+	}
+	if e.dohPath != "" {
+		return 443
+	}
+	return 0
 }
 
 // exchangeDoH sends the query as an RFC 8484 POST on the endpoint's existing HTTP/3
 // connection.
 //
-// The request is addressed to the nameserver's authentication domain (its TLS name), which
-// is the origin the connection was authenticated for, and the path comes from the SVCB
-// dohpath template. Sending it anywhere else would either be refused by the same-origin
-// check or, worse, would be a cross-origin request riding on those credentials.
-func (t *assignedDNSTransport) exchangeDoH(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
+// EVERY value in the request comes from THIS resolver endpoint. Taking the authority from
+// one nameserver and the port or path from another would address the request to an origin
+// the connection was never authenticated for: the same-origin check would reject it at
+// best, and at worst a future relaxation would let a query be sent under credentials that
+// were never presented for that origin.
+func (t *assignedDNSTransport) exchangeDoH(ctx context.Context, endpoint assignedResolverEndpoint, query []byte) (*mDNS.Msg, error) {
 	roundTripper := t.dohClient
 	if roundTripper == nil {
 		return nil, E.New("no same-connection HTTP/3 client for DoH")
 	}
-	authority := state.tlsName
-	if authority == "" {
-		// No authentication domain was advertised, so there is no origin to name. The
-		// plain address is used instead, which the same-origin check then compares
-		// against the configured authority; it only succeeds when they coincide.
-		authority = address.String()
-		if port := state.dohPort(); port != 0 {
-			authority = netip.AddrPortFrom(address, port).String()
-		}
+	// selectTransport only routes here when an authentication domain is present, so this
+	// is a guard against a future caller rather than a reachable branch.
+	if endpoint.authenticationDomainName == "" {
+		return nil, E.New("assigned DNS resolver ", endpoint.describe(),
+			" cannot use DoH without an authentication domain name")
+	}
+	authority := endpoint.authenticationDomainName
+	if port := endpoint.dohPort(); port != 0 && port != 443 {
+		authority = joinAuthority(endpoint.authenticationDomainName, port)
 	}
 	requestURL := &url.URL{
 		Scheme: "https",
 		Host:   authority,
-		Path:   dohPathTemplate(state.dohPath),
+		Path:   dohPathTemplate(endpoint.dohPath),
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(query))
 	if err != nil {
@@ -333,9 +547,16 @@ func (t *assignedDNSTransport) exchangeDoH(ctx context.Context, state *assignedD
 		detail, _ := io.ReadAll(io.LimitReader(response.Body, maxDoHErrorBodySize))
 		return nil, E.New("DoH server returned ", response.Status, formatDoHErrorDetail(detail))
 	}
-	payload, err := io.ReadAll(io.LimitReader(response.Body, maxAssignedDNSMessageSize))
+	// One byte PAST the ceiling is read deliberately, so an oversized response is reported
+	// as oversized. Reading exactly the ceiling would silently truncate a larger message,
+	// and the resulting error would name the DNS decoder rather than the real problem.
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxAssignedDNSMessageSize+1))
 	if err != nil {
 		return nil, E.Cause(err, "read DoH response")
+	}
+	if len(payload) > maxAssignedDNSMessageSize {
+		return nil, E.New("DoH response exceeds ", maxAssignedDNSMessageSize,
+			" bytes; refusing to parse a possibly truncated message")
 	}
 	var message mDNS.Msg
 	if err = message.Unpack(payload); err != nil {
@@ -344,13 +565,21 @@ func (t *assignedDNSTransport) exchangeDoH(ctx context.Context, state *assignedD
 	return &message, nil
 }
 
-// exchangeUDP performs one query against one nameserver over plain DNS through the tunnel.
-func (t *assignedDNSTransport) exchangeUDP(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
-	port := state.port
-	if port == 0 {
-		port = assignedDNSDefaultPort
+// joinAuthority appends a port to a host, bracketing an IPv6 literal so the result is a
+// valid authority rather than one whose colons are ambiguous.
+func joinAuthority(host string, port uint16) string {
+	if parsed, err := netip.ParseAddr(host); err == nil && parsed.Is6() && !parsed.Is4In6() {
+		return "[" + host + "]:" + strconv.Itoa(int(port))
 	}
-	destination := M.SocksaddrFrom(address, port)
+	return host + ":" + strconv.Itoa(int(port))
+}
+
+// exchangeUDP performs one query against one nameserver over plain DNS through the tunnel.
+func (t *assignedDNSTransport) exchangeUDP(ctx context.Context, endpoint assignedResolverEndpoint, query []byte) (*mDNS.Msg, error) {
+	if len(endpoint.addresses) == 0 {
+		return nil, E.New("assigned DNS resolver ", endpoint.describe(), " has no address")
+	}
+	destination := M.SocksaddrFrom(endpoint.addresses[0], endpoint.dnsPort())
 
 	conn, err := t.dialer.DialContext(ctx, N.NetworkUDP, destination)
 	if err != nil {
@@ -383,19 +612,16 @@ func (t *assignedDNSTransport) exchangeUDP(ctx context.Context, state *assignedD
 	return &response, nil
 }
 
-// dohPort reports the port a DoH request should be addressed to.
-func (s *assignedDNSState) dohPort() uint16 {
-	if s.port != 0 {
-		return s.port
-	}
-	// The dohpath is an HTTP resource, so its default is the HTTPS port, not the DNS one.
-	if s.dohPath != "" {
-		return 443
-	}
-	return 0
-}
-
 // setDoHClient publishes the client used for same-connection DoH.
+//
+// It is called ONCE, from the constructor, before the transport can be reached by any
+// query: the endpoint publishes it immediately after building the HTTP client and before
+// the tunnel exists. The invariant is therefore that dohClient is immutable after
+// construction, and Exchange reads it without a lock.
+//
+// The read is still guarded by a nil check rather than by an assumption, because the field
+// is also legitimately nil for a caller that never sets it, and a query must fail closed in
+// that case rather than panic.
 func (t *assignedDNSTransport) setDoHClient(client dohRoundTripper) {
 	t.access.Lock()
 	t.dohClient = client

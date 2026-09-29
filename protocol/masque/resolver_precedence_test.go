@@ -147,12 +147,18 @@ func TestWithdrawnAssignmentClearsTheResolver(t *testing.T) {
 		"a withdrawn assignment must clear the resolver")
 }
 
-// TestPartialReachabilityRefusesTheWholeAssignment proves the assignment is accepted or
-// refused as a unit.
+// TestPartialReachabilityDropsOnlyTheUnreachableResolver pins the reachability rule.
 //
-// Installing only the reachable nameservers would answer some queries through the tunnel
-// and send the rest somewhere else, which is a leak that looks like success.
-func TestPartialReachabilityRefusesTheWholeAssignment(t *testing.T) {
+// The unit of the decision is the RESOLVER, not the assignment. Two resolvers in one
+// configuration are servers that answer the same questions, so dropping the one whose
+// address is outside the tunnel still leaves those questions answered -- by the other,
+// inside the tunnel. Refusing the whole configuration instead would discard a usable
+// resolver, and refusing the whole assignment would also discard every OTHER configuration,
+// including ones for domains that had nothing to do with the unreachable address.
+//
+// What must never happen is the unreachable resolver being INSTALLED, because its queries
+// would leave the tunnel in cleartext. That is what the second assertion checks.
+func TestPartialReachabilityDropsOnlyTheUnreachableResolver(t *testing.T) {
 	t.Parallel()
 
 	endpoint := testEndpointWithAssignment()
@@ -164,8 +170,36 @@ func TestPartialReachabilityRefusesTheWholeAssignment(t *testing.T) {
 
 	endpoint.installAssignedDNS(configuration)
 
+	require.True(t, endpoint.assignedDNS.active(),
+		"the reachable resolver in the configuration must still be installed")
+
+	state := endpoint.assignedDNS.state.Load()
+	require.NotNil(t, state)
+	require.Len(t, state.configurations, 1)
+	require.Len(t, state.configurations[0].resolvers, 1,
+		"only the unreachable resolver may be dropped")
+	require.Equal(t, netip.MustParseAddr("10.0.0.53"), state.configurations[0].resolvers[0].addresses[0],
+		"the resolver that remains must be the reachable one, never the public address")
+}
+
+// TestConfigurationWithNoReachableResolverIsDropped proves a configuration whose resolvers
+// are ALL unreachable is removed, along with the domains it claimed.
+//
+// Keeping the configuration with an empty resolver list would make it capture matching
+// names and then fail them, which is worse than letting a broader configuration answer.
+func TestConfigurationWithNoReachableResolverIsDropped(t *testing.T) {
+	t.Parallel()
+
+	endpoint := testEndpointWithAssignment()
+	configuration := reachableAssignment()
+	configuration.DNS.Configurations[0].Nameservers = []masque.DNSNameserver{
+		{ServicePriority: 1, IPv4Addresses: []netip.Addr{netip.MustParseAddr("8.8.8.8")}},
+	}
+
+	endpoint.installAssignedDNS(configuration)
+
 	require.False(t, endpoint.assignedDNS.active(),
-		"an assignment whose nameservers are only partially reachable must be refused whole")
+		"a configuration with no reachable resolver must be dropped")
 }
 
 // TestNameserverWithoutAddressIsNotReachable covers the nameserver-reachable-only-by-name

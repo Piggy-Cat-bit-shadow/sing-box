@@ -127,7 +127,7 @@ func TestAssignedTransportClearedAssignmentFailsClosed(t *testing.T) {
 
 	dialer := &recordingDialer{fail: true}
 	transport := testAssignedTransport(dialer)
-	transport.apply(testConfiguration(), nil)
+	transport.apply(oneConfiguration(testConfiguration()), nil)
 	require.True(t, transport.active())
 
 	transport.clear()
@@ -147,7 +147,7 @@ func TestAssignedTransportSendsThroughTheTunnel(t *testing.T) {
 	response := buildDNSResponse(t, "example.test.", netip.MustParseAddr("203.0.113.7"))
 	dialer := &recordingDialer{answer: response}
 	transport := testAssignedTransport(dialer)
-	transport.apply(testConfiguration(), nil)
+	transport.apply(oneConfiguration(testConfiguration()), nil)
 
 	message := new(mDNS.Msg)
 	message.SetQuestion("example.test.", mDNS.TypeA)
@@ -177,7 +177,7 @@ func TestAssignedTransportHonoursPortServiceParameter(t *testing.T) {
 	configuration.Nameservers[0].ServiceParameters = map[dnsmessage.SVCParamKey][]byte{
 		dnsmessage.SVCParamKey(3): {0x14, 0x51}, // port 5201
 	}
-	transport.apply(configuration, nil)
+	transport.apply(oneConfiguration(configuration), nil)
 
 	message := new(mDNS.Msg)
 	message.SetQuestion("example.test.", mDNS.TypeA)
@@ -194,7 +194,7 @@ func TestAssignedTransportFailsWhenTunnelFails(t *testing.T) {
 
 	dialer := &recordingDialer{fail: true}
 	transport := testAssignedTransport(dialer)
-	transport.apply(testConfiguration(), nil)
+	transport.apply(oneConfiguration(testConfiguration()), nil)
 
 	message := new(mDNS.Msg)
 	message.SetQuestion("example.test.", mDNS.TypeA)
@@ -226,7 +226,7 @@ func TestAssignedTransportEnvironmentIsolatesCache(t *testing.T) {
 	clearedIdentity := transport.Environment()
 	require.NotEmpty(t, clearedIdentity)
 
-	transport.apply(testConfiguration(), nil)
+	transport.apply(oneConfiguration(testConfiguration()), nil)
 	first := transport.Environment()
 	require.NotEmpty(t, first)
 	require.NotEqual(t, clearedIdentity, first,
@@ -234,7 +234,7 @@ func TestAssignedTransportEnvironmentIsolatesCache(t *testing.T) {
 
 	// The same assignment applied again must still advance the generation, so a
 	// re-sent capsule invalidates cached answers.
-	transport.apply(testConfiguration(), nil)
+	transport.apply(oneConfiguration(testConfiguration()), nil)
 	second := transport.Environment()
 	require.NotEqual(t, first, second,
 		"re-applying an assignment must change the environment, or stale cache entries "+
@@ -243,11 +243,11 @@ func TestAssignedTransportEnvironmentIsolatesCache(t *testing.T) {
 	// A different nameserver must produce a different environment.
 	configuration := testConfiguration()
 	configuration.Nameservers[0].IPv4Addresses = []netip.Addr{netip.MustParseAddr("192.0.2.99")}
-	transport.apply(configuration, nil)
+	transport.apply(oneConfiguration(configuration), nil)
 	third := transport.Environment()
 	require.NotEqual(t, second, third,
 		"a different nameserver must produce a different cache identity")
-	require.Contains(t, third, "ns=192.0.2.99")
+	require.Contains(t, third, "cfg0.ns=192.0.2.99")
 
 	// Clearing must ALSO change it, so entries resolved by the withdrawn resolver are
 	// not reused. This is the case that would silently serve answers from a resolver
@@ -274,11 +274,11 @@ func TestAssignedTransportEnvironmentIncludesResolverIdentity(t *testing.T) {
 		dnsmessage.SVCParamALPN:   {0x02, 'h', '2'},
 		dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
 	}
-	transport.apply(configuration, nil)
+	transport.apply(oneConfiguration(configuration), nil)
 
 	environment := transport.Environment()
-	require.Contains(t, environment, "auth=resolver.example.")
-	require.Contains(t, environment, "dohpath=/dns-query{?dns}")
+	require.Contains(t, environment, "cfg0.auth=resolver.example.")
+	require.Contains(t, environment, "cfg0.dohpath=/dns-query{?dns}")
 }
 
 // ---------------------------------------------------------------------------

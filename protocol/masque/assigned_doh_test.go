@@ -129,11 +129,28 @@ func dohAssignment(t *testing.T, dohPath string, nameserver string) masque.DNSCo
 	return masque.DNSConfiguration{
 		Nameservers: []masque.DNSNameserver{
 			{
+				ServicePriority:          1,
 				IPv6Addresses:            []netip.Addr{netip.MustParseAddr(nameserver)},
-				AuthenticationDomainName: "dns.example.test",
+				AuthenticationDomainName: "dns.example.test.",
 				ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
+					// h2, length-prefixed per RFC 9460 section 7.1.
+					dnsmessage.SVCParamKey(1): {0x02, 'h', '2'},
 					dnsmessage.SVCParamKey(9): []byte(dohPath), // dohpath
 				},
+			},
+		},
+	}
+}
+
+// udpAssignment builds an assignment with no encrypted transport advertised, so the plain
+// UDP path is the only one available.
+func udpAssignment(t *testing.T, nameserver string) masque.DNSConfiguration {
+	t.Helper()
+	return masque.DNSConfiguration{
+		Nameservers: []masque.DNSNameserver{
+			{
+				ServicePriority: 1,
+				IPv6Addresses:   []netip.Addr{netip.MustParseAddr(nameserver)},
 			},
 		},
 	}
@@ -145,7 +162,7 @@ func newDoHTransport(t *testing.T, client dohRoundTripper, configuration masque.
 	t.Helper()
 	transport := newAssignedDNSTransport(logger.NOP(), &recordingDialer{}, "test")
 	transport.setDoHClient(client)
-	transport.apply(configuration, nil)
+	transport.apply(oneConfiguration(configuration), nil)
 	return transport
 }
 
@@ -171,7 +188,7 @@ func TestAssignedDNSUsesDoHWhenAdvertised(t *testing.T) {
 	dialer := &recordingDialer{}
 	transport := newAssignedDNSTransport(logger.NOP(), dialer, "test")
 	transport.setDoHClient(client)
-	transport.apply(dohAssignment(t, "/dns-query{?dns}", "2001:db8::53"), nil)
+	transport.apply(oneConfiguration(dohAssignment(t, "/dns-query{?dns}", "2001:db8::53")), nil)
 
 	response, err := transport.Exchange(context.Background(), query)
 	require.NoError(t, err)
@@ -186,8 +203,8 @@ func TestAssignedDNSUsesDoHWhenAdvertised(t *testing.T) {
 	require.Equal(t, http.MethodPost, request.Method, "RFC 8484 DoH queries are POSTed")
 	require.Equal(t, "/dns-query", request.URL.Path,
 		"the RFC 9461 URI Template placeholder must be stripped to leave a usable path")
-	require.Equal(t, "dns.example.test", request.URL.Host,
-		"the request must name the authentication domain the connection was verified for")
+	require.Equal(t, "dns.example.test.", request.URL.Host,
+		"the request must name the authentication domain exactly as the resolver advertised it")
 	require.Equal(t, dnsTransport.MimeType, request.Header.Get("Content-Type"))
 	require.Equal(t, dnsTransport.MimeType, request.Header.Get("Accept"))
 	require.Equal(t, int64(len(packed)), request.ContentLength,
@@ -233,7 +250,7 @@ func TestAssignedDNSDoHFailureDoesNotFallBackToHostSocket(t *testing.T) {
 	dialer := &recordingDialer{}
 	transport := newAssignedDNSTransport(logger.NOP(), dialer, "test")
 	transport.setDoHClient(client)
-	transport.apply(dohAssignment(t, "/dns-query", "2001:db8::53"), nil)
+	transport.apply(oneConfiguration(dohAssignment(t, "/dns-query", "2001:db8::53")), nil)
 
 	_, err := transport.Exchange(context.Background(), query)
 	require.Error(t, err)
@@ -242,12 +259,14 @@ func TestAssignedDNSDoHFailureDoesNotFallBackToHostSocket(t *testing.T) {
 		"a failed DoH query must not silently become a UDP query to a different transport")
 }
 
-// TestAssignedDNSWithoutDoHClientUsesUDPInsideTheTunnel covers the window before the
-// endpoint publishes its HTTP/3 client.
+// TestAssignedDNSWithoutDoHClientUsesUDPInsideTheTunnel covers a resolver that advertises
+// no encrypted transport at all.
 //
-// Falling back to UDP is correct here -- it is still inside the tunnel -- and the test
-// pins that it is the DEVICE that is dialed, so the fallback cannot drift into a host
-// socket.
+// Plain UDP is the right transport here, and the test pins that it is the DEVICE that is
+// dialed, so this path cannot drift into a host socket.
+//
+// Note the contrast with TestAssignedDNSRefusesToDowngradeWhenDoHIsAdvertised below: a
+// resolver that DID advertise DoH would refuse rather than take this path.
 func TestAssignedDNSWithoutDoHClientUsesUDPInsideTheTunnel(t *testing.T) {
 	t.Parallel()
 
@@ -267,8 +286,9 @@ func TestAssignedDNSWithoutDoHClientUsesUDPInsideTheTunnel(t *testing.T) {
 
 	dialer := &recordingDialer{answer: answer}
 	transport := newAssignedDNSTransport(logger.NOP(), dialer, "test")
-	// No DoH client published.
-	transport.apply(dohAssignment(t, "/dns-query", "2001:db8::53"), nil)
+	// No DoH client published, and no encrypted transport advertised either, so UDP is
+	// the only transport the resolver offers.
+	transport.apply(oneConfiguration(udpAssignment(t, "2001:db8::53")), nil)
 
 	resolved, err := transport.Exchange(context.Background(), query)
 	require.NoError(t, err)
@@ -344,8 +364,8 @@ func TestAssignedDNSDoHNeverUsesHostSocketWhenDialerFails(t *testing.T) {
 	query.SetQuestion("leak.example.test.", mDNS.TypeAAAA)
 	dialer := &recordingDialer{fail: true}
 	transport := newAssignedDNSTransport(logger.NOP(), dialer, "test")
-	// No DoH client, so the UDP path is taken and fails.
-	transport.apply(dohAssignment(t, "/dns-query", "2001:db8::53"), nil)
+	// No encrypted transport advertised, so the UDP path is taken and fails.
+	transport.apply(oneConfiguration(udpAssignment(t, "2001:db8::53")), nil)
 
 	_, err := transport.Exchange(context.Background(), query)
 	require.Error(t, err)
@@ -382,12 +402,16 @@ func TestAssignedDNSDoHPathDefaultsAndNormalisation(t *testing.T) {
 func TestAssignedDNSDoHPortSelection(t *testing.T) {
 	t.Parallel()
 
-	require.Equal(t, uint16(443), (&assignedDNSState{dohPath: "/dns-query"}).dohPort(),
+	require.Equal(t, uint16(443), (assignedResolverEndpoint{dohPath: "/dns-query"}).dohPort(),
 		"a DoH resource defaults to the HTTPS port")
-	require.Equal(t, uint16(8443), (&assignedDNSState{dohPath: "/dns-query", port: 8443}).dohPort(),
+	require.Equal(t, uint16(8443), (assignedResolverEndpoint{dohPath: "/dns-query", port: 8443}).dohPort(),
 		"an advertised port must override the default")
-	require.Equal(t, uint16(0), (&assignedDNSState{}).dohPort(),
+	require.Equal(t, uint16(0), (assignedResolverEndpoint{}).dohPort(),
 		"without a dohpath there is no DoH port to report")
+	// The plain DNS default is a different question from the DoH one, which is why the two
+	// are separate methods rather than one shared accessor.
+	require.Equal(t, uint16(53), (assignedResolverEndpoint{}).dnsPort())
+	require.Equal(t, uint16(5353), (assignedResolverEndpoint{port: 5353}).dnsPort())
 }
 
 // TestAssignedDNSDoHErrorBodyIsBounded proves a huge error body cannot be quoted wholesale

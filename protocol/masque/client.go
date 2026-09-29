@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+
+	"golang.org/x/net/dns/dnsmessage"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -334,27 +336,63 @@ func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) 
 		return
 	}
 
-	selected := configuration.DNS.SelectNameservers()
-	// Every nameserver in the selected configuration must be routable through the
-	// tunnel. A configuration with none reachable is refused as a whole rather than
-	// partially installed: a partial resolver would answer some queries through the
-	// tunnel and send the rest somewhere else.
-	var reachable masque.DNSConfiguration
-	for _, nameserver := range selected {
-		if !nameserverReachable(nameserver, configuration.Routes) {
-			c.logger.Warn("ignoring server DNS assignment: nameserver ",
-				nameserverAddressString(nameserver),
-				" is not reachable through the advertised routes")
-			c.assignedDNS.clear()
-			return
+	// The configuration BOUNDARIES are preserved.
+	//
+	// The previous version collapsed every configuration into one flat nameserver list with
+	// a single set of metadata, which destroyed the per-domain ownership the wire format
+	// expresses and let one resolver's authentication domain, dohpath and port be applied
+	// to another resolver's address. Configurations are kept apart here, and reachability is
+	// decided PER RESOLVER, because a resolver is the unit that can be reached or not.
+	//
+	// A configuration whose resolvers are ALL unreachable is dropped, along with the
+	// internal domains it claimed. Dropping the configuration rather than the individual
+	// resolver is deliberate: a configuration is a set of servers that answer the same
+	// questions, so keeping a subset would still answer those domains, just from fewer
+	// servers. Keeping a resolver whose address is outside the tunnel is the thing that
+	// must never happen, because that query would leave the tunnel in cleartext.
+	var installed []masque.DNSConfiguration
+	for _, configuration_ := range configuration.DNS.Configurations {
+		var reachableResolvers []masque.DNSNameserver
+		for _, nameserver := range configuration_.Nameservers {
+			if !nameserverReachable(nameserver, configuration.Routes) {
+				c.logger.Warn("ignoring server DNS resolver ",
+					nameserverAddressString(nameserver),
+					" in a configuration for ",
+					describeInternalDomains(configuration_.InternalDomains),
+					": not reachable through the advertised routes")
+				continue
+			}
+			reachableResolvers = append(reachableResolvers, nameserver)
 		}
-		reachable.Nameservers = append(reachable.Nameservers, nameserver)
+		if len(reachableResolvers) == 0 {
+			c.logger.Warn("ignoring server DNS configuration for ",
+				describeInternalDomains(configuration_.InternalDomains),
+				": no resolver in it is reachable through the advertised routes")
+			continue
+		}
+		installed = append(installed, masque.DNSConfiguration{
+			Nameservers:     reachableResolvers,
+			InternalDomains: append([]string(nil), configuration_.InternalDomains...),
+			SearchDomains:   append([]string(nil), configuration_.SearchDomains...),
+		})
 	}
-	reachable.InternalDomains = dnsInternalDomains(configuration.DNS)
-	reachable.SearchDomains = dnsSearchDomains(configuration.DNS)
-	c.assignedDNS.apply(reachable, configuration.PREF64)
-	c.logger.Debug("using server-assigned DNS resolver (", len(reachable.Nameservers),
-		" nameservers, generation ", configuration.DNS.Generation, ")")
+	if len(installed) == 0 {
+		c.logger.Warn("ignoring server DNS assignment: no resolver is reachable through the advertised routes")
+		c.assignedDNS.clear()
+		return
+	}
+
+	c.assignedDNS.apply(installed, configuration.PREF64)
+	c.logger.Debug("using server-assigned DNS resolver (", len(installed),
+		" configurations, generation ", configuration.DNS.Generation, ")")
+}
+
+// describeInternalDomains renders a configuration's domain scope for a log line.
+func describeInternalDomains(domains []string) string {
+	if len(domains) == 0 {
+		return "the default configuration"
+	}
+	return strings.Join(domains, ", ")
 }
 
 // nameserverReachable reports whether every address of a nameserver lies inside the
@@ -363,7 +401,17 @@ func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) 
 func nameserverReachable(nameserver masque.DNSNameserver, routes []masque.AddressRange) bool {
 	addresses := append(append([]netip.Addr(nil), nameserver.IPv4Addresses...), nameserver.IPv6Addresses...)
 	if len(addresses) == 0 {
-		return false
+		// # The one case where a name-only nameserver IS usable
+		//
+		// An encrypted resolver reached by name does not need its address to be inside the
+		// tunnel's routes, because it is reached over the MASQUE HTTP/3 connection -- a
+		// request stream, not a tunnel-routed packet -- and the same-origin check on that
+		// connection is what constrains it, not the routing table.
+		//
+		// Every other shape needs an address to dial, and an address outside the routes
+		// would leave the tunnel. So a name-only nameserver is accepted only when it
+		// advertises DoH, which is the transport this client can actually carry.
+		return nameserverUsesSameH3DoH(nameserver)
 	}
 	for _, address := range addresses {
 		if !isReachableThroughRoutes(address, routes) {
@@ -371,6 +419,32 @@ func nameserverReachable(nameserver masque.DNSNameserver, routes []masque.Addres
 		}
 	}
 	return true
+}
+
+// nameserverUsesSameH3DoH reports whether a nameserver offers the same-connection DoH path.
+//
+// It mirrors assignedResolverEndpoint.selectTransport deliberately: reachability is decided
+// on the wire types before the runtime model exists, so the two must agree about what
+// "encrypted, over this connection" means. A domain name is required because that is the
+// origin the TLS certificate is verified against, and a dohpath is required because that is
+// the resource a query is POSTed to.
+func nameserverUsesSameH3DoH(nameserver masque.DNSNameserver) bool {
+	if nameserver.AuthenticationDomainName == "" {
+		return false
+	}
+	if _, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamKey(9)]; !loaded {
+		return false
+	}
+	alpn, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamALPN]
+	if !loaded || len(alpn) == 0 {
+		return false
+	}
+	for _, protocol := range decodeALPNList(alpn) {
+		if protocol == "h2" || protocol == "h3" {
+			return true
+		}
+	}
+	return false
 }
 
 func nameserverAddressString(nameserver masque.DNSNameserver) string {
@@ -384,22 +458,6 @@ func nameserverAddressString(nameserver masque.DNSNameserver) string {
 		return nameserver.AuthenticationDomainName
 	}
 	return "<none>"
-}
-
-func dnsInternalDomains(assignment *masque.DNSAssignment) []string {
-	var domains []string
-	for _, configuration := range assignment.Configurations {
-		domains = append(domains, configuration.InternalDomains...)
-	}
-	return domains
-}
-
-func dnsSearchDomains(assignment *masque.DNSAssignment) []string {
-	var domains []string
-	for _, configuration := range assignment.Configurations {
-		domains = append(domains, configuration.SearchDomains...)
-	}
-	return domains
 }
 
 func (c *ClientEndpoint) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {
