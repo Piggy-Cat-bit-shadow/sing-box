@@ -2,6 +2,7 @@ package masque
 
 import (
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/sagernet/sing-box/transport/masque"
@@ -54,26 +55,150 @@ type assignedResolverEndpoint struct {
 	// noDefaultALPN is set when the server explicitly forbade the default ALPN. It is the
 	// flag that makes "encrypted only" binding rather than a preference.
 	noDefaultALPN bool
-	// dohPath is the SVCB dohpath template, when one was advertised.
+	// dohPath is the SVCB dohpath URI Template as advertised, when present.
 	dohPath string
-	// port is the advertised port, or 0 when none was advertised.
-	port uint16
+	// hasDohPath distinguishes an absent template from a present-but-empty one.
+	hasDohPath bool
+	// expandedDohPath is the RFC 8484 POST expansion of dohPath, computed once. Empty with a
+	// nil dohPathErr means no template was advertised.
+	expandedDohPath string
+	// dohPathErr records why the template is unusable, if it is. It is a string rather than
+	// an error so the state stays comparable and copyable.
+	dohPathErr string
+	// port is the advertised port; hasPort distinguishes it from an absent one.
+	port    uint16
+	hasPort bool
+	// mandatory lists the extra mandatory keys the server declared.
+	mandatory []dnsmessage.SVCParamKey
+	// invalidServiceParameters records that the nameserver's SvcParams could not be
+	// understood. Non-empty means the resolver is incompatible.
+	invalidServiceParameters string
+}
+
+// resolverCapability describes what THIS CLIENT can currently do, which is what decides
+// whether an advertised transport is usable.
+//
+// # Why the tunnel's transport is part of it
+//
+// draft-06 §3.5 asks that DoH requests be "coalesced over the same HTTPS connection" as the
+// CONNECT-IP tunnel. That is only honest if the tunnel really is that connection. The
+// configured protocol version is NOT the same fact: transport/http falls back from H3 to H2,
+// so a client configured for version 3 can end up with an H2 tunnel while the H3 code path
+// still exists. Asking RoundTripHTTP3 in that state could dial a SECOND connection purely
+// for DNS, which defeats the coalescing and creates an extra observable connection.
+//
+// So the capability is reported by whoever owns the connection, and same-H3 DoH is available
+// only when the tunnel really is H3 and a live connection exists.
+type resolverCapability struct {
+	// tunnelIsHTTP3 reports that the CONNECT-IP tunnel is running over HTTP/3.
+	tunnelIsHTTP3 bool
+	// sameH3Authorities are the origins the live H3 connection is authenticated for. DoH is
+	// offered only to a resolver whose authentication domain matches one of these, because
+	// otherwise the request would ride on credentials never presented for that origin.
+	// Empty means no usable H3 connection.
+	sameH3Authorities []string
+	// routes is the ROUTE_ADVERTISEMENT in force. A nil slice means the server has not
+	// advertised routes yet, and the draft's §5 ordering rule then means nothing is reachable
+	// through the tunnel -- which is what stops an assignment arriving before its routes from
+	// being installed.
+	routes []masque.AddressRange
+}
+
+// sameH3AvailableFor reports whether a resolver's origin can be served on the existing H3
+// connection.
+func (c resolverCapability) sameH3AvailableFor(authenticationDomainName string) bool {
+	if !c.tunnelIsHTTP3 || authenticationDomainName == "" {
+		return false
+	}
+	for _, authority := range c.sameH3Authorities {
+		if sameOriginHost(authority, authenticationDomainName) {
+			return true
+		}
+	}
+	return false
 }
 
 // assignedResolverConfiguration is one configuration: the resolvers responsible for a set
 // of internal domains.
+//
+// # What an empty internal-domain list means, and what it does NOT mean
+//
+// draft-ietf-masque-connect-ip-dns-06 §3.5 defines exactly one way to claim everything:
+//
+//	"Sending an empty string as an internal domain indicates the DNS root; i.e.,
+//	 that the corresponding nameserver can resolve all domain names."
+//
+// So `[""]` is the root claim. The draft assigns NO meaning to an EMPTY LIST, and this
+// model does not invent one: a configuration with no internal domains claims NOTHING and
+// can never be selected for any name.
+//
+// An earlier version read `len(internalDomains) == 0` as "the default configuration", which
+// is a guess the specification does not support. It was not merely tidy-mindedness: it
+// silently turned an unclaimed name into a claimed one, which is the difference between
+// "resolve this publicly" and "fail closed".
 type assignedResolverConfiguration struct {
-	// internalDomains are the names this configuration owns. An EMPTY list means it is the
-	// DEFAULT configuration, which serves every name no other configuration claims.
-	//
-	// That reading follows the draft: configurations exist so different servers can own
-	// separate internal domains, and a configuration with none names no domains to own,
-	// so it is the catch-all rather than an unreachable one.
+	// internalDomains are the names this configuration owns, in wire order. The single
+	// entry "" means the DNS root (all names); an empty list means no name at all.
 	internalDomains []string
 	// searchDomains are the search suffixes to append to unqualified names.
 	searchDomains []string
-	// resolvers are this configuration's nameservers, ordered by priority.
+	// resolvers are this configuration's nameservers, in wire order. Priority ordering is
+	// applied at selection time; the wire order is kept so ties stay deterministic.
+	//
+	// This list is retained even when EVERY resolver turns out to be unusable, because the
+	// CLAIM above is independent of whether we can currently reach a server for it. Dropping
+	// the configuration on unreachability would delete the claim and leak the name.
 	resolvers []assignedResolverEndpoint
+}
+
+// unusableReason explains why a resolver cannot serve queries. It is empty for a usable
+// resolver, and the zero value therefore means "usable" -- which keeps the common case the
+// cheap one.
+type unusableReason string
+
+const (
+	// unusableNone marks a resolver that can be used.
+	unusableNone unusableReason = ""
+	// unusableNoAddress means the resolver offers no transport this client can reach: it has
+	// neither a usable tunnel address (for plain DNS) nor a valid same-H3 DoH configuration.
+	unusableNoAddress unusableReason = "no usable address or DoH configuration"
+	// unusableRoute means none of its addresses is reachable through the advertised routes
+	// for the transport it would use.
+	unusableRoute unusableReason = "no address reachable through the advertised routes"
+	// unusableTransport means its advertised transport cannot be provided by this client.
+	unusableTransport unusableReason = "no supported transport"
+	// unusableServiceParameters means its SvcParams are malformed or demand something this
+	// client cannot honour.
+	unusableServiceParameters unusableReason = "unsupported or malformed service parameters"
+)
+
+// assignedTransport names a DNS transport this client can actually use.
+type assignedTransport string
+
+const (
+	// assignedTransportDoH is same-connection DNS over HTTPS: an RFC 8484 POST on the
+	// HTTP/3 connection the CONNECT-IP tunnel already uses (draft-06 §3.5).
+	assignedTransportDoH assignedTransport = "doh"
+	// assignedTransportPlainUDP is traditional DNS over UDP port 53, carried through the
+	// tunnel, with a TCP retry when the answer is truncated.
+	assignedTransportPlainUDP assignedTransport = "udp"
+)
+
+// resolverAvailability is the outcome of evaluating one resolver against the routes and the
+// client's capabilities. It is computed when the effective state is built, so selection is a
+// pure lookup rather than repeated validation.
+type resolverAvailability struct {
+	reason unusableReason
+	// addresses are the resolver's addresses that are usable for the transport selected.
+	// For same-H3 DoH this is empty by design: that transport does not dial the address.
+	addresses []netip.Addr
+	// transport is the transport that will be used.
+	transport assignedTransport
+}
+
+// usable reports whether this resolver can serve queries.
+func (a resolverAvailability) usable() bool {
+	return a.reason == unusableNone
 }
 
 // assignedDNSState is one assignment's worth of immutable resolver configuration.
@@ -89,17 +214,31 @@ type assignedDNSState struct {
 	generation     uint64
 	configurations []assignedResolverConfiguration
 	pref64         []netip.Prefix
-	// hasAssignment distinguishes "no assignment" from "an assignment with no usable
-	// resolvers". Both serve no queries, but only the second means the server spoke.
+	// availability is parallel to configurations[i].resolvers[j]. It is computed once, at
+	// publish time, from the routes and the client's H3 capability, so that selection and
+	// environment reporting do not re-evaluate and cannot disagree with each other.
+	availability [][]resolverAvailability
+	// identity is the deterministic resolver-relevant fingerprint of this state. It is what
+	// decides whether a reapply is a real change; see buildAssignedDNSState.
+	identity string
+	// hasAssignment distinguishes "no assignment at all" from "an assignment whose
+	// resolvers are all unusable". The two are different: only the second means the server
+	// made a claim we cannot serve, which must fail closed.
 	hasAssignment bool
 }
 
-// endpointLookup holds the resolver chosen for a query name, along with the configuration it
-// came from.
+// endpointLookup is the result of asking which configuration owns a name.
+//
+// It carries the WHOLE configuration plus the per-resolver availability, rather than one
+// chosen endpoint, because the caller walks the configuration's resolvers by priority and
+// needs to know which of them are usable. Selection of a specific resolver is a policy the
+// exchange applies, not a property of the lookup.
 type endpointLookup struct {
 	configuration assignedResolverConfiguration
-	endpoint      assignedResolverEndpoint
-	found         bool
+	availability  []resolverAvailability
+	// claimed reports that some configuration owns this name. When it is true the caller
+	// MUST NOT fall back to any other resolver, whatever happens next.
+	claimed bool
 }
 
 // selectForName chooses the configuration responsible for a name, then the
@@ -136,46 +275,62 @@ func (s *assignedDNSState) selectForName(name string) endpointLookup {
 	}
 	normalized := normalizeQueryName(name)
 
+	// WHICH configuration claims this name. The longest matching internal domain wins, and
+	// "" is the root claim, which matches everything but is by definition the LEAST specific,
+	// so it only wins when nothing narrower applies.
+	//
+	// A configuration with NO internal domains claims nothing and is skipped entirely: that
+	// is the difference between [] and [""], and it is what makes split DNS work.
 	bestConfiguration := -1
 	bestMatchLength := -1
-	defaultConfiguration := -1
-
 	for index, configuration := range s.configurations {
-		if len(configuration.resolvers) == 0 {
-			// A configuration with no usable resolver owns nothing: it cannot answer for
-			// any name, so it must not capture matching names from one that can.
-			continue
-		}
-		if len(configuration.internalDomains) == 0 {
-			if defaultConfiguration < 0 {
-				defaultConfiguration = index
-			}
-			continue
-		}
 		for _, domain := range configuration.internalDomains {
 			normalizedDomain := normalizeQueryName(domain)
 			if !nameMatchesDomain(normalized, normalizedDomain) {
 				continue
 			}
+			// The root claim ("") has length 0, so any explicit domain beats it.
 			if len(normalizedDomain) > bestMatchLength {
 				bestMatchLength = len(normalizedDomain)
 				bestConfiguration = index
 			}
 		}
 	}
+	if bestConfiguration < 0 {
+		return endpointLookup{}
+	}
 
-	if bestConfiguration < 0 {
-		bestConfiguration = defaultConfiguration
-	}
-	if bestConfiguration < 0 {
-		return endpointLookup{}
-	}
+	// The name IS claimed. From here the answer is that configuration or nothing: a claimed
+	// name must never be answered by some other resolver, which is the privacy invariant that
+	// makes split DNS safe.
 	configuration := s.configurations[bestConfiguration]
-	endpoint, found := configuration.preferredResolver()
-	if !found {
-		return endpointLookup{}
+	return endpointLookup{
+		configuration: configuration,
+		availability:  s.availability[bestConfiguration],
+		claimed:       true,
 	}
-	return endpointLookup{configuration: configuration, endpoint: endpoint, found: true}
+}
+
+// claimsName reports whether any configuration claims this name.
+//
+// This is the question the endpoint must ask BEFORE choosing between the assigned resolver
+// and the ordinary DNS rules, and it is deliberately independent of whether a resolver is
+// currently usable. "Who owns this name" and "can I reach the owner" are different
+// questions, and conflating them is how an internal name leaks to a public resolver when
+// its own nameserver is temporarily unreachable.
+func (s *assignedDNSState) claimsName(name string) bool {
+	if s == nil || len(s.configurations) == 0 {
+		return false
+	}
+	normalized := normalizeQueryName(name)
+	for _, configuration := range s.configurations {
+		for _, domain := range configuration.internalDomains {
+			if nameMatchesDomain(normalized, normalizeQueryName(domain)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // normalizeQueryName lowercases a name and strips the trailing root dot, so that
@@ -254,6 +409,82 @@ func (s *assignedDNSState) allEndpoints() []assignedResolverEndpoint {
 }
 
 // hasResolvers reports whether any configuration carries a usable resolver.
+// buildAssignedDNSState converts a parsed assignment into the runtime model.
+//
+// Every slice and map is COPIED. The parsed structures are owned by the caller that parsed
+// them, and the state is published to other goroutines and read for the lifetime of the
+// assignment, so retaining a caller's slice would let a later mutation change live resolver
+// behaviour. The service parameters are maps of byte slices, which is the case most likely
+// to be shared inadvertently, so each value is copied rather than referenced.
+func buildAssignedDNSState(configurations []masque.DNSConfiguration, pref64 []netip.Prefix, generation uint64, capability resolverCapability) *assignedDNSState {
+	state := &assignedDNSState{
+		generation:    generation,
+		pref64:        append([]netip.Prefix(nil), pref64...),
+		hasAssignment: true,
+	}
+	for _, configuration := range configurations {
+		runtimeConfiguration := assignedResolverConfiguration{
+			internalDomains: append([]string(nil), configuration.InternalDomains...),
+			searchDomains:   append([]string(nil), configuration.SearchDomains...),
+		}
+		var availability []resolverAvailability
+		for _, nameserver := range configuration.Nameservers {
+			endpoint := buildResolverEndpoint(nameserver)
+			runtimeConfiguration.resolvers = append(runtimeConfiguration.resolvers, endpoint)
+			availability = append(availability, endpoint.availability(capability))
+		}
+		state.configurations = append(state.configurations, runtimeConfiguration)
+		state.availability = append(state.availability, availability)
+	}
+	state.identity = state.resolverIdentity()
+	return state
+}
+
+// buildResolverEndpoint converts one nameserver, keeping its metadata its own.
+//
+// Every slice and map is COPIED. The parsed structures belong to whoever parsed them, and the
+// published state is read by other goroutines for the lifetime of the assignment, so
+// retaining a caller's slice would let a later mutation change live resolver behaviour. The
+// service-parameter map of byte slices is the case most likely to be shared inadvertently.
+//
+// The values were already validated at the wire boundary; this function does not re-validate,
+// it only copies. validateServiceParameters is called again here for the fields it derives
+// (alpn, mandatory, port presence) because those are computed, not stored.
+func buildResolverEndpoint(nameserver masque.DNSNameserver) assignedResolverEndpoint {
+	endpoint := assignedResolverEndpoint{
+		priority: nameserver.ServicePriority,
+		addresses: make([]netip.Addr, 0,
+			len(nameserver.IPv4Addresses)+len(nameserver.IPv6Addresses)),
+		authenticationDomainName: nameserver.AuthenticationDomainName,
+	}
+	endpoint.addresses = append(endpoint.addresses, nameserver.IPv4Addresses...)
+	endpoint.addresses = append(endpoint.addresses, nameserver.IPv6Addresses...)
+
+	// The nameserver was validated during parsing, so an error here would mean the value was
+	// mutated after parsing. Treat it as unusable rather than panicking.
+	parsed, err := masque.ValidateServiceParameters(nameserver)
+	if err != nil {
+		endpoint.invalidServiceParameters = err.Error()
+		return endpoint
+	}
+	endpoint.alpn = parsed.ALPN
+	endpoint.noDefaultALPN = parsed.NoDefaultALPN
+	endpoint.port = parsed.Port
+	endpoint.hasPort = parsed.HasPort
+	endpoint.dohPath = parsed.DohPath
+	endpoint.hasDohPath = parsed.HasDohPath
+	endpoint.mandatory = append([]dnsmessage.SVCParamKey(nil), parsed.Mandatory...)
+	if parsed.HasDohPath {
+		expanded, expandErr := masque.ExpandDohPathForPost(parsed.DohPath)
+		if expandErr != nil {
+			endpoint.dohPathErr = expandErr.Error()
+		} else {
+			endpoint.expandedDohPath = expanded
+		}
+	}
+	return endpoint
+}
+
 func (s *assignedDNSState) hasResolvers() bool {
 	if s == nil {
 		return false
@@ -266,112 +497,350 @@ func (s *assignedDNSState) hasResolvers() bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Building the model from the wire types
-// ---------------------------------------------------------------------------
+// Route protocols as they appear in a ROUTE_ADVERTISEMENT (RFC 9484 §4.7.1): 0 means "all
+// protocols", and the others are IP protocol numbers, so 6 is TCP and 17 is UDP.
+const (
+	protocolAll = 0
+	protocolTCP = 6
+	protocolUDP = 17
+)
 
-// buildAssignedDNSState converts a parsed assignment into the runtime model.
+// availability evaluates this resolver against the client's capability and the advertised
+// routes, deciding which transport (if any) will be used.
 //
-// Every slice and map is COPIED. The parsed structures are owned by the caller that parsed
-// them, and the state is published to other goroutines and read for the lifetime of the
-// assignment, so retaining a caller's slice would let a later mutation change live resolver
-// behaviour. The service parameters are maps of byte slices, which is the case most likely
-// to be shared inadvertently, so each value is copied rather than referenced.
-func buildAssignedDNSState(configurations []masque.DNSConfiguration, pref64 []netip.Prefix, generation uint64) *assignedDNSState {
-	state := &assignedDNSState{
-		generation:    generation,
-		pref64:        append([]netip.Prefix(nil), pref64...),
-		hasAssignment: true,
-	}
-	for _, configuration := range configurations {
-		runtimeConfiguration := assignedResolverConfiguration{
-			internalDomains: append([]string(nil), configuration.InternalDomains...),
-			searchDomains:   append([]string(nil), configuration.SearchDomains...),
-		}
-		for _, nameserver := range configuration.Nameservers {
-			runtimeConfiguration.resolvers = append(runtimeConfiguration.resolvers,
-				buildResolverEndpoint(nameserver))
-		}
-		state.configurations = append(state.configurations, runtimeConfiguration)
-	}
-	return state
-}
-
-// buildResolverEndpoint converts one nameserver, keeping its metadata its own.
-func buildResolverEndpoint(nameserver masque.DNSNameserver) assignedResolverEndpoint {
-	endpoint := assignedResolverEndpoint{
-		priority: nameserver.ServicePriority,
-		// A fresh slice, so nothing shares backing storage with the parsed message.
-		addresses: make([]netip.Addr, 0,
-			len(nameserver.IPv4Addresses)+len(nameserver.IPv6Addresses)),
-		authenticationDomainName: nameserver.AuthenticationDomainName,
-	}
-	endpoint.addresses = append(endpoint.addresses, nameserver.IPv4Addresses...)
-	endpoint.addresses = append(endpoint.addresses, nameserver.IPv6Addresses...)
-
-	if alpn, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamALPN]; loaded {
-		endpoint.alpn = decodeALPNList(alpn)
-	}
-	if _, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamNoDefaultALPN]; loaded {
-		endpoint.noDefaultALPN = true
-	}
-	if dohPath, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamKey(9)]; loaded {
-		endpoint.dohPath = string(dohPath)
-	}
-	if port, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamKey(3)]; loaded && len(port) == 2 {
-		endpoint.port = uint16(port[0])<<8 | uint16(port[1])
-	}
-	return endpoint
-}
-
-// decodeALPNList splits the SVCB alpn parameter.
+// # Order of the decision, and why
 //
-// RFC 9460 section 7.1 defines the value as a sequence of length-prefixed byte strings, so
-// `\x02h2\x02h3` is ["h2", "h3"]. A single comma-separated string is also accepted, because
-// that is the presentation format operators write and a permissive reader here can only
-// avoid false failures, not cause one.
-func decodeALPNList(value []byte) []string {
-	if len(value) == 0 {
-		return nil
+//  1. malformed SvcParams -> incompatible. Everything below reads those values, so nothing can
+//     be trusted until they are known good.
+//  2. same-H3 DoH, when the resolver's origin matches the live tunnel H3 connection. Checked
+//     FIRST because it is the transport draft-06 §3.5 asks for, and because it is the only one
+//     that needs no reachable nameserver address: the query travels as a request stream on a
+//     connection that already exists. This is what makes the draft's §3.6.1 full-tunnel
+//     example -- zero addresses, alpn=h2,h3, dohpath -- actually usable rather than a resolver
+//     that installs and then fails on its first query.
+//  3. otherwise plain DNS, which DOES need an address reachable through the advertised routes
+//     for the protocol it will use. UDP and TCP are separate route protocols, and a route
+//     advertised only for TCP does not make a UDP query reachable.
+func (e assignedResolverEndpoint) availability(capability resolverCapability) resolverAvailability {
+	if e.invalidServiceParameters != "" {
+		return resolverAvailability{reason: unusableServiceParameters}
 	}
-	// The length-prefixed form is tried FIRST and accepted only if it consumes the whole
-	// value exactly. Trying it first is what the wire format requires; requiring exact
-	// consumption is what keeps a comma-separated presentation string from being misread.
-	//
-	// Without the exactness check this is ambiguous, and the ambiguity is not theoretical:
-	// "h2,h3" would parse its first byte ('h' = 104) as a length, overrun immediately, and
-	// yield nothing -- while looking like a valid parse of a valid input.
-	protocols, ok := decodeLengthPrefixedALPN(value)
-	if ok {
-		return protocols
+	if e.hasDohPath && e.dohPathErr != "" {
+		return resolverAvailability{reason: unusableServiceParameters}
 	}
-	// Fall back to the presentation form.
-	var presentation []string
-	for _, part := range strings.Split(string(value), ",") {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			presentation = append(presentation, part)
+
+	// 2. Same-connection DoH.
+	if e.hasDohPath && capability.sameH3AvailableFor(e.authenticationDomainName) {
+		return resolverAvailability{reason: unusableNone, transport: assignedTransportDoH}
+	}
+
+	// 3. Plain DNS, which needs a reachable address.
+	if len(e.addresses) == 0 {
+		// No address and no usable DoH. When DoH WAS advertised, say so precisely:
+		// "unreachable" would be misleading, and the distinction tells an operator whether
+		// the tunnel or the client's capability is at fault.
+		if e.hasDohPath {
+			return resolverAvailability{reason: unusableTransport}
 		}
+		return resolverAvailability{reason: unusableNoAddress}
 	}
-	return presentation
+	if e.noDefaultALPN {
+		// The server withdrew the default transport, so plain DNS is forbidden and DoH was
+		// not usable. That is a refusal, not a downgrade.
+		return resolverAvailability{reason: unusableTransport}
+	}
+	reachable := e.reachableAddresses(capability.routes)
+	if len(reachable) == 0 {
+		return resolverAvailability{reason: unusableRoute}
+	}
+	return resolverAvailability{reason: unusableNone, transport: assignedTransportPlainUDP, addresses: reachable}
 }
 
-// decodeLengthPrefixedALPN parses RFC 9460 section 7.1's sequence of length-prefixed byte
-// strings, reporting whether the input was well formed.
-func decodeLengthPrefixedALPN(value []byte) ([]string, bool) {
-	var protocols []string
-	remaining := value
-	for len(remaining) > 0 {
-		length := int(remaining[0])
-		remaining = remaining[1:]
-		if length == 0 || length > len(remaining) {
-			return nil, false
+// reachableAddresses filters the resolver's addresses to those routable through the tunnel for
+// the protocols plain DNS needs.
+//
+// # Why the protocol matters
+//
+// draft-06 §3.2 defines unencrypted DNS as "traditionally sent over UDP port 53 and TCP port
+// 53", and a truncated UDP answer must be retried over TCP (RFC 1035 §4.2.1). So a route
+// advertised for some unrelated protocol does NOT make a DNS query reachable, and an address
+// is only kept when it can actually carry UDP -- the transport queries start on.
+//
+// TCP availability is reported separately so a truncated answer knows whether its retry is
+// possible, instead of discovering it by falling back to the host stack.
+func (e assignedResolverEndpoint) reachableAddresses(routes []masque.AddressRange) []netip.Addr {
+	var reachable []netip.Addr
+	for _, address := range e.addresses {
+		if routePermitsProtocol(routes, address, protocolUDP) {
+			reachable = append(reachable, address)
 		}
-		protocols = append(protocols, string(remaining[:length]))
-		remaining = remaining[length:]
 	}
-	if len(protocols) == 0 {
-		return nil, false
+	return reachable
+}
+
+// tcpReachableAddresses returns the addresses that can also carry TCP, for the
+// truncated-answer retry.
+func (e assignedResolverEndpoint) tcpReachableAddresses(routes []masque.AddressRange) []netip.Addr {
+	var reachable []netip.Addr
+	for _, address := range e.addresses {
+		if routePermitsProtocol(routes, address, protocolTCP) {
+			reachable = append(reachable, address)
+		}
 	}
-	return protocols, true
+	return reachable
+}
+
+// routePermitsProtocol reports whether any advertised route covers address AND permits the
+// given IP protocol.
+//
+// A route with Protocol 0 covers every protocol, so 0 matches any request. Otherwise the
+// route's protocol must equal the one being asked about. Addresses are compared on the
+// address family too: a v4 route never covers a v6 address, however the ranges happen to
+// compare.
+func routePermitsProtocol(routes []masque.AddressRange, address netip.Addr, protocol uint8) bool {
+	for _, route := range routes {
+		if route.Protocol != protocolAll && route.Protocol != protocol {
+			continue
+		}
+		if route.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolverIdentity is the deterministic fingerprint of everything about this state that can
+// change what a DNS query returns or where it is sent.
+//
+// # Why the generation must be derived from this rather than from call counts
+//
+// publish() used to bump the generation on every apply. That made a PREF64-only update, an
+// address-only update and an identical reapply all invalidate the DNS cache, even though
+// none of them changes an answer. Wasteful, and worse, it hides the case that DOES matter:
+// a ROUTE_ADVERTISEMENT change that makes a resolver unreachable alters effective behaviour
+// and must invalidate the cache, and that fact was invisible when everything bumped.
+//
+// So the identity is built from the resolver-relevant facts only, and the generation is
+// allocated only when it differs. PREF64 is deliberately EXCLUDED: it does not participate in
+// resolution (this client performs no DNS64 synthesis), so a change to it cannot change an
+// answer.
+//
+// The order is fixed by construction -- configurations and their resolvers are in wire order,
+// and the fields are appended in a fixed sequence -- so two equal states always produce equal
+// identities and Go map iteration cannot leak in.
+func (s *assignedDNSState) resolverIdentity() string {
+	if s == nil || len(s.configurations) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for configIndex, configuration := range s.configurations {
+		builder.WriteString("c")
+		builder.WriteString(strconv.Itoa(configIndex))
+		// The CLAIM is part of the identity: changing which names are owned changes answers
+		// even if every resolver stays the same.
+		for _, domain := range configuration.internalDomains {
+			builder.WriteString("|i=")
+			builder.WriteString(normalizeQueryName(domain))
+		}
+		for _, domain := range configuration.searchDomains {
+			builder.WriteString("|s=")
+			builder.WriteString(normalizeQueryName(domain))
+		}
+		for resolverIndex, resolver := range configuration.resolvers {
+			builder.WriteString("|r")
+			builder.WriteString(strconv.Itoa(resolverIndex))
+			builder.WriteString("p=")
+			builder.WriteString(strconv.Itoa(int(resolver.priority)))
+			builder.WriteString("a=")
+			builder.WriteString(resolver.authenticationDomainName)
+			builder.WriteString("d=")
+			builder.WriteString(resolver.dohPath)
+			if resolver.hasPort {
+				builder.WriteString("o=")
+				builder.WriteString(strconv.Itoa(int(resolver.port)))
+			}
+			builder.WriteString("n=")
+			for _, protocol := range resolver.alpn {
+				builder.WriteString(protocol)
+				builder.WriteString(",")
+			}
+			if resolver.noDefaultALPN {
+				builder.WriteString("!default")
+			}
+			for _, address := range resolver.addresses {
+				builder.WriteString("|")
+				builder.WriteString(address.String())
+			}
+			// The transport actually selected is the fact that matters most: a route change
+			// that flips a resolver from usable to unusable, or from plain to DoH, changes
+			// where queries go.
+			if len(s.availability) > configIndex && len(s.availability[configIndex]) > resolverIndex {
+				availability := s.availability[configIndex][resolverIndex]
+				builder.WriteString("|t=")
+				builder.WriteString(string(availability.transport))
+				builder.WriteString("u=")
+				builder.WriteString(string(availability.reason))
+				for _, address := range availability.addresses {
+					builder.WriteString("|")
+					builder.WriteString(address.String())
+				}
+			}
+		}
+	}
+	return builder.String()
+}
+
+// sameOriginHost compares two DNS host names for origin identity.
+//
+// # What is normalized, and what is deliberately not
+//
+// Authentication Domain Names arrive as DNS FQDNs (`resolver.example.`) while HTTP
+// authorities are written without the root dot (`resolver.example`), and the same name may
+// differ in case. Those three spellings denote ONE host, so they must compare equal.
+//
+// The normalization is applied ONLY to a value already known to be a host name, and only for
+// a SINGLE trailing root dot. A blanket TrimRight(".") would make `example..` equal
+// `example` and would also silently accept an empty name, neither of which is a host. An
+// IPv6 literal keeps its brackets, and any port is stripped and compared separately.
+func sameOriginHost(first string, second string) bool {
+	firstHost, firstPort := splitHostPort(first)
+	secondHost, secondPort := splitHostPort(second)
+	if firstPort != secondPort {
+		return false
+	}
+	return equalFoldASCII(normalizeHostName(firstHost), normalizeHostName(secondHost))
+}
+
+// splitHostPort separates a host from its port, defaulting to the HTTPS port.
+func splitHostPort(authority string) (string, string) {
+	// IPv6 literal: the colons inside brackets are not separators.
+	if strings.HasPrefix(authority, "[") {
+		if closing := strings.IndexByte(authority, ']'); closing >= 0 {
+			host := authority[:closing+1]
+			rest := authority[closing+1:]
+			if rest == "" {
+				return host, "443"
+			}
+			if strings.HasPrefix(rest, ":") {
+				return host, rest[1:]
+			}
+			return authority, "443"
+		}
+		return authority, "443"
+	}
+	if colon := strings.LastIndexByte(authority, ':'); colon >= 0 {
+		return authority[:colon], authority[colon+1:]
+	}
+	return authority, "443"
+}
+
+// normalizeHostName lowercases a host and removes at most ONE trailing root dot.
+func normalizeHostName(host string) string {
+	host = strings.ToLower(host)
+	if strings.HasSuffix(host, ".") && len(host) > 1 {
+		host = host[:len(host)-1]
+	}
+	return host
+}
+
+// equalFoldASCII compares two strings case-insensitively over ASCII only.
+//
+// It is written out rather than using strings.EqualFold so that the comparison cannot be
+// affected by Unicode case folding, which is not how host names compare.
+func equalFoldASCII(first string, second string) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range len(first) {
+		a, b := first[index], second[index]
+		if 'A' <= a && a <= 'Z' {
+			a += 'a' - 'A'
+		}
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+// recomputeAvailability rebuilds a state's availability from a new capability, keeping the
+// configurations, the claims and the resolvers exactly as they were.
+//
+// It exists because usability is a JOINT property of what the server advertised and what this
+// client can currently do. The same DNS_ASSIGN is usable or unusable depending on whether the
+// tunnel is H3 and which ranges were advertised, so a capability change must re-evaluate --
+// otherwise a tunnel that reconnects over H2 would keep offering same-H3 DoH on a connection
+// that no longer exists, and a route change would leave a now-unreachable resolver installed.
+func recomputeAvailability(current *assignedDNSState, capability resolverCapability) *assignedDNSState {
+	next := &assignedDNSState{
+		configurations: current.configurations,
+		pref64:         append([]netip.Prefix(nil), current.pref64...),
+		hasAssignment:  current.hasAssignment,
+	}
+	for _, configuration := range current.configurations {
+		var availability []resolverAvailability
+		for _, resolver := range configuration.resolvers {
+			availability = append(availability, resolver.availability(capability))
+		}
+		next.availability = append(next.availability, availability)
+	}
+	return next
+}
+
+// describe renders a resolver for logs and errors, naming the metadata that belongs to THIS
+// resolver. That is what makes a misrouting bug legible in a log rather than a mystery.
+func (e assignedResolverEndpoint) describe() string {
+	description := "<no address>"
+	if len(e.addresses) > 0 {
+		description = e.addresses[0].String()
+	} else if e.authenticationDomainName != "" {
+		description = e.authenticationDomainName
+	}
+	if e.authenticationDomainName != "" && len(e.addresses) > 0 {
+		description = description + " (" + e.authenticationDomainName + ")"
+	}
+	return description
+}
+
+// dnsPort is the port plain DNS should be sent to.
+//
+// An advertised `port` applies to the resolver's own transports, so it is honoured here as
+// well as for DoH. RFC 9461 makes `port` automatically mandatory, which means a client that
+// claims to support the endpoint cannot silently ignore it.
+func (e assignedResolverEndpoint) dnsPort() uint16 {
+	if e.hasPort {
+		return e.port
+	}
+	return assignedDNSDefaultPort
+}
+
+// dohPort is the port a DoH request should be addressed to.
+//
+// The dohpath is an HTTP resource, so its default is the HTTPS port; using the plain DNS
+// default of 53 would send an HTTPS request to the DNS port.
+func (e assignedResolverEndpoint) dohPort() uint16 {
+	if e.hasPort {
+		return e.port
+	}
+	if e.hasDohPath {
+		return 443
+	}
+	return 0
+}
+
+// offersDoH reports whether the advertised ALPN set includes an HTTP transport.
+//
+// Only h2 and h3 count. This client implements same-connection DoH over H3 exclusively, so
+// offersDoH is about what the SERVER advertised; whether the client can use it is decided by
+// availability(), which also requires the live tunnel to be H3.
+func (e assignedResolverEndpoint) offersDoH() bool {
+	for _, protocol := range e.alpn {
+		if protocol == "h2" || protocol == "h3" {
+			return true
+		}
+	}
+	return false
 }

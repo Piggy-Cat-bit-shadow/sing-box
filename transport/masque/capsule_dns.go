@@ -424,7 +424,32 @@ func parseDNSNameserver(payload []byte) (DNSNameserver, []byte, error) {
 		}
 		nameserver.ServiceParameters = parameters
 	}
+	// The values are validated here, at the wire boundary, rather than left for the runtime.
+	//
+	// RFC 9460 §2.2 makes a malformed SvcParamValue a reason to consider the record
+	// malformed, and the transport decision is made entirely from these values: a value
+	// accepted but misread produces a resolver that looks usable and is not, or a downgrade
+	// to a transport the server never offered. Rejecting at the boundary means nothing
+	// downstream can observe a half-understood parameter.
+	if _, err = ValidateServiceParameters(nameserver); err != nil {
+		return nameserver, nil, E.Cause(err, "nameserver ", nameserverAddressForError(nameserver))
+	}
 	return nameserver, payload, nil
+}
+
+// nameserverAddressForError renders a nameserver for a parse error, before it has been
+// validated into the runtime model.
+func nameserverAddressForError(nameserver DNSNameserver) string {
+	if nameserver.AuthenticationDomainName != "" {
+		return nameserver.AuthenticationDomainName
+	}
+	if len(nameserver.IPv4Addresses) > 0 {
+		return nameserver.IPv4Addresses[0].String()
+	}
+	if len(nameserver.IPv6Addresses) > 0 {
+		return nameserver.IPv6Addresses[0].String()
+	}
+	return "(addressless)"
 }
 
 // parseServiceParameters decodes the SVCB wire format (RFC 9460 §2.2).

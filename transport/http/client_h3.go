@@ -93,6 +93,28 @@ func newHTTP3Client(options ClientOptions, authorization string) (http3Client, e
 	}, nil
 }
 
+// existingConn returns the live, memoized ClientConn WITHOUT dialing.
+//
+// It shares the liveness test with acquire() -- the connection must exist and its context must
+// not be done -- so the two agree about what "usable" means. The difference is only what
+// happens when there is none: acquire() dials, this reports failure.
+func (c *http3ClientImpl) existingConn() (*http3.ClientConn, bool) {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.conn != nil && c.conn.Context().Err() == nil {
+		return c.conn, true
+	}
+	return nil, false
+}
+
+// HTTP3ConnectionAuthority implements http3ExistingConnectionRoundTripper.
+func (c *http3ClientImpl) HTTP3ConnectionAuthority() (string, bool) {
+	if _, live := c.existingConn(); !live {
+		return "", false
+	}
+	return c.authority, true
+}
+
 func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error) {
 	c.access.Lock()
 	defer c.access.Unlock()

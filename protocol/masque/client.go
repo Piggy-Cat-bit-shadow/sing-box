@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strings"
 
-	"golang.org/x/net/dns/dnsmessage"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -336,128 +335,57 @@ func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) 
 		return
 	}
 
-	// The configuration BOUNDARIES are preserved.
+	// # Claims are installed even when their resolvers are not usable
 	//
-	// The previous version collapsed every configuration into one flat nameserver list with
-	// a single set of metadata, which destroyed the per-domain ownership the wire format
-	// expresses and let one resolver's authentication domain, dohpath and port be applied
-	// to another resolver's address. Configurations are kept apart here, and reachability is
-	// decided PER RESOLVER, because a resolver is the unit that can be reached or not.
+	// Every configuration is published, INCLUDING one whose resolvers cannot currently be
+	// used. That is deliberate and it is a privacy property rather than tidiness.
 	//
-	// A configuration whose resolvers are ALL unreachable is dropped, along with the
-	// internal domains it claimed. Dropping the configuration rather than the individual
-	// resolver is deliberate: a configuration is a set of servers that answer the same
-	// questions, so keeping a subset would still answer those domains, just from fewer
-	// servers. Keeping a resolver whose address is outside the tunnel is the thing that
-	// must never happen, because that query would leave the tunnel in cleartext.
-	var installed []masque.DNSConfiguration
-	for _, configuration_ := range configuration.DNS.Configurations {
-		var reachableResolvers []masque.DNSNameserver
-		for _, nameserver := range configuration_.Nameservers {
-			if !nameserverReachable(nameserver, configuration.Routes) {
-				c.logger.Warn("ignoring server DNS resolver ",
-					nameserverAddressString(nameserver),
-					" in a configuration for ",
-					describeInternalDomains(configuration_.InternalDomains),
-					": not reachable through the advertised routes")
-				continue
-			}
-			reachableResolvers = append(reachableResolvers, nameserver)
-		}
-		if len(reachableResolvers) == 0 {
-			c.logger.Warn("ignoring server DNS configuration for ",
-				describeInternalDomains(configuration_.InternalDomains),
-				": no resolver in it is reachable through the advertised routes")
-			continue
-		}
-		installed = append(installed, masque.DNSConfiguration{
-			Nameservers:     reachableResolvers,
-			InternalDomains: append([]string(nil), configuration_.InternalDomains...),
-			SearchDomains:   append([]string(nil), configuration_.SearchDomains...),
-		})
-	}
-	if len(installed) == 0 {
-		c.logger.Warn("ignoring server DNS assignment: no resolver is reachable through the advertised routes")
-		c.assignedDNS.clear()
-		return
-	}
-
-	c.assignedDNS.apply(installed, configuration.PREF64)
-	c.logger.Debug("using server-assigned DNS resolver (", len(installed),
+	// A configuration's internal domains are a CLAIM: the server is saying "names under here
+	// are mine, and must be resolved by my nameserver". Whether we can reach that nameserver
+	// right now is a separate question, answered once the routes and the client's transport
+	// capability are known. If unreachability deleted the claim, the name would become
+	// unclaimed, and an unclaimed name is resolved by the ordinary DNS rules -- so a
+	// temporary inability to reach an internal resolver would silently send `internal.corp`
+	// to a public resolver. That is the split-DNS leak this design exists to prevent.
+	//
+	// So the configuration is published with its claim intact and its resolvers marked
+	// unusable. A query for a claimed name then finds the claim, finds no usable resolver, and
+	// FAILS -- which is the correct outcome.
+	//
+	// The wire types are passed through unchanged; usability is computed by the runtime model,
+	// where the routes and the client's capability are both available.
+	capability := c.resolverCapability(configuration.Routes)
+	c.assignedDNS.apply(configuration.DNS.Configurations, configuration.PREF64, capability)
+	c.logger.Debug("using server-assigned DNS resolver (", len(configuration.DNS.Configurations),
 		" configurations, generation ", configuration.DNS.Generation, ")")
 }
 
-// describeInternalDomains renders a configuration's domain scope for a log line.
-func describeInternalDomains(domains []string) string {
-	if len(domains) == 0 {
-		return "the default configuration"
-	}
-	return strings.Join(domains, ", ")
-}
-
-// nameserverReachable reports whether every address of a nameserver lies inside the
-// advertised routes. An address-less nameserver (reachable only by name) is NOT treated
-// as reachable, because resolving that name would itself need a resolver.
-func nameserverReachable(nameserver masque.DNSNameserver, routes []masque.AddressRange) bool {
-	addresses := append(append([]netip.Addr(nil), nameserver.IPv4Addresses...), nameserver.IPv6Addresses...)
-	if len(addresses) == 0 {
-		// # The one case where a name-only nameserver IS usable
-		//
-		// An encrypted resolver reached by name does not need its address to be inside the
-		// tunnel's routes, because it is reached over the MASQUE HTTP/3 connection -- a
-		// request stream, not a tunnel-routed packet -- and the same-origin check on that
-		// connection is what constrains it, not the routing table.
-		//
-		// Every other shape needs an address to dial, and an address outside the routes
-		// would leave the tunnel. So a name-only nameserver is accepted only when it
-		// advertises DoH, which is the transport this client can actually carry.
-		return nameserverUsesSameH3DoH(nameserver)
-	}
-	for _, address := range addresses {
-		if !isReachableThroughRoutes(address, routes) {
-			return false
-		}
-	}
-	return true
-}
-
-// nameserverUsesSameH3DoH reports whether a nameserver offers the same-connection DoH path.
+// resolverCapability describes what this client can currently do, which decides whether an
+// advertised transport is usable.
 //
-// It mirrors assignedResolverEndpoint.selectTransport deliberately: reachability is decided
-// on the wire types before the runtime model exists, so the two must agree about what
-// "encrypted, over this connection" means. A domain name is required because that is the
-// origin the TLS certificate is verified against, and a dohpath is required because that is
-// the resource a query is POSTed to.
-func nameserverUsesSameH3DoH(nameserver masque.DNSNameserver) bool {
-	if nameserver.AuthenticationDomainName == "" {
-		return false
+// # The tunnel's transport, not the CONFIGURED version
+//
+// draft-06 §3.5 asks that DoH be coalesced over the same HTTPS connection as the tunnel. That
+// is only honest if the tunnel really is that connection, and the configured protocol version
+// is not the same fact: transport/http falls back from H3 to H2, so an endpoint configured for
+// version 3 can end up on an H2 tunnel while the H3 code path still exists.
+//
+// Reporting "the tunnel is H3" from the configuration would therefore be a guess, and the
+// consequence of guessing wrong is that a DNS query DIALS A SECOND H3 CONNECTION. So the fact
+// is asked of the HTTP client, which owns the connection, and it is false until proven
+// otherwise.
+func (c *ClientEndpoint) resolverCapability(routes []masque.AddressRange) resolverCapability {
+	capability := resolverCapability{routes: append([]masque.AddressRange(nil), routes...)}
+	if c.httpClient == nil {
+		return capability
 	}
-	if _, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamKey(9)]; !loaded {
-		return false
+	authority, tunnelIsHTTP3 := c.httpClient.HTTP3ConnectionState()
+	if !tunnelIsHTTP3 || authority == "" {
+		return capability
 	}
-	alpn, loaded := nameserver.ServiceParameters[dnsmessage.SVCParamALPN]
-	if !loaded || len(alpn) == 0 {
-		return false
-	}
-	for _, protocol := range decodeALPNList(alpn) {
-		if protocol == "h2" || protocol == "h3" {
-			return true
-		}
-	}
-	return false
-}
-
-func nameserverAddressString(nameserver masque.DNSNameserver) string {
-	if len(nameserver.IPv4Addresses) > 0 {
-		return nameserver.IPv4Addresses[0].String()
-	}
-	if len(nameserver.IPv6Addresses) > 0 {
-		return nameserver.IPv6Addresses[0].String()
-	}
-	if nameserver.AuthenticationDomainName != "" {
-		return nameserver.AuthenticationDomainName
-	}
-	return "<none>"
+	capability.tunnelIsHTTP3 = true
+	capability.sameH3Authorities = []string{authority}
+	return capability
 }
 
 func (c *ClientEndpoint) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {
@@ -585,29 +513,59 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 	return c.device.DialContext(ctx, network, destination)
 }
 
-// lookupInner resolves a domain reached through the tunnel, applying the resolver
-// precedence in one place so the TCP and UDP paths cannot disagree about it.
+// lookupInner resolves a domain reached through the tunnel, applying the resolver precedence
+// in one place so the TCP and UDP paths cannot disagree about it.
 //
-//	explicit inner_domain_resolver   (highest)
-//	server-pushed DNS_ASSIGN
-//	normal DNS Router rules          (default)
+// # The precedence, and the distinction that makes it safe
 //
-// The assigned resolver is installed into the query options as a TRANSPORT rather than
-// replacing the router, so the DNS client's cache, TTL handling, negative cache,
-// singleflight and optimistic cache all still apply. Only the wire changes: instead of
-// the configured upstream, the query goes to the server-assigned nameserver through the
-// tunnel.
+//	explicit inner_domain_resolver        (highest: the operator's choice is the trusted one)
+//	        >
+//	DNS_ASSIGN, when it CLAIMS this name
+//	        >
+//	normal DNS Router rules               (default)
 //
-// Fail-closed is inherited rather than re-implemented: if the assigned transport cannot
-// reach its nameserver, its Exchange returns an error and the lookup FAILS. There is no
-// path here that would retry the query against a host resolver, which is the leak the
-// assigned transport exists to prevent.
+// The middle line is the one that matters, and it is why the decision is made on the CLAIM
+// rather than on the assignment's mere presence.
+//
+//	draft-06 §3.5: "Sending an empty string as an internal domain indicates the DNS root"
+//	draft-06 §3.6.2: a split-tunnel configuration claims "internal.corp.example" and nothing
+//	                 else, so public names must resolve normally
+//
+// An earlier version asked only "is an assignment active". That made every name assigned-DNS
+// traffic, so in a split tunnel a public name was sent to the internal resolver -- which then
+// refused it, because no configuration claimed it. Public resolution broke, and the failure
+// looked like a server fault rather than a routing mistake.
+//
+// # Claimed and unclaimed are different, and a claimed failure must NOT fall back
+//
+//	UNCLAIMED name -> the ordinary rules. The server never said this was its business.
+//	CLAIMED name   -> the assigned resolver, or FAILURE. Never the ordinary rules.
+//
+// The second rule is the privacy invariant of split DNS. A claimed name belongs to a resolver
+// the server nominated; if that resolver is unreachable, unsupported, or erroring, sending the
+// query to a public resolver would leak an internal name -- and would do so precisely when the
+// internal path is broken, which is when it is least expected. So a claimed name never falls
+// through. `assignedDNS.claimsName` answers the ownership question WITHOUT reference to
+// usability, which is what stops a temporarily unreachable resolver from quietly converting an
+// internal name into a public one.
 func (c *ClientEndpoint) lookupInner(ctx context.Context, domain string) ([]netip.Addr, error) {
-	queryOptions := c.innerQueryOptions
-	if queryOptions.Transport == nil && c.assignedDNS.active() {
-		queryOptions.Transport = c.assignedDNS
+	// 1. An explicit resolver wins outright: the operator has already said where queries go,
+	//    and a server must not be able to override that.
+	if c.innerQueryOptions.Transport != nil {
+		return c.dnsRouter.Lookup(ctx, domain, c.innerQueryOptions)
 	}
-	return c.dnsRouter.Lookup(ctx, domain, queryOptions)
+
+	// 2. The server's assignment, but ONLY for names it claims.
+	if c.assignedDNS.claimsName(domain) {
+		queryOptions := c.innerQueryOptions
+		queryOptions.Transport = c.assignedDNS
+		// No fallback here by construction: the router will use this transport, and if it
+		// fails the lookup fails.
+		return c.dnsRouter.Lookup(ctx, domain, queryOptions)
+	}
+
+	// 3. Unclaimed. The ordinary rules, which is the entire point of a split tunnel.
+	return c.dnsRouter.Lookup(ctx, domain, c.innerQueryOptions)
 }
 
 // dialResolved connects to one of the addresses the resolver returned.

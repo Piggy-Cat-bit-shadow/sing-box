@@ -53,7 +53,89 @@ type http3RequestRoundTripper interface {
 	RoundTripHTTP3(ctx context.Context, request *http.Request) (*http.Response, error)
 }
 
-var _ http3RequestRoundTripper = (*http3ClientImpl)(nil)
+// http3ExistingConnectionRoundTripper is the narrower capability for callers that must use an
+// ALREADY ESTABLISHED HTTP/3 connection and must never cause one to be created.
+//
+// # Why this is separate from RoundTripHTTP3
+//
+// RoundTripHTTP3 calls acquire(), which dials when no live connection exists. That is right
+// for a caller that owns the connection's lifecycle, but wrong for MASQUE's assigned-DNS
+// path: draft-ietf-masque-connect-ip-dns-06 §3.5 asks for DoH to be COALESCED over the
+// connection the CONNECT-IP tunnel already uses, and dialing a second connection purely to
+// carry DNS would defeat the purpose while creating an extra, observable connection.
+//
+// So the requirement is expressed in the type system rather than left to the caller's
+// discipline: this method reports whether a live connection exists and refuses to create one.
+type http3ExistingConnectionRoundTripper interface {
+	// RoundTripExistingHTTP3 issues a request only if an HTTP/3 connection is already
+	// established and alive. It must not dial.
+	RoundTripExistingHTTP3(ctx context.Context, request *http.Request) (*http.Response, error)
+	// HTTP3ConnectionAuthority reports the authority of the live HTTP/3 connection, or
+	// false when there is none.
+	HTTP3ConnectionAuthority() (string, bool)
+}
+
+var (
+	_ http3RequestRoundTripper            = (*http3ClientImpl)(nil)
+	_ http3ExistingConnectionRoundTripper = (*http3ClientImpl)(nil)
+)
+
+// HTTP3ConnectionState reports whether the tunnel is currently running over HTTP/3, and the
+// authority that connection is authenticated for.
+//
+// # Why the caller needs this
+//
+// "This client can do HTTP/3" and "this tunnel IS HTTP/3" are different facts. transport/http
+// falls back from HTTP/3 to HTTP/2, so an endpoint configured for version 3 can end up with an
+// HTTP/2 tunnel while the HTTP/3 code path still exists. A caller that conflated the two would
+// ask for a same-connection DoH request on an HTTP/2 tunnel and silently get a NEW HTTP/3
+// connection instead -- a second connection that the CONNECT-IP traffic does not share.
+//
+// The authority is returned alongside because same-origin reuse is only meaningful against the
+// origin the connection was actually verified for.
+func (c *Client) HTTP3ConnectionState() (string, bool) {
+	if c.http3 == nil {
+		return "", false
+	}
+	provider, isProvider := c.http3.(http3ExistingConnectionRoundTripper)
+	if !isProvider {
+		return "", false
+	}
+	authority, live := provider.HTTP3ConnectionAuthority()
+	if !live {
+		return "", false
+	}
+	// The connection's own authority is what matters, falling back to the configured one when
+	// the implementation does not track it separately.
+	if authority == "" {
+		authority = c.http3Authority
+	}
+	if authority == "" {
+		return "", false
+	}
+	return authority, true
+}
+
+// RoundTripExistingHTTP3 issues a request only on an already-established HTTP/3 connection.
+//
+// It is the same-connection DoH entry point: see http3ExistingConnectionRoundTripper for why
+// it must not dial.
+func (c *Client) RoundTripExistingHTTP3(ctx context.Context, request *http.Request) (*http.Response, error) {
+	if c.http3 == nil {
+		return nil, E.Cause1(ErrHTTP3Unavailable, E.New("this client is not using HTTP/3"))
+	}
+	roundTripper, isRoundTripper := c.http3.(http3ExistingConnectionRoundTripper)
+	if !isRoundTripper {
+		return nil, E.Cause1(ErrHTTP3Unavailable, E.New("this HTTP/3 client does not support existing-connection requests"))
+	}
+	if _, live := c.HTTP3ConnectionState(); !live {
+		return nil, E.Cause1(ErrHTTP3Unavailable, E.New("no live HTTP/3 connection"))
+	}
+	if err := c.validateSameOrigin(request); err != nil {
+		return nil, err
+	}
+	return roundTripper.RoundTripExistingHTTP3(ctx, request)
+}
 
 // RoundTripHTTP3 issues a request over HTTP/3 on this client's existing connection.
 //
@@ -208,6 +290,17 @@ func (c *http3ClientImpl) openRequestStream(ctx context.Context, request *http.R
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	return c.openRequestStreamOn(ctx, clientConn, request)
+}
+
+// openRequestStreamOn issues a request on a connection the caller already holds.
+//
+// Splitting this out is what lets the same-connection path share the entire request mechanism
+// while differing in exactly one respect: where the connection comes from. acquire() dials
+// when there is none; existingConn() reports failure. Everything after that -- stream
+// opening, cancellation scoping, body handling, response wiring -- is identical, which is
+// what keeps the two paths from drifting apart.
+func (c *http3ClientImpl) openRequestStreamOn(ctx context.Context, clientConn *http3.ClientConn, request *http.Request) (*http3.RequestStream, *http3.ClientConn, *http.Response, error) {
 	if request.Body != nil && request.Body != http.NoBody {
 		// See roundTripWithBody: a body-bearing request cannot go through
 		// RequestStream, because its header must be written by quic-go's own request
@@ -363,6 +456,35 @@ func readRequestResponse(ctx context.Context, clientConn *http3.ClientConn, stre
 		return nil, E.Cause(err, "close HTTP/3 request stream")
 	}
 	return stream.ReadResponse()
+}
+
+// RoundTripExistingHTTP3 issues a request on the connection this client ALREADY holds.
+//
+// It is the same-connection DoH entry point. Unlike RoundTripHTTP3 it never dials: if no live
+// connection exists it reports HTTP/3 unavailable, because creating one here would produce a
+// second connection that the CONNECT-IP tunnel does not share, which is precisely what
+// draft-ietf-masque-connect-ip-dns-06 §3.5's coalescing requirement exists to avoid.
+func (c *http3ClientImpl) RoundTripExistingHTTP3(ctx context.Context, request *http.Request) (*http.Response, error) {
+	clientConn, live := c.existingConn()
+	if !live {
+		return nil, E.Cause1(ErrHTTP3Unavailable, E.New("no live HTTP/3 connection to reuse"))
+	}
+	stream, _, response, err := c.openRequestStreamOn(ctx, clientConn, request)
+	if err != nil {
+		return nil, E.Cause(err, "HTTP/3 request on existing connection")
+	}
+	if response == nil {
+		releaseStream(stream, nil)
+		return nil, E.New("HTTP/3 request returned no response")
+	}
+	originalBody := response.Body
+	response.Body = &streamBoundBody{
+		Reader: originalBody,
+		closer: func() {
+			releaseStream(stream, originalBody)
+		},
+	}
+	return response, nil
 }
 
 // RoundTripHTTP3 performs a generic request on this client's existing HTTP/3 connection.
