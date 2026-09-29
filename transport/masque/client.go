@@ -49,6 +49,26 @@ type ClientHandler interface {
 	FrontHeadroom() int
 }
 
+// ClientHandlerWithTunnelTransport is an OPTIONAL extra capability of a ClientHandler.
+//
+// # Why the session reports this rather than the handler guessing
+//
+// "This HTTP client can speak HTTP/3", "this HTTP client currently holds a live HTTP/3
+// connection", and "THIS tunnel session was established over HTTP/3" are three different facts.
+// A handler that inferred the third from either of the first two would be wrong whenever the
+// tunnel path fell back: the fallback leaves an H3 connection object in place from an earlier
+// success while the session itself runs over HTTP/2.
+//
+// That distinction has a concrete consequence for MASQUE DNS, so the session -- which is the
+// only component that knows which branch actually succeeded -- reports it. A handler that does
+// not implement this interface is unaffected; it simply never learns the transport.
+type ClientHandlerWithTunnelTransport interface {
+	// UpdateTunnelTransport reports the protocol the current session was established over.
+	// It is called once per established session, and with TunnelTransportUnknown when the
+	// session ends, so a stale value cannot outlive the session it described.
+	UpdateTunnelTransport(ctx context.Context, transport transportHTTP.TunnelTransport)
+}
+
 type ClientOptions struct {
 	Context         context.Context
 	Logger          logger.ContextLogger
@@ -119,6 +139,10 @@ type clientSession struct {
 	access        sync.Mutex
 	configuration Configuration
 	ready         bool
+	// tunnelTransport is the protocol THIS session was established over, recorded where it
+	// was decided. It is per-session state rather than client state, so a replaced session
+	// cannot inherit the previous one's transport.
+	tunnelTransport transportHTTP.TunnelTransport
 	// state is the lock-free read view. It is written only under access and
 	// always with a complete, immutable snapshot.
 	state atomic.Pointer[sessionState]
@@ -199,6 +223,18 @@ func (c *Client) Close() error {
 	return c.httpClient.Close()
 }
 
+// notifyTunnelTransport reports the session transport to a handler that asked for it.
+//
+// The optional interface keeps every existing handler working: one that does not implement it
+// simply never learns the transport, which is the same as before this existed.
+func (c *Client) notifyTunnelTransport(tunnelTransport transportHTTP.TunnelTransport) {
+	handler, wantsTransport := c.handler.(ClientHandlerWithTunnelTransport)
+	if !wantsTransport {
+		return
+	}
+	handler.UpdateTunnelTransport(c.ctx, tunnelTransport)
+}
+
 func (c *Client) notifyStateLocked() {
 	close(c.stateUpdated)
 	c.stateUpdated = make(chan struct{})
@@ -261,7 +297,7 @@ func (c *Client) loop() {
 
 func (c *Client) connect() (bool, error) {
 	dialCtx, cancelDial := context.WithTimeout(c.ctx, C.TCPTimeout)
-	stream, err := c.httpClient.OpenTunnel(dialCtx, upgradeToken, c.template.Expand())
+	stream, tunnelTransport, err := c.httpClient.OpenTunnelWithInfo(dialCtx, upgradeToken, c.template.Expand())
 	cancelDial()
 	if err != nil {
 		return false, err
@@ -285,8 +321,13 @@ func (c *Client) connect() (bool, error) {
 		return false, nil
 	}
 	current.session = newSession(c.ctx, stream, current, c.handler.FrontHeadroom)
+	current.tunnelTransport = tunnelTransport
 	c.current = current
 	c.access.Unlock()
+	// Report the transport the session was actually established over, now that it is the
+	// current one. The handler may use it to decide whether a same-connection transport is
+	// available; it must never have to infer that from which connection objects exist.
+	c.notifyTunnelTransport(tunnelTransport)
 	err = current.writeCapsule(newAddressCapsule(capsuleTypeAddressRequest, []AssignedAddress{
 		{RequestID: 1, Prefix: netip.PrefixFrom(netip.IPv4Unspecified(), 32)},
 		{RequestID: 2, Prefix: netip.PrefixFrom(netip.IPv6Unspecified(), 128)},
@@ -301,6 +342,10 @@ func (c *Client) connect() (bool, error) {
 	c.access.Lock()
 	c.current = nil
 	c.access.Unlock()
+	// The session is over, so the transport fact it carried is no longer true. Reporting
+	// Unknown rather than leaving the last value in place is what stops a handler from
+	// treating a finished H3 session as a live one.
+	c.notifyTunnelTransport(transportHTTP.TunnelTransportUnknown)
 	// The session is finished: clear ready so a reader that still holds the
 	// pointer observes the tunnel as not-ready rather than as the state it had
 	// while it was up.

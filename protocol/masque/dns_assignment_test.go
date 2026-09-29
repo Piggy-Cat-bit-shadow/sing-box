@@ -252,9 +252,10 @@ func TestAddresslessDoHIsUsableOnAnH3Tunnel(t *testing.T) {
 	decision := onH3.decide("example.com.")
 	require.True(t, decision.usable, "the draft's full-tunnel example must be usable")
 	resolver := decision.configuration.resolvers[0]
-	require.Equal(t, assignedTransportDoH, resolver.transport)
-	require.Equal(t, "/dns-query", resolver.expandedPath, "the URI Template is expanded for POST")
-	require.Empty(t, resolver.usableAddresses, "same-connection DoH uses no nameserver address")
+	require.NotNil(t, resolver.doh, "the DoH capability must be compiled")
+	require.Equal(t, "/dns-query", resolver.doh.path, "the URI Template is expanded for POST")
+	require.Equal(t, "masque.example.org", resolver.doh.authority)
+	require.Nil(t, resolver.plain, "there is no address, so there is no plain DNS capability")
 
 	// On an H2 tunnel the same advertisement cannot be used: same-H3 DoH is unavailable and
 	// there is no address for plain DNS.
@@ -273,9 +274,9 @@ func TestSameOriginIsRequiredForDoH(t *testing.T) {
 	nameserver := dohResolver(1, "dns-a.example.", "/dns-query{?dns}", "192.0.2.1")
 	snapshot := compile(t, h3Capability("masque.example.org"), []string{""}, nameserver)
 	resolver := snapshot.decide("example.com.").configuration.resolvers[0]
-	require.NotEqual(t, assignedTransportDoH, resolver.transport,
+	require.Nil(t, resolver.doh,
 		"a different origin must not ride on the tunnel's credentials")
-	require.Equal(t, assignedTransportPlainUDP, resolver.transport,
+	require.NotNil(t, resolver.plain,
 		"it falls back to plain DNS, which its address and the routes allow")
 }
 
@@ -300,7 +301,7 @@ func TestTrailingRootDotNormalization(t *testing.T) {
 		t.Run(testCase.authority+" vs "+testCase.authDomain, func(t *testing.T) {
 			t.Parallel()
 			capability := h3Capability(testCase.authority)
-			require.Equal(t, testCase.shouldMatch, capability.sameH3AvailableFor(testCase.authDomain), testCase.reason)
+			require.Equal(t, testCase.shouldMatch, capability.sameH3OriginAvailable(testCase.authDomain), testCase.reason)
 		})
 	}
 }
@@ -421,15 +422,15 @@ func TestIdentityIsStableAndEffective(t *testing.T) {
 	nameserver := plainResolver(1, "192.0.2.1")
 	first := compile(t, plainCapability(), []string{"corp.example."}, nameserver)
 	second := compile(t, plainCapability(), []string{"corp.example."}, nameserver)
-	require.Equal(t, first.identity, second.identity,
+	require.Equal(t, first.configurations[0].effectiveIdentity(), second.configurations[0].effectiveIdentity(),
 		"an identical assignment must produce an identical identity, so a repeated capsule does not invalidate the DNS cache")
 
 	differentClaim := compile(t, plainCapability(), []string{"other.example."}, nameserver)
-	require.NotEqual(t, first.identity, differentClaim.identity,
+	require.NotEqual(t, first.configurations[0].effectiveIdentity(), differentClaim.configurations[0].effectiveIdentity(),
 		"changing which names are claimed changes answers")
 
 	differentResolver := compile(t, plainCapability(), []string{"corp.example."}, plainResolver(1, "192.0.2.2"))
-	require.NotEqual(t, first.identity, differentResolver.identity)
+	require.NotEqual(t, first.configurations[0].effectiveIdentity(), differentResolver.configurations[0].effectiveIdentity())
 }
 
 // TestIdentityChangesWhenUsabilityChanges proves a route change that disables a resolver is
@@ -443,7 +444,7 @@ func TestIdentityChangesWhenUsabilityChanges(t *testing.T) {
 		Start: netip.MustParseAddr("172.16.0.0"), End: netip.MustParseAddr("172.16.0.255"), Protocol: protocolAll,
 	}}}, []string{""}, nameserver)
 
-	require.NotEqual(t, usable.identity, unusable.identity,
+	require.NotEqual(t, usable.configurations[0].effectiveIdentity(), unusable.configurations[0].effectiveIdentity(),
 		"a resolver becoming unreachable changes where queries go, so cached answers must not be reused")
 }
 
@@ -473,8 +474,8 @@ func TestRouteProtocolMatters(t *testing.T) {
 	decision := udpOnly.decide("example.com.")
 	require.True(t, decision.usable)
 	resolver := decision.configuration.resolvers[0]
-	require.Len(t, resolver.usableAddresses, 1)
-	require.Empty(t, resolver.tcpAddresses,
+	require.Len(t, resolver.plain.udpAddresses, 1)
+	require.Empty(t, resolver.plain.tcpAddresses,
 		"the TCP retry is correctly reported as unavailable rather than silently leaving the tunnel")
 }
 
@@ -492,8 +493,8 @@ func TestAllUsableAddressesAreKept(t *testing.T) {
 	resolver := compile(t, plainCapability(), []string{""},
 		plainResolver(1, "192.0.2.1", "192.0.2.2", "2001:db8::1")).
 		decide("example.com.").configuration.resolvers[0]
-	require.Len(t, resolver.usableAddresses, 3)
-	require.Len(t, resolver.tcpAddresses, 3)
+	require.Len(t, resolver.plain.udpAddresses, 3)
+	require.Len(t, resolver.plain.tcpAddresses, 3)
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +718,7 @@ func TestConfigurationTransportTriesEveryAddress(t *testing.T) {
 	snapshot := compile(t, plainCapability(), []string{""},
 		plainResolver(1, "10.0.0.1", "10.0.0.2"))
 	configuration := snapshot.decide("multi.example.test.").configuration
-	require.Len(t, configuration.resolvers[0].usableAddresses, 2)
+	require.Len(t, configuration.resolvers[0].plain.udpAddresses, 2)
 
 	transport := newConfigurationDNSTransport(logger.NOP(), dialer, "test", configuration, nil)
 	_, err := transport.Exchange(testContext(t), query)

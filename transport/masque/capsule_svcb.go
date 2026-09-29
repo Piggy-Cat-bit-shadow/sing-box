@@ -107,7 +107,7 @@ type ParsedServiceParameters struct {
 //     extension adds `alpn`, because a client that ignores `alpn` would select a transport
 //     the server never offered. That choice is recorded in
 //     ValidateServiceParameters and in the docs.
-func (p ParsedServiceParameters) mandatoryKey(key dnsmessage.SVCParamKey) bool {
+func (p ParsedServiceParameters) MandatoryKey(key dnsmessage.SVCParamKey) bool {
 	for _, listed := range p.Mandatory {
 		if listed == key {
 			return true
@@ -262,19 +262,78 @@ func ValidateServiceParameters(nameserver DNSNameserver) (ParsedServiceParameter
 // configuration. Silently ignoring the requirement is what RFC 9460 §8 forbids.
 func checkMandatoryRecognised(nameserver DNSNameserver, parsed ParsedServiceParameters) error {
 	for _, key := range parsed.Mandatory {
-		if _, known := SvcParamKeyNames[key]; !known {
+		if !isKnownSvcParam(key) {
+			// A key we do not even recognise cannot have its requirement honoured, because we
+			// do not know what the requirement is.
 			return E.New("mandatory lists unknown key ", SvcParamKeyName(key),
 				", which this client cannot honour")
 		}
+		if !isSupportedMandatorySvcParam(key) {
+			// KNOWN IS NOT SUPPORTED. A key whose name we recognise, but whose semantics we do
+			// not implement, is just as impossible to honour -- and worse, because a name in
+			// the registry creates the impression that it works.
+			//
+			// ECH is the concrete case. This client does not fetch, validate or apply an
+			// Encrypted ClientHello configuration, so a server declaring it mandatory is
+			// saying the connection will not work correctly if it is ignored. It will not, so
+			// the resolver is incompatible.
+			return E.New("mandatory lists ", SvcParamKeyName(key),
+				", which this client recognises but does not implement")
+		}
 	}
-	// A key we know but cannot serve is equally incompatible, whether it was listed
-	// explicitly or is automatically mandatory.
-	if parsed.mandatoryKey(svcParamALPN) || parsed.mandatoryKey(svcParamNoDefaultALPN) {
+	// A key we know and support may still be unsupportable for THIS resolver, which is a
+	// different failure: the transport it names is absent.
+	if parsed.MandatoryKey(svcParamALPN) || parsed.MandatoryKey(svcParamNoDefaultALPN) {
 		if err := requireUsableTransportALPN(parsed.ALPN); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// isKnownSvcParam reports whether the key has a name this client recognises.
+//
+// This is a statement about the REGISTRY, not about the implementation. See
+// isSupportedMandatorySvcParam for the distinction that mandatory keys actually require.
+func isKnownSvcParam(key dnsmessage.SVCParamKey) bool {
+	_, known := SvcParamKeyNames[key]
+	return known
+}
+
+// isSupportedMandatorySvcParam reports whether this client can actually honour a key's
+// requirement as a mandatory key.
+//
+// # The rule, applied one key at a time
+//
+// A key belongs here only if ignoring it would change the connection in a way we would get
+// wrong -- and only if we do the right thing instead. Auditing every key this client names:
+//
+//	mandatory       RFC 9460 §8: always automatically mandatory and must not list itself. It is
+//	                handled by its own encoding rules, never "honoured" per se, so it never
+//	                appears in this set.
+//	alpn            SUPPORTED. We select transports from it, and refuse a set naming only
+//	                transports we lack. See requireUsableTransportALPN.
+//	no-default-alpn SUPPORTED. It withdraws the plain transport, and we honour that by refusing
+//	                rather than falling back to cleartext.
+//	port            SUPPORTED. Honoured for both plain DNS and DoH; a malformed length is
+//	                rejected rather than defaulted.
+//	dohpath         SUPPORTED. Required by RFC 9461 to expand to a valid HTTP path, and we
+//	                validate and expand it or refuse the resolver.
+//	ipv4hint        NOT APPLICABLE. draft-06 forbids the key outright, so a resolver carrying it
+//	ipv6hint        is rejected during parameter validation before mandatory is consulted.
+//	ech             NOT SUPPORTED. Recognised so the error can name it, but this client performs
+//	                no ECH handshake, so a mandatory ECH cannot be honoured.
+//	anything else   NOT SUPPORTED. Unknown keys are unhonourable by definition.
+//
+// A key that is present but NOT mandatory may still be unused: ipv4hint would be rejected as
+// malformed, and an unknown optional key is ignored per RFC 9460 §2.4.3.
+func isSupportedMandatorySvcParam(key dnsmessage.SVCParamKey) bool {
+	switch key {
+	case svcParamALPN, svcParamNoDefaultALPN, svcParamPort, svcParamDohPath:
+		return true
+	default:
+		return false
+	}
 }
 
 // requireUsableTransportALPN refuses an ALPN set that names only transports this client lacks.

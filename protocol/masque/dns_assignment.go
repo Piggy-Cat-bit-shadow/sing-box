@@ -40,11 +40,14 @@ import (
 // what makes replacement safe without refcounts, retirement queues or delayed cleanup.
 type dnsAssignmentSnapshot struct {
 	// configurations are in wire order, each with its claims compiled.
+	//
+	// There is deliberately NO top-level identity field. The DNS cache key is the PER
+	// CONFIGURATION identity, because a lookup has already been bound to one configuration by
+	// the time a query runs: the policy decision is what selects it, and the cache only needs to
+	// distinguish the resolver behaviour of the configuration actually used. A whole-assignment
+	// fingerprint would invalidate that configuration's cached answers when an unrelated
+	// configuration changed.
 	configurations []dnsConfigurationSnapshot
-	// identity is the deterministic fingerprint of the EFFECTIVE resolver behaviour. Two
-	// snapshots with the same identity would answer identically, so publishing the second one
-	// is not a change worth invalidating a DNS cache for.
-	identity string
 }
 
 // dnsConfigurationSnapshot is one DNS Configuration, compiled for query-time use.
@@ -84,18 +87,108 @@ type dnsResolverSnapshot struct {
 	dohPath      string
 	expandedPath string
 	hasDohPath   bool
+	// dohPathErr records why an advertised template is unusable. Non-empty means the DoH
+	// capability cannot be compiled, which does NOT by itself make the resolver unusable: a
+	// resolver that also offers plain DNS is still usable.
+	dohPathErr string
 	// mandatory lists the additional mandatory SvcParamKeys the server declared.
 	mandatory []dnsmessage.SVCParamKey
-	// unusable records why this resolver cannot serve queries, with unusableNone meaning it
-	// can. Computing it once keeps selection and environment reporting from disagreeing.
+	// doh is the same-connection DoH capability, or nil when this resolver cannot use that
+	// transport. A pointer-free boolean would be cheaper but this keeps the authority and path
+	// together with the fact that they are usable.
+	doh *compiledDoH
+	// plain is the plain DNS capability, or nil when this resolver cannot use that transport.
+	plain *compiledPlain
+	// unusable records why this resolver cannot serve queries AT ALL, with unusableNone
+	// meaning at least one capability is available.
+	//
+	// It is derived from the two capabilities rather than replacing them. An earlier model
+	// collapsed a resolver to a single transport at compile time, which meant a resolver that
+	// offered BOTH same-connection DoH and plain DNS permanently lost the plain path as soon as
+	// DoH was selected -- so a DoH failure at query time could not fall back to a transport the
+	// server had explicitly advertised.
 	unusable unusableReason
-	// transport is the transport that will be used, valid when usable.
-	transport assignedTransport
-	// usableAddresses are the addresses plain DNS may use: routable through the tunnel for
-	// UDP. Empty for same-connection DoH, which needs no address at all.
-	usableAddresses []netip.Addr
-	// tcpAddresses are the addresses the truncated-answer retry may use.
+}
+
+// compiledDoH is the same-connection DoH capability of one resolver.
+type compiledDoH struct {
+	// authority is the full origin a request is addressed to: normalized host plus the
+	// effective port. It is built once so the compile-time capability decision and the
+	// runtime same-origin check cannot disagree about what origin this resolver names.
+	authority string
+	// path is the RFC 8484 POST expansion of the advertised dohpath.
+	path string
+}
+
+// compiledPlain is the plain DNS capability of one resolver.
+type compiledPlain struct {
+	// udpAddresses are the addresses routable through the tunnel for UDP. Empty means plain
+	// DNS cannot be used at all.
+	udpAddresses []netip.Addr
+	// tcpAddresses are the addresses routable for the truncated-answer retry. It may be empty
+	// while udpAddresses is not, in which case UDP works but a truncated answer cannot be
+	// retried -- which is a legitimate partial capability rather than an error.
 	tcpAddresses []netip.Addr
+}
+
+// usable reports whether this resolver can serve a query at all.
+func (r dnsResolverSnapshot) usable() bool {
+	return r.doh != nil || r.plain != nil
+}
+
+// transportPreference returns the capabilities in the order they should be attempted.
+//
+// # Why DoH first, and why that is not an invented preference
+//
+// draft-06 §3.5 says that when the proxy is authoritative for the DoH origin, the client SHOULD
+// send its queries there and SHOULD coalesce them over the tunnel's connection. That is a
+// stated preference for the encrypted same-connection transport when it is available, so DoH is
+// tried first and plain DNS follows.
+//
+// The order also has a practical justification that does not depend on reading a preference
+// into the draft: the two are not equivalent fallbacks. Plain DNS is what the server offers by
+// default, while DoH is the one that keeps queries on the connection the tunnel already uses.
+// Preferring it when possible is the point of the coalescing requirement, and falling back to
+// plain is still permitted whenever the server left the default transport available.
+func (r dnsResolverSnapshot) transportPreference() []assignedTransport {
+	preference := make([]assignedTransport, 0, 2)
+	if r.doh != nil {
+		preference = append(preference, assignedTransportDoH)
+	}
+	if r.plain != nil {
+		preference = append(preference, assignedTransportPlainUDP)
+	}
+	return preference
+}
+
+// hasALPN reports whether the advertised ALPN set contains a protocol.
+//
+// The comparison is exact: ALPN identifiers are opaque byte strings (RFC 7301), so there is no
+// case folding or trimming to do. `H3` is not `h3`.
+func (r dnsResolverSnapshot) hasALPN(protocol string) bool {
+	for _, advertised := range r.alpn {
+		if advertised == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+// dohAuthority builds the origin this resolver's DoH requests are addressed to.
+//
+// The port is part of the origin, not a detail applied later: `masque.example` on 443 and
+// `masque.example` on 8443 are different origins, and comparing only host names would let a
+// request be sent to an origin the connection was never authenticated for.
+//
+// The port is the advertised one when present, otherwise the HTTPS default. RFC 9461 makes
+// `port` automatically mandatory, so an advertised port is honoured rather than replaced.
+func (r dnsResolverSnapshot) dohAuthority() string {
+	host := normalizeHostName(r.authenticationDomainName)
+	port := r.dohPort()
+	if port == 443 {
+		return host
+	}
+	return joinAuthority(host, port)
 }
 
 // assignedTransport names a DNS transport this client can use.
@@ -268,14 +361,18 @@ type resolverCapability struct {
 	routes []masque.AddressRange
 }
 
-// sameH3AvailableFor reports whether a resolver's origin can be served on the existing H3
-// connection.
-func (c resolverCapability) sameH3AvailableFor(authenticationDomainName string) bool {
-	if !c.tunnelIsHTTP3 || authenticationDomainName == "" {
+// sameH3OriginAvailable reports whether a resolver's FULL origin matches the live H3
+// connection's.
+//
+// Both sides are complete origins: normalized host is not enough, because two authorities that
+// differ only by port are different origins and a request to the wrong one would arrive at a
+// server the connection was never authenticated for.
+func (c resolverCapability) sameH3OriginAvailable(resolverAuthority string) bool {
+	if !c.tunnelIsHTTP3 || resolverAuthority == "" {
 		return false
 	}
 	for _, authority := range c.sameH3Authorities {
-		if sameOriginHost(authority, authenticationDomainName) {
+		if sameOrigin(authority, resolverAuthority) {
 			return true
 		}
 	}
@@ -302,7 +399,6 @@ func compileDNSAssignment(configurations []masque.DNSConfiguration, capability r
 		}
 		snapshot.configurations = append(snapshot.configurations, compiled)
 	}
-	snapshot.identity = snapshot.effectiveIdentity()
 	return snapshot
 }
 
@@ -349,7 +445,7 @@ func normalizeSearchDomains(domains []string) []string {
 	return normalized
 }
 
-// compileResolver validates one nameserver and decides its transport.
+// compileResolver validates one nameserver and compiles its capabilities.
 func compileResolver(nameserver masque.DNSNameserver, capability resolverCapability) dnsResolverSnapshot {
 	resolver := dnsResolverSnapshot{
 		priority: nameserver.ServicePriority,
@@ -358,8 +454,8 @@ func compileResolver(nameserver masque.DNSNameserver, capability resolverCapabil
 		authenticationDomainName: nameserver.AuthenticationDomainName,
 	}
 
-	// The wire value was validated during parsing; re-validating here would mean two sources
-	// of truth. An error at this point means the value changed after parsing, which is a
+	// The wire value was validated during parsing; re-validating here would mean two sources of
+	// truth. An error at this point means the value changed after parsing, which is a
 	// programming error, so the resolver is marked unusable rather than trusted.
 	parameters, err := masque.ValidateServiceParameters(nameserver)
 	if err != nil {
@@ -376,67 +472,117 @@ func compileResolver(nameserver masque.DNSNameserver, capability resolverCapabil
 	if parameters.HasDohPath {
 		expanded, expandErr := masque.ExpandDohPathForPost(parameters.DohPath)
 		if expandErr != nil {
-			resolver.unusable = unusableServiceParams
-			return resolver
+			// The template is unusable, so the DoH capability cannot be compiled. That is
+			// recorded rather than returned: an advertised but broken dohpath must not by
+			// itself make a resolver that also offers plain DNS unusable.
+			resolver.dohPathErr = expandErr.Error()
+		} else {
+			resolver.expandedPath = expanded
 		}
-		resolver.expandedPath = expanded
 	}
 
-	resolver.transport, resolver.unusable = selectTransport(resolver, capability)
-	if resolver.unusable != unusableNone {
-		return resolver
-	}
-	if resolver.transport == assignedTransportPlainUDP {
-		resolver.usableAddresses = reachableForProtocol(resolver.addresses, capability.routes, protocolUDP)
-		if len(resolver.usableAddresses) == 0 {
-			resolver.unusable = unusableRouteUnreachable
-			return resolver
-		}
-		resolver.tcpAddresses = reachableForProtocol(resolver.addresses, capability.routes, protocolTCP)
-	}
+	resolver.doh, resolver.plain, resolver.unusable = compileCapabilities(resolver, capability)
 	return resolver
 }
 
-// selectTransport decides how a query reaches this resolver.
+// compileCapabilities decides which transports this resolver can actually use.
 //
-// # Order, and why
+// # The rules, and where each comes from
 //
-//  1. same-connection DoH, when the resolver's origin matches the live tunnel H3 connection.
-//     Checked FIRST because it is the transport draft-06 §3.5 asks for, and because it is the
-//     only one that needs no reachable address: the query travels as a request stream on a
-//     connection that already exists. This is what makes the draft's §3.6.1 full-tunnel example
-//     -- zero addresses, alpn=h2,h3, dohpath -- usable instead of a resolver that installs and
-//     then fails on its first query.
-//  2. plain DNS, which DOES need an address. Whether such an address is actually routable is
-//     checked by the caller, which has the routes.
+//	same-connection DoH requires ALL of:
+//	    a valid dohpath                        RFC 9461 §5
+//	    ALPN that explicitly includes h3       the transport must be named, not assumed
+//	    the current CONNECT-IP session IS h3   draft-06 §3.5 coalescing
+//	    this resolver's origin == the session's origin, INCLUDING the port
 //
-// draft-06 §3.2 defines unencrypted DNS as "UDP port 53 and TCP port 53", and states that
-// omitting no-default-alpn means the nameserver supports it. The rule's address requirement is
-// applied only when `alpn` is ABSENT, because the literal rule rejects the draft's own §3.6.1
-// example; that deviation is documented on ValidateServiceParameters.
-func selectTransport(resolver dnsResolverSnapshot, capability resolverCapability) (assignedTransport, unusableReason) {
-	if resolver.hasDohPath && capability.sameH3AvailableFor(resolver.authenticationDomainName) {
-		return assignedTransportDoH, unusableNone
-	}
-	if resolver.noDefaultALPN {
-		// The server withdrew the plain transport, and same-connection DoH was not available.
-		// Refusing is required; falling back to cleartext would violate the assignment.
-		return "", unusableNoTransport
-	}
-	if len(resolver.addresses) == 0 {
-		// No address and no usable DoH. The reason distinguishes "the server offered only an
-		// encrypted transport we cannot carry" from "there is simply nothing to reach", which
-		// is the difference between a capability gap and a malformed advertisement.
-		if resolver.hasDohPath {
-			return "", unusableNoTransport
+//	plain DNS requires ALL of:
+//	    the server did not withdraw it         no-default-alpn absent (draft-06 §3.2)
+//	    at least one address routable for UDP  otherwise the query leaves the tunnel
+//
+// # Why ALPN must name h3 explicitly
+//
+// An earlier version selected DoH from `hasDohPath` plus a live H3 connection, and never looked
+// at ALPN at all. That is wrong in a way that matters: a server advertising `alpn=h2` with a
+// dohpath was given an HTTP/3 request. The dohpath says WHERE to POST, not which protocol
+// carries it, and RFC 9460 §7.1.2 requires a client to connect only with protocols both sides
+// support.
+//
+// `h2` alone is therefore not enough either: this client implements same-connection DoH over
+// HTTP/3 only, and pretending an h2-only resolver is usable over H3 would be exactly the kind
+// of guess that produces a working-looking path to the wrong endpoint.
+//
+// # Why both capabilities are compiled
+//
+// A resolver may legitimately offer BOTH. Compiling only the preferred one would hide a
+// transport the server advertised as soon as the other became unavailable at query time, so
+// both are recorded and the executor walks them in order.
+func compileCapabilities(resolver dnsResolverSnapshot, capability resolverCapability) (doh *compiledDoH, plain *compiledPlain, reason unusableReason) {
+	// Same-connection DoH.
+	if resolver.hasDohPath && resolver.dohPathErr == "" {
+		authority := resolver.dohAuthority()
+		switch {
+		case !resolver.hasALPN("h3"):
+			// The server did not name HTTP/3, so an HTTP/3 request is not ours to make. A
+			// missing ALPN is the same refusal: absent is not a wildcard.
+			break
+		case !capability.tunnelIsHTTP3:
+			// The session is not carried over HTTP/3, so there is no shared connection to
+			// coalesce onto. This is a CAPABILITY gap, not a malformed advertisement, and the
+			// resolver may still be usable over plain DNS.
+			break
+		case !capability.sameH3OriginAvailable(authority):
+			// The resolver names a different origin than the connection was authenticated for.
+			// Sending the request would ride on credentials never presented for it.
+			break
+		default:
+			doh = &compiledDoH{authority: authority, path: resolver.expandedPath}
 		}
-		return "", unusableNoAddress
 	}
-	return assignedTransportPlainUDP, unusableNone
+
+	// Plain DNS.
+	if !resolver.noDefaultALPN && len(resolver.addresses) > 0 {
+		udpAddresses := reachableForProtocol(resolver.addresses, capability.routes, protocolUDP)
+		if len(udpAddresses) > 0 {
+			plain = &compiledPlain{
+				udpAddresses: udpAddresses,
+				tcpAddresses: reachableForProtocol(resolver.addresses, capability.routes, protocolTCP),
+			}
+		}
+	}
+
+	switch {
+	case doh != nil || plain != nil:
+		return doh, plain, unusableNone
+	case resolver.noDefaultALPN:
+		// The server withdrew the plain transport and no encrypted transport could be used.
+		// Refusing is required; falling back to cleartext would violate the assignment.
+		return nil, nil, unusableNoTransport
+	case resolver.hasDohPath:
+		// A DoH path was advertised but no usable transport came of it: the resolver offered
+		// only an encrypted transport this client cannot carry.
+		return nil, nil, unusableNoTransport
+	case len(resolver.addresses) == 0:
+		return nil, nil, unusableNoAddress
+	default:
+		// Addresses exist but none is routable for the protocols DNS needs.
+		return nil, nil, unusableRouteUnreachable
+	}
 }
 
-// effectiveIdentity is the deterministic fingerprint of what THIS configuration would do,
-// used as the DNS cache key by the transport bound to it.
+// effectiveIdentity is the deterministic fingerprint of what this configuration would DO.
+//
+// It is the DNS cache key of the transport bound to this configuration. It contains only facts
+// that can change an answer or where a query goes: the claims, the resolvers and their
+// metadata, and the COMPILED CAPABILITIES. It deliberately excludes PREF64, search domains,
+// capsule arrival order and any monotonic counter, so a repeated capsule or an unrelated update
+// does not discard cached answers.
+//
+// It is computed directly rather than through a whole-snapshot wrapper, because a lookup is
+// already bound to one configuration by the time a query runs: the policy decision selected it,
+// and the cache only needs to distinguish that configuration's resolver behaviour.
+//
+// The order is fixed by construction -- configurations and resolvers are in wire order and
+// fields are appended in a fixed sequence -- so Go map iteration cannot introduce instability.
 //
 // Two identical configurations produce the same value, so a repeated capsule does not invalidate
 // a cache, and a PREF64-only update cannot affect it because PREF64 is not part of a
@@ -445,68 +591,60 @@ func selectTransport(resolver dnsResolverSnapshot, capability resolverCapability
 // It DOES change when a route change makes a resolver unusable, because that changes where
 // queries actually go -- the one case that must invalidate cached answers.
 func (c dnsConfigurationSnapshot) effectiveIdentity() string {
-	return (&dnsAssignmentSnapshot{configurations: []dnsConfigurationSnapshot{c}}).effectiveIdentity()
-}
-
-// effectiveIdentity is the deterministic fingerprint of what this snapshot would DO.
-//
-// It deliberately excludes PREF64 (which does not participate in resolution), the capsule
-// generation, and anything else that cannot change an answer. Two snapshots with the same
-// identity would behave identically, so republishing one is not a change worth invalidating a
-// DNS cache for.
-//
-// The order is fixed by construction -- configurations and resolvers are in wire order and
-// fields are appended in a fixed sequence -- so Go map iteration cannot introduce instability.
-func (s *dnsAssignmentSnapshot) effectiveIdentity() string {
-	if s == nil || len(s.configurations) == 0 {
-		return ""
-	}
 	var builder strings.Builder
-	for configIndex, configuration := range s.configurations {
-		builder.WriteString("c")
-		builder.WriteString(itoa(configIndex))
-		for _, domain := range configuration.internalDomains {
-			builder.WriteString("|i=")
-			builder.WriteString(domain)
+	for _, domain := range c.internalDomains {
+		builder.WriteString("|i=")
+		builder.WriteString(domain)
+	}
+	for resolverIndex, resolver := range c.resolvers {
+		builder.WriteString("|r")
+		builder.WriteString(itoa(resolverIndex))
+		builder.WriteString("p=")
+		builder.WriteString(itoa(int(resolver.priority)))
+		builder.WriteString("a=")
+		builder.WriteString(resolver.authenticationDomainName)
+		builder.WriteString("d=")
+		builder.WriteString(resolver.dohPath)
+		if resolver.hasPort {
+			builder.WriteString("o=")
+			builder.WriteString(itoa(int(resolver.port)))
 		}
-		for _, domain := range configuration.searchDomains {
-			builder.WriteString("|s=")
-			builder.WriteString(domain)
+		if resolver.noDefaultALPN {
+			builder.WriteString("!default")
 		}
-		for resolverIndex, resolver := range configuration.resolvers {
-			builder.WriteString("|r")
-			builder.WriteString(itoa(resolverIndex))
-			builder.WriteString("p=")
-			builder.WriteString(itoa(int(resolver.priority)))
-			builder.WriteString("a=")
-			builder.WriteString(resolver.authenticationDomainName)
-			builder.WriteString("d=")
-			builder.WriteString(resolver.dohPath)
-			if resolver.hasPort {
-				builder.WriteString("o=")
-				builder.WriteString(itoa(int(resolver.port)))
-			}
-			if resolver.noDefaultALPN {
-				builder.WriteString("!default")
-			}
-			builder.WriteString("n=")
-			for _, protocol := range resolver.alpn {
-				builder.WriteString(protocol)
+		builder.WriteString("n=")
+		for _, protocol := range resolver.alpn {
+			builder.WriteString(protocol)
+			builder.WriteString(",")
+		}
+		for _, address := range resolver.addresses {
+			builder.WriteString("|")
+			builder.WriteString(address.String())
+		}
+		// The COMPILED CAPABILITIES are the facts that matter most: a route change that flips a
+		// resolver from usable to unusable, or that removes the TCP retry path, changes where
+		// queries go and whether a truncated answer can be completed.
+		builder.WriteString("|u=")
+		builder.WriteString(string(resolver.unusable))
+		if resolver.doh != nil {
+			builder.WriteString("|doh=")
+			builder.WriteString(resolver.doh.authority)
+			builder.WriteString(resolver.doh.path)
+		}
+		if resolver.plain != nil {
+			builder.WriteString("|udp=")
+			for _, address := range resolver.plain.udpAddresses {
+				builder.WriteString(address.String())
 				builder.WriteString(",")
 			}
-			for _, address := range resolver.addresses {
-				builder.WriteString("|")
+			// TCP reachability is part of the identity because it is part of the BEHAVIOUR: a
+			// truncated UDP answer must be retried over TCP (RFC 1035 section 4.2.1), so losing
+			// the TCP route changes what happens to a large response even when the UDP
+			// addresses are identical.
+			builder.WriteString("|tcp=")
+			for _, address := range resolver.plain.tcpAddresses {
 				builder.WriteString(address.String())
-			}
-			// The DECISION is the fact that matters most: a route change that flips a resolver
-			// from usable to unusable, or from plain to DoH, changes where queries go.
-			builder.WriteString("|t=")
-			builder.WriteString(string(resolver.transport))
-			builder.WriteString("u=")
-			builder.WriteString(string(resolver.unusable))
-			for _, address := range resolver.usableAddresses {
-				builder.WriteString("|")
-				builder.WriteString(address.String())
+				builder.WriteString(",")
 			}
 		}
 	}
@@ -555,6 +693,19 @@ func reachableForProtocol(addresses []netip.Addr, routes []masque.AddressRange, 
 // SINGLE trailing root dot. A blanket TrimRight(".") would equate `example..` with `example`
 // and would accept an empty name, neither of which is a host. A non-default port makes two
 // authorities different origins, so ports are compared and never discarded.
+func sameOrigin(first string, second string) bool {
+	firstHost, firstPort := splitHostPort(first)
+	secondHost, secondPort := splitHostPort(second)
+	if firstPort != secondPort {
+		return false
+	}
+	return equalFoldASCII(normalizeHostName(firstHost), normalizeHostName(secondHost))
+}
+
+// sameOriginHost compares host names only, ignoring the port.
+//
+// It exists for callers that have a host and no port to compare, and is NOT the right check for
+// same-connection DoH: see sameOrigin, which includes the port.
 func sameOriginHost(first string, second string) bool {
 	firstHost, firstPort := splitHostPort(first)
 	secondHost, secondPort := splitHostPort(second)

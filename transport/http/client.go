@@ -438,7 +438,9 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 }
 
 func (c *Client) listenPacket(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
-	conn, stream, err := c.openTunnel(ctx, tunnelRequest{
+	// The transport kind is not needed here: this path only needs the stream. It is discarded
+	// deliberately rather than plumbed through a caller that has no use for it.
+	conn, stream, _, err := c.openTunnel(ctx, tunnelRequest{
 		protocol:    connectUDPProtocol,
 		url:         connectUDPURL(destination),
 		destination: destination,

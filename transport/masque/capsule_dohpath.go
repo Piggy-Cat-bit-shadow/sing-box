@@ -172,16 +172,27 @@ func stripTemplateExpressions(template string) (string, error) {
 	return builder.String(), nil
 }
 
-// validateDohPathForAdvertisedHTTP reports whether a dohpath is usable, given that an HTTP
-// transport was advertised.
+// httpALPNRequiresDohPath reports whether an advertised ALPN set promises an HTTP-based DNS
+// transport, and therefore requires a usable dohpath.
 //
-// It exists so the wording of the failure can distinguish "no template provided" from
-// "template provided but unusable", which is the difference between a server that forgot the
-// parameter and one that sent a malformed template.
-func ValidateDohPathForAdvertisedHTTP(parameters ParsedServiceParameters) error {
-	if !parameters.HasDohPath {
-		return E.New("an HTTP ALPN requires a dohpath service parameter, and none was provided")
+// # The rule, from the specifications
+//
+// RFC 9461 §5 defines the DNS SVCB mapping: `dohpath` is the URI Template a DoH query is sent
+// to, and RFC 8484 §3 requires the client to be CONFIGURED with one. A resolver that advertises
+// an HTTP ALPN without a template has named a transport and not said how to reach it, so the
+// DoH capability cannot be compiled.
+//
+// Note what this is NOT: it does not make such a resolver invalid. `dohpath` is not listed as
+// automatically mandatory by RFC 9461's HTTP mapping, and draft-06 does not add a requirement
+// either. A nameserver that offers HTTP alongside plain DNS remains usable over plain DNS, so
+// the missing template costs it one transport rather than the whole resolver. That distinction
+// is exactly what compileCapabilities implements, and the earlier dead version of this function
+// got it wrong by treating the two as the same failure.
+func httpALPNRequiresDohPath(alpn []string) bool {
+	for _, protocol := range alpn {
+		if protocol == "h2" || protocol == "h3" {
+			return true
+		}
 	}
-	_, err := ExpandDohPathForPost(parameters.DohPath)
-	return err
+	return false
 }

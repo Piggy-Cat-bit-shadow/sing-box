@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/service/oomkiller"
 	"github.com/sagernet/sing-box/transport/device"
 	"github.com/sagernet/sing-box/transport/http"
+	transportHTTP "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-box/transport/masque"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing-tun/gtcpip/header"
@@ -59,20 +60,34 @@ type ClientEndpoint struct {
 	// the configured DNS rules, which is exactly the behaviour that existed before
 	// this option.
 	innerQueryOptions adapter.DNSQueryOptions
-	// dnsAssignment is the DNS_ASSIGN configuration currently in force, or nil when none
-	// has been received. It is an IMMUTABLE snapshot replaced wholesale: a lookup captures
-	// it once and uses that value for its whole lifetime, so a capsule arriving mid-lookup
-	// cannot produce a mixed answer.
+	// dnsAssignment is the compiled DNS_ASSIGN currently in force, or nil when none has been
+	// received. It is an IMMUTABLE snapshot replaced wholesale: a lookup captures it once and
+	// uses that value for its whole lifetime, so a capsule arriving mid-lookup cannot produce
+	// a mixed answer.
 	dnsAssignment atomic.Pointer[dnsAssignmentSnapshot]
 	// pref64 holds the NAT64 prefixes in force. It is deliberately separate from the DNS
 	// assignment: PREF64 does not affect any answer or any transport, so it must not be able
 	// to invalidate the DNS cache.
 	pref64 pref64Store
 	// dnsTag is the transport tag assigned lookups are reported under.
-	dnsTag        string
-	client        *masque.Client
-	deviceOptions *device.Options
-	device        device.Device
+	dnsTag string
+	// sessionTransport is the protocol the CURRENT tunnel session was established over,
+	// recorded from the session itself. Its zero value (TunnelTransportUnknown) is the correct
+	// starting state: nothing has been established yet.
+	//
+	// It is a uint32 because the session goroutine writes it while lookups read it, and the
+	// value is a small enum, so an atomic store avoids a lock on the lookup path.
+	sessionTransport atomic.Uint32
+	// assignmentAccess guards currentAssignment and currentRoutes: the last server
+	// configuration received, kept so the capability can be RECOMPILED when the tunnel
+	// changes. The server does not resend DNS_ASSIGN when the tunnel's transport changes --
+	// the assignment did not change, our ability to use it did.
+	assignmentAccess  sync.Mutex
+	currentAssignment *masque.DNSAssignment
+	currentRoutes     []masque.AddressRange
+	client            *masque.Client
+	deviceOptions     *device.Options
+	device            device.Device
 	// httpClient is the HTTP client the tunnel is established with.
 	httpClient *http.Client
 	// httpDialer is the dialer that client actually uses. It is the bootstrap wrapper when
@@ -327,20 +342,37 @@ func (c *ClientEndpoint) UpdateConfiguration(configuration masque.Configuration)
 // claimed name fails closed instead. `decide` is what makes that distinction, and it is
 // deliberately answered without reference to usability.
 func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) {
+	// # PREF64 is published FIRST, and unconditionally
+	//
+	// PREF64 and DNS resolver precedence are independent states. PREF64 records NAT64 prefixes;
+	// this client performs no synthesis, so it neither affects nor is affected by which resolver
+	// answers. An earlier version returned early when an explicit inner resolver was configured,
+	// which meant those prefixes were silently never stored -- a state update lost to an
+	// unrelated preference.
+	c.pref64.publish(configuration.PREF64)
+
+	// Remember the assignment so the capability can be recomputed later, when the tunnel's
+	// transport or its routes change. That recomputation is what stops an availability decision
+	// from being frozen at the moment the capsule happened to arrive.
+	c.assignmentAccess.Lock()
+	if configuration.DNS == nil || configuration.DNS.Empty() {
+		c.currentAssignment = nil
+	} else {
+		c.currentAssignment = configuration.DNS
+	}
+	c.currentRoutes = append([]masque.AddressRange(nil), configuration.Routes...)
+	c.assignmentAccess.Unlock()
+
 	if c.innerQueryOptions.Transport != nil {
-		// An explicit resolver is configured. Record that the assignment was seen and ignored,
-		// at debug level so a server that pushes one does not produce noise.
+		// An explicit resolver is configured. The operator has said where inner queries go, and
+		// a server must not override that. The assignment is still parsed and validated, and
+		// PREF64 above is still applied -- only the DNS RESOLUTION policy is left alone.
 		if configuration.DNS != nil && !configuration.DNS.Empty() {
-			c.logger.Debug("server DNS assignment received but an explicit inner resolver is configured; ignoring it")
+			c.logger.Debug("server DNS assignment received but an explicit inner resolver is configured; not used for resolution")
 		}
+		c.dnsAssignment.Store(nil)
 		return
 	}
-	// PREF64 is stored SEPARATELY and always, including on a DNS withdrawal.
-	//
-	// It has no effect on any answer or transport, so it must not participate in the DNS
-	// snapshot's identity: a PREF64-only update that invalidated the DNS cache would discard
-	// answers it cannot possibly have changed.
-	c.pref64.publish(configuration.PREF64)
 
 	if configuration.DNS == nil || configuration.DNS.Empty() {
 		// Withdrawn. Storing nil is what makes every name unclaimed again, and an in-flight
@@ -381,16 +413,69 @@ func (c *ClientEndpoint) Pref64Prefixes() []netip.Prefix {
 // otherwise.
 func (c *ClientEndpoint) resolverCapability(routes []masque.AddressRange) resolverCapability {
 	capability := resolverCapability{routes: append([]masque.AddressRange(nil), routes...)}
+
+	// Three facts, and same-connection DoH needs the third:
+	//
+	//	1. this HTTP client CAN speak HTTP/3            (configuration)
+	//	2. it currently HOLDS a live HTTP/3 connection  (resource)
+	//	3. THIS tunnel session WAS ESTABLISHED over it  (session truth)
+	//
+	// The first two are not sufficient and the session truth is not derivable from them: the
+	// tunnel path falls back, so a live HTTP/3 connection can coexist with a session running
+	// over HTTP/2. Sending a DNS query on that connection would put it on a connection the
+	// tunnel traffic does not share, which is precisely what draft-06 §3.5's coalescing
+	// requirement forbids.
+	//
+	// So the session transport is taken from the session, which recorded it at the branch that
+	// actually opened the tunnel.
+	if c.sessionTransport.Load() != uint32(transportHTTP.TunnelTransportHTTP3) {
+		return capability
+	}
 	if c.httpClient == nil {
 		return capability
 	}
-	authority, tunnelIsHTTP3 := c.httpClient.HTTP3ConnectionState()
-	if !tunnelIsHTTP3 || authority == "" {
+	// And the connection must still be live: the session being H3 says how it started, not
+	// that the connection is up now.
+	authority, live := c.httpClient.HTTP3ConnectionState()
+	if !live || authority == "" {
 		return capability
 	}
 	capability.tunnelIsHTTP3 = true
 	capability.sameH3Authorities = []string{authority}
 	return capability
+}
+
+// UpdateTunnelTransport implements transportHTTP's optional tunnel-transport reporting.
+//
+// # Why a change here must recompile the DNS capability
+//
+// Whether a resolver can use same-connection DoH is a JOINT property of what the server
+// advertised and how the tunnel is currently carried. A snapshot compiled while the tunnel was
+// HTTP/2 marks an addressless DoH resolver unusable; if the tunnel later comes back over
+// HTTP/3, that decision is stale and the resolver stays unusable forever -- unless it is
+// recomputed here. The reverse matters too: a snapshot compiled on HTTP/3 would keep offering
+// DoH after a fallback to HTTP/2.
+//
+// The server does not resend DNS_ASSIGN when the tunnel changes, and it should not have to:
+// the assignment did not change, our ability to use it did.
+func (c *ClientEndpoint) UpdateTunnelTransport(ctx context.Context, tunnelTransport transportHTTP.TunnelTransport) {
+	c.sessionTransport.Store(uint32(tunnelTransport))
+	c.recompileAssignedDNS()
+}
+
+// recompileAssignedDNS re-evaluates the current assignment against the CURRENT capability.
+//
+// The server configuration is unchanged; only availability is recomputed. A new immutable
+// snapshot is published, so an in-flight lookup keeps the one it captured.
+func (c *ClientEndpoint) recompileAssignedDNS() {
+	c.assignmentAccess.Lock()
+	assignment, routes := c.currentAssignment, c.currentRoutes
+	c.assignmentAccess.Unlock()
+	if assignment == nil {
+		return
+	}
+	snapshot := compileDNSAssignment(assignment.Configurations, c.resolverCapability(routes))
+	c.dnsAssignment.Store(snapshot)
 }
 
 func (c *ClientEndpoint) WriteInboundBuffers(packetBuffers []*buf.Buffer) error {

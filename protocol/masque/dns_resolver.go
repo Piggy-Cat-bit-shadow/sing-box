@@ -161,17 +161,43 @@ func (t *configurationDNSTransport) ExchangeAsync(ctx context.Context, message *
 	}()
 }
 
-// exchangeWith runs one query against one resolver over its chosen transport.
+// exchangeWith runs one query against one resolver, walking its capabilities in order.
+//
+// # Why both capabilities are tried
+//
+// A resolver may advertise same-connection DoH AND plain DNS. The capability was decided at
+// compile time, but usability can change at query time -- the tunnel can drop between compiling
+// and sending -- so a DoH failure falls back to plain DNS WITHIN THE SAME RESOLVER rather than
+// skipping to the next one. Skipping would discard a transport the server explicitly offered,
+// and would report the resolver as failed when it was still usable.
+//
+// The fallback never leaves this resolver, and never reaches a host resolver.
 func (t *configurationDNSTransport) exchangeWith(ctx context.Context, resolver dnsResolverSnapshot, message *mDNS.Msg) (*mDNS.Msg, error) {
-	switch resolver.transport {
-	case assignedTransportDoH:
-		return t.exchangeDoH(ctx, resolver, message)
-	case assignedTransportPlainUDP:
-		return t.exchangePlain(ctx, resolver, message)
-	default:
-		return nil, E.New("assigned DNS resolver ", resolver.describe(),
-			": transport ", resolver.transport, " is not implemented")
+	var lastErr error
+	for _, transport := range resolver.transportPreference() {
+		var (
+			response *mDNS.Msg
+			err      error
+		)
+		switch transport {
+		case assignedTransportDoH:
+			response, err = t.exchangeDoH(ctx, resolver, message)
+		case assignedTransportPlainUDP:
+			response, err = t.exchangePlain(ctx, resolver, message)
+		default:
+			continue
+		}
+		if err == nil {
+			return response, nil
+		}
+		lastErr = err
+		t.logger.DebugContext(ctx, "assigned DNS resolver ", resolver.describe(),
+			" failed over ", transport, ": ", err)
 	}
+	if lastErr == nil {
+		lastErr = E.New("no usable transport")
+	}
+	return nil, lastErr
 }
 
 // exchangePlain runs traditional DNS through the native sing-box UDP transport, over the
@@ -186,8 +212,11 @@ func (t *configurationDNSTransport) exchangeWith(ctx context.Context, resolver d
 // fails -- which is a legitimate failure reported to the caller, never a reason to leave the
 // tunnel.
 func (t *configurationDNSTransport) exchangePlain(ctx context.Context, resolver dnsResolverSnapshot, message *mDNS.Msg) (*mDNS.Msg, error) {
+	if resolver.plain == nil {
+		return nil, E.New("assigned DNS resolver ", resolver.describe(), " has no plain DNS capability")
+	}
 	var lastErr error
-	for _, address := range resolver.usableAddresses {
+	for _, address := range resolver.plain.udpAddresses {
 		serverAddress := M.SocksaddrFrom(address, resolver.dnsPort())
 		// A short-lived transport per attempt. It owns only this query's sockets, so a
 		// snapshot replacement never has to retire anything.
@@ -231,6 +260,16 @@ func (t *configurationDNSTransport) exchangeDoH(ctx context.Context, resolver dn
 		return nil, E.New("assigned DNS resolver ", resolver.describe(),
 			": same-connection DoH is not available")
 	}
+	// EVERY value in the request comes from THIS resolver, through its compiled capability.
+	// Taking the authority from one nameserver and the path or port from another would address
+	// the request to an origin the connection was never authenticated for; the same-origin check
+	// in transport/http is a backstop rather than the mechanism.
+	if resolver.doh == nil {
+		return nil, E.New("assigned DNS resolver ", resolver.describe(), " has no DoH capability")
+	}
+	authority := resolver.doh.authority
+	requestPath := resolver.doh.path
+
 	packed, err := message.Pack()
 	if err != nil {
 		return nil, E.Cause(err, "pack DNS query")
@@ -246,11 +285,7 @@ func (t *configurationDNSTransport) exchangeDoH(ctx context.Context, resolver dn
 		return nil, err
 	}
 
-	authority := resolver.authenticationDomainName
-	if port := resolver.dohPort(); port != 0 && port != 443 {
-		authority = joinAuthority(authority, port)
-	}
-	requestURL := &url.URL{Scheme: "https", Host: authority, Path: resolver.expandedPath}
+	requestURL := &url.URL{Scheme: "https", Host: authority, Path: requestPath}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(packed))
 	if err != nil {
 		return nil, E.Cause(err, "build DoH request")

@@ -55,12 +55,17 @@ func (s *pref64Store) publish(prefixes []netip.Prefix) {
 	s.state = &pref64State{prefixes: append([]netip.Prefix(nil), prefixes...)}
 }
 
-// snapshot returns the current prefix set, which the caller must not modify.
+// snapshot returns a COPY of the current prefix set.
+//
+// The copy is not defensive tidiness: the caller is a public accessor, and returning the stored
+// slice would let any caller write through it and mutate published state. That would break the
+// immutability the rest of this design relies on -- a reader that captured the prefixes would
+// see them change underneath it, and the store would silently disagree with its own snapshot.
 func (s *pref64Store) snapshot() []netip.Prefix {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.state == nil {
 		return nil
 	}
-	return s.state.prefixes
+	return append([]netip.Prefix(nil), s.state.prefixes...)
 }
