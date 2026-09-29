@@ -272,7 +272,7 @@ func TestAssignedResolverEnvironmentChangesWithEachAssignment(t *testing.T) {
 // reachability decision is per RESOLVER, so the unreachable one is dropped while a reachable
 // sibling in the same configuration still answers -- but the unreachable address must never
 // appear in the installed state.
-func TestUnreachableAssignmentIsRefusedWholesale(t *testing.T) {
+func TestUnreachableAssignmentNeverInstallsTheUnreachableResolver(t *testing.T) {
 	t.Parallel()
 
 	router := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("2001:db8::6")}}
