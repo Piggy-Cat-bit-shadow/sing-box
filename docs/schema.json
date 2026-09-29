@@ -3555,6 +3555,9 @@
             "tls": {
               "$ref": "#/$defs/OutboundTLSOptions"
             },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
             "path": {
               "type": "string"
             },
