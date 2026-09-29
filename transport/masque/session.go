@@ -92,6 +92,19 @@ func (s *session) run() error {
 	return context.Cause(s.ctx)
 }
 
+// loopDatagram delivers received HTTP Datagrams to the handler.
+//
+// # It does not run alone
+//
+// run() starts this loop in its own goroutine and then occupies the calling goroutine with
+// loopCapsule, so a peer sending datagrams AND capsule-carried packets drives handlePacket from two
+// goroutines at once.
+//
+// That is worth stating because it forbids an optimisation that otherwise looks free: reusing one
+// []*buf.Buffer per session for the ClientHandler hand-off would save an allocation per received
+// packet, and this loop taken alone is single-goroutine and would tolerate it. The capsule loop is
+// the second caller, so a shared slice would be a data race. (A race of that shape is caught by
+// `go test -race`, so the guard is the existing CI rather than a bespoke test.)
 func (s *session) loopDatagram() {
 	for {
 		datagram, err := s.datagrams.ReceiveDatagram(s.ctx)

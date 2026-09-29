@@ -746,3 +746,43 @@ func BenchmarkDataplaneOversizePacketsRepeated(b *testing.B) {
 	}
 	b.ReportMetric(1, "sendattempts/op")
 }
+
+// BenchmarkDataplaneInboundSliceAllocation measures the receive path with the per-packet
+// []*buf.Buffer slice, which is the ONE remaining allocation on it that is not the buffer wrapper.
+//
+// # Why it is REJECTED as an optimisation target, despite being measurable
+//
+// The receive path hands each packet to the device through the ClientHandler interface, whose
+// method takes a slice. Delivering one packet therefore builds a one-element slice per packet:
+// 65ns and 2 allocations against 33ns and 1 when the slice is reused, i.e. about 32ns per received
+// packet -- not nothing.
+//
+// It is not fixed, for two independent reasons.
+//
+// First, the slice is not a local detail. ClientHandler.WriteInboundBuffers is the boundary between
+// this package and transport/device, and both device implementations batch RUNS of packets through
+// it. Narrowing it to a single buffer to save an allocation on one caller would push a per-packet
+// concern into a shared product interface.
+//
+// Second, and decisively, the obvious workaround is UNSAFE. Reusing one slice per session looks
+// free because loopDatagram is a single goroutine, but loopCapsule runs CONCURRENTLY in its own
+// goroutine (both are started by session.run) and also calls handlePacket for capsule-carried
+// packets. A shared mutable slice is therefore a data race, and one that would appear only when a
+// peer used capsules and datagrams at the same time. A sync.Pool would replace the allocation with
+// a lock on the receive path, which is worse.
+//
+// The safe version of this optimisation requires changing the shared handler contract, which is a
+// product-boundary decision rather than a dataplane one. Recorded as REJECTED with the figure, so
+// it can be revisited deliberately if that boundary ever moves.
+func BenchmarkDataplaneInboundSliceAllocation(b *testing.B) {
+	packet := buildBenchIPv4Packet(1280, 6,
+		netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr("10.0.0.2"))
+	current := benchSession(&benchDatagramSink{}, &benchDiscardStream{}, &benchHandler{})
+
+	b.ReportAllocs()
+	b.SetBytes(1280)
+	b.ResetTimer()
+	for b.Loop() {
+		current.handleIngressDatagram(packet)
+	}
+}
