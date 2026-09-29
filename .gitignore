@@ -30,3 +30,7 @@ AGENTS.md
 # Cache file created when sing-box runs from the source tree (default path is
 # relative, see experimental/cachefile/cache.go). Never a source artifact.
 cache.db
+
+# Compiled Go test binaries, produced by `go test -c` or left behind by an
+# interrupted run. Never source artifacts; one was committed accidentally.
+*.test
