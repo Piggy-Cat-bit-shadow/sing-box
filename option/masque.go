@@ -28,6 +28,18 @@ type _MASQUEClientEndpointOptions struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 	OutboundTLSOptionsContainer
+	// InnerDomainResolver resolves domains reached THROUGH the tunnel, which is a
+	// different question from the one DialerOptions.DomainResolver answers.
+	//
+	// DialerOptions.DomainResolver resolves the MASQUE *server* hostname, and it
+	// must keep working before any tunnel exists. This one resolves the traffic
+	// carried INSIDE the tunnel, so it may legitimately depend on the tunnel, on
+	// server-pushed DNS configuration, or on anything else that only exists once
+	// the connection is up.
+	//
+	// Unset preserves the previous behaviour exactly: inner lookups use the normal
+	// DNS router rules with empty query options.
+	InnerDomainResolver    *DomainResolveOptions            `json:"inner_domain_resolver,omitempty"`
 	Path                   string                           `json:"path,omitempty"`
 	Headers                badoption.HTTPHeader             `json:"headers,omitempty"`
 	Version                int                              `json:"version,omitempty" enum:"0,1,2,3"`

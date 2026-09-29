@@ -47,16 +47,25 @@ var (
 
 type ClientEndpoint struct {
 	endpointBase
-	ctx           context.Context
-	dnsRouter     adapter.DNSRouter
-	client        *masque.Client
-	deviceOptions *device.Options
-	device        device.Device
-	mtu           uint32
-	onDemand      bool
-	stateAccess   sync.Mutex
-	deviceStarted bool
-	state         atomic.Pointer[clientState]
+	ctx       context.Context
+	dnsRouter adapter.DNSRouter
+	// innerQueryOptions resolves domains reached THROUGH the tunnel. It is
+	// resolved ONCE at construction, not per connection, so an inner lookup takes
+	// the DNS router's transport fast path instead of re-walking the rule set for
+	// every target domain.
+	//
+	// The zero value is meaningful and is the default: it tells the router to apply
+	// the configured DNS rules, which is exactly the behaviour that existed before
+	// this option.
+	innerQueryOptions adapter.DNSQueryOptions
+	client            *masque.Client
+	deviceOptions     *device.Options
+	device            device.Device
+	mtu               uint32
+	onDemand          bool
+	stateAccess       sync.Mutex
+	deviceStarted     bool
+	state             atomic.Pointer[clientState]
 }
 
 type clientState struct {
@@ -94,6 +103,24 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if err != nil {
 		return nil, err
 	}
+	// The inner resolver is a DIFFERENT question from the bootstrap one above, and
+	// the two must not be conflated:
+	//
+	//	DialerOptions.DomainResolver -> the MASQUE server hostname, needed before any
+	//	                                tunnel exists
+	//	InnerDomainResolver          -> domains carried INSIDE the tunnel, which may
+	//	                                depend on state that only exists once the
+	//	                                tunnel is up
+	//
+	// Resolving it here means a missing or unknown resolver tag fails at
+	// configuration time rather than on the first inner lookup.
+	var innerQueryOptions adapter.DNSQueryOptions
+	if options.InnerDomainResolver != nil && options.InnerDomainResolver.Server != "" {
+		innerQueryOptions, err = dialer.NewDNSQueryOptions(ctx, options.InnerDomainResolver, false)
+		if err != nil {
+			return nil, E.Cause(err, "initialize inner domain resolver")
+		}
+	}
 	headers := options.Headers.Build()
 	authority := headers.Get("Host")
 	headers.Del("Host")
@@ -126,10 +153,11 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 			router:  router,
 			logger:  logger,
 		},
-		ctx:       ctx,
-		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
-		mtu:       options.MTU,
-		onDemand:  options.OnDemand,
+		ctx:               ctx,
+		dnsRouter:         service.FromContext[adapter.DNSRouter](ctx),
+		innerQueryOptions: innerQueryOptions,
+		mtu:               options.MTU,
+		onDemand:          options.OnDemand,
 	}
 	clientEndpoint.state.Store(&clientState{})
 	clientEndpoint.deviceOptions = newDeviceOptions(ctx, logger, clientEndpoint, options.MASQUEEndpointOptions, time.Duration(options.UDPTimeout), nil)
@@ -310,17 +338,79 @@ func (c *ClientEndpoint) DialContext(ctx context.Context, network string, destin
 		return nil, err
 	}
 	if destination.IsDomain() {
-		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, c.innerQueryOptions)
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
-		return N.DialSerial(ctx, c.device, network, destination, destinationAddresses)
+		return c.dialResolved(ctx, network, destination, destinationAddresses)
 	}
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return c.device.DialContext(ctx, network, destination)
 }
+
+// dialResolved connects to one of the addresses the resolver returned.
+//
+// # TCP races the address families; UDP does not
+//
+// For TCP the families are raced with a fallback delay, so a dual-stack target
+// whose IPv6 path is blackholed connects over IPv4 in about one fallback delay
+// instead of waiting for the IPv6 attempt to time out. That is what N.DialParallel
+// provides, and it already degrades to a serial attempt when the answer contains
+// only one family, so a single-stack target pays nothing for this.
+//
+// UDP deliberately keeps the serial path, and the reason is worth stating because
+// the asymmetry looks like an oversight otherwise: a UDP "connection" is
+// connectionless, so a successful socket creation or connect() proves only that
+// the local kernel accepted the address. It says nothing about whether the peer is
+// reachable. Racing on that signal would pick a winner that has not been shown to
+// work, which is worse than no race at all. TCP has a handshake to win; UDP does
+// not, and this code will not pretend otherwise.
+func (c *ClientEndpoint) dialResolved(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	if network != N.NetworkTCP {
+		return N.DialSerial(ctx, c.device, network, destination, destinationAddresses)
+	}
+	return N.DialParallel(ctx, c.device, network, destination, destinationAddresses,
+		preferIPv6(c.innerQueryOptions.Strategy, destinationAddresses), DefaultInnerFallbackDelay)
+}
+
+// preferIPv6 decides which address family the TCP race attempts first.
+//
+// The configured strategy wins, because the operator has already expressed a
+// preference and overriding it here would make the strategy option quietly
+// ineffective for tunnelled traffic.
+//
+// With no preference (AsIS) the decision is taken from the answer itself: the
+// family of the resolver's FIRST address goes first. That respects the ordering the
+// DNS layer already chose under its own rules instead of hardcoding one, and it is
+// the reading "as is" asks for. An answer with only one family yields no race at
+// all, because N.DialParallel short-circuits to serial in that case.
+func preferIPv6(strategy C.DomainStrategy, addresses []netip.Addr) bool {
+	switch strategy {
+	case C.DomainStrategyPreferIPv6:
+		return true
+	case C.DomainStrategyPreferIPv4:
+		return false
+	}
+	for _, address := range addresses {
+		if address.Is4() || address.Is4In6() {
+			return false
+		}
+		if address.Is6() {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultInnerFallbackDelay is how long the TCP race waits before starting the
+// other address family.
+//
+// It matches the standard Happy Eyeballs default rather than introducing a new
+// tunable: the task is to make dual-stack targets connect promptly, not to add
+// another knob whose correct value nobody knows.
+const DefaultInnerFallbackDelay = N.DefaultFallbackDelay
 
 func (c *ClientEndpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	c.logger.InfoContext(ctx, "outbound packet connection to ", destination)
@@ -329,10 +419,13 @@ func (c *ClientEndpoint) ListenPacketWithDestination(ctx context.Context, destin
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsDomain() {
-		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+		// Same inner resolver as the TCP path: it answers the same question and
+		// must not disagree with it about which server resolves tunnelled names.
+		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, c.innerQueryOptions)
 		if lookupErr != nil {
 			return nil, netip.Addr{}, lookupErr
 		}
+		// Serial, deliberately: see dialResolved for why UDP does not race.
 		packetConn, destinationAddress, listenErr := N.ListenSerial(ctx, c.device, destination, destinationAddresses)
 		if listenErr != nil {
 			return nil, netip.Addr{}, listenErr
