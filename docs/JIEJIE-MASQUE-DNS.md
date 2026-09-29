@@ -185,11 +185,15 @@ be expressed as one.
 
 | Advertised | Selected |
 |---|---|
-| dohpath + authentication domain, matching live tunnel H3 connection | **same-connection DoH** |
+| dohpath + authentication domain + **ALPN containing `h3`**, matching live tunnel H3 connection | **same-connection DoH** |
 | nothing | plain **UDP**, with the TCP retry the native transport performs |
 | ALPN list, no `no-default-alpn` | DoH when available and matching, else plain UDP |
 | `no-default-alpn`, DoH usable | **DoH** |
 | `no-default-alpn`, DoT only or nothing usable | **failure** for that resolver; try the next in the same configuration |
+
+**ALPN must name `h3` explicitly.** A dohpath says WHERE to POST, not which protocol carries it,
+so a resolver advertising `alpn=h2` with a dohpath is never given an HTTP/3 request. Absent ALPN
+is not a wildcard either: the server did not name HTTP/3, so no HTTP/3 request is ours to make.
 
 `no-default-alpn` is **binding**, not advisory. draft-06 §3.2 says omitting it indicates
 the nameserver supports unencrypted DNS, so its presence means the opposite: falling back
@@ -209,26 +213,63 @@ deliberately. Refusing is not the same as ignoring.
 ## Same-connection DoH must be the SAME connection
 
 draft-06 §3.5 asks that DoH be "coalesced over the same HTTPS connection" as the CONNECT-IP
-tunnel. That is only meaningful if the tunnel really is that connection.
+tunnel. That is only meaningful if the tunnel really is that connection, and three different
+facts are easy to conflate:
 
-Two facts are therefore required, and neither is assumed from configuration:
+| | Fact | How it is known |
+|---|---|---|
+| **A** | this client CAN speak HTTP/3 | configuration |
+| **B** | it currently HOLDS a live HTTP/3 connection | the client that owns it |
+| **C** | **THIS tunnel session WAS ESTABLISHED over HTTP/3** | `OpenTunnelWithInfo` |
 
-1. **The tunnel's transport really is HTTP/3.** The configured protocol version is not the
-   same fact: `transport/http` falls back to HTTP/2, so an endpoint configured for version
-   3 can end up on an H2 tunnel while the HTTP/3 code path still exists. The capability is
-   asked of the client that owns the connection.
-2. **The request goes on the connection that exists.** The DoH path uses an
-   existing-connection-only call. It never dials: a DNS query must never be the reason a
-   second QUIC connection appears.
+Same-connection DoH requires **C and B**, plus a matching origin and an advertising resolver.
 
-Same-origin is enforced strictly, with no cross-origin coalescing. A resolver whose
-authentication domain does not match the origin the connection was verified for does not
-get this path, and falls back to plain DNS if the advertisement permits it.
+Neither A nor B implies C, because the tunnel path **falls back**: an HTTP/3 attempt can fail,
+the session be established over HTTP/2, and a live HTTP/3 connection remain from an earlier
+success. A caller that inferred C from B would send a DNS query on a connection the tunnel
+traffic does not share, which is exactly what the coalescing requirement exists to prevent.
 
-Origin comparison normalizes exactly what denotes the same host and nothing more: ASCII
-case, and a **single** trailing root dot (the wire carries `resolver.example.` while an
-HTTP authority is written `resolver.example`). A non-default port is a different origin and
-is never discarded.
+So the fact is recorded where it is decided. `transport/http` reports the protocol each
+successful branch of `openTunnel` used, through an additive `OpenTunnelWithInfo`; `OpenTunnel`
+remains a wrapper, so existing callers are untouched. The MASQUE session records it per session
+and reports `Unknown` when the session ends, so the fact cannot outlive what it describes.
+
+The DoH path then uses an **existing-connection-only** call. It never dials: a DNS query must
+never be the reason a second QUIC connection appears.
+
+### The resolver's origin includes its port
+
+A DoH request is addressed to a host **and a port**, and `masque.example` on 443 and on 8443 are
+different origins. The authority is therefore built once, including the effective port, and both
+the compile-time capability decision and the runtime same-origin check use that one value -- so
+they cannot disagree about which origin the resolver names.
+
+Normalization covers exactly what denotes the same host and nothing more: ASCII case, and a
+single trailing root dot (the wire carries `resolver.example.` while an HTTP authority is written
+`resolver.example`).
+
+### Each resolver carries both of its capabilities
+
+A resolver may advertise same-connection DoH **and** plain DNS. Compiling a single transport
+would permanently hide one as soon as the other was selected, so a DoH failure at query time
+could not fall back to a transport the server explicitly advertised. Both capabilities are
+compiled, and the executor walks them in order:
+
+1. **same-connection DoH**, when it is currently applicable -- draft-06 §3.5 states a preference
+   for coalescing queries onto the tunnel's connection;
+2. **plain DNS**, when the server left the default transport available.
+
+The fallback stays **within the same resolver** and never reaches a host resolver.
+
+### Capability is recomputed when the tunnel changes
+
+Whether a resolver can use DoH is a **joint** property of the advertisement and the current
+tunnel. A snapshot compiled while the tunnel was HTTP/2 would mark an addressless DoH resolver
+unusable forever; one compiled on HTTP/3 would keep offering DoH after a fallback.
+
+The endpoint therefore keeps the last assignment and recomputes the capability when the session
+transport or the routes change, publishing a new immutable snapshot. The server does not resend
+`DNS_ASSIGN` and should not have to: the assignment did not change, our ability to use it did.
 
 ## SVCB validation
 
@@ -246,6 +287,34 @@ accepted but misread produces a resolver that looks usable and is not.
 
 A malformed value makes the **resolver** incompatible, and the next resolver in the same
 configuration is tried. If none can be used, the query fails closed.
+
+### Recognised is not the same as implemented
+
+`mandatory` is validated against what this client can actually **honour**, not against the keys
+it can name. The two are different, and conflating them is how a promise gets made that cannot be
+kept.
+
+| Key | Honoured as mandatory? |
+|---|---|
+| `alpn`, `no-default-alpn`, `port`, `dohpath` | **yes** -- each is enforced during validation or capability compilation |
+| `ipv4hint`, `ipv6hint` | rejected outright by draft-06 before `mandatory` is consulted |
+| `ech` | **no** -- the name is recognised so the error can cite it, but this client performs no ECH handshake |
+| anything else | no -- an unknown requirement cannot be honoured by definition |
+
+So `mandatory=ech` is refused. A server declaring it mandatory is saying the connection will not
+work correctly if it is ignored, and it will not. An unknown **non**-mandatory key is still
+ignored, per RFC 9460 §2.4.3.
+
+### An HTTP ALPN without a dohpath
+
+RFC 8484 §3 requires a DoH client to be configured with a URI Template and RFC 9461 §5 defines
+`dohpath` as it, so the combination is not **usable** as DoH. It is not **malformed**: draft-06
+requires only that `dohpath` be a relative DoH URI Template when present.
+
+The consequence is therefore handled where it belongs -- capability compilation simply cannot
+build a DoH capability without a path, so the resolver keeps whatever else it advertised. If the
+server also withdrew plain DNS, the resolver is unusable; otherwise it is still perfectly usable
+over the default transport.
 
 Two deliberate deviations from the reference implementation, both tested:
 
@@ -274,12 +343,29 @@ for a POST. So an expression expands to the empty string, including its own `?` 
 /q{?dns}suffix    ->  /qsuffix
 ```
 
-Truncating at the first `{` happens to give the right answer for the first case and the
-wrong one for the second, so the expansion is implemented rather than approximated.
+Truncating at the first `{` happens to give the right answer for the first case and the wrong one
+for the second, so the expansion is implemented rather than approximated.
 
-Nothing is invented. An empty template, a missing leading slash, or a template with no
-`dns` variable makes the resolver incompatible: guessing a path the server did not send is
-worse than reporting that its advertisement is unusable.
+### The supported subset, stated rather than approximated
+
+RFC 6570 is large and this client needs exactly one of its behaviours: expanding with **no
+variables defined**. Rather than accept whatever looks brace-shaped, a strict subset is
+recognised and the rest refused -- because expansion **deletes** an expression, so a permissive
+parser would produce a plausible path from a template it did not understand. The result would be
+a request to the right origin and the wrong resource, surfacing as a DNS failure far from its
+cause.
+
+Supported: `{dns}`, `{?dns}`, `{&dns}`, `{/dns}`, `{.dns}`, `{;dns}`, and comma-separated name
+lists.
+
+Refused: the `+` and `#` operators (reserved-character handling, which changes the path if got
+wrong), an empty expression, nested braces, unterminated or stray braces, the `*` and `:`
+modifiers, invalid variable names including invalid percent escapes, and any template that is not
+valid UTF-8 -- a URI Template is a sequence of characters, so invalid UTF-8 cannot be one.
+
+Nothing is invented. An empty template, a missing leading slash, or a template with no `dns`
+variable is refused: guessing a path the server did not send is worse than reporting that its
+advertisement cannot be used.
 
 ## DoH wire details
 
@@ -303,8 +389,17 @@ It contains no monotonic generation counter, so:
 
 - receiving the same `DNS_ASSIGN` twice does **not** invalidate a cache;
 - a `PREF64`-only update does **not** invalidate the DNS cache;
-- a route change that makes a resolver unreachable **does**, because that changes where
-  queries go.
+- changing only **search domains** does **not** invalidate it either: they are parsed and
+  preserved, but endpoint-local resolution does not apply them, so they cannot change an answer;
+- a route change that makes a resolver unreachable **does**, because that changes where queries
+  go;
+- losing the **TCP** route **does** as well, even when the UDP addresses are unchanged: a
+  truncated answer must be retried over TCP (RFC 1035 §4.2.1), so that changes what happens to a
+  large response.
+
+The key is **per configuration**, not per assignment: a lookup has already been bound to one
+configuration by the time a query runs, so an unrelated configuration changing must not discard
+that configuration's cached answers.
 
 TTL handling, caching, negative caching, singleflight and optimistic caching remain entirely
 the sing-box DNS client's responsibility. The assignment layer never reimplements them, and
@@ -335,7 +430,10 @@ production can reach it. These call real entry points:
 | **Production wiring** (constructor-level) | `protocol/masque/constructor_integration_test.go` |
 | **Policy and compilation** (snapshots, root semantics, transport selection) | `protocol/masque/dns_assignment_test.go` |
 | **Endpoint routing** (unclaimed / claimed / claimed-unusable, snapshot consistency) | `protocol/masque/dns_endpoint_test.go` |
+| **DNS capability transitions** (ALPN, origin+port, session truth, mandatory) | `protocol/masque/dns_capability_test.go` |
 | **Bootstrap and racer** | `protocol/masque/bootstrap_cache_test.go`, `bootstrap_race_test.go`, `bootstrap_race_ownership_test.go` |
+| **Tunnel transport report** (against a real HTTP/3 server) | `transport/http/tunnel_transport_test.go` |
+| **dohpath URI-template subset** | `transport/masque/capsule_dohpath_test.go` |
 | Capsule codecs and bounds | `transport/masque/capsule_dns_test.go` |
 | Server emission and ordering | `transport/masque/server_dns_test.go` |
 | Fuzzing (capsules, SVCB, PREF64, round trip) | `transport/masque/fuzz_dns_capsule_test.go` |
@@ -352,5 +450,9 @@ production can reach it. These call real entry points:
 - **PREF64 is state only.** No DNS64 synthesis of any kind.
 - **No DoT, no DoQ.** Recognised and refused, never silently substituted.
 - **No same-connection DoH over HTTP/2.** A resolver offering only h2 with
-  `no-default-alpn` is incompatible.
+  `no-default-alpn` is incompatible; with the default transport still permitted it uses plain DNS.
+- **No ECH support.** The parameter is recognised so a mandatory reference can be refused by name,
+  but no ECH configuration is fetched, validated or applied.
 - **No cross-origin HTTP/3 coalescing.**
+- **Only the strict `dohpath` subset** described above is accepted; other RFC 6570 constructs are
+  refused rather than approximated.

@@ -681,7 +681,7 @@ func reachableForProtocol(addresses []netip.Addr, routes []masque.AddressRange, 
 	return reachable
 }
 
-// sameOriginHost compares two DNS host names for origin identity.
+// sameOrigin compares two authorities for origin identity.
 //
 // # What is normalized, and what is deliberately not
 //
@@ -691,22 +691,13 @@ func reachableForProtocol(addresses []netip.Addr, routes []masque.AddressRange, 
 //
 // Normalization is applied only to a value already known to be a host name, and only for a
 // SINGLE trailing root dot. A blanket TrimRight(".") would equate `example..` with `example`
-// and would accept an empty name, neither of which is a host. A non-default port makes two
-// authorities different origins, so ports are compared and never discarded.
-func sameOrigin(first string, second string) bool {
-	firstHost, firstPort := splitHostPort(first)
-	secondHost, secondPort := splitHostPort(second)
-	if firstPort != secondPort {
-		return false
-	}
-	return equalFoldASCII(normalizeHostName(firstHost), normalizeHostName(secondHost))
-}
-
-// sameOriginHost compares host names only, ignoring the port.
+// and would accept an empty name, neither of which is a host.
 //
-// It exists for callers that have a host and no port to compare, and is NOT the right check for
-// same-connection DoH: see sameOrigin, which includes the port.
-func sameOriginHost(first string, second string) bool {
+// A PORT MAKES TWO AUTHORITIES DIFFERENT ORIGINS, so the port is compared and never discarded.
+// That is why this takes full authorities rather than host names: a DoH request is addressed to
+// host AND port, and a comparison that ignored the port would approve a request to an origin the
+// connection was never authenticated for.
+func sameOrigin(first string, second string) bool {
 	firstHost, firstPort := splitHostPort(first)
 	secondHost, secondPort := splitHostPort(second)
 	if firstPort != secondPort {
