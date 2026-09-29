@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
 	http "github.com/sagernet/sing-box/transport/http"
+	"github.com/sagernet/sing-box/transport/masque"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -429,4 +430,109 @@ func (d *closedPortDialer) ListenPacket(ctx context.Context, destination M.Socks
 func newRacerTestTLSConfig(t *testing.T) aTLS.Config {
 	t.Helper()
 	return racerTestTLSConfig(t)
+}
+
+// ---------------------------------------------------------------------------
+// DNS assignment plane, through the real constructor
+// ---------------------------------------------------------------------------
+
+// TestConstructorAcceptsADNSAssignmentAndRoutesOnIt proves the DNS plane is reachable through
+// the REAL constructor, not only through a hand-built endpoint.
+//
+// The bootstrap plane had a dedicated constructor test because it was once wired nowhere. The
+// DNS plane needs the same treatment for the same reason: a snapshot that nothing publishes to
+// is indistinguishable, from a unit test's point of view, from one that works. This test builds
+// a real endpoint, hands it a capsule the way the session does, and then checks that a lookup
+// is actually routed by it.
+func TestConstructorAcceptsADNSAssignmentAndRoutesOnIt(t *testing.T) {
+	t.Parallel()
+
+	lookupRouter := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("10.0.0.99")}}
+	endpoint, err := buildTestEndpoint(t, lookupRouter, "masque.example", newBootstrapTLSOptions())
+	require.NoError(t, err)
+	defer endpoint.Close()
+
+	clientEndpoint := endpoint.(*ClientEndpoint)
+
+	// Nothing is claimed before an assignment arrives, so a name resolves normally.
+	_, err = clientEndpoint.lookupInner(context.Background(), "host.internal.corp.example.")
+	require.NoError(t, err)
+	require.Nil(t, router0(lookupRouter), "with no assignment every name is unclaimed")
+
+	// The server sends a split-tunnel assignment, as UpdateConfiguration would deliver it.
+	clientEndpoint.installAssignedDNS(masque.Configuration{
+		Routes: []masque.AddressRange{{
+			Start: netip.MustParseAddr("10.0.0.0"), End: netip.MustParseAddr("10.0.0.255"), Protocol: protocolAll,
+		}},
+		DNS: &masque.DNSAssignment{
+			Configurations: []masque.DNSConfiguration{{
+				InternalDomains: []string{"internal.corp.example."},
+				Nameservers:     []masque.DNSNameserver{plainResolver(1, "10.0.0.53")},
+			}},
+		},
+	})
+
+	// The claimed name now routes to the assigned configuration.
+	_, err = clientEndpoint.lookupInner(context.Background(), "host.internal.corp.example.")
+	require.NoError(t, err)
+	require.NotNil(t, router0(lookupRouter),
+		"the assignment must have been published and be routing the name it claims")
+
+	// And an unclaimed name still resolves normally, which is what makes it a split tunnel.
+	_, err = clientEndpoint.lookupInner(context.Background(), "www.public.example.")
+	require.NoError(t, err)
+	require.Equal(t, 3, lookupRouter.lookupCount())
+	require.Nil(t, lookupRouter.transportAt(2), "an unclaimed name must not use the assigned configuration")
+}
+
+// TestConstructorKeepsPREF64OutOfTheDNSCacheKey proves the two capsules are independent through
+// the real constructor.
+func TestConstructorKeepsPREF64OutOfTheDNSCacheKey(t *testing.T) {
+	t.Parallel()
+
+	lookupRouter := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("10.0.0.99")}}
+	endpoint, err := buildTestEndpoint(t, lookupRouter, "masque.example", newBootstrapTLSOptions())
+	require.NoError(t, err)
+	defer endpoint.Close()
+
+	clientEndpoint := endpoint.(*ClientEndpoint)
+	assignment := &masque.DNSAssignment{
+		Configurations: []masque.DNSConfiguration{{
+			InternalDomains: []string{""},
+			Nameservers:     []masque.DNSNameserver{plainResolver(1, "10.0.0.53")},
+		}},
+	}
+	routes := []masque.AddressRange{{
+		Start: netip.MustParseAddr("10.0.0.0"), End: netip.MustParseAddr("10.0.0.255"), Protocol: protocolAll,
+	}}
+
+	clientEndpoint.installAssignedDNS(masque.Configuration{Routes: routes, DNS: assignment})
+	_, err = clientEndpoint.lookupInner(context.Background(), "before.example.")
+	require.NoError(t, err)
+	before := lookupRouter.environmentAt(0)
+
+	// The same assignment, now with NAT64 prefixes alongside it.
+	clientEndpoint.installAssignedDNS(masque.Configuration{
+		Routes: routes,
+		DNS:    assignment,
+		PREF64: []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")},
+	})
+	_, err = clientEndpoint.lookupInner(context.Background(), "after.example.")
+	require.NoError(t, err)
+	after := lookupRouter.environmentAt(1)
+
+	require.Equal(t, before, after,
+		"PREF64 arriving with an unchanged assignment must not change the DNS cache key")
+	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")}, clientEndpoint.Pref64Prefixes(),
+		"and the prefixes must still be exposed separately")
+}
+
+// router0 returns the transport given to the most recent lookup.
+func router0(router *recordingRouter) adapter.DNSTransport {
+	router.access.Lock()
+	defer router.access.Unlock()
+	if len(router.transports) == 0 {
+		return nil
+	}
+	return router.transports[len(router.transports)-1]
 }
