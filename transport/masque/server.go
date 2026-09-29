@@ -33,8 +33,21 @@ type ServerOptions struct {
 	Path            string
 	Address         []netip.Prefix
 	AdvertiseRoutes []netip.Prefix
-	Resolve         func(ctx context.Context, domain string) ([]netip.Addr, error)
-	Handler         ServerHandler
+	// DNSConfigurations, when non-empty, are sent to each client as a DNS_ASSIGN
+	// capsule after the routes have been advertised.
+	//
+	// The ordering is deliberate and required: draft-ietf-masque-connect-ip-dns-06 §5
+	// says implementations "need to ensure that DNS_ASSIGN capsules are not sent before
+	// the corresponding ROUTE_ADVERTISEMENT capsule", because a resolver the client
+	// cannot yet route through the tunnel would be reached outside it.
+	DNSConfigurations []DNSConfiguration
+	// PREF64Prefixes, when non-nil, are sent as a PREF64 capsule after the DNS
+	// assignment. A non-nil empty slice sends an empty capsule, which INVALIDATES any
+	// previously advertised prefixes rather than being a no-op -- that distinction is
+	// the reason this is a slice rather than a bool plus a list.
+	PREF64Prefixes []netip.Prefix
+	Resolve        func(ctx context.Context, domain string) ([]netip.Addr, error)
+	Handler        ServerHandler
 }
 
 type Server struct {
@@ -45,11 +58,17 @@ type Server struct {
 	inet4Address    netip.Addr
 	inet6Address    netip.Addr
 	advertiseRoutes *netipx.IPSet
-	resolve         func(ctx context.Context, domain string) ([]netip.Addr, error)
-	handler         ServerHandler
-	access          sync.RWMutex
-	addresses       map[netip.Addr]*serverSession
-	advertisements  []*serverSession
+	// dnsConfigurations and pref64 are the assignment this server pushes to every
+	// client, validated once at construction so a bad configuration fails at startup
+	// rather than per-connection.
+	dnsConfigurations []DNSConfiguration
+	pref64            []netip.Prefix
+	pref64Configured  bool
+	resolve           func(ctx context.Context, domain string) ([]netip.Addr, error)
+	handler           ServerHandler
+	access            sync.RWMutex
+	addresses         map[netip.Addr]*serverSession
+	advertisements    []*serverSession
 }
 
 type serverSession struct {
@@ -71,6 +90,23 @@ func NewServer(options ServerOptions) (*Server, error) {
 	if len(options.Address) == 0 {
 		return nil, E.New("missing address")
 	}
+	// The DNS assignment is validated HERE rather than when a client connects, so a
+	// malformed configuration fails at startup with a clear message instead of
+	// presenting as a per-session error. The same validation the client applies to a
+	// received capsule is applied to what this server intends to send: a server must
+	// not emit a configuration a conforming peer would have to reject.
+	for index, configuration := range options.DNSConfigurations {
+		if err = configuration.validate(); err != nil {
+			return nil, E.Cause(err, "invalid DNS configuration ", index)
+		}
+	}
+	for _, prefix := range options.PREF64Prefixes {
+		switch prefix.Bits() {
+		case 32, 40, 48, 56, 64, 96:
+		default:
+			return nil, E.New("invalid NAT64 prefix length: ", prefix.Bits())
+		}
+	}
 	server := &Server{
 		ctx:       options.Context,
 		logger:    options.Logger,
@@ -78,6 +114,12 @@ func NewServer(options ServerOptions) (*Server, error) {
 		resolve:   options.Resolve,
 		handler:   options.Handler,
 		addresses: make(map[netip.Addr]*serverSession),
+		// A nil slice means "send nothing"; an empty non-nil slice means "send an empty
+		// capsule", which invalidates previously advertised prefixes. Recording which
+		// one the caller asked for is what keeps those two cases distinct.
+		dnsConfigurations: options.DNSConfigurations,
+		pref64:            options.PREF64Prefixes,
+		pref64Configured:  options.PREF64Prefixes != nil,
 	}
 	var builder netipx.IPSetBuilder
 	for _, address := range options.Address {
@@ -215,6 +257,29 @@ func (s *Server) NewTunnelRequest(ctx context.Context, request transportHTTP.Tun
 	err = current.writeCapsule(newAddressCapsule(capsuleTypeAddressAssign, current.assignedAddresses(nil)))
 	if err == nil {
 		err = current.writeCapsule(newRouteCapsule(current.advertisedRoutes))
+	}
+	// DNS_ASSIGN and PREF64 go AFTER the route advertisement, in that order.
+	//
+	// draft-ietf-masque-connect-ip-dns-06 §5: implementations "need to ensure that
+	// DNS_ASSIGN capsules are not sent before the corresponding ROUTE_ADVERTISEMENT
+	// capsule", because a resolver the client cannot route through the tunnel would be
+	// reached outside it -- a cleartext leak caused by capsule ordering. A client that
+	// enforces the same rule from its side (this fork does; see
+	// isReachableThroughRoutes) would refuse an assignment that arrived too early, so
+	// getting the order wrong here would silently disable the feature.
+	if err == nil && len(s.dnsConfigurations) > 0 {
+		var dnsCapsule *buf.Buffer
+		dnsCapsule, err = encodeDNSAssign(s.dnsConfigurations)
+		if err == nil {
+			err = current.writeCapsule(dnsCapsule)
+		}
+	}
+	if err == nil && s.pref64Configured {
+		var pref64Capsule *buf.Buffer
+		pref64Capsule, err = encodePREF64(s.pref64)
+		if err == nil {
+			err = current.writeCapsule(pref64Capsule)
+		}
 	}
 	if err != nil {
 		current.cancel(err)
