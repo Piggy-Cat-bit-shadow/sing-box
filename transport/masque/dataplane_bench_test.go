@@ -820,6 +820,19 @@ type copyCountingStream struct {
 	refuseAt int
 	// sink accumulates a byte so the compiler cannot elide the work.
 	sink byte
+	// recordPayloads, when set, makes each send keep a copy of the payload bytes, so a test can
+	// assert on ORDER and CONTENT rather than on counts alone.
+	recordPayloads bool
+	payloads       [][]byte
+}
+
+// drainPayloads returns (and clears) the copied payloads recorded so far.
+func (s *copyCountingStream) drainPayloads() [][]byte {
+	s.access.Lock()
+	defer s.access.Unlock()
+	out := s.payloads
+	s.payloads = nil
+	return out
 }
 
 func (s *copyCountingStream) DatagramsEnabled() bool { return true }
@@ -856,6 +869,9 @@ func (s *copyCountingStream) SendDatagram(payload []byte) error {
 // caller must get its buffer back so it can build a PTB or fall back to capsules.
 func (s *copyCountingStream) SendDatagramOwned(buffer *buf.Buffer) error {
 	s.access.Lock()
+	if s.recordPayloads {
+		s.payloads = append(s.payloads, append([]byte(nil), buffer.Bytes()...))
+	}
 	if s.refuseAt > 0 && buffer.Len() > s.refuseAt {
 		ceiling := s.refuseAt
 		s.access.Unlock()
@@ -899,6 +915,11 @@ func (s *copyCountingStream) SendDatagramsOwned(buffers []*buf.Buffer) error {
 	}
 	s.batchCalls++
 	s.batchedPayloads += len(buffers)
+	if s.recordPayloads {
+		for _, buffer := range buffers {
+			s.payloads = append(s.payloads, append([]byte(nil), buffer.Bytes()...))
+		}
+	}
 	for _, buffer := range buffers {
 		if payload := buffer.Bytes(); len(payload) > 0 {
 			s.sink ^= payload[0]

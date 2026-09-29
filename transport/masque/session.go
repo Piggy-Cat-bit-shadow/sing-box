@@ -94,25 +94,10 @@ type session struct {
 	// the single-packet path keeps using ownedDatagrams, and when only ownedDatagrams is available
 	// the loop below is exactly what it was before batching existed.
 	batchOwnedDatagrams transportHTTP.BatchOwnedDatagramSender
-	// batchScratch is a reusable slice for the batched send path.
-	//
-	// # Why this exists, and what it cost not to have it
-	//
-	// The first version of the batch path allocated a fresh slice per batch, and the measurement
-	// was unambiguous: batch=2 was 46% SLOWER and batch=4 30% slower than the per-packet loop
-	// (p<0.001, isolated benchmark). One allocation of 32 B/op cost ~40 ns, which is far more than
-	// the ~13 ns/packet the batch reclaims from the send queue. Batching only pays if the batch
-	// itself is free to assemble.
-	//
-	// The slice is only ever used inside writeBatchOwned, which is single-threaded with respect to
-	// itself: writePackets is called from the device loop, and the transport takes ownership of the
-	// buffers (not of this slice) before returning. It is reused rather than pooled because it
-	// belongs to exactly one session.
-	batchScratch   []*buf.Buffer
-	reader         *std_bufio.Reader
-	handler        sessionHandler
-	packetHeadroom func() int
-	writeAccess    sync.Mutex
+	reader              *std_bufio.Reader
+	handler             sessionHandler
+	packetHeadroom      func() int
+	writeAccess         sync.Mutex
 }
 
 func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionHandler, packetHeadroom func() int) *session {
@@ -579,11 +564,7 @@ func (s *session) writePackets(buffers []*buf.Buffer) error {
 // context ID fits, so substitution does not happen in production. It is a correctness guard for a
 // caller with a differently-shaped pool.
 func (s *session) writeBatchOwned(buffers []*buf.Buffer) bool {
-	// Reused, not allocated: see the batchScratch field.
-	if cap(s.batchScratch) < len(buffers) {
-		s.batchScratch = make([]*buf.Buffer, len(buffers))
-	}
-	prepared := s.batchScratch[:len(buffers)]
+	prepared := make([]*buf.Buffer, len(buffers))
 	for i, buffer := range buffers {
 		prepared[i] = transportHTTP.PrependContextID(buffer)
 		if prepared[i] != buffer {
