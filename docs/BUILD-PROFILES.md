@@ -48,7 +48,7 @@ once and reaches every profile.
 | `CGO_ENABLED` | `0` | `1` (Cronet) |
 | Build tags | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` | `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 | Registry | `include/registry_jiejie_server.go` | `include/registry_jiejie_client_macos.go` |
-| Binary size (measured) | 48,605,024 B | 43,075,954 B |
+| Binary size (measured) | 48,605,024 B | 42,447,266 B |
 | SHA-256 (measured) | `be2ccbc2df38…` | `fa976ee5491c…` |
 | Workflow | `server-linux-amd64.yml` | `client-macos.yml` |
 | Artifact | `Jiejie-Linux-amd64-<version>-<sha>` | `Jiejie-macOS-arm64-<version>-<sha>` |
@@ -205,11 +205,11 @@ Measured hashes, for reference:
 ```text
 Linux amd64   18e72cc1f6e966cdf73ebcdfc8d63530be3fa244b4ad7c6013d105fb9123deab   local, 33,870,008 B
 macOS arm64   fa976ee5491c987b2c3665afa40a2479802e04078a3896f7763618fb503f617e   superseded, 76,166,402 B
-macOS arm64   43,075,954 B                                                        current, after the registry trim
+macOS arm64   42,447,266 B                                                        current, after the registry trim
 ```
 
 The macOS hash from the wider registry is kept only as a historical marker: the
-shipped binary is now the trimmed one at **43,075,954 B**. Sizes are recorded rather
+shipped binary is now the trimmed one at **42,447,266 B**. Sizes are recorded rather
 than hashes for the current build because the macOS core is CGO and its bytes vary
 across machines (see below) — the size does not, which is what makes it a useful
 guard.

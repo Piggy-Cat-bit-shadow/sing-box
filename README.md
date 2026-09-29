@@ -22,7 +22,7 @@ Upstream ahead  0 commits  (merge-base == upstream/testing)
 | Profile | Platform | Size | Tags |
 | --- | --- | --- | --- |
 | Linux Server Minimal | `linux/amd64`, CGO=0 | **33,767,608 B** | `with_quic,jiejie_server_minimal,badlinkname,tfogo_checklinkname0` |
-| macOS Client | `darwin/arm64`, CGO=1 | **43,075,954 B** | `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
+| macOS Client | `darwin/arm64`, CGO=1 | **42,447,266 B** | `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0` |
 
 CI（最近一次实测）：
 

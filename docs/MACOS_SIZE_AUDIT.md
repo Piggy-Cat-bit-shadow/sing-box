@@ -108,6 +108,65 @@ Layers 3 and 4 run against the artifact users get, and they are what gate the
 product. The static symbol audit is now a fifth layer that explains *why* something
 is missing, rather than the primary evidence.
 
+
+## Third round: linking-level trimming
+
+The second round reduced the registry and stripped the binary. This round asked a
+different question: which code is still LINKED that the product cannot reach, and for
+each candidate, what does it actually cost?
+
+The method matters more than the numbers here. `go list -deps` says a package is in
+the graph; it does not say the linker kept its code. Every candidate below was measured
+with `go tool nm -size` on an unstripped build, and each change was A/B'd against the
+shipped artifact rather than estimated.
+
+| Change | Bytes | Decision |
+|---|---|---|
+| Unused QUIC protocol imports (Hysteria2, TUIC, v2rayquic) | −264,816 | **KEPT** |
+| CLI toolchains compiled out (34 files) | −363,872 | **KEPT** |
+| **Total** | **−628,688 (−0.60 MiB)** | |
+
+Shipped macOS artifact: 43,075,954 → **42,447,266 B**.
+
+### The mistake this round fixed
+
+An earlier round stopped REGISTERING Hysteria2 and TUIC and described them as out of
+the picture. They were not: a Go import links a package and runs its `init()` whether
+or not the registration call is ever reached. The same error appeared one layer up in
+the CLI, where skipping `AddCommand` hid ten command families from `--help` while
+leaving their packages, and their dependencies, in the binary.
+
+Both are now fixed by build constraint or by removing the import, and both are
+asserted on the LINKED IMAGE rather than on the registry, because "not registered" and
+"not linked" are different claims.
+
+### Candidates measured and deliberately KEPT
+
+Each of these was a plausible removal that the measurement did not support:
+
+| Candidate | Linked cost | Why kept |
+|---|---|---|
+| HTTP/3 server code | 37.4 KiB | below the threshold, and splitting shared client/server files is a large risky refactor of upstream-owned code |
+| QUIC congestion variants (meta1/meta2) | 47.0 KiB | reachable through `common/httpclient`, which this client legitimately uses |
+| DoQ / generic DoH3 DNS transports | 13.6 KiB | removing them would cut real capability for negligible gain |
+| `schema` package | 13.8 KiB | a RUNTIME dependency: option structs implement `DescribeSchema`. Only the `schema` COMMAND was CLI-only. |
+| Cobra | 0.19 MiB | replacing the CLI parser is more risk than the bytes are worth |
+
+### Explicitly protected, verified present
+
+| Capability | Evidence |
+|---|---|
+| runtime rule-sets | `common/srs` linked (57 symbols); all four remote SRS fetched and parsed at runtime |
+| MASQUE HTTP/3 client | `transport/http/client_h3.go`, `with_quic` |
+| Native API | `service/api` |
+| Cronet / NaiveProxy | `with_naive_outbound`, CGO |
+| uTLS | 15 packages |
+
+The rule-set distinction is the one most at risk from a careless trim, so it is
+asserted in both directions: the CLI tooling must be ABSENT and `common/srs` must be
+PRESENT. Asserting only the removal would have let a future edit delete runtime SRS
+and still pass.
+
 ## NOT TESTED
 
 - Any real remote-network throughput or latency comparison; the size work makes no

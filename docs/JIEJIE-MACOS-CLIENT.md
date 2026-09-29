@@ -192,7 +192,7 @@ dropped as an optimisation:
 | `with_dhcp` | The desktop client does not use DHCP DNS. |
 | `with_wireguard` | The WireGuard endpoint is not part of the client feature set. |
 
-The macOS core is **43,075,954 B** against **108 MB** for the upstream default tag
+The macOS core is **42,447,266 B** against **108 MB** for the upstream default tag
 set built for the same platform. It is larger than a trimmed CGO-free core would
 be, because it ships NaiveProxy and MASQUE rather than excluding them; the saving
 against upstream still comes entirely from registration-level trimming.
@@ -583,7 +583,7 @@ The cost is accepted deliberately:
   the macOS core is CGO=1 and is not self-contained. The alternative would be a
   second CGO-free core that cannot speak NaiveProxy, which is the split that was
   removed.
-- The core is **43,075,954 B** for arm64, against roughly 56 MB for a CGO-free build
+- The core is **42,447,266 B** for arm64, against roughly 56 MB for a CGO-free build
   that excludes Naive and MASQUE. The trimmed registry gave back about 2.7 MB of
   that; the rest is the capabilities themselves, which are the point of the
   product.
