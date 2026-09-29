@@ -214,10 +214,10 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928085008-2616b72468d0
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260929232022-d2e71709a76b
 
-replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f
+replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c
 
 // Must match the replace in the root go.mod: this is a SEPARATE module, so it
 // does not inherit it, and transport/http now calls the owned-datagram API.
-replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929220002-d29e441af4d8
+replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94

@@ -242,8 +242,13 @@ func New(options Options) (*Box, error) {
 		return nil, E.Cause(err, "initialize router")
 	}
 	// The traffic manager and the routing-mode manager are created for the Native
-	// API, which subscribes to traffic and drives SetClashMode. The Clash API used
-	// to be a second reason to create them; it no longer exists.
+	// API, which subscribes to traffic and drives SetClashMode.
+	//
+	// Upstream gates this on needClashAPI as well, because upstream still has a
+	// Clash API. This product does not: the Clash API is trimmed, so the Native API
+	// and the platform log writer are the only reasons to build the managers. The
+	// condition therefore drops needClashAPI rather than reintroducing a control
+	// plane this product deliberately does not ship.
 	if needAPIService || options.PlatformLogWriter != nil {
 		trafficManager := trafficcontrol.NewManager()
 		service.MustRegisterPtr(ctx, trafficManager)

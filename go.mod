@@ -42,24 +42,24 @@ require (
 	github.com/sagernet/gomobile v0.1.12
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf
 	github.com/sagernet/nftables v0.3.0-mod.4
-	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
-	github.com/sagernet/sing v0.9.6-0.20260927091435-fcc22e2b9f96
-	github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a
-	github.com/sagernet/sing-cloudflared v0.1.3
-	github.com/sagernet/sing-mux v0.3.9
-	github.com/sagernet/sing-openconnect v0.1.1-0.20260925112412-098ce1337fbe
-	github.com/sagernet/sing-openvpn v0.1.1-0.20260925112415-fe3a4fdc2e64
-	github.com/sagernet/sing-quic v0.7.1
-	github.com/sagernet/sing-shadowsocks v0.2.8
-	github.com/sagernet/sing-shadowsocks2 v0.2.1
-	github.com/sagernet/sing-shadowtls v0.2.1
+	github.com/sagernet/quic-go v0.61.0-sing-box-mod.9
+	github.com/sagernet/sing v0.9.7-0.20260929150544-6f21f2425a95
+	github.com/sagernet/sing-anytls v0.0.0-20260928104022-580984e4d8cb
+	github.com/sagernet/sing-cloudflared v0.1.4-0.20260929150702-b3a1e8f3018c
+	github.com/sagernet/sing-mux v0.3.10-0.20260928104022-13d386f5efbd
+	github.com/sagernet/sing-openconnect v0.1.1-0.20260929151226-29757281a247
+	github.com/sagernet/sing-openvpn v0.1.1-0.20260929151220-f330676d6d4a
+	github.com/sagernet/sing-quic v0.7.2-0.20260929152029-258509488380
+	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929152116-0a3456819ce7
+	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b
+	github.com/sagernet/sing-shadowtls v0.2.2-0.20260928201441-a9c0127d5c99
 	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f
-	github.com/sagernet/sing-tun v0.9.6-0.20260925112405-97d11460f2ea
+	github.com/sagernet/sing-tun v0.9.7-0.20260929152201-837976228ca2
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca
-	github.com/sagernet/sing-vmess v0.2.8
+	github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1
 	github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd
-	github.com/sagernet/wireguard-go v0.0.8-0.20260925112423-da3fb928cdc1
+	github.com/sagernet/wireguard-go v0.0.8-0.20260929150556-ca3bc60c4ce7
 	github.com/sagernet/ws v0.0.0-20231204124109-acfe8907c854
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.0
@@ -201,14 +201,18 @@ require (
 
 // Adds WriteOwnedBuffer, the geometry-based ownership hand-off for a cached first payload.
 // Additive: no existing API changed.
-replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260929205859-3f609c65d21a
+// Adds WriteOwnedBuffer (the cached first-payload handoff) and the byteformats overflow
+// rejection. Rebased onto upstream/dev: only the local patches are applied, and the six
+// upstream commits that had been cherry-picked are now inherited from upstream itself.
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260929232022-d2e71709a76b
 
 // Adds async read/write buffer pinning (correctness: the native side retains the pointer
 // until its completion callback) and the EarlyCopyBufferGrowth capability the upload copy
 // loop asks for. Both are additive; no existing API changed.
 replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c
 
-// Adds the ownership-transferring DATAGRAM API (SendDatagramOwned) used by the MASQUE
-// zero-copy outbound path. Based on v0.61.0-sing-box-mod.7 with one additive commit;
-// SendDatagram and every other API are unchanged.
-replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929220002-d29e441af4d8
+// Adds the ownership-transferring DATAGRAM API (SendDatagramOwned, SendDatagramsOwned and
+// datagramQueue.AddBatch) used by the MASQUE zero-copy outbound path. Rebased onto
+// v0.61.0-sing-box-mod.9, which brings the OOB socket read fix; the additive DATAGRAM
+// commits are unchanged and SendDatagram keeps its copying semantics.
+replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94
