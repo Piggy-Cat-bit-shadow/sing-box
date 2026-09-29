@@ -1,6 +1,7 @@
 package masque
 
 import (
+	"strconv"
 	"strings"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -69,7 +70,7 @@ func SvcParamKeyName(key dnsmessage.SVCParamKey) string {
 	if name, known := SvcParamKeyNames[key]; known {
 		return name
 	}
-	return "key" + itoaDecimal(int(key))
+	return "key" + strconv.Itoa(int(key))
 }
 
 // ParsedServiceParameters is the validated view of one nameserver's SvcParams.
@@ -378,21 +379,6 @@ func hasZero(keys []dnsmessage.SVCParamKey) bool {
 		}
 	}
 	return false
-}
-
-// itoaDecimal renders a small non-negative int without importing strconv at every call site.
-func itoaDecimal(value int) string {
-	if value == 0 {
-		return "0"
-	}
-	var digits [20]byte
-	position := len(digits)
-	for value > 0 {
-		position--
-		digits[position] = byte('0' + value%10)
-		value /= 10
-	}
-	return string(digits[position:])
 }
 
 // DohPathIsRelative reports whether a dohpath is a relative reference.

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -175,13 +176,22 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	// through untouched and the hook stays nil, so this endpoint behaves exactly as it did
 	// before the recovery path existed rather than acquiring a degraded one.
 	httpDialer := outboundDialer
-	var http3ConnDialer http.HTTP3ConnDialer
+	var (
+		http3ConnDialer http.HTTP3ConnDialer
+		candidateHolder *candidateDialerHolder
+	)
 	if bootstrapDialer != nil {
 		httpDialer = bootstrapDialer
+		// The candidate primitive lives on the HTTP client, which does not exist yet: the
+		// client needs this hook in order to be constructed. A small holder breaks the cycle
+		// without weakening either side -- by the time the hook runs, the client is built, and
+		// a nil candidate dialer only means the racer falls back to its own DialEarly.
+		candidateHolder = &candidateDialerHolder{}
 		http3ConnDialer = masqueConnDialer(
 			newHandshakeRacer(N.DefaultFallbackDelay),
 			bootstrapDialer,
 			bootstrapResolver.strategy(),
+			candidateHolder,
 		)
 	}
 
@@ -204,6 +214,10 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The holder was needed before the client existed; now it can be filled.
+	if candidateHolder != nil {
+		candidateHolder.set(http3CandidateDialer(httpClient))
 	}
 	clientEndpoint := &ClientEndpoint{
 		endpointBase: endpointBase{
@@ -358,6 +372,53 @@ func (c *ClientEndpoint) installAssignedDNS(configuration masque.Configuration) 
 	c.assignedDNS.apply(configuration.DNS.Configurations, configuration.PREF64, capability)
 	c.logger.Debug("using server-assigned DNS resolver (", len(configuration.DNS.Configurations),
 		" configurations, generation ", configuration.DNS.Generation, ")")
+}
+
+// candidateDialerHolder breaks the construction cycle between the HTTP client and the
+// handshake hook that client needs.
+//
+// The hook is a field of the client, and the client's single-candidate primitive is what the
+// hook wants to delegate to, so one of them has to be supplied late. This holder is that
+// indirection: the hook is given the holder immediately, and the holder is filled in once the
+// client exists. The hook is not invoked until a connection is dialed, which is long after
+// construction, so the fill always happens first.
+type candidateDialerHolder struct {
+	dialer candidateDialer
+}
+
+func (h *candidateDialerHolder) set(dialer candidateDialer) {
+	h.dialer = dialer
+}
+
+// DialHTTP3Candidate implements candidateDialer.
+func (h *candidateDialerHolder) DialHTTP3Candidate(ctx context.Context, server M.Socksaddr, address netip.Addr) (net.Conn, *quic.Conn, error) {
+	if h.dialer == nil {
+		// No candidate primitive: report it so the racer falls back to its own DialEarly
+		// rather than failing the connection.
+		return nil, nil, errNoCandidateDialer
+	}
+	return h.dialer.DialHTTP3Candidate(ctx, server, address)
+}
+
+// errNoCandidateDialer signals that no transport-supplied candidate primitive exists, so the
+// racer should build the candidate itself.
+var errNoCandidateDialer = E.New("no HTTP/3 candidate dialer available")
+
+// http3CandidateDialer extracts the transport's single-candidate primitive, or nil when the
+// client has no HTTP/3 support.
+func http3CandidateDialer(client *http.Client) candidateDialer {
+	if client == nil {
+		return nil
+	}
+	provided := client.HTTP3CandidateDialer()
+	if provided == nil {
+		return nil
+	}
+	dialer, isDialer := provided.(candidateDialer)
+	if !isDialer {
+		return nil
+	}
+	return dialer
 }
 
 // resolverCapability describes what this client can currently do, which decides whether an

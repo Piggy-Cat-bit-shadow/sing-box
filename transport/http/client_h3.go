@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -375,3 +376,44 @@ var (
 	_ N.WriteCloser  = (*http3StreamConn)(nil)
 	_ DatagramStream = (*http3RequestDatagramStream)(nil)
 )
+
+// DialHTTP3Candidate establishes ONE HTTP/3 candidate and installs congestion control on it
+// before waiting for the handshake to complete.
+//
+// # Why this exists
+//
+// The default path in acquire() is, in order:
+//
+//	UDP dial -> DialEarly -> ApplyClientCongestionControl -> wait -> NewClientConn
+//
+// A racer that calls DialEarly itself and only returns after HandshakeComplete leaves the
+// congestion control to be installed later, by acquire(), which means the handshake exchanged
+// packets under the DEFAULT controller. Congestion control is not a post-connection option:
+// the first flight sets the initial window and the pacing behaviour, so installing it after the
+// handshake is a real behavioural difference, not a bookkeeping one.
+//
+// This primitive gives the racer the middle three steps without duplicating any of them.
+// protocol/masque supplies only candidate ordering, the stagger and the winner decision; the
+// UDP dial, the TLS/QUIC construction and the congestion-control choice all stay here, where
+// the transport already owns them.
+//
+// It does NOT touch the memoized connection: the caller (the racer) owns the returned pair
+// until it hands the winner back through the hook, at which point acquire() wraps it exactly as
+// before. So the memoization, the ordering and the default path are all unchanged.
+func (c *http3ClientImpl) DialHTTP3Candidate(ctx context.Context, server M.Socksaddr, address netip.Addr) (net.Conn, *quic.Conn, error) {
+	destination := M.SocksaddrFrom(address, server.Port)
+	rawConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, destination)
+	if err != nil {
+		return nil, nil, E.Cause(err, "dial UDP to ", address)
+	}
+	quicConn, err := qtls.DialEarly(ctx, rawConn, c.tlsConfig, c.quicConfig)
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, nil, E.Cause(err, "QUIC dial to ", address)
+	}
+	// THE point of this function: the configured congestion control is installed on the
+	// connection BEFORE it has completed its handshake, so the handshake itself runs under it --
+	// exactly as on the default path.
+	httpclient.ApplyClientCongestionControl(quicConn, c.congestionControl)
+	return rawConn, quicConn, nil
+}

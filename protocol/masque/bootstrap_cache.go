@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -116,8 +115,7 @@ func (c *bootstrapCache) resolve(ctx context.Context, fresh bootstrapResolution)
 		// worked -- which is exactly what a partially recovered network produces -- would
 		// discard addresses that are still reachable. The merge is the whole point of
 		// keeping a cache.
-		merged := c.recordAndMerge(freshAddresses)
-		return merged, nil
+		return c.recordFreshSnapshot(freshAddresses), nil
 	}
 
 	c.access.Lock()
@@ -145,40 +143,47 @@ func (c *bootstrapCache) resolve(ctx context.Context, fresh bootstrapResolution)
 	return ordered, nil
 }
 
-// recordAndMerge updates the cache from a successful fresh resolution and returns the
-// ordered candidate list the caller should use.
+// recordFreshSnapshot replaces the cache with a successful fresh resolution and returns the
+// candidate list the caller should use.
 //
-// It is called with FRESH addresses only, so the cache always reflects a resolution that
-// actually succeeded rather than an accumulation of historical guesses.
-func (c *bootstrapCache) recordAndMerge(fresh []netip.Addr) []netip.Addr {
+// # Why this REPLACES rather than merges
+//
+// The previous version returned `fresh ++ (cached \ fresh)`, carrying over addresses the fresh
+// answer had not mentioned. The intent was to survive a resolver answering with a subset, but
+// the effect on a WITHDRAWN address is a stale-DNS hazard: if the operator removes an address
+// from the record, the recovery cache puts it straight back and we keep dialling something the
+// resolver no longer publishes. There is no TTL on this memory, so nothing would ever expire
+// it.
+//
+// A successful DNS answer is authoritative. It is the current truth about where the server is,
+// and the cache exists only to cover the case where that truth cannot be obtained. So a fresh
+// success replaces the snapshot outright, and the cache is consulted ONLY when the fresh
+// lookup fails, times out, or returns nothing.
+func (c *bootstrapCache) recordFreshSnapshot(fresh []netip.Addr) []netip.Addr {
 	c.access.Lock()
 	defer c.access.Unlock()
-	merged := make([]netip.Addr, 0, len(fresh)+len(c.candidates))
-	seen := make(map[netip.Addr]struct{}, len(fresh)+len(c.candidates))
+	snapshot := make([]netip.Addr, 0, len(fresh))
+	seen := make(map[netip.Addr]struct{}, len(fresh))
 	for _, address := range fresh {
 		if _, loaded := seen[address]; loaded {
 			continue
 		}
 		seen[address] = struct{}{}
-		merged = append(merged, address)
+		snapshot = append(snapshot, address)
 	}
-	// Carry over previously known addresses the fresh answer did not mention, so a
-	// resolver returning a subset does not discard addresses that were working.
-	for _, address := range c.candidates {
-		if _, loaded := seen[address]; loaded {
-			continue
+	if len(snapshot) > c.maxCandidates {
+		snapshot = snapshot[:c.maxCandidates]
+	}
+	// The snapshot IS the candidate list: the caller iterates it, so it must be the same list
+	// the cache holds, not a copy that could drift.
+	c.candidates = append([]netip.Addr(nil), snapshot...)
+	// A winner that DNS no longer publishes is no longer worth preferring.
+	if c.winner.IsValid() {
+		if _, stillPresent := seen[c.winner]; !stillPresent {
+			c.winner = netip.Addr{}
 		}
-		seen[address] = struct{}{}
-		merged = append(merged, address)
 	}
-	if len(merged) > c.maxCandidates {
-		// Keep the freshest, which are at the front.
-		merged = merged[:c.maxCandidates]
-	}
-	// A fresh-resolution result is a complete snapshot rather than a truncation: the
-	// caller iterates it, so it must be the same list the cache holds.
-	c.candidates = append([]netip.Addr(nil), merged...)
-	return merged
+	return snapshot
 }
 
 // promote records that an address actually completed a connection.
@@ -235,31 +240,20 @@ type bootstrapDialer struct {
 	// resolver binds a hostname to a resolution function, so the cache's recovery logic
 	// never has to know which name it is recovering.
 	resolver *bootstrapResolver
-	// candidates is the most recent resolution, published for the QUIC racer.
-	//
-	// The racer needs the whole list to race at handshake level, and re-resolving for it
-	// would double the lookups and could return a different answer than the one this
-	// dialer just used. The cache already ordered the list; publishing it is how that
-	// ordering reaches the racer instead of being thrown away here.
-	candidates atomic.Pointer[[]netip.Addr]
 }
 
 func newBootstrapDialer(outboundDialer N.Dialer, cache *bootstrapCache, resolver *bootstrapResolver) *bootstrapDialer {
 	return &bootstrapDialer{Dialer: outboundDialer, cache: cache, resolver: resolver}
 }
 
-// bootstrapCandidates returns the address list from the most recent successful resolution,
-// or nil if none has happened yet.
-func (d *bootstrapDialer) bootstrapCandidates() []netip.Addr {
-	pointer := d.candidates.Load()
-	if pointer == nil {
-		return nil
-	}
-	return *pointer
-}
-
 // resolveCandidates produces the ordered candidate list for a connection attempt, using the
-// cache's recovery rules, and publishes it for the racer.
+// cache's recovery rules.
+//
+// It is called on EVERY new connection attempt, including reconnects after a network change.
+// An earlier version published the list and let the racer reuse it, which meant that after the
+// first successful connection DNS was never consulted again -- so a server that moved, or a
+// network that changed, kept being dialled at its old address. That fails silently, because a
+// stale address that still answers looks exactly like success.
 func (d *bootstrapDialer) resolveCandidates(ctx context.Context, fqdn string) ([]netip.Addr, error) {
 	addresses, err := d.cache.resolve(ctx, d.resolver.resolve(fqdn))
 	if err != nil {
@@ -268,13 +262,14 @@ func (d *bootstrapDialer) resolveCandidates(ctx context.Context, fqdn string) ([
 	if len(addresses) == 0 {
 		return nil, E.New("bootstrap resolution returned no addresses")
 	}
-	published := append([]netip.Addr(nil), addresses...)
-	d.candidates.Store(&published)
 	return addresses, nil
 }
 
 // DialContext resolves a domain through the cache, then tries the resulting addresses IN
 // ORDER until one connects.
+//
+// This is the non-QUIC path (a caller that dials the hostname directly rather than through the
+// racer).
 //
 // # Why the whole list matters
 //

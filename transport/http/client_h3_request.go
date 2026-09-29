@@ -5,12 +5,16 @@ package http
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // Generic HTTP/3 request support on the SAME connection the CONNECT-IP tunnel uses.
@@ -75,10 +79,37 @@ type http3ExistingConnectionRoundTripper interface {
 	HTTP3ConnectionAuthority() (string, bool)
 }
 
+// http3CandidateDialer is the capability the MASQUE racer needs: establish ONE candidate with
+// the transport's own TLS, QUIC and congestion-control configuration.
+//
+// Supplying this from transport/http is what lets the racer own candidate policy while the
+// transport keeps ownership of connection construction. The alternative -- the racer calling
+// DialEarly itself -- would mean protocol/masque duplicating the TLS config resolution, the
+// QUIC options and the congestion-control choice, and would put congestion control on the
+// WRONG side of the handshake, which is the defect this seam exists to fix.
+type http3CandidateDialer interface {
+	DialHTTP3Candidate(ctx context.Context, server M.Socksaddr, address netip.Addr) (net.Conn, *quic.Conn, error)
+}
+
 var (
 	_ http3RequestRoundTripper            = (*http3ClientImpl)(nil)
 	_ http3ExistingConnectionRoundTripper = (*http3ClientImpl)(nil)
+	_ http3CandidateDialer                = (*http3ClientImpl)(nil)
 )
+
+// HTTP3CandidateDialer exposes the single-candidate primitive to a caller that supplies its own
+// candidate ordering. It returns nil when this client has no HTTP/3 support, so a caller falls
+// back to its own dialing rather than failing.
+func (c *Client) HTTP3CandidateDialer() any {
+	if c.http3 == nil {
+		return nil
+	}
+	dialer, isDialer := c.http3.(http3CandidateDialer)
+	if !isDialer {
+		return nil
+	}
+	return dialer
+}
 
 // HTTP3ConnectionState reports whether the tunnel is currently running over HTTP/3, and the
 // authority that connection is authenticated for.
