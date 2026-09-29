@@ -201,7 +201,10 @@ require (
 
 replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260928085008-2616b72468d0
 
-replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260928085629-d83f1a1c6e7f
+// Adds async read/write buffer pinning (correctness: the native side retains the pointer
+// until its completion callback) and the EarlyCopyBufferGrowth capability the upload copy
+// loop asks for. Both are additive; no existing API changed.
+replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c
 
 // Adds the ownership-transferring DATAGRAM API (SendDatagramOwned) used by the MASQUE
 // zero-copy outbound path. Based on v0.61.0-sing-box-mod.7 with one additive commit;
