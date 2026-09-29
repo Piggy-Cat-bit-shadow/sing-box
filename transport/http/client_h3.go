@@ -403,6 +403,39 @@ func (s *http3RequestDatagramStream) SendDatagram(payload []byte) error {
 	return err
 }
 
+// SendDatagramOwned is the ownership-transferring counterpart of SendDatagram.
+//
+// # The error translation must stay identical
+//
+// The MTU a caller learns from a too-large error is used to build an ICMP Packet Too Big, and the
+// subtraction below accounts for the framing the QUIC layer measured but the caller did not send
+// (the quarter stream ID, and the context ID the caller prepended). Reporting a different ceiling
+// here than SendDatagram reports would make the same packet produce two different PTBs depending on
+// which path happened to be used.
+//
+// # Ownership on each branch
+//
+//	unsupported  -> payload untouched, still the caller's
+//	too large    -> payload rolled back by the HTTP/3 layer, still the caller's
+//	success      -> payload owned by the transport, released exactly once after serialization
+//
+// The rollback is what makes the first two branches useful: the caller trims the buffer and builds
+// the PTB, or hands it to the capsule fallback, from the very payload that failed.
+func (s *http3RequestDatagramStream) SendDatagramOwned(payload http3.OwnedDatagramPayload) error {
+	if !s.datagramsEnabled {
+		return ErrDatagramUnsupported
+	}
+	err := s.stream.SendDatagramOwned(payload)
+	if err == nil {
+		return nil
+	}
+	var tooLarge *quic.DatagramTooLargeError
+	if errors.As(err, &tooLarge) {
+		return &DatagramTooLargeError{MaxPayloadSize: int(tooLarge.MaxDatagramPayloadSize) - VarintLen(uint64(s.stream.StreamID()/4))}
+	}
+	return err
+}
+
 func (s *http3RequestDatagramStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	return s.stream.ReceiveDatagram(ctx)
 }

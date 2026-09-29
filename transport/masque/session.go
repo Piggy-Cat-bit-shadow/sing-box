@@ -44,10 +44,14 @@ type sessionHandler interface {
 }
 
 type session struct {
-	ctx            context.Context
-	cancel         context.CancelCauseFunc
-	stream         io.ReadWriteCloser
-	datagrams      transportHTTP.DatagramStream
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	stream    io.ReadWriteCloser
+	datagrams transportHTTP.DatagramStream
+	// ownedDatagrams is the ownership-transferring send capability, or nil when this stream cannot
+	// take ownership. Decided ONCE here rather than per packet: a stream's capability cannot change
+	// while the connection lives, and the packet path may not pay for a type assertion.
+	ownedDatagrams transportHTTP.OwnedDatagramSender
 	reader         *std_bufio.Reader
 	handler        sessionHandler
 	packetHeadroom func() int
@@ -61,14 +65,19 @@ func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionH
 	// assertion that cannot express it. A stream that does not report it is treated as
 	// incapable, which is the safe default: the capsule path always works.
 	var datagrams transportHTTP.DatagramStream
+	var ownedDatagrams transportHTTP.OwnedDatagramSender
 	if capable, isDatagramStream := stream.(transportHTTP.DatagramStream); isDatagramStream && capable.DatagramsEnabled() {
 		datagrams = capable
+		// Resolved once, alongside the capability that makes it meaningful. A stream that cannot
+		// take ownership simply leaves this nil and the copying path is used unchanged.
+		ownedDatagrams = transportHTTP.AsOwnedDatagramSender(capable)
 	}
 	current := &session{
 		ctx:            sessionCtx,
 		cancel:         cancel,
 		stream:         stream,
 		datagrams:      datagrams,
+		ownedDatagrams: ownedDatagrams,
 		reader:         std_bufio.NewReader(stream),
 		handler:        handler,
 		packetHeadroom: packetHeadroom,
@@ -371,17 +380,45 @@ func classifyWrappedDatagramError(err error) (datagramErrorKind, int) {
 	return datagramErrorOther, 0
 }
 
+// writePackets sends a batch of inner IP packets over the established session.
+//
+// # Two send paths, one ownership rule
+//
+// When the datagram stream can take ownership of a buffer, packets are handed over WITHOUT the two
+// payload copies quic-go's copying API performs. When it cannot, the copying path is used and this
+// side releases the buffer itself.
+//
+// The rule that keeps both correct is that a buffer is released EXACTLY ONCE, by whoever owns it:
+//
+//	owned, nil error       -> the transport owns it. This function must NOT release it.
+//	owned, non-nil error   -> still ours. The HTTP/3 layer rolled back its prefix, so the buffer
+//	                          reads as ContextID + packet again and can be retried or turned into
+//	                          a PTB.
+//	not owned, nil error   -> we still own it (the copy was sent), so release it here.
+//	not owned, non-nil err -> we own it, and it was never sent.
+//
+// Getting the first case wrong would be a double release of a pooled buffer, which corrupts
+// unrelated traffic later rather than failing here.
 func (s *session) writePackets(buffers []*buf.Buffer) error {
 	capsules := buffers[:0]
 	for i, buffer := range buffers {
 		datagram := transportHTTP.PrependContextID(buffer)
 		if s.datagrams != nil {
-			err := s.datagrams.SendDatagram(datagram.Bytes())
-			if err == nil {
-				// The overwhelmingly common case, and it is kept first and free of any
-				// error-classification machinery.
-				datagram.Release()
-				continue
+			var err error
+			if s.ownedDatagrams != nil {
+				// Ownership transfers on success, so the release below is skipped entirely.
+				err = s.ownedDatagrams.SendDatagramOwned(datagram)
+				if err == nil {
+					continue
+				}
+			} else {
+				err = s.datagrams.SendDatagram(datagram.Bytes())
+				if err == nil {
+					// The overwhelmingly common case, and it is kept first and free of any
+					// error-classification machinery.
+					datagram.Release()
+					continue
+				}
 			}
 			// Only now, on the failure path, is the error classified. This ordering is not
 			// stylistic: passing the address of a typed pointer to errors.As makes that variable
