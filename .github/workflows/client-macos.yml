@@ -324,8 +324,13 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
+          # ./protocol/masque/ is in this list because it is where the MASQUE
+          # concurrency lives: the upstream candidate racer, the assigned-DNS state
+          # model, and the bootstrap cache are all read on one goroutine while written
+          # on another. The ordinary unit-test step covers the package too, but a race
+          # in it would only be reported by this one.
           CGO_ENABLED=1 go test -race -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 40m \
-            ./transport/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
+            ./transport/masque/ ./protocol/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
           echo "PASS: race tests"
 
       - name: deep check - fuzz campaign
