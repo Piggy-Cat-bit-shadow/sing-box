@@ -9,8 +9,10 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/transport/masque"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 
 	mDNS "github.com/miekg/dns"
+	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/stretchr/testify/require"
 )
@@ -331,4 +333,89 @@ func TestReachableAssignmentIsInstalled(t *testing.T) {
 	_, err := endpoint.lookupInner(context.Background(), "reachable.example.test")
 	require.NoError(t, err)
 	require.Same(t, assigned, router.transportAt(0))
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: server-emitted capsules drive the client resolver
+// ---------------------------------------------------------------------------
+
+// TestServerEmittedAssignmentDrivesTheClientResolver closes the loop between the two
+// packages.
+//
+// The server package proves it emits capsules a client parser accepts. This proves the next
+// step, which is the one that actually matters operationally: that a configuration built the
+// way the server builds it is INSTALLED by the endpoint and then used for a real lookup.
+// Between those two steps sit the reachability check and the install policy, and a bug there
+// would leave a perfectly well-formed assignment silently ignored.
+//
+// The configuration here is hand-built in the SHAPE the server emits (the same field names,
+// the same SVC parameter encoding), and the routes are the ones the server would advertise,
+// so the reachability check runs for real rather than being short-circuited.
+func TestServerEmittedAssignmentDrivesTheClientResolver(t *testing.T) {
+	t.Parallel()
+
+	const nameserverAddress = "10.0.0.53"
+	// The shape the server emits: one configuration, one IPv4 nameserver, a dohpath.
+	configurations := []masque.DNSConfiguration{
+		{
+			Nameservers: []masque.DNSNameserver{
+				{
+					ServicePriority:          1,
+					IPv4Addresses:            []netip.Addr{netip.MustParseAddr(nameserverAddress)},
+					AuthenticationDomainName: "dns.example.test.",
+					ServiceParameters: map[dnsmessage.SVCParamKey][]byte{
+						dnsmessage.SVCParamKey(9): []byte("/dns-query{?dns}"),
+					},
+				},
+			},
+			SearchDomains: []string{"search.example.test."},
+		},
+	}
+	// The routes the server would advertise alongside it, wide enough to contain the
+	// nameserver so the reachability check is exercised rather than bypassed.
+	routes := []masque.AddressRange{{
+		Start: netip.MustParseAddr("10.0.0.0"),
+		End:   netip.MustParseAddr("10.0.0.255"),
+	}}
+
+	router := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("10.0.0.99")}}
+	endpoint, assigned := newLookupEndpoint(t, router, adapter.DNSQueryOptions{})
+	endpoint.installAssignedDNS(masque.Configuration{
+		Routes: routes,
+		DNS:    &masque.DNSAssignment{Configurations: configurations},
+		PREF64: []netip.Prefix{netip.MustParsePrefix("64:ff9b::/96")},
+	})
+
+	require.True(t, assigned.active(),
+		"the assignment the server emitted must be installed, which requires its nameserver to be inside the advertised routes")
+
+	// The lookup must go through the assigned resolver.
+	_, err := endpoint.lookupInner(context.Background(), "inner.example.test")
+	require.NoError(t, err)
+	require.Same(t, assigned, router.transportAt(0),
+		"an inner lookup must go through the assigned resolver")
+
+	// And the dohpath must have survived into the transport, because it is what selects
+	// same-connection DoH. If it were lost, queries would still be answered over UDP and
+	// nothing would fail -- the coalescing would just silently not happen.
+	require.Contains(t, assigned.Environment(), "dohpath=/dns-query{?dns}",
+		"the dohpath must reach the transport so DoH is selected rather than plain UDP")
+
+	// The queries must travel through the tunnel device, not anywhere else.
+	dialer := &recordingDialer{}
+	assigned.dialer = dialer
+	query := new(mDNS.Msg)
+	query.SetQuestion("through-tunnel.example.test.", mDNS.TypeAAAA)
+	answer := new(mDNS.Msg)
+	answer.SetReply(query)
+	packed, err := answer.Pack()
+	require.NoError(t, err)
+	dialer.answer = packed
+
+	_, err = assigned.Exchange(context.Background(), query)
+	require.NoError(t, err)
+	require.Equal(t, 1, dialer.dials, "the query must go through the tunnel device")
+	require.Equal(t, "udp", dialer.network)
+	require.Equal(t, M.SocksaddrFrom(netip.MustParseAddr(nameserverAddress), 53), dialer.last,
+		"the query must be addressed to the assigned nameserver on the DNS port")
 }
