@@ -8,7 +8,7 @@ the Naive outbound dataplane.
 | | |
 |---|---|
 | sing-box before | `dd8b19aa5` (`SING_BASE_HEAD`) |
-| sing-box after | `f45db770e` |
+| sing-box after | `751b6b7f8` (code at `f45db770e`, CI-verified) |
 | cronet-go before | `d83f1a1c6e7f392c865651229778748e1037dc7d` (`CRONET_BASE_SHA`, branch `fix/naive-codec-parity`) |
 | cronet-go after | `8c68ce89873c976b33ac62a3fd3128064d34e0a7` (`CRONET_FINAL_SHA`) |
 | cronet-go branch | `jiejie-naive-zero-copy` (fork of `Piggy-Cat-bit-shadow/cronet-go`) |
@@ -261,8 +261,8 @@ no such profile exists. **NO CHANGE to native code.**
 | | Result |
 |---|---|
 | cronet-go | **NOT DISPATCHABLE** — `naive-build.yml` triggers on `main`/`dev` only and is not on the default branch, so it cannot run for this branch. Its locally reproducible steps were run instead: root package tests under `with_purego` (**66 passed**), race clean, cgo and purego builds clean, `gofmt` clean |
-| macOS arm64 | see run IDs in the session report |
-| Linux amd64 | see run IDs in the session report |
+| macOS arm64 | **PASS** — [36627610199](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36627610199) on `f45db770e` |
+| Linux amd64 | **PASS** — [36627615972](https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/36627615972) on `f45db770e` |
 
 ## Binary
 
