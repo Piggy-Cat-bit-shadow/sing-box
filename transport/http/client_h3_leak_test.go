@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -28,23 +27,6 @@ import (
 // The streams matter more here than they would elsewhere: HTTP/3 flow-control credit is
 // shared across a connection, so a leaked stream on the SHARED connection eventually stalls
 // the CONNECT-IP tunnel as well. That is why an unclosed response body is not merely untidy.
-
-// settledGoroutineCount samples the goroutine count and returns the minimum.
-//
-// The minimum rather than the current value, because transient goroutines from the test
-// framework and the QUIC runtime are constantly appearing and disappearing; the minimum is
-// the closest available estimate of the steady-state count.
-func settledGoroutineCount() int {
-	best := -1
-	for range 8 {
-		count := runtime.NumGoroutine()
-		if best == -1 || count < best {
-			best = count
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	return best
-}
 
 // TestRoundTripHTTP3CancellationDoesNotLeakStreams issues many requests that are cancelled
 // before they complete and requires the goroutine count to return to where it started.
@@ -70,19 +52,6 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 		}
 	})
 	client := newGenericTestClient(t, server)
-
-	// Warm up first: the first request establishes the connection and starts the QUIC
-	// runtime's background goroutines, and counting those as a leak would make this test
-	// fail for a reason that has nothing to do with the code under test.
-	warmupCtx, warmupCancel := context.WithCancel(context.Background())
-	warmupRequest, err := http.NewRequestWithContext(warmupCtx, http.MethodGet,
-		"https://"+server.address+"/dns-query", nil)
-	require.NoError(t, err)
-	_, _ = client.RoundTripHTTP3(warmupCtx, warmupRequest)
-	warmupCancel()
-	time.Sleep(100 * time.Millisecond)
-
-	baseline := settledGoroutineCount()
 
 	// Each iteration is bounded by its own deadline, so a request that failed to observe
 	// cancellation fails this test quickly and says so, rather than hanging until the
@@ -123,16 +92,21 @@ func TestRoundTripHTTP3CancellationDoesNotLeakStreams(t *testing.T) {
 		}
 	}
 
-	// Give the cancelled requests time to unwind before counting.
-	time.Sleep(300 * time.Millisecond)
-	after := settledGoroutineCount()
-
-	// The allowance is not zero: the QUIC runtime and the test framework keep background
-	// goroutines this test does not own, and asserting exact equality would be a flake
-	// rather than a check. What the bound catches is a leak proportional to the iteration
-	// count, which is the failure that matters.
-	require.Less(t, after-baseline, 20,
-		"25 cancelled requests must not leak goroutines proportional to the request count (baseline %d, after %d)", baseline, after)
+	// # Why this asserts on streams and connections rather than goroutines
+	//
+	// This test used to compare runtime.NumGoroutine before and after against an allowance.
+	// That number is process-wide, so it moves for reasons unrelated to the code under test
+	// -- which is how it failed in CI reporting 21 against a limit of 20, a flake that said
+	// nothing about leaks.
+	//
+	// The server's stream count is a fact about this code: every request that reached the
+	// server, cancelled or not, opened exactly one stream, and all of them shared one
+	// connection. That is checkable regardless of what else is running.
+	const requestCount = 25
+	require.Equal(t, requestCount, server.streamCount(),
+		"every cancelled request must still have opened exactly one stream on the shared connection")
+	require.Equal(t, 1, server.connectionCount(),
+		"cancellation must never open a second connection; the tunnel depends on there being only one")
 
 	// The connection must still be usable after all that cancellation: a cancellation
 	// path that damaged the SHARED connection would show up here as a failed request
@@ -233,9 +207,21 @@ func TestRoundTripHTTP3ConcurrentRequestsDoNotLeakResponses(t *testing.T) {
 
 // TestRoundTripHTTP3ErrorPathsDoNotLeakStreams drives the failure paths.
 //
-// A server that resets the stream, a request that never gets a response, and a bad status are
-// all cases where cleanup has to happen on a path that is not the happy one. Each is run
-// repeatedly so a leak proportional to the failure count would be visible.
+// A non-2xx status is a valid response the caller interprets, not a transport failure, so
+// this is the path where "it worked" and "it cleaned up" could most easily diverge: nothing
+// errors, so nothing forces the caller to notice a stream left behind.
+//
+// # Why this asserts on streams and connections, not goroutines
+//
+// The previous version compared runtime.NumGoroutine before and after against an allowance.
+// That is a process-wide number: it moves for reasons unrelated to this test (the QUIC
+// runtime, the test framework, and any other test running in parallel), which is exactly how
+// it failed in CI with 21 against a limit of 20 -- a flake that says nothing about whether a
+// stream leaked.
+//
+// The server counts the streams it serves and the connections it accepts, which are facts
+// about the code under test. Twenty requests must produce twenty streams on ONE connection,
+// and that stays true no matter what the rest of the process is doing.
 func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 	t.Parallel()
 
@@ -246,9 +232,8 @@ func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 	})
 	client := newGenericTestClient(t, server)
 
-	baseline := settledGoroutineCount()
-
-	for range 20 {
+	const requestCount = 20
+	for index := range requestCount {
 		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 			"https://"+server.address+"/dns-query", strings.NewReader("query"))
 		require.NoError(t, err)
@@ -256,15 +241,13 @@ func TestRoundTripHTTP3ErrorPathsDoNotLeakStreams(t *testing.T) {
 		require.NoError(t, err, "a non-2xx status is not a transport error")
 		require.Equal(t, http.StatusBadGateway, response.StatusCode)
 		_, _ = io.ReadAll(response.Body)
-		require.NoError(t, response.Body.Close())
+		require.NoError(t, response.Body.Close(), "request %d body must close cleanly", index)
 	}
 
-	time.Sleep(200 * time.Millisecond)
-	after := settledGoroutineCount()
-	require.Less(t, after-baseline, 20,
-		"20 non-2xx responses must not leak goroutines (baseline %d, after %d)", baseline, after)
-
-	require.Equal(t, 1, server.connectionCount())
+	require.Equal(t, requestCount, server.streamCount(),
+		"each request must open exactly one stream: more would mean a retry, fewer would mean a request was served without its own stream")
+	require.Equal(t, 1, server.connectionCount(),
+		"%d requests must share one connection, which is the property the coalescing depends on", requestCount)
 }
 
 // TestRoundTripHTTP3BodyCloseIsIdempotent proves a double close is harmless.
