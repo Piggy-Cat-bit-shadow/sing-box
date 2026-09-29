@@ -250,3 +250,86 @@ func BenchmarkPaddingWriteBufferFramed(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkCachedFirstPayload measures the FIRST payload of a connection, which is the one the
+// sniffing/cache layer holds in a pooled buffer and hands to the destination before the copy loop
+// starts.
+//
+// # The two paths being compared
+//
+//	write-copying   destination.Write(cachedBuffer.Bytes())
+//	                the buffer's geometry is discarded; the framing writer must build a new
+//	                buffer and copy the payload into it
+//
+//	write-buffer    destination.WriteBuffer(cachedBuffer)
+//	                the header and padding go into the buffer's own headroom; no payload copy
+//
+// The route layer chooses between them with writeCachedBuffer, from the destination's advertised
+// geometry. This benchmark measures what that choice is worth.
+//
+// # Why it matters even though it is one payload per connection
+//
+// The first bytes of a sniffed connection are also the ones a user waits for. They are worth
+// measuring in isolation rather than hiding inside a bulk-transfer benchmark, where they are
+// amortised to nothing.
+func BenchmarkCachedFirstPayload(b *testing.B) {
+	for _, testCase := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"64B", bytes.Repeat([]byte("s"), 64)},
+		{"1400B", bytes.Repeat([]byte("m"), 1400)},
+		{"16KiB", bytes.Repeat([]byte("l"), 16*1024)},
+		{"64KiB", bytes.Repeat([]byte("L"), 64*1024)},
+	} {
+		b.Run("copying/"+testCase.name, func(b *testing.B) {
+			payload := testCase.payload
+			connection := &paddingConn{enabled: true}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				// The geometry the cache layer produces: headroom for the 3-byte header and 255
+				// bytes of padding, which is exactly what the copy loop allocates.
+				buffer := buf.NewSize(3 + 255 + len(payload))
+				buffer.Resize(3, len(payload))
+				copy(buffer.Bytes(), payload)
+				b.StartTimer()
+				// The old shape: a bare byte slice, so the framing writer receives no
+				// geometry and must build its own frame buffer.
+				if _, err := connection.writeChunked(io.Discard, buffer.Bytes()); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				buffer.Release()
+				// Reset the padding window so each iteration measures the framed phase rather than
+				// the raw pass-through that follows it.
+				connection.writePadding = 0
+				b.StartTimer()
+			}
+		})
+		b.Run("buffer/"+testCase.name, func(b *testing.B) {
+			payload := testCase.payload
+			connection := &paddingConn{enabled: true}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			b.ResetTimer()
+			for range b.N {
+				b.StopTimer()
+				buffer := buf.NewSize(3 + 255 + len(payload))
+				buffer.Resize(3, len(payload))
+				copy(buffer.Bytes(), payload)
+				b.StartTimer()
+				// The new shape: ownership transfers, and the frame is built in place.
+				if err := connection.writeBufferWithPadding(io.Discard, buffer); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				buffer.Release()
+				connection.writePadding = 0
+				b.StartTimer()
+			}
+		})
+	}
+}
