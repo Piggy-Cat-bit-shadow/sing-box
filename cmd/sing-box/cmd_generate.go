@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -22,10 +24,8 @@ func init() {
 	commandGenerate.AddCommand(commandGenerateUUID)
 	commandGenerate.AddCommand(commandGenerateRandom)
 
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("generate") {
-		mainCommand.AddCommand(commandGenerate)
-	}
+	mainCommand.AddCommand(commandGenerate)
+
 }
 
 var (

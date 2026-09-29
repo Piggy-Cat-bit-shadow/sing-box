@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -29,10 +31,8 @@ var commandSchema = &cobra.Command{
 
 func init() {
 	commandSchema.Flags().StringVarP(&commandSchemaFlagOutput, "output", "o", "", "write schema to file instead of stdout")
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("schema") {
-		mainCommand.AddCommand(commandSchema)
-	}
+	mainCommand.AddCommand(commandSchema)
+
 }
 
 func generateSchema() error {

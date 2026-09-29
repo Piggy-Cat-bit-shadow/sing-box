@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -27,10 +29,8 @@ var commandGeoSite = &cobra.Command{
 
 func init() {
 	commandGeoSite.PersistentFlags().StringVarP(&commandGeoSiteFlagFile, "file", "f", "geosite.db", "geosite file")
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("geosite") {
-		mainCommand.AddCommand(commandGeoSite)
-	}
+	mainCommand.AddCommand(commandGeoSite)
+
 }
 
 func geositePreRun() error {

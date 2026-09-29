@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -26,10 +28,8 @@ var commandGeoip = &cobra.Command{
 
 func init() {
 	commandGeoip.PersistentFlags().StringVarP(&commandGeoIPFlagFile, "file", "f", "geoip.db", "geoip file")
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("geoip") {
-		mainCommand.AddCommand(commandGeoip)
-	}
+	mainCommand.AddCommand(commandGeoip)
+
 }
 
 func geoipPreRun() error {

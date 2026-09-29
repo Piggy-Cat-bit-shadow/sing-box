@@ -61,37 +61,20 @@ func TestProductCLISurfaceIsExactlyRuntimeEssentials(t *testing.T) {
 		"the macOS product CLI must expose exactly %d commands", len(expected))
 }
 
-// TestProductExcludesTheDevelopmentTooling pins each excluded command individually,
-// so a failure names the command that came back rather than only reporting a count.
+// TestProductExcludesTheDevelopmentTooling pins what the runtime predicate still
+// withholds.
+//
+// It is deliberately short. The other command families used to be listed here and are
+// now excluded by BUILD CONSTRAINT instead, which is a stronger guarantee: an excluded
+// file is not compiled, whereas a runtime-gated command was still linked and its
+// dependencies still shipped. Those families are covered by
+// TestProductCLISurfaceIsExactlyRuntimeEssentials, which fails if any of them
+// reappears in the built binary's command set.
 func TestProductExcludesTheDevelopmentTooling(t *testing.T) {
 	t.Parallel()
 
-	// Every entry here is a command that was present in the shipped binary before
-	// this round and is deliberately gone.
-	//
-	// `lxd` is NOT in this list because its source was deleted outright in the
-	// previous round: there is no registration left to withhold, and asserting on it
-	// here would be asserting something this predicate is not responsible for. The
-	// audit script covers package absence instead.
-	//
-	// `netns-holder` is NOT in this list either: it is Hidden rather than withheld,
-	// because cmd_run.go needs its Use string as the re-exec argument for the Linux
-	// network namespace.
-	for _, name := range []string{
-		"api",        // the Dashboard is the only management surface
-		"completion", // no interactive shell in this deployment
-		"format",     // configs are edited by hand, then `check`ed
-		"generate",   // server-operator key/certificate generation
-		"geoip",      // GeoIP tooling
-		"geosite",    // GeoSite tooling
-		"merge",      // packaging-time config composition
-		"rule-set",   // rule-set publishing tooling
-		"schema",     // docs generation, done in CI
-		"tools",      // fetch/connect/stun/networkquality/synctime
-	} {
-		require.True(t, productExcludesCommand(name),
-			"%q must be withheld from the macOS product CLI", name)
-	}
+	require.True(t, productExcludesCommand("completion"),
+		"Cobra synthesises `completion`; withholding it is the only way to exclude it")
 }
 
 // TestProductKeepsRuntimeEssentials is the positive half, asserted separately so a
@@ -119,13 +102,16 @@ func TestMacOSPredicateIsNotIdentity(t *testing.T) {
 	t.Parallel()
 
 	var excluded, kept int
-	for _, name := range []string{"run", "check", "version", "api", "tools", "schema"} {
+	// The names that are ABOVE this predicate are the ones constrained out of the
+	// build; only the runtime cases appear here. Including "api"/"tools"/"schema"
+	// would assert the old mechanism, which is the thing this round replaced.
+	for _, name := range []string{"run", "check", "version", "completion"} {
 		if productExcludesCommand(name) {
 			excluded++
 		} else {
 			kept++
 		}
 	}
-	require.Positive(t, excluded, "the macOS profile must withhold something")
+	require.Positive(t, excluded, "the macOS profile must withhold something at runtime")
 	require.Positive(t, kept, "the macOS profile must keep the runtime essentials")
 }

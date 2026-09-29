@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -10,8 +12,6 @@ var commandRuleSet = &cobra.Command{
 }
 
 func init() {
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("rule-set") {
-		mainCommand.AddCommand(commandRuleSet)
-	}
+	mainCommand.AddCommand(commandRuleSet)
+
 }

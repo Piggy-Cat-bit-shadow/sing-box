@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -30,10 +32,8 @@ var commandMerge = &cobra.Command{
 }
 
 func init() {
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("merge") {
-		mainCommand.AddCommand(commandMerge)
-	}
+	mainCommand.AddCommand(commandMerge)
+
 }
 
 func merge(outputPath string) error {

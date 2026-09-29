@@ -1,4 +1,4 @@
-//go:build go1.20
+//go:build go1.20 && !jiejie_client_macos
 
 package main
 

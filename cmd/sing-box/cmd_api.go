@@ -57,10 +57,8 @@ var commandAPIRoot = &cobra.Command{
 func init() {
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagURL, "url", "", "API service URL (default: $BOX_API_URL)")
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagSecret, "secret", "", "API service secret (default: $BOX_API_SECRET)")
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("api") {
-		mainCommand.AddCommand(commandAPI)
-	}
+	mainCommand.AddCommand(commandAPI)
+
 }
 
 func runAPI(args []string) error {

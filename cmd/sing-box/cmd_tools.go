@@ -1,3 +1,5 @@
+//go:build !jiejie_client_macos
+
 package main
 
 import (
@@ -21,10 +23,8 @@ var commandTools = &cobra.Command{
 
 func init() {
 	commandTools.PersistentFlags().StringVarP(&commandToolsFlagOutbound, "outbound", "o", "", "Use specified tag instead of default outbound")
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("tools") {
-		mainCommand.AddCommand(commandTools)
-	}
+	mainCommand.AddCommand(commandTools)
+
 }
 
 func createPreStartedClient() (*box.Box, error) {
