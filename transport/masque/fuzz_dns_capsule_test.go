@@ -581,3 +581,125 @@ func TestDNSAssignAddressCountsCannotOverflow(t *testing.T) {
 		}, "an oversized declared count must never panic (case %d)", index)
 	}
 }
+
+// svcbEdgeCaseSeeds builds payloads that exercise the SVCB validation paths, which is where a
+// malformed advertisement can be mistaken for a usable resolver.
+//
+// The cases come from the specifications rather than from guesswork:
+//
+//   - RFC 9460 §7.1.1: alpn pairs MUST exactly fill the value; no-default-alpn MUST be empty
+//   - RFC 9460 §7.2:   port is exactly 2 octets
+//   - RFC 9460 §8:     mandatory must not list itself, must not repeat, and must reference
+//     keys that are present
+//   - draft-06 §3.2:   ipv4hint and ipv6hint MUST NOT appear
+//   - draft-06 §3.5:   an empty internal domain is the root
+func svcbEdgeCaseSeeds() [][]byte {
+	var seeds [][]byte
+
+	svcParam := func(key uint16, value []byte) []byte {
+		encoded := []byte{byte(key >> 8), byte(key), byte(len(value) >> 8), byte(len(value))}
+		return append(encoded, value...)
+	}
+	// A nameserver with a given SvcParam block, one IPv6 address, and an auth name.
+	nameserver := func(parameters []byte) []byte {
+		payload := []byte{0, 1}      // ServicePriority = 1
+		payload = append(payload, 0) // IPv4 count = 0
+		payload = append(payload, 1) // IPv6 count = 1
+		payload = append(payload, netip.MustParseAddr("2001:db8::53").AsSlice()...)
+		payload = append(payload, byte(len("dns.example.test.")))
+		payload = append(payload, "dns.example.test."...)
+		payload = append(payload, byte(len(parameters)>>8), byte(len(parameters)))
+		return append(payload, parameters...)
+	}
+	configuration := func(parameters []byte, internalDomain string) []byte {
+		payload := []byte{1} // Nameserver Count = 1
+		payload = append(payload, nameserver(parameters)...)
+		if internalDomain == "" {
+			payload = append(payload, 0) // Internal Domain Count = 0
+		} else {
+			payload = append(payload, 1, byte(len(internalDomain)))
+			payload = append(payload, internalDomain...)
+		}
+		return append(payload, 0) // Search Domain Count = 0
+	}
+
+	// A valid h2,h3 ALPN with a dohpath, which is the shape the draft uses.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '2', 0x02, 'h', '3'}), svcParam(7, []byte("/dns-query{?dns}"))...),
+		""))
+	// The root internal domain.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '3'}), svcParam(7, []byte("/dns-query{?dns}"))...),
+		"\x00"))
+	// no-default-alpn present with a NON-empty value, which RFC 9460 forbids.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '3'}), svcParam(2, []byte{0x01})...),
+		""))
+	// A truncated ALPN: the length prefix overruns the value.
+	seeds = append(seeds, configuration(svcParam(1, []byte{0x05, 'h'}), ""))
+	// A zero-length ALPN identifier.
+	seeds = append(seeds, configuration(svcParam(1, []byte{0x00}), ""))
+	// A comma-separated ALPN, which is presentation format and not wire format.
+	seeds = append(seeds, configuration(svcParam(1, []byte("h2,h3")), ""))
+	// A port with the wrong length.
+	seeds = append(seeds, configuration(svcParam(3, []byte{0x01}), ""))
+	// A port with an empty value.
+	seeds = append(seeds, configuration(svcParam(3, nil), ""))
+	// mandatory listing itself.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x00, 0x00}), ""))
+	// mandatory referencing a key that is not present.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x00, 0x03}), ""))
+	// mandatory with an odd number of bytes.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x00}), ""))
+	// mandatory listing an unknown key.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x9C, 0x40}), ""))
+	// mandatory listing duplicate keys.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x00, 0x01, 0x00, 0x01}), ""))
+	// mandatory with keys out of order.
+	seeds = append(seeds, configuration(svcParam(0, []byte{0x00, 0x03, 0x00, 0x01}), ""))
+	// ipv4hint, which draft-06 forbids.
+	seeds = append(seeds, configuration(svcParam(4, []byte{192, 0, 2, 1}), ""))
+	// ipv6hint, likewise.
+	seeds = append(seeds, configuration(svcParam(6, netip.MustParseAddr("2001:db8::1").AsSlice()), ""))
+	// An unknown non-mandatory key, which must be IGNORED rather than rejected.
+	seeds = append(seeds, configuration(
+		append(svcParam(1, []byte{0x02, 'h', '3'}), svcParam(0x9C40, []byte("ignored"))...),
+		""))
+	// dohpath with no dns variable, which RFC 9461 requires.
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query")), ""))
+	// An absolute dohpath URI.
+	seeds = append(seeds, configuration(svcParam(7, []byte("https://elsewhere.example/dns-query")), ""))
+	// A dohpath expansion that is not a path.
+	seeds = append(seeds, configuration(svcParam(7, []byte("dns-query{?dns}")), ""))
+	// A dohpath with an unterminated expression.
+	seeds = append(seeds, configuration(svcParam(7, []byte("/dns-query{?dns")), ""))
+	return seeds
+}
+
+// FuzzDNSAssignSVCB focuses on the service-parameter validation.
+//
+// It is separate from FuzzDNSAssign so the corpus for this shape stays dense: the interesting
+// cases are all in a handful of bytes of SvcParam value, and a general-purpose corpus would
+// spend almost all its effort elsewhere.
+func FuzzDNSAssignSVCB(fuzz *testing.F) {
+	for _, seed := range svcbEdgeCaseSeeds() {
+		fuzz.Add(seed)
+	}
+	fuzz.Fuzz(func(t *testing.T, payload []byte) {
+		configurations, err := parseDNSAssign(payload)
+		if err != nil {
+			return
+		}
+		// Anything accepted must be self-consistent, so it can be re-encoded and re-parsed.
+		for _, configuration := range configurations {
+			require.NoError(t, configuration.validate())
+		}
+		encoded, encodeErr := encodeDNSAssign(configurations)
+		require.NoError(t, encodeErr,
+			"a configuration the parser accepted must be encodable, or validity depends on which side reads it")
+		defer encoded.Release()
+		reparsed, reparseErr := parseDNSAssign(capsulePayload(t, encoded.Bytes()))
+		require.NoError(t, reparseErr)
+		require.Equal(t, normalizeDNSConfigurations(configurations), normalizeDNSConfigurations(reparsed))
+	})
+}
