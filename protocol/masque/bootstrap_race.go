@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	C "github.com/sagernet/sing-box/constant"
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -382,14 +383,66 @@ func interleaveCandidates(candidates []netip.Addr, preferIPv6 bool) []netip.Addr
 // lifetime, this package owns candidate policy. The hook receives the dialer and QUIC
 // configuration the transport already resolved, so nothing about TLS, QUIC options or
 // congestion control is duplicated here.
-func masqueConnDialer(racer *handshakeRacer, candidates []netip.Addr, preferIPv6 bool) transportHTTP.HTTP3ConnDialer {
+//
+// # Where the candidates come from
+//
+// From the bootstrap dialer's most recent resolution, which is the list the cache already
+// ordered (fresh first, cached remainder, winner first on recovery). They are NOT resolved
+// again here: a second lookup would double the DNS traffic on every reconnect and could
+// return a different answer than the one the dialer just used, which would make the racer
+// race a list the cache never saw.
+//
+// If no resolution has happened yet -- the transport dialed by hostname through the
+// bootstrap dialer first in some other code path -- the hook reports that rather than
+// racing an empty list.
+func masqueConnDialer(racer *handshakeRacer, dialer *bootstrapDialer, strategy C.DomainStrategy) transportHTTP.HTTP3ConnDialer {
 	return func(
 		ctx context.Context,
-		dialer N.Dialer,
+		transportDialer N.Dialer,
 		server M.Socksaddr,
 		tlsConfig aTLS.Config,
 		quicConfig *quic.Config,
 	) (net.Conn, *quic.Conn, error) {
-		return racer.dial(ctx, dialer, server, tlsConfig, quicConfig, candidates, preferIPv6)
+		candidates := dialer.bootstrapCandidates()
+		if len(candidates) == 0 {
+			// Resolve now, through the cache, so a hook that runs before any hostname
+			// dial still gets the recovery behaviour rather than an empty race.
+			if server.Fqdn == "" {
+				return nil, nil, E.New("no bootstrap candidates: the server address is not a hostname")
+			}
+			resolved, err := dialer.resolveCandidates(ctx, server.Fqdn)
+			if err != nil {
+				return nil, nil, E.Cause(err, "bootstrap resolve for QUIC race")
+			}
+			candidates = resolved
+		}
+		// The strategy decides which family leads, and the racer interleaves the rest so
+		// the other family is attempted second rather than after every preferred address.
+		preferIPv6 := preferIPv6FromStrategy(strategy, candidates)
+		return racer.dial(ctx, transportDialer, server, tlsConfig, quicConfig, candidates, preferIPv6)
 	}
+}
+
+// preferIPv6FromStrategy decides which family leads the race.
+//
+// The configured strategy wins, because the operator has already expressed a preference and
+// overriding it would make the option quietly ineffective for the server connection. With
+// no preference the family of the FIRST resolved address leads, which respects the ordering
+// the DNS layer already chose rather than hardcoding one.
+func preferIPv6FromStrategy(strategy C.DomainStrategy, candidates []netip.Addr) bool {
+	switch strategy {
+	case C.DomainStrategyPreferIPv6:
+		return true
+	case C.DomainStrategyPreferIPv4:
+		return false
+	}
+	for _, address := range candidates {
+		if address.Is4() || address.Is4In6() {
+			return false
+		}
+		if address.Is6() {
+			return true
+		}
+	}
+	return false
 }

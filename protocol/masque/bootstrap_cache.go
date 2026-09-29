@@ -5,8 +5,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
+	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -177,11 +181,21 @@ func (c *bootstrapCache) recordAndMerge(fresh []netip.Addr) []netip.Addr {
 	return merged
 }
 
-// promote records that an address actually completed a connection, moving it to the
-// front of the FALLBACK order.
+// promote records that an address actually completed a connection.
 //
-// This only affects what the cache offers when a fresh lookup fails. The next successful
-// fresh resolution still leads, because record() puts fresh addresses first.
+// # What it deliberately does NOT do
+//
+// It does not reorder c.candidates. The previous version moved the winner to the front of
+// the stored list, which directly contradicted this type's own documented rule that a FRESH
+// resolution leads and the cache only supplies the remainder. Because recordAndMerge
+// preserves the stored list when it merges, a promoted address would have been carried to
+// the front of the fresh result too -- so a stale winner could outrank a fresh answer, which
+// is the exact failure the fresh-first rule exists to prevent ("a working IPv6 address on
+// the old Wi-Fi says nothing about the new one").
+//
+// The winner is remembered separately, in c.winner, which is what the FALLBACK path uses to
+// order recovery. That is sufficient: on a fresh success the fresh order wins, and on a
+// fresh failure the winner goes first.
 func (c *bootstrapCache) promote(address netip.Addr) {
 	if !address.IsValid() {
 		return
@@ -189,18 +203,6 @@ func (c *bootstrapCache) promote(address netip.Addr) {
 	c.access.Lock()
 	defer c.access.Unlock()
 	c.winner = address
-	// Move it to the front of the stored list as well, so the ordering survives even if
-	// the winner is cleared.
-	for i, candidate := range c.candidates {
-		if candidate == address {
-			c.candidates = append(c.candidates[:i], c.candidates[i+1:]...)
-			break
-		}
-	}
-	c.candidates = append([]netip.Addr{address}, c.candidates...)
-	if len(c.candidates) > c.maxCandidates {
-		c.candidates = c.candidates[:c.maxCandidates]
-	}
 }
 
 // cachedCount reports the number of remembered addresses. It exists for tests.
@@ -229,16 +231,57 @@ func (c *bootstrapCache) hasCache() bool {
 // which is what the requirement actually is.
 type bootstrapDialer struct {
 	N.Dialer
-	cache   *bootstrapCache
-	resolve bootstrapResolution
+	cache *bootstrapCache
+	// resolver binds a hostname to a resolution function, so the cache's recovery logic
+	// never has to know which name it is recovering.
+	resolver *bootstrapResolver
+	// candidates is the most recent resolution, published for the QUIC racer.
+	//
+	// The racer needs the whole list to race at handshake level, and re-resolving for it
+	// would double the lookups and could return a different answer than the one this
+	// dialer just used. The cache already ordered the list; publishing it is how that
+	// ordering reaches the racer instead of being thrown away here.
+	candidates atomic.Pointer[[]netip.Addr]
 }
 
-func newBootstrapDialer(dialer N.Dialer, cache *bootstrapCache, resolve bootstrapResolution) *bootstrapDialer {
-	return &bootstrapDialer{Dialer: dialer, cache: cache, resolve: resolve}
+func newBootstrapDialer(outboundDialer N.Dialer, cache *bootstrapCache, resolver *bootstrapResolver) *bootstrapDialer {
+	return &bootstrapDialer{Dialer: outboundDialer, cache: cache, resolver: resolver}
 }
 
-// DialContext resolves a domain through the cache, then dials the resulting addresses in
-// the order the cache produced.
+// bootstrapCandidates returns the address list from the most recent successful resolution,
+// or nil if none has happened yet.
+func (d *bootstrapDialer) bootstrapCandidates() []netip.Addr {
+	pointer := d.candidates.Load()
+	if pointer == nil {
+		return nil
+	}
+	return *pointer
+}
+
+// resolveCandidates produces the ordered candidate list for a connection attempt, using the
+// cache's recovery rules, and publishes it for the racer.
+func (d *bootstrapDialer) resolveCandidates(ctx context.Context, fqdn string) ([]netip.Addr, error) {
+	addresses, err := d.cache.resolve(ctx, d.resolver.resolve(fqdn))
+	if err != nil {
+		return nil, err
+	}
+	if len(addresses) == 0 {
+		return nil, E.New("bootstrap resolution returned no addresses")
+	}
+	published := append([]netip.Addr(nil), addresses...)
+	d.candidates.Store(&published)
+	return addresses, nil
+}
+
+// DialContext resolves a domain through the cache, then tries the resulting addresses IN
+// ORDER until one connects.
+//
+// # Why the whole list matters
+//
+// Trying only the first address would make the cache's entire fallback ordering
+// decorative. The point of keeping a list is that the first entry can be stale -- a
+// address that worked on the previous network may now be unroutable -- so a dialer that
+// gives up after it has discarded the recovery state it was handed.
 //
 // A non-domain destination is passed straight through: there is nothing to resolve, and
 // the IP is already the thing to connect to.
@@ -246,20 +289,92 @@ func (d *bootstrapDialer) DialContext(ctx context.Context, network string, desti
 	if !destination.IsDomain() {
 		return d.Dialer.DialContext(ctx, network, destination)
 	}
-	addresses, err := d.cache.resolve(ctx, d.resolve)
+	addresses, err := d.resolveCandidates(ctx, destination.Fqdn)
 	if err != nil {
 		return nil, E.Cause(err, "bootstrap resolve ", destination.Fqdn)
 	}
-	if len(addresses) == 0 {
-		return nil, E.New("bootstrap resolve ", destination.Fqdn, ": no addresses")
+	var dialErrors []error
+	for _, address := range addresses {
+		conn, dialErr := d.Dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
+		if dialErr != nil {
+			dialErrors = append(dialErrors, dialErr)
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		// The address that actually connected is the one worth remembering, which is
+		// the only way this cache learns anything the DNS layer does not already know.
+		d.cache.promote(address)
+		return conn, nil
 	}
-	resolved := M.SocksaddrFrom(addresses[0], destination.Port)
-	conn, err := d.Dialer.DialContext(ctx, network, resolved)
-	if err != nil {
-		return nil, err
+	return nil, E.Cause(E.Errors(dialErrors...),
+		"bootstrap dial ", destination.Fqdn, ": all ", len(addresses), " resolved addresses failed")
+}
+
+// buildBootstrapResolution adapts an outbound dialer into a resolver factory for the
+// bootstrap cache.
+//
+// # Why this is the right seam
+//
+// common/dialer already carries the configured `domain_resolver` and the whole DNS router
+// behind it, and it exposes that through dialer.ResolveDialer. Using it means the bootstrap
+// path keeps every existing guarantee for free -- the rule set, the cache, TTLs,
+// singleflight, the strategy -- and this package adds only the recovery layer on top.
+//
+// Inventing a second resolver here would have been a new configuration surface and a second
+// source of truth for the same question, which is exactly the conflation the three DNS roles
+// exist to prevent.
+//
+// # Why it returns a factory
+//
+// The cache's resolution function takes no hostname because the cache does not care which
+// name it is recovering; the NAME belongs to the caller. So this returns a closure factory
+// bound to the router, and the dialer binds the actual FQDN. Threading the name through the
+// cache instead would mean the recovery logic had to know about MASQUE hostnames, which is
+// not its concern.
+//
+// The second return value reports whether the dialer can resolve at all. When it cannot,
+// the caller must leave the original dialer and a nil hook in place: substituting a wrapper
+// that can only fail would turn a working endpoint into a broken one.
+func buildBootstrapResolution(outboundDialer N.Dialer, router adapter.DNSRouter) (*bootstrapResolver, bool) {
+	resolveDialer, isResolveDialer := outboundDialer.(dialer.ResolveDialer)
+	if !isResolveDialer {
+		return nil, false
 	}
-	// The address that actually connected is the one worth remembering, which is the
-	// only way this cache learns anything the DNS layer does not already know.
-	d.cache.promote(addresses[0])
-	return conn, nil
+	if router == nil {
+		return nil, false
+	}
+	// The query options come from the resolve dialer, so the configured
+	// `domain_resolver` -- its strategy, timeout and cache controls -- is honoured rather
+	// than re-derived here.
+	// The query options carry the configured strategy, timeout and cache controls, so the
+	// bootstrap lookup honours `domain_resolver` rather than re-deriving any of it.
+	queryOptions := resolveDialer.QueryOptions()
+	return &bootstrapResolver{router: router, queryOptions: queryOptions}, true
+}
+
+// bootstrapResolver binds a hostname to a resolution function, and exposes the strategy the
+// resolver was configured with so the QUIC race can order its candidates consistently with
+// the DNS layer's own preference.
+type bootstrapResolver struct {
+	router       adapter.DNSRouter
+	queryOptions adapter.DNSQueryOptions
+	// fqdnResolve, when set, replaces the router. It exists so the recovery logic can be
+	// tested without a live DNS router, which is the same reason
+	// bootstrapResolution is a function rather than a direct call.
+	fqdnResolve func(fqdn string) bootstrapResolution
+}
+
+func (r *bootstrapResolver) resolve(fqdn string) bootstrapResolution {
+	if r.fqdnResolve != nil {
+		return r.fqdnResolve(fqdn)
+	}
+	return func(ctx context.Context) ([]netip.Addr, error) {
+		return r.router.Lookup(ctx, fqdn, r.queryOptions)
+	}
+}
+
+func (r *bootstrapResolver) strategy() C.DomainStrategy {
+	return r.queryOptions.Strategy
 }

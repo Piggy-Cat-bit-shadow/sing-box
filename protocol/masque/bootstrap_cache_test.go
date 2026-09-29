@@ -45,6 +45,16 @@ func emptyResolve() bootstrapResolution {
 	return func(context.Context) ([]netip.Addr, error) { return nil, nil }
 }
 
+// testResolver adapts the resolution helpers above to the bootstrapResolver the dialer
+// takes, so these tests keep exercising the cache through the real wrapper.
+type testResolver struct {
+	resolve bootstrapResolution
+}
+
+func newTestResolver(resolve bootstrapResolution) *bootstrapResolver {
+	return &bootstrapResolver{fqdnResolve: func(string) bootstrapResolution { return resolve }}
+}
+
 // TestBootstrapColdStartRequiresFreshResolution is the correctness case.
 func TestBootstrapColdStartRequiresFreshResolution(t *testing.T) {
 	t.Parallel()
@@ -257,7 +267,7 @@ func TestBootstrapDialerPassesThroughIPDestinations(t *testing.T) {
 
 	dialer := &recordingDialer{}
 	cache := newBootstrapCache()
-	wrapped := newBootstrapDialer(dialer, cache, failingResolve(errTestDialFailed))
+	wrapped := newBootstrapDialer(dialer, cache, newTestResolver(failingResolve(errTestDialFailed)))
 
 	_, err := wrapped.DialContext(context.Background(), "tcp", M.ParseSocksaddr("192.0.2.7:443"))
 	require.NoError(t, err)
@@ -274,7 +284,7 @@ func TestBootstrapDialerResolvesAndPromotes(t *testing.T) {
 
 	dialer := &recordingDialer{}
 	cache := newBootstrapCache()
-	wrapped := newBootstrapDialer(dialer, cache, staticResolve("192.0.2.1"))
+	wrapped := newBootstrapDialer(dialer, cache, newTestResolver(staticResolve("192.0.2.1")))
 
 	_, err := wrapped.DialContext(context.Background(), "tcp", M.ParseSocksaddr("masque.example:443"))
 	require.NoError(t, err)
@@ -291,7 +301,7 @@ func TestBootstrapDialerForwardsResolutionErrors(t *testing.T) {
 
 	dialer := &recordingDialer{}
 	cache := newBootstrapCache()
-	wrapped := newBootstrapDialer(dialer, cache, failingResolve(errTestDialFailed))
+	wrapped := newBootstrapDialer(dialer, cache, newTestResolver(failingResolve(errTestDialFailed)))
 
 	_, err := wrapped.DialContext(context.Background(), "tcp", M.ParseSocksaddr("masque.example:443"))
 	require.Error(t, err)

@@ -65,11 +65,21 @@ type ClientEndpoint struct {
 	client        *masque.Client
 	deviceOptions *device.Options
 	device        device.Device
-	mtu           uint32
-	onDemand      bool
-	stateAccess   sync.Mutex
-	deviceStarted bool
-	state         atomic.Pointer[clientState]
+	// httpClient is the HTTP client the tunnel is established with.
+	httpClient *http.Client
+	// httpDialer is the dialer that client actually uses. It is the bootstrap wrapper when
+	// a bootstrap resolver is available, and the raw outbound dialer otherwise. It is kept
+	// on the endpoint so the wiring can be inspected and asserted rather than inferred.
+	httpDialer N.Dialer
+	// http3ConnDialer is the handshake-racing hook installed on the HTTP client, or nil
+	// when there is no bootstrap candidate list to race. nil is the meaningful default:
+	// it is what preserves the plain dial path for every endpoint without a resolver.
+	http3ConnDialer http.HTTP3ConnDialer
+	mtu             uint32
+	onDemand        bool
+	stateAccess     sync.Mutex
+	deviceStarted   bool
+	state           atomic.Pointer[clientState]
 }
 
 type clientState struct {
@@ -107,6 +117,24 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if err != nil {
 		return nil, err
 	}
+	// The bootstrap path for the MASQUE server hostname.
+	//
+	// This must never consult the tunnel, the server's DNS assignment, or the
+	// same-connection DoH, because it runs BEFORE any tunnel exists: connecting needs the
+	// server's address, and the address cannot need the connection. The resolver used here
+	// is the one common/dialer already built from `domain_resolver`, so this adds recovery
+	// state without introducing a second resolver or a new configuration surface.
+	//
+	// What it adds over the plain dialer is memory: the DNS layer knows TTLs, but it does
+	// not know which address the server actually ANSWERED on. During a resolver outage --
+	// exactly when a reconnect storm happens -- that memory is the difference between
+	// reconnecting immediately and waiting for the resolver to come back.
+	bootstrapCache := newBootstrapCache()
+	bootstrapResolver, hasBootstrapResolve := buildBootstrapResolution(outboundDialer, service.FromContext[adapter.DNSRouter](ctx))
+	var bootstrapDialer *bootstrapDialer
+	if hasBootstrapResolve {
+		bootstrapDialer = newBootstrapDialer(outboundDialer, bootstrapCache, bootstrapResolver)
+	}
 	// The inner resolver is a DIFFERENT question from the bootstrap one above, and
 	// the two must not be conflated:
 	//
@@ -138,7 +166,25 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 			}
 		}
 	}
-	httpClient, err := http.NewClientWithTLS(ctx, logger, outboundDialer, options.ServerOptions, common.PtrValueOrDefault(options.TLS), http.ClientOptions{
+	// The dialer the HTTP client uses, and the handshake hook.
+	//
+	// Both are derived from the bootstrap state above and are only substituted when a
+	// bootstrap resolver actually exists. When it does not -- a bare IP server, or a
+	// resolver that is not a dialer.ResolveDialer -- the ORIGINAL dialer is passed
+	// through untouched and the hook stays nil, so this endpoint behaves exactly as it did
+	// before the recovery path existed rather than acquiring a degraded one.
+	httpDialer := outboundDialer
+	var http3ConnDialer http.HTTP3ConnDialer
+	if bootstrapDialer != nil {
+		httpDialer = bootstrapDialer
+		http3ConnDialer = masqueConnDialer(
+			newHandshakeRacer(N.DefaultFallbackDelay),
+			bootstrapDialer,
+			bootstrapResolver.strategy(),
+		)
+	}
+
+	httpClient, err := http.NewClientWithTLS(ctx, logger, httpDialer, options.ServerOptions, common.PtrValueOrDefault(options.TLS), http.ClientOptions{
 		Authority:              authority,
 		Username:               options.Username,
 		Password:               options.Password,
@@ -147,6 +193,13 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		DisableVersionFallback: options.DisableVersionFallback,
 		HTTP2Options:           http2Options,
 		HTTP3Options:           options.HTTP3Options,
+		// The handshake racer, when there is a bootstrap resolver to drive it.
+		//
+		// nil means "dial directly", which is the behaviour for every other user of
+		// transport/http and for this endpoint when no bootstrap resolver is available.
+		// Only the HTTP/3 path consults the hook, and only when it is non-nil, so
+		// Naive, protocol/http and common/httpclient keep the default path exactly.
+		HTTP3ConnDialer: http3ConnDialer,
 	})
 	if err != nil {
 		return nil, err
@@ -163,9 +216,12 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		// Built unconditionally but installed only when an assignment arrives. It holds
 		// the DEVICE as its dialer, which is what makes every assigned query go through
 		// the tunnel rather than the host stack.
-		assignedDNS: newAssignedDNSTransport(logger, nil, tag),
-		mtu:         options.MTU,
-		onDemand:    options.OnDemand,
+		assignedDNS:     newAssignedDNSTransport(logger, nil, tag),
+		httpClient:      httpClient,
+		httpDialer:      httpDialer,
+		http3ConnDialer: http3ConnDialer,
+		mtu:             options.MTU,
+		onDemand:        options.OnDemand,
 	}
 	// The assigned resolver sends DoH queries on the SAME connection as the tunnel, which
 	// is what draft-ietf-masque-connect-ip-dns-06 §3.5 asks for when the proxy is
