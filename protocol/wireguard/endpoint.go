@@ -115,6 +115,18 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		Address:    options.Address,
 		PrivateKey: options.PrivateKey,
 		ListenPort: options.ListenPort,
+		// ResolvePeer resolves a PEER ENDPOINT hostname, which is an address OUTSIDE the tunnel:
+		// the client has to reach it before any tunnel exists. It therefore uses the resolver this
+		// outbound was configured with, exactly like any other external server address.
+		//
+		// This is deliberately NOT the same authority as the inner targets resolved in
+		// DialContextWithDestination below. Those are addresses INSIDE the tunnel, and the tunnel's
+		// own routing decides how to reach them, so they follow the global DNS rules -- the same
+		// reading that OpenVPN, OpenConnect, Tailscale and MASQUE apply to their inner traffic.
+		//
+		// The two must not be silently unified: an operator points domain_resolver at a resolver
+		// reachable BEFORE the tunnel, and using it for inner names would send those queries to an
+		// address the tunnel may not route.
 		ResolvePeer: func(domain string) ([]netip.Addr, error) {
 			return ep.dnsRouter.Lookup(ctx, domain, outboundDialer.(dialer.ResolveDialer).QueryOptions())
 		},
@@ -291,6 +303,9 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 		return nil, E.New("WireGuard is not ready yet")
 	}
 	if destination.IsDomain() {
+		// An INNER target: it is reached through the tunnel, so it is resolved under the global DNS
+		// rules rather than by this outbound's domain_resolver. See ResolvePeer above for the
+		// external counterpart and why the two differ.
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
 			return nil, err
@@ -308,6 +323,8 @@ func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		return nil, netip.Addr{}, E.New("WireGuard is not ready yet")
 	}
 	if destination.IsDomain() {
+		// The UDP counterpart of the inner-target lookup in DialContextWithDestination: global DNS
+		// rules, not this outbound's domain_resolver.
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
 			return nil, netip.Addr{}, err
