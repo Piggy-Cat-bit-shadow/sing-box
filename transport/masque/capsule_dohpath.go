@@ -172,7 +172,7 @@ func stripTemplateExpressions(template string) (string, error) {
 	return builder.String(), nil
 }
 
-// httpALPNRequiresDohPath reports whether an advertised ALPN set promises an HTTP-based DNS
+// HTTPALPNRequiresDohPath reports whether an advertised ALPN set promises an HTTP-based DNS
 // transport, and therefore requires a usable dohpath.
 //
 // # The rule, from the specifications
@@ -188,7 +188,7 @@ func stripTemplateExpressions(template string) (string, error) {
 // the missing template costs it one transport rather than the whole resolver. That distinction
 // is exactly what compileCapabilities implements, and the earlier dead version of this function
 // got it wrong by treating the two as the same failure.
-func httpALPNRequiresDohPath(alpn []string) bool {
+func HTTPALPNRequiresDohPath(alpn []string) bool {
 	for _, protocol := range alpn {
 		if protocol == "h2" || protocol == "h3" {
 			return true

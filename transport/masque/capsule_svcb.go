@@ -241,6 +241,21 @@ func ValidateServiceParameters(nameserver DNSNameserver) (ParsedServiceParameter
 		return parsed, E.New("no-default-alpn requires alpn to also be present")
 	}
 
+	// An ALPN naming an HTTP-based DNS transport must come with a dohpath, because RFC 9484 §3
+	// requires the client to be CONFIGURED with a URI Template and RFC 9461 §5 defines dohpath as
+	// that template. A resolver naming HTTP without one has named a transport and not said how to
+	// reach it.
+	//
+	// Note carefully what this does NOT do: it does not make the RESOLVER invalid. A nameserver
+	// offering HTTP alongside plain DNS is still usable over plain DNS, so the missing template
+	// costs it one transport rather than the whole endpoint. That distinction lives in
+	// compileCapabilities; this check only refuses the nonsensical combination of advertising a
+	// DoH transport that carries no path.
+	if HTTPALPNRequiresDohPath(parsed.ALPN) && !parsed.HasDohPath {
+		return parsed, E.New("alpn ", parsed.ALPN,
+			" advertises an HTTP-based DNS transport but no dohpath was provided")
+	}
+
 	// The draft's address rule, applied only when alpn is absent. See the function comment.
 	if len(parsed.ALPN) == 0 && !parsed.NoDefaultALPN &&
 		len(nameserver.IPv4Addresses)+len(nameserver.IPv6Addresses) == 0 {
