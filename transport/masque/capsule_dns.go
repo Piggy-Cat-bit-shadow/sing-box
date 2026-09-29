@@ -366,7 +366,13 @@ func parseDNSNameserver(payload []byte) (DNSNameserver, []byte, error) {
 	// Each address is 4 bytes; checking the count against the remaining payload
 	// before allocating stops a declared huge count from reserving memory it cannot
 	// possibly fill.
-	if ipv4Count*4 > uint64(len(payload)) {
+	//
+	// The comparison is a DIVISION rather than `ipv4Count*4 > len(payload)`. Multiplying
+	// first can OVERFLOW: a varint may declare a count near 2^64, and a wrapped product
+	// compares as small, so the guard would pass and the slice below would panic on
+	// `payload[:4]`. The fuzzer found exactly that with a 16-byte input. Dividing cannot
+	// overflow, and it is the same test.
+	if ipv4Count > uint64(len(payload))/4 {
 		return nameserver, nil, E.New("IPv4 address count exceeds remaining payload")
 	}
 	nameserver.IPv4Addresses = make([]netip.Addr, 0, ipv4Count)
@@ -381,7 +387,8 @@ func parseDNSNameserver(payload []byte) (DNSNameserver, []byte, error) {
 		return nameserver, nil, E.New("truncated IPv6 address count")
 	}
 	payload = payload[length:]
-	if ipv6Count*16 > uint64(len(payload)) {
+	// Division for the same overflow reason as the IPv4 check above.
+	if ipv6Count > uint64(len(payload))/16 {
 		return nameserver, nil, E.New("IPv6 address count exceeds remaining payload")
 	}
 	nameserver.IPv6Addresses = make([]netip.Addr, 0, ipv6Count)

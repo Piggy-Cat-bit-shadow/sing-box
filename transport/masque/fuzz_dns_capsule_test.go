@@ -544,3 +544,40 @@ func TestDNSAssignParserNeverAllocatesFromDeclaredCounts(t *testing.T) {
 	_, err = parsePREF64(oversized)
 	require.Error(t, err, "a prefix run beyond the ceiling must be rejected")
 }
+
+// TestDNSAssignAddressCountsCannotOverflow is the regression test for an integer overflow
+// the fuzzer found.
+//
+// Both address-count guards read `count*size > len(payload)`. A varint may declare a count
+// near 2^64, and the product WRAPS: a wrapped value compares as small, so the guard passed
+// and the loop below sliced `payload[:4]` out of an exhausted buffer. The fuzzer reached it
+// with a 16-byte input, which is the point worth keeping -- a sixteen-byte message could
+// crash the client, and no unit test with hand-written inputs had produced a count that
+// large.
+//
+// The guards now DIVIDE rather than multiply, which cannot overflow and expresses the same
+// test.
+func TestDNSAssignAddressCountsCannotOverflow(t *testing.T) {
+	t.Parallel()
+
+	// The exact input the fuzzer produced, kept verbatim. It must be rejected, not panic.
+	overflow := []byte("000\x010000\xe0\x00\x00\x00\x00\x00\x00\x00")
+	require.NotPanics(t, func() {
+		_, err := parseDNSAssign(overflow)
+		require.Error(t, err, "a count that cannot be backed by the payload must be rejected")
+	}, "a declared address count must never panic, however large it is")
+
+	// The same shape driven deliberately, so the regression is pinned by construction rather
+	// than only by a corpus file: a maximal varint count for each family with a few bytes
+	// behind it.
+	maxCount := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}
+	for index, payload := range [][]byte{
+		append([]byte{1, 0, 0}, maxCount...),                   // huge IPv4 count
+		append([]byte{1, 0, 0, 0}, maxCount...),                // huge IPv6 count
+		append([]byte{1, 0, 1, 0, 0, 1, 0, 0, 0}, maxCount...), // both, after an auth name
+	} {
+		require.NotPanics(t, func() {
+			_, _ = parseDNSAssign(payload)
+		}, "an oversized declared count must never panic (case %d)", index)
+	}
+}
