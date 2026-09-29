@@ -167,6 +167,12 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		mtu:         options.MTU,
 		onDemand:    options.OnDemand,
 	}
+	// The assigned resolver sends DoH queries on the SAME connection as the tunnel, which
+	// is what draft-ietf-masque-connect-ip-dns-06 §3.5 asks for when the proxy is
+	// authoritative for the DoH origin. Passing the client here is what makes that
+	// possible; the transport still holds the device as its dialer, so the UDP path stays
+	// inside the tunnel.
+	clientEndpoint.assignedDNS.setDoHClient(httpClient)
 	clientEndpoint.state.Store(&clientState{})
 	clientEndpoint.deviceOptions = newDeviceOptions(ctx, logger, clientEndpoint, options.MASQUEEndpointOptions, time.Duration(options.UDPTimeout), nil)
 	clientEndpoint.client, err = masque.NewClient(masque.ClientOptions{

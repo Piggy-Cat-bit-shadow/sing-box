@@ -1,10 +1,13 @@
 package masque
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/dns"
+	dnsTransport "github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/transport/masque"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -63,7 +67,23 @@ type assignedDNSTransport struct {
 	// the DNS cache cannot serve a response resolved by a previous nameserver.
 	generation atomic.Uint64
 
+	// dohClient issues DoH requests on the SAME HTTP/3 connection the CONNECT-IP tunnel
+	// uses. It is nil until the endpoint publishes one, and the DoH path is only taken
+	// when it is present: without it there is no same-connection transport to use, and
+	// a DoH query sent any other way would not be the thing this path exists to prove.
+	dohClient dohRoundTripper
+
 	access sync.Mutex
+}
+
+// dohRoundTripper is the narrow capability the assigned-DNS transport needs: the ability
+// to issue an ordinary request on the endpoint's existing MASQUE HTTP/3 connection.
+//
+// It is declared here, rather than taking transport/http's concrete client, so that this
+// package cannot reach any further into that client than the one method it uses, and so
+// the DoH path can be tested with a double that counts connections.
+type dohRoundTripper interface {
+	RoundTripHTTP3(ctx context.Context, request *http.Request) (*http.Response, error)
 }
 
 // assignedDNSState is one assignment's worth of immutable resolver configuration.
@@ -237,13 +257,95 @@ func (t *assignedDNSTransport) ExchangeAsync(ctx context.Context, message *mDNS.
 
 // exchangeWith performs one query against one nameserver, over the tunnel.
 //
-// Only the unencrypted UDP transport is implemented. That is a deliberate limit rather
-// than an oversight: an encrypted transport (DoT/DoH) requires either a TLS session
-// through the device or a request stream on the MASQUE HTTP/3 connection, and the
-// latter is the same-connection DoH path. Claiming support for a transport this cannot
-// actually complete would mean silently ignoring the ALPN parameters, which is worse
-// than refusing.
+// # Transport selection
+//
+// DoH is used when the server advertised a dohpath AND the endpoint has published its
+// HTTP/3 client, because that is the only combination that puts the query on the SAME
+// connection as the tunnel, which is what draft-ietf-masque-connect-ip-dns-06 §3.5 asks
+// for when the proxy is authoritative for the DoH origin.
+//
+// Otherwise the query goes over plain UDP through the tunnel. That is a deliberate limit
+// rather than an oversight: DoT would need a TLS session through the device, which is a
+// separate transport with its own certificate story. Claiming to support a transport that
+// cannot actually be completed would mean silently ignoring the ALPN parameters, which is
+// worse than refusing -- and the UDP path is always available and always inside the tunnel.
 func (t *assignedDNSTransport) exchangeWith(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
+	if state.dohPath != "" {
+		if response, err := t.exchangeDoH(ctx, state, address, query); err == nil {
+			return response, nil
+		} else if t.dohClient == nil {
+			// No same-connection HTTP/3 client yet. Fall through to UDP so the query is
+			// still answered inside the tunnel; the event is logged because it means the
+			// coalescing the draft asks for is not happening.
+			t.logger.DebugContext(ctx, "assigned DNS DoH unavailable, using UDP through tunnel: ", err)
+		} else {
+			return nil, err
+		}
+	}
+	return t.exchangeUDP(ctx, state, address, query)
+}
+
+// exchangeDoH sends the query as an RFC 8484 POST on the endpoint's existing HTTP/3
+// connection.
+//
+// The request is addressed to the nameserver's authentication domain (its TLS name), which
+// is the origin the connection was authenticated for, and the path comes from the SVCB
+// dohpath template. Sending it anywhere else would either be refused by the same-origin
+// check or, worse, would be a cross-origin request riding on those credentials.
+func (t *assignedDNSTransport) exchangeDoH(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
+	roundTripper := t.dohClient
+	if roundTripper == nil {
+		return nil, E.New("no same-connection HTTP/3 client for DoH")
+	}
+	authority := state.tlsName
+	if authority == "" {
+		// No authentication domain was advertised, so there is no origin to name. The
+		// plain address is used instead, which the same-origin check then compares
+		// against the configured authority; it only succeeds when they coincide.
+		authority = address.String()
+		if port := state.dohPort(); port != 0 {
+			authority = netip.AddrPortFrom(address, port).String()
+		}
+	}
+	requestURL := &url.URL{
+		Scheme: "https",
+		Host:   authority,
+		Path:   dohPathTemplate(state.dohPath),
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(query))
+	if err != nil {
+		return nil, E.Cause(err, "build DoH request")
+	}
+	request.Header.Set("Content-Type", dnsTransport.MimeType)
+	request.Header.Set("Accept", dnsTransport.MimeType)
+	// The body length is known, and stating it lets the server reject a truncated query
+	// instead of parsing a partial one.
+	request.ContentLength = int64(len(query))
+
+	response, err := roundTripper.RoundTripHTTP3(ctx, request)
+	if err != nil {
+		return nil, E.Cause(err, "DoH request on MASQUE connection")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		// Read a bounded prefix so a server that explains the failure has its
+		// explanation surfaced, without letting it stream unbounded data into the error.
+		detail, _ := io.ReadAll(io.LimitReader(response.Body, maxDoHErrorBodySize))
+		return nil, E.New("DoH server returned ", response.Status, formatDoHErrorDetail(detail))
+	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxAssignedDNSMessageSize))
+	if err != nil {
+		return nil, E.Cause(err, "read DoH response")
+	}
+	var message mDNS.Msg
+	if err = message.Unpack(payload); err != nil {
+		return nil, E.Cause(err, "decode DoH response")
+	}
+	return &message, nil
+}
+
+// exchangeUDP performs one query against one nameserver over plain DNS through the tunnel.
+func (t *assignedDNSTransport) exchangeUDP(ctx context.Context, state *assignedDNSState, address netip.Addr, query []byte) (*mDNS.Msg, error) {
 	port := state.port
 	if port == 0 {
 		port = assignedDNSDefaultPort
@@ -279,6 +381,25 @@ func (t *assignedDNSTransport) exchangeWith(ctx context.Context, state *assigned
 		return nil, E.Cause(err, "decode DNS response")
 	}
 	return &response, nil
+}
+
+// dohPort reports the port a DoH request should be addressed to.
+func (s *assignedDNSState) dohPort() uint16 {
+	if s.port != 0 {
+		return s.port
+	}
+	// The dohpath is an HTTP resource, so its default is the HTTPS port, not the DNS one.
+	if s.dohPath != "" {
+		return 443
+	}
+	return 0
+}
+
+// setDoHClient publishes the client used for same-connection DoH.
+func (t *assignedDNSTransport) setDoHClient(client dohRoundTripper) {
+	t.access.Lock()
+	t.dohClient = client
+	t.access.Unlock()
 }
 
 // isReachableThroughRoutes reports whether an assigned nameserver lies inside the
@@ -335,7 +456,40 @@ func serviceParameterUint16(configuration masque.DNSConfiguration, key dnsmessag
 // usable request path. A template without a placeholder is returned as-is.
 func dohPathTemplate(value string) string {
 	if index := strings.IndexByte(value, '{'); index >= 0 {
-		return value[:index]
+		value = value[:index]
+	}
+	if value == "" {
+		// The draft's example carries the path in the template, but a server that
+		// advertises only the origin still needs a resource to name. RFC 8484 defines
+		// /dns-query as the conventional one.
+		return "/dns-query"
+	}
+	if !strings.HasPrefix(value, "/") {
+		return "/" + value
 	}
 	return value
+}
+
+// maxDoHErrorBodySize bounds how much of an error response is quoted back in the error.
+//
+// A failure explanation is useful; a server streaming megabytes into an error string is
+// not. The limit is generous enough for any plausible diagnostic body.
+const maxDoHErrorBodySize = 4096
+
+// formatDoHErrorDetail renders an error response body for an error message.
+//
+// The body is quoted only when it is short enough to be a diagnostic rather than a
+// document, so a large or binary body cannot flood the log or the DNS client's error path.
+func formatDoHErrorDetail(detail []byte) string {
+	if len(detail) == 0 {
+		return ""
+	}
+	text := strings.TrimSpace(string(detail))
+	if text == "" {
+		return ""
+	}
+	if len(text) > 256 {
+		text = text[:256] + "..."
+	}
+	return ": " + text
 }
