@@ -445,8 +445,11 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		if cachedBuffer != nil {
 			wrotePayload = true
 			dataLen := cachedBuffer.Len()
-			_, err = destinationWriter.Write(cachedBuffer.Bytes())
-			cachedBuffer.Release()
+			var handedOver bool
+			err, handedOver = writeCachedBuffer(destinationWriter, cachedBuffer)
+			if !handedOver {
+				cachedBuffer.Release()
+			}
 			if err == nil {
 				for _, counter := range readCounters {
 					counter(int64(dataLen))
@@ -479,6 +482,75 @@ func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.C
 		m.logger.ErrorContext(ctx, "connection download handshake: ", err)
 	}
 	return true
+}
+
+// writeCachedBuffer delivers a sniffed/cached first payload to the destination.
+//
+// It reports whether the destination TOOK OWNERSHIP of the buffer.
+//
+// # Why this is not just destination.Write(buffer.Bytes())
+//
+// A cached buffer is a pooled *buf.Buffer that already carries the geometry a framing writer needs:
+// front headroom, rear headroom and a bounded length. The plain Write([]byte) path throws that away
+// -- the writer receives a bare slice and, if it frames in place, has to build a new buffer and
+// copy the payload into it. For Naive that is one full payload copy on the FIRST bytes of every
+// connection, which is the most expensive place to spend it.
+//
+// # Why it is a capability test rather than a protocol test
+//
+// The check is on the destination WRITER, never on a protocol tag or an inbound type, and the
+// requirements are the writer's own advertised geometry:
+//
+//	it must accept buffers (N.ExtendedWriter)
+//	the payload must fit its WriterMTU
+//	the buffer must already have its FrontHeadroom and RearHeadroom
+//
+// Any writer meeting those can be handed the buffer directly, whatever protocol it speaks, and any
+// writer that does not simply keeps the old path. A Naive special case here would be a second place
+// to update the next time a protocol grows the same shape.
+//
+// # Ownership
+//
+// On success the writer consumes the buffer, matching N.ExtendedWriter.WriteBuffer's contract
+// everywhere else in sing (the copy loops call it and do not release). The bool exists so the
+// caller knows NOT to release, rather than relying on a Release being harmless.
+func writeCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) (error, bool) {
+	writer := N.UnwrapWriter(destinationWriter)
+	extendedWriter, isExtended := writer.(N.ExtendedWriter)
+	if !isExtended {
+		_, err := destinationWriter.Write(cachedBuffer.Bytes())
+		return err, false
+	}
+	// The buffer must already have the geometry the writer wants. Nothing is resized or relocated
+	// to force a fit: moving the payload to gain headroom would be the very copy this avoids, so a
+	// buffer that does not fit keeps the plain path.
+	//
+	// A writer that advertises no MTU or headroom is treated as having none to satisfy, which makes
+	// the requirement vacuous and the direct hand-off correct -- the same interpretation sing's own
+	// CalculateMTU applies to a plain net.Conn.
+	if withMTU, hasMTU := writer.(N.WriterWithMTU); hasMTU {
+		if cachedBuffer.Len() > withMTU.WriterMTU() {
+			_, err := destinationWriter.Write(cachedBuffer.Bytes())
+			return err, false
+		}
+	}
+	if withFrontHeadroom, hasFront := writer.(N.FrontHeadroom); hasFront {
+		if cachedBuffer.Start() < withFrontHeadroom.FrontHeadroom() {
+			_, err := destinationWriter.Write(cachedBuffer.Bytes())
+			return err, false
+		}
+	}
+	if withRearHeadroom, hasRear := writer.(N.RearHeadroom); hasRear {
+		if cachedBuffer.FreeLen() < withRearHeadroom.RearHeadroom() {
+			_, err := destinationWriter.Write(cachedBuffer.Bytes())
+			return err, false
+		}
+	}
+	err := extendedWriter.WriteBuffer(cachedBuffer)
+	if err != nil {
+		return err, false
+	}
+	return nil, true
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
