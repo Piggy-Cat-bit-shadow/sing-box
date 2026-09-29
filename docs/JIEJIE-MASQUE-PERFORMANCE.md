@@ -16,6 +16,15 @@ Method: `benchstat` where a before/after comparison is claimed, with the sample
 count recorded. A change is only described as an improvement if `benchstat` reports
 a statistically significant delta.
 
+Sections 7-9 were added in the performance-hardening round based on `0fadfc021`
+(Apple M1, `-count 10` for the headline comparisons). Section 3 was REVISED in that
+round: it previously concluded the linear route scan should stay, based on helper
+benchmarks that measured the scan without measuring the packet-path budget it was
+spent from. Both the original numbers and the reason for the change are kept there.
+
+This round also produced a full boundary and bottleneck audit in
+`docs/JIEJIE-MASQUE-PERFORMANCE-AUDIT.md`.
+
 ## Re-verification, 2026-09-28 (commit e07ffdb2b + this cycle)
 
 Every headline number below was re-measured on the same host and Go version, at a
@@ -259,7 +268,16 @@ append could write into an array a concurrent reader is still reading.
 
 ---
 
-## 3. Route containment: measured, and deliberately not changed
+## 3. Route containment: helper cost, then the real path, and a matcher
+
+This section originally concluded that the linear scan stays. That conclusion was reached from the
+HELPER measurements below, which are correct but answer a narrower question than they appear to:
+they measure the scan in isolation, so they understate its share of a real packet.
+
+Both sets of numbers are kept, because the change from "leave it" to "compile a matcher" is exactly
+the kind of revision that should be traceable.
+
+### The helper measurement (unchanged, still valid)
 
 `RoutesContain`, `prefixesContain` and `rangesContain` are linear scans built on
 `slices.ContainsFunc`. Benchmarked at 1/4/16/64/256 entries, measuring both a hit
@@ -278,22 +296,69 @@ RoutesContain      hit      miss   │  prefixesContain   hit       miss
 `0 B/op` and `0 allocs/op` at every size. Growth is ~8.8 ns per `AddressRange`
 entry and ~3.9 ns per prefix — cleanly linear.
 
-### Decision: the linear scan stays
+Read alone, this says the cost is 10–40 ns for a realistic advertisement, against a
+~1280-byte packet whose remaining processing looks far larger. On that basis the
+earlier decision was to keep the scan.
 
-A real CONNECT-IP client advertises a handful of ranges: a default route, or a small
-set of corporate prefixes. The realistic cost is therefore **10–40 ns per packet**,
-against a ~1280-byte packet whose remaining processing is orders of magnitude
-larger.
+### What the real path showed
 
-Replacing it with an IPv4/IPv6 split, a prefix trie or a BART would be real
-complexity — a new data structure plus a new invariant to maintain on every route
-update — bought with no measurable gain on any realistic configuration. The
-256-route case at 2.3 µs is the only point where a trie would clearly pay, and
-nothing suggests a deployment advertises that many ranges.
+`BenchmarkDataplaneOutboundRouteCounts` measures `Client.WritePacketBuffers` — the
+actual production entry point — with the packet addressed INSIDE THE LAST range so
+the scan cannot exit early. 1280-byte packet, batch of 1, `-count 8`:
 
-The benchmarks and a correctness test at every size are kept in
-`transport/masque/route_bench_test.go`, so the decision is reversible with data: if
-a large-route configuration ever appears, the baseline is already in the tree.
+```text
+routes      linear scan (before)     binary-search matcher (after)
+    1            ~140 ns                     ~145 ns      unchanged
+    4            ~406 ns                     ~152 ns      -63% (p=0.001)
+   16            ~315 ns                     ~155 ns      -49% (p=0.000)
+   64            ~813 ns                     ~162 ns      -80% (p=0.000)
+```
+
+The isolated scan is 154 ns at 16 routes, which is real CPU time — against a total
+packet path of only ~140 ns at one route, so the scan was not 10–40 ns of a large
+budget, it was most of a small one. The helper benchmark could not show that,
+because it never measured the budget it was being spent from.
+
+Sixteen routes is not a contrived figure: a default route plus split-tunnel prefixes
+reaches it, and a peer splitting a /8 into per-site ranges passes it easily.
+
+### Decision: a compiled matcher replaces the scan on the packet path
+
+`routeMatcher` (in `transport/masque/route_matcher.go`) splits the ranges by address
+family, sorts each family by start address, and finds the candidate by binary search.
+It is **flat** in the route count where the scan is linear, so the win grows exactly
+where the scan hurt, and at one route it is indistinguishable from the scan.
+
+It is compiled when a snapshot is PUBLISHED — at capsule handling or session
+construction — never on the packet path, because a capsule arrives rarely and a
+packet arrives constantly. It rides in `sessionState`, so the packet path still takes
+one lock-free snapshot read.
+
+### The subtlety that nearly shipped a bug
+
+Binary search finds the LAST range starting at or below the address. With overlapping
+ranges whose `Protocol` differs, that is **not** what a first-match scan returns, and
+the two genuinely disagree — a prototype failed exactly this case (a UDP range
+containing a TCP range, queried for UDP).
+
+That input cannot come from a parsed advertisement: `parseRoutes` rejects overlapping
+ranges per RFC 9484 §4.2.1, including the cross-protocol case that the ordering check
+alone misses. The matcher does not rely on that silently: when the candidate contains
+the address but does not permit the protocol, it falls back to the linear scan, which
+costs nothing on the common path and keeps the answer correct for a range set that did
+not come through `parseRoutes`.
+
+Removing that fallback fails `TestRouteMatcherFallsBackOnAnOverlappingSet`.
+
+### How the decision is kept reversible
+
+`RoutesContain` is retained as the reference implementation, and
+`TestRouteMatcherAgreesWithTheLinearScan` checks the matcher against it over 5 route-set
+shapes x 21 addresses x 6 protocols. Stating the property against the scan rather than
+against literal booleans means the routing RULES can change and the matcher is still
+required to follow.
+
+The helper benchmarks stay in `transport/masque/route_bench_test.go`.
 
 ---
 
@@ -379,3 +444,145 @@ future refactor does not quietly drop them:
 - batch path and packet timeout pinning
 - fuzzing coverage for capsules and IP packets
 - two-phase establishment and QUIC/H3 error classification
+
+---
+
+## 7. Outbound packet path: the per-packet allocation (this round)
+
+`session.writePackets` allocated once per **successfully sent** packet, for a reason
+invisible in review:
+
+```go
+var tooLarge *transportHTTP.DatagramTooLargeError
+switch {
+case err == nil:
+case errors.As(err, &tooLarge):
+```
+
+`errors.As` takes the ADDRESS of its target, so the compiler must assume the pointer
+outlives the call and moves the variable to the heap on every iteration — including the
+iterations where `err` is nil and the call is never reached. Escape analysis reports
+`moved to heap: tooLarge`, and a memory profile of the packet path showed it as the only
+allocation attributable to this package.
+
+The fix splits the nil case out of the function that contains `errors.As`, because Go
+hoists that allocation to FUNCTION ENTRY: a function that merely CONTAINS an `errors.As`
+pays for it even when the call is unreachable. The direct type assertion answers the case
+that actually occurs, and `errors.As` remains in the chain for a WRAPPED too-large error,
+so classification is unchanged.
+
+`-benchtime 200000x -count 10`, 1280-byte packet:
+
+```text
+                        before      after
+per-packet allocs          1           0
+batch-of-16 allocs        33          17
+B/op (batch of 16)      1251        1126     -10.0%
+ns/op (batch of 1)     140.7       128.6      -8.6%  (p=0.000)
+```
+
+The residual allocs/op belong to the benchmark fixture's pooled buffer acquisition, not to
+the packet path: with the fixture removed the path is **57–63 ns/op and 0 allocs/op**.
+
+Two contracts are pinned, and both are mutation-verified — injecting a payload `copy`
+moves allocs/op from 1 to 2, and reintroducing the unconditional `errors.As` moves the
+classifier from 0 to 1. An earlier version of the allocation test compared B/op between two
+packet sizes and could NOT fail, because the batch is reused and the pool is already
+drained; the comment records that experiment so the wrong version is not reintroduced.
+
+---
+
+## 8. Receive path, and two optimisations that were rejected
+
+### The receive path's remaining allocations
+
+Two per packet: the `*buf.Buffer` wrapper (56 B, which the API forces onto the heap as soon
+as a caller holds a pointer) and a one-element `[]*buf.Buffer` built for the
+`ClientHandler` hand-off.
+
+Reusing that slice measures **65 ns / 2 allocs → 33 ns / 1 alloc**, about 32 ns per received
+packet, and the tempting fix is a per-session scratch slice.
+
+**REJECTED**, for a reason not visible from `loopDatagram`: that loop IS single-goroutine,
+but `session.run` starts it in its own goroutine and then occupies the calling goroutine with
+`loopCapsule` — and the capsule loop also calls `handlePacket`, for packets a peer sends as
+DATAGRAM capsules. A shared mutable slice is a **data race**, and one that would appear only
+when a peer used both mechanisms at once. A `sync.Pool` would trade the allocation for a lock
+on the receive path, which is worse.
+
+The second reason is scope: `ClientHandler.WriteInboundBuffers` is the boundary to
+`transport/device`, and both device implementations batch RUNS of packets through it.
+Narrowing it to suit one caller would push a per-packet concern into a shared product
+interface.
+
+The constraint is noted at `loopDatagram` itself, so the argument is attached to the code
+that creates it. No bespoke test was added: a race of that shape is caught by
+`go test -race`, which runs over this package in CI.
+
+### Learned datagram ceiling for oversize packets
+
+An oversize packet costs a failed `SendDatagram` before its ICMP Packet Too Big: **400–690 ns
+and 6 allocations** against ~140 ns and 2 for a normal packet, with `sendattempts/op` fixed at
+1.0. A session-local ceiling that short-circuits packets above a learned maximum is the
+obvious fix.
+
+**REJECTED** because the premise does not hold. quic-go computes its limit as
+
+```text
+min(peerMaxDatagramFrameSize, maxPayloadSizeEstimate)
+```
+
+and `maxPayloadSizeEstimate` is an atomic that is only ever RAISED as path MTU discovery
+succeeds (`connection.go` stores it only when the new estimate is larger). "Too large" is
+therefore a transient statement about the current estimate, not a stable property of the
+connection. A ceiling that only ratchets down would latch a temporary reduction and
+permanently refuse packets the connection could carry once PMTU recovered — trading a correct,
+self-healing path for a fast, permanently-degraded one, on a condition a correctly configured
+tunnel does not produce at all.
+
+### Datagram capability: NO CHANGE
+
+`sendattempts/op` of 1.0 is measured only for a state the protocol makes unreachable — a
+transport that reports itself datagram-capable and then refuses every send. `newSession`
+caches the `DatagramStream` once, at construction, from the peer's SETTINGS
+(`DatagramsEnabled()`), so a session either has a usable datagram path or never touches one.
+The benchmark is kept so the cost of the hypothetical would become visible if the capability
+ever became dynamic.
+
+### Racer orchestration: NO BENCHMARK
+
+It cannot be measured honestly without a real QUIC connection: `awaitHandshake` calls
+`quicConn.HandshakeComplete()` and `quicConn.Context()`, so a stub connector cannot stand in —
+a fake `*quic.Conn` is a nil dereference, which is what the first attempt at this benchmark
+found. A real one would measure quic-go's handshake rather than this package's orchestration,
+and the racer runs once per connection rather than per packet.
+
+What IS measurable is the ordering helper: **38 ns / 1 allocation** for the common dual-stack
+pair, 1.2 µs / 11 allocations for 64 candidates.
+
+---
+
+## 9. Where the packet path actually stands
+
+With the benchmark fixture removed, the CPU profile of the outbound path contains **no function
+from `transport/masque` at all**:
+
+```text
+outbound, 1400B, fixture removed:   57-63 ns/op, 0 allocs/op, 22-24 GB/s
+  runtime.kevent        50.0%     (scheduler / syscall)
+  runtime.scanobject    25.0%     (GC)
+  runtime.usleep        25.0%
+
+inbound, 1400B:                     54-70 ns/op, 2 allocs/op
+  runtime.kevent        50.0%
+  packetAddresses       12.5%     (3-5 ns measured directly, 0 allocs)
+  runtime.madvise       12.5%
+```
+
+Concurrent ingress and egress are flat across 1, 4 and 16 workers (~216 ns and ~210–246 ns
+respectively), which is the evidence that neither path takes a lock.
+
+**The packet hot path is already dominated by quic-go and the kernel.** No function in this
+package appears in the outbound profile; the inbound path's only per-packet costs are the
+buffer wrapper the API requires and a slice the device interface requires. Per the task's stop
+condition, this is where optimisation ends rather than where it continues.
