@@ -1,439 +1,356 @@
-# MASQUE DNS: the three resolvers and what bounds each one
+# MASQUE DNS: four planes, and what each one owns
 
-This is an engineering contract for how DNS works on the Jiejie MASQUE client. It
-exists because MASQUE has **three distinct DNS roles** that are easy to conflate,
-and conflating them produces either a bootstrap that depends on the tunnel it is
-supposed to establish, or a resolution path that silently bypasses the sing-box
-DNS router.
+This document describes how the Jiejie MASQUE client consumes a server's `DNS_ASSIGN`
+and `PREF64` capsules. It is written to be read before the code, and it states the
+scope limits as plainly as the capabilities, because the limits are what keep the
+design small.
 
-All three roles are implemented. Roles A and B were extended for server-pushed DNS
-configuration; role C is unchanged upstream sing-box behaviour and is documented here
-because it is the role most easily confused with B.
+The one-sentence version:
 
-## The three roles
+> DNS_ASSIGN is immutable configuration, not a mutable DNS subsystem.
 
-```
-  (A) BOOTSTRAP                 (B) INNER                    (C) INTERCEPTION
-  resolves the MASQUE           resolves domains             raw DNS packets
-  SERVER hostname               reached THROUGH              arriving from TUN
-                                the tunnel
-        │                             │                             │
-        ▼                             ▼                             ▼
-  dialer.New            dnsRouter.Lookup(               router.HijackDNSPacket()
-  + domain_resolver      ctx, fqdn,                       (unchanged, upstream
-  + DNS router           innerQueryOptions)               sing-box behaviour)
-        │                             │
-        ▼                             ▼
-  must work BEFORE            may depend on the
-  any tunnel exists           tunnel, or on server-
-                              pushed DNS configuration
-```
+## Scope: endpoint-local, and only that
 
-| | A. Bootstrap | B. Inner | C. Interception |
-|---|---|---|---|
-| Config field | `domain_resolver` | `inner_domain_resolver` | — |
-| Code | `common/dialer` | `protocol/masque/client.go` | `route/` |
-| May use the tunnel? | **No, never** | Yes | n/a |
+`DNS_ASSIGN` is consumed for exactly one purpose: choosing the resolver this MASQUE
+endpoint uses when **it** resolves a domain destination that it is about to carry
+through the tunnel. That is the inner-resolution path behind
+`ClientEndpoint.DialContext(domain)` and `ClientEndpoint.ListenPacket(domain)`.
 
-### Why A and B must be separate
+It is **not** global DNS configuration. This implementation does **not**:
 
-Role A runs when there is no tunnel yet. If it could consult server-pushed DNS or
-`inner_domain_resolver`, the dependency would be circular: connecting requires
-resolving the server, resolving requires connecting.
+- program the sing-box DNS router's global rules or transports;
+- configure the operating system resolver;
+- install search domains anywhere;
+- install NAT64 prefixes anywhere;
+- intercept or answer DNS packets that applications send into the TUN device;
+- implement a full Remote Access VPN DNS policy.
 
-Role B runs after the tunnel exists and legitimately depends on it. Merging the two
-fields would make the bootstrap path depend on the thing it bootstraps, so they are
-two settings and the code keeps them apart.
+Those are separate features with separate designs. Nothing here should drift into
+them, and nothing here should be read as claiming them. A future full-VPN DNS
+integration would be its own design, layered on top of the snapshot this code already
+preserves.
 
-## Status
-
-### What "implemented" means here
-
-A feature is called **implemented** only when all four hold:
-
-1. the code exists;
-2. the **production call path reaches it** — a constructor sets it, and a runtime
-   operation uses it;
-3. an **integration test** exercises it through that path, not through a component
-   built by the test itself;
-4. CI covers it.
-
-Unit tests alone are explicitly **not** sufficient. This distinction is not
-pedantry: the bootstrap cache and the handshake racer were once fully implemented,
-fully unit-tested and completely unreachable — `NewClientEndpoint` passed the raw
-outbound dialer to the HTTP client and left `HTTP3ConnDialer` nil, so neither ever
-ran in production. Everything was green. The column below therefore records the
-*production entry point*, so a reader can check the claim rather than trust it.
-
-| Role / feature | Status | Code | Production entry point | Integration test |
-|---|---|---|---|---|
-| A. Bootstrap resolver (`domain_resolver`) | **existing**, unchanged | `common/dialer` | — | — |
-| A. Bounded fresh resolve + last-known-good cache | **implemented** | `bootstrap_cache.go` | `NewClientEndpoint` → `newBootstrapDialer` | `TestConstructorWiresBootstrapRecoveryIntoTheDialer`, `TestBootstrapRecoveryUsesTheCacheAfterTheResolverFails` |
-| A. QUIC handshake-level happy eyeballs | **implemented** | `bootstrap_race.go` | `NewClientEndpoint` → `ClientOptions.HTTP3ConnDialer` → `acquire` | `TestConstructorSetsTheHTTP3ConnDialer`, `TestConstructorHookRacesTheResolvedCandidates` |
-| B. Inner resolver (`inner_domain_resolver`) | **implemented** | `client.go` | `lookupInner` | `resolver_precedence_test.go` |
-| B. Server-assigned resolver (`DNS_ASSIGN`) | **implemented** | `assigned_dns_transport.go` | `installAssignedDNS` → `lookupInner` | `dns_leak_cycle_test.go`, `assigned_dns_model_test.go` |
-| B. Assigned-resolver DoH on the tunnel connection | **implemented** | `assigned_dns_transport.go` | `selectTransport` → `RoundTripHTTP3` | `TestDoHMetadataComesFromTheSelectedResolver`, `TestTunnelAndDoHShareOneConnection` |
-| B. TCP happy eyeballs | **implemented** | `client.go` | `dialResolved` | `client.go` tests |
-| B. UDP selection stays serial | **implemented (deliberate)** | `client.go` | `dialResolved` | `client.go` tests |
-| C. DNS interception | existing, unchanged | `route/` | — | — |
-| `DNS_ASSIGN` capsule (send + receive) | **implemented** | `capsule_dns.go` | `server.go`, session dispatch | `server_dns_test.go`, `e2e_dns_assign_test.go` |
-| `PREF64` capsule (send + receive) | **implemented** | `capsule_dns.go` | `server.go`, session dispatch | `server_dns_test.go`, `e2e_dns_assign_test.go` |
-| Generic HTTP/3 request on the tunnel connection | **implemented** | `transport/http/client_h3_request.go` | `Client.RoundTripHTTP3` | `client_h3_same_conn_test.go` |
-| `PREF64` NAT64 synthesis | **not implemented (deliberate)** | — | — | — |
-
-## B. Inner resolver
-
-### Configuration
-
-```json
-{
-  "type": "masque-client",
-  "tag": "masque-out",
-  "server": "95.169.1.53",
-  "server_port": 443,
-  "domain_resolver": "dns-bootstrap",
-  "inner_domain_resolver": {
-    "server": "dns-us",
-    "strategy": "prefer_ipv6",
-    "timeout": "3s"
-  }
-}
-```
-
-`inner_domain_resolver` reuses `option.DomainResolveOptions`, so it accepts the same
-bare-string shorthand and carries the same `strategy`, `timeout` and cache controls
-as everywhere else in sing-box. No parallel schema was invented.
-
-### Precedence
+## The four planes
 
 ```
-explicit inner_domain_resolver   (highest)
-        >
-server-pushed DNS_ASSIGN         (implemented)
-        >
-normal DNS router rules          (default)
+A. BOOTSTRAP PLANE          resolves the MASQUE SERVER hostname
+   bootstrap_cache.go       fresh resolution, last-known-good fallback
+   bootstrap_race.go        candidate ordering, stagger, winner selection
+        |  knows nothing about DNS_ASSIGN, PREF64, assigned resolvers, or DoH
+        v
+B. SESSION CONFIGURATION    receives capsules, validates, publishes snapshots
+   client.go                DNS_ASSIGN  -> dnsAssignmentSnapshot  (immutable)
+   pref64.go                PREF64      -> pref64Store            (separate)
+        |  pure state, no sockets, no goroutines, no lifecycle
+        v
+C. DNS POLICY PLANE         decides WHICH configuration owns a name
+   dns_assignment.go        decide(name) -> unclaimed | claimed(usable) | claimed(unusable)
+        |  no dialing, no HTTP, no packet handling
+        v
+D. DNS EXECUTION PLANE      runs the query
+   dns_resolver.go          plain DNS via the native sing-box UDP transport
+                            same-connection DoH via one thin executor
 ```
 
-A configured inner resolver always wins. A server cannot override explicit local
-configuration — that is a security property, not a convenience: the operator's
-choice is the trusted one.
+Each plane can be described without reference to the others' internals, which is the
+point. The previous design had a single mutable transport that owned all four, and every
+responsibility it accumulated produced its own bug.
 
-### Unset means unchanged
+### A. Bootstrap plane
 
-An omitted `inner_domain_resolver` is **nil**, and nil resolves to the zero
-`DNSQueryOptions`, which tells the DNS router to apply the configured rules. That is
-precisely the behaviour that existed before the option, so no existing configuration
-changes meaning. This is asserted by test rather than assumed, because a non-nil
-zero value would silently alter every current config.
+Resolves the MASQUE **server** hostname. It runs before any tunnel exists, so it must
+never consult the tunnel, the assignment, or same-connection DoH: connecting needs the
+server's address, and the address cannot need the connection.
 
-### Resolved once, at construction
-
-The option becomes an `adapter.DNSQueryOptions` in `NewClientEndpoint`, not on each
-connection. Two consequences:
-
-- an unknown resolver tag fails at **configuration time** rather than on the first
-  inner lookup;
-- an inner lookup takes the DNS router's transport fast path instead of re-walking
-  the rule set for every target domain.
-
-## B. TCP happy eyeballs
-
-Inner TCP targets race the address families with `N.DialParallel` and the standard
-fallback delay (300ms). A dual-stack target whose preferred family is blackholed
-connects over the other family in about one fallback delay.
-
-Measured, from the tests in this repository:
-
-| Scenario | Serial (before) | Raced (after) |
-|---|---|---|
-| IPv6 blackholed, IPv4 healthy | 10.001s | **102ms** |
-| IPv4 blackholed, IPv6 healthy | 10.0s | **101ms** |
-| Single-family answer | no race | no race (no timer started) |
-
-The 10s figure is the serial attempt blocking until its context expired; that is the
-"page hangs for ten seconds on a broken IPv6 network" symptom. A single-family
-answer short-circuits to serial, so single-stack targets pay nothing.
-
-### Family preference
-
-| `strategy` | Behaviour |
-|---|---|
-| `prefer_ipv6` | IPv6 first |
-| `prefer_ipv4` | IPv4 first |
-| unset / `AsIS` (zero value) | the family of the resolver's **first** address |
-
-`AsIS` reads the order the DNS layer already chose rather than hardcoding a family,
-which is what "as is" asks for. Within a family the resolver's ordering is preserved.
-
-### UDP does NOT race
-
-A UDP socket is connectionless. A successful `connect()` or `ListenPacket` proves
-only that the **local kernel** accepted the address; it says nothing about whether
-the peer is reachable. Racing on that signal would anoint a winner that has not been
-shown to work, which is worse than no race. TCP has a handshake to win and UDP does
-not, so the UDP path stays serial on purpose.
-
-## A. Bounded fresh resolve + last-known-good cache
-
-Implemented in `protocol/masque/bootstrap_cache.go`.
-
-A resolver outage during a reconnect storm used to be unrecoverable: the connect loop
-retried with a 1s→1m backoff and re-resolved from scratch every time, with no fallback.
-The bootstrap path now keeps state across retries:
-
-- an in-memory, **bounded** (`defaultMaxBootstrapCandidates = 8`, deduplicated)
-  per-endpoint candidate set;
-- fresh-first ordering, `fresh ++ (cached \ fresh)`, so a winner from the previous
-  network never outranks a fresh answer;
-- when a fresh lookup fails, times out or returns empty, the cache is used instead,
-  bounded by `bootstrapFreshTimeout = 3s` rather than a system resolver's 20–30s;
-- a candidate is promoted to the front once it actually completes a connection;
-- the cache **survives `RestartSession`** and is released only on endpoint close.
-
-This is **connection-recovery** state, not a DNS cache. It does not duplicate, replace
-or shadow the sing-box DNS cache.
-
-## A. QUIC handshake-level happy eyeballs
-
-Implemented in `protocol/masque/bootstrap_race.go`.
-
-The production path, as `NewClientEndpoint` builds it:
+It keeps two pieces of state and nothing else:
 
 ```
-outboundDialer  (domain_resolver, via common/dialer)
-     │
-     ├─ bootstrapCache          remembers addresses the server ANSWERED on
-     │                          (the DNS layer knows TTLs, not this)
-     └─ bootstrapDialer         resolves through the cache, tries candidates in order
-            │
-            ├─ httpDialer      what the HTTP client dials through
-            └─ masqueConnDialer → HTTP3ConnDialer hook
-                     │
-                     └─ handshakeRacer   winner = completed QUIC handshake
+lastFresh    the most recent successful resolution
+lastWinner   the address that most recently completed a QUIC handshake
 ```
 
-Both substitutions are **conditional**. With no bootstrap resolver — a literal-IP
-server, or a dialer that cannot resolve — the original dialer is passed through
-untouched and the hook stays `nil`, so the endpoint behaves exactly as it did before
-the recovery path existed rather than acquiring a degraded one. Only `masque-client`
-sets the hook; Naive, `protocol/http` and `common/httpclient` keep `hook == nil` and
-the default dial path.
+Every connection attempt resolves **fresh**, because a server can move and a network can
+change. Reusing a remembered list without asking DNS again would keep dialling an address
+that is no longer published, and it would fail silently: a stale address that still
+answers looks exactly like success.
 
-### Winner ownership
+A fresh **success replaces** the remembered set rather than merging with it. Carrying
+forward an address the fresh answer did not mention is a stale-DNS hazard: when an
+operator removes an address from the record, the recovery state would put it back and we
+would keep dialling it, with no TTL to expire it. A successful DNS answer is
+authoritative about where the server is; the remembered set exists only to cover the case
+where that answer cannot be obtained.
 
-Every attempt ends in exactly one of two states: it **is** the winner, or it is
-**closed**. There is no third state in which a successful attempt is published
-somewhere nobody reads.
+Candidate ordering alternates address families (RFC 8305 §4), and the winner is the
+first candidate whose **QUIC handshake completes** -- not the first that creates a
+socket, not the first that returns from `DialEarly`, and not the first that offers 0-RTT.
+Everything that opens a socket ends in exactly one of two states: it is the winner, or it
+is closed. Losers are closed before the race returns.
 
-That third state existed and leaked. Attempts published with
-`results <- result{conn}` on a channel buffered to `len(candidates)`; a buffered
-send succeeds whenever there is room, so the cancellation arm was never taken and a
-second completed handshake parked its connection in a slot nobody would read. With a
-socket-counting dialer, a three-candidate race against one reachable server left
-**three** sockets open where one is correct. The fix is structural: a
-`sync.Once`-guarded CAS decides the winner exactly once, `results` is **unbuffered**,
-and the success send also selects on the attempt's context.
+The candidate itself is built by `transport/http`, through a connector closure it hands
+over per call. That is what keeps the UDP dial, the QUIC start and the congestion-control
+installation in the transport's own order and in one place; this package owns candidate
+ordering, the stagger and the winner decision, and nothing else.
 
-Cleanup is **synchronous** — losers are closed before `dial` returns. An earlier
-version returned the winner while starting `go func() { wg.Wait() }()`, so a caller
-counting descriptors at the moment of return still saw losers, contradicting the
-comment that claimed otherwise.
+### B. Session configuration plane
 
-Candidate order **alternates families** (RFC 8305 §4). Grouping as "preferred family,
-then the other" gives `IPv6#1 → delay → IPv6#2 → delay → IPv4`, i.e. two fallback
-delays of silence before the working family is tried, which is the case the mechanism
-exists to fix. The interleave **reorders and never filters**: every address still
-appears exactly once, because dropping the preferred family's later addresses would
-trade a latency bug for a connectivity one.
+Two independent snapshots, because the two capsules describe unrelated things.
 
-The constraint that shapes the whole thing is that **a UDP socket connect is not a
-winner**. A reachable UDP path is not a reachable QUIC endpoint, so candidates are raced
-at the **QUIC handshake** level and the winner is the first candidate whose handshake
-actually completes — `quicConn.HandshakeComplete()`. It is deliberately *not* the first
-that creates a socket, not the first that returns a `DialEarly` object, and not the first
-that offers 0-RTT data. Staggering uses `N.DefaultFallbackDelay` (300ms). Session
-resumption is preserved; it just does not decide the race.
+`dnsAssignmentSnapshot` is the compiled `DNS_ASSIGN`. It is **pure data**: it owns no
+socket, starts no goroutine, and needs no `Close`. Replacing it is a single pointer store,
+and an in-flight lookup keeps using the value it captured.
 
-`TestRacerDoesNotTreatUDPConnectAsSuccess` pins that property directly.
+That immutability is load-bearing rather than stylistic. A single DNS lookup issues an
+**A and an AAAA query concurrently**. If the transport read the assignment again per
+query, a capsule arriving mid-lookup could answer IPv4 from one assignment and IPv6 from
+the next. Capturing once makes that impossible rather than unlikely.
 
-## B. Server-assigned resolver (`DNS_ASSIGN` and `PREF64`)
+`pref64Store` holds the NAT64 prefixes. It is separate because PREF64 changes nothing:
+this client performs no DNS64 synthesis, so the prefixes cannot affect an answer or a
+transport. When they lived inside the DNS state, a PREF64-only capsule invalidated the
+entire DNS cache for no reason.
 
-Both capsules are implemented in both directions: `transport/masque/capsule_dns.go`
-holds the codecs, `transport/masque/server.go` sends them, and
-`protocol/masque/assigned_dns_transport.go` consumes them.
+### C. DNS policy plane
 
-Reviewed against `quic-go/connect-ip-go@v0.4.1-0.20260924175820-fdd945e3d600`, which
-implements `draft-ietf-masque-connect-ip-dns-06`:
-
-| Capsule | Type ID | Wire shape |
-|---|---|---|
-| `DNS_ASSIGN` | `0x1ace79ec` | repeated DNS Configuration: nameserver count, then per-nameserver `{priority u16 BE, v4 count + 4-byte each, v6 count + 16-byte each, auth domain (varint len + bytes), SVC params (varint len + key/value pairs)}`, then internal domains, then search domains |
-| `PREF64` | `0x274c0fbc` | N × 13 bytes: 1-byte prefix length ∈ {32,40,48,56,64,96} + exactly 12 address bytes, always 12 regardless of prefix length |
-
-Both are **declarative latest-state**: each capsule supersedes the previous one rather
-than appending. An empty `PREF64` capsule is a **withdrawal**, which is why the server
-distinguishes a nil prefix list (send nothing) from an empty non-nil one (send an empty
-capsule). Values are provisional in the draft and will change before publication, so they
-stay named constants.
-
-Updates are **independently atomic**: a `DNS_ASSIGN` and a `PREF64` arriving separately
-each take effect on their own, and no cross-capsule atomicity is invented.
-`TestDNSAndPREF64UpdatesAreIndividuallyAtomic` pins that.
-
-### The runtime model: two selections, in order
-
-An assignment may carry **several** configurations, and they are not
-interchangeable: each owns the internal domains it answers for. So a query is
-routed in two steps, and the order matters.
+One pure function, answering one question: **which configuration owns this name**.
 
 ```
-query name
-    │
-    ├─ 1. WHICH configuration?   longest matching internal domain wins
-    │                            (a configuration with none is the DEFAULT)
-    │
-    └─ 2. WHICH resolver in it?  lowest ServicePriority wins
+decide(name)
+    |
+    +- unclaimed             no configuration claims it
+    |                        -> the ordinary DNS rules apply
+    |
+    +- claimed, usable       a configuration claims it and has a usable resolver
+    |                        -> that configuration answers
+    |
+    +- claimed, unusable     a configuration claims it, but nothing can serve it
+                             -> FAIL, and never fall back
 ```
 
-`ServicePriority` orders resolvers that serve the **same** domains. It is not a
-global ranking: a priority-1 resolver for `corp.example.` must not answer a public
-name just because its number is lower. Treating it as global was the defect in the
-first version, which flattened every configuration into one address list and then
-ranked across all of them.
+**Ownership is decided without reference to usability.** That separation is the privacy
+invariant of split DNS: a claimed name belongs to a resolver the server nominated, and
+handing it to a public resolver when that resolver is unreachable would leak an internal
+name at exactly the moment the internal path is broken. So an unusable resolver never
+removes the claim.
 
-Matching is on a **label boundary**, so `notcorp.example` does not match
-`corp.example`, and it is case- and root-dot-insensitive so presentation cannot
-change routing. A name no configuration claims is answered by the default
-configuration; if there is no default, the query **fails** rather than being sent
-to a resolver that never claimed it.
+Selection is longest-match on internal domains, so a configuration claiming `corp.example.`
+answers `a.corp.example.` while a configuration claiming `example.` answers `b.example.`.
+Matching is on a label boundary (`notcorp.example` does not match `corp.example`) and is
+case- and root-dot-insensitive.
 
-Per-resolver metadata stays with its resolver. The authentication domain, dohpath
-and port used for a DoH request all come from the **same** endpoint — never mixed
-from a sibling. That is not tidiness: a request addressed to one origin but sent to
-another server is a request the connection was never authenticated for.
+#### What an empty internal-domain list means
 
-### Transport capability is binding
+draft-ietf-masque-connect-ip-dns-06 §3.5 defines exactly one way to claim everything:
+
+> Sending an empty string as an internal domain indicates the DNS root; i.e., that the
+> corresponding nameserver can resolve all domain names.
+
+So `[""]` is the root claim. The draft assigns **no** meaning to an empty list, and this
+code does not invent one: `[]` claims nothing and is never selected. An earlier version
+read `len(...) == 0` as "the default configuration", which silently converted unclaimed
+names into claimed ones -- the difference between "resolve this publicly" and "fail
+closed".
+
+#### Before the first DNS_ASSIGN
+
+The protocol has no capsule announcing that an assignment is coming, so before the first
+`DNS_ASSIGN` arrives the client **cannot know** which names will be claimed. Until then
+every name is unclaimed and resolves normally.
+
+That is a protocol limitation, not a gap this code can close, and no timer, sleep or
+readiness gate is invented to pretend otherwise. A name resolved a moment before an
+assignment that would have claimed it is not a leak this implementation can prevent; it
+is a property of the protocol.
+
+### D. DNS execution plane
+
+Execution runs one query against an **already-chosen** configuration. It does not choose a
+configuration, does not hold assignment state, and does not implement DNS transports.
+
+**Plain DNS is delegated.** `dns/transport.NewUDPRaw` already implements UDP exchange with
+query multiplexing and EDNS sizing, the truncated-answer retry over TCP, TCP framing,
+deadlines and lifecycle. The assigned path constructs one, pointed at the MASQUE
+**device**, uses it for one exchange, and closes it. That keeps a single implementation of
+the protocol instead of two that could drift, and because the transport is short-lived
+there is no per-assignment socket state to own, retire or leak.
+
+Every advertised address is tried in turn, and a resolver's advertised `port` is honoured
+rather than replaced by a default.
+
+**Same-connection DoH is the one special case.** It is not a DNS transport at all: it is
+an HTTP request stream on the connection the tunnel already uses, which is why it cannot
+be expressed as one.
+
+## Transport selection, and `no-default-alpn`
 
 | Advertised | Selected |
 |---|---|
-| dohpath + authentication domain, same-connection HTTP/3 client available | **DoH** on the tunnel's own connection |
-| nothing | plain **UDP** through the tunnel |
-| ALPN list, no `no-default-alpn` | DoH when available, else plain UDP |
+| dohpath + authentication domain, matching live tunnel H3 connection | **same-connection DoH** |
+| nothing | plain **UDP**, with the TCP retry the native transport performs |
+| ALPN list, no `no-default-alpn` | DoH when available and matching, else plain UDP |
 | `no-default-alpn`, DoH usable | **DoH** |
-| `no-default-alpn`, only DoT / nothing usable | **failure** — never cleartext |
+| `no-default-alpn`, DoT only or nothing usable | **failure** for that resolver; try the next in the same configuration |
 
-`no-default-alpn` is treated as **binding**, not advisory. The parameter exists to
-say unencrypted DNS is not offered, so falling back to plain UDP/53 does not
-"degrade gracefully" — it sends the query in cleartext to a server that explicitly
-said not to. An unsupported transport is therefore a failure **for that resolver**,
-and the next resolver in the same configuration is tried; if none can be used, the
-query fails closed.
+`no-default-alpn` is **binding**, not advisory. draft-06 §3.2 says omitting it indicates
+the nameserver supports unencrypted DNS, so its presence means the opposite: falling back
+to UDP port 53 would send the query in cleartext to a server that explicitly said not to.
 
-An ALPN list **without** `no-default-alpn` is not a restriction: it names transports
-the resolver *also* offers, and unencrypted DNS remains permitted.
+An ALPN list **without** `no-default-alpn` is not a restriction. It names transports the
+resolver also offers, and unencrypted DNS remains permitted.
 
-DoT is recognised and **not implemented**. Reporting that plainly is better than
-silently substituting something else, because the resolver's operator chose DoT
-deliberately. Implementing DoT is out of scope; refusing is not the same as
-ignoring.
+An **addressless** resolver is usable when it advertises same-connection DoH and the
+tunnel is H3, because the query travels as a request stream on a connection that already
+exists. That is exactly the draft's §3.6.1 full-tunnel example.
 
-### Reachability, decided per resolver
+DoT and DoQ are recognised and **not implemented**. Reporting that plainly is better than
+silently substituting something else, because the resolver's operator chose them
+deliberately. Refusing is not the same as ignoring.
 
-An assigned resolver is installed only if **every** address it advertises lies
-inside the routes the server advertised. A resolver outside those routes would be
-reached by the ordinary routing table rather than through the tunnel — the
-cleartext leak the feature exists to prevent.
+## Same-connection DoH must be the SAME connection
 
-The decision is per **resolver**. A reachable sibling in the same configuration
-still answers; a configuration whose resolvers are *all* unreachable is dropped
-along with its domains, so it cannot capture matching names and then fail them.
+draft-06 §3.5 asks that DoH be "coalesced over the same HTTPS connection" as the CONNECT-IP
+tunnel. That is only meaningful if the tunnel really is that connection.
 
-One case is accepted without an address: a **name-only** resolver, and only when it
-advertises same-connection DoH. It is then reached over the MASQUE HTTP/3
-connection — a request stream, not a tunnel-routed packet — so the routes do not
-constrain it and the same-origin check does instead.
+Two facts are therefore required, and neither is assumed from configuration:
 
-A `nil` route set means the server has not advertised routes yet. The draft's §5
-ordering rule is that DNS_ASSIGN must not precede ROUTE_ADVERTISEMENT, and treating
-"no routes" as "nothing is reachable" enforces that from the receiving side rather
-than trusting the peer.
+1. **The tunnel's transport really is HTTP/3.** The configured protocol version is not the
+   same fact: `transport/http` falls back to HTTP/2, so an endpoint configured for version
+   3 can end up on an H2 tunnel while the HTTP/3 code path still exists. The capability is
+   asked of the client that owns the connection.
+2. **The request goes on the connection that exists.** The DoH path uses an
+   existing-connection-only call. It never dials: a DNS query must never be the reason a
+   second QUIC connection appears.
 
-### Fail closed
+Same-origin is enforced strictly, with no cross-origin coalescing. A resolver whose
+authentication domain does not match the origin the connection was verified for does not
+get this path, and falls back to plain DNS if the advertisement permits it.
 
-Every query goes through the MASQUE device. There is no code path that falls back
-to a host socket: if the tunnel cannot carry a query, the query fails. Accepted
-assignments are published as **one immutable snapshot** whose generation is
-allocated inside it, so a reader can never observe a new resolver list with an old
-generation — which matters because `Environment()` keys the DNS cache on it.
+Origin comparison normalizes exactly what denotes the same host and nothing more: ASCII
+case, and a **single** trailing root dot (the wire carries `resolver.example.` while an
+HTTP authority is written `resolver.example`). A non-default port is a different origin and
+is never discarded.
 
-`DNS_ASSIGN` and `PREF64` remain **independently atomic**. No cross-capsule
-atomicity is invented.
+## SVCB validation
 
-### Documented deviations from the reference
+Service parameters are validated at the wire boundary, because a parameter that is
+accepted but misread produces a resolver that looks usable and is not.
 
-Two places where this fork is deliberately not byte-identical to the reference, both
-documented at the code and covered by tests:
+| Parameter | Rule | Source |
+|---|---|---|
+| `alpn` | length-prefixed pairs that MUST exactly fill the value | RFC 9460 §7.1.1 |
+| `no-default-alpn` | value MUST be empty | RFC 9460 §7.1.1 |
+| `port` | exactly 2 octets, network byte order; honoured when present | RFC 9460 §7.2 |
+| `mandatory` | keys present, no repetition, must not list itself, all recognised | RFC 9460 §8 |
+| `ipv4hint`, `ipv6hint` | **rejected** | draft-06 §3.2 |
+| unknown, non-mandatory | ignored | RFC 9460 §2.4.3 |
 
-1. **Address-count requirement.** `draft-ietf-masque-connect-ip-dns-06` §3.2 says that when
-   `no-default-alpn` is omitted the address count MUST be nonzero — which rejects the
-   draft's *own* §3.6.1 example, whose nameserver carries `alpn=h2,h3`, no
-   `no-default-alpn`, and **zero** addresses. This fork applies the requirement only when
-   `ALPN` is **absent**. That accepts strictly *more* than the reference on receive (so
-   anything the reference sends still validates here) and keeps every draft example valid.
-   It does not weaken the send path.
-2. **PREF64 host bits.** This fork **masks** host bits below the prefix length; the
-   reference does not, and its own test asserts that `2001:db8:0:0:1::/32` survives parsing
-   with host bits set. Masking is both safe and stricter: RFC 6052 synthesis only reads bits
-   within the prefix length, and masking makes the stored value compare equal across
-   differently-padded encodings of the same prefix, which is what latest-state replacement
-   and cache keys need.
+A malformed value makes the **resolver** incompatible, and the next resolver in the same
+configuration is tried. If none can be used, the query fails closed.
 
-The reference does **not** implement DNS64 synthesis; it only transports the configuration.
-This fork does not synthesise either — `PREF64` state is carried and exposed, not used to
-rewrite addresses.
+Two deliberate deviations from the reference implementation, both tested:
 
-## Cycle and leak rules
+1. **Address count.** draft-06 §3.2 says that when `no-default-alpn` is omitted the address
+   count MUST be nonzero -- which rejects the draft's *own* §3.6.1 example, whose nameserver
+   carries `alpn=h2,h3`, no `no-default-alpn`, and zero addresses. This fork applies the rule
+   only when `alpn` is **absent**. That accepts strictly more than the literal rule on
+   receive, so anything the reference sends still validates, and every published example
+   stays valid.
+2. **PREF64 host bits.** This fork masks host bits below the prefix length; the reference
+   does not. Masking is safe and stricter: RFC 6052 synthesis only reads bits within the
+   prefix length, and masking makes the stored value compare equal across differently-padded
+   encodings of the same prefix.
 
-- Role A must never reach the MASQUE endpoint.
-  `TestAssignedResolverIsNeverUsedForBootstrap` pins this.
-- Server-pushed resolvers must be reachable **through the tunnel** and must fail
-  closed. A server-pushed address must never cause a cleartext query from the host
-  interface. `TestUnreachableAssignmentNeverInstallsTheUnreachableResolver`,
-  `TestNoDefaultALPNRefusesToDowngradeToPlainUDP` and
-  `TestAssignedDNSDoHFailureDoesNotFallBackToHostSocket` pin this.
-- Same-connection DoH reuses the existing HTTP/3 connection's request streams; it never
-  opens a second QUIC connection and never carries DoH inside the CONNECT-IP capsule
-  stream. `TestTunnelAndDoHShareOneConnection` pins this against a real server.
-- Generic HTTP/3 requests are **same-origin only**. The connection is authenticated for one
-  authority, so a request naming another is refused rather than forwarded: allowing it would
-  turn the connection into a cross-origin tunnel riding on credentials never presented for
-  that origin.
+`ipv4hint` and `ipv6hint` are rejected per draft-06 even though RFC 9461 permits them
+generally, because draft-06 is the direct specification for this extension.
+
+## `dohpath`
+
+RFC 9461 §5 defines `dohpath` as a **relative** URI Template that must contain the `dns`
+variable, and RFC 8484 §4.1 says the template is processed **with no variables defined**
+for a POST. So an expression expands to the empty string, including its own `?` or `&`:
+
+```
+/dns-query{?dns}  ->  /dns-query
+/q{?dns}suffix    ->  /qsuffix
+```
+
+Truncating at the first `{` happens to give the right answer for the first case and the
+wrong one for the second, so the expansion is implemented rather than approximated.
+
+Nothing is invented. An empty template, a missing leading slash, or a template with no
+`dns` variable makes the resolver incompatible: guessing a path the server did not send is
+worse than reporting that its advertisement is unusable.
+
+## DoH wire details
+
+- Requests carry **DNS ID 0** (RFC 8484 §4.1), on a copy of the wire bytes, so the caller's
+  message is never mutated. The caller's ID is restored on the reply, because the DNS client
+  sent the query with that ID and matches the response against it.
+- Any **2xx** status is a success (RFC 8484 §4.2.1), not only 200.
+- The response media type is validated with MIME parsing, so an HTML error page from an
+  intercepting proxy is reported as a media-type mismatch rather than as a corrupt DNS
+  message. An absent header is tolerated: the RFC sets no MUST for it.
+- Responses are bounded, with one byte read past the ceiling so an oversized message is
+  reported as oversized.
+
+## Cache identity
+
+A configuration-bound transport reports an `Environment()` derived from **effective
+resolver behaviour**: the claims, the resolvers, their metadata, and the transport each one
+will actually use.
+
+It contains no monotonic generation counter, so:
+
+- receiving the same `DNS_ASSIGN` twice does **not** invalidate a cache;
+- a `PREF64`-only update does **not** invalidate the DNS cache;
+- a route change that makes a resolver unreachable **does**, because that changes where
+  queries go.
+
+TTL handling, caching, negative caching, singleflight and optimistic caching remain entirely
+the sing-box DNS client's responsibility. The assignment layer never reimplements them, and
+the bootstrap recovery state is not a DNS cache.
+
+## Ownership
+
+```
+bootstrap DNS state             owns no socket
+DNS assignment snapshot         owns no socket, no goroutine, no Close
+configuration transport         owns no long-lived socket
+plain DNS per-attempt transport owns only that query's sockets
+transport/http                  owns the HTTP/3 ClientConn
+transport/masque session        owns the CONNECT-IP stream
+DoH executor                    owns only its request stream
+```
+
+No layer needs a refcount, a retirement queue or delayed cleanup, because nothing that owns
+a resource is replaceable state.
 
 ## Testing
 
-Two layers, and the distinction matters:
-
-- **component tests** build the thing under test themselves, so they cannot tell
-  whether production can reach it;
-- **constructor / integration tests** call the real entry point
-  (`NewClientEndpoint`) and inspect what it built, so a component that is not wired
-  in cannot pass.
+Component tests build the thing under test themselves and therefore cannot tell whether
+production can reach it. These call real entry points:
 
 | Area | Where |
 |---|---|
 | **Production wiring** (constructor-level) | `protocol/masque/constructor_integration_test.go` |
-| **Configuration model** (routing, metadata, ALPN) | `protocol/masque/assigned_dns_model_test.go` |
-| **QUIC racer ownership** (socket accounting, family interleave) | `protocol/masque/bootstrap_race_ownership_test.go` |
-| Capsule codecs, bounds, reference vectors | `transport/masque/capsule_dns_test.go` |
-| Capsule session state (replace / withdraw / clear) | `transport/masque/session_dns_state_test.go` |
+| **Policy and compilation** (snapshots, root semantics, transport selection) | `protocol/masque/dns_assignment_test.go` |
+| **Endpoint routing** (unclaimed / claimed / claimed-unusable, snapshot consistency) | `protocol/masque/dns_endpoint_test.go` |
+| **Bootstrap and racer** | `protocol/masque/bootstrap_cache_test.go`, `bootstrap_race_test.go`, `bootstrap_race_ownership_test.go` |
+| Capsule codecs and bounds | `transport/masque/capsule_dns_test.go` |
 | Server emission and ordering | `transport/masque/server_dns_test.go` |
-| Server→client end-to-end agreement | `transport/masque/e2e_dns_assign_test.go` |
-| Assigned transport, reachability, fail-closed | `protocol/masque/assigned_dns_transport_test.go` |
-| Same-connection DoH | `protocol/masque/assigned_doh_test.go` |
-| Resolver precedence | `protocol/masque/resolver_precedence_test.go` |
-| Leak prevention and resolver cycles | `protocol/masque/dns_leak_cycle_test.go` |
-| Bootstrap cache and handshake race (component) | `protocol/masque/bootstrap_cache_test.go`, `bootstrap_race_test.go` |
-| Fuzzing (`DNS_ASSIGN`, `PREF64`, encode/parse round trip) | `transport/masque/fuzz_dns_capsule_test.go` |
-| Generic H3 requests, same-origin, reuse | `transport/http/client_h3_request_test.go` |
+| Fuzzing (capsules, SVCB, PREF64, round trip) | `transport/masque/fuzz_dns_capsule_test.go` |
+| Generic H3 requests and same-origin | `transport/http/client_h3_request_test.go` |
 | One-connection proof against a real server | `transport/http/client_h3_same_conn_test.go` |
-| Resource leaks (cancellation, abandoned bodies) | `transport/http/client_h3_leak_test.go` |
+
+## Known limitations
+
+- **Endpoint-local only.** No global OS or VPN DNS integration, as described at the top.
+- **Search domains are preserved, not applied.** They are parsed and kept in the snapshot so
+  a future integration has them, and so discarding parsed configuration is not silent.
+  Nothing installs them.
+- **Claims before the first `DNS_ASSIGN` are unknowable.** See the temporal note above.
+- **PREF64 is state only.** No DNS64 synthesis of any kind.
+- **No DoT, no DoQ.** Recognised and refused, never silently substituted.
+- **No same-connection DoH over HTTP/2.** A resolver offering only h2 with
+  `no-default-alpn` is incompatible.
+- **No cross-origin HTTP/3 coalescing.**
