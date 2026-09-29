@@ -85,6 +85,10 @@ type ClientEndpoint struct {
 	assignmentAccess  sync.Mutex
 	currentAssignment *masque.DNSAssignment
 	currentRoutes     []masque.AddressRange
+	// h3ConnectionProbe, when set, replaces the HTTP client's liveness report. It exists so a
+	// test can exercise session-transport changes without building a live QUIC connection; the
+	// production path asks the client that owns the connection.
+	h3ConnectionProbe func() (string, bool)
 	client            *masque.Client
 	deviceOptions     *device.Options
 	device            device.Device
@@ -431,18 +435,31 @@ func (c *ClientEndpoint) resolverCapability(routes []masque.AddressRange) resolv
 	if c.sessionTransport.Load() != uint32(transportHTTP.TunnelTransportHTTP3) {
 		return capability
 	}
-	if c.httpClient == nil {
-		return capability
-	}
-	// And the connection must still be live: the session being H3 says how it started, not
-	// that the connection is up now.
-	authority, live := c.httpClient.HTTP3ConnectionState()
+	// And the connection must still be live: the session being H3 says how it started, not that
+	// the connection is up now. h3ConnectionState handles the absent-client case itself, which
+	// keeps this ordering from mattering.
+	authority, live := c.h3ConnectionState()
 	if !live || authority == "" {
 		return capability
 	}
 	capability.tunnelIsHTTP3 = true
 	capability.sameH3Authorities = []string{authority}
 	return capability
+}
+
+// h3ConnectionState reports the live HTTP/3 connection's authority, if there is one.
+//
+// It is a method rather than a direct field access so the two independent facts -- the session's
+// transport and the connection's liveness -- can each be exercised on their own. The production
+// implementation asks the HTTP client, which owns the connection.
+func (c *ClientEndpoint) h3ConnectionState() (string, bool) {
+	if c.h3ConnectionProbe != nil {
+		return c.h3ConnectionProbe()
+	}
+	if c.httpClient == nil {
+		return "", false
+	}
+	return c.httpClient.HTTP3ConnectionState()
 }
 
 // UpdateTunnelTransport implements transportHTTP's optional tunnel-transport reporting.
