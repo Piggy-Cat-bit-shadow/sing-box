@@ -53,8 +53,12 @@ type recordingSession struct {
 	mtus []int
 }
 
-func (h *recordingSession) handleAddressAssign([]AssignedAddress) error   { return nil }
-func (h *recordingSession) handleAddressRequest([]AssignedAddress) error  { return nil }
+func (h *recordingSession) handleAddressAssign([]AssignedAddress) error  { return nil }
+func (h *recordingSession) handleAddressRequest([]AssignedAddress) error { return nil }
+func (h *recordingSession) handleDNSAssign([]DNSConfiguration) error     { return nil }
+
+func (h *recordingSession) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *recordingSession) handleRouteAdvertisement([]AddressRange) error { return nil }
 
 func (h *recordingSession) handlePacket(buffer *buf.Buffer) {

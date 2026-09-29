@@ -26,8 +26,12 @@ type shutdownProbeHandler struct {
 	packets int
 }
 
-func (h *shutdownProbeHandler) handleAddressAssign([]AssignedAddress) error   { return nil }
-func (h *shutdownProbeHandler) handleAddressRequest([]AssignedAddress) error  { return nil }
+func (h *shutdownProbeHandler) handleAddressAssign([]AssignedAddress) error  { return nil }
+func (h *shutdownProbeHandler) handleAddressRequest([]AssignedAddress) error { return nil }
+func (h *shutdownProbeHandler) handleDNSAssign([]DNSConfiguration) error     { return nil }
+
+func (h *shutdownProbeHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *shutdownProbeHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 func (h *shutdownProbeHandler) handlePacket(*buf.Buffer)                      { h.packets++ }
 func (h *shutdownProbeHandler) handlePacketTooBig(*buf.Buffer, int)           {}

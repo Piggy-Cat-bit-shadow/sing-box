@@ -405,6 +405,31 @@ func (s *serverSession) assignedAddresses(requests []AssignedAddress) []Assigned
 	return assigned
 }
 
+// handleDNSAssign records nothing.
+//
+// draft-ietf-masque-connect-ip-dns-06 §3.5 is explicit that a DNS_ASSIGN capsule is
+// only acted on by a peer that trusts the sender and expects configuration from it:
+// "clients will trust the IP proxy and apply received DNS configuration, whereas IP
+// proxies will ignore any DNS configuration sent by the client."
+//
+// So the server parses and validates the capsule -- giving a malformed one a clear
+// protocol error instead of silence -- and then discards it, which is the same shape
+// handleAddressAssign already uses for the client-sent address assignments it does not
+// honour.
+func (s *serverSession) handleDNSAssign(configurations []DNSConfiguration) error {
+	s.server.logger.DebugContext(s.ctx, "ignoring client-sent DNS configuration (",
+		len(configurations), " configurations)")
+	return nil
+}
+
+// handlePREF64 records nothing, for the same reason as handleDNSAssign: a client does
+// not get to configure the proxy's NAT64 prefixes.
+func (s *serverSession) handlePREF64(prefixes []netip.Prefix) error {
+	s.server.logger.DebugContext(s.ctx, "ignoring client-sent PREF64 (",
+		len(prefixes), " prefixes)")
+	return nil
+}
+
 func (s *serverSession) handleAddressAssign(addresses []AssignedAddress) error {
 	return nil
 }

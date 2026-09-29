@@ -165,8 +165,12 @@ type ownershipProbeHandler struct {
 	device int
 }
 
-func (h *ownershipProbeHandler) handleAddressAssign([]AssignedAddress) error   { return nil }
-func (h *ownershipProbeHandler) handleAddressRequest([]AssignedAddress) error  { return nil }
+func (h *ownershipProbeHandler) handleAddressAssign([]AssignedAddress) error  { return nil }
+func (h *ownershipProbeHandler) handleAddressRequest([]AssignedAddress) error { return nil }
+func (h *ownershipProbeHandler) handleDNSAssign([]DNSConfiguration) error     { return nil }
+
+func (h *ownershipProbeHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *ownershipProbeHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 func (h *ownershipProbeHandler) handlePacket(buffer *buf.Buffer)               { buffer.Release() }
 func (h *ownershipProbeHandler) handlePacketTooBig(buffer *buf.Buffer, mtu int) {

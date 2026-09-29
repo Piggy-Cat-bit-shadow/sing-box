@@ -231,6 +231,10 @@ func (h *recordingSessionHandler) handleAddressAssign([]AssignedAddress) error {
 
 func (h *recordingSessionHandler) handleAddressRequest([]AssignedAddress) error { return nil }
 
+func (h *recordingSessionHandler) handleDNSAssign([]DNSConfiguration) error { return nil }
+
+func (h *recordingSessionHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *recordingSessionHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 
 func (h *recordingSessionHandler) handlePacket(buffer *buf.Buffer) {

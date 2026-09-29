@@ -2,6 +2,7 @@ package masque
 
 import (
 	"context"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -116,8 +117,12 @@ type ingressHandler struct {
 	packets chan *buf.Buffer
 }
 
-func (h *ingressHandler) handleAddressAssign([]AssignedAddress) error   { return nil }
-func (h *ingressHandler) handleAddressRequest([]AssignedAddress) error  { return nil }
+func (h *ingressHandler) handleAddressAssign([]AssignedAddress) error  { return nil }
+func (h *ingressHandler) handleAddressRequest([]AssignedAddress) error { return nil }
+func (h *ingressHandler) handleDNSAssign([]DNSConfiguration) error     { return nil }
+
+func (h *ingressHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *ingressHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 func (h *ingressHandler) handlePacketTooBig(_ *buf.Buffer, _ int)       {}
 

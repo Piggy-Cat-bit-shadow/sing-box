@@ -236,6 +236,10 @@ func (h *countingSessionHandler) handleRouteAdvertisement(routes []AddressRange)
 	return nil
 }
 
+func (h *countingSessionHandler) handleDNSAssign([]DNSConfiguration) error { return nil }
+
+func (h *countingSessionHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *countingSessionHandler) handlePacket(buffer *buf.Buffer) {
 	h.packets.Add(1)
 	buffer.Release()

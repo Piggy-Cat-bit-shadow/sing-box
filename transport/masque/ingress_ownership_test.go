@@ -3,6 +3,7 @@ package masque
 import (
 	"context"
 	"io"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -55,8 +56,12 @@ func newIngressCapture(want int) *ingressCapture {
 	return &ingressCapture{done: make(chan struct{}), want: want}
 }
 
-func (h *ingressCapture) handleAddressAssign([]AssignedAddress) error   { return nil }
-func (h *ingressCapture) handleAddressRequest([]AssignedAddress) error  { return nil }
+func (h *ingressCapture) handleAddressAssign([]AssignedAddress) error  { return nil }
+func (h *ingressCapture) handleAddressRequest([]AssignedAddress) error { return nil }
+func (h *ingressCapture) handleDNSAssign([]DNSConfiguration) error     { return nil }
+
+func (h *ingressCapture) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *ingressCapture) handleRouteAdvertisement([]AddressRange) error { return nil }
 func (h *ingressCapture) handlePacketTooBig(_ *buf.Buffer, _ int)       {}
 
@@ -504,7 +509,11 @@ type concurrentIngressHandler struct {
 func (h *concurrentIngressHandler) handleAddressAssign([]AssignedAddress) error   { return nil }
 func (h *concurrentIngressHandler) handleAddressRequest([]AssignedAddress) error  { return nil }
 func (h *concurrentIngressHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
-func (h *concurrentIngressHandler) handlePacketTooBig(_ *buf.Buffer, _ int)       {}
+
+func (h *concurrentIngressHandler) handleDNSAssign([]DNSConfiguration) error { return nil }
+
+func (h *concurrentIngressHandler) handlePREF64([]netip.Prefix) error       { return nil }
+func (h *concurrentIngressHandler) handlePacketTooBig(_ *buf.Buffer, _ int) {}
 
 func (h *concurrentIngressHandler) handlePacket(buffer *buf.Buffer) {
 	h.delivered.Add(1)

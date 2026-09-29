@@ -3,6 +3,7 @@ package masque
 import (
 	"context"
 	"io"
+	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,6 +101,10 @@ func (h *capabilityProbeHandler) handleAddressAssign([]AssignedAddress) error { 
 func (h *capabilityProbeHandler) handleAddressRequest([]AssignedAddress) error {
 	return nil
 }
+func (h *capabilityProbeHandler) handleDNSAssign([]DNSConfiguration) error { return nil }
+
+func (h *capabilityProbeHandler) handlePREF64([]netip.Prefix) error { return nil }
+
 func (h *capabilityProbeHandler) handleRouteAdvertisement([]AddressRange) error { return nil }
 func (h *capabilityProbeHandler) handlePacket(*buf.Buffer)                      { h.packets.Add(1) }
 func (h *capabilityProbeHandler) handlePacketTooBig(*buf.Buffer, int)           {}

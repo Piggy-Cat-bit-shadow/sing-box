@@ -25,6 +25,22 @@ type Configuration struct {
 	Address          []netip.Prefix
 	Routes           []AddressRange
 	RoutesAdvertised bool
+	// DNS is the DNS configuration the server last assigned, or nil when none has
+	// been received or the last one was empty.
+	//
+	// draft-ietf-masque-connect-ip-dns-06 §3.4: "If multiple DNS_ASSIGN capsules are
+	// sent in one direction, each DNS_ASSIGN capsule supersedes prior ones." So this
+	// is REPLACED on every capsule and never appended to. The value is owned by the
+	// published snapshot, exactly like Address and Routes.
+	DNS *DNSAssignment
+	// PREF64 holds the NAT64 prefixes the server last advertised, or nil when the last
+	// capsule was empty.
+	//
+	// §4.2: "The newly received PREF64 capsule overrides any previously received
+	// PREF64 capsules", and "An empty PREF64 capsule invalidates any previously
+	// received NAT64 Prefixes." Both are replacements, including the empty case, which
+	// is why an empty capsule clears rather than being ignored.
+	PREF64 []netip.Prefix
 }
 
 type ClientHandler interface {
@@ -442,6 +458,77 @@ func (s *clientSession) handleAddressAssign(addresses []AssignedAddress) error {
 	configuration := s.configuration
 	s.publishStateLocked()
 	s.access.Unlock()
+	return s.updateConfiguration(configuration)
+}
+
+// handleDNSAssign replaces the session's DNS configuration.
+//
+// Replacement is unconditional, including by an EMPTY assignment: the draft makes each
+// capsule supersede the last, and a configuration carrying no usable nameserver is a
+// genuine withdrawal. Treating empty as "nothing to do" would leave a resolver the
+// server has stopped advertising.
+//
+// The locking follows handleRouteAdvertisement exactly, and the shape matters: the
+// lock is held only while building and publishing the snapshot, released BEFORE
+// calling out to the handler, and never held across it. Calling out under the lock
+// would let a slow handler block the packet path, and using `defer Unlock` together
+// with an explicit Unlock is a double-unlock.
+func (s *clientSession) handleDNSAssign(configurations []DNSConfiguration) error {
+	s.access.Lock()
+	if len(configurations) == 0 {
+		if s.configuration.DNS == nil {
+			s.access.Unlock()
+			return nil
+		}
+		s.configuration.DNS = nil
+	} else {
+		var generation uint64
+		if s.configuration.DNS != nil {
+			generation = s.configuration.DNS.Generation
+		}
+		// A fresh value rather than a mutation, so nothing a reader already holds can
+		// observe the change. The generation advances so a consumer can tell two
+		// assignments apart without deep-comparing them, which is what the DNS
+		// transport environment uses for cache isolation.
+		s.configuration.DNS = &DNSAssignment{
+			Configurations: configurations,
+			Generation:     generation + 1,
+		}
+	}
+	configuration := s.configuration
+	s.publishStateLocked()
+	s.access.Unlock()
+	if len(configuration.Address) == 0 {
+		// The session is not ready yet, so there is nothing to notify. The state is
+		// published and will be observed when ready is set.
+		return nil
+	}
+	return s.updateConfiguration(configuration)
+}
+
+// handlePREF64 replaces the session's NAT64 prefixes.
+//
+// An empty slice clears them, which §4.2 states explicitly rather than leaving to
+// inference. Same locking discipline as handleDNSAssign.
+func (s *clientSession) handlePREF64(prefixes []netip.Prefix) error {
+	s.access.Lock()
+	if len(prefixes) == 0 {
+		if s.configuration.PREF64 == nil {
+			s.access.Unlock()
+			return nil
+		}
+		s.configuration.PREF64 = nil
+	} else {
+		// Copied, because the parser's slice must not become state a later caller
+		// could mutate through its own reference.
+		s.configuration.PREF64 = append([]netip.Prefix(nil), prefixes...)
+	}
+	configuration := s.configuration
+	s.publishStateLocked()
+	s.access.Unlock()
+	if len(configuration.Address) == 0 {
+		return nil
+	}
 	return s.updateConfiguration(configuration)
 }
 

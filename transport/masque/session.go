@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/netip"
 	"sync"
 
 	transportHTTP "github.com/sagernet/sing-box/transport/http"
@@ -30,6 +31,14 @@ type sessionHandler interface {
 	handleAddressAssign(addresses []AssignedAddress) error
 	handleAddressRequest(addresses []AssignedAddress) error
 	handleRouteAdvertisement(routes []AddressRange) error
+	// handleDNSAssign receives a validated DNS configuration. Each capsule SUPERSEDES
+	// the previous one rather than appending, per draft-ietf-masque-connect-ip-dns-06
+	// §3.4; the handler is responsible for replacing its state accordingly.
+	handleDNSAssign(configurations []DNSConfiguration) error
+	// handlePREF64 receives NAT64 prefixes, or none when the capsule is empty. An
+	// empty capsule INVALIDATES previously received prefixes (§4.2), so an empty slice
+	// is a meaningful instruction and not a no-op.
+	handlePREF64(prefixes []netip.Prefix) error
 	handlePacket(buffer *buf.Buffer)
 	handlePacketTooBig(buffer *buf.Buffer, mtu int)
 }
@@ -182,9 +191,14 @@ func (s *session) loopCapsule() error {
 		switch capsuleType {
 		case transportHTTP.CapsuleTypeDatagram:
 			err = s.readDatagramCapsule(int(length))
-		case capsuleTypeAddressAssign, capsuleTypeAddressRequest, capsuleTypeRouteAdvertisement:
+		case capsuleTypeAddressAssign, capsuleTypeAddressRequest, capsuleTypeRouteAdvertisement,
+			capsuleTypeDNSAssign, capsuleTypePREF64:
 			err = s.readControlCapsule(capsuleType, int(length))
 		default:
+			// Unknown capsules are ignored, as RFC 9297 requires, so a peer
+			// implementing a later extension cannot break this session. The two new
+			// types are matched explicitly above precisely so that recognising them is
+			// a deliberate act rather than a side effect.
 			_, err = s.reader.Discard(int(length))
 		}
 		if err != nil {
@@ -231,6 +245,18 @@ func (s *session) readControlCapsule(capsuleType uint64, length int) error {
 			return E.Cause(parseErr, "parse ADDRESS_ASSIGN capsule")
 		}
 		return s.handler.handleAddressAssign(addresses)
+	case capsuleTypeDNSAssign:
+		configurations, parseErr := parseDNSAssign(payload)
+		if parseErr != nil {
+			return E.Cause(parseErr, "parse DNS_ASSIGN capsule")
+		}
+		return s.handler.handleDNSAssign(configurations)
+	case capsuleTypePREF64:
+		prefixes, parseErr := parsePREF64(payload)
+		if parseErr != nil {
+			return E.Cause(parseErr, "parse PREF64 capsule")
+		}
+		return s.handler.handlePREF64(prefixes)
 	case capsuleTypeAddressRequest:
 		addresses, parseErr := parseAddresses(payload)
 		if parseErr != nil {
