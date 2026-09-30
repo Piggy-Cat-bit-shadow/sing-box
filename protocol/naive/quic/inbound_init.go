@@ -197,6 +197,10 @@ func init() {
 
 		h3Server := &http3.Server{
 			Handler: handler,
+			// Connection-level faults are swallowed inside quic-go's per-connection goroutine:
+			// handleConn's error goes to s.Logger and is never returned from ServeListener, so
+			// without this the exit classification below never sees them. See h3_error_class.go.
+			Logger: newNaiveH3ServerLogger(logger),
 			ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
 				// A nil selector means "keep quic-go's default congestion
 				// control". Calling SetCongestionControl with a nil would be a
@@ -211,12 +215,18 @@ func init() {
 		go func() {
 			sErr := h3Server.ServeListener(quicListener)
 			udpConn.Close()
-			if sErr != nil && !E.IsClosedOrCanceled(sErr) {
+			// Typed classification first: a listener-level fault must stay visible even though
+			// quic-go's TransportError unwraps to net.ErrClosed and would satisfy the generic
+			// test. Expected closures (graceful shutdown, idle and handshake timeouts) stay quiet.
+			if sErr != nil && !classifyNaiveH3Error(sErr) {
 				logger.Error("http3 server closed: ", sErr)
 			}
 		}()
 
 		return quicListener, nil
 	}
-	naive.WrapError = qtls.WrapError
+	// naive.WrapError is the tunnel's error boundary. Classify there so the routing layer's
+	// closed/canceled test cannot silence a genuine fault: qtls.WrapError alone lets every
+	// quic-go error satisfy net.ErrClosed whatever its code is.
+	naive.WrapError = normalizeNaiveStreamError
 }

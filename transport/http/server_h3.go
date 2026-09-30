@@ -101,6 +101,11 @@ func init() {
 		http3Server := &http3.Server{
 			Handler:         handler,
 			EnableDatagrams: true,
+			// Connection-level faults are swallowed inside quic-go's per-connection goroutine:
+			// handleConn's error is logged with s.Logger and never returned from ServeListener,
+			// so without this the listener's exit classification never sees them. See
+			// h3_server_log.go.
+			Logger: newH3ServerLogger(logger, "http3 server"),
 			// max_header_bytes must apply to HTTP/3 as well as HTTP/2. Without
 			// this, the HTTP/3 server silently used http.DefaultMaxHeaderBytes
 			// and the configured limit only affected the loopback HTTP/2
