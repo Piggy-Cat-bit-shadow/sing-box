@@ -1,6 +1,6 @@
 # sing-box
 
-**Platforms:** macOS arm64 · Linux amd64
+**平台：** macOS arm64 · Linux amd64
 
 ## [Pruning](docs/pruning.md)
 
@@ -9,35 +9,34 @@
 
 ## [MASQUE](docs/masque.md)
 
-围绕 HTTP/3 DATAGRAM 数据面优化发送路径与队列模型。  
-Outbound payload 改为 ownership-transfer zero-copy，减少 payload copy 与 per-packet allocation。  
-增加 batch enqueue、失败回滚、关闭路径与异步 ownership 校验。
+优化 HTTP/3 DATAGRAM 的发送路径与队列，减少报文拷贝和逐包分配。
+
+出站改为转移缓冲区所有权并批量入队；补充失败回滚、关闭和异步使用场景的测试。
 
 ## [Naive](docs/naive.md)
 
-优化 cached payload 到 Cronet 的 owned-buffer handoff 与 framing 路径。  
-校正 async read/write buffer lifetime，覆盖 deadline、cancel、close 与 terminal callback 边界。  
-减少首包 plaintext copy，并校验 Cronet DNS 与 socket handoff 的实际解析路径。
+优化缓存首包向 Cronet 的缓冲区移交与封装路径，减少明文拷贝。
+
+修正异步读写的缓冲区生命周期，覆盖超时、取消、关闭及回调结束；核对 Cronet 的 DNS 解析与套接字移交路径。
 
 ## [SOCKS5 出站](docs/socks5-outbound.md)
 
-TCP 预连接：默认关闭。提前完成建连、SOCKS5 握手和认证；请求到来时只需发送 CONNECT，池为空则立即正常建连。
-复制缓冲区调优：默认关闭。链式转发可更早扩大缓冲区，并按上传、下载各自的写入端决定是否扩容，避免另一方向无谓扩容。
+TCP 预连接：默认关闭。预先建连并完成 SOCKS5 握手和认证；请求到来后只需发送 CONNECT，池为空时直接建立新连接。
+
+复制缓冲区调优：默认关闭。链式转发可更早扩容，并按上传、下载各自的写入端分别判断，避免另一方向无谓扩容。
 
 ## [Shadowsocks](docs/shadowsocks.md)
 
-按首包、稳态、上传、下载拆分审计 Shadowsocks 数据路径。  
-利用 buffer geometry 与 in-place AEAD 减少 framing copy 和 allocation。  
-区分 first-write、steady-state 与 NeedHeadroom 路径，避免将条件性 copy 误计为协议固定开销。
+分别检查首包、持续传输及上下行的缓冲区使用。
+
+通过合适的缓冲区尺寸和原位 AEAD 加密，减少封装时的拷贝与分配；明确首次写入、持续传输和预留空间不足时的拷贝条件。
 
 ## [DNS](docs/dns.md)
 
-校正 resolver authority 与不同协议的目标解析边界。  
-修复 SOCKS4 target resolution、代理端点解析与隧道内 DNS authority 混用问题。  
-清理 cache-hit、query options、logging 与结果处理中的 hot-path 固定开销。
+明确不同协议中目标域名、代理端点及隧道内域名分别由谁解析。
+
+修正 SOCKS4 目标解析等策略混用问题，减少缓存命中、查询处理和日志记录中的额外开销。
 
 ## [Other](docs/other.md)
 
-通用修复、性能优化、测试基础设施、构建、CI、跨协议改动与工程维护。  
-收录无法自然归入单一协议或裁剪分类的提交。  
-包括公共 buffer / ownership、回归测试、mutation、benchmark 与发布链路相关改动。
+收录跨协议修复、公共缓冲区与所有权改动，以及测试、基准测量、构建、CI 和发布维护。
