@@ -7,6 +7,7 @@ run:
     - with_wireguard
     - with_utls
     - with_acme
+    - with_clash_api
     - with_tailscale
     - with_ccm
     - with_ocm
