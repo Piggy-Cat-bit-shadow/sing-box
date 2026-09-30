@@ -40,20 +40,29 @@ import (
 // outbound will hand the router. Dialling would be slower, would need a live SOCKS4 server, and
 // would prove less.
 
-// TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer proves the two resolutions agree.
+// TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer pins the unconfigured half of the rule.
 //
-// Rather than dialling, this checks the DERIVATION: the outbound reads its target policy from the
-// very dialer it hands to the SOCKS client, so "the same resolver" is structural rather than two
-// independently-configured values that happen to match.
+// # What this test used to claim, and why that was wrong
 //
-// Building the dialer through NewWithOptions needs DNS services in the context, so the assertion is
-// made on the code path instead: a nil-safe ResolveDialer assertion, which is exactly what
-// NewOutbound performs. A SOCKS5 outbound never reads it, which the next test pins.
+// It previously asserted that an IP server address leaves targetQueryOptions zero "because there is
+// no policy to inherit" -- reading the policy off the outbound dialer, which only exists when the
+// server is a domain. That was the defect, stated as an expectation: the target policy comes from
+// DialerOptions, so it must be derived from those options whether or not the server needs resolving.
+//
+// What survives is the genuinely-unconfigured case: no domain_resolver, no policy, and the outbound
+// still constructs. The configured case is covered by
+// TestSOCKS4TargetPolicyIsBuiltFromDialerOptions, which fails against the old derivation.
 func TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer(t *testing.T) {
 	t.Parallel()
 
-	// A plain IP server produces a dialer that is NOT a ResolveDialer, and the outbound must still
-	// construct -- leaving the policy zero, because nothing needs resolving by domain.
+	// A plain IP server with NO domain_resolver configured carries no target policy, and the
+	// outbound must still construct.
+	//
+	// NOTE: this comment previously read "an IP server address yields no resolve dialer, so there
+	// is no policy to inherit", and the assertion below was the same. That reasoning was the
+	// DEFECT: the target policy comes from DialerOptions, not from whether the server happens to be
+	// a hostname. With no domain_resolver configured the policy is legitimately empty; with one
+	// configured it must NOT be, which TestSOCKS4TargetPolicyIsBuiltFromDialerOptions covers.
 	instance, err := newTestOutbound(t, option.SOCKSOutboundOptions{
 		ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 1080},
 		Version:       "4",
@@ -62,12 +71,8 @@ func TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer(t *testing.T) {
 	outbound := instance.(*Outbound)
 	require.True(t, outbound.resolve, "SOCKS4 still resolves a domain target locally")
 	require.Equal(t, adapter.DNSQueryOptions{}, outbound.targetQueryOptions,
-		"an IP server address yields no resolve dialer, so there is no policy to inherit; the guard "+
-			"must not turn that into a failure")
-
-	// A domain server address DOES produce a ResolveDialer, and that is the path where the policy
-	// must be inherited. It needs DNS services in the context, so it is exercised in the
-	// integration suite rather than here; this test pins the nil-safe half.
+		"with no domain_resolver configured there is no policy to carry, and the outbound must "+
+			"still construct")
 }
 
 // TestSOCKS5StillSendsTheDomain proves the change did not alter SOCKS5 semantics.
