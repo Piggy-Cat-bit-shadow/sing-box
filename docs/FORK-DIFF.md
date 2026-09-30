@@ -1,15 +1,27 @@
-# Current fork diff manifest
+# Fork diff
 
-`testing` is the sole long-term source branch. Linux amd64 server and macOS arm64 client binaries come from the same tree, with distinct build tags and registries. See [build profiles](BUILD-PROFILES.md).
+What this fork changes relative to [SagerNet/sing-box](https://github.com/SagerNet/sing-box), as of
+the current `testing` tree. Only differences that still exist are listed; rationale and history are
+in Git, and implementation detail is in the documents linked from each row.
 
-| Area | Current fork behavior | Source |
-| --- | --- | --- |
-| MASQUE | HTTP inbound serves authenticated CONNECT over H2/H3 with masquerade; the client has a MASQUE endpoint and HTTP outbound. | `protocol/http`, `protocol/masque`, `transport/masque`, `transport/http` |
-| AnyTLS | Inbound supports default and ALPN-specific fallback. | `option/anytls.go`, `protocol/anytls` |
-| Native Naive | Server minimal registers the Native Naive inbound; the macOS client uses a separately tagged Cronet outbound. | `include/registry_jiejie_server.go`, `include/registry_jiejie_client_macos.go` |
-| HTTP resources | Explicit per-inbound header, H2/H3, BBR and unauthenticated-request options. | `option/simple.go`, `option/http.go`, `transport/http` |
-| Server registry | Inbounds: `http`, `anytls`, `naive`, `shadowtls`, `shadowsocks`; outbounds: `direct`, `socks`; DNS: `udp`, `local`; no endpoints or services. | `include/registry_jiejie_server.go` |
-| macOS registry | `tun` and `mixed` inbounds, selected client outbounds, `masque-client`, client DNS transports and Native API service. | `include/registry_jiejie_client_macos.go`, `include/quic_client_macos.go` |
-| Production topology | MASQUE H2/H3, AnyTLS, Native Naive, ShadowTLS v3 and SS2022; residential TCP uses a SOCKS5 outbound after IPv4 resolution. | `release/jiejie-production-topology.json` |
+`testing` is the sole long-term source branch. Both products come from it with distinct build tags
+and registries — see [build profiles](BUILD-PROFILES.md).
 
-The default-tag upstream full registry remains available. Product build tags select capabilities, not separate copies of protocol implementations. The Linux and macOS workflows each have a routine artifact path and manually requested deep checks. Current source, registry and topology take precedence if this manifest drifts.
+| Area | Current difference | Detail | Source |
+| --- | --- | --- | --- |
+| MASQUE | The HTTP inbound serves authenticated CONNECT and CONNECT-UDP over H2/H3, and routes unauthenticated probes to a configurable masquerade. | [server](JIEJIE-SERVER.md), [MASQUE](masque.md) | `protocol/http`, `transport/http` |
+| CONNECT-IP endpoint | A MASQUE client endpoint with address assignment, route advertisement, DNS_ASSIGN and PREF64 state. | [MASQUE](masque.md) | `protocol/masque`, `transport/masque` |
+| AnyTLS fallback | Inbound supports a default fallback destination and ALPN-specific fallbacks, after TLS termination. | [server](JIEJIE-SERVER.md) | `option/anytls.go`, `protocol/anytls` |
+| Native Naive | A NaiveProxy server inbound, registered in the minimal server registry, with UoT, padding, masquerade and pre-authentication resource controls. | [Native Naive](naive.md) | `protocol/naive`, `option/naive.go` |
+| HTTP resource controls | Per-inbound header, H2/H3 window, congestion-control and pre-authentication limits, configurable rather than compiled in. | [server](JIEJIE-SERVER.md) | `option/simple.go`, `option/http.go`, `transport/http` |
+| SOCKS outbound pooling | An opt-in authenticated SOCKS5 TCP pool and copy-path tuning for a chained hop. | [SOCKS outbound](configuration/outbound/socks.md) | `option/simple.go`, `protocol/socks` |
+| Server registry | A minimal registry: inbounds `http`, `anytls`, `naive`, `shadowtls`, `shadowsocks`; outbounds `direct`, `socks`; DNS `udp`, `local`; no endpoints or services. | [server](JIEJIE-SERVER.md) | `include/registry_jiejie_server.go` |
+| macOS registry | `tun` and `mixed` inbounds, a selected client outbound set, the `masque-client` endpoint, client DNS transports and the native `api` service. | [macOS client](JIEJIE-MACOS-CLIENT.md) | `include/registry_jiejie_client_macos.go`, `include/quic_client_macos.go` |
+| Clash API | Removed. A configuration using `experimental.clash_api` is invalid in both products. | [macOS client](JIEJIE-MACOS-CLIENT.md) | `include/registry_jiejie_*.go` |
+| Launcher / LXD surface | Removed, including the daemon launcher RPC and LXD integration. | [macOS client](JIEJIE-MACOS-CLIENT.md) | `cmd`, `daemon` |
+| Production topology | A checked-in topology contract covering MASQUE H2/H3, AnyTLS, Native Naive, ShadowTLS v3 and SS2022, with residential TCP resolved to IPv4 before a SOCKS5 exit. | [server](JIEJIE-SERVER.md) | `release/jiejie-production-topology.json` |
+| Forked dependencies | `sing`, `cronet-go` and `quic-go` are replaced with fork pins in both the root and `test` modules. | [engineering notes](ENGINEERING-NOTES.md) | `go.mod`, `test/go.mod` |
+
+The upstream default-tag registry remains available and is not pruned; product build tags select
+capabilities, not separate protocol implementations. If this manifest drifts, the current source,
+registries and [production topology](../release/jiejie-production-topology.json) take precedence.

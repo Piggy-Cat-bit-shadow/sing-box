@@ -36,7 +36,7 @@ import (
 // for this inbound is unlimited. No default limit is applied: the production
 // topology serves long-lived tunnels from real users, and a limit chosen without
 // measuring that deployment's concurrency would be a guess that silently breaks
-// traffic. See docs/JIEJIE-NAIVE-RESOURCE-CONTROLS.md.
+// traffic. See docs/naive.md and docs/configuration/inbound/naive.md.
 type NaiveServerLimitsOptions struct {
 	// MaxConnections caps total concurrent connections on this inbound,
 	// authenticated or not.

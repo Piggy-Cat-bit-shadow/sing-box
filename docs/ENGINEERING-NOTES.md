@@ -14,6 +14,8 @@
 
 MASQUE 层不另写 QUIC、TLS、拥塞控制或通用 H3 生命周期。DNS_ASSIGN 使用现有 DNS transport，不引入第二套 DNS 引擎；PREF64 当前只维护状态，不等于实现 DNS64。不要为局部微优化打破这些边界。
 
+当前实现、协议语义与证据范围见 [MASQUE](masque.md)；本文件只记录不应被轻易推翻的判断依据。
+
 ### 正确性契约与证据范围
 
 - HTTP/3 CONNECT 收到 `200` 后，隧道仍须双向传输；只断言状态码不足以证明生命周期正确。见 [`client_h3_connect_lifecycle_test.go`](../transport/http/client_h3_connect_lifecycle_test.go)。同一 H3 连接复用隧道与 DoH 时，也必须保持隧道可用，见 [`client_h3_same_conn_test.go`](../transport/http/client_h3_same_conn_test.go)。
@@ -21,6 +23,22 @@ MASQUE 层不另写 QUIC、TLS、拥塞控制或通用 H3 生命周期。DNS_ASS
 - Packet Too Big 必须回到所属会话，不能广播给其他会话。真实 quic-go `DatagramTooLarge` 触发的 **IPv4 live H3 PTB** 已测试；ICMPv6 PTB 报文形状也有测试。两者都不能代替 **live IPv6 H3 PTB** 的验证。见 [`connect_ip_ptb_live_test.go`](../test/jiejie/reference/connect_ip_ptb_live_test.go) 和 [`packet_too_big_test.go`](../transport/masque/packet_too_big_test.go)。
 - 非零 DATAGRAM context ID 已在真实 H3 CONNECT-UDP / CONNECT-IP 隧道中覆盖：不支持的 ID 应被丢弃，后续 context 0 流量仍可在同一隧道中往返。它不再是“未测试”项。见 [`context_id_test.go`](../test/jiejie/reference/context_id_test.go)。
 - 当前保留的 QUICHE 检查是 [`quiche_oracle_test.go`](../test/jiejie/reference/quiche_oracle_test.go) 的协议向量/决策表检查。历史 live QUICHE tunnel harness 已删除；向量一致不等于真实互通，也不能声称当前 CI 正在测试 QUICHE live MASQUE tunnel。独立 Go reference module 的隧道测试在 Linux 手动 deep checks 中运行，见 [workflow](../.github/workflows/server-linux-amd64.yml)。
+
+### 已确认缺陷与长期不变式
+
+两项已修复的缺陷都源于同一个结构性错误：**通用的 closed/canceled 判断被放在了 typed QUIC / HTTP3 语义分类之前**。每一种 quic-go error 类型都实现 `Unwrap() -> net.ErrClosed`，与严重程度无关，因此先做通用判断会把协议违规与正常关闭混为一谈。
+
+- **H3 request cancellation（268 / `0x10c` = `H3_REQUEST_CANCELLED`）** 是 stream-local 的预期取消。此前 classifier 只特判 code 0，268 因而落到 unexpected fault，被记为 ERROR。现在按 typed H3 classification 处理，归为预期关闭（TRACE），并且不得影响 shared H3 connection 或其他 multiplexed stream。
+- **`quic.TransportError.Unwrap()` 可返回 `net.ErrClosed`**。因此若 `errors.Is(err, net.ErrClosed)` 先于 typed 分类执行，真实的 `PROTOCOL_VIOLATION` 会被静默当成普通关闭而消失。
+
+长期不变式：**typed QUIC / HTTP3 semantic classification 必须优先于 generic closed/canceled classification。**真实的 protocol / transport fault 必须保持 visible。`ApplicationError`、`StatelessResetError`、`VersionNegotiationError` 等类型同样适用；完整分类表见 [MASQUE](masque.md)。
+
+### 已调查但确认非缺陷
+
+- **IdleTimeout**：`IdleTimeoutError` 本来就是预期关闭，其 `Unwrap()` 返回 `net.ErrClosed`，因此 "no recent network activity" 原本已被正确抑制。不需要为它改 classifier。
+- **Connection cache**：liveness predicate、stale eviction、replacement isolation 均正常；late failure 不会清除 replacement；stream cancellation 保持 stream-local；reconnect 有严格 coalescing（单 client、单 generation 下恰好一次 replacement dial）。经证据检查：**NO PRODUCT BUG FOUND IN CONNECTION CACHE.** 生产 cache 未因该次事件修改。
+
+以下属于 **evidence gaps，不是已确认缺陷**：~1.84s -> ~30s 的 timeout 机制；NAT rebinding / path migration 的完整生命周期；bootstrap winner 随后 idle 的极窄 race；OpenStream failure 后是否值得增加 connection-level retry。当前没有因为上述任何一项调高 timeout、增加 speculative retry 或重写 connection cache。
 
 ### 数据路径与所有权
 
@@ -62,7 +80,7 @@ writerMTU = 65278, front headroom = 3, rear headroom = 255
 
 Cronet read/write 由异步 native callback 完成。Go 缓冲区在回调结束前必须保持 pinned、有效且有明确所有者；success、error、timeout、cancel、close 均需释放正确。缓存首包在几何条件满足时可直接移交，减少明文拷贝；不满足时必须安全回退，不能为省一次 allocation 引入 callback-after-free。
 
-历史缓存首包局部基准约为：64 B `470 → 214 ns`，1400 B `482 → 216 ns`，16 KiB `796 → 215 ns`，`1 → 0 alloc`。它们仅说明对应大小和夹具的 fast path，不代表 64 KiB 等超过阈值的情形，也不是远端吞吐结论。
+历史缓存首包局部基准约为：64 B `470 → 214 ns`，1400 B `482 → 216 ns`，16 KiB `796 → 215 ns`，`1 → 0 alloc`。它们仅说明对应大小和夹具的 fast path，不代表 64 KiB 等超过阈值的情形，也不是远端吞吐结论。当前实现与安全契约见 [Native Naive](naive.md)。
 
 ### QUIC/HTTP3 默认值
 
@@ -72,7 +90,7 @@ Naive H3 服务器不主动启用 0-RTT；未覆盖的 stream limit 和 path man
 
 未认证或错误认证连接应避免直接暴露明显的代理认证响应，并在部署支持时进入合理的 masquerade/fallback。**不声称消除协议指纹**：QUIC、HTTP/3 SETTINGS、H3_DATAGRAM 与 Extended CONNECT 等仍可被观察。
 
-Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于部署层；sing-box core 不能替代这层配置。UDP/443 的 H3 入口又是另一条路径。现行部署约束见 [`JIEJIE-NGINX-ALPN-HARDENING.md`](JIEJIE-NGINX-ALPN-HARDENING.md)、[`JIEJIE-SERVER.md`](JIEJIE-SERVER.md) 与[生产拓扑夹具](../release/jiejie-production-topology.json)。不要把仓库内测试说成真实 VPS 前门已经按文档部署。
+Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于部署层；sing-box core 不能替代这层配置。UDP/443 的 H3 入口又是另一条路径。现行部署约束见 [`JIEJIE-SERVER.md`](JIEJIE-SERVER.md) 与[生产拓扑夹具](../release/jiejie-production-topology.json)。不要把仓库内测试说成真实 VPS 前门已经按文档部署。
 
 ## 上游同步与定制依赖
 
@@ -89,6 +107,6 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 - 真实 WAN 的 PMTU、分片黑洞、移动网络切换与 CGNAT 行为；本地/CI 隧道测试不证明这些部署结果。
 - 长时间 VPS 资源稳定性和生产并发上限；局部资源测试与默认流限制不构成真实部署容量结论。
 - Cronet 单/多 engine A/B、receive-window 系统扫描，以及 BBR/BBR2/CUBIC/Reno 在受控 RTT、随机丢包和突发丢包下的比较。
-- 生产 VPS 自身公网地址是否已纳入目标 ACL，需要部署环境中的真实地址与规则验证；仓库拓扑夹具不能证明现场状态。见 [`JIEJIE-NAIVE-TARGET-ACL.md`](JIEJIE-NAIVE-TARGET-ACL.md)。
+- 生产 VPS 自身公网地址是否已纳入目标 ACL，需要部署环境中的真实地址与规则验证；仓库拓扑夹具不能证明现场状态。见 [Native Naive](naive.md) 的 Target ACL 章节。
 
 这些条目描述当前仓库证据的边界，不预断真实部署一定存在缺陷；有可靠测试或现场记录后应更新本节。

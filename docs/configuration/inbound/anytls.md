@@ -20,6 +20,16 @@ icon: material/new-box
     }
   ],
   "padding_scheme": [],
+  "fallback": {
+    "server": "127.0.0.1",
+    "server_port": 8080
+  },
+  "fallback_for_alpn": {
+    "http/1.1": {
+      "server": "127.0.0.1",
+      "server_port": 8080
+    }
+  },
   "tls": {}
 }
 ```
@@ -55,6 +65,30 @@ Default padding scheme:
   "7=500-1000"
 ]
 ```
+
+#### fallback
+
+Default fallback destination for connections that are not an accepted AnyTLS session. The backend
+receives the **decrypted** stream, so it is reached after TLS termination.
+
+`server` must be non-empty and `server_port` non-zero; an invalid value fails configuration load.
+
+An authenticated AnyTLS session never falls back. The backend is dialed only after authentication
+fails.
+
+Do not point a fallback at the AnyTLS listener itself: that configuration loops.
+
+#### fallback_for_alpn
+
+ALPN-specific fallback destinations, keyed by the negotiated ALPN.
+
+When this field is present, a **negotiated** ALPN with no matching entry is rejected. The default
+[`fallback`](#fallback) is used only when no ALPN was negotiated at all.
+
+The fork does not translate HTTP/2 to HTTP/1.1. A backend reached with `h2` negotiated receives the
+plaintext HTTP/2 preface and frames, so it must genuinely support h2c; advertising only `http/1.1`
+with a plaintext HTTP/1.1 backend is the simple deployment. This field does not override TLS ALPN —
+set [`tls.alpn`](/configuration/shared/tls/#inbound) explicitly.
 
 #### tls
 

@@ -1,46 +1,46 @@
 # sing-box
 
-**平台：** macOS arm64 · Linux amd64
+A fork of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) maintained for one private
+deployment, built from a single `testing` source tree.
 
-## [Pruning](docs/pruning.md)
+## Products
 
-**保留：** Direct、Group、HTTP / MASQUE、Shadowsocks、ShadowTLS、VLESS、AnyTLS、Naive、MASQUE Client。  
-**移除：** VMess、Trojan、Snell、Hysteria2、TUIC、WireGuard、Tailscale、OpenVPN、OpenConnect、SSH、Tor。
+Two product binaries are built from this tree, with distinct build tags and registries:
 
-## [MASQUE](docs/masque.md)
+| Product | Target | Purpose |
+| --- | --- | --- |
+| Linux Server Minimal | `linux/amd64`, CGO disabled | The production server: MASQUE H2/H3 front door, AnyTLS, Native Naive, ShadowTLS v3 + SS2022, residential SOCKS exit. |
+| macOS Client | `darwin/arm64`, CGO enabled | A headless-first CLI core for Apple Silicon: TUN and mixed inbounds, the Cronet-backed Naive outbound, MASQUE client, and the native API with its Web Dashboard. |
 
-优化 HTTP/3 DATAGRAM 的发送路径与队列，减少报文拷贝和逐包分配。
+Both come from the same protocol implementations; the profiles select capabilities, not separate
+copies. See [build profiles](docs/BUILD-PROFILES.md).
 
-出站改为转移缓冲区所有权并批量入队；补充失败回滚、关闭和异步使用场景的测试。
+## Current fork capabilities
 
-## [Naive](docs/naive.md)
+- **MASQUE** — authenticated HTTP CONNECT and CONNECT-UDP over H2/H3, with a masquerade path for
+  unauthenticated probes, plus the CONNECT-IP endpoint with DNS_ASSIGN and PREF64.
+- **Native Naive** — a NaiveProxy server inbound in the minimal server registry, with UoT, padding,
+  masquerade and pre-authentication resource controls.
+- **AnyTLS fallback** — default and ALPN-specific fallback destinations after TLS termination.
+- **ShadowTLS v3 + SS2022** — the production TLS-camouflage chain.
+- **Residential SOCKS chain** — IPv4-only resolution on the server followed by a pooled SOCKS5 exit.
+- **Server pruning and registry control** — explicit per-product registries; the minimal server
+  carries no endpoints, services or client-only protocols.
+- **Native API and macOS client pruning** — the macOS registry is an audited allowlist, and the
+  Clash compatibility API is absent from both products.
 
-优化缓存首包向 Cronet 的缓冲区移交与封装路径，减少明文拷贝。
+## Documentation
 
-修正异步读写的缓冲区生命周期，覆盖超时、取消、关闭及回调结束；核对 Cronet 的 DNS 解析与套接字移交路径。
+| Document | Covers |
+| --- | --- |
+| [Fork diff](docs/FORK-DIFF.md) | What this fork changes relative to upstream. |
+| [Build profiles](docs/BUILD-PROFILES.md) | How one tree produces the two product binaries. |
+| [Linux server](docs/JIEJIE-SERVER.md) | The server product and its production deployment contract. |
+| [macOS client](docs/JIEJIE-MACOS-CLIENT.md) | The macOS product, usage and verification. |
+| [MASQUE](docs/masque.md) | The current MASQUE implementation and its boundaries. |
+| [Native Naive](docs/naive.md) | The current Naive implementation and its boundaries. |
+| [Engineering notes](docs/ENGINEERING-NOTES.md) | Design decisions that must not be changed casually, and open evidence gaps. |
 
-## [SOCKS5 出站](docs/socks5-outbound.md)
-
-TCP 预连接：默认关闭。预先建连并完成 SOCKS5 握手和认证；请求到来后只需发送 CONNECT，池为空时直接建立新连接。
-
-复制缓冲区调优：默认关闭。链式转发可更早扩容，并按上传、下载各自的写入端分别判断，避免另一方向无谓扩容。
-
-## [Shadowsocks](docs/shadowsocks.md)
-
-分别检查首包、持续传输及上下行的缓冲区使用。
-
-通过合适的缓冲区尺寸和原位 AEAD 加密，减少封装时的拷贝与分配；明确首次写入、持续传输和预留空间不足时的拷贝条件。
-
-## [DNS](docs/dns.md)
-
-明确不同协议中目标域名、代理端点及隧道内域名分别由谁解析。
-
-修正 SOCKS4 目标解析等策略混用问题，减少缓存命中、查询处理和日志记录中的额外开销。
-
-## [Other](docs/other.md)
-
-收录跨协议修复、公共缓冲区与所有权改动，以及测试、基准测量、构建、CI 和发布维护。
-
-## [工程笔记](docs/ENGINEERING-NOTES.md)
-
-记录当前仍有效的架构决策、性能取舍与尚未闭环的验证边界。
+Configuration fields are documented under [`docs/configuration/`](docs/configuration/index.md).
+The machine-readable production topology contract is
+[`release/jiejie-production-topology.json`](release/jiejie-production-topology.json).

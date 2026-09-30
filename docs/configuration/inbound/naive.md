@@ -27,6 +27,14 @@
 "rewrite_host": true
 },
 
+// optional pre-authentication resource bounds
+"server_limits": {
+"max_connections": 0,
+"max_connections_per_ip": 0,
+"header_timeout": "",
+"max_tracked_ips": 0
+},
+
 // optional HTTP/2 server bounds
 "max_concurrent_streams": 0,
 "idle_timeout": "",
@@ -86,6 +94,36 @@ request can reach the Web backend.
 
 Unset means the upstream behaviour: an unauthenticated `CONNECT` is rejected with
 `407` and a non-`CONNECT` request with `400`.
+
+#### server_limits
+
+Optional bounds on what a peer may hold **before** it authenticates.
+
+Omitted means unlimited, which is the upstream behaviour: no limit is applied by default, because
+this inbound serves long-lived tunnels and a guessed limit would silently break them.
+
+| Field | Description |
+| --- | --- |
+| `max_connections` | Total concurrent connections on the inbound, authenticated or not. |
+| `max_connections_per_ip` | Concurrent connections from one source address. |
+| `header_timeout` | How long a connection may take to deliver a complete request once the handshake is done. |
+| `max_tracked_ips` | Ceiling on tracked source addresses. Defaults to `4096` when `max_connections_per_ip` is set without it. |
+
+`max_connections` and `max_connections_per_ip` defend different things — total host exposure versus
+a single offender — so they are separate. Validation rejects negative values and rejects
+`max_connections_per_ip` greater than `max_connections`, which could never take effect.
+
+The per-IP key is the **real transport peer**, never a forwarded header: a client that can name its
+own source address would trivially evade a per-IP limit. An IPv4-mapped IPv6 address is unmapped so
+it shares one budget with its IPv4 form.
+
+`header_timeout` applies to the **request phase only**. An established tunnel is never subject to
+it: a tunnel that is legitimately idle for longer than this must not be torn down.
+
+There is deliberately no `handshake_timeout` here — use
+[`tls.handshake_timeout`](/configuration/shared/tls/#inbound), which covers a peer that stalls
+*during* the handshake. There is deliberately no `idle_timeout` here —
+[`idle_timeout`](#idle_timeout) already provides one.
 
 #### max_concurrent_streams
 

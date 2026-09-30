@@ -1,129 +1,348 @@
 # MASQUE
 
-| Commit | 工作 |
+Current MASQUE implementation in this fork: what it does, where the boundaries are, and what is
+verified. Design decisions that must not be changed casually are in
+[engineering notes](ENGINEERING-NOTES.md).
+
+## Current scope
+
+- **HTTP CONNECT / CONNECT-UDP over H2 and H3** — the production server's L4 proxy path. HTTP/3 is
+  primary; HTTP/2 is the fallback transport.
+- **CONNECT-IP endpoint** — a MASQUE client endpoint with address assignment, route advertisement,
+  DNS_ASSIGN and PREF64 state.
+
+## Two different MASQUE surfaces
+
+These are separate capabilities with separate lifecycles. They must not be conflated.
+
+### L4 HTTP CONNECT / CONNECT-UDP
+
+The production server path. An HTTP inbound authenticates the request, then carries either a TCP
+CONNECT or a CONNECT-UDP session over HTTP/2 or HTTP/3. Unauthenticated and wrong-password requests
+can be routed to a masquerade instead; see the [server document](JIEJIE-SERVER.md) for the
+deployment semantics.
+
+### CONNECT-IP endpoint path
+
+`protocol/masque` and `transport/masque` implement the CONNECT-IP endpoint: an IP tunnel with
+address assignment, route advertisement and optional DNS configuration delivered as capsules. This
+is endpoint capability, not the L4 proxy path the server serves.
+
+## Architecture boundaries
+
+| Directory | Responsibility |
 | --- | --- |
-| [`9c85c41`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9c85c41719be4da83cfa324ff1db440ea350a1b9) | 测试批量发送时，逐字节检查数据内容和送达顺序。 |
-| [`37755cc`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/37755ccd928fce1aa2bd0d139d5ecf92ddf936d3) | 补充元数据、队列和内存分配优化的测量结果。 |
-| [`f8ff656`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f8ff65642be50e40ce7bf48253449479e8231f27) | 用 100 万个数据包测量内存分配与 GC 后的内存占用。 |
-| [`c39ca8e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c39ca8eb819b1985d747b5cb1d7a08bad1e7a540) | 批量提交出站数据报，减少重复加锁与唤醒开销。 |
-| [`baa97e9`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/baa97e945601d10f9e6365685fb6e4d6dfc9e7c2) | 改为等待测试服务端的 datagram 循环，不再假定其已启动。 |
-| [`dd8b19a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/dd8b19aa5cc3d59d3814393bcd7417e32e835dc7) | 记录零拷贝工作在 CI 上的运行结果与结论。 |
-| [`32ae337`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/32ae337e9d5f82c27b27c9a3810f789d93f37660) | 补充零拷贝数据传输的实现和适用范围。 |
-| [`4cad551`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4cad5511c67e126a8456656612cc05edda103ed1) | 验证 inbound 路径只产生一次 copy，并定位该 copy 的位置。 |
-| [`52d5756`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/52d57568fd794029e04d89e33ab2aad03b580eb4) | 为数据报预留合适的头部空间，避免发送时再次拷贝。 |
-| [`1a7b3eb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1a7b3ebe5dd6e378528b03fdaa0ec82852fc5749) | 让 CONNECT-IP 出站报文走数据报发送路径，并直接移交缓冲区所有权。 |
-| [`b8cb5e2`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b8cb5e2cbf2cb15eda638483ab8bc4e361ed2c91) | 将 quic-go 依赖切换到支持缓冲区所有权转移的分支。 |
-| [`f907032`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f9070327b7504e14b080e0cd9ba35034eafd31a1) | 补充性能测试结果，并根据结果调整路由方案。 |
-| [`d2f645d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d2f645df4e87e07550ac7815dbcc60252f93f7ca) | 测量接收路径，并记录其 slice 保持分配的原因。 |
-| [`fad8101`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/fad8101c573cb4aab098ad0aefc4879cdd37f40b) | 测量超限与竞争两条路径，两者结论均为无需改动。 |
-| [`864c004`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/864c0048be7022ce2a9576d0a500faca71a6986b) | 通告路由改用二分查找替代线性扫描。 |
-| [`0127eee`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0127eee90366726f682989234c04f8ff330e297d) | 记录 datagram 能力无需修改的依据，避免无谓改动。 |
-| [`b5a25ed`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b5a25edd84a05e4e831d93461eb381895df5d926) | 移除 datagram 路径上的每包分配，降低稳态开销。 |
-| [`bebeb5c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bebeb5c7e3c95f77565d34dcdc653d1b65f9b553) | 记录封闭式能力模型，明确各路径的可用能力集合。 |
-| [`db94a76`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/db94a76b2d9c7e07335c9e40a228de012d80c7bd) | 覆盖能力状态迁移与最终规范边界。 |
-| [`2073b63`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/2073b634bff82c51f72902feac6aea577261b103) | 固定硬失败级联行为，并修正一处错误的定时器描述。 |
-| [`c30290f`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c30290fbffc62954175fc2371d935cfc0d918889) | 描述四个平面并说明范围限制，划定审计与实现边界。 |
-| [`176721a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/176721a9300aa4137bc56b655a7252513e9d619c) | 拒绝会超出 payload 上限的地址数量，避免越界写入。 |
-| [`f119aef`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f119aefa2fca70f92c9b5f2e043668f58b0cba27) | 在深度检查中对目标协议包运行竞态检测。 |
-| [`4f74c65`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4f74c65595c77c0128ebd5081064aa6febe25ae2) | 要求具备生产路径后才可称为已实现。 |
-| [`05fa733`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/05fa733917eb39a9016ccb1e635c8e78a61f6b07) | 移除失效的选择规则，并对新模型施压测试。 |
-| [`8700681`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/87006818d839b651f7181185caef6e66ac920871) | 关闭每一个未胜出的 QUIC 竞争尝试，避免连接泄漏。 |
-| [`b3218f3`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b3218f340b8f543bbf6ac543bea15f00cf409da4) | 补齐 CONNECT-IP 目标编码矩阵，覆盖各类目标形式。 |
-| [`a2a7a9a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a2a7a9a30fda815eda42428228854a60f15ab062) | 消除 CONNECT-UDP 延迟激活竞态，保证激活语义确定。 |
-| [`ecdc966`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ecdc966ab4ee1f83880a0bbbb380129ecc8ac28b) | 拒绝 CONNECT-IP 模板目标中的反斜杠，防止解析歧义。 |
-| [`7d66493`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/7d66493bd3e4ac5441dbfe69fa0c7e3fa2eef529) | 让运行时冒烟测试识别 masque 端口占位符。 |
-| [`0176c85`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0176c852a0021a8b4c5a98bfef95ecb3264245ff) | 使测试夹具端到端跑通客户端完整路径。 |
-| [`0c500d4`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0c500d42df809371a0081c99dc56e625e4d8429f) | 修复 ingress 夹具泄漏 goroutine 导致整包挂起的问题。 |
-| [`29000a5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/29000a54a4d046c688a7d125c813b5799f391fb1) | 基准测试路由匹配，并增加客户端 QUIC 拥塞控制选项。 |
-| [`6d94da5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/6d94da584f9b5313be08c1d8d6b943a1e03de628) | 会话状态改从不可变快照读取，不再加锁。 |
-| [`9739c42`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9739c42a888f5254574bdf2c47048a88dfc8f491) | 入站数据报改为包装而非复制，减少入站内存拷贝。 |
-| [`8f1ba42`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8f1ba42a97aec1f38ad70a6c8f1dffe391ab162c) | 拆分客户端与服务端端点注册，使职责边界清晰。 |
-| [`143f886`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/143f886e2168dd0906eacfe6b4806e8a7c2b6e5b) | 对端提前断开时释放建立窗口内的 datagram。 |
-| [`71f0f12`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/71f0f12881d6212f1b2dda436fc9f79f7cb7f885) | 记录可提交上游的分支状态与待提交范围。 |
-| [`fd53dbc`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/fd53dbcf25dbdd809a0033dd51d553804e5d2be6) | 修正批量系统调用测试，使其在目标平台上通过静态检查。 |
-| [`a64e79f`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a64e79f0f9ea6b1b090203b71ee24a5cbdde573b) | 保留批量写入接口的测试，防止后续修改意外删除。 |
-| [`4ac7723`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4ac7723103aeb1fe2030af5b5034d58e4776a0f5) | 使批量测试满足现代化与未使用代码检查要求。 |
-| [`a2bff6b`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a2bff6b7c62d48d2b6f4108685edcfc466667355) | 校准当前互操作与 PTB 证据，使结论与实测一致。 |
-| [`87d11bd`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/87d11bd2992ef3b7e2a621ea67283dd53a1e04d4) | 明确 packet-too-big 错误属于哪个会话。 |
-| [`a07fd54`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a07fd54787705bbf79f969f1c427640053388248) | 精确区分 QUICHE 执行失败的类型，避免笼统归因。 |
-| [`4d22f47`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4d22f47677bc8a53285d7dd02793cf4f6e45936c) | 补齐超时场景下的批量转发缺口，覆盖异常分支。 |
-| [`c51772f`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c51772f6a1004387f5c75eaedab17c6781fc1a87) | 在真实数据报套接字上验证批量发送路径。 |
-| [`9d6bfc7`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9d6bfc783d08bfd3cb8f69099c51b1ffd55f56e6) | 对超时包装器的批量路径做基准测试。 |
-| [`e7f7dde`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e7f7dde6a0457ed075cf43b52a9ca6db9b5aeb76) | 验证批量能力可以穿过 UDP 超时包装器。 |
-| [`ff12828`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ff12828a4ded44350b80f0fa9ca9263d239b99ed) | 将 QUICHE 互操作测试移出快速任务，避免拖慢常规 CI。 |
-| [`b6a2fbc`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b6a2fbcc4be14c376a4da82ec51adbe549d4839d) | 记录互操作执行器的能力限制，说明其适用边界。 |
-| [`a9c1860`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a9c18602dab9b97c8627faae5146e1e4c329ccc3) | 区分 QUICHE 停顿与协议不一致两种失败，避免误判。 |
-| [`c8e5a65`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c8e5a65f9031198f385702ec209591965092aa1a) | 更新已验证的验收边界，反映当前实测状态。 |
-| [`8a6b333`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8a6b3336773393ad5d92d9464df653cf04e0b8f9) | 增加可重复的 VPS 验收运行器，统一验收流程。 |
-| [`60fec08`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/60fec086ebbaac2622e902f88257b20d6fc4109b) | 接入 Google QUICHE 实时互操作测试作为第三方判定。 |
-| [`ad40266`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ad4026620a4c613b2c519c2d8bebcdfc4fac0752) | 强制触发真实场景下的报文过大分支，验证处理路径。 |
-| [`5f37304`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/5f373043a3048822c7312760da8ea0183d506817) | 移除未使用的 GSO 辅助函数并使 Linux 基准通过 errcheck。 |
-| [`c7de774`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c7de7747d71348f87c9a6725822c59616641cd08) | 测量 Linux UDP GSO 分组并据此否决一个尺寸阈值。 |
-| [`f20e71c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f20e71c728d171638d11ea51d376c6a2c940e88e) | 删除批量能力测试中重复的检查。 |
-| [`0af10db`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0af10dbbc72c8cc2fee1b23fbf7da90268fee0e5) | 记录性能测试因依赖问题受阻的阶段。 |
-| [`1a0761e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1a0761e9a2601d7e5318b6af179f8939a9d165c1) | 审计 HTTP/3 MTU 现状而非新增选项，先摸清实际情况。 |
-| [`62d5900`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/62d59003e74abb4fb5d886d9aac7e95d7438f3a9) | 在返回成功前完成 CONNECT-UDP 目标建立，保证语义正确。 |
-| [`bffd069`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bffd06952dd42067c84cc7f027884a1114987795) | 测试目标套接字是否实际调用批量发送系统接口。 |
-| [`b8e7312`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b8e731257bb4b64b509102ee1cc80b7d647864b6) | 测量超时包装器会丢弃批量能力，确认该实现的副作用。 |
-| [`01ae0d3`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/01ae0d3082890d6f71caf32ebfa864e9f0864a34) | 批量转发目标协议数据包，降低每包处理开销。 |
-| [`3b8d99a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/3b8d99a216fecbc8cbd0de86bab1a4f7e29f8f66) | H3 ingress datagram 改为包装而非复制，避免入站多余拷贝。 |
-| [`ec2b4b9`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ec2b4b91e0f521ba8dbb30e9cd304a8655acf5a2) | 目标转发改用已连接的数据报套接字，简化收发。 |
-| [`5c58b10`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/5c58b10572be6c6d4bc2486f3d9224de640bdcaf) | 整理说明文档中目标协议章节，使文档与实现一致。 |
-| [`864be35`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/864be35ebcf150252ddd2512f57c77f6b9aa86bd) | 修正共享 CI 环境中偶发失败的伸缩测试。 |
-| [`583bfc8`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/583bfc84f38a0f7160deab84484c260bbd7377b8) | 将 QUICHE 判定测试加入参考运行过滤集合。 |
-| [`8dedfb4`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8dedfb4e3ba1e7bb5dac3ff91eb4fbf366a24d80) | 使新增测试满足格式化与现代化检查要求。 |
-| [`4db6f90`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4db6f90f9857215398eb8ddaad56c4c2a46d9d00) | 将 RFC 9931 客户端侧重新归类为范围之外，明确不实现。 |
-| [`a78d273`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a78d273ac585c631f2696ace63981d81e0abd1a3) | 去重互操作检查表条目，避免重复记录同一项。 |
-| [`0455e6e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0455e6ec188fe129a7f7e9968d9e842ff89bb0b2) | 在 VPS 前检查表中加入 QUICHE 向量行，补全验收项。 |
-| [`0dbfc43`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0dbfc43d1e3fd9ddbc8b2363cc81d56c0e9428f6) | 记录 QUICHE 协议向量检查并重新归类客户端侧。 |
-| [`36d4048`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/36d404826b9409b0d9a905c2ff82e60c4adf04f0) | 将 Google QUICHE 作为第三个协议判定源接入流程。 |
-| [`41a04ce`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/41a04ceb14e13881c5624337f323c74f3a3eea1c) | 固定跨会话策略、控制突发与 IPv6 扩展链行为。 |
-| [`e823b43`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e823b4312b37aa96898c1b2f6b53702baee9fb9c) | 完成参考审计并加入 VPS 前检查表，形成闭环。 |
-| [`daa4907`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/daa49073e8f42eaeaff246ca76b1305507eedc76) | 补充 CONNECT-UDP 的 IPv6 测试，并修正 RFC 9931 的引用。 |
-| [`1dbf363`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1dbf363d49df2270b6edd9418dd6e7ac5baf6d91) | 测量丢包、重复与乱序容忍度，验证数据面健壮性。 |
-| [`ba7f62a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ba7f62a4ba852f3faa8f7008d0aa273d22e22234) | 验证报文过大证据链，确认路径发现机制可用。 |
-| [`4fc9984`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4fc9984b3992ed3039e7ea29d93949e70cddc535) | capsule 路径允许最大的普通 IPv6 包，避免不必要分片。 |
-| [`988df7a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/988df7a35847375f166e3a6c25728491d1ddcc81) | 固定实时标识、零长度数据报与错误语义三类行为。 |
-| [`8530321`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8530321703a14b7ae5427aba6570d6b850cba697) | 固定限流来源键以抵御 NAT 重绑定导致的绕过。 |
-| [`7bb4342`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/7bb43427550aad174fd5a6a9837d9060a22281f6) | 通过测量确认数据来源，避免只检查预设值。 |
-| [`7ae42c9`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/7ae42c98d47b562131c260b0e999e0f77c1346de) | 在 CI 中有界运行全部模糊测试目标，控制耗时。 |
-| [`5434688`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/543468826807688ae878cf30b60ae6d25c088ab2) | 修复模糊测试语料并补充 CONNECT-UDP 路径覆盖。 |
-| [`c702497`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c70249783f7d661375ec7910f29a041f1a2ca69a) | 修复参考测试工具的第六版协议控制包解码错误。 |
-| [`a819eeb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a819eeb3feeea280bc16059a9f1967c9a1761cba) | 控制包突发测试改用新版等待组写法，符合当前规范。 |
-| [`67e55b3`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/67e55b387253355041b27c53e495461c7b8c9706) | 记录第三阶段结论并修正此前两处说法。 |
-| [`a12e5c2`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a12e5c258c16d39b6ce4cd82487c8deeea5aa1e4) | 双向堵住参考测试的假绿漏洞，确保失败可被发现。 |
-| [`429d8b6`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/429d8b6774a1315816dfce828e2090aa1ba84bc9) | 审计 Proxy-Status 并固定认证边界，明确错误上报语义。 |
-| [`a7fd9ec`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a7fd9ec116cd3e147f29e1289b6a8ec4cec6abd9) | 测试流辅助函数改用 sync.Once 关闭，避免重复关闭。 |
-| [`824cd65`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/824cd658a8d2e5816744a9ccf53faffcdd81c388) | 使跳数递减函数对畸形报文头部安全，不再越界访问。 |
-| [`86002b5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/86002b56f064d541127a48bdaae6ef88cdfa0e98) | 对 IP 包解析器与 capsule 分片做模糊测试，覆盖畸形输入。 |
-| [`1325727`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1325727a5625dd2dc58954e5825b7ac66334c6f1) | 锁定 IPv6 扩展头的协议解析行为，防止回归。 |
-| [`0cc6074`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0cc6074e3d2d5d444083f168aef76dfa7ae9872f) | 固定可变长度整数边界上的数据报尺寸计算。 |
-| [`858284e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/858284e5a0751ba2454697ae441122a82d631857) | 测试发送队列的背压和缓冲区所有权，防止并发问题。 |
-| [`c5e2d3e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c5e2d3eb48c1bea13c69420519aa195297fc9c3c) | 测量活动隧道的关闭与资源回收是否彻底。 |
-| [`01f20ce`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/01f20ce4e69fac8ea38432cb22959e41f4329f71) | 测量 NAT 重绑定场景下的 QUIC 迁移是否可用。 |
-| [`0783a33`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0783a33b3bad284eb4b074ab8734b3341cb5323f) | 验证禁用数据报时的控制包回退路径是否正确。 |
-| [`6efcf0a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/6efcf0a75f5d2b9d61cfa8581a4c2a44dbc00b1c) | CONNECT-IP ICMP 夹具改用真实服务端网关作为目标。 |
-| [`528858c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/528858c4447baba18a176dac74737636ce5b13db) | 参考互操作按用例各自所需的二进制运行。 |
-| [`9577b09`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9577b095f89e39825f02065f4206dfa16477ee50) | 使模糊测试种子满足格式化检查要求。 |
-| [`762b0ce`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/762b0cede298983f6ec0fceac4b6005c8a82a442) | 补充连接池、隔离机制和模糊测试的覆盖情况。 |
-| [`66f0e94`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/66f0e94360bb079f6d7980b22d092b09252af2af) | 对消费对端可控字节的解析器做模糊测试。 |
-| [`e4d2f6c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e4d2f6c1afb1008741a137b8c94481e0f8602f16) | 使 Contains 与服务端自身地址的查询结果一致。 |
-| [`907dbfb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/907dbfb991861d2630ac275b9be65380c278e11c) | 记录标准修复与数据报回退的实测结果。 |
-| [`b81244b`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b81244bdf767f798d4e8509f8e3f3898d9ded89a) | 在真实链路上验证数据报到控制包的回退路径。 |
-| [`432b36c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/432b36ce7532ec6e3e27d70249f64334a35dd784) | 记录参考互操作结果与两种 pin 形式的差异。 |
-| [`32b1d25`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/32b1d25cbfd12786ffceef4b4cd03f5e9cdfc71a) | 验证与固定参考实现之间的 CONNECT-UDP 与 CONNECT-IP 互操作。 |
-| [`e81f849`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e81f849949ac79854c090ef2d068ff9d796d584f) | 从仓库根目录运行带特性标记的协议测试。 |
-| [`935ffec`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/935ffeca80dcc48c533de14f9328d9428bd4f148) | 运行目标协议各包与带特性标记的协议测试。 |
-| [`d159ec0`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d159ec09dfd1e9637c5c559d0630af95aec22923) | 记录参考审计、改动与剩余缺口，形成阶段结论。 |
-| [`ab9c9f0`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ab9c9f09d9962288cffb1febb63cbd2c67719f7e) | 固定 CONNECT-UDP 请求路径测试语料，覆盖常见形态。 |
-| [`e4f847e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e4f847ecf732e8cd580ed1517f34fd3436ec6380) | 将 MASQUE 的 QUIC 调优改为可选开启，避免默认行为变化。 |
-| [`a529b68`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a529b68c830ff6a2ffe61cbe9ce5535e401a9c2a) | 限制单个控制 capsule 的条目数量，防止资源耗尽。 |
-| [`b656b06`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b656b062f99901406c8360f1358174b480eecfd5) | 以线性时间校验 ROUTE_ADVERTISEMENT 重叠，避免二次复杂度。 |
-| [`969909b`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/969909bc16a188206f6fb598e6d2b833429f11f5) | 拒绝跨协议重叠的路由公告范围，避免路由冲突。 |
-| [`d4ead14`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d4ead1498a30c45b971074ef17282483b1f1a8a1) | 按数据报粒度强制执行目标访问控制，并交付配置。 |
-| [`cb567c0`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/cb567c0ccd419047056d5ee0644a15ee77580b33) | 补齐未授权探测矩阵，覆盖各类越权尝试。 |
-| [`1276eb8`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1276eb85a2afa318ba7c6178ee69fdc8caf8bacc) | 测试从 HTTP/3 回退到 HTTP/2 时的重放安全性。 |
-| [`0271b14`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0271b145addf40759e6fcae9a83fdec9ae3d4c14) | 连接请求需等待握手完成，避免提前建立连接。 |
-| [`9491008`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9491008a97bd5bb636458e32d4aa51e1e0118e51) | 将 http3_fallback 接入 MASQUE 客户端并修正退避生命周期。 |
-| [`b836956`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b836956030c132a17133e9ea0144373a5e461686) | 将连接池应用于 MASQUE 隧道客户端，复用既有连接。 |
-| [`5dc14cc`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/5dc14ccc21cfd543294ac790ca0f1099e93bb80b) | 增加目标协议与隧道协议在两种版本下的集成覆盖。 |
+| [`protocol/masque`](../protocol/masque) | Endpoint integration, options, target resolution, DNS_ASSIGN policy and state, PREF64 state, bootstrap policy, routing and capability compilation. |
+| [`transport/masque`](../transport/masque) | CONNECT-IP sessions, control capsules, ADDRESS_ASSIGN, ROUTE_ADVERTISEMENT, IP packet send/receive, H3 DATAGRAM with capsule fallback, buffer ownership, MTU/PTB and session lifecycle. |
+| [`transport/http`](../transport/http) | HTTP/1.1, HTTP/2, HTTP/3, CONNECT, QUIC/TLS establishment, congestion control, H3 ClientConn and request-stream lifecycle. |
+
+The MASQUE layer does not reimplement QUIC, TLS, congestion control or generic H3 lifecycle.
+DNS_ASSIGN uses the existing DNS transports rather than introducing a second DNS engine, and PREF64
+maintains state only. Do not break these boundaries for a local micro-optimization.
+
+## H3 lifecycle and error semantics
+
+CONNECT and ordinary requests share one HTTP/3 connection but **do not share a lifecycle**:
+
+| | Ordinary request | CONNECT |
+| --- | --- | --- |
+| Stream owner | quic-go `ClientConn.RoundTrip` | the tunnel, opened by `openConnectStream` |
+| Write side at 200 | finished | **stays open** |
+| Response | is the response | becomes the tunnel |
+| Setup context | applies to the request | bounds setup only, then detached |
+
+A CONNECT's `200` is where the tunnel *begins*. Closing the write side there leaves a stream that
+can be read but never written, and the first proxy write fails with `write on closed stream`. The
+setup context is detached once the tunnel is handed over, because the caller's `DialContext`
+typically cancels its own setup context on return and leaving it wired would tear down a healthy
+tunnel.
+
+**Error classification invariant.** Typed QUIC / HTTP/3 semantic classification always precedes any
+generic closed/canceled test. Every quic-go error type implements `Unwrap() -> net.ErrClosed`
+regardless of severity, so a generic test run first cannot distinguish an orderly shutdown from a
+protocol violation. Current behaviour:
+
+| Condition | Classification |
+| --- | --- |
+| `H3_REQUEST_CANCELLED` (268 / `0x10c`), remote or local | expected closure — stream-local, TRACE |
+| `http3.ErrCodeNoError`, code `0` | expected closure |
+| `IdleTimeoutError`, `HandshakeTimeoutError` | expected closure |
+| `TransportError` with code 0, `ApplicationError` with code 0 | expected closure |
+| `TransportError` fault (e.g. `PROTOCOL_VIOLATION`) | **visible fault** |
+| `ApplicationError` with a fault code | **visible fault** |
+| `http3.Error` with a fault code | **visible fault** |
+| `StatelessResetError`, `VersionNegotiationError` | **visible fault** |
+| Unclassifiable error | **visible fault** |
+
+A cancelled stream is stream-local: it must not close the shared connection, and other multiplexed
+streams continue. A connection-level failure ends every stream on that connection and evicts it.
+
+## Datagram ownership and performance
+
+The outbound owned-DATAGRAM path writes the HTTP/3 Quarter Stream ID in place using buffer headroom,
+then transfers buffer ownership to the QUIC queue. Two full payload copies before
+packetization/AEAD become zero. The copying `SendDatagram` keeps its original semantics.
+
+Ownership contract for the owned API: on success the receiver releases exactly once; on failure or
+an oversized payload the caller still holds the buffer; shutdown drains the queue. See
+[`owned_datagram.go`](../transport/http/owned_datagram.go).
+
+A historical local benchmark at 1280 B measured the owned path at roughly **2.7×** the copying path.
+That is a dataplane microbenchmark on one machine and fixture; it is not a WAN throughput, VPS
+memory or loss-tolerance result.
+
+Inbound still relies on quic-go's receive buffers, asynchronous TUN handoff and buffer lifetime.
+*REJECT:* removing the last receive-side copy by introducing cross-layer reference counting or a
+shared mutable staging area increases release and race risk, and no profile supports it.
+
+## CONNECT-IP lifecycle
+
+- Address assignment, route advertisement and IP packet send/receive must be handled correctly. When
+  H3 DATAGRAM is available it is used; when the peer does not support it the session must fall back
+  to capsules.
+- Packet Too Big must be attributed to the session that owns it and never broadcast to other
+  sessions.
+- Non-zero DATAGRAM context IDs are covered: unsupported IDs are dropped and later context-0 traffic
+  still round-trips on the same tunnel.
+
+## DNS_ASSIGN / PREF64
+
+`DNS_ASSIGN` is **immutable configuration, not a mutable DNS subsystem.** It is consumed for one
+purpose: choosing the resolver this endpoint uses when it resolves a domain destination it is about
+to carry through the tunnel. It does not program the sing-box DNS router, configure the OS resolver,
+install search domains or NAT64 prefixes, or intercept DNS packets applications send into the TUN
+device.
+
+### Four planes
+
+| Plane | Responsibility |
+| --- | --- |
+| Bootstrap | Resolves the MASQUE *server* hostname before any tunnel exists. Never consults the tunnel or the assignment. |
+| Session configuration | Receives capsules, validates them, publishes immutable snapshots. Pure state: no sockets, no goroutines, no lifecycle. |
+| DNS policy | Decides *which* configuration owns a name. A pure function; no dialing, no HTTP, no packet handling. |
+| DNS execution | Runs the query against an already-chosen configuration, via plain DNS over the native UDP transport or same-connection DoH. |
+
+Bootstrap keeps two pieces of state: the most recent successful resolution, and the address that
+most recently completed a QUIC handshake. Every attempt resolves fresh, and a fresh success
+*replaces* the remembered set rather than merging it. The winner is the first candidate whose QUIC
+handshake **completes** — not the first to create a socket. Losers are closed before the race
+returns.
+
+### same-connection DoH
+
+DoH is coalesced onto the connection the tunnel itself uses. Three distinct facts matter:
+
+- **A** — the client *can* speak HTTP/3 (configuration).
+- **B** — it currently holds a live HTTP/3 connection.
+- **C** — *this tunnel session was established over* HTTP/3.
+
+Same-connection DoH requires **C and B** plus a matching origin and an advertising resolver. Neither
+A nor B implies C, because the tunnel path falls back: an HTTP/3 attempt can fail, the session be
+established over HTTP/2, and a live HTTP/3 connection remain from an earlier success. Inferring C
+from B would send a DNS query on a connection the tunnel traffic does not share.
+
+C is recorded where it is decided — `transport/http` reports the protocol each successful branch of
+`openTunnel` used, through an additive `OpenTunnelWithInfo` — and is checked in two places: the
+compile-time capability decision and the request-time executor. Checking only B reintroduces the
+conflation, and because every individual query would still succeed the mistake is invisible until
+someone notices the second connection. DoH uses an **existing-connection-only** call: a DNS query
+must never be the reason a second QUIC connection appears.
+
+### Resolver origin
+
+A DoH request is addressed to a host **and a port**; the same host on two ports is two origins. The
+authority is built once including the effective port, and both the capability decision and the
+runtime same-origin check use that one value. Normalization covers exactly ASCII case and a single
+trailing root dot. An advertised SVCB `port` is honoured rather than replaced by a default.
+
+### Capability recomputation
+
+Whether a resolver can use DoH is a *joint* property of the advertisement and the current tunnel. A
+snapshot compiled while the tunnel was HTTP/2 would mark an addressless DoH resolver unusable
+forever; one compiled on HTTP/3 would keep offering DoH after a fallback. The endpoint therefore
+recomputes when the session transport or the routes change and publishes a new immutable snapshot.
+The server does not resend `DNS_ASSIGN`, and should not have to: the assignment did not change, our
+ability to use it did.
+
+Each resolver carries **both** of its capabilities, so a DoH failure at query time can still fall
+back to the transport the server advertised. Executor order is same-connection DoH when currently
+applicable, then plain DNS when the server left the default transport available. Selection table:
+
+| Advertised | Selected |
+| --- | --- |
+| `dohpath` + authentication domain + ALPN containing `h3`, matching the live tunnel connection | same-connection DoH |
+| nothing | plain DNS over UDP, with the native transport's TCP retry |
+| ALPN list without `no-default-alpn` | DoH when available and matching, else plain DNS |
+| `no-default-alpn` and DoH usable | DoH |
+| `no-default-alpn` with only DoT or nothing usable | failure for that resolver; try the next in the same configuration |
+
+**ALPN must name `h3` explicitly.** A `dohpath` says *where* to POST, not which protocol carries it;
+`alpn=h2` with a `dohpath` is never given an HTTP/3 request. Absent ALPN is not a wildcard.
+`no-default-alpn` is binding rather than advisory: omitting it is what indicates support for
+unencrypted DNS, so falling back to UDP/53 would send cleartext to a server that said not to. An
+ALPN list *without* it is not a restriction.
+
+### SVCB
+
+Wire-boundary validation, because a parameter accepted but misread produces a resolver that looks
+usable and is not:
+
+| Parameter | Rule |
+| --- | --- |
+| `alpn` | Length-prefixed pairs that must exactly fill the value. |
+| `no-default-alpn` | Value must be empty. |
+| `port` | Exactly 2 octets, network byte order; honoured when present. |
+| `mandatory` | Keys present, no repetition, must not list itself, all recognised. |
+| `ipv4hint`, `ipv6hint` | **Rejected**, per the CONNECT-IP DNS draft. |
+| Unknown, non-mandatory | Ignored. |
+
+A malformed value makes that resolver incompatible and the next resolver in the same configuration
+is tried; if none can be used the query fails closed.
+
+Recognised ≠ implemented for `mandatory`: `alpn`, `no-default-alpn`, `port` and `dohpath` are
+honoured as mandatory; `ipv4hint`/`ipv6hint` are rejected outright; `ech` is recognised so a
+mandatory reference can be refused by name, but no ECH handshake is performed; anything else cannot
+be honoured by definition.
+
+An HTTP ALPN without a `dohpath` is not *usable* as DoH but is not *malformed*. It simply cannot
+build a DoH capability, so the resolver keeps whatever else it advertised and is unusable only if
+the server also withdrew plain DNS.
+
+### dohpath
+
+`dohpath` is a **relative** URI Template that must contain the `dns` variable. For a POST the
+template is processed with no variables defined, so an expression expands to the empty string
+including its own `?` or `&`: `/dns-query{?dns}` → `/dns-query`, and `/q{?dns}suffix` → `/qsuffix`.
+Expansion is implemented rather than approximated — truncating at the first `{` is right for the
+first case and wrong for the second.
+
+Supported: `{dns}`, `{?dns}`, `{&dns}`, `{/dns}`, `{.dns}`, `{;dns}`, and comma-separated name
+lists. Refused: the `+` and `#` operators, an empty expression, nested braces, unterminated or stray
+braces, the `*` and `:` modifiers, invalid variable names including invalid percent escapes, and any
+template that is not valid UTF-8. A variable name must match the RFC 6570 grammar where the dot is a
+*separator* between non-empty components.
+
+The **expansion** is validated too, because it becomes the request's `:path` verbatim: a raw control
+character, a space, a non-ASCII byte, or a `%` beginning no valid escape is refused. A template
+whose expansion is empty, lacks a leading slash, or contains no `dns` variable is never sent —
+guessing a path the server did not send is worse than reporting the advertisement unusable.
+Expansion *deletes* an expression, so a permissive parser would produce a plausible path from a
+template it did not understand: a request to the right origin and the wrong resource.
+
+### Cache identity
+
+A configuration-bound transport reports an environment derived from **effective resolver
+behaviour**: the claims, the resolvers, their metadata, and the transport each will actually use. It
+contains no monotonic generation counter, so:
+
+| Change | Invalidates cached answers? |
+| --- | --- |
+| The same `DNS_ASSIGN` again | No |
+| A `PREF64`-only update | No |
+| Search domains changing | No — parsed and preserved, but endpoint-local resolution does not apply them |
+| A route change making a resolver unreachable | Yes |
+| Losing the TCP route, even with UDP addresses unchanged | Yes — a truncated answer must retry over TCP |
+
+The key is per **configuration**, not per assignment: a lookup is already bound to one configuration
+by the time a query runs, so an unrelated configuration changing must not discard that
+configuration's answers. TTL handling, caching, negative caching, singleflight and optimistic
+caching remain the sing-box DNS client's responsibility; this layer does not reimplement them, and
+the bootstrap recovery state is not a DNS cache.
+
+Immutability is load-bearing: a single lookup issues an A and an AAAA query concurrently, so if the
+transport read the assignment per query, a capsule arriving mid-lookup could answer IPv4 from one
+assignment and IPv6 from the next.
+
+### Ownership
+
+No layer needs a reference count, retirement queue or delayed cleanup, because nothing that owns a
+resource is replaceable state. The assignment snapshot owns no socket, goroutine or `Close`, so
+replacing it is a single pointer store and an in-flight lookup keeps using the value it captured.
+`pref64Store` is separate from DNS state and cannot affect an answer or a transport. Plain DNS is
+delegated to the native UDP transport, pointed at the MASQUE device, used for one exchange and then
+closed, so there is one implementation of the protocol rather than two that could drift.
+
+The TCP-retry dialer is constrained to the protocols advertised for **that one address**, taken from
+`ROUTE_ADVERTISEMENT` — per address, not per resolver, so an address without an advertised TCP route
+cannot inherit permission from a sibling. Without that, a UDP-only route would produce TCP traffic
+the server never said it routes, and the caller would see a timeout resembling packet loss.
+
+DoH wire rules: requests carry DNS ID 0 on a **copy** of the wire bytes so the caller's message is
+never mutated, and the caller's ID is restored on the reply. Any 2xx is success, not only 200. The
+response media type is validated by MIME parsing (an absent header is tolerated); an HTML error page
+is reported as a media-type mismatch rather than a corrupt DNS message. Responses are bounded, with
+one byte read past the ceiling so an oversized message is reported as oversized.
+
+Policy rules: ownership is decided **without reference to usability**, because handing a claimed
+name to a public resolver when the internal one is unreachable would leak an internal name at
+exactly the moment the internal path is broken. Selection is longest-match on internal domains,
+on a label boundary, case- and root-dot-insensitive. An empty list claims nothing; the root claim is
+the single empty-string entry.
+
+### Limitations
+
+- Endpoint-local only: no global OS or VPN DNS integration.
+- Search domains are preserved, not applied.
+- Claims before the first `DNS_ASSIGN` are unknowable — the protocol has no capsule announcing one
+  is coming, so until it arrives every name is unclaimed. A name resolved a moment before a claiming
+  assignment is a leak this implementation cannot prevent, and no timer or readiness gate pretends
+  otherwise.
+- PREF64 is state only; there is no DNS64 synthesis.
+- DoT and DoQ are recognised and refused, never silently substituted.
+- No same-connection DoH over HTTP/2: a resolver offering only `h2` with `no-default-alpn` is
+  incompatible; with the default transport permitted it uses plain DNS.
+- No ECH, and no cross-origin HTTP/3 coalescing.
+- Only the strict `dohpath` subset above is accepted.
+
+## MTU / PTB
+
+Packet Too Big handling belongs to `transport/masque`. An oversized datagram is rejected in the
+session that owns it. A historical experiment that lowered a learned DATAGRAM ceiling permanently
+after one oversized packet was *REJECT*ed: the underlying effective limit can rise again, so a
+one-way ratchet turns a recoverable path into a permanent refusal.
+
+## Security / masquerade boundary
+
+Masquerade is a deployment feature of the HTTP inbound, documented in
+[the server document](JIEJIE-SERVER.md). It changes only the response to requests that fail
+authentication; the authenticated data plane is unmodified.
+
+**It does not make the protocol undetectable.** QUIC, HTTP/3 SETTINGS, `H3_DATAGRAM` and Extended
+CONNECT remain observable on the wire. A `429` decoy is not claimed to be path-indistinguishable.
+
+## Verification
+
+| Area | Evidence |
+| --- | --- |
+| CONNECT remains writable and bidirectional after 200 | `client_h3_connect_lifecycle_test.go` against a real quic-go HTTP/3 server |
+| Tunnel and DoH share one connection | `client_h3_same_conn_test.go` |
+| Stream cancellation is stream-local; faults stay visible | `stream_error_class_test.go` |
+| Stale connection eviction, replacement isolation, reconnect coalescing | `client_h3_stale_conn_test.go` |
+| H3 DATAGRAM with capsule fallback, IPv6 assignment | `test/jiejie/reference/connect_ip_ipv6_test.go` |
+| Non-zero DATAGRAM context IDs | `test/jiejie/reference/context_id_test.go` |
+| Packet Too Big attribution | `connect_ip_ptb_live_test.go`, `packet_too_big_test.go` |
+| Owned datagram ownership | `owned_datagram_ownership_test.go` |
+| QUICHE protocol vectors | `quiche_oracle_test.go` |
+
+## Remaining NOT PROVEN
+
+These are evidence gaps, not confirmed defects. Nothing was changed because of them: no timeout was
+raised, no speculative retry was added, and the connection cache was not rewritten.
+
+- **Timeout pattern of ~1.84 s followed by ~30 s.** It could not be reproduced, and the available
+  logs could not distinguish a second failure on one connection from a redial. Generation and cache
+  decision tracing was added so it becomes answerable; the mechanism itself remains unproven.
+- **Live IPv6 H3 Packet Too Big.** Existing ICMPv6 shape tests and the IPv4 live H3 PTB test do not
+  substitute for it.
+- **Google QUICHE live MASQUE tunnel interop.** Only protocol vectors are checked; the live harness
+  was removed. Vector agreement is not live interoperability.
+- **Real WAN PMTU, fragment blackholes, mobile handover and CGNAT behaviour.** Local and CI tunnel
+  tests do not establish these.
+- **Long-running VPS stability and production concurrency limits.**
+- **NAT rebinding / QUIC path migration.** The cache is proven to key on connection liveness rather
+  than an address tuple, and a live connection is not mistaken for a replacement, but this is
+  simulated at the lifecycle level. No wire-level migration was performed.
+- **Bootstrap winner subsequently going idle.** The narrow window is covered through concurrent
+  acquires; the candidate-racing hook itself is not exercised.
+- **Whether a connection-level retry after an OpenStream failure is worthwhile.** Deliberately not
+  implemented.
