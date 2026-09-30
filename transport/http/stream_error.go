@@ -31,9 +31,35 @@ import (
 // Only unambiguously normal conditions are translated. Anything that could
 // indicate a real fault is returned unchanged so it still reaches the logs as an
 // ERROR.
+//
+// # The closed-ness check must come AFTER the quic-go types, not before
+//
+// quic-go's TransportError implements Unwrap() returning net.ErrClosed. That is convenient for
+// callers who only want "is this connection finished", but it means a genuine transport fault --
+// PROTOCOL_VIOLATION, FRAME_ENCODING_ERROR, a flow-control violation -- reports as closed.
+//
+// E.IsClosedOrCanceled consults net.ErrClosed, so a transport fault used to satisfy this
+// function's early exit and be handed back untouched; route/conn.go then applied the SAME test
+// and classified a protocol violation as an ordinary teardown, erasing it from the logs.
+//
+// The concrete quic-go types are therefore examined first, exactly as classifyH3Error does, and
+// only a fault-free error may reach the closed-ness shortcut.
 func normalizeStreamError(err error) error {
 	if err == nil {
 		return nil
+	}
+	// A transport-level error is a fault unless its code is the no-error code used for an
+	// orderly close. This must be decided BEFORE any net.ErrClosed test, because TransportError
+	// unwraps to net.ErrClosed regardless of how serious it is.
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		if transportErr.ErrorCode == quic.TransportErrorCode(0) {
+			return net.ErrClosed
+		}
+		// A real transport fault. It is NOT enough to return it unchanged: TransportError's
+		// Unwrap reports net.ErrClosed, and the outer quic-go wrapper forwards that, so the
+		// routing layer's closed-ness test would still silence it. See visibleFault.
+		return asVisibleFault(err)
 	}
 	// Already a recognised sentinel: leave it alone.
 	if E.IsClosedOrCanceled(err) {
@@ -42,11 +68,6 @@ func normalizeStreamError(err error) error {
 	var h3Err *http3.Error
 	if errors.As(err, &h3Err) {
 		switch h3Err.ErrorCode {
-		case http3.ErrCodeNoError, // orderly close
-			http3.ErrCodeRequestCanceled,   // the peer abandoned the request
-			http3.ErrCodeRequestIncomplete, // the peer went away mid-request
-			http3.ErrCodeRequestRejected:   // the peer declined to serve it
-			return net.ErrClosed
 		case 0:
 			// A zero code means "no QUIC-level error": the tunnel simply ended.
 			// quic-go surfaces this as an *http3.Error with ErrorCode 0, which
@@ -56,6 +77,11 @@ func normalizeStreamError(err error) error {
 			// why an earlier attempt at this fix matched nothing.
 			return net.ErrClosed
 		}
+		// Delegate to the shared table so the expected/unexpected split cannot drift
+		// between this client-side normalizer and the server-side classifier.
+		if classifyH3ErrorCode(h3Err.ErrorCode) == h3ErrorExpected {
+			return net.ErrClosed
+		}
 		// Every other HTTP/3 code (protocol violations, frame and settings
 		// errors, QPACK failures, internal errors) is a real fault and is
 		// deliberately passed through unchanged.
@@ -63,15 +89,80 @@ func normalizeStreamError(err error) error {
 	}
 	var streamErr *quic.StreamError
 	if errors.As(err, &streamErr) {
-		if streamErr.ErrorCode == 0 {
+		// A stream reset is decided by the SAME code table the server side uses, so a
+		// single definition of "expected" covers both directions.
+		//
+		// Matching only code 0 here was the bug: a peer cancelling a request sends
+		// H3_REQUEST_CANCELLED (0x10c = 268), which quic-go reports as
+		// *quic.StreamError{Remote: true, ErrorCode: 268} and formats as
+		//
+		//	stream 184 canceled by remote with error code 268
+		//
+		// That is a stream-local cancellation, not a connection fault, but it fell
+		// through this branch and was logged at ERROR by route/conn.go. The numeric
+		// literal is deliberately not repeated here: classifyH3ErrorCode owns it.
+		if classifyH3ErrorCode(http3.ErrCode(streamErr.ErrorCode)) == h3ErrorExpected {
 			return net.ErrClosed
 		}
-		return err
+		return asVisibleFault(err)
 	}
 	if errors.Is(err, io.EOF) {
 		return io.EOF
 	}
-	return err
+	// An unclassifiable error is a fault. It must not carry a spurious net.ErrClosed
+	// in its chain, or the routing layer will silence it.
+	return asVisibleFault(err)
+}
+
+// visibleFault reports a genuine fault while hiding any misleading net.ErrClosed in the chain.
+//
+// # Why a wrapper is needed at all
+//
+// quic-go's TransportError.Unwrap() returns net.ErrClosed whatever the error code is. That makes
+// "the connection finished" indistinguishable from "the peer violated the protocol" to anything
+// testing for closed-ness -- and route/conn.go decides the log level with exactly such a test:
+//
+//	if !E.IsClosedOrCanceled(err) {
+//	    m.logger.ErrorContext(ctx, "connection upload closed: ", err)
+//	}
+//
+// Returning the raw fault therefore does NOT get it logged: E.IsClosedOrCanceled sees the
+// TransportError's net.ErrClosed and calls a PROTOCOL_VIOLATION an ordinary teardown, so it
+// disappears from the logs.
+//
+// This type keeps the message and the original condition -- Unwrap is deliberately NOT
+// implemented, so errors.Is/As cannot reach the misleading sentinel -- while exposing Cause for
+// callers that want the underlying error.
+type visibleFault struct {
+	err error
+}
+
+func (f *visibleFault) Error() string {
+	return f.err.Error()
+}
+
+// Is reports matching only against another visibleFault, so a fault never satisfies
+// errors.Is(err, net.ErrClosed).
+func (f *visibleFault) Is(target error) bool {
+	other, isVisibleFault := target.(*visibleFault)
+	return isVisibleFault && f.err.Error() == other.err.Error()
+}
+
+// Cause exposes the underlying failure for diagnostics without making it reachable through
+// errors.Is/errors.As.
+func (f *visibleFault) Cause() error {
+	return f.err
+}
+
+func asVisibleFault(err error) error {
+	if err == nil {
+		return nil
+	}
+	var already *visibleFault
+	if errors.As(err, &already) {
+		return err
+	}
+	return &visibleFault{err: err}
 }
 
 // normalizingConn applies error normalization at the outermost connection
