@@ -18,7 +18,7 @@
 # For each module:
 #
 #   go mod tidy -diff                 go.mod/go.sum are complete and canonical
-#   go list -mod=readonly -m all      the whole module graph resolves read-only
+#   go list -mod=readonly -m all      the whole module graph resolves without modifying go.mod/go.sum
 #   go mod verify                     (--verify) downloaded cache content matches go.sum
 #
 # `-diff` is used instead of plain `tidy` on purpose: this script must never modify the
@@ -30,6 +30,19 @@
 # The default run discovers every module and checks its metadata with `tidy -diff` and
 # read-only graph resolution. `--verify` additionally checks downloaded module cache
 # content against go.sum for every checked module; it is left to the deep run.
+#
+# Measured warm on this repository:
+#
+#   default run (tidy -diff + list, all modules)   ~0.5s
+#   bare `go mod verify`, all modules summed        ~9s   (4.0 + 4.6 + 0.4)
+#   full run with --verify                          ~11s
+#
+# `go mod verify` re-hashes every module in the cache, which is where essentially all of the
+# time goes; the surrounding checks are cheap.
+#
+# Note the distinction when quoting timings: ~11s is the cost of a full --verify RUN
+# (tidy + verify + list + parity), not the cost of `go mod verify` in isolation (~9s here).
+# Measure the bare command separately if that is the number wanted.
 #
 # # Fork replace parity
 #
@@ -150,18 +163,45 @@ for module in "${ALL_MODULES[@]}"; do
 done
 echo
 
-# A nested module must never disappear from the checked set by accident. If a caller
-# declares a module required, it has to actually be in range.
+# A nested module must never disappear from the checked set by accident. If a caller declares
+# a module required, it must actually have been CHECKED -- not merely discovered.
+#
+# Testing membership in ALL_MODULES is not enough and produced a false green:
+#
+#   --exclude test --require-checked test
+#
+# found `test` among the discovered modules, reported success, and never ran a single
+# integrity check against it. The requirement is about what was checked, so it is evaluated
+# against CHECKED_MODULES, and the two failure modes are reported distinctly:
+#
+#   not discovered at all  -> the module was renamed or removed
+#   discovered but excluded -> the exclusion and the requirement contradict each other
 for required in "${REQUIRE_CHECKED[@]:-}"; do
     [ -n "$required" ] || continue
-    found=0
+
+    required_discovered=0
     for module in "${ALL_MODULES[@]}"; do
-        [ "$module" = "$required" ] && found=1
+        [ "$module" = "$required" ] && required_discovered=1
     done
-    if [ "$found" -eq 0 ]; then
+
+    if [ "$required_discovered" -eq 0 ]; then
         fail "required module '$required' was not discovered; it may have been renamed or removed"
+        continue
     fi
+
+    required_checked=0
+    for module in "${CHECKED_MODULES[@]}"; do
+        [ "$module" = "$required" ] && required_checked=1
+    done
+
+    if [ "$required_checked" -eq 0 ]; then
+        fail "required module '$required' was discovered but excluded, so it was NOT checked;"$'\n'"        remove it from --exclude or drop the --require-checked requirement"
+        continue
+    fi
+
+    echo "required module '${required}': checked"
 done
+echo
 
 # ---------------------------------------------------------------------------
 # 2. Per-module integrity
@@ -218,7 +258,12 @@ for module in "${CHECKED_MODULES[@]}"; do
         fi
     fi
 
-    # The entire module graph must resolve without network or edits.
+    # The entire module graph must resolve without modifying go.mod or go.sum.
+    #
+    # This is NOT an offline check. -mod=readonly guarantees the module files are left
+    # untouched, but on a cold cache it may still download modules to satisfy the graph.
+    # Nothing here forces offline resolution (no GOPROXY=off), so do not describe it as
+    # network-free.
     if ! (cd "$dir" && GOWORK=off go list -mod=readonly -m all >/dev/null 2>&1); then
         fail "${label}: go list -mod=readonly -m all failed; module graph does not resolve read-only"
     else
