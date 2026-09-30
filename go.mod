@@ -204,7 +204,7 @@ require (
 // Adds WriteOwnedBuffer (the cached first-payload handoff) and the byteformats overflow
 // rejection. Rebased onto upstream/dev: only the local patches are applied, and the six
 // upstream commits that had been cherry-picked are now inherited from upstream itself.
-replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260929232022-d2e71709a76b
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260930000459-0428bc73b0df
 
 // Adds async read/write buffer pinning (correctness: the native side retains the pointer
 // until its completion callback) and the EarlyCopyBufferGrowth capability the upload copy
