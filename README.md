@@ -1,46 +1,37 @@
 # sing-box
 
-A fork of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) maintained for one private
-deployment, built from a single `testing` source tree.
+**平台：** macOS arm64 · Linux amd64
 
-## Products
+同一份 `testing` 源码树构建两个产品，靠 build tags 与 registry 区分能力，不复制协议实现。
 
-Two product binaries are built from this tree, with distinct build tags and registries:
+## [Fork 差异](docs/FORK-DIFF.md)
 
-| Product | Target | Purpose |
-| --- | --- | --- |
-| Linux Server Minimal | `linux/amd64`, CGO disabled | The production server: MASQUE H2/H3 front door, AnyTLS, Native Naive, ShadowTLS v3 + SS2022, residential SOCKS exit. |
-| macOS Client | `darwin/arm64`, CGO enabled | A headless-first CLI core for Apple Silicon: TUN and mixed inbounds, the Cronet-backed Naive outbound, MASQUE client, and the native API with its Web Dashboard. |
+当前相对 upstream 仍然存在的差异：MASQUE、AnyTLS fallback、Native Naive、HTTP 资源控制、两端 registry、生产拓扑契约与定制依赖。
 
-Both come from the same protocol implementations; the profiles select capabilities, not separate
-copies. See [build profiles](docs/BUILD-PROFILES.md).
+## [构建配置](docs/BUILD-PROFILES.md)
 
-## Current fork capabilities
+一个源码树如何产出两种产品：平台、CGO、build tags、registry、workflow 与能力边界。
 
-- **MASQUE** — authenticated HTTP CONNECT and CONNECT-UDP over H2/H3, with a masquerade path for
-  unauthenticated probes, plus the CONNECT-IP endpoint with DNS_ASSIGN and PREF64.
-- **Native Naive** — a NaiveProxy server inbound in the minimal server registry, with UoT, padding,
-  masquerade and pre-authentication resource controls.
-- **AnyTLS fallback** — default and ALPN-specific fallback destinations after TLS termination.
-- **ShadowTLS v3 + SS2022** — the production TLS-camouflage chain.
-- **Residential SOCKS chain** — IPv4-only resolution on the server followed by a pooled SOCKS5 exit.
-- **Server pruning and registry control** — explicit per-product registries; the minimal server
-  carries no endpoints, services or client-only protocols.
-- **Native API and macOS client pruning** — the macOS registry is an audited allowlist, and the
-  Clash compatibility API is absent from both products.
+## [服务端](docs/JIEJIE-SERVER.md)
 
-## Documentation
+Linux amd64 Server Minimal 的产品能力与生产部署契约：TCP/443 前门、UDP/443 H3、loopback 后端、AnyTLS fallback、masquerade 与 residential 链路。
 
-| Document | Covers |
-| --- | --- |
-| [Fork diff](docs/FORK-DIFF.md) | What this fork changes relative to upstream. |
-| [Build profiles](docs/BUILD-PROFILES.md) | How one tree produces the two product binaries. |
-| [Linux server](docs/JIEJIE-SERVER.md) | The server product and its production deployment contract. |
-| [macOS client](docs/JIEJIE-MACOS-CLIENT.md) | The macOS product, usage and verification. |
-| [MASQUE](docs/masque.md) | The current MASQUE implementation and its boundaries. |
-| [Native Naive](docs/naive.md) | The current Naive implementation and its boundaries. |
-| [Engineering notes](docs/ENGINEERING-NOTES.md) | Design decisions that must not be changed casually, and open evidence gaps. |
+## [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md)
 
-Configuration fields are documented under [`docs/configuration/`](docs/configuration/index.md).
-The machine-readable production topology contract is
-[`release/jiejie-production-topology.json`](release/jiejie-production-topology.json).
+macOS arm64 客户端包含什么、不包含什么，以及无头运行、Native API 与验证方式。
+
+## [MASQUE](docs/masque.md)
+
+当前 MASQUE 实现：L4 CONNECT / CONNECT-UDP 与 CONNECT-IP endpoint 两条不同的能力路径，H3 生命周期与错误分类，DATAGRAM 所有权，DNS_ASSIGN 与 PREF64。
+
+## [Native Naive](docs/naive.md)
+
+当前 Native Naive 实现：服务端 inbound 与 macOS Cronet outbound、UoT、padding、masquerade、资源控制，以及目标访问控制边界。
+
+## [工程笔记](docs/ENGINEERING-NOTES.md)
+
+记录当前仍有效的架构决策、正确性不变式、性能取舍与尚未闭环的验证边界。
+
+---
+
+配置字段见 `docs/configuration/`；生产拓扑机器可读契约见 `release/jiejie-production-topology.json`。
