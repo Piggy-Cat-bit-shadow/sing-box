@@ -1,7 +1,7 @@
 # Native NaiveProxy server
 
-This document describes running the Naive inbound in this fork as a standalone
-NaiveProxy server, including the UoT (UDP over TCP) extension, without Caddy.
+This document describes the production Native Naive inbound in the Linux server
+minimal build, including the UoT (UDP over TCP) extension, without Caddy.
 
 ## What this is, and what it is not
 
@@ -46,7 +46,7 @@ no `UDP/443` allocation; that port remains available for MASQUE HTTP/3.
   "type": "naive",
   "tag": "naive-in",
   "listen": "127.0.0.1",
-  "listen_port": 28545,
+  "listen_port": 28438,
   "network": "tcp",
   "users": [
     {
@@ -186,8 +186,7 @@ in flight toward this server. They are not the client's
 
 A finished UoT session releases its resources. This fork's tests assert that
 finished sessions do not accumulate goroutines or sockets, including after abrupt
-client disconnects, because the Caddy fork this replaces was patched for exactly
-that leak. An active session legitimately holds resources; the requirement is that
+client disconnects. An active session legitimately holds resources; the requirement is that
 **finished** ones do not.
 
 ## Verifying a deployment
@@ -199,7 +198,7 @@ TAGS="with_quic,badlinkname,tfogo_checklinkname0,with_naive_outbound"
 go test -tags "$TAGS" ./protocol/naive/
 
 # Wire-level TCP, UoT, masquerade and lifecycle tests.
-# NOTE: these need the FULL registry; do NOT add jiejie_server_minimal, which
-# deliberately does not register the Naive inbound.
+# This command uses the full registry; the production minimal registry also
+# registers the Native Naive inbound. The server does not link Cronet outbound.
 (cd test && go test -tags "$TAGS" -run 'TestJiejieNaive' ./jiejie/)
 ```

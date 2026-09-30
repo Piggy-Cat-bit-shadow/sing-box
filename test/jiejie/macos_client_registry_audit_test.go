@@ -122,7 +122,7 @@ func TestClientMacOSOutboundRegistryResolves(t *testing.T) {
 
 	// The production allowlist. Each entry is used by the real configuration on
 	// this machine, or is a routing primitive that configuration depends on; see
-	// docs/MACOS_REQUIRED_CAPABILITIES.md for the derivation.
+	// docs/JIEJIE-MACOS-CLIENT.md and the client registry for the contract.
 	requireTypesPresent(t, "outbound", types, []string{
 		// routing primitives
 		"direct",
