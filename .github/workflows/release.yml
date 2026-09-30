@@ -1,0 +1,213 @@
+name: Release
+
+# Publishes a GitHub Release for a version tag, attaching the binaries that CI
+# already BUILT AND VERIFIED for that commit.
+#
+# # Why this does not build anything
+#
+# A release must not ship a binary that no gate has seen. The Linux and macOS
+# workflows run the full verification set - focused tests, the production registry
+# and topology contracts, capability verification, the runtime smoke, and the Clash
+# API probe - against the artifact they upload. This workflow therefore DOWNLOADS
+# those artifacts rather than recompiling: the bytes attached to the release are the
+# bytes that passed.
+#
+# It also means the release cannot drift from what CI measured. A rebuild here could
+# differ (a dependency resolution, a toolchain patch) and nothing would have checked
+# the difference.
+#
+# # Why it waits
+#
+# The tag is usually pushed right after the branch, so the CI runs for the tagged
+# commit may still be in flight. The first step polls until both have completed and
+# fails if either is not a success, which keeps "released" and "green" the same
+# statement.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1)'
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: resolve tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v*) ;;
+            *) echo "FAIL: tag must start with 'v', got '$tag'" >&2; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved tag: $tag"
+
+      - name: check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: wait for the CI runs for this commit
+        id: ci
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "commit: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          # The two product workflows must both exist for this commit and both
+          # succeed. Waiting here rather than relying on the tag push to trigger them
+          # is deliberate: a tag does not re-run a branch workflow, so the runs may
+          # already be finished - or still be going.
+          deadline=$(( $(date +%s) + 5400 ))
+          while :; do
+            line="$(gh run list --limit 60 --json headSha,name,status,conclusion \
+              --jq "[.[] | select(.headSha == \"$sha\")] | map(select(.name == \"Linux amd64\" or .name == \"macOS arm64\")) | \"\\(length) \\(map(.status) | join(\",\")) \\(map(.conclusion) | join(\",\"))\"" \
+              2>/dev/null || echo "")"
+            echo "  runs: ${line:-<query failed>}"
+            count="$(printf '%s' "$line" | awk '{print $1}')"
+            statuses="$(printf '%s' "$line" | awk '{print $2}')"
+            if [ "${count:-0}" = "2" ] && [ "$statuses" = "completed,completed" ]; then
+              conclusions="$(printf '%s' "$line" | awk '{print $3}')"
+              if [ "$conclusions" != "success,success" ]; then
+                echo "FAIL: CI did not pass for $sha (conclusions: $conclusions)" >&2
+                gh run list --limit 60 --json headSha,name,conclusion,url \
+                  --jq ".[] | select(.headSha == \"$sha\") | \"  \\(.name): \\(.conclusion) \\(.url)\"" >&2
+                exit 1
+              fi
+              echo "PASS: Linux amd64 and macOS arm64 both succeeded for $sha"
+              break
+            fi
+            if [ "$(date +%s)" -gt "$deadline" ]; then
+              echo "FAIL: CI runs for $sha did not complete within 90 minutes" >&2
+              exit 1
+            fi
+            sleep 30
+          done
+
+          gh run list --limit 60 --json headSha,name,conclusion,url \
+            --jq ".[] | select(.headSha == \"$sha\") | \"  \\(.name): \\(.conclusion) \\(.url)\""
+
+      - name: download the verified artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="${{ steps.ci.outputs.sha }}"
+          mkdir -p release-assets
+
+          # Download from the runs for the tagged commit specifically, so a stale
+          # artifact from an earlier commit cannot be published by accident.
+          count=0
+          while IFS=$'\t' read -r run_id run_name; do
+            [ -n "$run_id" ] || continue
+            echo "downloading artifacts from $run_name (run $run_id)"
+            gh run download "$run_id" --dir release-assets || true
+            count=$((count + 1))
+          done < <(gh run list --limit 60 --json headSha,databaseId,name \
+            --jq ".[] | select(.headSha == \"$sha\") | select(.name == \"Linux amd64\" or .name == \"macOS arm64\") | \"\(.databaseId)\t\(.name)\"")
+
+          if [ "$count" -eq 0 ]; then
+            echo "FAIL: no CI runs found to download from" >&2
+            exit 1
+          fi
+
+          echo "downloaded tree:"
+          find release-assets -type f | sort
+
+          # Both products must be present, or the release would be incomplete.
+          for expected in sing-box-linux-amd64 sing-box-darwin-arm64; do
+            if ! find release-assets -type f -name "$expected" | grep -q .; then
+              echo "FAIL: expected artifact '$expected' was not found in the downloaded runs" >&2
+              exit 1
+            fi
+          done
+          echo "PASS: both product binaries are present"
+
+      - name: verify the SHA256 files match the binaries
+        run: |
+          set -euo pipefail
+          # The .sha256 beside each binary is what the operator will verify against,
+          # so it is checked here rather than trusted. A mismatch means the release
+          # notes and the download would disagree.
+          checked=0
+          while IFS= read -r sumfile; do
+            dir="$(dirname "$sumfile")"
+            echo "verifying $sumfile"
+            ( cd "$dir" && sha256sum -c "$(basename "$sumfile")" )
+            checked=$((checked + 1))
+          done < <(find release-assets -type f -name '*.sha256' | sort)
+          if [ "$checked" -eq 0 ]; then
+            echo "FAIL: no .sha256 files were found to verify" >&2
+            exit 1
+          fi
+          echo "PASS: $checked SHA256 file(s) verified against the published binaries"
+
+      - name: flatten the release assets
+        run: |
+          set -euo pipefail
+          # Each product artifact is a directory of small files. The release attaches
+          # the files directly, prefixed by platform so the two binaries cannot
+          # collide and a downloader sees which is which without opening BUILD-INFO.
+          mkdir -p upload
+          while IFS= read -r binary; do
+            base="$(basename "$binary")"
+            dir="$(dirname "$binary")"
+            case "$base" in
+              sing-box-linux-amd64) prefix="jiejie-sing-box-linux-amd64-${TAG}" ;;
+              sing-box-darwin-arm64) prefix="jiejie-sing-box-macos-arm64-${TAG}" ;;
+              *) continue ;;
+            esac
+            # The archive name carries the tag, so a downloaded file identifies its
+            # release without opening the notes.
+            tar -C "$dir" -czf "upload/${prefix}.tar.gz" .
+            echo "packaged upload/${prefix}.tar.gz"
+          done < <(find release-assets -type f \( -name sing-box-linux-amd64 -o -name sing-box-darwin-arm64 \) | sort)
+
+          # A flat checksum manifest over the tarballs, so one file verifies the whole
+          # release.
+          ( cd upload && sha256sum ./*.tar.gz > SHA256SUMS )
+
+          echo "release assets:"
+          ls -la upload
+          cat upload/SHA256SUMS
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          sha="${{ steps.ci.outputs.sha }}"
+
+          # Deliberately NOT --prerelease and NOT --draft: v0.1 is the first stable
+          # release of this fork.
+          gh release create "$tag" \
+            --title "$tag" \
+            --target "$sha" \
+            --notes-file .github/RELEASE_NOTES.md \
+            upload/*.tar.gz upload/SHA256SUMS
+
+          echo "PASS: release $tag created"
+          gh release view "$tag" --json url,isDraft,isPrerelease,tagName,assets \
+            --jq '"url: \(.url)\nisDraft: \(.isDraft)\nisPrerelease: \(.isPrerelease)\ntag: \(.tagName)\nassets:\n\(.assets[] | "  \(.name)  \(.size) bytes")"'
