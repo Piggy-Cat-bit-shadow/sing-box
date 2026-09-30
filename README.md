@@ -2,36 +2,34 @@
 
 **平台：** macOS arm64 · Linux amd64
 
-同一份 `testing` 源码树构建两个产品，靠 build tags 与 registry 区分能力，不复制协议实现。
+## [Pruning](docs/commits/pruning.md)
 
-## [Fork 差异](docs/FORK-DIFF.md)
+精简服务端与 macOS 客户端的构建标签、注册表和链接内容，保留各自实际使用的协议能力。
 
-当前相对 upstream 仍然存在的差异：MASQUE、AnyTLS fallback、Native Naive、HTTP 资源控制、两端 registry、生产拓扑契约与定制依赖。
+## [MASQUE](docs/commits/masque.md)
 
-## [构建配置](docs/BUILD-PROFILES.md)
+优化 CONNECT-IP、CONNECT-UDP、HTTP/3 DATAGRAM、缓冲区所有权和隧道生命周期。
 
-一个源码树如何产出两种产品：平台、CGO、build tags、registry、workflow 与能力边界。
+## [Naive](docs/commits/naive.md)
 
-## [服务端](docs/JIEJIE-SERVER.md)
+实现 Native Naive 服务端与 Cronet 客户端，并修正 UoT、封装、伪装和资源控制。
 
-Linux amd64 Server Minimal 的产品能力与生产部署契约：TCP/443 前门、UDP/443 H3、loopback 后端、AnyTLS fallback、masquerade 与 residential 链路。
+## [SOCKS5 出站](docs/commits/socks5-outbound.md)
 
-## [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md)
+增加默认关闭的 TCP 预连接与复制缓冲区调优，改善链式转发路径。
 
-macOS arm64 客户端包含什么、不包含什么，以及无头运行、Native API 与验证方式。
+## [Shadowsocks](docs/commits/shadowsocks.md)
 
-## [MASQUE](docs/masque.md)
+调整首包与稳态传输的缓冲区布局，减少封装过程中的拷贝。
 
-当前 MASQUE 实现：L4 CONNECT / CONNECT-UDP 与 CONNECT-IP endpoint 两条不同的能力路径，H3 生命周期与错误分类，DATAGRAM 所有权，DNS_ASSIGN 与 PREF64。
+## [DNS](docs/commits/dns.md)
 
-## [Native Naive](docs/naive.md)
+明确目标解析边界，修复解析策略混用并优化查询路径。
 
-当前 Native Naive 实现：服务端 inbound 与 macOS Cronet outbound、UoT、padding、masquerade、资源控制，以及目标访问控制边界。
+## [Other](docs/commits/other.md)
 
-## [工程笔记](docs/ENGINEERING-NOTES.md)
-
-记录当前仍有效的架构决策、正确性不变式、性能取舍与尚未闭环的验证边界。
+收录公共缓冲区、跨协议修复、构建、CI、测试与发布维护。
 
 ---
 
-配置字段见 `docs/configuration/`；生产拓扑机器可读契约见 `release/jiejie-production-topology.json`。
+当前架构与使用说明：[构建配置](docs/BUILD-PROFILES.md) · [服务端](docs/JIEJIE-SERVER.md) · [macOS 客户端](docs/JIEJIE-MACOS-CLIENT.md) · [工程笔记](docs/ENGINEERING-NOTES.md)
