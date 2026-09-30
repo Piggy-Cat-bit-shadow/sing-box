@@ -133,7 +133,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-          cache-dependency-path: go.sum
+          # Every sum file the fast path reads, not just the root one. The nested
+          # modules are separate and do NOT inherit the root go.sum, so omitting theirs
+          # would make the cache key blind to exactly the files this job now checks.
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
+            test/jiejie/reference/go.sum
 
       - name: gofmt
         run: |
@@ -145,6 +151,16 @@ jobs:
             exit 1
           fi
           echo "PASS: gofmt clean"
+
+      - name: nested Go module integrity
+        # A nested module does not inherit the root module's replaces or go.sum, so a
+        # root-level dependency change can leave it stale while every root check passes.
+        # This runs BEFORE anything compiles the nested module, which is where that used
+        # to be discovered. Modules are discovered dynamically; a new nested go.mod is
+        # checked automatically rather than being silently skipped.
+        #
+        # This is platform-independent, so it lives here only -- not duplicated on macOS.
+        run: ./scripts/ci/check-go-module-integrity.sh
 
       - name: unit tests (production tags)
         # Focused for the same reason as vet: every listed package is one the
