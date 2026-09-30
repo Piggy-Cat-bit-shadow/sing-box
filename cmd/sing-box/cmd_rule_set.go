@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -13,5 +11,4 @@ var commandRuleSet = &cobra.Command{
 
 func init() {
 	mainCommand.AddCommand(commandRuleSet)
-
 }

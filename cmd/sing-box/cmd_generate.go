@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -25,7 +23,6 @@ func init() {
 	commandGenerate.AddCommand(commandGenerateRandom)
 
 	mainCommand.AddCommand(commandGenerate)
-
 }
 
 var (

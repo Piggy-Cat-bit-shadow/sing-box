@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -33,7 +31,6 @@ var commandMerge = &cobra.Command{
 
 func init() {
 	mainCommand.AddCommand(commandMerge)
-
 }
 
 func merge(outputPath string) error {

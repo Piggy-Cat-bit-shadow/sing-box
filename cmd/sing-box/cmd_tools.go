@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -24,7 +22,6 @@ var commandTools = &cobra.Command{
 func init() {
 	commandTools.PersistentFlags().StringVarP(&commandToolsFlagOutbound, "outbound", "o", "", "Use specified tag instead of default outbound")
 	mainCommand.AddCommand(commandTools)
-
 }
 
 func createPreStartedClient() (*box.Box, error) {

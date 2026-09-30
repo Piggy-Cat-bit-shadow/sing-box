@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -32,7 +30,6 @@ var commandSchema = &cobra.Command{
 func init() {
 	commandSchema.Flags().StringVarP(&commandSchemaFlagOutput, "output", "o", "", "write schema to file instead of stdout")
 	mainCommand.AddCommand(commandSchema)
-
 }
 
 func generateSchema() error {

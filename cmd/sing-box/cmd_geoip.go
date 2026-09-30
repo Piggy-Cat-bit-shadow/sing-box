@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -29,7 +27,6 @@ var commandGeoip = &cobra.Command{
 func init() {
 	commandGeoip.PersistentFlags().StringVarP(&commandGeoIPFlagFile, "file", "f", "geoip.db", "geoip file")
 	mainCommand.AddCommand(commandGeoip)
-
 }
 
 func geoipPreRun() error {

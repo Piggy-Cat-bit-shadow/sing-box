@@ -16,8 +16,5 @@ var commandNetnsHolder = &cobra.Command{
 }
 
 func init() {
-	// Withheld from the Jiejie macOS product; see cmd_product_macos.go for why
-	if !productExcludesCommand("netns-holder") {
-		mainCommand.AddCommand(commandNetnsHolder)
-	}
+	mainCommand.AddCommand(commandNetnsHolder)
 }

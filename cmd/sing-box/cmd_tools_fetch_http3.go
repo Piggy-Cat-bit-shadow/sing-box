@@ -1,4 +1,4 @@
-//go:build with_quic && !jiejie_client_macos
+//go:build with_quic
 
 package main
 

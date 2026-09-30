@@ -28,12 +28,6 @@ var (
 var mainCommand = &cobra.Command{
 	Use:              "sing-box",
 	PersistentPreRun: preRun,
-	// Cobra registers a `completion` command automatically. The macOS product
-	// withholds it because nothing in this deployment has an interactive shell to
-	// complete into; every other build keeps it.
-	CompletionOptions: cobra.CompletionOptions{
-		DisableDefaultCmd: productExcludesCommand("completion"),
-	},
 }
 
 func init() {

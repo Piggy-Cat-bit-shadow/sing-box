@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -30,7 +28,6 @@ var commandGeoSite = &cobra.Command{
 func init() {
 	commandGeoSite.PersistentFlags().StringVarP(&commandGeoSiteFlagFile, "file", "f", "geosite.db", "geosite file")
 	mainCommand.AddCommand(commandGeoSite)
-
 }
 
 func geositePreRun() error {

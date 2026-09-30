@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -58,7 +56,6 @@ func init() {
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagURL, "url", "", "API service URL (default: $BOX_API_URL)")
 	commandAPIRoot.PersistentFlags().StringVar(&commandAPIFlagSecret, "secret", "", "API service secret (default: $BOX_API_SECRET)")
 	mainCommand.AddCommand(commandAPI)
-
 }
 
 func runAPI(args []string) error {

@@ -1,5 +1,3 @@
-//go:build !jiejie_client_macos
-
 package main
 
 import (
@@ -32,7 +30,6 @@ var commandFormat = &cobra.Command{
 func init() {
 	commandFormat.Flags().BoolVarP(&commandFormatFlagWrite, "write", "w", false, "write result to (source) file instead of stdout")
 	mainCommand.AddCommand(commandFormat)
-
 }
 
 func format() error {
