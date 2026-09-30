@@ -331,9 +331,13 @@ func (h *httpHandler) serveForward(ctx context.Context, writer http.ResponseWrit
 		if response.StatusCode >= 200 {
 			break
 		}
-		if response.StatusCode == http.StatusSwitchingProtocols {
+		// 927770c29 ("Fix protocol input validation"): an informational 1xx other
+		// than 101, and any status below 100, is not a valid upstream response to
+		// loop on. The fork previously only rejected 101, so a peer answering 0 or
+		// 42 kept this loop spinning.
+		if response.StatusCode < 100 || response.StatusCode == http.StatusSwitchingProtocols {
 			upstream.Close()
-			h.server.logger.ErrorContext(ctx, "process connection from ", source, ": unexpected 101 response")
+			h.server.logger.ErrorContext(ctx, "process connection from ", source, ": unexpected ", response.StatusCode, " response")
 			writer.WriteHeader(http.StatusBadGateway)
 			return
 		}

@@ -39,16 +39,16 @@ type _MASQUEClientEndpointOptions struct {
 	//
 	// Unset preserves the previous behaviour exactly: inner lookups use the normal
 	// DNS router rules with empty query options.
-	InnerDomainResolver    *DomainResolveOptions            `json:"inner_domain_resolver,omitempty"`
-	Path                   string                           `json:"path,omitempty"`
-	Headers                badoption.HTTPHeader             `json:"headers,omitempty"`
-	Version                int                              `json:"version,omitempty" enum:"0,1,2,3"`
-	DisableVersionFallback bool                             `json:"disable_version_fallback,omitempty"`
-	AdvertiseRoutes        badoption.Listable[netip.Prefix] `json:"advertise_routes,omitempty"`
-	UDPTimeout             badoption.Duration               `json:"udp_timeout,omitempty"`
-	OnDemand               bool                             `json:"on_demand,omitempty"`
-	HTTP2Options           HTTP2Options                     `json:"-"`
-	HTTP3Options           QUICOptions                      `json:"-"`
+	InnerDomainResolver    *DomainResolveOptions `json:"inner_domain_resolver,omitempty"`
+	Path                   string                `json:"path,omitempty"`
+	Headers                badoption.HTTPHeader  `json:"headers,omitempty"`
+	Version                int                   `json:"version,omitempty" enum:"0,1,2,3"`
+	DisableVersionFallback bool                  `json:"disable_version_fallback,omitempty"`
+	AdvertiseRoutes        []netip.Prefix        `json:"advertise_routes,omitempty"`
+	UDPTimeout             badoption.Duration    `json:"udp_timeout,omitempty"`
+	OnDemand               bool                  `json:"on_demand,omitempty"`
+	HTTP2Options           HTTP2Options          `json:"-"`
+	HTTP3Options           QUICOptions           `json:"-"`
 }
 
 type MASQUEClientEndpointOptions _MASQUEClientEndpointOptions
@@ -93,7 +93,7 @@ type _MASQUEServerEndpointOptions struct {
 	InboundTLSOptionsContainer
 	Path            string                           `json:"path,omitempty"`
 	Address         badoption.Listable[netip.Prefix] `json:"address"`
-	AdvertiseRoutes badoption.Listable[netip.Prefix] `json:"advertise_routes,omitempty"`
+	AdvertiseRoutes []netip.Prefix                   `json:"advertise_routes,omitempty"`
 	HTTP2Options    HTTP2Options                     `json:"-"`
 	HTTP3Options    QUICOptions                      `json:"-"`
 }
