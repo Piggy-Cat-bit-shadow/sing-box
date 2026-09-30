@@ -67,16 +67,21 @@ It is not recommended to change the default build tag list unless you really kno
 
 !!! note "This fork"
 
-    The Jiejie fork also defines two product tag files,
-    `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL` and
-    `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`. Build those products with
+    The Jiejie fork builds both its products from the upstream tag files above:
+    `release/DEFAULT_BUILD_TAGS` for the macOS client and
+    `release/DEFAULT_BUILD_TAGS_OTHERS` for the Linux server. Build them with
     `scripts/ci/build-server.sh` and `scripts/ci/build-macos-client.sh`, which read
-    the tag file rather than taking a tag list. The macOS client tag set is
-    `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0`;
-    `with_quic` is required there (MASQUE's HTTP/3
-    path respectively). The fork does **not** build the Clash API — the feature was
-    removed, so there is no `with_clash_api` tag to enable, and the Native `api`
-    service is the only management plane.
+    the tag file rather than taking a tag list.
+
+    There is no fork-specific registry or protocol allowlist: both products carry
+    upstream's complete registry, so capabilities upstream adds are inherited
+    automatically.
+
+    The one deviation from the upstream tag files is `with_clash_api`, which is
+    removed because the fork does **not** build the Clash API. That is a
+    control-plane decision rather than a size cut: the Native `api` service is the
+    only management plane, and a configuration using `experimental.clash_api` is
+    rejected as an unknown field rather than silently ignored.
 
 ## :material-wrench: Linker Flags
 

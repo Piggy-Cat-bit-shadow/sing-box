@@ -204,7 +204,7 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 	if common.Contains(n.network, N.NetworkUDP) {
 		// ConfigureHTTP3ListenerFunc is installed by the QUIC support package and
 		// is simply left nil by builds that do not include it. Under the
-		// production tag set (with_quic,jiejie_server_minimal) no file assigns
+		// server profile (release/DEFAULT_BUILD_TAGS_OTHERS) no file assigns
 		// it, so calling it unconditionally panics with a nil dereference the
 		// moment a configuration enables UDP on this inbound.
 		switch decideHTTP3Availability(ConfigureHTTP3ListenerFunc != nil, n.network) {

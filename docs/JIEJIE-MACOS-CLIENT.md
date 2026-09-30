@@ -1,14 +1,20 @@
 # Jiejie macOS Client Edition
 
-The macOS client is a headless-first sing-box CLI core for Apple Silicon (`darwin/arm64`). It shares the `testing` source tree with the Linux server and has its own build tags and registry. launchd can supervise the process; the Native API serves its Web Dashboard. No companion GUI is bundled.
+The macOS client is a headless-first sing-box CLI core for Apple Silicon (`darwin/arm64`). It shares the `testing` source tree with the Linux server and is built from upstream's own Darwin feature profile. launchd can supervise the process; the Native API serves its Web Dashboard. No companion GUI is bundled.
 
 ## Build profile and registry
 
-The canonical tag file is `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`:
+The canonical tag file is `release/DEFAULT_BUILD_TAGS`, which is upstream's Darwin profile:
 
 ```text
-with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0
+with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
 ```
+
+Both products use `include/registry.go`, which is upstream's complete registry. There is no
+fork-specific registry and no capability allowlist: capabilities upstream adds are inherited
+automatically. The only deviation from upstream's tag files is the removal of `with_clash_api`,
+which names no file because the Clash API was removed as a control-plane decision rather than a
+size cut.
 
 `with_quic` enables MASQUE H3. `with_naive_outbound` links the Cronet-backed Naive client and requires CGO. TUN uses the default Go stack; `with_gvisor` is absent. The client is one product, with no Intel or reduced-capability variant.
 
@@ -20,7 +26,7 @@ with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_ch
 | DNS transports | `udp`, `tcp`, `tls`, `https`, `local`, `hosts`, `fakeip`, `quic`, `h3` |
 | Service | native `api` |
 
-The registry is in `include/registry_jiejie_client_macos.go` and its QUIC extension in `include/quic_client_macos.go`. `local` DNS is required for startup fallback even if a configuration does not name it. The client does not register a Native Naive inbound, a MASQUE server endpoint, or Hysteria2/TUIC outbounds. The `http` outbound is retained for MASQUE. Routing and rule-set support remain available; the registry tests check the product allowlist.
+The registry is `include/registry.go` (upstream's), with its QUIC surface in `include/quic.go`. `local` DNS remains available for startup fallback. Routing and rule-set support remain available. Capability presence is verified by `scripts/ci/verify-full-capabilities.sh`, which resolves a minimal valid configuration for every major protocol, DNS transport, endpoint and service through the shipped binary.
 
 ## Control plane and dashboard
 

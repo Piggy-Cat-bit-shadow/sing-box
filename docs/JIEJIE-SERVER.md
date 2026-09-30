@@ -1,7 +1,8 @@
-# Linux Server Minimal
+# Linux Server
 
-The production server is a Linux amd64, CGO-disabled sing-box binary built from `testing` with the
-tags in `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`. Its configuration contract is the
+The production server is a Linux amd64, CGO-disabled sing-box binary built from `testing` with
+upstream's own server feature profile, `release/DEFAULT_BUILD_TAGS_OTHERS`. It carries the complete
+upstream registry; nothing is pruned out of it. Its configuration contract is the
 [production topology](../release/jiejie-production-topology.json); build and CI detail is in
 [build profiles](BUILD-PROFILES.md).
 
@@ -14,12 +15,12 @@ tags in `release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`. Its configuration contract i
 | Native Naive | A NaiveProxy server inbound, including UoT, padding, masquerade and pre-authentication limits. |
 | ShadowTLS v3 + SS2022 | The TLS-camouflage chain; ShadowTLS v3 detours to a Shadowsocks 2022 inbound. |
 | Residential SOCKS | A SOCKS5 outbound that carries residential TCP after the target is resolved to IPv4 on this host. |
-| DNS transports | `udp` and `local` only. `local` is required for startup fallback. |
+| DNS transports | The complete upstream set; `local` remains available for startup fallback. |
 
-The registry is `include/registry_jiejie_server.go`: inbounds `http`, `anytls`, `naive`,
-`shadowtls`, `shadowsocks`; outbounds `direct`, `socks`; no endpoints and no services. Native Naive
-is a production inbound, not a compatibility layer. The server does not register a Naive outbound
-and does not link the client's Cronet stack.
+The registry is `include/registry.go`, which is upstream's complete registry. The server profile
+does not set `with_naive_outbound`, so it does not link the client's Cronet stack; the Naive
+**inbound** is present, because the production topology declares one. Native Naive is a production
+inbound, not a compatibility layer.
 
 ## Production topology
 

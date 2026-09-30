@@ -39,7 +39,7 @@ import (
 //  2. The residential SOCKS5 outbound carries TCP through an authenticated
 //     upstream, which is the only non-direct outbound the production config has.
 //
-// Both are executed under release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL.
+// Both are executed under release/DEFAULT_BUILD_TAGS_OTHERS, the server profile.
 
 // testDNSServer answers one specific name over both UDP and TCP on the same
 // address. The UDP reply is deliberately truncated (TC bit set); the TCP reply

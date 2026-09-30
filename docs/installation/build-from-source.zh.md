@@ -71,17 +71,17 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
 
 !!! note "本 fork"
 
-    Jiejie fork 另外定义了两个产品标签文件：`release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL`
-    与 `release/BUILD_TAGS_JIEJIE_CLIENT_MACOS`。请用 `scripts/ci/build-server.sh` 与
-    `scripts/ci/build-macos-client.sh` 构建这两个产品——它们直接读取标签文件，不需要在
-    命令行传标签列表。macOS 客户端的标签为
-    `with_quic,with_utls,with_naive_outbound,jiejie_client_macos,badlinkname,tfogo_checklinkname0`，
-    其中 `with_quic` 是必需的（对应 MASQUE 的 HTTP/3 路径）；`with_gvisor` 已移除，因为生产配置的 tun 使用默认的 Go 栈，
-    不能当作可选标签删掉。
+    Jiejie fork 的两个产品都直接使用上面的 upstream 标签文件：macOS 客户端用
+    `release/DEFAULT_BUILD_TAGS`，Linux 服务端用 `release/DEFAULT_BUILD_TAGS_OTHERS`。
+    请用 `scripts/ci/build-server.sh` 与 `scripts/ci/build-macos-client.sh` 构建——它们
+    直接读取标签文件，不需要在命令行传标签列表。
 
-    本 fork **不构建** Clash API：该功能已被移除，不存在 `with_clash_api` 标签，配置里的
-    `experimental.clash_api` 会以 unknown field 报错。Native `api` service 是唯一的
-    管理面。
+    本 fork 不再维护专属 registry 或协议白名单：两个产品都携带 upstream 的完整 registry，
+    upstream 新增的协议、endpoint、DNS transport、service 与证书提供者会被自动继承。
+
+    与 upstream 标签文件的唯一差异是去掉了 `with_clash_api`，因为本 fork **不构建**
+    Clash API。这是控制面架构决策而非体积裁剪：Native `api` service 是唯一的管理面，
+    配置里的 `experimental.clash_api` 会以 unknown field 报错，而不是被静默忽略。
 
 ## :material-wrench: 链接器标志
 

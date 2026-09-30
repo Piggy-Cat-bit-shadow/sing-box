@@ -68,7 +68,7 @@ func TestJiejieNaiveH3QUICVersionsMatchTheReference(t *testing.T) {
 	if !http3SupportLinked() {
 		t.Skipf("this build does not link HTTP/3 support (the production tag set " +
 			"omits protocol/naive/quic), so the QUIC version sets cannot be " +
-			"compared. Run under with_quic without jiejie_server_minimal. This is " +
+			"compared. Run under with_quic with the client profile. This is " +
 			"a SKIP, not a pass.")
 	}
 	binary := caddyReferenceBinary(t)

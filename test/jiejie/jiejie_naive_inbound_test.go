@@ -52,24 +52,24 @@ type naiveTestEnv struct {
 //
 // The discriminator is the OUTBOUND, not the inbound, and that distinction matters:
 //
-//   - The Naive INBOUND is now registered by jiejie_server_minimal too, because the
-//     live production configuration declares a `naive` inbound (see AUD-P2-002).
-//     Checking the inbound here therefore no longer distinguishes the two builds.
-//   - The Naive OUTBOUND is still server-irrelevant. protocol/naive/outbound.go
-//     carries its own `with_naive_outbound` build tag, which the production tag set
-//     does not set, so the outbound and the Chromium/Cronet stack behind it stay out
-//     of a server build by design.
+// The discriminator is the OUTBOUND, not the inbound, because the two are gated by
+// different build tags and only one of them is server-relevant:
+//
+//   - The Naive INBOUND is part of every profile; the live production configuration
+//     declares a `naive` inbound (see AUD-P2-002).
+//   - The Naive OUTBOUND carries its own `with_naive_outbound` build tag, which the
+//     server profile (release/DEFAULT_BUILD_TAGS_OTHERS) does not set, so the
+//     outbound and the Chromium/Cronet stack behind it stay out of a server build.
 //
 // These tests drive the full client/server Naive data path and need that outbound.
-// Without this guard they fail under jiejie_server_minimal with a confusing
+// Without this guard they fail under the server profile with a confusing
 // "outbound type not found: naive" that looks like a code defect instead of a
-// build-tag mismatch - which is precisely what happened when the inbound was
-// restored and this guard was still keyed on the inbound.
+// build-tag mismatch.
 func requireFullNaiveRegistry(t *testing.T) {
 	t.Helper()
 	if _, loaded := include.OutboundRegistry().CreateOptions("naive"); !loaded {
-		t.Skip("the naive OUTBOUND is not registered in this build " +
-			"(jiejie_server_minimal); run the Naive tests WITHOUT that tag")
+		t.Skip("the naive OUTBOUND is not registered in this build; it requires " +
+			"with_naive_outbound, which the server profile does not set")
 	}
 }
 

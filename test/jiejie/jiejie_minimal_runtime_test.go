@@ -34,20 +34,18 @@ import (
 
 // Runtime integration for the PRODUCTION MINIMAL registry.
 //
-// Every test in this file must pass under
-// release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL, which registers only:
+// Every test in this file must pass under release/DEFAULT_BUILD_TAGS_OTHERS, the
+// server profile, which carries upstream's complete registry. The capabilities this
+// suite depends on are:
 //
-//	inbounds:  http, anytls, shadowtls, shadowsocks
+//	inbounds:  http, anytls, naive, shadowtls, shadowsocks
 //	outbounds: direct, socks
-//	dns:       udp
-//	services:  none
-//	endpoints: none
+//	dns:       udp, local
 //
-// The tests therefore drive real protocol clients (HTTP/2, quic-go HTTP/3,
-// sing-shadowtls, sing-anytls) rather than an in-process sing-box client, because
-// the minimal registry deliberately registers no socks/mixed inbound. If a test
-// here needs a protocol the production registry does not register, that is a
-// signal it belongs in the client-feature group instead.
+// The tests drive real protocol clients (HTTP/2, quic-go HTTP/3, sing-shadowtls,
+// sing-anytls) rather than an in-process sing-box client, because the production
+// configuration they model does not expose a socks/mixed inbound. That is now a
+// property of the topology being tested rather than of a restricted registry.
 //
 // Fixtures are loopback only, the certificate is generated per test, and the
 // credentials are obvious placeholders. No production secret is involved.

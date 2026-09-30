@@ -2,11 +2,11 @@
 
 **平台：** macOS arm64 · Linux amd64
 
-## [Pruning](docs/commits/pruning.md)
+## [构建与完整功能集](docs/BUILD-PROFILES.md)
 
-Linux 服务端保留 MASQUE、AnyTLS、Native Naive、ShadowTLS v3、Shadowsocks 2022，以及 Direct / SOCKS5 出站。  
-macOS 客户端保留 TUN、Mixed、VLESS、AnyTLS、Naive、Shadowsocks / ShadowTLS、HTTP / MASQUE 与必要的分组能力。  
-移除 VMess、Trojan、Snell、Hysteria2、TUIC、WireGuard、Tailscale、OpenVPN、OpenConnect、SSH、Tor 等未使用协议，以及无关 CLI、Clash API、LXD / launcher RPC 和链接依赖。
+macOS 客户端与 Linux 服务端都采用 upstream 官方的完整 registry 与 build-tag profile，不再维护本 fork 专属的协议白名单。
+upstream 新增协议、endpoint、DNS transport、service 或证书提供者时会被自动继承，无需再手工维护一份 allowlist。
+本 fork 只在 upstream 源码之上维护自己的协议、传输、正确性与性能优化。唯一例外是 Clash API：它因控制面架构决策被移除，而非为缩减体积。
 
 ## [MASQUE](docs/commits/masque.md)
 

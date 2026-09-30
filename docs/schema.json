@@ -3555,6 +3555,9 @@
             "tls": {
               "$ref": "#/$defs/OutboundTLSOptions"
             },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
             "path": {
               "type": "string"
             },
@@ -3621,6 +3624,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -3816,6 +3828,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -6549,6 +6570,20 @@
                 }
               ]
             },
+            "max_header_bytes": {
+              "type": "integer"
+            },
+            "bbr_profile": {
+              "type": "string",
+              "enum": [
+                "conservative",
+                "standard",
+                "aggressive"
+              ]
+            },
+            "unauthenticated_limits": {
+              "$ref": "#/$defs/UnauthenticatedLimitsOptions"
+            },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
             },
@@ -6588,6 +6623,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [
@@ -12093,6 +12137,15 @@
             },
             "disable_path_mtu_discovery": {
               "type": "boolean"
+            },
+            "quic_congestion_control": {
+              "type": "string",
+              "enum": [
+                "default",
+                "cubic",
+                "bbr",
+                "reno"
+              ]
             }
           },
           "required": [

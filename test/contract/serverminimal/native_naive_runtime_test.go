@@ -186,8 +186,6 @@ func buildFixtureInbound(t *testing.T, tag string) adapter.Inbound {
 // "the binary cannot run my configuration" - rather than only at the level the
 // registry reports.
 func TestServerMinimalBuildsNativeNaiveInbound(t *testing.T) {
-	requireJiejieMinimalRegistry(t)
-
 	instance := buildFixtureInbound(t, "naive-in")
 	defer instance.Close()
 
@@ -210,8 +208,6 @@ func TestServerMinimalBuildsNativeNaiveInbound(t *testing.T) {
 // the constructor, so a fixture edit cannot quietly weaken what this profile builds
 // while every other test still passes.
 func TestServerMinimalNativeNaiveInboundKeepsProductionShape(t *testing.T) {
-	requireJiejieMinimalRegistry(t)
-
 	raw := loadFixtureInboundJSON(t, "naive-in")
 
 	var shape struct {
@@ -263,8 +259,6 @@ func TestServerMinimalNativeNaiveInboundKeepsProductionShape(t *testing.T) {
 // receive windows, lifecycle and half-close - remains in protocol/naive and the
 // jiejie suite, which the deep check runs.
 func TestServerMinimalNaiveOptionsCarryForkFeatures(t *testing.T) {
-	requireJiejieMinimalRegistry(t)
-
 	options, loaded := include.InboundRegistry().CreateOptions("naive")
 	require.True(t, loaded)
 

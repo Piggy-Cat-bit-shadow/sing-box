@@ -1,7 +1,25 @@
-# Pruning
+# Pruning（已退役 / Historical）
 
-[当前构建与裁剪模型](../BUILD-PROFILES.md)
+**这套架构已经退役。** 当前构建模型见 [构建与完整功能集](../BUILD-PROFILES.md)。
 
+本 fork 曾维护过一套产品级裁剪体系：专属 registry（`include/registry_jiejie_server.go`、
+`include/registry_jiejie_client_macos.go`）、专属 build-tag 文件、协议白名单，以及一批
+"某协议必须 ABSENT" 的 negative audit。其目标是让 macOS 客户端与 Linux 服务端只携带
+各自需要的协议，从而缩小二进制体积。
+
+该体系已整体移除，原因：
+
+- 它要求每次 upstream 新增协议时都手工更新一份 allowlist，维护成本持续增长；
+- negative audit 只能证明"某能力不在"，无法证明"该在的能力都在"，回归会静默发生；
+- 二进制体积收益不足以抵消上述两点。
+
+现在两个产品都使用 upstream 官方的完整 registry 与 build-tag profile。upstream 新增的
+协议、endpoint、DNS transport、service 与证书提供者会被自动继承。
+
+下表仅作为历史索引保留，其中的 commit 描述的是当时的裁剪工作，**不代表当前架构**。
+
+| Commit | 当时的工作 |
+| --- | --- |
 | Commit | 工作 |
 | --- | --- |
 | [`3cad151`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/3cad15190822825e6159d2cf8845a8481f0a2a51) | 补充第三轮二进制精简的结果，以及仍被链接的符号清单。 |
