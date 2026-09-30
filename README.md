@@ -19,11 +19,12 @@ Outbound payload 改为 ownership-transfer zero-copy，减少 payload copy 与 p
 校正 async read/write buffer lifetime，覆盖 deadline、cancel、close 与 terminal callback 边界。  
 减少首包 plaintext copy，并校验 Cronet DNS 与 socket handoff 的实际解析路径。
 
-## [住宅代理链路](docs/residential-proxy.md)
+## [SOCKS5 出站](docs/socks5-outbound.md)
 
-本仓库的住宅 AnyTLS 链路在 VPS 上先将目标域名解析为 IPv4，再通过 SOCKS5 连接住宅出口；住宅用户的 UDP 流量仍被拒绝。
-可选的 TCP 预连接会提前完成 SOCKS5 握手和认证，请求到来时只需发起 CONNECT，连接只使用一次。
-可选的提前扩容按实际写入方向选择缓冲区阈值，避免另一方向无谓扩容；这些改动没有真实住宅代理链路的延迟或吞吐测试数据。
+- **TCP 预连接**：默认关闭。提前完成建连、SOCKS5 握手和认证；请求到来时只需发送 CONNECT，池为空则立即正常建连。
+- **复制缓冲区调优**：默认关闭。链式转发可更早扩大缓冲区，并按上传、下载各自的写入端决定是否扩容，避免另一方向无谓扩容。
+
+现有测试验证了行为与边界，尚无真实链路的延迟或吞吐数据。
 
 ## [Shadowsocks](docs/shadowsocks.md)
 

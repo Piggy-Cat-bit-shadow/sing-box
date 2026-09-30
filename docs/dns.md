@@ -33,3 +33,4 @@
 | [`d0b2c27`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d0b2c27ecb503dd910e51da59823e6112a6bf6df) | 增加显式的隧道内域名解析器，并竞争内层 TCP 目标。 |
 | [`d1b7eda`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d1b7edac2a7ca52bb5feadf2a7437325ee78b230) | 停止格式化被日志级别丢弃的逐记录日志行。 |
 | [`b6b68b8`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/b6b68b85a7cfe5b58d6e33a57009a7d5f2222229) | 共享查询失败后重新竞争重试代次。 |
+| [`6910cb1`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/6910cb1af06122c5e0cb2455604554e5d880149c) | 固定住宅链路的 DNS 排序契约，并加入测试保护。 |

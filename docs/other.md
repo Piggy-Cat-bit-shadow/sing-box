@@ -48,6 +48,7 @@
 | [`d3c6afd`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d3c6afd171fde6455067c8af62e4f722b5c5c9b8) | 实现一元分组与出站快照两类查询接口。 |
 | [`a02cd38`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a02cd386cbed7a13ccbda2471a92776cb933633b) | 增加启动器命令接口契约定义，约束控制面调用方式。 |
 | [`d695a84`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d695a848acb7ad008293a8016a19d923cd810a89) | 将负窗口测试放到能够实际观察该问题的位置。 |
+| [`0068728`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/0068728f233d4fcfc2534c9daa379ab98134c600) | 记录住宅代理链路的部署形态与实际用途。 |
 | [`eae8983`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/eae898389f169762868092682ae7e2ce7ceb454f) | 将 README 改写为工程修复台账，记录改动脉络。 |
 | [`747ca9e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/747ca9e3d72ddb364a4f79b5d42ae6f21ed9bc09) | 使快速与深度运行不再互相取消，避免误中断。 |
 | [`e07ffdb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e07ffdb2b3dab51131126058d6f6b6127ba61dec) | 恢复 README 结构并依据发布构件刷新内容。 |
