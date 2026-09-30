@@ -66,11 +66,24 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
-	// The outbound dialer is a ResolveDialer whenever the server is a domain, but it is built
-	// unconditionally, so the type assertion is guarded rather than assumed.
-	var targetQueryOptions adapter.DNSQueryOptions
-	if resolveDialer, isResolveDialer := outboundDialer.(dialer.ResolveDialer); isResolveDialer {
-		targetQueryOptions = resolveDialer.QueryOptions()
+	// The target policy is derived from DialerOptions DIRECTLY, not from the outbound dialer.
+	//
+	// # Why stealing it from the dialer was wrong
+	//
+	// dialer.New only builds a ResolveDialer when ServerIsDomain() is true, so when the proxy server
+	// is an IP literal there is no dialer to read a policy from -- and the previous code left the
+	// policy zero. An empty DNSQueryOptions is not "no preference": it bypasses
+	// dialer_options.domain_resolver entirely and sends the target through the default DNS path, so
+	// the SERVER name and the TARGET name would be resolved by different authorities with nothing in
+	// the configuration explaining the difference.
+	//
+	// Both names come from the same DialerOptions, so both are derived from it. dialer.New derives
+	// the server-side policy from these options; TargetQueryOptions derives the target-side policy
+	// from the same options, which is what makes them agree by construction rather than by
+	// coincidence.
+	targetQueryOptions, err := dialer.TargetQueryOptions(ctx, options.DialerOptions)
+	if err != nil {
+		return nil, err
 	}
 	outbound := &Outbound{
 		Adapter:            outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
