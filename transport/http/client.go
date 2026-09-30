@@ -93,6 +93,10 @@ type ClientOptions struct {
 	// is deliberately narrow. nil keeps the existing behaviour, which is every caller
 	// except the MASQUE client.
 	HTTP3ConnDialer HTTP3ConnDialer
+	// lifecycleLogger is carried through to the HTTP/3 client for TRACE-level connection
+	// lifecycle tracing. It is unexported because it is an internal wiring detail: callers
+	// pass their logger to NewClientWithTLS, and that is the only entry point that sets it.
+	lifecycleLogger logger.ContextLogger
 }
 
 // http3Authority is set when this client is configured for HTTP/3, and is the authority
@@ -127,6 +131,11 @@ type Client struct {
 	http3                           http3Client
 	http3Broken                     atomic.Int64
 	http3Backoff                    atomic.Int64
+	// lifecycleLogger is used ONLY for connection-lifecycle tracing. Every call site must
+	// stay at TRACE/DEBUG: the success path must be silent at INFO and above, and nothing
+	// sensitive (Authorization, Proxy-Authorization, credentials, destination query strings)
+	// may be passed.
+	lifecycleLogger logger.ContextLogger
 	// http3Authority is the authority this client's HTTP/3 connection is authenticated
 	// for. Generic HTTP/3 requests are validated against it so an authenticated
 	// connection cannot be turned into a cross-origin tunnel.
@@ -169,11 +178,13 @@ func NewClientWithTLS(ctx context.Context, logger logger.ContextLogger, outbound
 	}
 	options.RawDialer = outboundDialer
 	options.Server = serverOptions.Build()
+	options.lifecycleLogger = logger
 	return NewClient(options)
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
 	client := &Client{
+		lifecycleLogger:        options.lifecycleLogger,
 		dialer:                 options.Dialer,
 		http1Dialer:            options.HTTP1Dialer,
 		server:                 options.Server,
@@ -223,6 +234,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 			return nil, err
 		}
 		client.http3 = http3
+		// Give the HTTP/3 client the same logger for lifecycle tracing only. It is optional:
+		// an implementation that does not accept one simply does not trace.
+		if tracer, isTracer := http3.(http3LifecycleTracer); isTracer {
+			tracer.SetLifecycleLogger(options.lifecycleLogger)
+		}
 		// Record the authority this connection is authenticated for. The generic request
 		// path validates against it, so an authenticated connection cannot be used to
 		// reach an origin its certificate does not cover.

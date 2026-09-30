@@ -19,6 +19,7 @@ import (
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-quic"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -53,6 +54,13 @@ type http3ClientImpl struct {
 	access            sync.Mutex
 	conn              *http3.ClientConn
 	rawConn           net.Conn
+	// generation increments every time a NEW ClientConn is installed. It exists so lifecycle
+	// tracing can say "old 3 -> new 4" instead of pointing at two opaque pointers, which is
+	// what makes a redial visible in a log without an operator having to correlate addresses.
+	generation atomic.Uint64
+	// lifecycleLogger is a copy of the owning Client's. nil is allowed and means "do not
+	// trace", which is what every construction site that does not set it gets.
+	lifecycleLogger logger.ContextLogger
 }
 
 func newHTTP3Client(options ClientOptions, authorization string) (http3Client, error) {
@@ -127,7 +135,17 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 	c.access.Lock()
 	defer c.access.Unlock()
 	if c.conn != nil && c.conn.Context().Err() == nil {
+		c.traceLifecycle(ctx, "http3 connection accepted from cache", c.generation.Load(), 0)
 		return c.conn, nil
+	}
+	// Report WHY the cached connection was rejected, which is the difference between "there was
+	// never one" and "there was one and it is dead" -- the distinction the 1.84s/30s investigation
+	// could not make from the logs it had.
+	if c.conn != nil {
+		c.traceLifecycle(ctx, "http3 cached connection rejected", c.generation.Load(), 0,
+			"cached_error", c.conn.Context().Err())
+	} else {
+		c.traceLifecycle(ctx, "http3 connection cache empty", c.generation.Load(), 0)
 	}
 	if c.rawConn != nil {
 		c.rawConn.Close()
@@ -157,14 +175,64 @@ func (c *http3ClientImpl) acquire(ctx context.Context) (*http3.ClientConn, error
 		rawConn, quicConn, err = c.candidateConnector()(ctx, c.server.Addr)
 	}
 	if err != nil {
+		c.traceLifecycle(ctx, "http3 dial failed", c.generation.Load(), 0, "error", err)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		return nil, E.Cause1(ErrHTTP3Unavailable, err)
 	}
+	previousGeneration := c.generation.Load()
 	c.conn = c.transport.NewClientConn(quicConn)
 	c.rawConn = rawConn
+	generation := c.generation.Add(1)
+	c.traceLifecycle(ctx, "http3 dial succeeded", generation, previousGeneration)
 	return c.conn, nil
+}
+
+// traceLifecycle emits a connection-lifecycle event at TRACE level.
+//
+// # Rules for this function
+//
+//   - TRACE only. The success path must never produce INFO/WARN/ERROR noise; an operator who has
+//     not asked for trace output must see nothing.
+//   - No secrets. Never pass Authorization, Proxy-Authorization, a password, a token, or a full
+//     destination URL (which can carry credentials or identifying query parameters). Callers pass
+//     an authority host at most, which is already visible in every connection log.
+//   - No new logging framework: this uses the logger the client was already given.
+//   - It NEVER changes control flow. It is a pure observer, so it cannot affect connection
+//     lifetime.
+func (c *http3ClientImpl) traceLifecycle(ctx context.Context, message string, generation uint64, previousGeneration uint64, keyValues ...any) {
+	if c.lifecycleLogger == nil {
+		return
+	}
+	fields := make([]any, 0, len(keyValues)+6)
+	fields = append(fields, "protocol", "h3", "generation", generation)
+	if previousGeneration != 0 {
+		fields = append(fields, "previous_generation", previousGeneration)
+	}
+	// The connection's own view of its liveness, which is what the cache keys on.
+	if c.conn != nil {
+		fields = append(fields, "conn_context_error", c.conn.Context().Err())
+	}
+	fields = append(fields, keyValues...)
+	// The logger takes variadic key/value args, so the slice is spread. Passing it as a single
+	// argument would log one opaque slice and lose every field -- which is the bug this
+	// observability exists to prevent, in miniature.
+	c.lifecycleLogger.TraceContext(ctx, append([]any{message}, fields...)...)
+}
+
+// http3LifecycleTracer is implemented by HTTP/3 clients that accept a logger for lifecycle
+// tracing. It is optional so that a client built by a test, or by a build without QUIC, does not
+// have to provide one.
+type http3LifecycleTracer interface {
+	SetLifecycleLogger(logger.ContextLogger)
+}
+
+// SetLifecycleLogger installs the logger used for TRACE-level connection-lifecycle events.
+func (c *http3ClientImpl) SetLifecycleLogger(lifecycleLogger logger.ContextLogger) {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.lifecycleLogger = lifecycleLogger
 }
 
 // candidateConnector returns the connector, binding it on first use if construction did not.
