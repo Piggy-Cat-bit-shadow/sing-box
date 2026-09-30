@@ -3,7 +3,9 @@
 package http
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net"
 	"testing"
 
@@ -204,6 +206,262 @@ func TestStreamAndConnectionClassifiersAgree(t *testing.T) {
 			t.Fatalf("code 0x%x: classifier says expected=%v but the client normalizer says "+
 				"silenced=%v; a disagreement means one side logs a fault the other calls routine",
 				uint64(code), expected, silenced)
+		}
+	}
+}
+
+// TestStreamErrorClassificationTable is the COMPLETE enumeration of the quic-go error surface.
+//
+// # Why a full table, rather than the cases that happened to come up
+//
+// The two previous rounds each fixed the type that had been observed in the logs, and each time
+// the fix left a sibling type behind:
+//
+//	round 1  *quic.StreamError with code 0 was handled; code 268 was not
+//	round 2  *quic.TransportError was handled; *quic.ApplicationError was not
+//
+// Both mistakes have the same shape: the classifier knew about the types someone had seen, and
+// every OTHER quic-go type silently inherited "expected closure", because they all implement
+// Unwrap() -> net.ErrClosed. A table over the whole surface is what stops that from recurring.
+//
+// Every quic-go error type in the pinned fork is listed: TransportError, ApplicationError,
+// VersionNegotiationError, StatelessResetError, IdleTimeoutError and HandshakeTimeoutError.
+func TestStreamErrorClassificationTable(t *testing.T) {
+	transportViolation := &quic.TransportError{
+		ErrorCode:    quic.TransportErrorCode(0xa),
+		ErrorMessage: "PROTOCOL_VIOLATION",
+	}
+	applicationFault := &quic.ApplicationError{
+		ErrorCode: quic.ApplicationErrorCode(http3.ErrCodeInternalError),
+	}
+
+	testCases := []struct {
+		name string
+		err  error
+		// quiet is the expected classification: true means "normal teardown, do not log as a
+		// fault", false means "must remain visible".
+		quiet bool
+		why   string
+	}{
+		// ---- expected: the peer or the client ended things normally ----
+		{
+			name:  "stream reset H3_REQUEST_CANCELLED remote",
+			err:   &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: true},
+			quiet: true,
+			why:   "the peer abandoned ONE request stream; the connection stays usable",
+		},
+		{
+			name:  "stream reset H3_REQUEST_CANCELLED local",
+			err:   &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: false},
+			quiet: true,
+			why:   "this client abandoned its own request",
+		},
+		{
+			name:  "stream reset code 0",
+			err:   &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: false},
+			quiet: true,
+			why:   "no-error stream close",
+		},
+		{
+			name:  "transport error no-error code",
+			err:   &quic.TransportError{ErrorCode: quic.NoError},
+			quiet: true,
+			why:   "orderly transport shutdown",
+		},
+		{
+			name:  "application error no-error code",
+			err:   &quic.ApplicationError{ErrorCode: 0},
+			quiet: true,
+			why:   "orderly application shutdown",
+		},
+		{
+			name:  "idle timeout",
+			err:   &quic.IdleTimeoutError{},
+			quiet: true,
+			why:   "the connection simply went inactive",
+		},
+		{
+			name:  "handshake timeout",
+			err:   &quic.HandshakeTimeoutError{},
+			quiet: true,
+			why:   "the handshake never completed",
+		},
+		{
+			name:  "http3 ErrCodeNoError",
+			err:   &http3.Error{ErrorCode: http3.ErrCodeNoError, Remote: true},
+			quiet: true,
+			why:   "orderly HTTP/3 shutdown",
+		},
+		{
+			name:  "http3 ErrCodeRequestCanceled",
+			err:   &http3.Error{ErrorCode: http3.ErrCodeRequestCanceled, Remote: true},
+			quiet: true,
+			why:   "the same code as 268, in its http3.Error spelling",
+		},
+		{
+			name:  "context canceled",
+			err:   context.Canceled,
+			quiet: true,
+			why:   "the caller gave up",
+		},
+		{
+			name:  "context deadline exceeded",
+			err:   context.DeadlineExceeded,
+			quiet: true,
+			why:   "the caller's deadline expired",
+		},
+		{
+			name:  "bare net.ErrClosed",
+			err:   net.ErrClosed,
+			quiet: true,
+			why:   "a plain closed connection carries no quic-go fault semantics",
+		},
+		{
+			name:  "io.EOF",
+			err:   io.EOF,
+			quiet: true,
+			why:   "normal end of stream",
+		},
+
+		// ---- real faults: must stay visible ----
+		{
+			name:  "stream reset internal error",
+			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeInternalError), Remote: true},
+			quiet: false,
+			why:   "the peer hit an internal error on this stream",
+		},
+		{
+			name:  "stream reset general protocol error",
+			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError), Remote: true},
+			quiet: false,
+			why:   "a protocol violation",
+		},
+		{
+			name:  "stream reset frame unexpected",
+			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeFrameUnexpected), Remote: true},
+			quiet: false,
+			why:   "the peer sent a frame this state machine forbids",
+		},
+		{
+			name:  "stream reset settings error",
+			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeSettingsError), Remote: true},
+			quiet: false,
+			why:   "a SETTINGS exchange failure",
+		},
+		{
+			name:  "transport PROTOCOL_VIOLATION",
+			err:   transportViolation,
+			quiet: false,
+			why:   "a transport fault that unwraps to net.ErrClosed and would otherwise be erased",
+		},
+		{
+			name:  "application error with a fault code",
+			err:   applicationFault,
+			quiet: false,
+			why:   "the peer reported a fault in its own code space",
+		},
+		{
+			name:  "stateless reset",
+			err:   &quic.StatelessResetError{},
+			quiet: false,
+			why:   "the path was torn down without a close; notable on an active tunnel",
+		},
+		{
+			name:  "version negotiation failure",
+			err:   &quic.VersionNegotiationError{},
+			quiet: false,
+			why:   "no usable QUIC version was agreed, so nothing was established",
+		},
+		{
+			name:  "http3 ErrCodeInternalError",
+			err:   &http3.Error{ErrorCode: http3.ErrCodeInternalError, Remote: true},
+			quiet: false,
+			why:   "an internal HTTP/3 fault",
+		},
+		{
+			name:  "http3 ErrCodeMessageError",
+			err:   &http3.Error{ErrorCode: http3.ErrCodeMessageError, Remote: true},
+			quiet: false,
+			why:   "a malformed HTTP/3 message",
+		},
+		{
+			name:  "plain unclassified error",
+			err:   errors.New("something genuinely went wrong"),
+			quiet: false,
+			why:   "an unknown error must never be assumed benign",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Both the wrapped and unwrapped spellings must classify identically: the client
+			// always sees the qtls-wrapped form on the stream path, while the classifier sees
+			// whichever the caller passes.
+			for _, input := range []struct {
+				label string
+				err   error
+			}{
+				{"unwrapped", testCase.err},
+				{"qtls-wrapped", qtls.WrapError(testCase.err)},
+			} {
+				normalized := normalizeStreamError(input.err)
+				quiet := E.IsClosedOrCanceled(normalized)
+				if quiet != testCase.quiet {
+					t.Fatalf("%s (%s): quiet=%v, want %v -- %s",
+						testCase.name, input.label, quiet, testCase.quiet, testCase.why)
+				}
+
+				// And the server-side classifier must agree, or one direction logs a fault the
+				// other calls routine.
+				if got := classifyH3Error(input.err) == h3ErrorExpected; got != testCase.quiet {
+					// The two are only required to agree for errors carrying HTTP/3 or QUIC
+					// semantics; a bare sentinel or an unclassifiable error is the client
+					// normalizer's business.
+					if isQuicTyped(testCase.err) {
+						t.Fatalf("%s (%s): classifier says quiet=%v but the normalizer says %v",
+							testCase.name, input.label, got, quiet)
+					}
+				}
+			}
+		})
+	}
+}
+
+// isQuicTyped reports whether an error carries a quic-go or HTTP/3 type, which is the set both
+// classifiers are required to agree about.
+func isQuicTyped(err error) bool {
+	var (
+		streamErr    *quic.StreamError
+		transportErr *quic.TransportError
+		appErr       *quic.ApplicationError
+		h3Err        *http3.Error
+	)
+	return errors.As(err, &streamErr) || errors.As(err, &transportErr) ||
+		errors.As(err, &appErr) || errors.As(err, &h3Err)
+}
+
+// TestTypedClassificationPrecedesGenericNetErrClosed is the ordering guard.
+//
+// Every quic-go error type unwraps to net.ErrClosed. If any code path evaluates a generic
+// `errors.Is(err, net.ErrClosed)` BEFORE the typed checks, a protocol violation is reported as an
+// orderly teardown and disappears. That is the exact shape of both defects found so far, so the
+// ordering is asserted directly rather than left implicit.
+func TestTypedClassificationPrecedesGenericNetErrClosed(t *testing.T) {
+	// A fault that is closed, generic and typed all at once. The typed meaning must win.
+	faults := []error{
+		&quic.TransportError{ErrorCode: quic.TransportErrorCode(0xa)},
+		&quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(http3.ErrCodeInternalError)},
+		&quic.StatelessResetError{},
+	}
+	for _, fault := range faults {
+		if !errors.Is(fault, net.ErrClosed) {
+			t.Fatalf("%T is expected to unwrap to net.ErrClosed; this test is only meaningful if "+
+				"the generic test would otherwise match it", fault)
+		}
+		normalized := normalizeStreamError(qtls.WrapError(fault))
+		if E.IsClosedOrCanceled(normalized) {
+			t.Fatalf("%T satisfies errors.Is(net.ErrClosed) but is a real fault: the typed "+
+				"classification must run first, otherwise this fault is silently erased", fault)
 		}
 	}
 }

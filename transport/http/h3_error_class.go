@@ -54,14 +54,23 @@ func classifyH3Error(err error) h3ErrorClass {
 	if errors.As(err, &h3Err) {
 		return classifyH3ErrorCode(h3Err.ErrorCode)
 	}
-	// A QUIC application error carries a code as well.
+	// A QUIC application error carries a code as well. Code 0 is the no-error
+	// value used for an orderly shutdown, the same convention as TransportError
+	// above; it is NOT http3.ErrCodeNoError (0x100), which is a different number.
 	var applicationErr *quic.ApplicationError
 	if errors.As(err, &applicationErr) {
+		if applicationErr.ErrorCode == quic.ApplicationErrorCode(0) {
+			return h3ErrorExpected
+		}
 		return classifyH3ErrorCode(http3.ErrCode(applicationErr.ErrorCode))
 	}
-	// A stream reset is routine when a client abandons a request.
+	// A stream reset is routine when a client abandons a request. As above, a
+	// zero code means no error was raised rather than an unlisted H3 code.
 	var streamErr *quic.StreamError
 	if errors.As(err, &streamErr) {
+		if streamErr.ErrorCode == 0 {
+			return h3ErrorExpected
+		}
 		return classifyH3ErrorCode(http3.ErrCode(streamErr.ErrorCode))
 	}
 	// Idle and handshake timeouts are reported for peers that simply go away,

@@ -48,69 +48,128 @@ func normalizeStreamError(err error) error {
 	if err == nil {
 		return nil
 	}
-	// A transport-level error is a fault unless its code is the no-error code used for an
-	// orderly close. This must be decided BEFORE any net.ErrClosed test, because TransportError
-	// unwraps to net.ErrClosed regardless of how serious it is.
-	var transportErr *quic.TransportError
-	if errors.As(err, &transportErr) {
-		if transportErr.ErrorCode == quic.TransportErrorCode(0) {
-			return net.ErrClosed
-		}
-		// A real transport fault. It is NOT enough to return it unchanged: TransportError's
-		// Unwrap reports net.ErrClosed, and the outer quic-go wrapper forwards that, so the
-		// routing layer's closed-ness test would still silence it. See visibleFault.
-		return asVisibleFault(err)
+	// TYPED CLASSIFICATION COMES FIRST, ALWAYS.
+	//
+	// Every quic-go error type -- TransportError, ApplicationError, StatelessResetError,
+	// VersionNegotiationError, IdleTimeoutError, HandshakeTimeoutError -- implements
+	// Unwrap() returning net.ErrClosed, whatever its error code is. A generic
+	// E.IsClosedOrCanceled test therefore answers "closed" for a PROTOCOL_VIOLATION just as
+	// readily as for an orderly shutdown, and running it before the typed checks silently
+	// erases real faults from the logs.
+	//
+	// So the concrete types are examined first, and only an error that carries no quic-go
+	// semantics at all may reach the generic closed-ness shortcut below.
+	if normalized, handled := normalizeTypedQuicError(err); handled {
+		return normalized
 	}
-	// Already a recognised sentinel: leave it alone.
+	// No quic-go type in the chain. A bare closed/canceled sentinel is a normal teardown.
 	if E.IsClosedOrCanceled(err) {
 		return err
-	}
-	var h3Err *http3.Error
-	if errors.As(err, &h3Err) {
-		switch h3Err.ErrorCode {
-		case 0:
-			// A zero code means "no QUIC-level error": the tunnel simply ended.
-			// quic-go surfaces this as an *http3.Error with ErrorCode 0, which
-			// formats as "H3 error (0x0)" — exactly the message that was being
-			// logged at ERROR for an ordinary teardown. It is NOT
-			// http3.ErrCodeNoError (0x100); the two are different values, which is
-			// why an earlier attempt at this fix matched nothing.
-			return net.ErrClosed
-		}
-		// Delegate to the shared table so the expected/unexpected split cannot drift
-		// between this client-side normalizer and the server-side classifier.
-		if classifyH3ErrorCode(h3Err.ErrorCode) == h3ErrorExpected {
-			return net.ErrClosed
-		}
-		// Every other HTTP/3 code (protocol violations, frame and settings
-		// errors, QPACK failures, internal errors) is a real fault and is
-		// deliberately passed through unchanged.
-		return err
-	}
-	var streamErr *quic.StreamError
-	if errors.As(err, &streamErr) {
-		// A stream reset is decided by the SAME code table the server side uses, so a
-		// single definition of "expected" covers both directions.
-		//
-		// Matching only code 0 here was the bug: a peer cancelling a request sends
-		// H3_REQUEST_CANCELLED (0x10c = 268), which quic-go reports as
-		// *quic.StreamError{Remote: true, ErrorCode: 268} and formats as
-		//
-		//	stream 184 canceled by remote with error code 268
-		//
-		// That is a stream-local cancellation, not a connection fault, but it fell
-		// through this branch and was logged at ERROR by route/conn.go. The numeric
-		// literal is deliberately not repeated here: classifyH3ErrorCode owns it.
-		if classifyH3ErrorCode(http3.ErrCode(streamErr.ErrorCode)) == h3ErrorExpected {
-			return net.ErrClosed
-		}
-		return asVisibleFault(err)
 	}
 	if errors.Is(err, io.EOF) {
 		return io.EOF
 	}
 	// An unclassifiable error is a fault. It must not carry a spurious net.ErrClosed
 	// in its chain, or the routing layer will silence it.
+	return asVisibleFault(err)
+}
+
+// normalizeTypedQuicError classifies an error that carries a quic-go type.
+//
+// It reports handled=false when the chain contains no quic-go type at all, which is the signal
+// for the caller to fall back to the generic closed-ness test.
+//
+// The order inside is deliberate: the more specific a type's code semantics, the earlier it is
+// examined. Everything that reaches the final branch is an HTTP/3 code decided by the SHARED
+// table (classifyH3ErrorCode), so the client normalizer and the server classifier cannot drift.
+func normalizeTypedQuicError(err error) (error, bool) {
+	// A transport-level error is a fault unless its code is the no-error code used for an
+	// orderly close.
+	var transportErr *quic.TransportError
+	if errors.As(err, &transportErr) {
+		if transportErr.ErrorCode == quic.TransportErrorCode(0) {
+			return net.ErrClosed, true
+		}
+		return asVisibleFault(err), true
+	}
+	// An APPLICATION error carries the peer's own code space. quic.NoError (0) is the orderly
+	// shutdown; anything else is the peer reporting a fault and must stay visible.
+	//
+	// This branch previously did not exist, so an ApplicationError carrying a real fault code
+	// fell through to the generic net.ErrClosed test and was reported as an ordinary teardown.
+	var applicationErr *quic.ApplicationError
+	if errors.As(err, &applicationErr) {
+		if applicationErr.ErrorCode == quic.ApplicationErrorCode(0) {
+			return net.ErrClosed, true
+		}
+		return asVisibleFault(err), true
+	}
+	// An HTTP/3 application error carries a numeric code. Zero means "no error"; the rest are
+	// decided by the shared table.
+	var h3Err *http3.Error
+	if errors.As(err, &h3Err) {
+		if h3Err.ErrorCode == 0 {
+			// A zero code means "no QUIC-level error": the tunnel simply ended.
+			// quic-go surfaces this as an *http3.Error with ErrorCode 0, which
+			// formats as "H3 error (0x0)" — exactly the message that was being
+			// logged at ERROR for an ordinary teardown. It is NOT
+			// http3.ErrCodeNoError (0x100); the two are different values, which is
+			// why an earlier attempt at this fix matched nothing.
+			return net.ErrClosed, true
+		}
+		return classifyH3Code(h3Err.ErrorCode, err), true
+	}
+	// A stream reset. Matching only code 0 here was the original bug: a peer cancelling a
+	// request sends H3_REQUEST_CANCELLED (0x10c = 268), which quic-go reports as
+	// *quic.StreamError{Remote: true, ErrorCode: 268} and formats as
+	//
+	//	stream 184 canceled by remote with error code 268
+	//
+	// That is a stream-local cancellation, not a connection fault, but it used to fall through
+	// and be logged at ERROR by route/conn.go. The numeric literal is deliberately not repeated
+	// here: classifyH3ErrorCode owns it.
+	var streamErr *quic.StreamError
+	if errors.As(err, &streamErr) {
+		return classifyH3Code(http3.ErrCode(streamErr.ErrorCode), err), true
+	}
+	// A stateless reset means the peer or a middlebox told us the connection is gone without
+	// shutting it down. That is a real, notable event on an active path -- not an orderly
+	// teardown -- and it unwraps to net.ErrClosed, so it must be made visible explicitly.
+	var statelessReset *quic.StatelessResetError
+	if errors.As(err, &statelessReset) {
+		return asVisibleFault(err), true
+	}
+	// Version negotiation failing means no usable QUIC version was agreed. Nothing was ever
+	// established, so this is a dial-time fault worth reporting, not a closed connection.
+	var versionErr *quic.VersionNegotiationError
+	if errors.As(err, &versionErr) {
+		return asVisibleFault(err), true
+	}
+	// Idle and handshake timeouts describe a peer that went away, which is routine.
+	var idleTimeout *quic.IdleTimeoutError
+	if errors.As(err, &idleTimeout) {
+		return net.ErrClosed, true
+	}
+	var handshakeTimeout *quic.HandshakeTimeoutError
+	if errors.As(err, &handshakeTimeout) {
+		return net.ErrClosed, true
+	}
+	return nil, false
+}
+
+// classifyH3Code maps an HTTP/3 code onto the shared expected/unexpected split.
+func classifyH3Code(code http3.ErrCode, err error) error {
+	// Code 0 is "no error at all", which is how quic-go reports a stream or connection that
+	// ended without anyone raising a condition. It is deliberately NOT part of
+	// classifyH3ErrorCode's table -- that table speaks HTTP/3 codes, where the no-error value is
+	// ErrCodeNoError (0x100), a different number. Treating 0 as a fault would log every ordinary
+	// stream close, which is the very noise this function exists to remove.
+	if code == 0 {
+		return net.ErrClosed
+	}
+	if classifyH3ErrorCode(code) == h3ErrorExpected {
+		return net.ErrClosed
+	}
 	return asVisibleFault(err)
 }
 
