@@ -342,6 +342,107 @@ jobs:
           fi
           echo "PASS: started cleanly and shut down on SIGTERM with no panic"
 
+      - name: Clash API runtime probe
+        # The Clash API is restored from upstream, so it must be proven live rather
+        # than merely present in the registry: start the binary with an
+        # external_controller, then speak HTTP to it on localhost only.
+        #
+        # The secret is asserted to be a real gate. A field that parses and is then
+        # ignored would leave the management API open to anything that can reach the
+        # port, and nothing else in the pipeline would notice.
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          cat > "$workdir/clash.json" <<'JSON'
+          {
+            "log": {"level": "info"},
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "experimental": {
+              "clash_api": {
+                "external_controller": "127.0.0.1:19302",
+                "secret": "ci-clash-probe"
+              }
+            }
+          }
+          JSON
+
+          ./"$BINARY" run -c "$workdir/clash.json" > "$workdir/clash.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+
+          probe() {
+            python3 -c "
+          import sys, urllib.request, urllib.error
+          req = urllib.request.Request('http://127.0.0.1:19302' + sys.argv[1])
+          if sys.argv[2] == 'auth':
+              req.add_header('Authorization', 'Bearer ci-clash-probe')
+          try:
+              with urllib.request.urlopen(req, timeout=2) as response:
+                  print(response.status)
+                  print(response.read().decode()[:200])
+          except urllib.error.HTTPError as e:
+              print(e.code)
+          except Exception:
+              print(0)
+          " "$1" "$2"
+          }
+
+          ready=""
+          for _ in $(seq 1 100); do
+            status="$(probe /version noauth | head -1)"
+            if [ "$status" != "0" ]; then ready=1; break; fi
+            if ! kill -0 $pid 2>/dev/null; then
+              echo "FAIL: the process exited before the Clash API came up" >&2
+              cat "$workdir/clash.log" >&2
+              exit 1
+            fi
+            sleep 0.2
+          done
+          [ -n "$ready" ] || {
+            echo "FAIL: the Clash API never answered on 127.0.0.1:19302" >&2
+            cat "$workdir/clash.log" >&2
+            exit 1
+          }
+
+          # An unauthenticated request must be rejected, not served.
+          unauth_status="$(probe /version noauth | head -1)"
+          if [ "$unauth_status" != "401" ]; then
+            echo "FAIL: an unauthenticated /version returned $unauth_status, expected 401" >&2
+            exit 1
+          fi
+          echo "PASS: an unauthenticated request is rejected with 401"
+
+          # An authenticated request must be served with a JSON body.
+          auth_output="$(probe /version auth)"
+          auth_status="$(printf '%s' "$auth_output" | head -1)"
+          auth_body="$(printf '%s' "$auth_output" | tail -n +2)"
+          if [ "$auth_status" != "200" ]; then
+            echo "FAIL: an authenticated /version returned $auth_status, expected 200" >&2
+            exit 1
+          fi
+          case "$auth_body" in
+            *'"version"'*) ;;
+            *) echo "FAIL: /version did not return a version field: $auth_body" >&2; exit 1 ;;
+          esac
+          echo "PASS: an authenticated request is served with a JSON version body"
+
+          # A second endpoint proves it is the real API surface, not one handler.
+          proxies_status="$(probe /proxies auth | head -1)"
+          if [ "$proxies_status" != "200" ]; then
+            echo "FAIL: an authenticated /proxies returned $proxies_status, expected 200" >&2
+            exit 1
+          fi
+          echo "PASS: an authenticated request reaches /proxies"
+
+          kill -TERM $pid
+          wait $pid || true
+          if grep -qiE "panic|FATAL" "$workdir/clash.log"; then
+            echo "FAIL: panic or fatal error while running with the Clash API" >&2
+            cat "$workdir/clash.log" >&2
+            exit 1
+          fi
+          echo "PASS: the Clash API started and shut down cleanly"
+
       - name: full capability verification (compile-time package graph)
         # This fork carries the complete upstream feature profile, so the contract is
         # that capabilities are PRESENT, not that they are absent.
@@ -380,6 +481,7 @@ jobs:
             "github.com/sagernet/sing-box/service/origin_ca"
             "github.com/sagernet/sing-box/service/ssmapi"
             "github.com/sagernet/sing-box/service/api"
+            "github.com/sagernet/sing-box/experimental/clashapi"
             "github.com/sagernet/sing-box/dns/transport/quic"
             "github.com/sagernet/sing-box/protocol/tailscale"
             "github.com/caddyserver/certmagic"

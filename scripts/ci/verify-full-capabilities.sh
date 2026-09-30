@@ -188,6 +188,14 @@ check_config "endpoint-openvpn-client" \
 check_config "endpoint-openvpn-server" \
   "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"openvpn-server\",\"tag\":\"ovs\",\"listen\":\"127.0.0.1\",\"listen_port\":1194,\"mode\":\"static_key\",\"address\":[\"10.8.0.1/24\"],\"peer_address\":\"10.8.0.2\",\"remote\":\"127.0.0.1\",\"remote_port\":1195,\"cipher\":\"AES-256-CBC\",\"static_key\":[\"$ovpn_key\"]}]}"
 
+echo "== experimental =="
+# The Clash API is restored from upstream and must remain constructible. It is the one
+# capability that is both a config model and a listener, so it is checked here at the
+# construction level; the runtime probe lives in the workflow, which starts the binary
+# and speaks HTTP to it.
+check_config "experimental-clash-api" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"experimental\":{\"clash_api\":{\"external_controller\":\"127.0.0.1:19099\",\"secret\":\"ci-smoke\"}}}"
+
 echo "== services =="
 check_config "service-api" \
   "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"services\":[{\"type\":\"api\",\"tag\":\"api\",\"listen\":\"127.0.0.1\",\"listen_port\":19090}]}"
