@@ -390,7 +390,25 @@ func (c *http3StreamConn) wrapError(err error) error {
 	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	return qtls.WrapError(err)
+	// The wrapped error is normalised HERE, at the tunnel's own error boundary, rather than
+	// left to qtls.WrapError alone.
+	//
+	// qtls.WrapError's contract cannot express "closed" precisely: every quic-go error type
+	// implements Unwrap() returning net.ErrClosed whatever its code is, so a real fault such
+	// as PROTOCOL_VIOLATION satisfies errors.Is(err, net.ErrClosed). The wrapper's own typed
+	// switch never gets to run, because its first line delegates to errors.Is on the raw
+	// error, and even if it did not, errors.Is would still traverse Unwrap().
+	//
+	// route/conn.go decides the log level with exactly that test:
+	//
+	//	if !E.IsClosedOrCanceled(err) {
+	//	    m.logger.ErrorContext(ctx, "connection upload closed: ", err)
+	//	}
+	//
+	// so without this the fault disappears. normalizeStreamError applies typed QUIC/HTTP3
+	// classification FIRST and only then the generic closed/canceled tests, and returns a
+	// visibleFault for anything that is genuinely a fault.
+	return normalizeStreamError(qtls.WrapError(err))
 }
 
 func (c *http3StreamConn) CloseWrite() error {
