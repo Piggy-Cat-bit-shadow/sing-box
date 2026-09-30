@@ -4,11 +4,21 @@
 
 | Commit | 工作 |
 | --- | --- |
+| [`7eab0bb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/7eab0bb97ea4ff3bdf5103ac32bd65532d32c3f9) | 按错误类型区分 MASQUE 隧道与 V2Ray QUIC 接受循环的正常结束和故障。 |
+| [`d267546`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d26754689839fbd3b91183701167a6491042d4c7) | 补齐 HTTP/3 服务端与 Native Naive 的连接级故障分类和日志。 |
+| [`af86de2`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/af86de2c62cdf8cbfc8e0dcd6107347696442564) | 在 HTTP/3 客户端隧道边界保留真实 QUIC 故障，避免被当作正常关闭。 |
+| [`98028f7`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/98028f7b6e6dd1341780a360abe99ab95f588689) | 将 QUIC 无状态重置和版本协商失败识别为 HTTP/3 故障。 |
+| [`a6fcdf9`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a6fcdf95dacc8d87020595bf9c55de65eb0847bd) | 将 README 各分类简介扩写为三至四行，并加入显式换行。 |
+| [`1f0cca5`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1f0cca55cd5bb944f8200c1d0132d56ba96fd34d) | 恢复协议优先的 README 首页，并将提交索引移入 docs/commits。 |
+| [`02269b6`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/02269b6ef3f1e2e8e124079302d23b3329c64892) | 把 README 恢复为简洁中文布局，重排当时的文档入口。 |
+| [`a19f5cb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a19f5cb24de37945ffdb8c0db5103aec9bd74983) | 整合长期协议文档，删除重复专题文档并更新 Naive 注释引用。 |
 | [`ad3c38b`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ad3c38b2a3271fbe40f030fb3a99120f979329cb) | 测试 HTTP/3 连接合并、迁移容忍、启动竞态和重试边界。 |
 | [`a14ac8d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a14ac8d14c847019ec595c7f184d372960b4cbe2) | 为 HTTP/3 连接增加生命周期代际和缓存决策追踪。 |
 | [`83210ce`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/83210cef3dbd61cbdd93d0d67b297b60ec6ab04a) | 先识别 quic-go 的具体错误类型，再处理通用连接关闭错误。 |
+| [`ce4170e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ce4170ed8816da067543dd13caa6c4428f2986b9) | 校准文档中的 H3、BBR 与 Native Naive 描述，移除过时文档。 |
 | [`841ae59`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/841ae59fcc0e8ca028b41427563efcd82a17dca2) | 测试过期 HTTP/3 连接的驱逐及替换连接之间的隔离。 |
 | [`e323a9c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e323a9ce7646ed1b3a55ec70ba755655987da8b9) | 区分 HTTP/3 请求取消与连接失败，避免错误分类混淆两者。 |
+| [`ca330b8`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ca330b831df2efa21ae7e632d3f1641c1dd8e61c) | 将历史审计与性能结论汇入工程笔记，清理旧文档引用。 |
 | [`942d19d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/942d19d243a7a06b81f604e555b866a42abfb494) | 修正模块完整性检查中 `--require-checked` 的判定：已发现但被排除的模块不能算作已检查。 |
 | [`947aaa3`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/947aaa34041cf94444d1c3e65aa1bd526e32667f) | 将 Go 模块缓存校验接入 Linux 深度检查，并清除过时的“仅深度检查”标记。 |
 | [`bfa4755`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bfa47557548121141a119ea884d6830740a59c7a) | 修正 Go 模块检查把依赖下载日志误判为文件变更的问题。 |
