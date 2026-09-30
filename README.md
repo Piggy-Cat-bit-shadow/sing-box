@@ -21,9 +21,7 @@ Outbound payload 改为 ownership-transfer zero-copy，减少 payload copy 与 p
 
 ## [VLESS / Vision](docs/vless-vision.md)
 
-围绕 Vision padding、framing 与 buffer handoff 优化数据面。  
-减少 padding 阶段的 payload copy，同时保持 TLS filtering、command state 与 direct-mode 语义。  
-覆盖首帧、分片、direct transition 与异常路径的 ownership / wire parity。
+本 fork 暂无以 VLESS / Vision 为主要改动的独立提交。仓库历史中已有上游的相关提交；涉及 VLESS 的跨协议或构建改动按主要用途列入其他分类。
 
 ## [Shadowsocks](docs/shadowsocks.md)
 
