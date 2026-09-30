@@ -47,7 +47,7 @@ name: Linux amd64
 # # Deep checks
 #
 # Everything expensive sits behind `workflow_dispatch` with `deep_checks=true`:
-# go vet, reproducibility, race tests, the fuzz campaign, the reference suite
+# Go module cache verification, go vet, reproducibility, race tests, the fuzz campaign, the reference suite
 # (`test/jiejie/reference` plus the Caddy/forwardproxy differential) and the MASQUE
 # reference interop. Slow is fine there; it is a manual full audit.
 #
@@ -85,7 +85,7 @@ on:
   workflow_dispatch:
     inputs:
       deep_checks:
-        description: Run expensive deep validation (vet, race, fuzz, reproducibility, reference suite, MASQUE interop)
+        description: Run expensive deep validation (module verify, vet, race, fuzz, reproducibility, reference suite, MASQUE interop)
         required: false
         default: false
         type: boolean
@@ -546,6 +546,12 @@ jobs:
       # =======================================================================
       # Deep checks: manual dispatch with deep_checks=true only.
       # =======================================================================
+
+      - name: deep check - Go module verify
+        # Check downloaded module cache content against go.sum for every discovered
+        # module, including the reference module. Metadata drift is checked above.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
+        run: ./scripts/ci/check-go-module-integrity.sh --verify
 
       - name: deep check - go vet
         # The package list is IDENTICAL to what the fast path used; nothing was

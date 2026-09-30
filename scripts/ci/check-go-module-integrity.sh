@@ -19,7 +19,7 @@
 #
 #   go mod tidy -diff                 go.mod/go.sum are complete and canonical
 #   go list -mod=readonly -m all      the whole module graph resolves read-only
-#   go mod verify                     (--verify) cached content matches go.sum
+#   go mod verify                     (--verify) downloaded cache content matches go.sum
 #
 # `-diff` is used instead of plain `tidy` on purpose: this script must never modify the
 # working tree and must never "fix" drift by rewriting files. Drift is a FAILURE, and the
@@ -27,11 +27,9 @@
 #
 # # Why `go mod verify` is opt-in
 #
-# Measured warm on this repository: `tidy -diff` plus `list` across all three modules costs
-# about 0.5s, while `go mod verify` alone costs about 15s, because it re-hashes every module
-# in the cache. It is also the only check that does not depend on this repository's own
-# files. The two cheap checks are what actually catch the drift this guard exists for, so
-# they run on every push and `verify` is left to the deep run.
+# The default run discovers every module and checks its metadata with `tidy -diff` and
+# read-only graph resolution. `--verify` additionally checks downloaded module cache
+# content against go.sum for every checked module; it is left to the deep run.
 #
 # # Fork replace parity
 #
@@ -64,9 +62,6 @@ PARITY_REPLACES=(
     github.com/sagernet/cronet-go
     github.com/sagernet/quic-go
 )
-# Module kept out of the default run. It is the reference isolation module.
-DEEP_ONLY_MODULES=(test/jiejie/reference)
-
 EXCLUDES=()
 REQUIRE_CHECKED=()
 RUN_VERIFY=0
@@ -150,7 +145,7 @@ echo "==================="
 echo "discovered ${#ALL_MODULES[@]} module(s):"
 for module in "${ALL_MODULES[@]}"; do
     marker="checked"
-    is_excluded "$module" && marker="excluded (deep-only)"
+    is_excluded "$module" && marker="excluded"
     echo "  MODULE: ${module}  [${marker}]"
 done
 echo
