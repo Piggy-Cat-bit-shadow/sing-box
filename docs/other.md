@@ -2,6 +2,10 @@
 
 | Commit | 工作 |
 | --- | --- |
+| [`942d19d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/942d19d243a7a06b81f604e555b866a42abfb494) | 修正模块完整性检查中 `--require-checked` 的判定：已发现但被排除的模块不能算作已检查。 |
+| [`947aaa3`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/947aaa34041cf94444d1c3e65aa1bd526e32667f) | 将 Go 模块缓存校验接入 Linux 深度检查，并清除过时的“仅深度检查”标记。 |
+| [`bf78d81`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bf78d81d826c9466e473ea43eb25e6893028c89d) | 精简 README 各分类简介，并修正 SOCKS5 出站说明的段落分隔。 |
+| [`feca611`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/feca611a30ea9f073677a4e4547298c7fe4ed4d0) | 补录近期提交，并将 SOCKS4 目标解析测试归入 DNS 分类。 |
 | [`f718300`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f718300b18fccb5678d3f8bdff9bf9620274fc34) | 从 README 的 SOCKS5 出站简介中删除测试范围说明。 |
 | [`6b2845c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/6b2845c6dba75bc126bafd048c58ffad24d30497) | 调整 README 中 SOCKS5 出站简介的排版，去除列表格式。 |
 | [`984cf05`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/984cf0595be20b6cbdc1a3e7fa209958e47a6fb1) | 将住宅代理分类改为 SOCKS5 出站，并把简介收紧到预连接与缓冲区调优。 |
