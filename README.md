@@ -2,12 +2,6 @@
 
 **平台：** macOS arm64 · Linux amd64
 
-## [构建与完整功能集](docs/BUILD-PROFILES.md)
-
-macOS 客户端与 Linux 服务端都采用 upstream 官方的完整 registry 与 build-tag profile，不再维护本 fork 专属的协议白名单。
-upstream 新增协议、endpoint、DNS transport、service 或证书提供者时会被自动继承，无需再手工维护一份 allowlist。
-本 fork 只在 upstream 源码之上维护自己的协议、传输、正确性与性能优化。唯一例外是 Clash API：它因控制面架构决策被移除，而非为缩减体积。
-
 ## [MASQUE](docs/commits/masque.md)
 
 保留 H2 / H3 MASQUE 与 CONNECT-IP，共用现有 HTTP / QUIC 传输层。  
