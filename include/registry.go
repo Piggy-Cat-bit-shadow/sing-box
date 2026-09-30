@@ -1,5 +1,3 @@
-//go:build !jiejie_server_minimal && !jiejie_client_macos
-
 package include
 
 import (
@@ -93,6 +91,7 @@ func OutboundRegistry() *outbound.Registry {
 	group.RegisterURLTest(registry)
 
 	socks.RegisterOutbound(registry)
+	http.RegisterOutbound(registry)
 	shadowsocks.RegisterOutbound(registry)
 	snell.RegisterOutbound(registry)
 	vmess.RegisterOutbound(registry)
