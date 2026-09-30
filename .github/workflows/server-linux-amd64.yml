@@ -191,7 +191,7 @@ jobs:
         # (Naive differential, HCL/UoT, H3, ACL, MASQUE, resource, lifecycle) to run
         # nine in-memory assertions: 0.47s of test for a ~20s step.
         #
-        # They now live in `test/contract/serverminimal`, a package containing nothing
+        # They now live in `test/contract/server`, a package containing nothing
         # but these contracts, so the step compiles what it runs. The tests were MOVED,
         # not copied - there is one definition of each, and `git log --follow` traces
         # them. No assertion was dropped: the set was enumerated with
@@ -205,7 +205,7 @@ jobs:
           set -euo pipefail
           TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           cd test
-          go test -tags "$TAGS" -count=1 -timeout 5m -v ./contract/serverminimal/
+          go test -tags "$TAGS" -count=1 -timeout 5m -v ./contract/server/
           echo "PASS: production registry and topology contract tests"
 
       # -----------------------------------------------------------------------
@@ -225,9 +225,14 @@ jobs:
           ./"$BINARY" version
           file "$BINARY"
 
-          # The binary must report the version and the tags its files declare. A
-          # tag-file edit the build ignored would otherwise go unnoticed, which is
-          # exactly how a missing registry tag once survived a green build.
+          # The binary must report the version and EXACTLY the tags its file
+          # declares. Equality is the whole contract: a tag-file edit the build
+          # ignored, or a build that quietly added or dropped a tag, both show up as
+          # a difference. A narrower assertion list would not, which is why the
+          # former "must not carry" checks were removed - two of them
+          # (with_tailscale, with_openvpn) directly contradicted the official tag
+          # file, and `! cmd` under `set -e` does not abort on failure, so they could
+          # never have caught anything.
           ./"$BINARY" version | grep -F "$VERSION"
           reported="$(./"$BINARY" version | sed -n 's/^Tags: //p')"
           expected="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
@@ -237,21 +242,15 @@ jobs:
             echo "  expected: $expected" >&2
             exit 1
           fi
-          # The production server must not carry component tags it does not use.
-          ! ./"$BINARY" version | grep -F "with_tailscale"
-          ! ./"$BINARY" version | grep -F "with_openvpn"
-          ! ./"$BINARY" version | grep -F "with_naive_outbound"
           echo "PASS: version and tags agree with release/"
 
       - name: config check
         # Checks the REAL production topology, which is the config this server
-        # exists to run. If a registry trim removed something the topology needs,
-        # this fails here rather than on the VPS.
+        # exists to run. If the build failed to register something the topology
+        # needs, this fails here rather than on the VPS.
         #
         # It deliberately does NOT check release/config/config.json: that is the
-        # upstream stock example, and Server Minimal correctly rejects it
-        # ("unknown transport type: tls") because the trim removes DNS transports
-        # this topology does not use.
+        # upstream stock example and is not this product's configuration contract.
         run: |
           set -euo pipefail
           topology="release/jiejie-production-topology.json"
@@ -279,10 +278,9 @@ jobs:
         # proves the configuration parses; this proves the process runs, binds its
         # listener, accepts a connection and shuts down cleanly.
         #
-        # There is deliberately NO API readiness probe: Server Minimal registers no
-        # service at all - no Clash API, no native API - because the production
-        # topology uses none. Readiness is observed the way an operator would
-        # observe it: the listener accepts.
+        # Readiness is observed the way an operator would observe it: the proxy
+        # listener accepts. The config below deliberately declares no service, so the
+        # smoke does not depend on one being registered.
         run: |
           set -euo pipefail
           workdir="$(mktemp -d)"
@@ -359,9 +357,9 @@ jobs:
           echo "package graph: $(wc -l < /tmp/deps.txt) packages"
           failed=0
 
-          # MUST be in the graph. These are the components the retired pruning
-          # architecture used to remove; if any of them disappears again, the fork
-          # has silently reverted to a narrower profile.
+          # MUST be in the graph. These are the components the retired product
+          # registry used to withhold; if any disappears again, the profile has
+          # silently narrowed.
           required=(
             "github.com/sagernet/sing-box/protocol/hysteria"
             "github.com/sagernet/sing-box/protocol/hysteria2"
@@ -426,7 +424,7 @@ jobs:
           mkdir -p "$OUT"
           cp "$BINARY" "$OUT/sing-box-linux-amd64"
           cp LICENSE "$OUT/LICENSE"
-          ./scripts/ci/build-info.sh "$OUT/BUILD-INFO-LINUX.txt" linux amd64 server-minimal "$OUT/sing-box-linux-amd64"
+          ./scripts/ci/build-info.sh "$OUT/BUILD-INFO-LINUX.txt" linux amd64 server "$OUT/sing-box-linux-amd64"
           # A standalone .sha256 beside the binary, so an operator can verify a
           # download without parsing a manifest.
           source scripts/ci/lib.sh

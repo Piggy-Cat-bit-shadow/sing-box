@@ -27,10 +27,15 @@ eval "$(./scripts/ci/version.sh)"
 # The aliases exist so a caller can name the product rather than the tag file.
 # Both products now use upstream's own feature profiles; the only difference
 # between them is the profile upstream itself selects for that platform.
+#
+# `server-minimal` is accepted as a legacy alias only. The product is not minimal any
+# more - it carries the full upstream registry - so the canonical name is `server`,
+# and that is what the workflows emit.
 tags_file=""
 case "$flavor" in
-  server|server-minimal)   tags_file="release/DEFAULT_BUILD_TAGS_OTHERS" ;;
+  server)                  tags_file="release/DEFAULT_BUILD_TAGS_OTHERS" ;;
   macos|client-macos)      tags_file="release/DEFAULT_BUILD_TAGS" ;;
+  server-minimal)          tags_file="release/DEFAULT_BUILD_TAGS_OTHERS" ;;
 esac
 if [ -z "$tags_file" ] || [ ! -f "$tags_file" ]; then
   echo "build-info.sh: unknown flavor '$flavor' (no tag file)" >&2

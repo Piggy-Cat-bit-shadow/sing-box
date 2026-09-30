@@ -1,4 +1,4 @@
-package serverminimal_test
+package server_test
 
 import (
 	"context"
@@ -75,7 +75,7 @@ func fixtureCertificates(t *testing.T) (certPath, keyPath string) {
 	return certPath, keyPath
 }
 
-// This file proves the Server Minimal profile can actually BUILD the Native Naive
+// This file proves the server profile can actually BUILD the Native Naive
 // inbound, not merely resolve its type name.
 //
 // # Why presence-of-a-type is not enough
@@ -173,19 +173,19 @@ func buildFixtureInbound(t *testing.T, tag string) adapter.Inbound {
 	instance, err := registry.Create(
 		context.Background(), nil, log.NewNOPFactory().Logger(), tag, "naive", options)
 	require.NoError(t, err,
-		"the Server Minimal registry must be able to CONSTRUCT the production Native "+
+		"the server registry must be able to CONSTRUCT the production Native "+
 			"Naive inbound; a decode-only check would miss a constructor that fails")
 	require.NotNil(t, instance)
 	return instance
 }
 
-// TestServerMinimalBuildsNativeNaiveInbound builds the fixture's `naive-in` through
+// TestServerBuildsNativeNaiveInbound builds the fixture's `naive-in` through
 // the shipped registry and starts it.
 //
 // This is the assertion that fails at the level an operator experiences the problem -
 // "the binary cannot run my configuration" - rather than only at the level the
 // registry reports.
-func TestServerMinimalBuildsNativeNaiveInbound(t *testing.T) {
+func TestServerBuildsNativeNaiveInbound(t *testing.T) {
 	instance := buildFixtureInbound(t, "naive-in")
 	defer instance.Close()
 
@@ -204,10 +204,10 @@ func TestServerMinimalBuildsNativeNaiveInbound(t *testing.T) {
 	require.NoError(t, instance.Close())
 }
 
-// TestServerMinimalNativeNaiveInboundKeepsProductionShape pins the options that reach
+// TestServerNativeNaiveInboundKeepsProductionShape pins the options that reach
 // the constructor, so a fixture edit cannot quietly weaken what this profile builds
 // while every other test still passes.
-func TestServerMinimalNativeNaiveInboundKeepsProductionShape(t *testing.T) {
+func TestServerNativeNaiveInboundKeepsProductionShape(t *testing.T) {
 	raw := loadFixtureInboundJSON(t, "naive-in")
 
 	var shape struct {
@@ -246,7 +246,7 @@ func TestServerMinimalNativeNaiveInboundKeepsProductionShape(t *testing.T) {
 			"dead port")
 }
 
-// TestServerMinimalNaiveOptionsCarryForkFeatures pins that the fork-specific Naive
+// TestServerNaiveOptionsCarryForkFeatures pins that the fork-specific Naive
 // work is still compiled into this profile's options type.
 //
 // The capabilities below are why this inbound is a maintained production capability
@@ -258,7 +258,7 @@ func TestServerMinimalNativeNaiveInboundKeepsProductionShape(t *testing.T) {
 // behavioural coverage - UoT, padding, masquerade, target ACL, ALPN isolation,
 // receive windows, lifecycle and half-close - remains in protocol/naive and the
 // jiejie suite, which the deep check runs.
-func TestServerMinimalNaiveOptionsCarryForkFeatures(t *testing.T) {
+func TestServerNaiveOptionsCarryForkFeatures(t *testing.T) {
 	options, loaded := include.InboundRegistry().CreateOptions("naive")
 	require.True(t, loaded)
 

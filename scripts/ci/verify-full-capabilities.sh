@@ -1,30 +1,47 @@
 #!/usr/bin/env bash
-# Verifies that a built binary really carries the full upstream feature profile.
+# Representative runtime capability smoke for a built binary.
 #
 # Usage: verify-full-capabilities.sh <binary> [config-dir]
 #
-# # What this replaces
+# # What this is, precisely
 #
-# This fork used to ship a product-specific registry and a matching audit whose job
-# was to prove that capabilities were ABSENT: Hysteria2 absent, TUIC absent, the
-# Clash API absent, a protocol's server role absent, and so on. Those assertions
-# were the contract for a pruning architecture that no longer exists.
+# This is a RUNTIME, construction-level smoke over a representative sample of the
+# feature set: 50 capabilities covering outbound and inbound protocols, DNS
+# transports, endpoints and services. Each one builds a minimal but valid
+# configuration and resolves it through the binary's own registry with
+# `sing-box check`.
 #
-# The contract is now the opposite one. The binary is expected to carry the complete
-# upstream registry, so what needs proving is that capabilities are PRESENT. A
-# regression here is silent: a narrower tag set still produces a working binary, and
-# nothing would notice that the shipped core had lost part of its protocol surface.
+# It is NOT a proof that the binary carries the COMPLETE upstream registry, and it
+# does not claim to be. The exhaustive, compile-time presence proof is the
+# `go list -deps` audit in the Linux workflow, which asserts ~28 specific packages
+# (including components this script does not cover, such as the derp service, the
+# resolved/origin_ca/ssmapi services and caddyserver/certmagic) are linked. Between
+# them: deps proves what is COMPILED, this proves what the binary will ACCEPT.
+#
+# # What it deliberately does not do
+#
+# It does not claim any of these capabilities interoperate over a live network. That
+# needs real peers, and it is covered by the protocol regression suites.
+#
+# It also does not fabricate configurations that cannot be legitimately constructed
+# in CI. Two places where that boundary was hit are recorded rather than papered
+# over: OpenVPN is exercised in static_key mode because TLS mode would need a real
+# PKI, and the MASQUE endpoints use a throwaway self-signed certificate. Nothing
+# here is a credential.
 #
 # # Why config-level rather than symbol-level
 #
 # The shipped macOS artifact is stripped (-s -w), so `go tool nm` cannot read it. The
-# check therefore goes through the same path an operator uses: build a minimal but
-# valid configuration for each capability and let `sing-box check` resolve it through
-# the real registry. That exercises the registry, the option schema and each
-# constructor's validation, which is exactly what "the capability is present" means.
+# check therefore goes through the same path an operator uses: resolve a config
+# through the real registry. That exercises the registry, the option schema and each
+# constructor's validation, which is what "the capability is present" means.
 #
-# It deliberately does NOT claim these capabilities interoperate over a live network.
-# That requires real peers and is covered by the protocol regression suites.
+# # What this replaces
+#
+# The previous audit's job was to prove that capabilities were ABSENT: Hysteria2
+# absent, TUIC absent, the Clash API absent, a protocol's server role absent. Those
+# assertions were the contract for a product registry that no longer exists, and the
+# contract is now the opposite one.
 set -euo pipefail
 
 binary="${1:?usage: verify-full-capabilities.sh <binary> [config-dir]}"
@@ -92,6 +109,9 @@ for spec in \
   "outbound-shadowsocks:{\"type\":\"shadowsocks\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"method\":\"2022-blake3-aes-128-gcm\",\"password\":\"AAAAAAAAAAAAAAAAAAAAAA==\"}" \
   "outbound-socks:{\"type\":\"socks\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1}" \
   "outbound-http:{\"type\":\"http\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1}" \
+  "outbound-hysteria2:{\"type\":\"hysteria2\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"password\":\"p\",\"tls\":{\"enabled\":true,\"server_name\":\"example.com\"}}" \
+  "outbound-tuic:{\"type\":\"tuic\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"uuid\":\"00000000-0000-0000-0000-000000000000\",\"password\":\"p\",\"tls\":{\"enabled\":true,\"server_name\":\"example.com\"}}" \
+  "outbound-snell:{\"type\":\"snell\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"psk\":\"p\",\"version\":4}" \
   "outbound-shadowtls:{\"type\":\"shadowtls\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"version\":3,\"password\":\"p\",\"tls\":{\"enabled\":true,\"server_name\":\"example.com\"}}" \
   "outbound-anytls:{\"type\":\"anytls\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"password\":\"p\",\"tls\":{\"enabled\":true,\"server_name\":\"example.com\"}}" \
   "outbound-tor:{\"type\":\"tor\",\"tag\":\"o\"}" \
@@ -147,9 +167,28 @@ for spec in \
   check_config "$name" "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"dns\":{\"servers\":[{\"tag\":\"fallback\",\"type\":\"local\"},$body],\"final\":\"fallback\"}}"
 done
 
-echo "== endpoints / services =="
+echo "== endpoints =="
 check_config "endpoint-wireguard" \
   "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"wireguard\",\"tag\":\"wg\",\"address\":[\"10.0.0.2/32\"],\"private_key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"peers\":[{\"address\":\"127.0.0.1\",\"port\":51820,\"public_key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"allowed_ips\":[\"0.0.0.0/0\"]}]}]}"
+check_config "endpoint-tailscale" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"tailscale\",\"tag\":\"ts\"}]}"
+check_config "endpoint-masque-client" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"masque-client\",\"tag\":\"mc\",\"server\":\"127.0.0.1\",\"server_port\":443,\"tls\":{\"enabled\":true,\"server_name\":\"example.com\"}}]}"
+check_config "endpoint-masque-server" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"masque-server\",\"tag\":\"ms\",\"listen\":\"127.0.0.1\",\"listen_port\":4443,\"address\":[\"10.0.0.1/24\"],\"tls\":{\"enabled\":true,\"certificate_path\":\"$cert_dir/cert.pem\",\"key_path\":\"$cert_dir/key.pem\"}}]}"
+check_config "endpoint-openconnect" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"openconnect\",\"tag\":\"oc\",\"server\":\"127.0.0.1\"}]}"
+
+# OpenVPN is modelled in static_key mode: TLS mode would need a real PKI, so this
+# stays a construction-level smoke rather than a fabricated handshake config. The
+# key is generated per run and is deliberately not a credential.
+ovpn_key="$(openssl rand -base64 256 | tr -d '\n')"
+check_config "endpoint-openvpn-client" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"openvpn-client\",\"tag\":\"ov\",\"servers\":[{\"server\":\"127.0.0.1\",\"server_port\":1194}],\"mode\":\"static_key\",\"address\":[\"10.8.0.2/24\"],\"peer_address\":\"10.8.0.1\",\"cipher\":\"AES-256-CBC\",\"static_key\":[\"$ovpn_key\"]}]}"
+check_config "endpoint-openvpn-server" \
+  "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"endpoints\":[{\"type\":\"openvpn-server\",\"tag\":\"ovs\",\"listen\":\"127.0.0.1\",\"listen_port\":1194,\"mode\":\"static_key\",\"address\":[\"10.8.0.1/24\"],\"peer_address\":\"10.8.0.2\",\"remote\":\"127.0.0.1\",\"remote_port\":1195,\"cipher\":\"AES-256-CBC\",\"static_key\":[\"$ovpn_key\"]}]}"
+
+echo "== services =="
 check_config "service-api" \
   "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"}],\"services\":[{\"type\":\"api\",\"tag\":\"api\",\"listen\":\"127.0.0.1\",\"listen_port\":19090}]}"
 

@@ -1,4 +1,4 @@
-package serverminimal_test
+package server_test
 
 import (
 	"encoding/json"
@@ -389,7 +389,7 @@ func TestProductionFixtureHasNoSecrets(t *testing.T) {
 // forwardproxy@udpintcp had replaced all Native Naive usage in this deployment.
 //
 // The assumption was wrong. The real server configuration still declares a `naive`
-// inbound, and the Server Minimal binary built while this test demanded its absence
+// inbound, and the server binary built while this test demanded its absence
 // rejected that configuration at startup with `unknown inbound type: naive`. A
 // fixture that under-describes production is worse than stale documentation, because
 // the contract tests are what CI trusts - it let CI certify a binary that could not

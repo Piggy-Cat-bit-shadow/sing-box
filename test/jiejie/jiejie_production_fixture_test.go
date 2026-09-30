@@ -11,7 +11,7 @@ import (
 // release/jiejie-production-topology.json from this package.
 //
 // The product-contract assertions on the same fixture moved to
-// test/contract/serverminimal, which compiles only the contracts. This file keeps the
+// test/contract/server, which compiles only the contracts. This file keeps the
 // minimal model needed by the integration tests that REMAIN here and still read the
 // fixture - currently the Naive self-hosted rule-shape check, which pins the shipped
 // rule shape so the runtime tests cannot drift from production.

@@ -14,7 +14,7 @@
 #
 # That means every capability upstream adds is inherited automatically. There is
 # no fork-side list to update when upstream registers a new protocol, which was
-# the whole point of retiring the pruning architecture.
+# the whole point of retiring the product registry.
 #
 # The single deviation from upstream's tag file is the removal of
 # `with_clash_api`, which no longer names any file: the Clash API was deleted

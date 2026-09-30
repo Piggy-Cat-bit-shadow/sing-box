@@ -867,9 +867,9 @@ func TestJiejieMinimalAnyTLSFallback(t *testing.T) {
 //     a shadowsocks inbound. It fails if the detour ever regresses to an
 //     outbound such as "direct".
 //
-//  2. TestJiejieMinimalShadowTLSInboundRegisters proves the minimal registry
-//     can actually construct the server side of both inbounds, which is what the
-//     registry trim could plausibly break; the wire-level half is covered by the
+//  2. TestJiejieMinimalShadowTLSInboundRegisters proves the registry
+//     can actually construct the server side of both inbounds, which is what a
+//     registry change could plausibly break; the wire-level half is covered by the
 //     upstream TestShadowTLS / TestChainedInbound suites in the client-feature
 //     group, which run under the default tag set where the ShadowTLS outbound
 //     exists.

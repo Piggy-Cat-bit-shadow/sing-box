@@ -204,7 +204,7 @@ jobs:
         #
         # This replaced a symbol audit whose contract was the opposite one: it
         # asserted that Hysteria2, TUIC, the Clash API and various server roles were
-        # ABSENT. Those assertions belonged to the retired pruning architecture.
+        # ABSENT. Those assertions belonged to the retired product-registry model.
         run: |
           set -euo pipefail
           ./scripts/ci/verify-full-capabilities.sh "$BINARY"

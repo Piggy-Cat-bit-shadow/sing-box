@@ -544,7 +544,7 @@ func loadTestCertificate(certPath, keyPath string) (*tls.Config, error) {
 // drift. It was decoupled for a while, when the fixture was believed to have no
 // naive inbound.
 //
-// That belief was wrong: Native Naive IS part of the Server Minimal profile, because
+// That belief was wrong: Native Naive IS part of the server profile, because
 // the live production configuration declares a `naive` inbound. The fixture now
 // declares it again, and TestProductionFixtureDeclaresNativeNaive pins it there.
 //
