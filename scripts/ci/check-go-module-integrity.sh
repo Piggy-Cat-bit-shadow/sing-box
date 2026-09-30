@@ -189,17 +189,30 @@ for module in "${CHECKED_MODULES[@]}"; do
 
     # go.mod / go.sum must already be canonical. -diff never writes to the tree.
     #
-    # NOTE: `go mod tidy -diff` prints the required changes but can still exit 0, so its
-    # EXIT CODE ALONE IS NOT A VERDICT. The output must be inspected too.
-    if ! tidy_diff="$(cd "$dir" && GOWORK=off go mod tidy -diff 2>&1)"; then
-        fail "${label}: go mod tidy -diff reported drift; go.mod/go.sum are not canonical"
-        printf '%s\n' "$tidy_diff" | sed 's/^/      /' >&2
+    # Two things make the naive version of this check wrong, and both were hit for real:
+    #
+    #   1. `go mod tidy -diff` can print the required changes and still exit 0, so the exit
+    #      status alone is not a verdict.
+    #   2. It writes the ACTUAL DIFF to stdout, but progress noise -- "go: downloading ..."
+    #      on a cold module cache -- goes to stderr. Merging the two with 2>&1 makes any
+    #      download look like drift, so a clean tree fails on the first CI run.
+    #
+    # So: capture stdout ONLY, and treat a non-empty result as drift. Stderr is preserved
+    # and shown when the command itself fails, which is where genuine errors appear.
+    tidy_stderr="$(mktemp)"
+    tidy_rc=0
+    tidy_diff="$(cd "$dir" && GOWORK=off go mod tidy -diff 2>"$tidy_stderr")" || tidy_rc=$?
+
+    if [ "$tidy_rc" -ne 0 ]; then
+        fail "${label}: go mod tidy -diff failed to run (exit ${tidy_rc})"
+        sed 's/^/      /' "$tidy_stderr" >&2
     elif [ -n "$tidy_diff" ]; then
-        fail "${label}: go mod tidy -diff reported drift; go.mod/go.sum are not canonical"
+        fail "${label}: go mod tidy -diff reports drift; go.mod/go.sum are not canonical"
         printf '%s\n' "$tidy_diff" | sed 's/^/      /' >&2
     else
         echo "  ok: go mod tidy -diff is clean"
     fi
+    rm -f "$tidy_stderr"
 
     # Downloaded module content must match go.sum. Opt-in: see the note at the top.
     if [ "$RUN_VERIFY" -eq 1 ]; then
