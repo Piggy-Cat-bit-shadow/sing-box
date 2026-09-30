@@ -208,8 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/ci/verify-full-capabilities.sh "$BINARY"
-          echo "PASS: full upstream feature profile verified""
-
+          echo "PASS: full upstream feature profile verified"
 
       - name: write BUILD-INFO and SHA256
         run: |

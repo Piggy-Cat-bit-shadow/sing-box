@@ -383,7 +383,7 @@ jobs:
             "github.com/sagernet/sing-box/service/ssmapi"
             "github.com/sagernet/sing-box/service/api"
             "github.com/sagernet/sing-box/dns/transport/quic"
-            "github.com/sagernet/sing-box/tailscale"
+            "github.com/sagernet/sing-box/protocol/tailscale"
             "github.com/caddyserver/certmagic"
             # The capabilities this fork actually serves must survive too.
             "github.com/sagernet/sing-box/protocol/http"
