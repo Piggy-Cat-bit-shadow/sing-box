@@ -7,7 +7,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,6 +52,14 @@ import (
 type connIdentityClient struct {
 	*Client
 	impl *http3ClientImpl
+	// dials counts UDP dials made by this client's own dialer, which is the authoritative
+	// measure of replacement dials.
+	dials *countingUDPDialer
+}
+
+// replacementDialCount reports how many UDP dials this client has performed in total.
+func (c *connIdentityClient) replacementDialCount() int64 {
+	return c.dials.count.Load()
 }
 
 func (c *connIdentityClient) currentConn() *http3.ClientConn {
@@ -231,12 +241,33 @@ func TestHTTP3LateFailureDoesNotEvictReplacement(t *testing.T) {
 // TestHTTP3ConcurrentReconnectAgainstStaleConnection exercises the herd.
 //
 // Many concurrent CONNECTs arrive while the cached connection is already dead. The requirements
-// are that every caller terminates with a clear outcome, that the pool ends up pointing at ONE
-// healthy connection, and that the client does not stampede into an unbounded number of dials.
+// are that every caller terminates with a clear outcome, that the cache ends up pointing at ONE
+// healthy connection, and that the client performs EXACTLY ONE replacement dial.
 //
-// It asserts STATE, not wall-clock time: how many connections exist, whether all callers finished,
-// and whether the surviving connection is healthy. No timing threshold appears here, because a
-// slow CI box is not a bug.
+// # Why the expected dial count is exactly 1, and where extra connections may legitimately come from
+//
+// The cache holds a SINGLE connection per client. acquire() holds c.access across the entire dial
+// -- candidate selection, the QUIC handshake, and the install of the resulting ClientConn -- so a
+// burst of callers that all find the cache empty cannot dial concurrently: the first takes the
+// lock, the rest block on it and then observe the connection the first one installed.
+//
+// Therefore, for one client, one cache key and one generation, the answer is exactly one dial.
+// There is no legitimate second connection inside this test, which is why it asserts equality
+// rather than an upper bound. An earlier revision asserted `<= 4` and explained the slack as "not
+// a stampede"; that bound was invented rather than measured, and it would have accepted genuine
+// over-dialing as a pass.
+//
+// Multiple connections DO legitimately exist ACROSS the process, and that is a different axis:
+// every outbound that speaks HTTP/3 constructs its own transport/http.Client (see
+// NewClientWithTLS callers in protocol/masque and protocol/http), and each client owns its own
+// http3ClientImpl and therefore its own single-connection cache. So a process with a MASQUE
+// outbound and a plain HTTP outbound has two independent HTTP/3 connections, each of which still
+// coalesces strictly on its own. This test deliberately covers one client, because mixing several
+// would measure the wiring of independent caches rather than the coalescing of one.
+//
+// It asserts STATE, not wall-clock time: dial counts, connection identity, and whether the
+// surviving connection is healthy. No timing threshold appears here, because a slow CI box is not
+// a bug.
 func TestHTTP3ConcurrentReconnectAgainstStaleConnection(t *testing.T) {
 	t.Parallel()
 
@@ -249,6 +280,10 @@ func TestHTTP3ConcurrentReconnectAgainstStaleConnection(t *testing.T) {
 
 	connA := client.currentConn()
 	require.NotNil(t, connA)
+
+	// Baseline for the coalescing assertion below: the warm-up dial above is not a replacement.
+	dialsBeforeReplacement := client.replacementDialCount()
+
 	server.killConnections()
 	require.Eventually(t, func() bool {
 		return connA.Context().Err() != nil
@@ -298,12 +333,24 @@ func TestHTTP3ConcurrentReconnectAgainstStaleConnection(t *testing.T) {
 	require.NoError(t, survivor.Context().Err(), "the surviving connection must be healthy")
 	require.NotSame(t, connA, survivor, "the dead connection must not have survived the herd")
 
-	// Bounded dialing: 32 simultaneous callers must not produce 32 QUIC connections. acquire()
-	// holds the client lock across the dial, so the losers wait and reuse the winner.
-	connections := server.connectionCount()
-	require.LessOrEqual(t, connections, 4,
-		"concurrent reconnects must be coalesced rather than stampeding; got %d connections for "+
-			"%d callers", connections, callers)
+	// STRICT coalescing. acquire() holds the client lock across the WHOLE dial -- candidate
+	// selection, handshake, and the install of the resulting ClientConn -- so 32 callers that
+	// arrive while the cache is empty must produce EXACTLY ONE replacement dial: the first takes
+	// the lock, the other 31 block on it and then find a live connection.
+	//
+	// The count is taken from the CLIENT'S OWN dialer, which is the authoritative measure. A
+	// server-side count cannot distinguish "the client dialed twice" from "one dial produced two
+	// connections at the server" (a retry at the QUIC layer, a stray probe), and it is the client
+	// behaviour that this test is about.
+	//
+	// An earlier revision of this test asserted `<= 4` and explained the slack as "not a
+	// stampede". That number was invented, not measured: the real count is 1, and a loose bound
+	// would have accepted genuine over-dialing (two or three replacement dials) as a pass.
+	replacementDials := client.replacementDialCount() - dialsBeforeReplacement
+	require.Equal(t, int64(1), replacementDials,
+		"32 concurrent CONNECTs against one dead connection must coalesce into exactly ONE "+
+			"replacement dial; acquire() serializes the whole dial, so anything higher means the "+
+			"cache is being populated more than once for the same key and generation")
 
 	// And the survivor must really work.
 	final := client.dialTunnel(t, "target.example:443")
@@ -431,6 +478,24 @@ func startKillableTunnelServer(t *testing.T) *killableTunnelServer {
 	return server
 }
 
+// countingUDPDialer is a connected UDP dialer that counts how many dials it performed.
+//
+// It embeds the behaviour of connectedUDPDialer rather than replacing it, so the dial semantics
+// under test are unchanged and only the count is added.
+type countingUDPDialer struct {
+	count atomic.Int64
+}
+
+func (d *countingUDPDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	d.count.Add(1)
+	return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(
+		netip.AddrPortFrom(destination.Addr, destination.Port)))
+}
+
+func (d *countingUDPDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return net.ListenUDP("udp", nil)
+}
+
 // newConnIdentityClient builds a real HTTP/3 client against a loopback server, exposing the
 // implementation so tests can read and invalidate the cached connection by identity.
 func newConnIdentityClient(t *testing.T, address string) *connIdentityClient {
@@ -444,8 +509,9 @@ func newConnIdentityClient(t *testing.T, address string) *connIdentityClient {
 		})
 	require.NoError(t, err)
 
+	dials := &countingUDPDialer{}
 	impl := &http3ClientImpl{
-		dialer:    &connectedUDPDialer{},
+		dialer:    dials,
 		server:    M.ParseSocksaddr(address),
 		authority: address,
 		tlsConfig: clientTLS,
@@ -460,15 +526,16 @@ func newConnIdentityClient(t *testing.T, address string) *connIdentityClient {
 
 	return &connIdentityClient{
 		Client: &Client{
-			dialer:            &connectedUDPDialer{},
-			http1Dialer:       &connectedUDPDialer{},
+			dialer:            dials,
+			http1Dialer:       dials,
 			authorityOverride: address,
 			version:           3,
 			server:            M.ParseSocksaddr(address),
 			http3:             impl,
 			http3Authority:    address,
 		},
-		impl: impl,
+		impl:  impl,
+		dials: dials,
 	}
 }
 
