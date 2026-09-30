@@ -24,8 +24,6 @@ Outbound payload 改为 ownership-transfer zero-copy，减少 payload copy 与 p
 TCP 预连接：默认关闭。提前完成建连、SOCKS5 握手和认证；请求到来时只需发送 CONNECT，池为空则立即正常建连。
 复制缓冲区调优：默认关闭。链式转发可更早扩大缓冲区，并按上传、下载各自的写入端决定是否扩容，避免另一方向无谓扩容。
 
-现有测试验证了行为与边界，尚无真实链路的延迟或吞吐数据。
-
 ## [Shadowsocks](docs/shadowsocks.md)
 
 按首包、稳态、上传、下载拆分审计 Shadowsocks 数据路径。  
