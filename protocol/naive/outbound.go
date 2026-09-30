@@ -201,7 +201,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// keeps the platform behaviour exactly as upstream: N engines on macOS, one
 	// engine on iOS. Setting it true is what makes the single-engine + isolation-key
 	// shape selectable on macOS for the A/B described in
-	// docs/JIEJIE-NAIVE-CLIENT-AUDIT.md.
+	// docs/ENGINEERING-NOTES.md.
 	clientOptions := buildCronetNaiveClientOptions(cronetNaiveClientParams{
 		ctx:                     ctx,
 		logger:                  logger,

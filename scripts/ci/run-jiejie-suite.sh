@@ -47,7 +47,7 @@ TIMEOUT="${JIEJIE_TIMEOUT:-1200s}"
 #
 # Contract: TestAuditUoTPaddingContractIsTransportDependent.
 # Structural guard: TestNoHTTP1TunnelWritesPaddedFrames.
-# Retraction of record: docs/JIEJIE-NAIVE-UOT-FALSE-P0.md.
+# The former UoT failure was a test-framing false positive; see docs/ENGINEERING-NOTES.md.
 KNOWN_FAILURES=()
 
 echo "==> test/jiejie with tags: $TAGS (timeout $TIMEOUT)"

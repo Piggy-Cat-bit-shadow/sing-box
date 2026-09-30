@@ -10,9 +10,8 @@ import (
 //
 //	/.well-known/masque/udp/{target_host}/{target_port}/
 //
-// and it is the only one this server accepts; see the scope note in
-// docs/JIEJIE-MASQUE-REFERENCE-AUDIT.md for why arbitrary templates are not
-// configurable here.
+// and it is the only one this server accepts. Arbitrary templates are outside
+// the current CONNECT-UDP parser's scope.
 //
 // The corpus pins the parser's decisions rather than asserting a preference, so a
 // future change to any of them is visible in review.

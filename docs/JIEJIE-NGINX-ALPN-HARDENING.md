@@ -187,7 +187,7 @@ change.
 - HTTP/3 and MASQUE have protocol-observable capabilities (QUIC, SETTINGS,
   `H3_DATAGRAM`, Extended CONNECT). Those are visible on UDP/443 by design and
   no Nginx rule changes that. See
-  [JIEJIE-PROBE-RESISTANCE-MATRIX.md](JIEJIE-PROBE-RESISTANCE-MATRIX.md).
+  [ENGINEERING-NOTES.md](ENGINEERING-NOTES.md#探测伪装与部署边界).
 - Because there is no production Nginx configuration in this repository, **none
   of the above is applied by any build, test or CI job in this repo.** It is an
   operator-facing hardening step that must be applied and verified on the

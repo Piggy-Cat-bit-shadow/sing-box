@@ -375,7 +375,8 @@ recorded so the server baseline is not mistaken for a clean run.
 > as pre-existing Naive UoT failures with an `EOF` during the handshake. That was
 > **wrong**. Both were failures of the TEST HARNESS, not the product: they framed an
 > HTTP/1 CONNECT payload as Naive padded data, and HTTP/1 is a raw tunnel. They now
-> pass. See [JIEJIE-NAIVE-UOT-FALSE-P0.md](JIEJIE-NAIVE-UOT-FALSE-P0.md).
+> pass. The failures came from test framing: HTTP/1 CONNECT carries raw payloads,
+> even when the request includes a Padding header. The transport matrix tests now pin this rule.
 
 ### What is green
 

@@ -236,4 +236,4 @@ echo "Compare throughput against the window size. If the last two rows are equal
 echo "within noise, the larger window is not buying throughput and a lower default"
 echo "would bound per-connection memory at no cost. If 128MiB is clearly ahead, it"
 echo "stays. Record the machine, the server and the path RTT in"
-echo "docs/JIEJIE-NAIVE-CLIENT-AUDIT.md."
+echo "the experiment record."

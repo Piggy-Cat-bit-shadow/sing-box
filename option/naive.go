@@ -125,7 +125,7 @@ type NaiveOutboundOptions struct {
 	// considering a default flip, and a measurement needs a build that can select
 	// each shape. This option is that switch.
 	//
-	// See docs/JIEJIE-NAIVE-CLIENT-AUDIT.md for the A/B method and for why the
+	// See docs/ENGINEERING-NOTES.md for the A/B boundary and why the
 	// macOS default was left unchanged.
 	InsecureConcurrencySingleEngine bool                     `json:"insecure_concurrency_single_engine,omitempty"`
 	ExtraHeaders                    badoption.HTTPHeader     `json:"extra_headers,omitempty"`

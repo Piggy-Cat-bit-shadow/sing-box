@@ -257,7 +257,7 @@ rejected at config load. A test asserts this enum matches the profiles the
 dependency actually defines, so it cannot silently drift.
 
 Changing this profile is **unmeasured** on this server. Treat it as an A/B
-experiment (see [JIEJIE-BENCHMARK.md](JIEJIE-BENCHMARK.md)); do not assume
+experiment (see [ENGINEERING-NOTES.md](ENGINEERING-NOTES.md#维护原则)); do not assume
 `aggressive` is faster.
 
 ## 7. `unauthenticated_limits`
@@ -756,14 +756,12 @@ This fork does **not** claim that any option makes the server faster. The
 benchmarks in CI are regression references on shared runners, and loopback
 numbers do not predict a real path. Whether `size: 2` helps, and by how much,
 is to be determined by your own A/B on the VPS —
-see [JIEJIE-BENCHMARK.md](JIEJIE-BENCHMARK.md).
+see [ENGINEERING-NOTES.md](ENGINEERING-NOTES.md#维护原则).
 
 ## 17. Related documents
 
-* [JIEJIE-PROBE-RESISTANCE-MATRIX.md](JIEJIE-PROBE-RESISTANCE-MATRIX.md) — what
-  each public protocol does for an unauthenticated or wrongly authenticated
-  probe, the resource bounds, and the honest list of what is still
-  protocol-observable.
+* [ENGINEERING-NOTES.md](ENGINEERING-NOTES.md#探测伪装与部署边界) — the scope of
+  probe resistance claims and the boundary between the core and deployment.
 * [JIEJIE-NGINX-ALPN-HARDENING.md](JIEJIE-NGINX-ALPN-HARDENING.md) — the
   operator-side hardening of the Nginx Stream front door for the MASQUE H2 SNI.
   This is a production front-door change, not a sing-box change, and it is not

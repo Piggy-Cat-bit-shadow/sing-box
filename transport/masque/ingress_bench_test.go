@@ -44,7 +44,7 @@ import (
 // strategies directly with no harness in the way, and
 // BenchmarkDatagramIngressEndToEnd is kept only as an integration guard that the
 // real path still runs and still delivers every datagram. The direct benchmarks
-// are where the numbers in docs/JIEJIE-MASQUE-PERFORMANCE.md come from.
+// support the measurement boundary in docs/ENGINEERING-NOTES.md.
 //
 // # Why the returned slice is safe to keep
 //

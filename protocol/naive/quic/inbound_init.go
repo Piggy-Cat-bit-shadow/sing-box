@@ -52,9 +52,8 @@ import (
 // this deployment WANTS different behaviour, that is stated in configuration,
 // where it can be seen, tested and reverted, rather than compiled in.
 //
-// See docs/JIEJIE-NAIVE-H3-AUDIT.md. DisablePathManager is recorded there as a
-// retained difference; making it configurable is what allows the default to go
-// back to reference-like without discarding the production choice.
+// See docs/ENGINEERING-NOTES.md. DisablePathManager is opt-in, so the default
+// follows the library without discarding the deployment choice.
 func nativeNaiveQUICConfig(options option.NaiveInboundOptions) *quic.Config {
 	return &quic.Config{
 		// QUIC versions are pinned EXPLICITLY, matching the reference.

@@ -21,7 +21,7 @@ import (
 // "effectively unlimited" clamp rather than a considered limit; that value was
 // removed so the listener keeps a server-side bound on concurrent HTTP/3 work
 // and matches the reference's library-default behaviour. See
-// docs/JIEJIE-NAIVE-H3-AUDIT.md.
+// docs/ENGINEERING-NOTES.md.
 //
 // These tests record what the setting DOES, so the behaviour stays measured
 // rather than assumed. They do not assert a specific number, and they are written

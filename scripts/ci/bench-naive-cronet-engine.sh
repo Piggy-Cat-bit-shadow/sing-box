@@ -59,7 +59,7 @@
 # It also cannot observe Cronet engine count, HTTP/2 session count, network isolation
 # keys or connection pool count. The single-engine decision rule requires the session
 # count to still reach insecure_concurrency, so that half of the rule is NOT DIRECTLY
-# VERIFIED by this harness - see docs/JIEJIE-NAIVE-CLIENT-AUDIT.md. Do not read a
+# VERIFIED by this harness - see docs/ENGINEERING-NOTES.md. Do not read a
 # favourable throughput row as evidence that isolation holds.
 set -euo pipefail
 
@@ -333,4 +333,4 @@ echo "Compare the two blocks above. Single-engine is worth adopting as the macOS
 echo "default only if throughput and first-CONNECT latency show no meaningful"
 echo "regression AND the session count still reaches insecure_concurrency; the"
 echo "resource figures alone are not sufficient. Record the result in"
-echo "docs/JIEJIE-NAIVE-CLIENT-AUDIT.md, including the machine and server used."
+echo "the experiment record, including the machine and server used."

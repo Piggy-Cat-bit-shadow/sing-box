@@ -32,10 +32,9 @@ import (
 // advertisement is possible (a peer splitting a /8 into many ranges, or a dual-stack
 // split set), which is what the upper end of the sweep represents.
 //
-// The results are recorded in docs/JIEJIE-MASQUE-PERFORMANCE.md and drive the
-// decision. The honest outcome for a handful of routes may well be "leave the
-// linear scan alone": a trie or a pre-normalised lookup table is real complexity,
-// and it must not be added on the theory that it should be faster.
+// The current compiled matcher decision is recorded in docs/ENGINEERING-NOTES.md.
+// Keep measuring before changing it again; route count determines whether a
+// different representation would earn its complexity.
 
 // benchRouteSet builds `count` non-overlapping IPv4 ranges plus a matching prefix
 // list, and returns them together with an address INSIDE the last range (a hit)
