@@ -176,7 +176,12 @@ func (h *shadowsocksDialer) DialContext(ctx context.Context, network string, des
 		if err != nil {
 			return nil, err
 		}
-		return h.method.DialEarlyConn(outConn, destination), nil
+		// Advertise the payload ceiling the in-place framing branch can actually handle.
+		//
+		// Without this the copy loop sizes steady-state buffers from the pooled buf.BufferSize,
+		// which is larger than the in-place limit, so every full buffer takes the COPYING branch.
+		// See stream_mtu.go for the measurement and for why the number is derived.
+		return withStreamMTU(h.method.DialEarlyConn(outConn, destination)), nil
 	case N.NetworkUDP:
 		outConn, err := h.dialer.DialContext(ctx, N.NetworkUDP, h.serverAddr)
 		if err != nil {
