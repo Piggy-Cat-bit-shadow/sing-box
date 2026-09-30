@@ -40,19 +40,26 @@ import (
 // outbound will hand the router. Dialling would be slower, would need a live SOCKS4 server, and
 // would prove less.
 
-// TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer pins the unconfigured half of the rule.
+// TestSOCKS4WithoutDomainResolverHasEmptyTargetPolicy pins the genuinely-unconfigured case.
 //
-// # What this test used to claim, and why that was wrong
+// # What this test proves, stated precisely
+//
+// Without a domain_resolver: the target policy is empty, and the outbound still constructs. That is
+// all. It does NOT prove anything about how the policy is derived, and the name it used to carry --
+// TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer -- claimed a relationship this test never
+// exercises. "SameDialer" is not observable from the assertions below.
+//
+// # The history that makes the distinction matter
 //
 // It previously asserted that an IP server address leaves targetQueryOptions zero "because there is
 // no policy to inherit" -- reading the policy off the outbound dialer, which only exists when the
-// server is a domain. That was the defect, stated as an expectation: the target policy comes from
-// DialerOptions, so it must be derived from those options whether or not the server needs resolving.
+// server is a domain. That was the defect, stated as an expectation. The real rule is that the
+// target policy comes from DialerOptions, so it must be derived from those options whether or not
+// the server needs resolving.
 //
-// What survives is the genuinely-unconfigured case: no domain_resolver, no policy, and the outbound
-// still constructs. The configured case is covered by
-// TestSOCKS4TargetPolicyIsBuiltFromDialerOptions, which fails against the old derivation.
-func TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer(t *testing.T) {
+// The configured case is covered by TestSOCKS4TargetPolicyIsBuiltFromDialerOptions, which fails
+// against the old derivation. This test covers its complement and nothing more.
+func TestSOCKS4WithoutDomainResolverHasEmptyTargetPolicy(t *testing.T) {
 	t.Parallel()
 
 	// A plain IP server with NO domain_resolver configured carries no target policy, and the
@@ -171,7 +178,7 @@ func TestSOCKS4LookupCarriesTheTargetPolicy(t *testing.T) {
 //
 // # What the earlier tests missed, and why this one exists
 //
-// TestSOCKS4TargetPolicyIsDerivedFromTheSameDialer asserts that an IP server address leaves
+// TestSOCKS4WithoutDomainResolverHasEmptyTargetPolicy asserts that an IP server address leaves
 // targetQueryOptions ZERO, and calls that correct: "there is no policy to inherit". That reasoning
 // is the bug. The target policy comes from DialerOptions.DomainResolver, which the operator writes
 // regardless of how the proxy server itself is addressed. Deriving it from whether the server
@@ -223,11 +230,21 @@ func TestSOCKS4TargetPolicyIsBuiltFromDialerOptions(t *testing.T) {
 			"dialer_options.domain_resolver and resolves the target through the default DNS path")
 }
 
-// TestSOCKS4ServerDomainAndTargetShareTheResolver is the matrix row where both names need resolving.
+// TestSOCKS4TargetPolicyConfiguredWhenServerIsDomain covers the row where the proxy server itself is
+// a hostname AND a resolver is configured.
 //
-// It proves the two resolutions agree rather than being independently derived, which is the
-// structural claim: one policy derivation, two consumers.
-func TestSOCKS4ServerDomainAndTargetShareTheResolver(t *testing.T) {
+// # What this test proves, stated precisely
+//
+// That the target policy is non-empty in this configuration. It does NOT prove that the two lookups
+// share one resolver: the assertions below never capture both option sets, so a name claiming they
+// "ShareTheResolver" would assert more than the code checks.
+//
+// Proving the equality would need a fixture that captures the server lookup and the target lookup
+// separately and compares them. That means a live DNS path and a live SOCKS server, for a claim that
+// TestSOCKS4TargetPolicyIsBuiltFromDialerOptions already protects from the other direction (the
+// policy is derived from DialerOptions, so both consumers read the same field by construction).
+// Renaming to match the assertions is the better trade than growing the fixture.
+func TestSOCKS4TargetPolicyConfiguredWhenServerIsDomain(t *testing.T) {
 	ctx, _ := newResolverTestContext(t, "configured-dns")
 
 	instance, err := NewOutbound(

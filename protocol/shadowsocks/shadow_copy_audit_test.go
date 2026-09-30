@@ -27,10 +27,14 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/sagernet/sing-box/adapter/outbound"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
 	shadowss "github.com/sagernet/sing-shadowsocks2"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -267,10 +271,11 @@ func TestShadowSteadyStateUploadAllocations(t *testing.T) {
 func TestShadowSteadyStateWriterCostIsFlatInPayload(t *testing.T) {
 	method := shadowAuditMethod(t, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
 
-	// Sizes bracket the two real boundaries rather than being round numbers:
-	//   maxPacketSize = BufferSize - PacketLengthBufferSize - Overhead*2 = 32768 - 2 - 32 = 32734
-	// so 32 KiB is the largest payload that still frames IN PLACE, and 64 KiB is past it.
-	for _, payloadSize := range []int{1400, 16 << 10, 32734, 32 << 10, 64 << 10} {
+	// Sizes bracket the real boundary rather than being round numbers: the in-place limit is
+	// whatever streamWriterMTU() reports, so the limit and limit+1 cases are derived from it and
+	// cannot drift away from production. 32 KiB and 64 KiB sit either side of it.
+	inPlaceLimit := streamWriterMTU()
+	for _, payloadSize := range []int{1400, 16 << 10, inPlaceLimit, inPlaceLimit + 1, 32 << 10, 64 << 10} {
 		t.Run(itoa(payloadSize), func(t *testing.T) {
 			sink := &copyDetectingWriter{}
 			conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
@@ -299,11 +304,11 @@ func TestShadowSteadyStateWriterCostIsFlatInPayload(t *testing.T) {
 			// measures the UNWRAPPED writer, so the expectation follows the documented boundary
 			// rather than assuming every size is in place. The production wrapper keeps the copy
 			// loop BELOW that boundary, which TestStreamMtuMatchesTheInPlaceBranch proves.
-			if payloadSize <= 32734 && allocations > 2 {
+			if payloadSize <= inPlaceLimit && allocations > 2 {
 				t.Errorf("payload=%d needed %.2f allocations; below the in-place limit the framing "+
 					"path should add none beyond the pooled buffer itself", payloadSize, allocations)
 			}
-			if payloadSize > 32734 && allocations <= 2 {
+			if payloadSize > inPlaceLimit && allocations <= 2 {
 				t.Errorf("payload=%d needed only %.2f allocations, but it exceeds the in-place limit "+
 					"and must copy", payloadSize, allocations)
 			}
@@ -327,90 +332,20 @@ func itoa(n int) string {
 // TestShadowSteadyStateProductionPayloadSize records the payload size the production copy loop
 // actually hands this writer.
 //
-// # Why this decides whether the oversize branch matters
+// TestShadowSteadyStateProductionPayloadSize is superseded.
 //
-// WriteBuffer has two branches:
+// It only logged the geometry the copy loop computes; it asserted nothing. The same facts are now
+// asserted by TestShadowRealCopyLoopBufferGeometry (the raw loop really does overshoot) and
+// TestStreamMtuMatchesTheInPlaceBranch (the advertised ceiling really is the branch boundary), so
+// keeping a third copy that merely prints numbers adds maintenance cost without adding evidence.
+
+// TestShadowRealCopyLoopPayloadSize is superseded by TestShadowRealCopyLoopBufferGeometry.
 //
-//	if buffer.Len() > w.maxPacketSize { write a copy }   <- maxPacketSize = BufferSize-2-32 = 16350
-//	... else frame IN PLACE ...
+// It logged the largest payload the loop produced but only asserted nothing -- the pass/fail lived
+// in a t.Logf branch. TestShadowRealCopyLoopBufferGeometry drives the same loop and FAILS when no
+// buffer exceeds the in-place limit, which is the actual property worth protecting.
 //
-// The measurement above showed allocations jumping from 1.00 to 7.00 at a 64 KiB payload, which is
-// that branch. Whether that matters in production depends entirely on how large a buffer the copy
-// loop hands over, so the size is measured rather than assumed.
-func TestShadowSteadyStateProductionPayloadSize(t *testing.T) {
-	method := shadowAuditMethod(t, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
-
-	sink := &copyDetectingWriter{}
-	conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
-	extended := conn.(N.ExtendedWriter)
-
-	// What the copy loop computes for this destination.
-	frontHeadroom := N.CalculateFrontHeadroom(extended)
-	mtu := N.CalculateMTU(nil, extended)
-	rearHeadroom := N.CalculateRearHeadroom(extended)
-
-	t.Logf("copy loop geometry for the SS writer: frontHeadroom=%d mtu=%d rearHeadroom=%d",
-		frontHeadroom, mtu, rearHeadroom)
-
-	// The steady-state buffer the pool hands out is buf.BufferSize unless the writer advertises a
-	// smaller MTU, and BufferSize is what the pooled allocator serves.
-	t.Logf("buf.BufferSize=%d  (the pooled steady-state buffer)", buf.BufferSize)
-
-	if mtu <= 0 || mtu > buf.BufferSize {
-		t.Logf("the writer advertises no constraining MTU, so steady-state payloads are bounded by "+
-			"buf.BufferSize=%d; the oversize branch at maxPacketSize=16350 is therefore reachable "+
-			"whenever BufferSize exceeds it", buf.BufferSize)
-	}
-}
-
-// TestShadowRealCopyLoopPayloadSize drives the REAL sing copy loop and records the payload size it
-// hands the Shadowsocks writer.
-//
-// # Why this is the decisive measurement
-//
-// WriteBuffer frames IN PLACE up to maxPacketSize (32734 with the shipped tags) and COPIES above
-// it. Whether that branch is ever reached in production depends on how large a buffer the copy loop
-// produces, which depends on the reader and the writer's advertised MTU -- not on anything visible
-// by reading WriteBuffer alone.
-func TestShadowRealCopyLoopPayloadSize(t *testing.T) {
-	method := shadowAuditMethod(t, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
-
-	const streamTotal = 1 << 20 // 1 MiB, enough to reach steady state
-	sink := &copyDetectingWriter{}
-	conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
-
-	if _, err := bufio.Copy(conn, &fixedSizeReader{remaining: streamTotal}); err != nil {
-		t.Fatalf("copy: %v", err)
-	}
-
-	sizes := sink.payloadSizes
-	if len(sizes) == 0 {
-		t.Fatal("the copy loop wrote nothing; the measurement is meaningless")
-	}
-	maxSize, total := 0, 0
-	for _, size := range sizes {
-		total += size
-		if size > maxSize {
-			maxSize = size
-		}
-	}
-	t.Logf("copy loop delivered %d writes, %d payload bytes total, largest write %d bytes",
-		len(sizes), total, maxSize)
-	// maxPacketSize = BufferSize - PacketLengthBufferSize - Overhead*2
-	const inPlaceLimit = 32768 - 2 - 32
-	t.Logf("in-place limit (maxPacketSize) is %d; largest observed write is %d", inPlaceLimit, maxSize)
-
-	// This drives the RAW writer, deliberately: it is the measurement that MOTIVATED
-	// withStreamMTU. Without the wrapper the loop overshoots the in-place limit, which is why the
-	// outbound now advertises WriterMTU. Asserted so the finding cannot silently disappear.
-	if maxSize <= inPlaceLimit {
-		t.Logf("the raw copy loop stayed within the in-place limit (%d <= %d); the wrapper would "+
-			"then be unnecessary, so this measurement should be re-examined", maxSize, inPlaceLimit)
-	} else {
-		t.Logf("CONFIRMED: the raw copy loop overshoots the in-place limit (%d > %d), which is why "+
-			"the outbound advertises WriterMTU through withStreamMTU", maxSize, inPlaceLimit)
-	}
-}
+// What is kept from it is the fixedSizeReader helper below, which the surviving tests use.
 
 // fixedSizeReader yields zeros, honouring whatever buffer size it is given.
 type fixedSizeReader struct{ remaining int }
@@ -427,32 +362,18 @@ func (r *fixedSizeReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestShadowCopyLoopBoundaryGap isolates the exact gap.
+// TestShadowCopyLoopBoundaryGap is superseded.
 //
-// The copy loop hands over buffers of buf.BufferSize (32768) while the writer frames in place only
-// up to BufferSize - PacketLengthBufferSize - Overhead*2 (32734). The 34-byte difference is the
-// frame header plus two AEAD tags, which the writer must PREPEND and APPEND, so a payload that
-// already fills the pooled buffer leaves no room for them.
-//
-// This test states the gap as a number so the finding cannot be mistaken for a rounding artefact.
-func TestShadowCopyLoopBoundaryGap(t *testing.T) {
-	const (
-		bufferSize      = 32768
-		packetLenSize   = 2
-		overhead        = 16
-		inPlaceLimit    = bufferSize - packetLenSize - overhead*2
-		observedPayload = 32768
-	)
-	t.Logf("pooled buffer:      %d", bufferSize)
-	t.Logf("writer in-place max: %d  (= %d - %d - %d*2)", inPlaceLimit, bufferSize, packetLenSize, overhead)
-	t.Logf("copy loop delivers:  %d", observedPayload)
-	t.Logf("shortfall:           %d bytes", observedPayload-inPlaceLimit)
-}
+// It printed the pooled buffer size, the in-place limit and the 34-byte gap as literals. Those
+// numbers are now derived from the production functions (buf.BufferSize and streamWriterMTU)
+// wherever they are needed, and the relationship that matters -- the loop overshoots, the advertised
+// ceiling does not -- is asserted by the two tests named above rather than restated as arithmetic.
 
 // BenchmarkShadowSteadyStateUpload measures the production chunk size against the in-place limit.
 //
-// 32768 is what the copy loop actually delivers (measured above). 32734 is the largest payload the
-// writer frames in place. The pair isolates the cost of the 34-byte shortfall.
+// buf.BufferSize is what the copy loop delivers when nothing constrains it, and streamWriterMTU()
+// is the largest payload the writer frames in place. The pair isolates the cost of the shortfall
+// between them.
 func BenchmarkShadowSteadyStateUpload(b *testing.B) {
 	method, err := shadowss.CreateMethod(context.Background(), "2022-blake3-aes-128-gcm",
 		shadowss.MethodOptions{Password: "AAAAAAAAAAAAAAAAAAAAAA=="})
@@ -460,9 +381,10 @@ func BenchmarkShadowSteadyStateUpload(b *testing.B) {
 		b.Skipf("method unavailable: %v", err)
 	}
 
-	// 32734 is the in-place limit; 32768 is what the loop sends WITHOUT a WriterMTU. The pair
-	// isolates the cost of the 34-byte shortfall at the size production actually uses.
-	for _, payloadSize := range []int{1400, 16384, 32734, 32768} {
+	// Both ends are derived from production rather than written as literals, so this keeps
+	// measuring the real shortfall if either the pooled buffer size or the framing rule changes.
+	inPlaceLimit := streamWriterMTU()
+	for _, payloadSize := range []int{1400, 16384, inPlaceLimit, buf.BufferSize} {
 		b.Run(itoa(payloadSize), func(b *testing.B) {
 			sink := &copyDetectingWriter{}
 			conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
@@ -522,7 +444,10 @@ func TestShadowRealCopyLoopBufferGeometry(t *testing.T) {
 		t.Fatalf("copy: %v", err)
 	}
 
-	const inPlaceLimit = 32768 - 2 - 16*2
+	// The boundary comes from production, not from a restated literal: this test is about the
+	// relationship between what the loop sends and what the writer can frame, and both ends of that
+	// relationship belong to the production code.
+	inPlaceLimit := streamWriterMTU()
 	var above int
 	for _, size := range observer.inputLens {
 		if size > inPlaceLimit {
@@ -565,19 +490,19 @@ func (w *geometryObservingWriter) Write(p []byte) (int, error) {
 func (w *geometryObservingWriter) FrontHeadroom() int { return N.CalculateFrontHeadroom(w.upstream) }
 func (w *geometryObservingWriter) RearHeadroom() int  { return N.CalculateRearHeadroom(w.upstream) }
 
-// TestShadowWriterMTUWouldCapTheCopyLoop is the experiment that decides whether advertising a
-// WriterMTU is worth a dependency change.
+// TestShadowWriterMTUWouldCapTheCopyLoop is the regression that justifies withStreamMTU.
 //
-// # The hypothesis
+// # The property
 //
 // The copy loop sizes its steady-state buffer from ReadWaitOptions, whose MTU comes from
-// CalculateMTU(reader, writer). The SS writer advertises no WriterMTU, so the loop uses the pooled
-// BufferSize (32768) -- 34 bytes above the in-place limit. If the writer advertised
-// maxPacketSize (32734), the loop should size to fit and take the in-place branch.
+// CalculateMTU(reader, writer). The Shadowsocks writer advertises no WriterMTU, so the loop uses the
+// pooled buf.BufferSize, which is larger than the in-place limit; advertising the limit makes the
+// loop size to fit and take the in-place branch.
 //
-// This measures it by wrapping the writer with an MTU-advertising facade and re-running the real
-// copy loop. If the buffers then fit, the fix is real; if they do not, a writer MTU would not help
-// and the finding is informational only.
+// This runs the real copy loop twice, against the real writer, differing only in whether an MTU is
+// advertised. It was originally an experiment that only LOGGED the outcome, which meant it would
+// keep passing -- green, and therefore reassuring -- if the behaviour it describes had reversed.
+// The conditions are now asserted, so a reversal FAILS instead of printing a contradictory log line.
 func TestShadowWriterMTUWouldCapTheCopyLoop(t *testing.T) {
 	method := shadowAuditMethod(t, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
 
@@ -585,46 +510,51 @@ func TestShadowWriterMTUWouldCapTheCopyLoop(t *testing.T) {
 	conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
 	real := conn.(N.ExtendedWriter)
 
-	const inPlaceLimit = 32768 - 2 - 16*2
+	inPlaceLimit := streamWriterMTU()
 
-	// Baseline: the real writer, no MTU.
-	baselineObserver := &geometryObservingWriter{upstream: real}
-	if _, err := bufio.Copy(baselineObserver, &fixedSizeReader{remaining: 1 << 20}); err != nil {
-		t.Fatal(err)
-	}
-	baselineMax := 0
-	for _, size := range baselineObserver.inputLens {
-		if size > baselineMax {
-			baselineMax = size
+	// largestBuffer drives the real copy loop and returns the largest buffer it handed the writer.
+	largestBuffer := func(upstream N.ExtendedWriter, mtu int) int {
+		observer := &geometryObservingWriter{upstream: upstream, mtu: mtu}
+		if _, err := bufio.Copy(observer, &fixedSizeReader{remaining: 1 << 20}); err != nil {
+			t.Fatal(err)
 		}
+		if len(observer.inputLens) == 0 {
+			t.Fatal("the copy loop handed the writer no buffers; the measurement is meaningless")
+		}
+		maximum := 0
+		for _, size := range observer.inputLens {
+			if size > maximum {
+				maximum = size
+			}
+		}
+		return maximum
 	}
-	t.Logf("baseline (no WriterMTU): largest buffer = %d, in-place limit = %d", baselineMax, inPlaceLimit)
 
-	// With an advertised MTU, on a FRESH conn so the request is sent again.
+	// Baseline: the real writer, advertising no MTU.
+	baselineMax := largestBuffer(real, 0)
+
+	// With the limit advertised, on a FRESH conn so the request is framed again.
 	sink2 := &copyDetectingWriter{}
 	conn2 := method.DialEarlyConn(sink2, M.ParseSocksaddrHostPort("target.example", 443))
-	withMTUObserver := &geometryObservingWriter{
-		upstream: conn2.(N.ExtendedWriter),
-		mtu:      inPlaceLimit,
-	}
-	if _, err := bufio.Copy(withMTUObserver, &fixedSizeReader{remaining: 1 << 20}); err != nil {
-		t.Fatal(err)
-	}
-	mtuMax := 0
-	for _, size := range withMTUObserver.inputLens {
-		if size > mtuMax {
-			mtuMax = size
-		}
-	}
-	t.Logf("with WriterMTU=%d: largest buffer = %d", inPlaceLimit, mtuMax)
+	mtuMax := largestBuffer(conn2.(N.ExtendedWriter), inPlaceLimit)
 
-	if mtuMax < baselineMax {
-		t.Logf("RESULT: advertising a WriterMTU DOES reduce the buffer size (%d -> %d)", baselineMax, mtuMax)
-	} else {
-		t.Logf("RESULT: advertising a WriterMTU does NOT change the buffer size (%d vs %d); "+
-			"CalculateMTU takes the MAX of reader and writer MTU, so a writer cap cannot lower a "+
-			"reader that already asks for more", baselineMax, mtuMax)
-	}
+	t.Logf("baseline (no WriterMTU): largest buffer = %d; with WriterMTU=%d: largest buffer = %d; "+
+		"in-place limit = %d", baselineMax, inPlaceLimit, mtuMax, inPlaceLimit)
+
+	// If any of these stops holding, the wrapper's justification has changed and the decision has to
+	// be re-derived rather than silently carried forward.
+	require.Greater(t, baselineMax, streamWriterMTU(),
+		"upstream/copy-loop behaviour changed: without an advertised WriterMTU the loop must still "+
+			"overshoot the in-place limit, which is the entire reason withStreamMTU exists. "+
+			"Re-evaluate whether withStreamMTU is still necessary")
+	require.LessOrEqual(t, mtuMax, streamWriterMTU(),
+		"upstream/copy-loop behaviour changed: advertising WriterMTU=%d must keep the loop at or "+
+			"below the in-place limit. Re-evaluate whether withStreamMTU is still necessary",
+		inPlaceLimit)
+	require.Less(t, mtuMax, baselineMax,
+		"upstream/copy-loop behaviour changed: advertising the WriterMTU must reduce the buffer size "+
+			"the loop hands over, otherwise the wrapper buys nothing. Re-evaluate whether withStreamMTU "+
+			"is still necessary")
 }
 
 // BenchmarkShadowRealCopyLoop measures the REAL copy loop with and without a writer MTU.
@@ -643,7 +573,7 @@ func BenchmarkShadowRealCopyLoop(b *testing.B) {
 	if err != nil {
 		b.Skipf("method unavailable: %v", err)
 	}
-	const inPlaceLimit = 32768 - 2 - 16*2
+	inPlaceLimit := streamWriterMTU()
 	const streamTotal = 4 << 20
 
 	for _, variant := range []struct {
@@ -667,9 +597,27 @@ func BenchmarkShadowRealCopyLoop(b *testing.B) {
 				}
 				source := &fixedSizeReader{remaining: streamTotal}
 				b.StartTimer()
-				if _, err := bufio.Copy(destination, source); err != nil {
+				copied, err := bufio.Copy(destination, source)
+				if err != nil {
 					b.Fatal(err)
 				}
+				b.StopTimer()
+				// Path-execution sanity checks, OUTSIDE the timed region.
+				//
+				// A benchmark that runs without error can still have copied nothing -- a fixture that
+				// never delivers payload would report a very fast, very allocation-light "result" for a
+				// datapath that did not execute. These checks make that a failure instead of a number.
+				if copied != streamTotal {
+					b.Fatalf("copied %d bytes, expected %d: the datapath did not carry the payload, "+
+						"so this measurement is invalid", copied, streamTotal)
+				}
+				if len(destination.inputLens) == 0 {
+					b.Fatalf("the copy loop handed the writer no buffers: silent no-op, invalid measurement")
+				}
+				if len(sink.payloadSizes) == 0 {
+					b.Fatalf("the destination recorded no payload writes: silent no-op, invalid measurement")
+				}
+				b.StartTimer()
 			}
 		})
 	}
@@ -774,16 +722,108 @@ func TestWithStreamMTUIsTransparent(t *testing.T) {
 		"CalculateMTU must see the advertised ceiling, which is the whole point of the wrapper")
 }
 
-// BenchmarkShadowWiredPath measures the REAL outbound dial path, so the wiring is under test rather
-// than the wrapper in isolation.
+// TestShadowsocksDialerAdvertisesStreamMTU is the ONLY test here that proves the PRODUCTION WIRING.
 //
-// # Why this exists on top of the simulated benchmark
+// # Why a separate test is required
 //
-// The simulated benchmark calls withStreamMTU directly. If the dialer forgot to call it -- or called
-// it somewhere the copy loop never sees -- that benchmark would still show the win while production
-// got nothing. This one goes through shadowsocksDialer, which is the code path a routed connection
-// actually takes, and so fails to show a win if the wiring is missing.
-func BenchmarkShadowWiredPath(b *testing.B) {
+// Every other MTU test calls withStreamMTU directly. That proves the wrapper works, but it proves
+// nothing about whether production ever applies it: if shadowsocksDialer.DialContext returned the
+// bare Shadowsocks conn, every one of those tests would still pass while the shipped path silently
+// lost the optimisation.
+//
+// So this drives (*shadowsocksDialer).DialContext itself -- the method a routed connection actually
+// goes through -- and asserts on the conn it returns. The upstream dialer is a local stub, so the
+// test is deterministic and touches no network.
+func TestShadowsocksDialerAdvertisesStreamMTU(t *testing.T) {
+	method := shadowAuditMethod(t, "2022-blake3-aes-128-gcm", "AAAAAAAAAAAAAAAAAAAAAA==")
+
+	// A stub upstream dialer handing back a fully local, controlled connection. It records the
+	// server address it was asked for so the test can confirm the production path dialled the
+	// configured server rather than something else.
+	var dialled M.Socksaddr
+	stub := &stubDialer{
+		dial: func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+			dialled = destination
+			client, server := net.Pipe()
+			// Drain the server end so a write never blocks.
+			go func() {
+				_, _ = io.Copy(io.Discard, server)
+				_ = server.Close()
+			}()
+			return client, nil
+		},
+	}
+
+	dialer := (*shadowsocksDialer)(&Outbound{
+		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeShadowsocks, "ss-test", []string{N.NetworkTCP, N.NetworkUDP}, option.DialerOptions{}),
+		method:     method,
+		dialer:     stub,
+		serverAddr: M.ParseSocksaddrHostPort("127.0.0.1", 8388),
+	})
+
+	conn, err := dialer.DialContext(context.Background(), N.NetworkTCP,
+		M.ParseSocksaddrHostPort("target.example", 443))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.Equal(t, M.ParseSocksaddrHostPort("127.0.0.1", 8388), dialled,
+		"the production dialer must dial the configured server address")
+
+	// The production wiring must expose the full geometry the copy loop needs. A missing capability
+	// here means the wrapper was dropped or replaced by the bare conn.
+	extended, isExtended := conn.(N.ExtendedWriter)
+	require.True(t, isExtended, "the dialed conn must accept buffers (N.ExtendedWriter)")
+	require.NotNil(t, extended)
+
+	front, isFront := conn.(N.FrontHeadroom)
+	require.True(t, isFront, "the dialed conn must advertise front headroom (N.FrontHeadroom)")
+	require.NotNil(t, front)
+
+	rear, isRear := conn.(N.RearHeadroom)
+	require.True(t, isRear, "the dialed conn must advertise rear headroom (N.RearHeadroom)")
+	require.NotNil(t, rear)
+
+	withMTU, hasMTU := conn.(N.WriterWithMTU)
+	require.True(t, hasMTU,
+		"the dialed conn must advertise WriterMTU: without it the copy loop sizes steady-state "+
+			"buffers above the in-place limit and every full buffer is copied")
+	require.Equal(t, streamWriterMTU(), withMTU.WriterMTU(),
+		"the advertised MTU must be the production in-place limit")
+
+	// And the copy loop must actually compute a constrained MTU from what the dialer returned.
+	require.Equal(t, streamWriterMTU(), N.CalculateMTU(nil, conn),
+		"CalculateMTU must see the advertised ceiling through the production dialer's conn")
+}
+
+// stubDialer is an N.Dialer that delegates to a local function, so tests can hand the production
+// dialers a fully controlled upstream connection without touching the network.
+type stubDialer struct {
+	dial func(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error)
+}
+
+func (d *stubDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return d.dial(ctx, network, destination)
+}
+
+func (d *stubDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, E.New("stubDialer: ListenPacket not implemented")
+}
+
+// BenchmarkShadowMTUWrappedPath measures the real Shadowsocks writer with and without the MTU
+// wrapper, over an assembled copy loop.
+//
+// # What this does NOT prove, and used to claim
+//
+// It does not prove the production wiring. The dial happens with a plain net.Dial and the wrapper is
+// applied by hand, so (*shadowsocksDialer).DialContext is never entered. An earlier revision of this
+// benchmark described itself as exercising "the real outbound dial path" and "production wiring",
+// which the code below does not do -- a benchmark that overstates its own coverage is worse than one
+// that states its limits.
+//
+// Production wiring is proven by TestShadowsocksDialerAdvertisesStreamMTU, which calls the dialer.
+// This benchmark is here to MEASURE the datapath: real Shadowsocks writer, real copy loop, with and
+// without the MTU advertised.
+func BenchmarkShadowMTUWrappedPath(b *testing.B) {
 	method, err := shadowss.CreateMethod(context.Background(), "2022-blake3-aes-128-gcm",
 		shadowss.MethodOptions{Password: "AAAAAAAAAAAAAAAAAAAAAA=="})
 	if err != nil {
@@ -824,8 +864,15 @@ func BenchmarkShadowWiredPath(b *testing.B) {
 		}
 		destination := withStreamMTU(method.DialEarlyConn(outConn,
 			M.ParseSocksaddrHostPort("target.example", 443)))
-		if _, err := bufio.Copy(destination, &fixedSizeReader{remaining: streamTotal}); err != nil {
-			b.Fatal(err)
+		copied, copyErr := bufio.Copy(destination, &fixedSizeReader{remaining: streamTotal})
+		if copyErr != nil {
+			b.Fatal(copyErr)
+		}
+		// Path-execution sanity check: a benchmark that copies nothing would report a fast,
+		// low-allocation result for a datapath that never ran.
+		if copied != streamTotal {
+			b.Fatalf("copied %d bytes, expected %d: the datapath did not carry the payload, so this "+
+				"measurement is invalid", copied, streamTotal)
 		}
 		_ = destination.Close()
 	}
