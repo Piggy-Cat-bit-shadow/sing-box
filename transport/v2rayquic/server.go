@@ -77,6 +77,12 @@ func (s *Server) acceptLoop() {
 		}
 		go func() {
 			hErr := s.streamAcceptLoop(conn)
+			// asVisibleFault first: a quic-go fault satisfies the generic closed/canceled test
+			// because every quic-go type unwraps to net.ErrClosed, so the check below alone would
+			// report a PROTOCOL_VIOLATION as an ordinary teardown. See stream_error.go.
+			if hErr != nil {
+				hErr = asVisibleFault(hErr)
+			}
 			if hErr != nil && !E.IsClosedOrCanceled(hErr) {
 				s.logger.ErrorContext(conn.Context(), hErr)
 			}

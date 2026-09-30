@@ -285,7 +285,10 @@ func (s *Server) NewTunnelRequest(ctx context.Context, request transportHTTP.Tun
 		current.cancel(err)
 	}
 	err = current.run()
-	if err != nil && !E.IsClosedOrCanceled(err) {
+	// The log level comes from sessionErrorIsExpected, which applies typed classification before
+	// any generic closed/canceled test. See its doc comment for why the order matters.
+	fatal := err != nil && !sessionErrorIsExpected(err)
+	if fatal {
 		s.logger.ErrorContext(ctx, E.Cause(err, "tunnel from ", request.Source(), " closed"))
 	} else {
 		s.logger.DebugContext(ctx, "tunnel from ", request.Source(), " closed")
@@ -599,4 +602,20 @@ func firstPeerAddress(packet []byte, addresses []AssignedAddress) netip.Addr {
 		}
 	}
 	return netip.Addr{}
+}
+
+// sessionErrorIsExpected reports whether a finished tunnel ended for an expected reason.
+//
+// It is the single decision point for the session's log level. The order is deliberate: an error
+// carrying quic-go or HTTP/3 semantics is decided by the typed classification ALONE, because the
+// generic closed/canceled test would otherwise answer "closed" for a protocol violation. Only an
+// error with no typed semantics falls back to the generic sentinels.
+func sessionErrorIsExpected(err error) bool {
+	if err == nil {
+		return true
+	}
+	if transportHTTP.CarriesQuicSemantics(err) {
+		return transportHTTP.IsExpectedH3Closure(err)
+	}
+	return E.IsClosedOrCanceled(err)
 }
