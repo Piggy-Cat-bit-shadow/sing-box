@@ -155,11 +155,15 @@ func New(options Options) (*Box, error) {
 	}
 	var needCacheFile bool
 	var needV2RayAPI bool
+	var needClashAPI bool
 	if experimentalOptions.CacheFile != nil && experimentalOptions.CacheFile.Enabled || options.PlatformLogWriter != nil {
 		needCacheFile = true
 	}
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
+	}
+	if experimentalOptions.ClashAPI != nil {
+		needClashAPI = true
 	}
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
@@ -173,9 +177,14 @@ func New(options Options) (*Box, error) {
 		defaultLogWriter = io.Discard
 	}
 	logFactory, err := log.New(log.Options{
-		Context:        ctx,
-		Options:        common.PtrValueOrDefault(options.Log),
-		Observable:     needAPIService,
+		Context: ctx,
+		Options: common.PtrValueOrDefault(options.Log),
+		// Either control plane needs an observable log factory: the Native API's
+		// SubscribeLog consumes it, and the Clash API's external_controller is what
+		// serves /logs. Neither may be dropped for the other - a build with both
+		// gets one factory serving both.
+		Observable: needAPIService ||
+			(needClashAPI && experimentalOptions.ClashAPI.ExternalController != ""),
 		DefaultWriter:  defaultLogWriter,
 		BaseTime:       createdAt,
 		PlatformWriter: options.PlatformLogWriter,
@@ -241,24 +250,25 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
 	}
-	// The traffic manager and the routing-mode manager are created for the Native
-	// API, which subscribes to traffic and drives SetClashMode.
-	//
-	// Upstream gates this on needClashAPI as well, because upstream still has a
-	// Clash API. This product does not: the Clash API is trimmed, so the Native API
-	// and the platform log writer are the only reasons to build the managers. The
-	// condition therefore drops needClashAPI rather than reintroducing a control
-	// plane this product deliberately does not ship.
-	if needAPIService || options.PlatformLogWriter != nil {
+	// ONE shared traffic manager and ONE shared mode manager, created if any consumer
+	// needs them: the Clash API (traffic + mode endpoints), the Native API
+	// (SubscribeConnections, SetClashMode) or the platform log writer. Creating a
+	// second pair for the second control plane would mean two managers observing
+	// different state.
+	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
 		trafficManager := trafficcontrol.NewManager()
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)
 		internalServices = append(internalServices, trafficManager)
-		// The Native API is the only control plane, and it manages the routing mode
-		// through this manager. The default mode is derived from the route rules
-		// themselves (CalculateModeList) rather than from a now-removed Clash API
-		// option, so an operator sets it by defining rules, not by config.
-		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), "", clashmode.CalculateModeList(options.Options))
+		// The routing mode is shared state: the Clash API serves it, and the Native
+		// API's SetClashMode drives it. When the Clash API is configured its
+		// default_mode seeds the manager; otherwise the mode list is derived from the
+		// route rules (CalculateModeList) and no default is imposed.
+		var clashDefaultMode string
+		if needClashAPI {
+			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
+		}
+		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
 		service.MustRegisterPtr(ctx, clashMode)
 		internalServices = append(internalServices, clashMode)
 	}
@@ -433,6 +443,13 @@ func New(options Options) (*Box, error) {
 		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
 		internalServices = append(internalServices, cacheFile)
+	}
+	if needClashAPI {
+		clashServer, err := experimental.NewClashServer(ctx, logFactory.(log.ObservableFactory), common.PtrValueOrDefault(experimentalOptions.ClashAPI))
+		if err != nil {
+			return nil, E.Cause(err, "create clash-server")
+		}
+		internalServices = append(internalServices, clashServer)
 	}
 	if needV2RayAPI {
 		v2rayServer, err := experimental.NewV2RayServer(logFactory.NewLogger("v2ray-api"), common.PtrValueOrDefault(experimentalOptions.V2RayAPI))
