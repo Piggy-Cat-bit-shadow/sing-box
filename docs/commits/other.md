@@ -4,6 +4,21 @@
 
 | Commit | 工作 |
 | --- | --- |
+| [`e42cd00`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e42cd00e9cf9434a2d18fcb27c8e67d825da6c75) | 将测试模块使用的 protobuf 标为直接依赖。 |
+| [`1d1e399`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1d1e399b321fced101325678c4e3a20e5d156f7b) | 更新构建文档，说明 Clash API 与 Native API 并存及官方标签。 |
+| [`332e201`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/332e20194636df4ea0f33c85d01c4d2d6bfe509e) | 在 CI 中验证 Clash API 能力及其与 Native API 的共存行为。 |
+| [`76cd68e`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/76cd68eaf0b2183856185e2d91583910e4631bc2) | 在官方构建标签中恢复 with_clash_api，使发布构件包含 Clash API。 |
+| [`9683953`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/968395304d407821758c7b005b942ed0e6f70a19) | 恢复上游 Clash API，并与 Native API 共用实例状态。 |
+| [`d339792`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d339792e41719b6e922f4b81809e996b221cd384) | 从 README 移除重复的完整功能集段落，保留协议索引。 |
+| [`8d575c6`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8d575c6c47fe08f41ea2bf6cd82dba69562a7ef1) | 清理 CI、构建脚本和测试中残留的产品注册表裁剪假设。 |
+| [`8b6d4e8`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/8b6d4e8c418e1a3674fcbb1b12a90bf3db6ae8ba) | 修正完整能力验证步骤的 Shell 引号与 Tailscale 包路径。 |
+| [`4c39a83`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/4c39a835b5560b5f7e1d1f8e6256755bf7a49141) | 将旧 Pruning 架构标为历史，并更新完整注册表的说明与测试。 |
+| [`dcd8b10`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/dcd8b10cda0771954a46db83eed384b25ce889d4) | 以完整能力验证取代精简注册表的缺失能力审计。 |
+| [`523db47`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/523db47e4fb82e3a82226cc2dd3269abc56d6617) | 移除本 fork 的命令编译裁剪条件，恢复上游完整 CLI。 |
+| [`3bab501`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/3bab501db725bb4dd24ae4fae5c520d9ef20c437) | 移除产品专用注册表与构建标签白名单，恢复上游完整注册表。 |
+| [`2ec210f`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/2ec210f70f3ae2252c40af27eaaa6a5a8e768a8e) | 合并上游 testing，并处理与 fork 协议和测试改动的差异。 |
+| [`c7c5f1c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/c7c5f1c03d6a2f1a4bd7546f29a0a000461e32ee) | 在 V2Ray QUIC 中把无状态重置与版本协商失败识别为真实故障。 |
+| [`d76e4d1`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d76e4d1d63f646ce845b13c1bd4cc1d0a5c77a98) | 改写 README 分类简介，补充当时的产品能力与协议优化概览。 |
 | [`7eab0bb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/7eab0bb97ea4ff3bdf5103ac32bd65532d32c3f9) | 按错误类型区分 MASQUE 隧道与 V2Ray QUIC 接受循环的正常结束和故障。 |
 | [`d267546`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d26754689839fbd3b91183701167a6491042d4c7) | 补齐 HTTP/3 服务端与 Native Naive 的连接级故障分类和日志。 |
 | [`af86de2`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/af86de2c62cdf8cbfc8e0dcd6107347696442564) | 在 HTTP/3 客户端隧道边界保留真实 QUIC 故障，避免被当作正常关闭。 |
