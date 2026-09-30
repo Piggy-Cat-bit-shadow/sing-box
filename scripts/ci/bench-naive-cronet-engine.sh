@@ -103,7 +103,7 @@ build_variant() {
   echo "building variant $name (single_engine=$single)"
   CGO_ENABLED=1 go build \
     -trimpath -buildvcs=false \
-    -tags "$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)" \
+    -tags "$(cat release/DEFAULT_BUILD_TAGS)" \
     -o "$outdir/sing-box-$name" ./cmd/sing-box
 }
 

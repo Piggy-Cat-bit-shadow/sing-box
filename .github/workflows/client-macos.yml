@@ -92,7 +92,7 @@ permissions:
 
 env:
   BINARY: dist/sing-box-darwin-arm64
-  TAGS_FILE: release/BUILD_TAGS_JIEJIE_CLIENT_MACOS
+  TAGS_FILE: release/DEFAULT_BUILD_TAGS
 
 jobs:
   macos-arm64:
@@ -193,27 +193,22 @@ jobs:
           ./scripts/ci/check-macos-client-headless.sh "$BINARY" dist/headless
           echo "PASS: headless smoke"
 
-      - name: product registry and capability audit
-        # ONE `go tool nm` over the SHIPPED binary, covering everything a name cannot
-        # prove: excluded packages, included packages, the registry role split, the
-        # Naive real-vs-stub distinction, the exact Cronet constructor, the
-        # MASQUE client/server split and the shared transport plane, TUN, and the
-        # ABSENCE of the removed Clash API and LXD daemon packages.
+      - name: full capability verification
+        # This fork carries the complete upstream feature profile, so what needs
+        # proving is that capabilities are PRESENT, not that they are absent.
         #
-        # It also runs `sing-box check` against the real client fixture and
-        # example-config.json, which is where the standalone `config check` step used
-        # to run. That validation is therefore still performed on the shipped binary -
-        # once, inside the script, instead of twice.
+        # The check goes through `sing-box check` rather than `go tool nm` for two
+        # reasons: the shipped artifact is stripped, and resolving a config through
+        # the real registry exercises the registry, the option schema and each
+        # constructor - which is what "the capability is present" actually means.
         #
-        # The former `product capability verification` step ran a SECOND `go tool nm`
-        # over the same binary to assert a mostly-overlapping set. Its unique
-        # assertions (exact `cronet-go.NewNaiveClient`) were merged into
-        # the script rather than dropped; the binary's symbol
-        # table is now read once.
+        # This replaced a symbol audit whose contract was the opposite one: it
+        # asserted that Hysteria2, TUIC, the Clash API and various server roles were
+        # ABSENT. Those assertions belonged to the retired pruning architecture.
         run: |
           set -euo pipefail
-          ./scripts/ci/audit-macos-client-registry.sh "$BINARY"
-          echo "PASS: product registry and capability audit"
+          ./scripts/ci/verify-full-capabilities.sh "$BINARY"
+          echo "PASS: full upstream feature profile verified""
 
 
       - name: write BUILD-INFO and SHA256

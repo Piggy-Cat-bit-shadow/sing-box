@@ -4,9 +4,15 @@
 # Usage: build-server.sh <goos> <goarch> <output>
 #        build-server.sh linux amd64 dist/sing-box-linux-amd64
 #
-# This fork ships exactly one server product, so this script builds exactly one
-# profile: the Server Minimal tag set, read from
-# release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL.
+# This fork no longer maintains a product-specific protocol registry. The server is
+# built with upstream's own non-naive feature profile
+# (release/DEFAULT_BUILD_TAGS_OTHERS): the complete protocol, endpoint,
+# DNS-transport, service and certificate-provider registry that upstream ships for
+# servers. Capabilities upstream adds are inherited automatically.
+#
+# The single deviation from upstream's tag file is the removal of
+# `with_clash_api`, which no longer names any file: the Clash API was deleted from
+# this fork as a control-plane decision (see docs/FORK-DIFF.md), not as a size cut.
 #
 # # Why the version is injected here
 #
@@ -34,7 +40,7 @@ goos="$1"; goarch="$2"; output="$3"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL"
+tags_file="release/DEFAULT_BUILD_TAGS_OTHERS"
 if [ ! -f "$tags_file" ]; then
   echo "missing tag file: $tags_file" >&2
   exit 2
@@ -52,7 +58,7 @@ fi
 # for the symbol audit rather than shipping symbols to users.
 ldflags="-s -w -X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS)"
 
-echo "building jiejie-server-minimal goos=$goos goarch=$goarch"
+echo "building jiejie-server goos=$goos goarch=$goarch"
 echo "tags:    $tags"
 echo "ldflags: $ldflags"
 

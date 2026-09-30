@@ -24,13 +24,13 @@ eval "$(./scripts/ci/version.sh)"
 # sidecar, which is worse than failing: the artifact would look documented while
 # claiming nothing.
 #
-# The macOS aliases (macos, client-macos) exist so a caller can name the product
-# rather than the tag file, and so older invocations keep working. There is no
-# lite/naive distinction any more - there is one macOS core.
+# The aliases exist so a caller can name the product rather than the tag file.
+# Both products now use upstream's own feature profiles; the only difference
+# between them is the profile upstream itself selects for that platform.
 tags_file=""
 case "$flavor" in
-  server-minimal)          tags_file="release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL" ;;
-  macos|client-macos)      tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS" ;;
+  server|server-minimal)   tags_file="release/DEFAULT_BUILD_TAGS_OTHERS" ;;
+  macos|client-macos)      tags_file="release/DEFAULT_BUILD_TAGS" ;;
 esac
 if [ -z "$tags_file" ] || [ ! -f "$tags_file" ]; then
   echo "build-info.sh: unknown flavor '$flavor' (no tag file)" >&2

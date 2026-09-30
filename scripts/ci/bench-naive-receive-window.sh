@@ -86,7 +86,7 @@ mkdir -p "$outdir"
 echo "building the macOS core once; only stream_receive_window changes per run"
 CGO_ENABLED=1 go build \
   -trimpath -buildvcs=false \
-  -tags "$(cat release/BUILD_TAGS_JIEJIE_CLIENT_MACOS)" \
+  -tags "$(cat release/DEFAULT_BUILD_TAGS)" \
   -o "$outdir/sing-box-window" ./cmd/sing-box
 
 url="${BENCH_URL:-https://$server_host/}"

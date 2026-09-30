@@ -26,9 +26,8 @@ name: Linux amd64
 #   version and tags
 #   production topology config check
 #   runtime smoke
-#   package-graph pruning audit     (`go list -deps`, no build)
-#   runtime registry pruning audit  (the shipped binary rejects pruned types)
-#   size ceiling
+#   capability audit, compile-time  (`go list -deps`, no build)
+#   capability audit, runtime       (the shipped binary resolves every capability)
 #   SHA-256 and BUILD-INFO
 #   upload
 #
@@ -36,10 +35,10 @@ name: Linux amd64
 #
 # This claim was false before and is enforced now:
 #
-#   - the `.debug` second build for the symbol audit is GONE. Pruning is checked
-#     against the compile-time package graph (`go list -deps`), which needs no build
-#     at all and is in fact a stronger statement: it proves the package is not in
-#     the program, not merely that its symbols were not observed.
+#   - the `.debug` second build for the symbol audit is GONE. Capability presence is
+#     checked against the compile-time package graph (`go list -deps`), which needs no
+#     build at all and is in fact a stronger statement: it proves the package IS in
+#     the program, not merely that one of its symbols was observed.
 #   - reproducibility moved to deep_checks, so the `repro-check` rebuild is gone.
 #
 # Both `go build` invocations that remain in this file are inside deep-check steps.
@@ -107,11 +106,6 @@ permissions:
   contents: read
 
 env:
-  # Raw ELF size ceiling. The current production binary is about 33.9 MB; this
-  # leaves room for normal Go and dependency growth while still catching an
-  # accidental regression, such as a protocol or service that should have been
-  # pruned finding its way back into the registry.
-  MAX_BINARY_BYTES: 48000000
   BINARY: dist/sing-box-linux-amd64
 
 jobs:
@@ -169,7 +163,7 @@ jobs:
         # the protocols this server serves.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           go test -tags "$TAGS" -count=1 -timeout 10m \
             ./option ./transport/http ./protocol/http ./protocol/naive \
             ./protocol/anytls ./protocol/shadowtls ./protocol/shadowsocks \
@@ -209,7 +203,7 @@ jobs:
         # below.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           cd test
           go test -tags "$TAGS" -count=1 -timeout 5m -v ./contract/serverminimal/
           echo "PASS: production registry and topology contract tests"
@@ -236,7 +230,7 @@ jobs:
           # exactly how a missing registry tag once survived a green build.
           ./"$BINARY" version | grep -F "$VERSION"
           reported="$(./"$BINARY" version | sed -n 's/^Tags: //p')"
-          expected="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          expected="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           if [ "$reported" != "$expected" ]; then
             echo "FAIL: reported tags do not match the tag file" >&2
             echo "  reported: $reported" >&2
@@ -350,25 +344,25 @@ jobs:
           fi
           echo "PASS: started cleanly and shut down on SIGTERM with no panic"
 
-      - name: dependency pruning audit (compile-time package graph)
-        # Answers "is this package in the program" using the compiler's own view,
-        # with NO build step. `go list -deps` resolves the import graph for the
-        # production tags in under a second, and it is a STRONGER check than reading
-        # a symbol table: a package absent from the graph is definitively not
-        # compiled in, whereas a missing symbol could in principle be inlining,
-        # dead-code elimination or a stripped table.
+      - name: full capability verification (compile-time package graph)
+        # This fork carries the complete upstream feature profile, so the contract is
+        # that capabilities are PRESENT, not that they are absent.
         #
-        # This replaces an earlier revision that linked a second, unstripped
-        # `*.debug` binary purely to run `go tool nm`.
+        # `go list -deps` answers "is this package in the program" using the
+        # compiler's own view, with no build step, and is stronger than reading a
+        # symbol table: a package absent from the graph is definitively not compiled
+        # in, whereas a missing symbol could be inlining or dead-code elimination.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           go list -deps -tags "$TAGS" ./cmd/sing-box > /tmp/deps.txt
           echo "package graph: $(wc -l < /tmp/deps.txt) packages"
           failed=0
 
-          # Must NOT be in the graph. Full import paths, not loose substrings.
-          pruned=(
+          # MUST be in the graph. These are the components the retired pruning
+          # architecture used to remove; if any of them disappears again, the fork
+          # has silently reverted to a narrower profile.
+          required=(
             "github.com/sagernet/sing-box/protocol/hysteria"
             "github.com/sagernet/sing-box/protocol/hysteria2"
             "github.com/sagernet/sing-box/protocol/tuic"
@@ -391,39 +385,19 @@ jobs:
             "github.com/sagernet/sing-box/dns/transport/quic"
             "github.com/sagernet/sing-box/tailscale"
             "github.com/caddyserver/certmagic"
-          )
-          for pkg in "${pruned[@]}"; do
-            if grep -qxF "$pkg" /tmp/deps.txt; then
-              echo "FAIL: $pkg is in the production package graph" >&2
-              failed=1
-            else
-              echo "PASS: $pkg pruned"
-            fi
-          done
-
-          # MUST be in the graph, or the topology this server exists to serve is
-          # not actually servable. Without this half, the check above would pass on
-          # a build that compiled nothing at all.
-          required=(
+            # The capabilities this fork actually serves must survive too.
             "github.com/sagernet/sing-box/protocol/http"
             "github.com/sagernet/sing-box/protocol/anytls"
             "github.com/sagernet/sing-box/protocol/shadowtls"
             "github.com/sagernet/sing-box/protocol/shadowsocks"
-            "github.com/sagernet/sing-box/transport/http"
-            # Native Naive is REQUIRED: the live production configuration declares
-            # a `naive` inbound, and a build without this package rejects that config
-            # with `unknown inbound type: naive`. It was previously listed as pruned on
-            # the mistaken belief that Caddy forwardproxy@udpintcp had replaced it; see
-            # AUD-P2-002. Only the inbound is needed - the Naive OUTBOUND carries its own
-            # `with_naive_outbound` tag, which this profile does not set, so cronet stays
-            # out of the graph.
             "github.com/sagernet/sing-box/protocol/naive"
+            "github.com/sagernet/sing-box/transport/http"
           )
           for pkg in "${required[@]}"; do
             if grep -qxF "$pkg" /tmp/deps.txt; then
               echo "PASS: $pkg linked"
             else
-              echo "FAIL: $pkg is MISSING; the production topology cannot be served" >&2
+              echo "FAIL: $pkg is MISSING; the profile is not the full upstream set" >&2
               failed=1
             fi
           done
@@ -431,66 +405,15 @@ jobs:
           [ "$failed" -eq 0 ] || exit 1
           echo "AUDIT: PASS"
 
-      - name: registry pruning audit (runtime, against the shipped binary)
+      - name: full capability verification (runtime, against the shipped binary)
         # The package graph proves what was COMPILED. This proves what the shipped
-        # binary will actually ACCEPT, which is a different question: the registry
-        # could resolve a type whose package is present but unregistered, and the
-        # config loader is what an operator experiences.
-        #
-        # Both directions, so neither can be satisfied by rejecting everything.
+        # binary will actually ACCEPT: it resolves a minimal config for every major
+        # protocol, DNS transport, endpoint and service through the real registry,
+        # so it also exercises the option schema and each constructor's validation.
         run: |
           set -euo pipefail
-          workdir="$(mktemp -d)"
-
-          # A pruned inbound must be REJECTED.
-          cat > "$workdir/pruned.json" <<'JSON'
-          {"log": {"level": "error"},
-           "inbounds": [{"type": "tun", "tag": "t", "interface_name": "tun0"}]}
-          JSON
-          if ./"$BINARY" check -c "$workdir/pruned.json" >/dev/null 2>&1; then
-            echo "FAIL: the pruned 'tun' inbound was accepted; the trim is not real" >&2
-            exit 1
-          fi
-          echo "PASS: a pruned inbound type is rejected by the shipped binary"
-
-          # A pruned OUTBOUND must be rejected too, since the production registry
-          # registers only direct and socks.
-          cat > "$workdir/pruned-out.json" <<'JSON'
-          {"log": {"level": "error"},
-           "outbounds": [{"type": "vmess", "tag": "v", "server": "127.0.0.1", "server_port": 1, "uuid": "00000000-0000-0000-0000-000000000000"}]}
-          JSON
-          if ./"$BINARY" check -c "$workdir/pruned-out.json" >/dev/null 2>&1; then
-            echo "FAIL: the pruned 'vmess' outbound was accepted" >&2
-            exit 1
-          fi
-          echo "PASS: a pruned outbound type is rejected by the shipped binary"
-
-          # And the transports the topology uses must be ACCEPTED, so the checks
-          # above cannot pass by the registry rejecting everything.
-          cat > "$workdir/present.json" <<'JSON'
-          {"log": {"level": "error"},
-           "outbounds": [{"type": "direct", "tag": "direct"}]}
-          JSON
-          if ! ./"$BINARY" check -c "$workdir/present.json" >/dev/null 2>&1; then
-            echo "FAIL: the 'direct' outbound the topology uses was rejected" >&2
-            exit 1
-          fi
-          echo "PASS: the direct outbound is accepted"
-
-      - name: size ceiling
-        run: |
-          set -euo pipefail
-          SIZE=$(stat -c '%s' "$BINARY")
-          echo "raw bytes: $SIZE"
-          echo "ceiling:   $MAX_BINARY_BYTES"
-          ls -lh "$BINARY"
-          if [ "$SIZE" -gt "$MAX_BINARY_BYTES" ]; then
-            echo "FAIL: production binary size regression" >&2
-            echo "A protocol or service that should have been pruned has most likely" >&2
-            echo "found its way back into the registry." >&2
-            exit 1
-          fi
-          echo "PASS: $SIZE <= $MAX_BINARY_BYTES bytes"
+          ./scripts/ci/verify-full-capabilities.sh "$BINARY"
+          echo "PASS: full upstream feature profile verified against the shipped binary"
 
       # -----------------------------------------------------------------------
       # Package: the artifact holds what was verified, and nothing else.
@@ -536,7 +459,7 @@ jobs:
             echo "| arch | amd64 |"
             echo "| version | \`$(cat release/JIEJIE_VERSION)\` |"
             echo "| commit | \`${{ github.sha }}\` |"
-            echo "| build tags | \`$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)\` |"
+            echo "| build tags | \`$(cat release/DEFAULT_BUILD_TAGS_OTHERS)\` |"
             echo "| binary bytes | $(stat -c '%s' "$BINARY") |"
             echo "| sha256 | \`$(cut -d' ' -f1 "$ARTIFACT_DIR/sing-box-linux-amd64.sha256")\` |"
             echo "| artifact | \`$ARTIFACT_NAME\` |"
@@ -572,7 +495,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           go vet -tags "$TAGS" \
             ./option ./include ./route ./adapter/... \
             ./protocol/direct ./protocol/dns ./protocol/group ./protocol/anytls \
@@ -607,7 +530,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           go test -race -tags "$TAGS" -count=1 -timeout 40m \
             ./transport/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
           echo "PASS: race tests"
@@ -628,7 +551,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           run_fuzz() {
             echo "--- fuzzing $2 in $1 for ${3}s"
             go test -tags "$TAGS" -run '^$' -fuzz "^$2\$" -fuzztime "$3" "$1"
@@ -658,7 +581,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
 
           # The reference module needs a binary built from the reference tag set, and it
           # reads its path from JIEJIE_SING_BOX_BINARY.
@@ -704,7 +627,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
         run: |
           set -euo pipefail
-          TAGS="$(cat release/BUILD_TAGS_JIEJIE_SERVER_MINIMAL)"
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           cd test
           # The names are `TestJiejieMASQUE*` and `TestJiejieMinimalMASQUE*`, in
           # UPPERCASE. This filter used to read `TestJiejieMasque`, which is

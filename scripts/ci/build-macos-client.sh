@@ -4,30 +4,33 @@
 # Usage: build-macos-client.sh <goarch> [output]
 #        build-macos-client.sh arm64 dist/sing-box-darwin-arm64
 #
-# # One macOS product
+# # Full upstream feature profile
 #
-# This fork ships exactly ONE macOS core. It contains the NaiveProxy outbound
-# (Cronet) AND the MASQUE transport AND the full client protocol set, because
-# those are the capabilities the product is for. There is no lite/naive split and
-# no second user-visible core: a capability that is needed is in the product, and
-# a capability that is not needed is not built at all.
+# This fork no longer maintains a product-specific protocol registry or an
+# allowlist of permitted capabilities. The macOS core is built with upstream's
+# own Darwin feature profile (release/DEFAULT_BUILD_TAGS): the complete protocol,
+# endpoint, DNS-transport, service and certificate-provider registry that
+# upstream ships.
 #
-# The tag set lives in release/BUILD_TAGS_JIEJIE_CLIENT_MACOS and nowhere else, so
-# this script and the workflow cannot drift apart.
+# That means every capability upstream adds is inherited automatically. There is
+# no fork-side list to update when upstream registers a new protocol, which was
+# the whole point of retiring the pruning architecture.
+#
+# The single deviation from upstream's tag file is the removal of
+# `with_clash_api`, which no longer names any file: the Clash API was deleted
+# from this fork as a control-plane decision (see docs/FORK-DIFF.md), not as a
+# size cut. Keeping the tag would advertise a capability that does not exist.
 #
 # # CGO
 #
 # `with_naive_outbound` links github.com/sagernet/cronet-go, a prebuilt Chromium
-# network stack, so this profile is CGO=1 by definition. That is accepted rather
-# than worked around: the alternative would be a second CGO-free core that cannot
-# speak NaiveProxy, which is exactly the split this consolidation removes.
+# network stack, so this profile is CGO=1 by definition.
 #
 # # Reproducibility
 #
 # -trimpath and -buildvcs=false remove the checkout path and the VCS stamp, and no
 # timestamp is linked into the binary: build time lives only in the BUILD-INFO
-# sidecar. The same commit therefore produces a byte-identical binary. Verified by
-# building twice and comparing SHA-256.
+# sidecar. The same commit therefore produces a byte-identical binary.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -38,35 +41,21 @@ output="${2:-}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-tags_file="release/BUILD_TAGS_JIEJIE_CLIENT_MACOS"
+tags_file="release/DEFAULT_BUILD_TAGS"
 if [ ! -f "$tags_file" ]; then
   echo "missing tag file: $tags_file" >&2
   exit 2
 fi
 tags="$(cat "$tags_file")"
 
-# The product requirement, asserted rather than assumed. A tag-file edit that
-# dropped the Naive outbound would still produce a working binary, so nothing else
-# in the pipeline would notice that the shipped core lost a headline capability.
-# with_gvisor is deliberately absent, and that is a measured decision rather than an
-# omission. The production configuration declares a tun inbound with NO `stack` field,
-# and sing-tun resolves unset to "" -> NewGo, the Go userspace stack. The gVisor stack
-# is reached only by stack="gvisor" or stack="mixed", which this deployment never sets.
-# Verified against sing-tun's NewStack with the tag absent:
-#
-#   <unset> -> OK                     go -> OK
-#   gvisor  -> "gVisor is not included in this build, rebuild with -tags with_gvisor"
-#   mixed   -> (same)
-#
-# The unset case -- the one this deployment uses -- behaves identically with and
-# without the tag, so removing it cannot change the stack in use. It removes
-# 4,088,992 bytes (3.89 MiB) of code that is never executed.
-#
-# with_quic IS still required: MASQUE needs HTTP/3, a different consumer of that tag
-# from hysteria2/tuic, both of which are unregistered in this product.
-for required in with_quic with_utls with_naive_outbound jiejie_client_macos; do
+# The profile must actually be the full upstream feature set. Asserted rather than
+# assumed, because a silent revert to a narrower tag list would still produce a
+# working binary and nothing downstream would notice that the core had lost
+# capabilities. The list is upstream's own Darwin baseline; the point of the
+# check is that the file still names all of it.
+for required in with_gvisor with_quic with_utls with_naive_outbound with_wireguard with_tailscale; do
   if ! grep -q "$required" <<<"$tags"; then
-    echo "$tags_file is missing $required; the macOS core would lose a required capability" >&2
+    echo "$tags_file is missing $required; the macOS core would lose part of the upstream feature profile" >&2
     exit 2
   fi
 done
@@ -95,12 +84,9 @@ fi
 # building.
 #
 # The cost is that `go tool nm` no longer works on the shipped artifact. That is
-# deliberate: symbol-name inspection was how the old capability audit worked, and it has
-# been replaced by build-graph + registry + config + RUNTIME evidence.
-# The file holds "-s -w" on one line. Only the trailing newline is stripped: deleting
-# ALL whitespace would fuse the two flags into "-s-w", which the linker does not
-# recognise and reports as a usage error.
-strip_flags="$(tr -d '\n' < release/LDFLAGS_JIEJIE_CLIENT_MACOS)"
+# deliberate: capability verification is done by building, running and checking the
+# registry, not by inspecting stripped symbol tables.
+strip_flags="-s -w"
 ldflags="-X github.com/sagernet/sing-box/constant.Version=${version} $(cat release/LDFLAGS) ${strip_flags}"
 
 # Cronet ships prebuilt static libraries, so CGO is mandatory here. Defaulting it on

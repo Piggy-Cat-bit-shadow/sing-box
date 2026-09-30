@@ -20,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# Keep in step with release/BUILD_TAGS_JIEJIE_CLIENT_MACOS: the suite exercises the
+# Keep in step with release/DEFAULT_BUILD_TAGS: the suite exercises the
 # Naive outbound, so it needs the client profile's tags.
 TAGS="with_quic,with_naive_outbound,badlinkname,tfogo_checklinkname0"
 
