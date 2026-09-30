@@ -73,6 +73,20 @@ func classifyH3Error(err error) h3ErrorClass {
 		}
 		return classifyH3ErrorCode(http3.ErrCode(streamErr.ErrorCode))
 	}
+	// A stateless reset means the peer or a middlebox declared the connection
+	// gone without closing it. That is a real, notable event on an active path,
+	// and it unwraps to net.ErrClosed, so it must be classified explicitly or a
+	// later generic closed-ness test would call it routine.
+	var statelessReset *quic.StatelessResetError
+	if errors.As(err, &statelessReset) {
+		return h3ErrorUnexpected
+	}
+	// Version negotiation failing means no usable QUIC version was agreed, so
+	// nothing was ever established. Like the above it unwraps to net.ErrClosed.
+	var versionErr *quic.VersionNegotiationError
+	if errors.As(err, &versionErr) {
+		return h3ErrorUnexpected
+	}
 	// Idle and handshake timeouts are reported for peers that simply go away,
 	// including scanners that connect and vanish.
 	var idleTimeout *quic.IdleTimeoutError
@@ -114,8 +128,43 @@ func classifyH3ErrorCode(code http3.ErrCode) h3ErrorClass {
 	}
 }
 
-// isExpectedH3Closure reports whether an HTTP/3 or QUIC error represents a
-// normal lifecycle event rather than a fault.
-func isExpectedH3Closure(err error) bool {
+// IsExpectedH3Closure reports whether an HTTP/3 or QUIC error represents a normal lifecycle
+// event rather than a fault.
+//
+// It is exported because other packages that handle the same wire protocols -- transport/masque
+// among them -- decide log levels with a generic closed/canceled test that every quic-go error
+// satisfies regardless of its code. They must apply the SAME typed classification rather than
+// growing a second copy of the code table, which would drift.
+//
+// Callers must use this BEFORE any errors.Is(err, net.ErrClosed) style test.
+func IsExpectedH3Closure(err error) bool {
 	return classifyH3Error(err) == h3ErrorExpected
+}
+
+// isExpectedH3Closure is the internal spelling used within this package.
+func isExpectedH3Closure(err error) bool {
+	return IsExpectedH3Closure(err)
+}
+
+// CarriesQuicSemantics reports whether the error chain contains a quic-go or HTTP/3 type.
+//
+// It exists so a caller can tell "this error has a typed meaning, so the typed classifier is
+// authoritative" from "this is a bare sentinel, so a generic closed/canceled test is the best
+// available answer". Without that distinction a caller writing `!typed && !generic` still lets
+// the generic and permissive test win, because every quic-go type unwraps to net.ErrClosed.
+func CarriesQuicSemantics(err error) bool {
+	var (
+		transportErr *quic.TransportError
+		appErr       *quic.ApplicationError
+		streamErr    *quic.StreamError
+		h3Err        *http3.Error
+		statelessErr *quic.StatelessResetError
+		versionErr   *quic.VersionNegotiationError
+		idleErr      *quic.IdleTimeoutError
+		handshakeErr *quic.HandshakeTimeoutError
+	)
+	return errors.As(err, &transportErr) || errors.As(err, &appErr) ||
+		errors.As(err, &streamErr) || errors.As(err, &h3Err) ||
+		errors.As(err, &statelessErr) || errors.As(err, &versionErr) ||
+		errors.As(err, &idleErr) || errors.As(err, &handshakeErr)
 }

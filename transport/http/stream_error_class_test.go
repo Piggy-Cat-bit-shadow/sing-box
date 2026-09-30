@@ -241,154 +241,188 @@ func TestStreamErrorClassificationTable(t *testing.T) {
 		// quiet is the expected classification: true means "normal teardown, do not log as a
 		// fault", false means "must remain visible".
 		quiet bool
-		why   string
+		// typedSemantics declares whether this error carries quic-go or HTTP/3 semantics, and
+		// therefore whether the two classifiers MUST agree about it.
+		//
+		// This is declared per row rather than inferred. The previous revision inferred it with a
+		// hand-written isQuicTyped() whitelist listing four types, which silently omitted
+		// StatelessResetError, VersionNegotiationError, IdleTimeoutError and
+		// HandshakeTimeoutError -- so those rows never executed the agreement assertion at all.
+		// An inferred predicate that can be incomplete is exactly how a coverage hole hides; a
+		// declared field cannot omit a row without the row visibly lacking it.
+		typedSemantics bool
+		why            string
 	}{
 		// ---- expected: the peer or the client ended things normally ----
 		{
-			name:  "stream reset H3_REQUEST_CANCELLED remote",
-			err:   &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: true},
-			quiet: true,
-			why:   "the peer abandoned ONE request stream; the connection stays usable",
+			name:           "stream reset H3_REQUEST_CANCELLED remote",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: true},
+			quiet:          true,
+			why:            "the peer abandoned ONE request stream; the connection stays usable",
 		},
 		{
-			name:  "stream reset H3_REQUEST_CANCELLED local",
-			err:   &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: false},
-			quiet: true,
-			why:   "this client abandoned its own request",
+			name:           "stream reset H3_REQUEST_CANCELLED local",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 184, ErrorCode: 268, Remote: false},
+			quiet:          true,
+			why:            "this client abandoned its own request",
 		},
 		{
-			name:  "stream reset code 0",
-			err:   &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: false},
-			quiet: true,
-			why:   "no-error stream close",
+			name:           "stream reset code 0",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 4, ErrorCode: 0, Remote: false},
+			quiet:          true,
+			why:            "no-error stream close",
 		},
 		{
-			name:  "transport error no-error code",
-			err:   &quic.TransportError{ErrorCode: quic.NoError},
-			quiet: true,
-			why:   "orderly transport shutdown",
+			name:           "transport error no-error code",
+			typedSemantics: true,
+			err:            &quic.TransportError{ErrorCode: quic.NoError},
+			quiet:          true,
+			why:            "orderly transport shutdown",
 		},
 		{
-			name:  "application error no-error code",
-			err:   &quic.ApplicationError{ErrorCode: 0},
-			quiet: true,
-			why:   "orderly application shutdown",
+			name:           "application error no-error code",
+			typedSemantics: true,
+			err:            &quic.ApplicationError{ErrorCode: 0},
+			quiet:          true,
+			why:            "orderly application shutdown",
 		},
 		{
-			name:  "idle timeout",
-			err:   &quic.IdleTimeoutError{},
-			quiet: true,
-			why:   "the connection simply went inactive",
+			name:           "idle timeout",
+			typedSemantics: true,
+			err:            &quic.IdleTimeoutError{},
+			quiet:          true,
+			why:            "the connection simply went inactive",
 		},
 		{
-			name:  "handshake timeout",
-			err:   &quic.HandshakeTimeoutError{},
-			quiet: true,
-			why:   "the handshake never completed",
+			name:           "handshake timeout",
+			typedSemantics: true,
+			err:            &quic.HandshakeTimeoutError{},
+			quiet:          true,
+			why:            "the handshake never completed",
 		},
 		{
-			name:  "http3 ErrCodeNoError",
-			err:   &http3.Error{ErrorCode: http3.ErrCodeNoError, Remote: true},
-			quiet: true,
-			why:   "orderly HTTP/3 shutdown",
+			name:           "http3 ErrCodeNoError",
+			typedSemantics: true,
+			err:            &http3.Error{ErrorCode: http3.ErrCodeNoError, Remote: true},
+			quiet:          true,
+			why:            "orderly HTTP/3 shutdown",
 		},
 		{
-			name:  "http3 ErrCodeRequestCanceled",
-			err:   &http3.Error{ErrorCode: http3.ErrCodeRequestCanceled, Remote: true},
-			quiet: true,
-			why:   "the same code as 268, in its http3.Error spelling",
+			name:           "http3 ErrCodeRequestCanceled",
+			typedSemantics: true,
+			err:            &http3.Error{ErrorCode: http3.ErrCodeRequestCanceled, Remote: true},
+			quiet:          true,
+			why:            "the same code as 268, in its http3.Error spelling",
 		},
 		{
-			name:  "context canceled",
-			err:   context.Canceled,
-			quiet: true,
-			why:   "the caller gave up",
+			name:           "context canceled",
+			typedSemantics: false,
+			err:            context.Canceled,
+			quiet:          true,
+			why:            "the caller gave up",
 		},
 		{
-			name:  "context deadline exceeded",
-			err:   context.DeadlineExceeded,
-			quiet: true,
-			why:   "the caller's deadline expired",
+			name:           "context deadline exceeded",
+			typedSemantics: false,
+			err:            context.DeadlineExceeded,
+			quiet:          true,
+			why:            "the caller's deadline expired",
 		},
 		{
-			name:  "bare net.ErrClosed",
-			err:   net.ErrClosed,
-			quiet: true,
-			why:   "a plain closed connection carries no quic-go fault semantics",
+			name:           "bare net.ErrClosed",
+			typedSemantics: false,
+			err:            net.ErrClosed,
+			quiet:          true,
+			why:            "a plain closed connection carries no quic-go fault semantics",
 		},
 		{
-			name:  "io.EOF",
-			err:   io.EOF,
-			quiet: true,
-			why:   "normal end of stream",
+			name:           "io.EOF",
+			typedSemantics: false,
+			err:            io.EOF,
+			quiet:          true,
+			why:            "normal end of stream",
 		},
 
 		// ---- real faults: must stay visible ----
 		{
-			name:  "stream reset internal error",
-			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeInternalError), Remote: true},
-			quiet: false,
-			why:   "the peer hit an internal error on this stream",
+			name:           "stream reset internal error",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeInternalError), Remote: true},
+			quiet:          false,
+			why:            "the peer hit an internal error on this stream",
 		},
 		{
-			name:  "stream reset general protocol error",
-			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError), Remote: true},
-			quiet: false,
-			why:   "a protocol violation",
+			name:           "stream reset general protocol error",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeGeneralProtocolError), Remote: true},
+			quiet:          false,
+			why:            "a protocol violation",
 		},
 		{
-			name:  "stream reset frame unexpected",
-			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeFrameUnexpected), Remote: true},
-			quiet: false,
-			why:   "the peer sent a frame this state machine forbids",
+			name:           "stream reset frame unexpected",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeFrameUnexpected), Remote: true},
+			quiet:          false,
+			why:            "the peer sent a frame this state machine forbids",
 		},
 		{
-			name:  "stream reset settings error",
-			err:   &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeSettingsError), Remote: true},
-			quiet: false,
-			why:   "a SETTINGS exchange failure",
+			name:           "stream reset settings error",
+			typedSemantics: true,
+			err:            &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(http3.ErrCodeSettingsError), Remote: true},
+			quiet:          false,
+			why:            "a SETTINGS exchange failure",
 		},
 		{
-			name:  "transport PROTOCOL_VIOLATION",
-			err:   transportViolation,
-			quiet: false,
-			why:   "a transport fault that unwraps to net.ErrClosed and would otherwise be erased",
+			name:           "transport PROTOCOL_VIOLATION",
+			typedSemantics: true,
+			err:            transportViolation,
+			quiet:          false,
+			why:            "a transport fault that unwraps to net.ErrClosed and would otherwise be erased",
 		},
 		{
-			name:  "application error with a fault code",
-			err:   applicationFault,
-			quiet: false,
-			why:   "the peer reported a fault in its own code space",
+			name:           "application error with a fault code",
+			typedSemantics: true,
+			err:            applicationFault,
+			quiet:          false,
+			why:            "the peer reported a fault in its own code space",
 		},
 		{
-			name:  "stateless reset",
-			err:   &quic.StatelessResetError{},
-			quiet: false,
-			why:   "the path was torn down without a close; notable on an active tunnel",
+			name:           "stateless reset",
+			typedSemantics: true,
+			err:            &quic.StatelessResetError{},
+			quiet:          false,
+			why:            "the path was torn down without a close; notable on an active tunnel",
 		},
 		{
-			name:  "version negotiation failure",
-			err:   &quic.VersionNegotiationError{},
-			quiet: false,
-			why:   "no usable QUIC version was agreed, so nothing was established",
+			name:           "version negotiation failure",
+			typedSemantics: true,
+			err:            &quic.VersionNegotiationError{},
+			quiet:          false,
+			why:            "no usable QUIC version was agreed, so nothing was established",
 		},
 		{
-			name:  "http3 ErrCodeInternalError",
-			err:   &http3.Error{ErrorCode: http3.ErrCodeInternalError, Remote: true},
-			quiet: false,
-			why:   "an internal HTTP/3 fault",
+			name:           "http3 ErrCodeInternalError",
+			typedSemantics: true,
+			err:            &http3.Error{ErrorCode: http3.ErrCodeInternalError, Remote: true},
+			quiet:          false,
+			why:            "an internal HTTP/3 fault",
 		},
 		{
-			name:  "http3 ErrCodeMessageError",
-			err:   &http3.Error{ErrorCode: http3.ErrCodeMessageError, Remote: true},
-			quiet: false,
-			why:   "a malformed HTTP/3 message",
+			name:           "http3 ErrCodeMessageError",
+			typedSemantics: true,
+			err:            &http3.Error{ErrorCode: http3.ErrCodeMessageError, Remote: true},
+			quiet:          false,
+			why:            "a malformed HTTP/3 message",
 		},
 		{
-			name:  "plain unclassified error",
-			err:   errors.New("something genuinely went wrong"),
-			quiet: false,
-			why:   "an unknown error must never be assumed benign",
+			name:           "plain unclassified error",
+			typedSemantics: false,
+			err:            errors.New("something genuinely went wrong"),
+			quiet:          false,
+			why:            "an unknown error must never be assumed benign",
 		},
 	}
 
@@ -412,32 +446,18 @@ func TestStreamErrorClassificationTable(t *testing.T) {
 				}
 
 				// And the server-side classifier must agree, or one direction logs a fault the
-				// other calls routine.
-				if got := classifyH3Error(input.err) == h3ErrorExpected; got != testCase.quiet {
-					// The two are only required to agree for errors carrying HTTP/3 or QUIC
-					// semantics; a bare sentinel or an unclassifiable error is the client
-					// normalizer's business.
-					if isQuicTyped(testCase.err) {
-						t.Fatalf("%s (%s): classifier says quiet=%v but the normalizer says %v",
+				// other calls routine. This runs for EVERY row that declares quic-go or HTTP/3
+				// semantics, so a type cannot be added to the table and silently skip it.
+				if testCase.typedSemantics {
+					if got := classifyH3Error(input.err) == h3ErrorExpected; got != testCase.quiet {
+						t.Fatalf("%s (%s): the server classifier says quiet=%v but the client "+
+							"normalizer says %v -- the two must not drift about the same error",
 							testCase.name, input.label, got, quiet)
 					}
 				}
 			}
 		})
 	}
-}
-
-// isQuicTyped reports whether an error carries a quic-go or HTTP/3 type, which is the set both
-// classifiers are required to agree about.
-func isQuicTyped(err error) bool {
-	var (
-		streamErr    *quic.StreamError
-		transportErr *quic.TransportError
-		appErr       *quic.ApplicationError
-		h3Err        *http3.Error
-	)
-	return errors.As(err, &streamErr) || errors.As(err, &transportErr) ||
-		errors.As(err, &appErr) || errors.As(err, &h3Err)
 }
 
 // TestTypedClassificationPrecedesGenericNetErrClosed is the ordering guard.
