@@ -662,6 +662,47 @@
         }
       ]
     },
+    "ClashAPIOptions": {
+      "type": "object",
+      "properties": {
+        "external_controller": {
+          "type": "string"
+        },
+        "external_ui": {
+          "type": "string"
+        },
+        "external_ui_download_url": {
+          "type": "string"
+        },
+        "external_ui_download_detour": {
+          "type": "string",
+          "x-tag-reference": "outbound"
+        },
+        "secret": {
+          "type": "string"
+        },
+        "default_mode": {
+          "type": "string"
+        },
+        "access_control_allow_origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "access_control_allow_private_network": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "DERPMeshOptions": {
       "type": "object",
       "properties": {
@@ -5192,6 +5233,9 @@
       "properties": {
         "cache_file": {
           "$ref": "#/$defs/CacheFileOptions"
+        },
+        "clash_api": {
+          "$ref": "#/$defs/ClashAPIOptions"
         },
         "v2ray_api": {
           "$ref": "#/$defs/V2RayAPIOptions"

@@ -12,10 +12,10 @@ no allowlist of permitted capabilities.
 | Registry | `include/registry.go` | `include/registry.go` |
 | Workflow | `.github/workflows/server-linux-amd64.yml` | `.github/workflows/client-macos.yml` |
 
-The two tag files are upstream's, unmodified except for the removal of
-`with_clash_api` (see [Clash API](#clash-api) below). The platform split is
-upstream's own: its CI uses `DEFAULT_BUILD_TAGS` for CGO/naive builds and
-`DEFAULT_BUILD_TAGS_OTHERS` otherwise.
+Both tag files are upstream's, unmodified: the fork's default capability set now
+matches upstream's exactly. The platform split is upstream's own - its CI uses
+`DEFAULT_BUILD_TAGS` for CGO/naive builds and `DEFAULT_BUILD_TAGS_OTHERS`
+otherwise.
 
 ## Capability boundary
 
@@ -41,16 +41,14 @@ fork-side list to update, and no CI step that has to be told about it.
 
 ## Clash API
 
-`with_clash_api` is the one deliberate deviation from upstream's tag files. It is
-**not** a build-size decision: the Clash API was deleted from the source tree
-because this fork has exactly one control plane (the Native API plus
-`sing-box-dashboard`), and a second, incompatible management surface was dead
-weight. `experimental/clashmode/` was deliberately kept, because `SetClashMode` is
-a required Native API method.
+`with_clash_api` is enabled in both profiles, as upstream ships it. The Clash API and
+the Native `api` service are two management surfaces over **one** instance: they share
+the traffic manager and the routing-mode manager, so a mode set through the Native
+API's `SetClashMode` is the mode the Clash API reports, and both observe the same
+connection and log streams.
 
-The tag now names no file, so leaving it in the tag list would advertise a
-capability that does not exist. A configuration containing `experimental.clash_api`
-fails as an unknown field rather than being silently ignored.
+The two may be configured together. `external_controller` is what makes the Clash API
+listen; the Native API listens through its own `api` service entry.
 
 See [server](JIEJIE-SERVER.md) and [macOS client](JIEJIE-MACOS-CLIENT.md) for
 product details, and [FORK-DIFF.md](FORK-DIFF.md) for the full list of

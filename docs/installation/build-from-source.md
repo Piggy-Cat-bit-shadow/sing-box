@@ -77,11 +77,12 @@ It is not recommended to change the default build tag list unless you really kno
     upstream's complete registry, so capabilities upstream adds are inherited
     automatically.
 
-    The one deviation from the upstream tag files is `with_clash_api`, which is
-    removed because the fork does **not** build the Clash API. That is a
-    control-plane decision rather than a size cut: the Native `api` service is the
-    only management plane, and a configuration using `experimental.clash_api` is
-    rejected as an unknown field rather than silently ignored.
+    The default capability set matches upstream's exactly, including
+    `with_clash_api`. The fork does not remove any upstream capability any more.
+
+    The Clash API and the Native `api` service can coexist in one instance: they are
+    two different management surfaces over the same shared traffic and routing-mode
+    state. See [Clash API](/configuration/experimental/clash-api/) for the options.
 
 ## :material-wrench: Linker Flags
 

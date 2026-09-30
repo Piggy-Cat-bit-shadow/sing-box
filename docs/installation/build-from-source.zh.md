@@ -79,9 +79,11 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
     本 fork 不再维护专属 registry 或协议白名单：两个产品都携带 upstream 的完整 registry，
     upstream 新增的协议、endpoint、DNS transport、service 与证书提供者会被自动继承。
 
-    与 upstream 标签文件的唯一差异是去掉了 `with_clash_api`，因为本 fork **不构建**
-    Clash API。这是控制面架构决策而非体积裁剪：Native `api` service 是唯一的管理面，
-    配置里的 `experimental.clash_api` 会以 unknown field 报错，而不是被静默忽略。
+    默认能力集与 upstream 完全一致，包含 `with_clash_api`。本 fork 不再移除任何
+    upstream 能力。
+
+    Clash API 与 Native `api` service 可以在同一个实例中并存：它们是共享同一份
+    流量与路由模式状态的两个管理面。选项见 [Clash API](/configuration/experimental/clash-api/)。
 
 ## :material-wrench: 链接器标志
 

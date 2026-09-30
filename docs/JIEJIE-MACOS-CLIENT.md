@@ -12,9 +12,8 @@ with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_tailscal
 
 Both products use `include/registry.go`, which is upstream's complete registry. There is no
 fork-specific registry and no capability allowlist: capabilities upstream adds are inherited
-automatically. The only deviation from upstream's tag files is the removal of `with_clash_api`,
-which names no file because the Clash API was removed as a control-plane decision rather than a
-size cut.
+automatically. The tag file is upstream's, unmodified: the default capability set matches
+upstream's exactly, including `with_clash_api`.
 
 `with_quic` enables MASQUE H3. `with_naive_outbound` links the Cronet-backed Naive client and requires CGO. TUN uses the default Go stack; `with_gvisor` is absent. The client is one product, with no Intel or reduced-capability variant.
 
@@ -44,7 +43,7 @@ The native `api` service is the management interface. It supports status, logs, 
 }
 ```
 
-The dashboard is downloaded or served from the configured directory; it is not embedded in the binary. An unavailable dashboard does not stop TUN, DNS, routing or proxy traffic. Keep the API on loopback unless authentication and exposure are deliberately configured. The Native API remains; the launcher RPC surface and LXD integration have been removed. The Clash compatibility API is also absent, so a configuration using `experimental.clash_api` is invalid.
+The dashboard is downloaded or served from the configured directory; it is not embedded in the binary. An unavailable dashboard does not stop TUN, DNS, routing or proxy traffic. Keep the API on loopback unless authentication and exposure are deliberately configured. The Native API remains; the launcher RPC surface and LXD integration have been removed. The Clash compatibility API is also available and can run alongside the Native API, sharing the same traffic and routing-mode state.
 
 ## TUN, Naive and MASQUE
 

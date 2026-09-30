@@ -16,6 +16,9 @@
 现在两个产品都使用 upstream 官方的完整 registry 与 build-tag profile。upstream 新增的
 协议、endpoint、DNS transport、service 与证书提供者会被自动继承。
 
+其中 Clash API 的移除后来也被撤销：该能力已从 upstream 完整恢复，
+`with_clash_api` 重新进入正式 tag 文件，Native API 与 Clash API 并存。
+
 下表仅作为历史索引保留，其中的 commit 描述的是当时的裁剪工作，**不代表当前架构**。
 
 | Commit | 当时的工作 |
