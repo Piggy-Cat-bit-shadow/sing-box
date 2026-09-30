@@ -2,6 +2,7 @@
 
 | Commit | 工作 |
 | --- | --- |
+| [`a03eb2d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a03eb2d5fb11f40a5632754349f82440f0004e8a) | 将 SOCKS4 目标解析测试收窄到未配置域名解析器的场景，删除把旧缺陷当作预期行为的断言。 |
 | [`d676b4a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d676b4a626bdd7cedb759394ace40da0e1b0059f) | 从 DialerOptions 直接推导 SOCKS4 目标解析策略，不再依赖代理服务器是否为域名。 |
 | [`9260e8a`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/9260e8a95c2b07ecea0a3ad6e64b47adb95025ed) | 补充各协议数据传输和 DNS 审计的结论与依据。 |
 | [`977f530`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/977f53031f6800ad08d002e090b6bc83a9f47615) | 明确 WireGuard 的两个 DNS 授权边界，不再让语义保持隐含。 |

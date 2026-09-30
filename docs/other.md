@@ -2,9 +2,19 @@
 
 | Commit | 工作 |
 | --- | --- |
+| [`f718300`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f718300b18fccb5678d3f8bdff9bf9620274fc34) | 从 README 的 SOCKS5 出站简介中删除测试范围说明。 |
+| [`6b2845c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/6b2845c6dba75bc126bafd048c58ffad24d30497) | 调整 README 中 SOCKS5 出站简介的排版，去除列表格式。 |
+| [`984cf05`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/984cf0595be20b6cbdc1a3e7fa209958e47a6fb1) | 将住宅代理分类改为 SOCKS5 出站，并把简介收紧到预连接与缓冲区调优。 |
+| [`ba77c02`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ba77c028ab6cc76ded1e9071b667e7c201cbd599) | 删除空的 VLESS / Vision 栏目，整理住宅代理相关提交。 |
+| [`bfa4755`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bfa47557548121141a119ea884d6830740a59c7a) | 修正 Go 模块检查把依赖下载日志误判为文件变更的问题。 |
+| [`d9e7c8c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d9e7c8c00471aeb1e255e21c45bff679252d8259) | 解释 VLESS / Vision 索引为空的原因，修正 README 中缺乏提交依据的描述。 |
+| [`ebeda69`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/ebeda694b7a258952803918b232e44c10e4f7718) | 加强 SOCKS4 与 Shadowsocks 的回归测试，去除只打印结果却不检查结果的测试。 |
+| [`d2ad14d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/d2ad14d35da64f6421ba3f0eab3b1faf5bc99ab8) | 在 CI 中检查根模块与嵌套 Go 模块的依赖一致性，提前发现版本和校验和漂移。 |
+| [`e3493bb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/e3493bb22a62cc6979303e71a1671a3d113c83b8) | 将提交索引摘要恢复为中文，并润色部分措辞。 |
+| [`bea7039`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/bea7039465c534e3fd2fe14087d06043fe922f3b) | 将提交索引摘要暂时替换为原始提交标题。 |
+| [`86ee36d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/86ee36d1014dae829e639f6d0a23f35214411307) | 将 README 改为按主题分组的提交索引。 |
 | [`f240a30`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/f240a30d0b2121db0d3c7dfa3e7975ee5c3d089e) | 补齐 test module 的 go.sum，避免独立测试模块无法解析依赖。 |
 | [`813905c`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/813905c6fba4cc2670f701ba8e514f8002f1f803) | 锁定包含缓存缓冲区移交保护的 sing 依赖版本。 |
-| [`a03eb2d`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/a03eb2d5fb11f40a5632754349f82440f0004e8a) | 修正把缺陷当作正确行为的过时测试预期。 |
 | [`dfc7948`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/dfc79488a01d0eb33304793f1e57be57c5005cbf) | 使本地特性适配合并后的上游代码树。 |
 | [`1bcb748`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1bcb748a6907b8a0379707a896a15be546de6347) | 修正写入失败时缓存缓冲区的所有权判断。 |
 | [`1ba1efb`](https://github.com/Piggy-Cat-bit-shadow/sing-box/commit/1ba1efb97d11cdcaa4460ac934a9be9637413559) | 为批量提交的依赖刷新测试模块校验和文件。 |
