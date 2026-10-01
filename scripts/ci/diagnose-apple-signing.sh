@@ -45,8 +45,16 @@ if identities="$(security find-identity -v -p codesigning 2>/dev/null)" &&
    ! printf '%s' "$identities" | grep -q "0 valid identities found"; then
   printf '%s\n' "$identities" | sed 's/^/  /'
   # The team in parentheses is the one provisioning must be asked for.
-  teams="$(printf '%s' "$identities" | grep -oE '\(([A-Z0-9]{10})\)' | tr -d '()' | sort -u | tr '\n' ' ')"
-  echo "  team IDs found: ${teams:-none}"
+  # The parenthesised value in the name is the certificate's individual
+  # identifier; the TEAM is the OU field. They are often different, and using the
+  # wrong one produces "No Account for Team \"...\"" even when the account is
+  # present and signed in.
+  echo "  team IDs (from the certificate OU field, which is the real one):"
+  security find-certificate -a -c "Apple Development" -p 2>/dev/null \
+    | openssl x509 -noout -subject 2>/dev/null \
+    | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | sed 's/OU=/    /' | sort -u
+  names="$(printf '%s' "$identities" | grep -oE '\(([A-Z0-9]{10})\)' | tr -d '()' | sort -u | tr '\n' ' ')"
+  echo "  identifiers in the certificate NAME (NOT the team): ${names:-none}"
 else
   echo "  none"
   echo "  Without a valid identity nothing can be signed. Note that importing a"

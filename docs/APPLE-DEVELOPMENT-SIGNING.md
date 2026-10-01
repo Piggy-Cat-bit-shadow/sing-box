@@ -58,6 +58,47 @@ signing style.
 > [Apple's certificate authority page](https://www.apple.com/certificateauthority/)
 > if Xcode has not already installed it.
 
+### Dev builds need at least one registered device
+
+A development provisioning profile is **device-scoped**, for macOS as well as iOS.
+A team with no registered devices cannot be issued one at all, and every target
+fails with:
+
+```text
+Communication with Apple failed: Your team has no devices from which to generate a
+provisioning profile. Connect a device to use or manually add device IDs in
+Certificates, Identifiers & Profiles.
+```
+
+This is not a project or configuration problem, and `-allowProvisioningDeviceRegistration`
+does not create the first device on its own. Register at least one:
+
+```text
+Connect an iPhone over USB and let Xcode see it (Window > Devices and Simulators),
+or add a device UDID manually at
+https://developer.apple.com/account/resources/devices/list
+```
+
+For a Mac-only build, register the Mac itself. Its identifier is the Hardware UUID:
+
+```sh
+system_profiler SPHardwareDataType | grep "Hardware UUID"
+```
+
+> The team ID is the certificate's **OU** field, which is not always the value shown
+> in the certificate's name. For `Apple Development: <name> (XXXXXXXXXX)` the
+> parenthesised value is the individual's certificate identifier; the team is the
+> `OU`. Check it before setting `APPLE_TEAM_ID`:
+>
+> ```sh
+> security find-certificate -c "Apple Development" -p \
+>   | openssl x509 -noout -subject | tr ',' '\n' | grep OU
+> ```
+>
+> A mismatch produces `No Account for Team "<the wrong id>"`, which reads as a
+> missing account even though the account is present and signed in, and even though
+> Xcode's UI lists a team.
+
 ## Step 2 — identifiers
 
 Every bundle identifier is derived from **one** base value,
@@ -344,6 +385,8 @@ Step 1. A successful `security import` does not imply a usable identity.
 **`No signing certificate "iOS Development" found`** — no identity for
 `APPLE_TEAM_ID`. Run `security find-identity -v -p codesigning` and compare the
 team in parentheses.
+
+**`... is automatically signed, but provisioning profile ... has been manually specified`** — the project pins Developer ID settings on the macOS SDK for SFM.System, SystemExtension and ShareExtension.System. The build scripts override them; if you invoke `xcodebuild` yourself, pass `CODE_SIGN_IDENTITY="Apple Development" PROVISIONING_PROFILE_SPECIFIER=""` (unqualified — the `[sdk=macosx*]` form cannot be given on the command line).
 
 **`Provisioning profile ... doesn't match`** — the profile's App ID or team does
 not match the bundle identifier being signed. With automatic signing, delete the
