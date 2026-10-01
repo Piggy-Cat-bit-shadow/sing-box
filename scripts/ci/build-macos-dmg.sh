@@ -161,6 +161,24 @@ else
   build_settings+=(
     BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID"
     DEVELOPMENT_TEAM="$APPLE_TEAM_ID"
+    # The project pins Developer ID distribution settings on the macOS SDK for
+    # three targets - SFM.System, SystemExtension and ShareExtension.System:
+    #
+    #   "CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+    #   "PROVISIONING_PROFILE_SPECIFIER[sdk=macosx*]" = "XC io nekohasekai sfamt ...";
+    #
+    # Those are upstream's release settings. Under automatic development signing
+    # they conflict, and Xcode refuses the build with:
+    #
+    #   SFM.System is automatically signed, but provisioning profile
+    #   XC io nekohasekai sfamt standalone has been manually specified.
+    #
+    # Setting the unqualified name here overrides the SDK-qualified value, so the
+    # override works without editing the pinned project. Passing the bracket form on
+    # the command line does not: the brackets are not parsed as a condition there
+    # and the literal text ends up as the value.
+    CODE_SIGN_IDENTITY="Apple Development"
+    PROVISIONING_PROFILE_SPECIFIER=""
   )
   if [ "$APPLE_SIGNING_STYLE" = "automatic" ]; then
     build_settings+=(CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates)

@@ -45,7 +45,22 @@ echo "building Libbox.xcframework for: $targets"
 echo "source commit: $(git rev-parse HEAD)"
 
 rm -rf Libbox.xcframework
-go run ./cmd/internal/build_libbox -target apple -platform "$targets"
+# Prefer the local module cache when it already holds everything.
+#
+# gomobile resolves dependencies with GOPROXY=off internally, and the outer `go run`
+# still reaches GitHub for anything missing. This machine's network to github.com
+# fails intermittently (SSL_ERROR_SYSCALL), which turns a signing build into a
+# network failure that looks like a toolchain problem. Every module this build needs
+# is already in the local cache, so point the resolver at the cache first and fall
+# back to the network only if a module really is missing.
+cache_proxy="file://$(go env GOMODCACHE)/cache/download"
+if [ -d "$(go env GOMODCACHE)/cache/download" ]; then
+  echo "  module proxy: local cache first ($cache_proxy)"
+  GOFLAGS="${GOFLAGS:-}" GOPROXY="$cache_proxy,https://proxy.golang.org,direct" \
+    go run ./cmd/internal/build_libbox -target apple -platform "$targets"
+else
+  go run ./cmd/internal/build_libbox -target apple -platform "$targets"
+fi
 
 if [ ! -d Libbox.xcframework ]; then
   echo "FAIL: Libbox.xcframework was not produced" >&2
