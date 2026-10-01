@@ -148,6 +148,17 @@ echo "  [compatibility] PromotePowerReportDraft -> no-op (no draft entry point i
 echo "  [compatibility] notification send(_:)   -> untouched, single implementation"
 
 # ---------------------------------------------------------------------------
+# 1b. [compatibility] Fix AppConfiguration.teamID.
+# ---------------------------------------------------------------------------
+# teamID is interpolated into XPC and System Extension code-signing requirements
+# of the form `certificate leaf[subject.OU] = "<teamID>"`. It was derived by
+# splitting the App Group name on the first dot, which cannot produce a team id
+# under any App Group convention this project uses ("group" or "TEAMIDio"), so
+# those requirements could never be satisfied and every XPC connection would be
+# rejected at runtime. The build's real team is carried in the bundle instead.
+python3 "$root/scripts/ci/fix-apple-team-id.py" "$submodule_path"
+
+# ---------------------------------------------------------------------------
 # 2. [entitlements] Multicast switch and App Group consistency.
 # ---------------------------------------------------------------------------
 # Multicast Networking must be requested from Apple separately, so it is off by
@@ -163,6 +174,7 @@ echo "overlay [entitlements]: multicast=$APPLE_ENABLE_MULTICAST"
 # also contains tvOS and UI-test targets this fork does not ship.
 ios_app_entitlements="$submodule_path/SFI/SFI.entitlements"
 ios_tunnel_entitlements="$submodule_path/Extension/Extension.entitlements"
+ios_intents_entitlements="$submodule_path/IntentsExtension/IntentsExtension.entitlements"
 macos_app_entitlements="$submodule_path/SFM.System/SFM.entitlements"
 macos_sysext_entitlements="$submodule_path/SystemExtension/SystemExtension.entitlements"
 macos_share_entitlements="$submodule_path/ShareExtension.System/ShareExtension.entitlements"
@@ -253,6 +265,41 @@ groups = plist.get("com.apple.security.application-groups") or []
 print(groups[0] if groups else "")
 '
 }
+
+# --- iCloud switch -----------------------------------------------------------
+# iCloud drive is a real profile backend here, not dead weight: the client offers
+# Local / iCloud / Remote storage. It is off by default because enabling it means
+# creating an iCloud container and assigning it to two more App IDs, which is pure
+# setup cost for personal testing, and the client copes without it -
+# FilePath.iCloudDirectory falls back to a stub URL when the ubiquity container is
+# unavailable, and the Local backend is unaffected.
+echo "overlay [entitlements]: icloud=$APPLE_ENABLE_ICLOUD"
+for f in "$ios_app_entitlements" "$ios_intents_entitlements" "$macos_app_entitlements"; do
+  [ -f "$f" ] || continue
+  if [ "$APPLE_ENABLE_ICLOUD" = "true" ]; then
+    continue
+  fi
+  removed_any=0
+  for key in \
+    com.apple.developer.icloud-container-identifiers \
+    com.apple.developer.icloud-services \
+    com.apple.developer.ubiquity-container-identifiers
+  do
+    if [ "$(has_key "$f" "$key")" = "1" ]; then
+      /usr/libexec/PlistBuddy -c "Delete :$key" "$f" >/dev/null 2>&1 || true
+      if [ "$(has_key "$f" "$key")" != "0" ]; then
+        echo "FAIL: could not remove $key from $f" >&2; fail=1
+      else
+        removed_any=1
+      fi
+    fi
+  done
+  if [ "$removed_any" = "1" ]; then
+    echo "  [entitlements] removed iCloud entitlements from $(basename "$(dirname "$f")")"
+  else
+    echo "  [entitlements] $(basename "$(dirname "$f")"): no iCloud entitlements to remove"
+  fi
+done
 
 # --- the macOS targets must use the SAME group form as iOS -------------------
 #
