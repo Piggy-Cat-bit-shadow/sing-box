@@ -38,9 +38,9 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 APPLE_SIGNING_MODE="${APPLE_SIGNING_MODE:-unsigned}"
 case "$APPLE_SIGNING_MODE" in
-  unsigned|development) ;;
+  unsigned|development|testflight) ;;
   *)
-    echo "apple-signing-config: APPLE_SIGNING_MODE must be 'unsigned' or 'development', got '$APPLE_SIGNING_MODE'" >&2
+    echo "apple-signing-config: APPLE_SIGNING_MODE must be 'unsigned', 'development' or 'testflight', got '$APPLE_SIGNING_MODE'" >&2
     exit 2
     ;;
 esac
@@ -54,6 +54,21 @@ case "$APPLE_SIGNING_STYLE" in
   automatic|manual) ;;
   *)
     echo "apple-signing-config: APPLE_SIGNING_STYLE must be 'automatic' or 'manual', got '$APPLE_SIGNING_STYLE'" >&2
+    exit 2
+    ;;
+esac
+
+# iCloud drive is a real profile-storage backend in this client (see
+# ApplicationLibrary/Views/Profile/EditProfileView.swift, where iCloud is one of
+# Local / iCloud / Remote). It is nevertheless switched, because enabling it means
+# creating an iCloud container and assigning it to two more App IDs, and the client
+# degrades cleanly without it: FilePath.iCloudDirectory falls back to a stub URL
+# when the ubiquity container is unavailable, and the Local backend is unaffected.
+APPLE_ENABLE_ICLOUD="${APPLE_ENABLE_ICLOUD:-false}"
+case "$APPLE_ENABLE_ICLOUD" in
+  true|false) ;;
+  *)
+    echo "apple-signing-config: APPLE_ENABLE_ICLOUD must be 'true' or 'false', got '$APPLE_ENABLE_ICLOUD'" >&2
     exit 2
     ;;
 esac
@@ -82,7 +97,9 @@ require() {
   fi
 }
 
-if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+# development and testflight both sign with a real identity; only the export
+# destination differs (a local IPA versus App Store Connect).
+if [ "$APPLE_SIGNING_MODE" != "unsigned" ]; then
   # --- identity ---------------------------------------------------------
   require APPLE_TEAM_ID "${APPLE_TEAM_ID:-}"
 
@@ -111,7 +128,7 @@ fi
 
 if [ "${#missing[@]}" -gt 0 ]; then
   {
-    echo "apple-signing-config: APPLE_SIGNING_MODE=development is missing required configuration:"
+    echo "apple-signing-config: APPLE_SIGNING_MODE=$APPLE_SIGNING_MODE is missing required configuration:"
     for name in "${missing[@]}"; do
       echo "  - $name"
     done
@@ -133,7 +150,7 @@ fi
 UPSTREAM_TEAM_ID="P8XK3KHB48"
 UPSTREAM_BUNDLE_PREFIX="io.nekohasekai"
 
-if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+if [ "$APPLE_SIGNING_MODE" != "unsigned" ]; then
   if [ "${APPLE_TEAM_ID:-}" = "$UPSTREAM_TEAM_ID" ]; then
     echo "apple-signing-config: APPLE_TEAM_ID is upstream's team ($UPSTREAM_TEAM_ID)." >&2
     echo "  A development build must use your own team, or signing will fail with a" >&2
@@ -167,6 +184,7 @@ if [ "${1:-}" = "--print" ]; then
 APPLE_SIGNING_MODE=$APPLE_SIGNING_MODE
 APPLE_SIGNING_STYLE=$APPLE_SIGNING_STYLE
 APPLE_ENABLE_MULTICAST=$APPLE_ENABLE_MULTICAST
+APPLE_ENABLE_ICLOUD=$APPLE_ENABLE_ICLOUD
 APPLE_TEAM_ID=${APPLE_TEAM_ID:-}
 APPLE_BASE_BUNDLE_ID=$base
 APPLE_APP_GROUP_ID=$group
@@ -183,6 +201,7 @@ cat <<EOF
 APPLE_SIGNING_MODE=$APPLE_SIGNING_MODE
 APPLE_SIGNING_STYLE=$APPLE_SIGNING_STYLE
 APPLE_ENABLE_MULTICAST=$APPLE_ENABLE_MULTICAST
+APPLE_ENABLE_ICLOUD=$APPLE_ENABLE_ICLOUD
 APPLE_TEAM_ID=${APPLE_TEAM_ID:-}
 APPLE_BASE_BUNDLE_ID=$base
 APPLE_APP_GROUP_ID=$group

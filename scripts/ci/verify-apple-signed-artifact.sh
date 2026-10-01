@@ -30,12 +30,12 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-artifact_kind="${1:?usage: verify-apple-signed-artifact.sh <ios-ipa|macos-dmg> <path>}"
-artifact_path="${2:?usage: verify-apple-signed-artifact.sh <ios-ipa|macos-dmg> <path>}"
+artifact_kind="${1:?usage: verify-apple-signed-artifact.sh <ios-ipa|macos-dmg|ios-archive> <path>}"
+artifact_path="${2:?usage: verify-apple-signed-artifact.sh <ios-ipa|macos-dmg|ios-archive> <path>}"
 
 eval "$("$root/scripts/ci/apple-signing-config.sh")"
 
-if [ "$APPLE_SIGNING_MODE" != "development" ]; then
+if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
   echo "verify-apple-signed-artifact: SKIP (APPLE_SIGNING_MODE=$APPLE_SIGNING_MODE)"
   echo "  Entitlements and provisioning are only meaningful for a signed build."
   exit 0
@@ -99,7 +99,21 @@ echo "verify-apple-signed-artifact: $artifact_kind"
 # ---------------------------------------------------------------------------
 declare -a objects=()
 
-if [ "$artifact_kind" = "ios-ipa" ]; then
+if [ "$artifact_kind" = "ios-archive" ]; then
+  # A TestFlight archive is already an expanded directory.
+  app="$(find "$artifact_path/Products/Applications" -maxdepth 1 -name '*.app' -type d 2>/dev/null | head -1)"
+  [ -n "$app" ] || { echo "FAIL: the archive contains no application bundle" >&2; exit 1; }
+  note "archive: $(basename "$artifact_path")"
+  note "app: $(basename "$app")"
+
+  objects+=("$app")
+  while IFS= read -r nested; do
+    objects+=("$nested")
+  done < <(find "$app/PlugIns" -maxdepth 1 -name '*.appex' -type d 2>/dev/null | sort)
+  while IFS= read -r fw; do
+    objects+=("$fw")
+  done < <(find "$app/Frameworks" -maxdepth 1 -name '*.framework' -type d 2>/dev/null | sort)
+elif [ "$artifact_kind" = "ios-ipa" ]; then
   unzip -q "$artifact_path" -d "$work/ipa"
   app="$(find "$work/ipa/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
   [ -n "$app" ] || { echo "FAIL: the IPA contains no Payload/*.app" >&2; exit 1; }
