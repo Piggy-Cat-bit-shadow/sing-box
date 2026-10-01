@@ -53,6 +53,45 @@ echo "libbox: built from this repository (clients/apple/Libbox.xcframework)"
 rm -rf "$work"
 mkdir -p "$work"
 
+# SwiftLint runs as a build-tool plug-in attached by one of the SFM dependencies'
+# own Package.swift (nekohasekai/CodeEditSourceEditor). Its plug-in sandbox cannot
+# load sourcekitdInProc, so it aborts the build with
+#   SourceKittenFramework/library_wrapper.swift: Fatal error:
+#   Loading sourcekitdInProc.framework/Versions/A/sourcekitdInProc failed
+# Xcode offers no flag to skip EXECUTING a dependency's build-tool plug-in (only
+# -skipPackagePluginValidation, which suppresses the trust prompt rather than the
+# run), and this was verified to fail identically with a PRISTINE Apple client, so
+# it is an environment incompatibility rather than anything this repository does.
+#
+# The plug-in is a lint step, so it is removed from the RESOLVED DEPENDENCY
+# CHECKOUTS. Those live in DerivedData and are not part of the pinned submodule,
+# so the Apple client source is untouched; resolving first makes them exist, and
+# the edit then applies to whichever file actually attaches it.
+echo "resolving packages"
+xcodebuild -resolvePackageDependencies \
+  -project "$client/sing-box.xcodeproj" \
+  -scheme "$scheme" \
+  -derivedDataPath "$work/dd" >/dev/null 2>&1 || true
+
+removed_plugins=0
+while IFS= read -r pkg; do
+  # Skip the plug-in package's own manifest: it declares itself, which is not an
+  # attachment and must be left alone. The script enforces this too; checking here
+  # as well keeps the log honest about what was actually changed.
+  case "$(basename "$(dirname "$pkg")")" in
+    SwiftLintPlugin) continue ;;
+  esac
+  if grep -q "SwiftLintPlugin" "$pkg"; then
+    python3 "$root/scripts/ci/strip-swiftlint-plugin.py" "$pkg"
+    removed_plugins=$((removed_plugins + 1))
+    echo "  dropped SwiftLint plug-in from $(basename "$(dirname "$pkg")")"
+  fi
+done < <(find "$work/dd/SourcePackages/checkouts" -maxdepth 2 -name Package.swift 2>/dev/null | sort)
+
+if [ "$removed_plugins" -eq 0 ]; then
+  echo "  note: no SwiftLint plug-in attachment found in the resolved packages"
+fi
+
 echo "building $scheme (Release, macOS, arm64, unsigned)"
 xcodebuild build \
   -project "$client/sing-box.xcodeproj" \
