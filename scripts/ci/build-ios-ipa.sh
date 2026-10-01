@@ -210,8 +210,13 @@ fi
 [ "$fail" -eq 0 ] || { echo "FAIL: iOS bundle verification failed" >&2; exit 1; }
 
 # --- 7. Zip it. -----------------------------------------------------------------
+# Resolve the output to an absolute path BEFORE changing directory. Evaluating
+# `dirname "$out"` inside the subshell would resolve a relative output against the
+# staging directory instead of the caller's working directory.
+mkdir -p "$(dirname "$out")"
+out_abs="$(cd "$(dirname "$out")" && pwd)/$(basename "$out")"
 # zip from inside the staging directory so the archive root is exactly Payload/.
-( cd "$stage" && zip -qry "$(cd "$(dirname "$out")" && pwd)/$(basename "$out")" Payload )
+( cd "$stage" && zip -qry "$out_abs" Payload )
 
 echo "built: $out"
 echo "bytes: $(wc -c < "$out" | tr -d ' ')"
