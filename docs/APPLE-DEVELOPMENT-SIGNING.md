@@ -58,6 +58,39 @@ signing style.
 > [Apple's certificate authority page](https://www.apple.com/certificateauthority/)
 > if Xcode has not already installed it.
 
+### Two certificate types, two different flows
+
+`security find-identity` reports what you can sign with, and the two flows need
+different things:
+
+| Flow | Certificate | Profile | Needs a registered device? |
+|---|---|---|---|
+| development | Apple Development | iOS/Mac App Development | **yes** |
+| TestFlight | Apple Distribution | App Store | **no** |
+
+A development profile is device-scoped, so a team with no registered devices cannot
+be issued one at all. An App Store distribution profile is not device-scoped, so
+TestFlight does not depend on device registration — but it does require an **Apple
+Distribution** certificate, which is separate from Apple Development and is not
+created by installing the development one.
+
+If `security find-identity -v -p codesigning` shows only an Apple Development
+identity, create a distribution certificate before attempting TestFlight:
+
+```text
+Xcode > Settings > Accounts > select the team > Manage Certificates > +
+  > Apple Distribution
+```
+
+Confirm both are present before building:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+> Installing a certificate does not make it usable. Its Apple WWDR intermediate
+> must also be present, or the identity is reported as invalid.
+
 ### Dev builds need at least one registered device
 
 A development provisioning profile is **device-scoped**, for macOS as well as iOS.
@@ -410,6 +443,11 @@ When you want to distribute a DMG to other Macs, that is a separate change: a
 `developer-id` signing mode plus notarization and stapling.
 
 ## TestFlight
+
+TestFlight needs an **Apple Distribution** certificate (not Apple Development)
+and an App Store provisioning profile. Neither is device-scoped, so unlike the
+development flow this does not require a registered device. The archive is signed
+as `Apple Distribution`; see "Two certificate types, two different flows".
 
 TestFlight uses a third signing mode, because it is a different destination rather
 than a stricter development build:
