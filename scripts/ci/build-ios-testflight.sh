@@ -71,7 +71,23 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-echo "archiving (Release, iphoneos, arm64)"
+# An ARCHIVE must be signed for DISTRIBUTION, not development.
+#
+# Asking for "Apple Development" makes Xcode request an iOS *Development* profile,
+# which is device-scoped and therefore impossible for a team with no registered
+# device:
+#
+#   Communication with Apple failed: Your team has no devices from which to
+#   generate a provisioning profile.
+#
+# "Apple Distribution" produces an App Store profile instead, which needs no
+# device, so TestFlight does not depend on device registration at all.
+#
+# CODE_SIGN_STYLE=Automatic must stay: clearing PROVISIONING_PROFILE_SPECIFIER while
+# pinning an identity makes Xcode treat signing as manual, which disables automatic
+# provisioning entirely ("Automatic signing is disabled and unable to generate a
+# profile").
+echo "archiving (Release, iphoneos, arm64, Apple Distribution)"
 rm -rf "$archive_path"
 xcodebuild archive \
   -project "$client/sing-box.xcodeproj" \
@@ -86,6 +102,7 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
+  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   -allowProvisioningUpdates \

@@ -101,6 +101,22 @@ require() {
 # destination differs (a local IPA versus App Store Connect).
 if [ "$APPLE_SIGNING_MODE" != "unsigned" ]; then
   # --- identity ---------------------------------------------------------
+  # If APPLE_TEAM_ID was not supplied, derive it from the signing certificate
+  # rather than making the user look it up. The team is the certificate's OU field,
+  # NOT the value in its name: for
+  #   "Apple Development: <name> (ABCDE12345)"  ->  CN identifier is ABCDE12345
+  # while the team is the OU, and the two are frequently different. Using the name
+  # value fails with `No Account for Team "<wrong>"`, which reads as a missing
+  # account even though the account is present and signed in.
+  if [ -z "${APPLE_TEAM_ID:-}" ]; then
+    detected_team="$(security find-certificate -a -c "Apple Development" -p 2>/dev/null \
+      | openssl x509 -noout -subject 2>/dev/null \
+      | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u | head -1)"
+    if [ -n "$detected_team" ]; then
+      APPLE_TEAM_ID="$detected_team"
+      APPLE_TEAM_ID_DETECTED=1
+    fi
+  fi
   require APPLE_TEAM_ID "${APPLE_TEAM_ID:-}"
 
   # The bundle identifier base every target derives from. The project already
@@ -186,6 +202,7 @@ APPLE_SIGNING_STYLE=$APPLE_SIGNING_STYLE
 APPLE_ENABLE_MULTICAST=$APPLE_ENABLE_MULTICAST
 APPLE_ENABLE_ICLOUD=$APPLE_ENABLE_ICLOUD
 APPLE_TEAM_ID=${APPLE_TEAM_ID:-}
+APPLE_TEAM_ID_DETECTED=${APPLE_TEAM_ID_DETECTED:-0}
 APPLE_BASE_BUNDLE_ID=$base
 APPLE_APP_GROUP_ID=$group
 APPLE_IOS_APP_BUNDLE_ID=$APPLE_IOS_APP_BUNDLE_ID
@@ -203,6 +220,7 @@ APPLE_SIGNING_STYLE=$APPLE_SIGNING_STYLE
 APPLE_ENABLE_MULTICAST=$APPLE_ENABLE_MULTICAST
 APPLE_ENABLE_ICLOUD=$APPLE_ENABLE_ICLOUD
 APPLE_TEAM_ID=${APPLE_TEAM_ID:-}
+APPLE_TEAM_ID_DETECTED=${APPLE_TEAM_ID_DETECTED:-0}
 APPLE_BASE_BUNDLE_ID=$base
 APPLE_APP_GROUP_ID=$group
 APPLE_IOS_APP_BUNDLE_ID=$APPLE_IOS_APP_BUNDLE_ID

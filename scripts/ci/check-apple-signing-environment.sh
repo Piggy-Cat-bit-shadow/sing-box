@@ -61,11 +61,19 @@ else
   printf '%s\n' "$identities" | sed 's/^/    /'
   # The identity's team must match the configured one, or the build will pick a
   # certificate that cannot sign these bundle IDs.
-  if ! printf '%s\n' "$identities" | grep -q "($APPLE_TEAM_ID)"; then
-    echo "    FAIL: no signing identity found for team $APPLE_TEAM_ID." >&2
-    echo "          The identities listed above belong to other teams. Either set" >&2
-    echo "          APPLE_TEAM_ID to one of those teams, or create/import a" >&2
-    echo "          certificate for $APPLE_TEAM_ID." >&2
+  # Match the certificate's OU field, which IS the team. The value in parentheses
+  # in the certificate's NAME is a different thing - the individual certificate
+  # identifier - and matching on it rejects a correct team while accepting a wrong
+  # one: for "Apple Development: <name> (KH7DK5S5M7)" the team here is TAFD7BAGYZ.
+  cert_teams="$(security find-certificate -a -c "Apple Development" -p 2>/dev/null \
+    | openssl x509 -noout -subject 2>/dev/null \
+    | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u)"
+  printf '%s\n' "$cert_teams" | sed 's/^/    certificate team (OU): /'
+  if ! printf '%s\n' "$cert_teams" | grep -qx "$APPLE_TEAM_ID"; then
+    echo "    FAIL: no certificate's team (OU) matches APPLE_TEAM_ID=$APPLE_TEAM_ID." >&2
+    echo "          The teams listed above are the ones you actually have. The value" >&2
+    echo "          in a certificate's NAME is NOT its team - check the OU field." >&2
+    echo "          Leave APPLE_TEAM_ID unset to have it detected automatically." >&2
     fail=1
   else
     echo "    ok: an identity for team $APPLE_TEAM_ID is present"
