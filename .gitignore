@@ -56,3 +56,9 @@ cache.db
 /build/apple-ios/
 /build/apple-macos/
 /Libbox.xcframework/
+
+# Apple signing configuration. The committed file is the .example template only;
+# a real configuration names your team, bundle IDs and profiles and must stay out
+# of the repository.
+config/apple/*.env
+!config/apple/*.env.example

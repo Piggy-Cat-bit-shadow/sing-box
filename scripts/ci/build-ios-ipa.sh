@@ -36,6 +36,9 @@ out="${1:?usage: build-ios-ipa.sh <output-ipa>}"
 shift || true
 scheme="SFI"
 
+# Signing configuration: mode, team, identifiers and the multicast switch.
+eval "$("$root/scripts/ci/apple-signing-config.sh")"
+
 work="build/apple-ios"
 mkdir -p "$(dirname "$out")"
 
@@ -67,23 +70,65 @@ echo "building $scheme (Release, iphoneos, arm64, unsigned)"
 # profiles" flags keep it from reaching for a provisioning profile. ENTITLEMENTS
 # are still processed, because the app must declare what it will be signed FOR -
 # only the signature itself is absent.
-xcodebuild build \
-  -project "$client/sing-box.xcodeproj" \
-  -scheme "$scheme" \
-  -configuration Release \
-  -destination 'generic/platform=iOS' \
-  -derivedDataPath "$work/dd" \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=NO \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
-  CODE_SIGN_ENTITLEMENTS="" \
-  EXPANDED_CODE_SIGN_IDENTITY="" \
-  PROVISIONING_PROFILE_SPECIFIER="" \
-  DEVELOPMENT_TEAM="" \
-  -skipPackagePluginValidation \
-  2>&1 | tail -40
+build_settings=(
+  -project "$client/sing-box.xcodeproj"
+  -scheme "$scheme"
+  -configuration Release
+  -destination 'generic/platform=iOS'
+  -derivedDataPath "$work/dd"
+  ARCHS=arm64
+  ONLY_ACTIVE_ARCH=NO
+  -skipPackagePluginValidation
+  # APP_GROUP_IDENTIFIER is passed for BOTH modes, because the project defines it
+  # inconsistently: the iOS targets use "group.$(BASE_PACKAGE_IDENTIFIER)" while
+  # ten macOS configuration blocks use
+  # "$(TeamIdentifierPrefix)$(BASE_PACKAGE_IDENTIFIER)". TeamIdentifierPrefix comes
+  # from provisioning and is empty outside a signed build, so the macOS value
+  # collapses to a bare bundle identifier. That is not a valid App Group at all,
+  # and it is why the app could not open its shared container: the host app and the
+  # extension resolved to different, unusable paths.
+  #
+  # Passing it here overrides every one of those blocks at once, so all targets
+  # agree by construction rather than by two expressions coinciding.
+  APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID"
+)
+
+if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
+  echo "building $scheme (Release, iphoneos, arm64, UNSIGNED)"
+  build_settings+=(
+    CODE_SIGNING_ALLOWED=NO
+    CODE_SIGNING_REQUIRED=NO
+    CODE_SIGN_IDENTITY=""
+    CODE_SIGN_ENTITLEMENTS=""
+    EXPANDED_CODE_SIGN_IDENTITY=""
+    PROVISIONING_PROFILE_SPECIFIER=""
+    DEVELOPMENT_TEAM=""
+  )
+else
+  echo "building $scheme (Release, iphoneos, arm64, DEVELOPMENT-SIGNED)"
+  echo "  team:      $APPLE_TEAM_ID"
+  echo "  base id:   $APPLE_BASE_BUNDLE_ID"
+  echo "  app group: $APPLE_APP_GROUP_ID"
+  echo "  style:     $APPLE_SIGNING_STYLE"
+  # Signing is left ENABLED so Xcode signs each target itself, including the
+  # Packet Tunnel extension. Clearing CODE_SIGN_ENTITLEMENTS here would strip the
+  # App Group and networkextension capabilities, which is precisely the failure
+  # this mode exists to avoid.
+  build_settings+=(
+    BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID"
+    DEVELOPMENT_TEAM="$APPLE_TEAM_ID"
+  )
+  if [ "$APPLE_SIGNING_STYLE" = "automatic" ]; then
+    build_settings+=(CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates)
+  else
+    build_settings+=(
+      CODE_SIGN_STYLE=Manual
+      PROVISIONING_PROFILE_SPECIFIER="$IOS_APP_PROFILE"
+    )
+  fi
+fi
+
+xcodebuild build "${build_settings[@]}" 2>&1 | tail -40
 
 # --- 3. Locate the built app. ---------------------------------------------------
 # The bundle name is NOT the scheme name: the SFI scheme produces `sing-box.app`.
@@ -116,10 +161,15 @@ ditto "$app" "$stage/Payload/$product_name"
 # embedded provisioning profile behind. Their presence would suggest the app carries
 # a signature it does not have, which is exactly the confusion this artifact must
 # avoid. Only these are removed - never binaries, Info.plist, PlugIns or resources.
-while IFS= read -r residue; do
-  echo "  removing $residue"
-  rm -rf "$residue"
-done < <(find "$stage/Payload" \( -name "_CodeSignature" -o -name "embedded.mobileprovision" \) -print)
+if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
+  while IFS= read -r residue; do
+    echo "  removing $residue"
+    rm -rf "$residue"
+  done < <(find "$stage/Payload" \( -name "_CodeSignature" -o -name "embedded.mobileprovision" \) -print)
+else
+  # The signature and its embedded profile are the deliverable in this mode.
+  echo "  keeping signature and embedded provisioning profiles"
+fi
 
 # --- 6. Assert the bundle is complete and iPhoneOS/arm64. ----------------------
 fail=0

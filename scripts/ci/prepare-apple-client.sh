@@ -34,6 +34,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
+# Signing configuration drives the entitlement overlay (multicast). Sourced here
+# rather than passed in so the overlay always sees the same resolved values the
+# build will use.
+eval "$("$root/scripts/ci/apple-signing-config.sh")"
+
 expected_sha=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -143,53 +148,203 @@ echo "  [compatibility] PromotePowerReportDraft -> no-op (no draft entry point i
 echo "  [compatibility] notification send(_:)   -> untouched, single implementation"
 
 # ---------------------------------------------------------------------------
-# 2. [personal-signing] Retire the multicast entitlement from the iOS extension.
+# 2. [entitlements] Multicast switch and App Group consistency.
 # ---------------------------------------------------------------------------
-echo "overlay [personal-signing]: multicast entitlement"
+# Multicast Networking must be requested from Apple separately, so it is off by
+# default and stripped from every target that would declare it. Once granted,
+# APPLE_ENABLE_MULTICAST=true keeps it and no further edit is needed.
+#
+# Both products are handled, not just iOS: the macOS System Extension declares the
+# same capability and would fail to sign for the same reason.
+echo "overlay [entitlements]: multicast=$APPLE_ENABLE_MULTICAST"
 
-if [ ! -f "$extension_entitlements" ]; then
-  echo "FAIL: $extension_entitlements does not exist; upstream restructured it." >&2
-  exit 1
-fi
+# The targets that actually participate in the two shipped products. Enumerated
+# from the verified builds rather than from the project's full target list, which
+# also contains tvOS and UI-test targets this fork does not ship.
+ios_app_entitlements="$submodule_path/SFI/SFI.entitlements"
+ios_tunnel_entitlements="$submodule_path/Extension/Extension.entitlements"
+macos_app_entitlements="$submodule_path/SFM.System/SFM.entitlements"
+macos_sysext_entitlements="$submodule_path/SystemExtension/SystemExtension.entitlements"
+macos_share_entitlements="$submodule_path/ShareExtension.System/ShareExtension.entitlements"
+macos_helper_entitlements="$submodule_path/HelperService/RootHelper.entitlements"
+
+for f in "$ios_app_entitlements" "$ios_tunnel_entitlements" \
+         "$macos_app_entitlements" "$macos_sysext_entitlements" \
+         "$macos_share_entitlements" "$macos_helper_entitlements"; do
+  if [ ! -f "$f" ]; then
+    echo "FAIL: $f does not exist; the pinned client was restructured." >&2
+    exit 1
+  fi
+done
 
 read_plist() { plutil -convert xml1 -o - "$1" 2>/dev/null || cat "$1"; }
 has_key() {
   if read_plist "$1" | grep -q "<key>$2</key>"; then echo 1; else echo 0; fi
 }
 
-if [ "$(has_key "$extension_entitlements" com.apple.developer.networking.multicast)" != "1" ]; then
-  echo "FAIL: $extension_entitlements has no multicast entitlement, so this overlay" >&2
-  echo "      no longer describes the tree." >&2
-  exit 1
-fi
-
-/usr/libexec/PlistBuddy -c "Delete :com.apple.developer.networking.multicast" "$extension_entitlements" >/dev/null 2>&1 || true
-
 fail=0
-if [ "$(has_key "$extension_entitlements" com.apple.developer.networking.multicast)" != "0" ]; then
-  echo "FAIL: multicast entitlement still present" >&2; fail=1
+
+# --- multicast ---------------------------------------------------------------
+if [ "$APPLE_ENABLE_MULTICAST" = "true" ]; then
+  for f in "$ios_tunnel_entitlements" "$macos_sysext_entitlements"; do
+    if [ "$(has_key "$f" com.apple.developer.networking.multicast)" != "1" ]; then
+      echo "FAIL: $APPLE_ENABLE_MULTICAST=true but $(basename "$f") declares no multicast" >&2
+      fail=1
+    fi
+  done
+  echo "  [entitlements] multicast kept (APPLE_ENABLE_MULTICAST=true)"
 else
-  echo "  [personal-signing] removed: com.apple.developer.networking.multicast"
+  for f in "$ios_tunnel_entitlements" "$macos_sysext_entitlements"; do
+    if [ "$(has_key "$f" com.apple.developer.networking.multicast)" = "1" ]; then
+      /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.networking.multicast" "$f" >/dev/null 2>&1 || true
+      if [ "$(has_key "$f" com.apple.developer.networking.multicast)" != "0" ]; then
+        echo "FAIL: could not remove multicast from $f" >&2; fail=1
+      else
+        echo "  [entitlements] removed multicast from $(basename "$(dirname "$f")")"
+      fi
+    fi
+  done
 fi
 
-# The tunnel is the product; losing this would install but never connect.
-if [ "$(has_key "$extension_entitlements" com.apple.developer.networking.networkextension)" != "1" ]; then
-  echo "FAIL: com.apple.developer.networking.networkextension was lost" >&2; fail=1
-elif ! read_plist "$extension_entitlements" | grep -q "packet-tunnel-provider"; then
-  echo "FAIL: packet-tunnel-provider is no longer listed" >&2; fail=1
+# --- the tunnel capabilities must survive whatever we did above --------------
+# iOS: losing packet-tunnel-provider would install but never connect.
+if [ "$(has_key "$ios_tunnel_entitlements" com.apple.developer.networking.networkextension)" != "1" ]; then
+  echo "FAIL: iOS extension lost com.apple.developer.networking.networkextension" >&2; fail=1
+elif ! read_plist "$ios_tunnel_entitlements" | grep -q "packet-tunnel-provider"; then
+  echo "FAIL: iOS extension no longer lists packet-tunnel-provider" >&2; fail=1
 else
-  echo "  [personal-signing] kept: networkextension (packet-tunnel-provider)"
+  echo "  [entitlements] iOS extension keeps packet-tunnel-provider"
 fi
 
-if [ "$(has_key "$extension_entitlements" com.apple.security.application-groups)" != "1" ]; then
-  echo "FAIL: com.apple.security.application-groups was lost" >&2; fail=1
+# macOS uses the System Extension variant of the same capability.
+if [ "$(has_key "$macos_sysext_entitlements" com.apple.developer.networking.networkextension)" != "1" ]; then
+  echo "FAIL: macOS system extension lost the networkextension entitlement" >&2; fail=1
+elif ! read_plist "$macos_sysext_entitlements" | grep -q "packet-tunnel-provider-systemextension"; then
+  echo "FAIL: macOS system extension no longer lists packet-tunnel-provider-systemextension" >&2; fail=1
 else
-  echo "  [personal-signing] kept: application-groups"
+  echo "  [entitlements] macOS system extension keeps packet-tunnel-provider-systemextension"
 fi
 
-if ! plutil -lint "$extension_entitlements" >/dev/null 2>&1; then
-  echo "FAIL: $extension_entitlements is no longer a valid plist" >&2; fail=1
+# The host app must be allowed to install the system extension.
+if [ "$(has_key "$macos_app_entitlements" com.apple.developer.system-extension.install)" != "1" ]; then
+  echo "FAIL: macOS app lost com.apple.developer.system-extension.install" >&2; fail=1
+else
+  echo "  [entitlements] macOS app keeps system-extension.install"
 fi
+
+# --- App Group consistency ---------------------------------------------------
+# This is the failure that was actually observed at runtime: the client could not
+# write its App Group database. The cause is a host app and extension resolving to
+# DIFFERENT groups, which no build-time signature check would catch, because each
+# signature is individually valid.
+#
+# Every participating target must resolve to the same group. The value is compared
+# after substitution so that a target using $(TeamIdentifierPrefix) is checked in
+# its expanded form rather than assumed to be right.
+app_group_for() {
+  read_plist "$1" | python3 -c '
+import plistlib, sys
+data = sys.stdin.buffer.read()
+try:
+    plist = plistlib.loads(data)
+except Exception:
+    print(""); raise SystemExit
+groups = plist.get("com.apple.security.application-groups") or []
+print(groups[0] if groups else "")
+'
+}
+
+# --- the macOS targets must use the SAME group form as iOS -------------------
+#
+# Upstream's project is inconsistent here, and the macOS side is wrong:
+#
+#   iOS   SFI.entitlements and Extension.entitlements use $(APP_GROUP_IDENTIFIER),
+#         which the project defines as "group.$(BASE_PACKAGE_IDENTIFIER)".
+#   macOS SFM.System and SystemExtension use
+#         "$(TeamIdentifierPrefix)$(BASE_PACKAGE_IDENTIFIER)".
+#
+# TeamIdentifierPrefix is supplied by provisioning and is EMPTY outside a signed
+# build, so the macOS value collapses to a bare bundle identifier. An App Group
+# without the "group." prefix is not a valid group at all, which is exactly the
+# "client cannot write App Group database" failure observed at runtime: the xpc
+# service and the app resolve to different, unusable containers.
+#
+# Rewriting the macOS entitlements to the same $(APP_GROUP_IDENTIFIER) the iOS side
+# already uses makes every target agree by construction, rather than by hoping two
+# different expressions happen to coincide. It also removes the empty-prefix
+# collapse, since APP_GROUP_IDENTIFIER has no provisioning dependency.
+macos_group_files="$macos_app_entitlements $macos_sysext_entitlements $macos_share_entitlements $macos_helper_entitlements"
+for f in $macos_group_files; do
+  current="$(app_group_for "$f")"
+  case "$current" in
+    *'$(TeamIdentifierPrefix)'*)
+      /usr/libexec/PlistBuddy -c "Set :com.apple.security.application-groups:0 \$(APP_GROUP_IDENTIFIER)" "$f" >/dev/null 2>&1 || true
+      updated="$(app_group_for "$f")"
+      if [ "$updated" != '$(APP_GROUP_IDENTIFIER)' ]; then
+        echo "FAIL: could not normalise the App Group in $f (still '$updated')" >&2; fail=1
+      else
+        echo "  [app-group] normalised $(basename "$(dirname "$f")") to \$(APP_GROUP_IDENTIFIER)"
+      fi
+      ;;
+  esac
+done
+
+app_group_for() {
+  read_plist "$1" | python3 -c '
+import plistlib, sys
+data = sys.stdin.buffer.read()
+try:
+    plist = plistlib.loads(data)
+except Exception:
+    print(""); raise SystemExit
+groups = plist.get("com.apple.security.application-groups") or []
+print(groups[0] if groups else "")
+'
+}
+
+groups_seen=""
+for f in "$ios_app_entitlements" "$ios_tunnel_entitlements" \
+         "$macos_app_entitlements" "$macos_sysext_entitlements" \
+         "$macos_share_entitlements" "$macos_helper_entitlements"; do
+  raw="$(app_group_for "$f")"
+  if [ -z "$raw" ]; then
+    echo "FAIL: $(basename "$(dirname "$f")") declares no App Group" >&2; fail=1
+    continue
+  fi
+  # Expand the build settings the project uses, so the comparison is on the value
+  # that will actually be signed. TeamIdentifierPrefix is expanded to the
+  # configured team, which is what provisioning supplies at build time.
+  expanded="$(printf '%s' "$raw" | sed "s/\$(TeamIdentifierPrefix)/${APPLE_TEAM_ID:-}/g; s/\$(BASE_PACKAGE_IDENTIFIER)/${APPLE_BASE_BUNDLE_ID}/g; s/\$(APP_GROUP_IDENTIFIER)/${APPLE_APP_GROUP_ID}/g")"
+  echo "  [app-group] $(basename "$(dirname "$f")"): $expanded"
+  case "$expanded" in
+    *'$('*)
+      echo "FAIL: $(basename "$f") uses an unexpanded build setting: $expanded" >&2; fail=1 ;;
+  esac
+  case " $groups_seen " in
+    *" $expanded "*) ;;
+    *) groups_seen="$groups_seen $expanded" ;;
+  esac
+done
+
+group_count="$(printf '%s' "$groups_seen" | wc -w | tr -d ' ')"
+if [ "$group_count" != "1" ]; then
+  echo "FAIL: the targets resolve to $group_count different App Groups:$groups_seen" >&2
+  echo "      The host app and its extensions MUST share one group, or the client" >&2
+  echo "      cannot open its database at runtime." >&2
+  fail=1
+else
+  echo "  [app-group] all targets agree on:$groups_seen"
+fi
+
+# Every entitlements file must still be a valid plist.
+for f in "$ios_app_entitlements" "$ios_tunnel_entitlements" \
+         "$macos_app_entitlements" "$macos_sysext_entitlements" \
+         "$macos_share_entitlements" "$macos_helper_entitlements"; do
+  if ! plutil -lint "$f" >/dev/null 2>&1; then
+    echo "FAIL: $f is no longer a valid plist" >&2; fail=1
+  fi
+done
+
 [ "$fail" -eq 0 ] || exit 1
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,11 @@ cd "$root"
 out="${1:?usage: build-macos-dmg.sh <output-dmg>}"
 scheme="SFM.System"
 
+# Signing configuration: mode, team, identifiers and the multicast switch all come
+# from here, so nothing is hardcoded and nothing is silently defaulted in a signed
+# build. See scripts/ci/apple-signing-config.sh.
+eval "$("$root/scripts/ci/apple-signing-config.sh")"
+
 work="build/apple-macos"
 mkdir -p "$(dirname "$out")"
 
@@ -92,24 +97,100 @@ if [ "$removed_plugins" -eq 0 ]; then
   echo "  note: no SwiftLint plug-in attachment found in the resolved packages"
 fi
 
-echo "building $scheme (Release, macOS, arm64, unsigned)"
-xcodebuild build \
-  -project "$client/sing-box.xcodeproj" \
-  -scheme "$scheme" \
-  -configuration Release \
-  -destination 'generic/platform=macOS' \
-  -derivedDataPath "$work/dd" \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=NO \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
-  CODE_SIGN_ENTITLEMENTS="" \
-  EXPANDED_CODE_SIGN_IDENTITY="" \
-  PROVISIONING_PROFILE_SPECIFIER="" \
-  DEVELOPMENT_TEAM="" \
-  -skipPackagePluginValidation \
-  2>&1 | tail -40
+# --- signing mode ------------------------------------------------------------
+#
+# The two modes differ in exactly one way: whether Xcode is allowed to sign.
+#
+#   unsigned     No identity, no entitlements, no provisioning. Produces a
+#                structurally valid app for CI and packaging checks. Its App Group
+#                and System Extension do NOT work at runtime, and the summary says
+#                so rather than implying otherwise.
+#
+#   development  Xcode signs every target with the configured team, so the nested
+#                System Extension, share extension and helper each get their own
+#                correct signature, entitlements and profile. This is the mode that
+#                produces something runnable.
+#
+# Entitlements are deliberately NOT cleared in development mode. Doing so is what
+# silently removes the App Group and Network Extension capabilities, producing an
+# app that installs and then cannot connect - the exact failure this mode exists to
+# prevent.
+build_settings=(
+  -project "$client/sing-box.xcodeproj"
+  -scheme "$scheme"
+  -configuration Release
+  -destination 'generic/platform=macOS'
+  -derivedDataPath "$work/dd"
+  ARCHS=arm64
+  ONLY_ACTIVE_ARCH=NO
+  -skipPackagePluginValidation
+  # APP_GROUP_IDENTIFIER is passed for BOTH modes, because the project defines it
+  # inconsistently: the iOS targets use "group.$(BASE_PACKAGE_IDENTIFIER)" while
+  # ten macOS configuration blocks use
+  # "$(TeamIdentifierPrefix)$(BASE_PACKAGE_IDENTIFIER)". TeamIdentifierPrefix comes
+  # from provisioning and is empty outside a signed build, so the macOS value
+  # collapses to a bare bundle identifier. That is not a valid App Group at all,
+  # and it is why the app could not open its shared container: the host app and the
+  # extension resolved to different, unusable paths.
+  #
+  # Passing it here overrides every one of those blocks at once, so all targets
+  # agree by construction rather than by two expressions coinciding.
+  APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID"
+)
+
+if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
+  echo "building $scheme (Release, macOS, arm64, UNSIGNED)"
+  build_settings+=(
+    CODE_SIGNING_ALLOWED=NO
+    CODE_SIGNING_REQUIRED=NO
+    CODE_SIGN_IDENTITY=""
+    CODE_SIGN_ENTITLEMENTS=""
+    EXPANDED_CODE_SIGN_IDENTITY=""
+    PROVISIONING_PROFILE_SPECIFIER=""
+    DEVELOPMENT_TEAM=""
+  )
+else
+  echo "building $scheme (Release, macOS, arm64, DEVELOPMENT-SIGNED)"
+  echo "  team:      $APPLE_TEAM_ID"
+  echo "  base id:   $APPLE_BASE_BUNDLE_ID"
+  echo "  app group: $APPLE_APP_GROUP_ID"
+  echo "  style:     $APPLE_SIGNING_STYLE"
+  # The identifiers are overridden from one base so the whole target set stays
+  # consistent, and the project's own upstream values are replaced rather than
+  # edited in place.
+  build_settings+=(
+    BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID"
+    DEVELOPMENT_TEAM="$APPLE_TEAM_ID"
+  )
+  if [ "$APPLE_SIGNING_STYLE" = "automatic" ]; then
+    build_settings+=(CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates)
+  else
+    build_settings+=(
+      CODE_SIGN_STYLE=Manual
+      PROVISIONING_PROFILE_SPECIFIER="$MACOS_APP_PROFILE"
+    )
+  fi
+fi
+
+xcodebuild build "${build_settings[@]}" 2>&1 | tail -40
+
+# A signed build that did not actually sign is a failure, not a warning. Xcode can
+# succeed while skipping signing if a setting is wrong, and the resulting app looks
+# built but cannot install.
+if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+  built_app="$(find "$work/dd/Build/Products/Release" -maxdepth 1 -name '*.app' -type d | head -1)"
+  if [ -z "$built_app" ]; then
+    echo "FAIL: no .app was produced; cannot verify the development signature" >&2
+    exit 1
+  fi
+  if ! codesign -dv "$built_app" >/dev/null 2>&1; then
+    echo "FAIL: APPLE_SIGNING_MODE=development but the app is not signed." >&2
+    echo "      The build succeeded without applying a signature, which means it" >&2
+    echo "      would install but could not reach its App Group or start its tunnel." >&2
+    exit 1
+  fi
+  echo "  signature applied: $(codesign -dv "$built_app" 2>&1 | grep -E '^Authority=' | head -1)"
+fi
 
 # --- 2. Locate the app. ---------------------------------------------------------
 # The bundle name is NOT the scheme name: the SFM.System scheme produces SFM.app.

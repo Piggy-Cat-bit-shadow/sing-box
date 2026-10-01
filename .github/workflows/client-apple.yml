@@ -85,6 +85,12 @@ jobs:
           go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      - name: Apple signing regression tests
+        # Cheap invariant checks for the failures that are otherwise silent: a
+        # signed build falling back to unsigned, upstream identifiers left in
+        # place, or entitlements cleared while signing.
+        run: ./scripts/ci/test-apple-signing.sh
+
       - name: verify the Apple submodule revision
         run: |
           set -euo pipefail
@@ -104,6 +110,12 @@ jobs:
         # keeps a slow or flaky proxy from looking like a build failure, and makes
         # the fetch its own step in the log.
         run: go mod download all
+
+      - name: Apple signing preflight
+        # In unsigned mode this prints SKIP. In development mode it fails with an
+        # actionable message rather than letting xcodebuild produce an artifact
+        # that installs and cannot connect.
+        run: ./scripts/ci/check-apple-signing-environment.sh
 
       - name: build Libbox from this fork
         # This is the step that makes the app "ours": Libbox.xcframework is compiled
@@ -132,6 +144,13 @@ jobs:
           set -euo pipefail
           ./scripts/ci/build-ios-ipa.sh dist/apple/SFI-unsigned.ipa
 
+      - name: verify the signed artifact
+        # In unsigned mode this prints SKIP. In development mode it checks each
+        # nested code object, reads the SIGNED entitlements back, and compares them
+        # against the embedded provisioning profiles - including that the app and
+        # its extensions agree on one App Group.
+        run: ./scripts/ci/verify-apple-signed-artifact.sh ios-ipa dist/apple/SFI-unsigned.ipa
+
       - name: name the artifact
         run: |
           set -euo pipefail
@@ -146,6 +165,7 @@ jobs:
       - name: BUILD-INFO and SHA256
         run: |
           set -euo pipefail
+          eval "$(./scripts/ci/apple-signing-config.sh)"
           out="dist/apple/out"
           {
             echo "Jiejie sing-box Apple client build information"
@@ -161,6 +181,23 @@ jobs:
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "xcode:                  $(xcodebuild -version | head -1)"
             echo "go_version:             $(go version)"
+            echo ""
+            echo "signing_mode:           $APPLE_SIGNING_MODE"
+            echo "signing_style:          $APPLE_SIGNING_STYLE"
+            echo "team_id:                ${APPLE_TEAM_ID:-N/A}"
+            echo "base_bundle_id:         $APPLE_BASE_BUNDLE_ID"
+            echo "app_group:              $APPLE_APP_GROUP_ID"
+            echo "multicast_enabled:      $APPLE_ENABLE_MULTICAST"
+            if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+              echo "provisioning_validation: PASS"
+              echo "entitlement_validation:  PASS"
+              echo "app_group_consistency:   PASS"
+            else
+              echo "provisioning_validation: N/A (unsigned)"
+              echo "entitlement_validation:  N/A (unsigned)"
+              echo "app_group_consistency:   N/A (unsigned)"
+            fi
+            echo "runtime_validation:     NOT EXECUTED"
           } > "$out/BUILD-INFO-IOS.txt"
           ( cd "$out" && shasum -a 256 "$IPA_NAME" > SHA256SUMS-IOS.txt )
           cat "$out/BUILD-INFO-IOS.txt"
@@ -177,6 +214,7 @@ jobs:
       - name: summary
         run: |
           set -euo pipefail
+          eval "$(./scripts/ci/apple-signing-config.sh)"
           out="dist/apple/out"
           sha="$(awk '{print $1}' "$out/SHA256SUMS-IOS.txt")"
           size="$(wc -c < "$out/$IPA_NAME" | tr -d ' ')"
@@ -196,12 +234,44 @@ jobs:
             echo "| target | SFI |"
             echo "| platform | iphoneos |"
             echo "| arch | arm64 |"
-            echo "| signing | **unsigned** |"
             echo "| PacketTunnel extension | present (verified) |"
-            echo "| multicast entitlement | removed for personal test build |"
             echo "| IPA | \`$IPA_NAME\` |"
             echo "| size | $size bytes |"
             echo "| SHA256 | \`$sha\` |"
+            echo ""
+            echo "| signing | |"
+            echo "|---|---|"
+            echo "| Signing mode | \`$APPLE_SIGNING_MODE\` |"
+            echo "| Team ID | ${APPLE_TEAM_ID:-N/A (unsigned)} |"
+            echo "| Base bundle ID | \`$APPLE_BASE_BUNDLE_ID\` |"
+            echo "| App Group | \`$APPLE_APP_GROUP_ID\` |"
+            echo "| Multicast | $APPLE_ENABLE_MULTICAST |"
+            if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+              echo "| Provisioning validation | PASS |"
+              echo "| Entitlement validation | PASS |"
+              echo "| App Group consistency | PASS |"
+              echo "| Network Extension entitlement | PASS |"
+              echo ""
+              echo "**Runtime Candidate: YES** — statically verified, not yet executed."
+            else
+              echo "| Provisioning validation | N/A |"
+              echo "| Entitlement validation | N/A |"
+              echo ""
+              echo "> **UNSIGNED artifact — not a runtime candidate.**"
+              echo ">"
+              echo "> This validates that the app **builds, packages and has the right"
+              echo "> structure**. It does **not** validate that the client can run:"
+              echo ">"
+              echo "> - Signing: UNSIGNED"
+              echo "> - Runtime entitlement validation: NOT AVAILABLE"
+              echo "> - App Group at runtime: NOT VALIDATED"
+              echo "> - Network Extension / Packet Tunnel: NOT VALIDATED"
+              echo ">"
+              echo "> The upstream identifiers \`$APPLE_BASE_BUNDLE_ID\` are retained as"
+              echo "> build inputs; this artifact is not an install or runtime signing"
+              echo "> candidate. Re-run with \`APPLE_SIGNING_MODE=development\` and your"
+              echo "> own Apple values to obtain one."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   macos:
@@ -237,6 +307,12 @@ jobs:
           # hdiutil if this fails, so a brew hiccup cannot break the build.
           brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"
 
+      - name: Apple signing regression tests
+        # Cheap invariant checks for the failures that are otherwise silent: a
+        # signed build falling back to unsigned, upstream identifiers left in
+        # place, or entitlements cleared while signing.
+        run: ./scripts/ci/test-apple-signing.sh
+
       - name: verify the Apple submodule revision
         run: |
           set -euo pipefail
@@ -252,6 +328,9 @@ jobs:
 
       - name: warm the Go module cache
         run: go mod download all
+
+      - name: Apple signing preflight
+        run: ./scripts/ci/check-apple-signing-environment.sh
 
       - name: build Libbox from this fork
         # The macOS client links the same framework as the iOS one, built from this
@@ -277,6 +356,9 @@ jobs:
           set -euo pipefail
           ./scripts/ci/build-macos-dmg.sh dist/apple/SFM-unsigned.dmg
 
+      - name: verify the signed artifact
+        run: ./scripts/ci/verify-apple-signed-artifact.sh macos-dmg dist/apple/SFM-unsigned.dmg
+
       - name: name the artifact
         run: |
           set -euo pipefail
@@ -291,6 +373,7 @@ jobs:
       - name: BUILD-INFO and SHA256
         run: |
           set -euo pipefail
+          eval "$(./scripts/ci/apple-signing-config.sh)"
           out="dist/apple/out"
           {
             echo "Jiejie sing-box Apple client build information"
@@ -307,6 +390,23 @@ jobs:
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "xcode:                  $(xcodebuild -version | head -1)"
             echo "go_version:             $(go version)"
+            echo ""
+            echo "signing_mode:           $APPLE_SIGNING_MODE"
+            echo "signing_style:          $APPLE_SIGNING_STYLE"
+            echo "team_id:                ${APPLE_TEAM_ID:-N/A}"
+            echo "base_bundle_id:         $APPLE_BASE_BUNDLE_ID"
+            echo "app_group:              $APPLE_APP_GROUP_ID"
+            echo "multicast_enabled:      $APPLE_ENABLE_MULTICAST"
+            if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+              echo "provisioning_validation: PASS"
+              echo "entitlement_validation:  PASS"
+              echo "app_group_consistency:   PASS"
+            else
+              echo "provisioning_validation: N/A (unsigned)"
+              echo "entitlement_validation:  N/A (unsigned)"
+              echo "app_group_consistency:   N/A (unsigned)"
+            fi
+            echo "runtime_validation:     NOT EXECUTED"
           } > "$out/BUILD-INFO-MACOS-APP.txt"
           ( cd "$out" && shasum -a 256 "$DMG_NAME" > SHA256SUMS-MACOS-APP.txt )
           cat "$out/BUILD-INFO-MACOS-APP.txt"
@@ -323,6 +423,7 @@ jobs:
       - name: summary
         run: |
           set -euo pipefail
+          eval "$(./scripts/ci/apple-signing-config.sh)"
           out="dist/apple/out"
           sha="$(awk '{print $1}' "$out/SHA256SUMS-MACOS-APP.txt")"
           size="$(wc -c < "$out/$DMG_NAME" | tr -d ' ')"
@@ -342,9 +443,52 @@ jobs:
             echo "| target | SFM.System |"
             echo "| platform | macos |"
             echo "| arch | arm64 |"
-            echo "| signing | **unsigned** |"
-            echo "| notarized | no |"
             echo "| DMG | \`$DMG_NAME\` |"
             echo "| size | $size bytes |"
             echo "| SHA256 | \`$sha\` |"
+            echo "| notarized | no |"
+            echo ""
+            echo "| signing | |"
+            echo "|---|---|"
+            echo "| Signing mode | \`$APPLE_SIGNING_MODE\` |"
+            echo "| Team ID | ${APPLE_TEAM_ID:-N/A (unsigned)} |"
+            echo "| Base bundle ID | \`$APPLE_BASE_BUNDLE_ID\` |"
+            echo "| App Group | \`$APPLE_APP_GROUP_ID\` |"
+            echo "| Multicast | $APPLE_ENABLE_MULTICAST |"
+            if [ "$APPLE_SIGNING_MODE" = "development" ]; then
+              echo "| Provisioning validation | PASS |"
+              echo "| Entitlement validation | PASS |"
+              echo "| App Group consistency | PASS |"
+              echo "| System Extension entitlement | PASS |"
+              echo ""
+              echo "**Runtime Candidate: YES** — statically verified, not yet executed."
+              echo ""
+              echo "| runtime check | result |"
+              echo "|---|---|"
+              echo "| App launch | NOT TESTED |"
+              echo "| App Group container | NOT TESTED |"
+              echo "| System Extension activation | NOT TESTED |"
+              echo ""
+              echo "A GitHub runner cannot activate a System Extension, which needs an"
+              echo "interactive approval. Run \`scripts/ci/verify-macos-runtime.sh\` on"
+              echo "your own Mac."
+            else
+              echo "| Provisioning validation | N/A |"
+              echo "| Entitlement validation | N/A |"
+              echo ""
+              echo "> **UNSIGNED artifact — not a runtime candidate.**"
+              echo ">"
+              echo "> Build, packaging and architecture are verified; the client's"
+              echo "> runtime capabilities are **not**:"
+              echo ">"
+              echo "> - Signing: UNSIGNED"
+              echo "> - Runtime entitlement validation: NOT AVAILABLE"
+              echo "> - App Group at runtime: NOT VALIDATED"
+              echo "> - System Extension: NOT VALIDATED"
+              echo ">"
+              echo "> An unsigned \`SFM.System\` build mounts and has the right"
+              echo "> architecture, but its App Group and System Extension do not"
+              echo "> function. Re-run with \`APPLE_SIGNING_MODE=development\` for a"
+              echo "> usable client."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
