@@ -70,6 +70,26 @@ echo "building $scheme (Release, iphoneos, arm64, unsigned)"
 # profiles" flags keep it from reaching for a provisioning profile. ENTITLEMENTS
 # are still processed, because the app must declare what it will be signed FOR -
 # only the signature itself is absent.
+# Resolve packages as a separate step before building.
+#
+# Without this, xcodebuild resolves the package graph inline during the build, and
+# Xcode's SwiftPM integration has been observed to abort there:
+#
+#   ** INTERNAL ERROR: Uncaught exception **
+#   -[NSMutableArray insertObjects:atIndexes:]: count of array (26) differs from
+#   count of index set (25)   (IDESwiftPackageCore.registerDependencyFileReferences)
+#
+# That is an Xcode crash rather than a fault in this project, and it is not
+# deterministic - the same commit built fine locally afterwards, and the macOS job,
+# which already resolved packages up front, passed on the very same CI run.
+# Resolving first keeps the two phases separate and gives the graph a chance to be
+# complete before the build reads it.
+echo "resolving packages"
+xcodebuild -resolvePackageDependencies \
+  -project "$client/sing-box.xcodeproj" \
+  -scheme "$scheme" \
+  -derivedDataPath "$work/dd" >/dev/null 2>&1 || true
+
 build_settings=(
   -project "$client/sing-box.xcodeproj"
   -scheme "$scheme"
