@@ -171,6 +171,36 @@ expects_fail "release-apple.sh rejects an unknown target" \
   ./scripts/release-apple.sh nonsense
 
 
+echo "== the real iOS target set =="
+# A real build asks for these seven. An earlier draft of the documentation listed
+# six and marked three of them optional, which would have sent a developer to the
+# portal with an incomplete list.
+check "the docs list the widget extension" \
+  grep -q "jiejiebox.widget" docs/APPLE-DEVELOPMENT-SIGNING.md
+check "the docs list the action extension" \
+  grep -q "jiejiebox.action" docs/APPLE-DEVELOPMENT-SIGNING.md
+check "the docs list the fileprovider extension" \
+  grep -q "jiejiebox.fileprovider" docs/APPLE-DEVELOPMENT-SIGNING.md
+check "the docs list the intents extension" \
+  grep -q "jiejiebox.intents" docs/APPLE-DEVELOPMENT-SIGNING.md
+
+echo "== entitlements that must survive every overlay =="
+check "iOS extension keeps packet-tunnel-provider" \
+  grep -q "packet-tunnel-provider" clients/apple/Extension/Extension.entitlements
+check "macOS system extension keeps the systemextension variant" \
+  grep -q "packet-tunnel-provider-systemextension" clients/apple/SystemExtension/SystemExtension.entitlements
+check "the macOS app keeps system-extension.install" \
+  grep -q "com.apple.developer.system-extension.install" clients/apple/SFM.System/SFM.entitlements
+
+echo "== no capability is added that the account may not have =="
+check "no multicast survives in the iOS tunnel" \
+  bash -c '! grep -q multicast clients/apple/Extension/Extension.entitlements'
+check "no multicast survives in the macOS system extension" \
+  bash -c '! grep -q multicast clients/apple/SystemExtension/SystemExtension.entitlements'
+check "no iCloud entitlement survives with the switch off" \
+  bash -c '! grep -q "com.apple.developer.icloud" clients/apple/SFI/SFI.entitlements'
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
