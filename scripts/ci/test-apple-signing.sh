@@ -135,6 +135,42 @@ for script in scripts/ci/build-ios-ipa.sh scripts/ci/build-macos-dmg.sh; do
     grep -q 'APP_GROUP_IDENTIFIER="\$APPLE_APP_GROUP_ID"' "$script"
 done
 
+echo "== testflight mode =="
+check "testflight is a recognised mode" \
+  env APPLE_SIGNING_MODE=testflight APPLE_TEAM_ID=A123456789 \
+      APPLE_BASE_BUNDLE_ID=com.example.jb APPLE_APP_GROUP_ID=group.com.example.jb \
+      ./scripts/ci/apple-signing-config.sh --print
+expects_fail "testflight without configuration is rejected" \
+  env APPLE_SIGNING_MODE=testflight ./scripts/ci/apple-signing-config.sh --print
+expects_fail "the testflight builder refuses to run in another mode" \
+  ./scripts/ci/build-ios-testflight.sh
+expects_fail "an unknown signing mode is still rejected" \
+  env APPLE_SIGNING_MODE=distribution ./scripts/ci/apple-signing-config.sh --print
+
+echo "== capability switches =="
+check "iCloud defaults to off" \
+  bash -c './scripts/ci/apple-signing-config.sh --print | grep -q "^APPLE_ENABLE_ICLOUD=false$"'
+check "multicast defaults to off" \
+  bash -c './scripts/ci/apple-signing-config.sh --print | grep -q "^APPLE_ENABLE_MULTICAST=false$"'
+expects_fail "an invalid iCloud value is rejected" \
+  env APPLE_ENABLE_ICLOUD=maybe ./scripts/ci/apple-signing-config.sh --print
+
+echo "== the team identifier is not derived from the App Group =="
+# AppConfiguration.teamID split the group name on the first dot, which cannot
+# produce a team id under either App Group convention. The value feeds code-signing
+# requirements, so a wrong one silently rejects XPC connections.
+check "the overlay carries the real team into the bundle" \
+  grep -q "TeamIdentifier" scripts/ci/fix-apple-team-id.py
+check "teamID prefers the injected value" \
+  grep -q 'object(forInfoDictionaryKey: "TeamIdentifier")' scripts/ci/fix-apple-team-id.py
+
+echo "== the unified entry point =="
+check "release-apple.sh documents its targets" \
+  bash -c './scripts/release-apple.sh --help | grep -q testflight'
+expects_fail "release-apple.sh rejects an unknown target" \
+  ./scripts/release-apple.sh nonsense
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

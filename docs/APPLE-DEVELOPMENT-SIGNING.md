@@ -66,13 +66,24 @@ With `APPLE_BASE_BUNDLE_ID=com.example.jiejiebox` you need these App IDs:
 | iOS Packet Tunnel extension | `com.example.jiejiebox.extension` | needs **Network Extensions** |
 | macOS app | `com.example.jiejiebox.standalone` | needs **System Extension** (for its own extension) and **Network Extensions** |
 | macOS System Extension | `com.example.jiejiebox.system` | needs **Network Extensions** |
+| iOS widget extension | `com.example.jiejiebox.widget` | only App Groups |
+| iOS share extension | `com.example.jiejiebox.share` | only App Groups |
+| iOS action extension | `com.example.jiejiebox.action` | only App Groups |
+| iOS file provider extension | `com.example.jiejiebox.fileprovider` | only App Groups |
+| iOS intents extension | `com.example.jiejiebox.intents` | only App Groups |
 | macOS share extension | `com.example.jiejiebox.share` | only App Groups |
 | macOS root helper | `com.example.jiejiebox.helper` | only App Groups |
 
-Do **not** create identifiers for the tvOS targets, the UI-test bundles or the
-FileProvider/Intents/Widget extensions unless you actually intend to run those.
-`scripts/ci/prepare-apple-client.sh` checks only the six targets the two shipped
-products embed, which is what the list above covers.
+That list is complete for what the two schemes build, and it was taken from a real
+build rather than from the project's target list:
+
+```sh
+xcodebuild ... -allowProvisioningUpdates build 2>&1 | grep -oE "No profiles for '[^']+'"
+```
+
+Every identifier that command prints needs an App ID. Do **not** create identifiers
+for the tvOS targets, the UI-test bundles, or the jailbreak daemon — those are not
+part of either shipped product.
 
 ### Capabilities
 
@@ -112,12 +123,21 @@ debugging this client. The build now enforces it in two places:
   entitlements and compares the app against each of its extensions.
 
 > Historical note, in case you see it elsewhere: the upstream project defines
-> `APP_GROUP_IDENTIFIER` inconsistently, and ten of its macOS configuration blocks
-> use `$(TeamIdentifierPrefix)$(BASE_PACKAGE_IDENTIFIER)`. `TeamIdentifierPrefix`
-> is empty outside a signed build, which collapses the value to a bare bundle
-> identifier — not a valid App Group at all. The build scripts now pass
-> `APP_GROUP_IDENTIFIER` explicitly so the project's own blocks cannot produce that
-> value.
+> `APP_GROUP_IDENTIFIER` two different ways — the iOS targets use
+> `group.$(BASE_PACKAGE_IDENTIFIER)`, while ten macOS configuration blocks use
+> `$(TeamIdentifierPrefix)$(BASE_PACKAGE_IDENTIFIER)`.
+>
+> macOS does support the team-prefixed App Group form, so the second expression is
+> not wrong by itself. The problem is that it does not resolve to the *same* group
+> as the iOS form: `TeamIdentifierPrefix` is supplied by provisioning, so in an
+> unsigned build it is empty and the value collapses to a bare bundle identifier,
+> and even in a signed build it produces a differently-shaped group from the iOS
+> side. Because the host app and its extension must resolve to one shared
+> container, the two conventions cannot be mixed within one product.
+>
+> The build scripts therefore pass `APP_GROUP_IDENTIFIER` explicitly, and the
+> macOS entitlements are normalised to the same `group.<base>` form the iOS side
+> already used, so every target agrees by construction.
 
 ### Multicast is off by default
 
@@ -210,9 +230,13 @@ xcrun devicectl device install app --device <udid> dist/SFI.ipa
 # or: Apple Configurator, or Xcode's Devices window
 ```
 
-Your device must be registered. With automatic signing Xcode does this when you run
-the scheme from Xcode once; otherwise add the device UDID in the developer portal.
-The profile also has to list the device for an Ad Hoc profile.
+This is a **development-signed** build, not Ad Hoc. It uses an Apple Development
+certificate and a development provisioning profile, which must include your device.
+
+With automatic signing, Xcode registers the device and manages the profile for you
+the first time you run the scheme from Xcode with the device connected. If you would
+rather not do that, add the device UDID in the developer portal and let the next
+build pick up the updated profile.
 
 ### Mac
 
@@ -301,3 +325,109 @@ artifact; the message names the missing values.
 
 When you want to distribute a DMG to other Macs, that is a separate change: a
 `developer-id` signing mode plus notarization and stapling.
+
+## TestFlight
+
+TestFlight uses a third signing mode, because it is a different destination rather
+than a stricter development build:
+
+```sh
+export APPLE_SIGNING_MODE=testflight
+export APPLE_TEAM_ID=ABCDE12345
+export APPLE_BASE_BUNDLE_ID=com.example.jiejiebox
+export APPLE_APP_GROUP_ID=group.com.example.jiejiebox
+
+./scripts/release-apple.sh testflight
+```
+
+That runs `scripts/ci/build-ios-testflight.sh`, which:
+
+1. archives with `xcodebuild archive` in Release — not a re-signed development IPA,
+   because the archive is what reproduces the bundle layout App Store Connect
+   expects and lets Xcode sign every nested target in its own order;
+2. runs a pre-upload gate and refuses to upload unless every check passes;
+3. exports with a generated `ExportOptions.plist` using the upload destination;
+4. reports the result.
+
+### The pre-upload gate
+
+Nothing reaches Apple unless all of these hold:
+
+```text
+Libbox came from this fork
+main app bundle ID is yours, not io.nekohasekai.*
+team ID is yours, not P8XK3KHB48
+main app signature verifies
+Packet Tunnel extension present and signed
+Packet Tunnel carries packet-tunnel-provider
+no multicast entitlement
+Packet Tunnel carries an App Group
+build number is set
+```
+
+An archive that cannot be shown to be yours must not be uploaded, so the gate fails
+the run rather than warning.
+
+### Build numbers
+
+App Store Connect rejects a build whose `CFBundleVersion` is not greater than the
+last accepted one for the same marketing version. The build number is therefore
+derived from the clock (`YYYYMMDDHHMM`) and printed with the marketing version and
+the git SHA. Override it with `APPLE_BUILD_NUMBER` when you need a specific value.
+
+### The first upload needs an App Record
+
+App Store Connect requires the app to exist before a build can be uploaded, and
+creating the first record is still a web action:
+
+```text
+App Store Connect
+→ My Apps
+→ +
+→ New App
+→ Platform: iOS
+→ Name:    (anything you like)
+→ Bundle ID: com.example.jiejiebox      <- must match exactly
+→ SKU:     (any unique string)
+```
+
+Once that exists, `./scripts/release-apple.sh testflight` uploads to it. Later
+builds need nothing further.
+
+### What "uploaded" does and does not mean
+
+```text
+TESTFLIGHT UPLOAD: PASS     the build reached Apple
+PROCESSING: APPLE SERVER    Apple is validating it; this is not a failure
+```
+
+Apple processes the build server-side after upload. The script reports the upload
+as the result and does not poll indefinitely; check TestFlight in App Store Connect
+for the processed state. Internal testing does not need Beta App Review.
+
+### If the upload fails
+
+The archive is still valid — only the upload failed. In order of likelihood:
+
+- Xcode is not signed in (**Xcode → Settings → Accounts**);
+- the App Record does not exist yet (above);
+- an agreement or tax form needs the Account Holder to accept it in App Store
+  Connect.
+
+The script prints these rather than guessing, and never falls back to an unsigned
+or development upload.
+
+## Capability switches
+
+Two capabilities complicate provisioning, so both are off by default and can be
+turned on when wanted:
+
+| Switch | Default | Effect |
+|---|---|---|
+| `APPLE_ENABLE_MULTICAST` | `false` | Removes `com.apple.developer.networking.multicast` from the iOS tunnel and the macOS System Extension. Apple grants this separately. |
+| `APPLE_ENABLE_ICLOUD` | `false` | Removes the iCloud and ubiquity entitlements from the iOS app, the intents extension and the macOS app, so you do not need an iCloud container or two extra capability assignments. |
+
+iCloud is a real profile-storage backend here — the client offers Local / iCloud /
+Remote — but it degrades cleanly without it: the iCloud directory falls back to a
+stub URL and the Local backend is unaffected. Set `APPLE_ENABLE_ICLOUD=true` when
+you want it, having created the container `iCloud.<your base bundle id>`.

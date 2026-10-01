@@ -21,7 +21,14 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
-eval "$(./scripts/ci/apple-signing-config.sh)"
+# The configuration layer already validates completeness and exits non-zero with a
+# list of what is missing. Capture that rather than letting `set -u` explode on the
+# unset variables below, which would bury the actionable message.
+if ! config_output="$(./scripts/ci/apple-signing-config.sh)"; then
+  # The config script has already printed why; nothing to add.
+  exit 1
+fi
+eval "$config_output"
 
 if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
   echo "check-apple-signing-environment: SKIP (APPLE_SIGNING_MODE=unsigned)"
