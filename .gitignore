@@ -34,3 +34,25 @@ cache.db
 # Compiled Go test binaries, produced by `go test -c` or left behind by an
 # interrupted run. Never source artifacts; one was committed accidentally.
 *.test
+
+# Signing material and local iOS build output. These live in the working tree for
+# local iOS builds only and must NEVER be committed: a private key or a
+# provisioning profile in Git history cannot be un-leaked by a later deletion.
+# The password for the .p12 is stored beside it and is covered by the same rule,
+# so `git add -A` cannot stage any of it.
+签名证书/
+证书/
+*.p12
+*.mobileprovision
+*.ipa
+*.xcarchive
+*.cer
+*.key
+*.pem
+
+# Apple client build output (scripts/ci/build-apple-libbox.sh and the iOS/macOS
+# build scripts). The xcframework is compiled from this repository's own libbox at
+# build time, so it is never a source artifact.
+/build/apple-ios/
+/build/apple-macos/
+/Libbox.xcframework/

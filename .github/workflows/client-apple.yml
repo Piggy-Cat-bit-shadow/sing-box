@@ -1,0 +1,339 @@
+name: Apple client
+
+# Builds the Apple GUI apps for personal testing, UNSIGNED.
+#
+# Two artifacts: an iOS arm64 IPA and a macOS arm64 DMG. Neither is signed, notarized
+# or otherwise touched by an Apple identity, because this stage exists to produce
+# something that can be RE-SIGNED later with a real certificate and provisioning
+# profile. No certificate, provisioning profile, Team ID, App Store Connect key or
+# apple-actions secret is used or required.
+#
+# # Relationship to client-macos.yml
+#
+# That workflow builds and fully verifies the sing-box CORE binary
+# (dist/sing-box-darwin-arm64) and has done so for a long time. This one builds the
+# GUI clients, which link that same fork through Libbox. They are deliberately
+# separate: the core pipeline keeps its existing gates, and nothing here changes
+# them. Neither workflow re-implements the other.
+#
+# # Why the app links THIS fork
+#
+# Before building the apps, Libbox.xcframework is generated from this repository's
+# own experimental/libbox via `make lib_apple`, and the submodule's copy is verified
+# to be that freshly built framework. If it were missing, the app would fail to link
+# or, worse, link whatever was already there. Nothing downloads an upstream libbox.
+#
+# # Trigger
+#
+# Manual only for now. Building an IPA and a DMG takes far longer than the core
+# pipeline, and it would be wasteful to run it for every Go commit. Once this is
+# known-good, a path filter for Apple-related sources can be added.
+on:
+  workflow_dispatch:
+    inputs:
+      build_ios:
+        description: 'Build the iOS unsigned IPA'
+        type: boolean
+        default: true
+      build_macos:
+        description: 'Build the macOS arm64 DMG'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  # Both jobs share these so the artifact names cannot drift between them.
+  APPLE_SUBMODULE: clients/apple
+
+jobs:
+  ios:
+    if: ${{ inputs.build_ios }}
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: check out with submodules
+        uses: actions/checkout@v4
+        with:
+          # The Apple client is a git submodule pinned by this repository, and it has
+          # its own nested submodule (Frameworks/Runestone) that the Xcode project
+          # needs in order to resolve packages. `recursive` fetches both. The
+          # revision must be the one this repository pins - never a newer upstream tip.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: set up Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer" 2>/dev/null || true
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: install gomobile
+        # gomobile is what produces the xcframework; it is not on the runner image.
+        run: |
+          set -euo pipefail
+          # Match the version the repository pins, so a local build and CI agree.
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: verify the Apple submodule revision
+        run: |
+          set -euo pipefail
+          recorded="$(git ls-tree HEAD "$APPLE_SUBMODULE" | awk '{print $3}')"
+          actual="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+          echo "parent records: $recorded"
+          echo "checked out:    $actual"
+          if [ "$actual" != "$recorded" ]; then
+            echo "FAIL: the Apple submodule is not at the revision this repository pins." >&2
+            exit 1
+          fi
+          echo "PASS: submodule matches the parent gitlink"
+
+      - name: warm the Go module cache
+        # gomobile prepends its own temporary GOPATH, and on a cold runner the whole
+        # module graph would be fetched from inside that step. Downloading it here
+        # keeps a slow or flaky proxy from looking like a build failure, and makes
+        # the fetch its own step in the log.
+        run: go mod download all
+
+      - name: build Libbox from this fork
+        # This is the step that makes the app "ours": Libbox.xcframework is compiled
+        # from this repository's experimental/libbox at the current commit and
+        # installed into the Apple client. It never downloads a prebuilt libbox from
+        # an upstream release.
+        #
+        # The script is used rather than `make lib_apple` because that target builds
+        # upstream's full Apple matrix (ios,iossimulator,tvos,tvossimulator,macos),
+        # and the amd64 iOS simulator slice cannot link against the pinned cronet-go,
+        # which ships no ios_amd64_simulator library. This builds ios and macos only.
+        run: |
+          set -euo pipefail
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          ./scripts/ci/build-apple-libbox.sh both
+
+      - name: apply the personal-test overlay
+        # Removes the multicast entitlement (not yet granted by Apple) and refuses to
+        # continue if the extension's entitlements are not what this overlay expects.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/prepare-apple-client.sh
+
+      - name: build unsigned IPA
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-ios-ipa.sh dist/apple/SFI-unsigned.ipa
+
+      - name: name the artifact
+        run: |
+          set -euo pipefail
+          version="$(cat release/JIEJIE_VERSION)"
+          short="$(git rev-parse --short HEAD)"
+          name="jiejiebox-ios-arm64-${version}-${short}-unsigned.ipa"
+          mkdir -p dist/apple/out
+          mv dist/apple/SFI-unsigned.ipa "dist/apple/out/$name"
+          echo "IPA_NAME=$name" >> "$GITHUB_ENV"
+          echo "IPA_PATH=dist/apple/out/$name" >> "$GITHUB_ENV"
+
+      - name: BUILD-INFO and SHA256
+        run: |
+          set -euo pipefail
+          out="dist/apple/out"
+          {
+            echo "Jiejie sing-box Apple client build information"
+            echo "============================================="
+            echo "platform:               ios"
+            echo "arch:                   arm64"
+            echo "target:                 SFI"
+            echo "signing_mode:           unsigned"
+            echo "version:                $(cat release/JIEJIE_VERSION)"
+            echo "parent_sha:             $(git rev-parse HEAD)"
+            echo "apple_submodule_sha:    $(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+            echo "libbox_source_sha:      $(git rev-parse HEAD)"
+            echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "xcode:                  $(xcodebuild -version | head -1)"
+            echo "go_version:             $(go version)"
+          } > "$out/BUILD-INFO-IOS.txt"
+          ( cd "$out" && shasum -a 256 "$IPA_NAME" > SHA256SUMS-IOS.txt )
+          cat "$out/BUILD-INFO-IOS.txt"
+          cat "$out/SHA256SUMS-IOS.txt"
+
+      - name: upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: dist/apple/out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: summary
+        run: |
+          set -euo pipefail
+          out="dist/apple/out"
+          sha="$(awk '{print $1}' "$out/SHA256SUMS-IOS.txt")"
+          size="$(wc -c < "$out/$IPA_NAME" | tr -d ' ')"
+          {
+            echo "### Apple Client Build - iOS"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| Parent SHA | \`$(git rev-parse HEAD)\` |"
+            echo "| Apple submodule SHA | \`$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)\` |"
+            echo "| Version | \`$(cat release/JIEJIE_VERSION)\` |"
+            echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
+            echo "| Go | \`$(go version | awk '{print $3}')\` |"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| target | SFI |"
+            echo "| platform | iphoneos |"
+            echo "| arch | arm64 |"
+            echo "| signing | **unsigned** |"
+            echo "| PacketTunnel extension | present (verified) |"
+            echo "| multicast entitlement | removed for personal test build |"
+            echo "| IPA | \`$IPA_NAME\` |"
+            echo "| size | $size bytes |"
+            echo "| SHA256 | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  macos:
+    if: ${{ inputs.build_macos }}
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: check out with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: set up Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer" 2>/dev/null || true
+          xcodebuild -version
+
+      - name: install gomobile and create-dmg
+        run: |
+          set -euo pipefail
+          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # create-dmg makes a Finder-friendly image. The script falls back to
+          # hdiutil if this fails, so a brew hiccup cannot break the build.
+          brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"
+
+      - name: verify the Apple submodule revision
+        run: |
+          set -euo pipefail
+          recorded="$(git ls-tree HEAD "$APPLE_SUBMODULE" | awk '{print $3}')"
+          actual="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+          echo "parent records: $recorded"
+          echo "checked out:    $actual"
+          if [ "$actual" != "$recorded" ]; then
+            echo "FAIL: the Apple submodule is not at the revision this repository pins." >&2
+            exit 1
+          fi
+          echo "PASS: submodule matches the parent gitlink"
+
+      - name: warm the Go module cache
+        run: go mod download all
+
+      - name: build Libbox from this fork
+        # The macOS client links the same framework as the iOS one, built from this
+        # repository's experimental/libbox at the current commit.
+        run: |
+          set -euo pipefail
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make lib_apple
+
+      - name: build unsigned DMG
+        run: |
+          set -euo pipefail
+          ./scripts/ci/build-macos-dmg.sh dist/apple/SFM-unsigned.dmg
+
+      - name: name the artifact
+        run: |
+          set -euo pipefail
+          version="$(cat release/JIEJIE_VERSION)"
+          short="$(git rev-parse --short HEAD)"
+          name="jiejiebox-macos-arm64-${version}-${short}-unsigned.dmg"
+          mkdir -p dist/apple/out
+          mv dist/apple/SFM-unsigned.dmg "dist/apple/out/$name"
+          echo "DMG_NAME=$name" >> "$GITHUB_ENV"
+          echo "DMG_PATH=dist/apple/out/$name" >> "$GITHUB_ENV"
+
+      - name: BUILD-INFO and SHA256
+        run: |
+          set -euo pipefail
+          out="dist/apple/out"
+          {
+            echo "Jiejie sing-box Apple client build information"
+            echo "============================================="
+            echo "platform:               macos"
+            echo "arch:                   arm64"
+            echo "target:                 SFM.System"
+            echo "signing_mode:           unsigned"
+            echo "notarized:              no"
+            echo "version:                $(cat release/JIEJIE_VERSION)"
+            echo "parent_sha:             $(git rev-parse HEAD)"
+            echo "apple_submodule_sha:    $(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+            echo "libbox_source_sha:      $(git rev-parse HEAD)"
+            echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "xcode:                  $(xcodebuild -version | head -1)"
+            echo "go_version:             $(go version)"
+          } > "$out/BUILD-INFO-MACOS-APP.txt"
+          ( cd "$out" && shasum -a 256 "$DMG_NAME" > SHA256SUMS-MACOS-APP.txt )
+          cat "$out/BUILD-INFO-MACOS-APP.txt"
+          cat "$out/SHA256SUMS-MACOS-APP.txt"
+
+      - name: upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.DMG_NAME }}
+          path: dist/apple/out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: summary
+        run: |
+          set -euo pipefail
+          out="dist/apple/out"
+          sha="$(awk '{print $1}' "$out/SHA256SUMS-MACOS-APP.txt")"
+          size="$(wc -c < "$out/$DMG_NAME" | tr -d ' ')"
+          {
+            echo "### Apple Client Build - macOS"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| Parent SHA | \`$(git rev-parse HEAD)\` |"
+            echo "| Apple submodule SHA | \`$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)\` |"
+            echo "| Version | \`$(cat release/JIEJIE_VERSION)\` |"
+            echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
+            echo "| Go | \`$(go version | awk '{print $3}')\` |"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| target | SFM.System |"
+            echo "| platform | macos |"
+            echo "| arch | arm64 |"
+            echo "| signing | **unsigned** |"
+            echo "| notarized | no |"
+            echo "| DMG | \`$DMG_NAME\` |"
+            echo "| size | $size bytes |"
+            echo "| SHA256 | \`$sha\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Builds an UNSIGNED macOS arm64 DMG from the pinned Apple client submodule.
+#
+# Usage: build-macos-dmg.sh <output-dmg>
+#
+# # What this produces
+#
+#   SFM.app (arm64, unsigned) inside a compressed DMG.
+#
+# # Why not `make build_macos_dmg_apple`
+#
+# That target chains archive -> exportArchive -> create-dmg, and the export step
+# reads SFM.System/Export.plist, which requests method=developer-id with two named
+# provisioning profiles. Without a Developer ID certificate that export cannot
+# succeed, so the upstream chain is unusable for an unsigned artifact. This script
+# keeps the parts that work (build the app, verify it, wrap it in a DMG) and drops
+# only the export step that requires Apple signing assets.
+#
+# # arm64 only
+#
+# The user's machine is Apple Silicon and this stage is personal testing, so no
+# Intel or universal slice is built. The architecture is verified rather than
+# assumed, so a stray x86_64 slice fails the build instead of shipping.
+#
+# # Not notarized
+#
+# No notarytool, no stapler, no Developer ID. Gatekeeper will warn on first launch,
+# which is expected and is re-signed later.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$root"
+
+out="${1:?usage: build-macos-dmg.sh <output-dmg>}"
+scheme="SFM.System"
+
+work="build/apple-macos"
+mkdir -p "$(dirname "$out")"
+
+client="clients/apple"
+if [ ! -d "$client" ]; then
+  echo "FAIL: $client is missing; run the submodule checkout first." >&2
+  exit 1
+fi
+
+if [ ! -d "$client/Libbox.xcframework" ]; then
+  echo "FAIL: $client/Libbox.xcframework is missing; build it with make lib_apple first." >&2
+  exit 1
+fi
+echo "libbox: built from this repository (clients/apple/Libbox.xcframework)"
+
+# --- 1. Build unsigned, arm64. --------------------------------------------------
+rm -rf "$work"
+mkdir -p "$work"
+
+echo "building $scheme (Release, macOS, arm64, unsigned)"
+xcodebuild build \
+  -project "$client/sing-box.xcodeproj" \
+  -scheme "$scheme" \
+  -configuration Release \
+  -destination 'generic/platform=macOS' \
+  -derivedDataPath "$work/dd" \
+  ARCHS=arm64 \
+  ONLY_ACTIVE_ARCH=NO \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGN_ENTITLEMENTS="" \
+  EXPANDED_CODE_SIGN_IDENTITY="" \
+  PROVISIONING_PROFILE_SPECIFIER="" \
+  DEVELOPMENT_TEAM="" \
+  -skipPackagePluginValidation \
+  2>&1 | tail -40
+
+# --- 2. Locate the app. ---------------------------------------------------------
+# The bundle name is NOT the scheme name: the SFM.System scheme produces SFM.app.
+# Read it from the scheme rather than hardcoding either.
+product_name="$(grep -oE 'BuildableName = "[^"]*\.app"' "$client/sing-box.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')"
+if [ -z "$product_name" ]; then
+  echo "FAIL: could not determine the product name for scheme $scheme" >&2
+  exit 1
+fi
+echo "product: $product_name"
+
+app="$(find "$work/dd/Build/Products" -maxdepth 2 -name "$product_name" -type d | head -1)"
+if [ -z "$app" ]; then
+  echo "FAIL: $product_name was not produced under $work/dd/Build/Products" >&2
+  find "$work/dd/Build/Products" -maxdepth 2 -type d | head -20 >&2
+  exit 1
+fi
+echo "built app: $app"
+
+# --- 3. Verify structure and architecture before packaging. --------------------
+fail=0
+app_name="$(basename "$app")"
+
+exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || true)"
+main_bin="$app/Contents/MacOS/$exe"
+if [ ! -f "$main_bin" ]; then
+  echo "FAIL: no main executable at Contents/MacOS/$exe" >&2
+  fail=1
+else
+  archs="$(lipo -archs "$main_bin" 2>/dev/null || true)"
+  echo "main executable: $exe"
+  echo "  archs: $archs"
+  shasum -a 256 "$main_bin" | awk '{print "  sha256: "$1}'
+  case "$archs" in
+    *x86_64*) echo "FAIL: an x86_64 slice is present; this stage is arm64 only" >&2; fail=1 ;;
+  esac
+  case "$archs" in
+    *arm64*) ;;
+    *) echo "FAIL: the main executable is not arm64" >&2; fail=1 ;;
+  esac
+  file "$main_bin"
+fi
+
+for key in CFBundleIdentifier CFBundleVersion CFBundleShortVersionString; do
+  val="$(/usr/libexec/PlistBuddy -c "Print :$key" "$app/Contents/Info.plist" 2>/dev/null || true)"
+  printf '  %-26s %s\n' "$key" "${val:-<MISSING>}"
+  [ -n "$val" ] || { echo "FAIL: $key is missing" >&2; fail=1; }
+done
+
+# Embedded content: extensions and frameworks must not smuggle in an Intel slice.
+echo "embedded content:"
+while IFS= read -r nested; do
+  rel="${nested#$app/Contents/}"
+  narchs="$(lipo -archs "$nested" 2>/dev/null || true)"
+  [ -n "$narchs" ] || continue
+  echo "  $rel -> $narchs"
+  case "$narchs" in
+    *x86_64*) echo "FAIL: $rel contains an x86_64 slice" >&2; fail=1 ;;
+  esac
+done < <(find "$app/Contents" \( -path "*/MacOS/*" -o -path "*frameworks/*" -o -name "*.appex" \) -type f -perm +111 2>/dev/null | sort -u | head -40)
+
+[ "$fail" -eq 0 ] || { echo "FAIL: macOS app verification failed" >&2; exit 1; }
+
+# --- 4. Build the DMG. ----------------------------------------------------------
+# create-dmg makes a Finder-friendly disk image. If it is unavailable, hdiutil
+# produces an equivalent (if plainer) image, so the build does not depend on a
+# Homebrew formula being installed.
+dmg_stage="$work/dmg"
+rm -rf "$dmg_stage"
+mkdir -p "$dmg_stage"
+ditto "$app" "$dmg_stage/$app_name"
+ln -s /Applications "$dmg_stage/Applications"
+
+rm -f "$out"
+if command -v create-dmg >/dev/null 2>&1; then
+  echo "packaging with create-dmg"
+  icon="$app/Contents/Resources/AppIcon.icns"
+  icon_args=()
+  [ -f "$icon" ] && icon_args=(--volicon "$icon")
+  create-dmg \
+    --volname "sing-box" \
+    "${icon_args[@]}" \
+    --icon "$app_name" 0 0 \
+    --hide-extension "$app_name" \
+    --app-drop-link 0 0 \
+    --skip-jenkins \
+    "$out" "$dmg_stage" >/dev/null 2>&1 || {
+      echo "create-dmg failed; falling back to hdiutil" >&2
+      rm -f "$out"
+      hdiutil create -volname "sing-box" -srcfolder "$dmg_stage" -ov -format UDZO "$out" >/dev/null
+    }
+else
+  echo "create-dmg not installed; packaging with hdiutil"
+  hdiutil create -volname "sing-box" -srcfolder "$dmg_stage" -ov -format UDZO "$out" >/dev/null
+fi
+
+if [ ! -f "$out" ]; then
+  echo "FAIL: no DMG was produced at $out" >&2
+  exit 1
+fi
+
+# --- 5. Verify the DMG actually contains the app. ------------------------------
+# A DMG that mounts but lacks the app is the failure mode worth catching here.
+mount_point="$work/mnt"
+mkdir -p "$mount_point"
+if hdiutil attach "$out" -mountpoint "$mount_point" -nobrowse -readonly >/dev/null 2>&1; then
+  if [ ! -d "$mount_point/$app_name" ]; then
+    echo "FAIL: $app_name is not present inside the mounted DMG" >&2
+    ls -la "$mount_point" >&2
+    hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  mounted_exe="$mount_point/$app_name/Contents/MacOS/$exe"
+  mounted_archs="$(lipo -archs "$mounted_exe" 2>/dev/null || true)"
+  echo "mounted DMG: $app_name present, executable archs: $mounted_archs"
+  case "$mounted_archs" in
+    *arm64*) ;;
+    *) echo "FAIL: the app inside the DMG is not arm64" >&2; hdiutil detach "$mount_point" >/dev/null 2>&1 || true; exit 1 ;;
+  esac
+  hdiutil detach "$mount_point" >/dev/null 2>&1 || true
+else
+  echo "FAIL: the DMG could not be mounted for verification" >&2
+  exit 1
+fi
+
+echo "built: $out"
+echo "bytes: $(wc -c < "$out" | tr -d ' ')"
+echo "sha256: $(shasum -a 256 "$out" | awk '{print $1}')"
