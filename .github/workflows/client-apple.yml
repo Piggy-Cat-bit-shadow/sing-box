@@ -256,10 +256,21 @@ jobs:
       - name: build Libbox from this fork
         # The macOS client links the same framework as the iOS one, built from this
         # repository's experimental/libbox at the current commit.
+        #
+        # The script is used rather than `make lib_apple` for the same reason as the
+        # iOS job: that target builds upstream's full Apple matrix, whose amd64 iOS
+        # simulator slice cannot link against the pinned cronet-go.
         run: |
           set -euo pipefail
           export PATH="$(go env GOPATH)/bin:$PATH"
-          make lib_apple
+          ./scripts/ci/build-apple-libbox.sh both
+
+      - name: apply the build overlays
+        # Compatibility shims for the pinned client's libbox API, plus the
+        # multicast-entitlement removal. Both are verified and fail closed.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/prepare-apple-client.sh
 
       - name: build unsigned DMG
         run: |
