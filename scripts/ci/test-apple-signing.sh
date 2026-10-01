@@ -26,6 +26,11 @@ cd "$root"
 pass=0
 fail=0
 
+# Obviously fake values: these tests exercise configuration logic, not a real
+# signature, and must never be mistaken for a working Apple setup.
+TEST_TEAM="ABCDE12345"
+TEST_BASE="com.example.jiejiebox"
+
 check() {
   local name="$1"
   shift
@@ -184,21 +189,42 @@ check "the docs list the fileprovider extension" \
 check "the docs list the intents extension" \
   grep -q "jiejiebox.intents" docs/APPLE-DEVELOPMENT-SIGNING.md
 
-echo "== entitlements that must survive every overlay =="
-check "iOS extension keeps packet-tunnel-provider" \
-  grep -q "packet-tunnel-provider" clients/apple/Extension/Extension.entitlements
-check "macOS system extension keeps the systemextension variant" \
-  grep -q "packet-tunnel-provider-systemextension" clients/apple/SystemExtension/SystemExtension.entitlements
-check "the macOS app keeps system-extension.install" \
-  grep -q "com.apple.developer.system-extension.install" clients/apple/SFM.System/SFM.entitlements
+echo "== entitlements after the overlay is applied =="
+# These assertions are about what the OVERLAY produces, so the test applies it
+# itself. Reading the submodule directly would only pass if some earlier command
+# happened to leave the overlay in place - a green result that means nothing on a
+# clean checkout. The submodule is restored afterwards either way.
+overlay_state="$(git -C clients/apple status --porcelain | wc -l | tr -d ' ')"
+restore_overlay() {
+  if [ "$overlay_state" = "0" ]; then
+    git -C clients/apple checkout -- . >/dev/null 2>&1 || true
+  fi
+}
 
-echo "== no capability is added that the account may not have =="
-check "no multicast survives in the iOS tunnel" \
-  bash -c '! grep -q multicast clients/apple/Extension/Extension.entitlements'
-check "no multicast survives in the macOS system extension" \
-  bash -c '! grep -q multicast clients/apple/SystemExtension/SystemExtension.entitlements'
-check "no iCloud entitlement survives with the switch off" \
-  bash -c '! grep -q "com.apple.developer.icloud" clients/apple/SFI/SFI.entitlements'
+if APPLE_SIGNING_MODE=development APPLE_TEAM_ID="$TEST_TEAM" \
+   APPLE_BASE_BUNDLE_ID="$TEST_BASE" APPLE_APP_GROUP_ID="group.$TEST_BASE" \
+   ./scripts/ci/prepare-apple-client.sh >/dev/null 2>&1; then
+  check "iOS extension keeps packet-tunnel-provider" \
+    grep -q "packet-tunnel-provider" clients/apple/Extension/Extension.entitlements
+  check "macOS system extension keeps the systemextension variant" \
+    grep -q "packet-tunnel-provider-systemextension" clients/apple/SystemExtension/SystemExtension.entitlements
+  check "the macOS app keeps system-extension.install" \
+    grep -q "com.apple.developer.system-extension.install" clients/apple/SFM.System/SFM.entitlements
+  check "no multicast survives in the iOS tunnel" \
+    bash -c '! grep -q multicast clients/apple/Extension/Extension.entitlements'
+  check "no multicast survives in the macOS system extension" \
+    bash -c '! grep -q multicast clients/apple/SystemExtension/SystemExtension.entitlements'
+  check "no iCloud entitlement survives with the switch off" \
+    bash -c '! grep -q "com.apple.developer.icloud" clients/apple/SFI/SFI.entitlements'
+  check "the overlay is idempotent (refuses to re-apply)" \
+    bash -c '! APPLE_SIGNING_MODE=development APPLE_TEAM_ID='"$TEST_TEAM"' \
+      APPLE_BASE_BUNDLE_ID='"$TEST_BASE"' APPLE_APP_GROUP_ID=group.'"$TEST_BASE"' \
+      ./scripts/ci/prepare-apple-client.sh'
+else
+  echo "  FAIL: could not apply the overlay; skipping its assertions" >&2
+  fail=$((fail + 1))
+fi
+restore_overlay
 
 
 echo

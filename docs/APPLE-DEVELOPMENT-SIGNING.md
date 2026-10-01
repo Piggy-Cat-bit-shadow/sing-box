@@ -45,6 +45,12 @@ If Xcode is signed in under **Settings → Accounts**, Xcode can create the
 certificate and the profiles for you, which is why `automatic` is the default
 signing style.
 
+> An account listed in Xcode is not the same as an account that is signed in.
+> If `Xcode → Settings → Accounts` shows your Apple ID but provisioning fails with
+> `No Account for Team "<team>"`, the account entry exists without an authenticated
+> session — re-select the account and sign in again. Run
+> `./scripts/ci/diagnose-apple-signing.sh` to tell the two apart in one step.
+
 > A development certificate alone is not enough. It is issued by an intermediate
 > (currently `AppleWWDRCAG3`), and without that intermediate installed,
 > `security find-identity -v -p codesigning` reports **0 valid identities** even
@@ -84,6 +90,40 @@ xcodebuild ... -allowProvisioningUpdates build 2>&1 | grep -oE "No profiles for 
 Every identifier that command prints needs an App ID. Do **not** create identifiers
 for the tvOS targets, the UI-test bundles, or the jailbreak daemon — those are not
 part of either shipped product.
+
+### The full identifier set
+
+Every bundle identifier derives from `$(BASE_PACKAGE_IDENTIFIER)`, so one value
+determines all of them. These are the identifiers the two schemes actually resolve,
+read from the project rather than assumed:
+
+| Target | Bundle ID | Used by |
+|---|---|---|
+| SFI | `<base>` | iOS |
+| Extension | `<base>.extension` | iOS Packet Tunnel |
+| ActionExtension | `<base>.action` | iOS |
+| FileProviderExtension | `<base>.fileprovider` | iOS |
+| IntentsExtension | `<base>.intents` | iOS |
+| ShareExtension | `<base>.share` | iOS |
+| WidgetExtension | `<base>.widget` | iOS |
+| SFM.System | `<base>.standalone` | macOS |
+| SystemExtension | `<base>.system` | macOS |
+| ShareExtension.System | `<base>.standalone.share` | macOS |
+| RootHelper | `<base>.helper` | macOS |
+
+To print this for your own base value:
+
+```sh
+for t in SFI Extension ActionExtension FileProviderExtension IntentsExtension \
+         ShareExtension WidgetExtension SFM.System SystemExtension \
+         ShareExtension.System RootHelper; do
+  printf '%-24s ' "$t"
+  xcodebuild -project clients/apple/sing-box.xcodeproj -target "$t" \
+    -configuration Release -showBuildSettings -skipPackagePluginValidation \
+    BASE_PACKAGE_IDENTIFIER=top.jiejie12131.jiejiebox 2>/dev/null \
+    | grep -E '^ +PRODUCT_BUNDLE_IDENTIFIER = ' | head -1 | sed 's/.*= //'
+done
+```
 
 ### Capabilities
 
