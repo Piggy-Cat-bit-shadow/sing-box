@@ -60,6 +60,13 @@ func DialSerialNetwork(ctx context.Context, dialer N.Dialer, network string, des
 //
 // The interface and strategy arguments are unchanged; they select the per-attempt dialer.
 func DialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+	return dialParallelNetwork(ctx, dialer, network, destination, destinationAddresses, preferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, nil, 0)
+}
+
+// dialParallelNetwork is the health-aware form. The exported function keeps its signature so
+// existing callers are unaffected, and passes no health; callers that own family state use
+// this one.
+func dialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration, health *familyHealth, networkEnvironment uint64) (net.Conn, error) {
 	if len(destinationAddresses) == 0 {
 		if !destination.IsIP() {
 			panic("invalid usage")
@@ -73,7 +80,15 @@ func DialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, ne
 	}
 	plan := planCandidates(destinationAddresses, netip.Addr{}, domainStrategy)
 
-	scheduler := &candidateScheduler{fallbackDelay: fallbackDelay}
+	// Health comes from the dialer that owns the underlay, so the verdict survives across
+	// connections instead of being relearned every time. The parameter carries it because
+	// this is a free function; the alternative - a package-level variable - would share one
+	// network's verdict with every dialer in the process.
+	scheduler := &candidateScheduler{
+		fallbackDelay:      fallbackDelay,
+		health:             health,
+		networkEnvironment: networkEnvironment,
+	}
 	conn, _, err := scheduler.dial(ctx, plan, func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
 		// Each attempt keeps the full configuration the caller supplied: the network
 		// strategy, the interface selection and the fallback interface selection. Racing

@@ -83,9 +83,20 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 		// No goroutine, no timer, no channel, no race state. A "dual-stack" scheduler that
 		// costs a goroutine and a timer for a single address would be a regression on the
 		// most frequent path in the process.
+		//
+		// Family health is still updated, cheaply and without any of that machinery. Leaving
+		// it out would mean the single-candidate path - the one most connections take - could
+		// neither record a failure nor clear a penalty, so a family would never recover from
+		// a single-stack connection.
 		conn, err := attempt(ctx, candidates[0].address)
 		if err != nil {
+			if s.health != nil {
+				s.health.recordFailure(s.networkEnvironment, candidates[0].family, err)
+			}
 			return nil, netip.Addr{}, E.Cause(err, "dial ", candidates[0].address)
+		}
+		if s.health != nil {
+			s.health.recordSuccess(s.networkEnvironment, candidates[0].family)
 		}
 		return conn, candidates[0].address, nil
 	}
@@ -107,6 +118,22 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 		go func() {
 			defer workerGroup.Done()
 			conn, err := attempt(raceCtx, candidate.address)
+
+			// Record a PATH failure here, where the attempt completes, rather than only on
+			// the winner path.
+			//
+			// An attempt that loses the race is exactly the case that carries the useful
+			// signal: the address that blackholed is usually the LOSING one, and the winner
+			// is the family that already works. Recording only on success meant nothing was
+			// ever learned from the situation the mechanism exists for, so the fast-fallback
+			// path was inert in production.
+			//
+			// The classification is conservative: caller cancellation and closed connections
+			// - which is how a loser is torn down - record nothing.
+			if err != nil && s.health != nil {
+				s.health.recordFailure(s.networkEnvironment, classifyAddress(candidate.address), err)
+			}
+
 			select {
 			case results <- dialAttemptResult{conn: conn, err: err, address: candidate.address}:
 			case <-raceCtx.Done():
@@ -212,6 +239,14 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 				if len(successes) == 1 {
 					// The winner. Cancel the race and stop launching; pending attempts are
 					// closed by the deferred cleanup.
+					//
+					// A family that just completed a connection has demonstrated the path
+					// works, so any penalty it carries is cleared here rather than by a
+					// caller remembering to do it. Without this a family penalised once
+					// would stay penalised for the full window even after it recovered.
+					if s.health != nil {
+						s.health.recordSuccess(s.networkEnvironment, classifyAddress(result.address))
+					}
 					cancelRace()
 					stopTimer()
 					return result.conn, result.address, nil
@@ -224,9 +259,6 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 
 			lastErr = result.err
 			failures = append(failures, E.Cause(result.err, result.address.String()))
-			if s.health != nil {
-				s.health.recordFailure(s.networkEnvironment, classifyAddress(result.address), result.err)
-			}
 
 			// A fast failure frees its slot immediately: waiting out the delay would only
 			// postpone an answer already known to be no.
@@ -394,21 +426,40 @@ func isFamilyPathFailure(err error) bool {
 		errors.Is(err, syscall.ENETDOWN) {
 		return true
 	}
+	// Cancellation is never a family verdict. A cancelled context means the CALLER stopped
+	// waiting - a losing attempt being cleaned up, a user aborting, or the whole operation's
+	// deadline expiring and cancelling every attempt at once. Recording that as "this family
+	// is broken" would penalise a healthy family for fifteen seconds because a different
+	// candidate happened to win, or because the user navigated away.
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// net.ErrClosed is the same class: it comes from caller cancellation, a network switch,
+	// or this package closing a loser. None of those says anything about the path.
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	// io.EOF during connect means the peer closed before answering. On a datagram-oriented
+	// path that is ambiguous, and on a stream it is indistinguishable from a server that
+	// accepts and immediately hangs up - which is a server problem, not a broken family. The
+	// conservative reading is to record nothing.
+	if errors.Is(err, io.EOF) {
+		return false
+	}
+	// A refusal is the peer actively answering: the path works.
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
 	// A timeout means nothing answered on that path. This is the blackhole case the whole
 	// mechanism exists for.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return true
 	}
+	// A bare deadline exceeded reaches here only when the attempt itself timed out rather
+	// than the parent operation: a parent deadline arrives as context.Canceled-derived
+	// cancellation of the attempt, and is excluded above.
 	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	// A refusal is the peer actively answering: the path works.
-	if errors.Is(err, syscall.ECONNREFUSED) {
-		return false
-	}
-	// A closed connection during connect is a path-level failure.
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return true
 	}
 	return false

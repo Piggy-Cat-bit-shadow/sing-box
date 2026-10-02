@@ -113,23 +113,59 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		// configured family preference survives the recovery.
 		strategy := d.queryOptions.Strategy
 		candidates := MergeOriginalDestination(destination.Addr, recovered, strategy)
-		plan := planCandidates(candidates, destination.Addr, strategy)
-		scheduler := &candidateScheduler{fallbackDelay: d.fallbackDelay}
-		conn, _, err := scheduler.dial(ctx, plan, func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
-			return d.dialer.DialContext(attemptCtx, network, M.SocksaddrFrom(address, destination.Port))
-		})
-		return conn, err
+		return d.raceCandidates(ctx, network, destination, candidates, strategy)
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
 	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
 	if err != nil {
 		return nil, err
 	}
-	if d.parallel {
-		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
-	} else {
+	if !d.parallel {
+		// parallel=false is an explicit request for serial behaviour, used by callers that
+		// dial one bootstrap address at a time. It is NOT "the old implementation", so it
+		// keeps its meaning: no racing, no fallback delay, resolver order preserved.
 		return N.DialSerial(ctx, d.dialer, network, destination, addresses)
 	}
+	// A hostname now takes the SAME candidate planner and scheduler as a recovered literal.
+	// Previously this branch called N.DialParallel, which split candidates into family groups
+	// and iterated serially inside each - so a hostname did not get interleaving, same-family
+	// stagger, the unified error aggregation or family health. Two implementations of one
+	// policy is how a fix lands on one path and not the other.
+	return d.raceCandidates(ctx, network, destination, addresses, d.queryOptions.Strategy)
+}
+
+// raceCandidates dials the planned candidates through the shared scheduler.
+//
+// Every racing path in this file goes through here, so candidate ordering, scheduling, family
+// health and loser cleanup cannot differ between a hostname and a recovered literal.
+func (d *resolveDialer) raceCandidates(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, strategy C.DomainStrategy) (net.Conn, error) {
+	plan := planCandidates(addresses, destination.Addr, strategy)
+	if len(plan.candidates) == 0 {
+		return nil, E.New("no dial candidates for ", destination)
+	}
+	scheduler := d.newScheduler()
+	conn, _, err := scheduler.dial(ctx, plan, func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
+		return d.dialer.DialContext(attemptCtx, network, M.SocksaddrFrom(address, destination.Port))
+	})
+	return conn, err
+}
+
+// newScheduler builds a scheduler bound to this dialer's family health.
+//
+// When the underlying dialer owns health - the production case - the verdict survives across
+// connections instead of being relearned every time. The fallback keeps the previously
+// health-less behaviour for dialers that have no state to share, rather than inventing a
+// per-connection one that would never accumulate history.
+func (d *resolveDialer) newScheduler() *candidateScheduler {
+	if owner, isOwner := d.dialer.(familyHealthOwner); isOwner {
+		return owner.newDualStackScheduler(d.fallbackDelay)
+	}
+	return &candidateScheduler{fallbackDelay: d.fallbackDelay}
+}
+
+// familyHealthOwner is implemented by dialers that own long-lived family health.
+type familyHealthOwner interface {
+	newDualStackScheduler(fallbackDelay time.Duration) *candidateScheduler
 }
 
 func (d *resolveDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

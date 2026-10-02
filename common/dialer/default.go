@@ -51,6 +51,16 @@ type DefaultDialer struct {
 	fallbackNetworkType    []C.InterfaceType
 	networkFallbackDelay   time.Duration
 	networkLastFallback    common.TypedValue[time.Time]
+
+	// familyHealth remembers which address family recently failed to establish a connection,
+	// so the next connection does not pay the fallback delay again to rediscover it.
+	//
+	// It lives on the dialer, not in a package-level variable: two dialers with different
+	// configurations (a direct one and a detour-bound one) do not necessarily share an
+	// underlay, and sharing a verdict between them would penalise a path one of them never
+	// used. It is created once here and reused for the dialer's lifetime - creating it per
+	// connection would mean it never had any history to reuse.
+	familyHealth *familyHealth
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
@@ -243,6 +253,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		autoDetectBindFunc:     autoDetectBindFunc,
 		connectionManager:      connectionManager,
 		networkManager:         networkManager,
+		familyHealth:           newFamilyHealth(),
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		outboundManager:        service.FromContext[adapter.OutboundManager](ctx),
 		dnsTransportManager:    service.FromContext[adapter.DNSTransportManager](ctx),
@@ -547,4 +558,30 @@ func (d *DefaultDialer) dialAttribution(ctx context.Context, destination M.Socks
 		attribution.Destination = destination.String()
 	}
 	return attribution
+}
+
+// networkEnvironment returns the current network environment identifier for family health
+// scoping.
+//
+// Health is per-network: a Wi-Fi network with broken IPv6 says nothing about the cellular
+// network, and carrying a verdict across that boundary would penalise a working path. Zero
+// means "no network manager", which scopes the state to this dialer alone.
+func (d *DefaultDialer) networkEnvironment() uint64 {
+	if d.networkManager == nil {
+		return 0
+	}
+	return d.networkManager.NetworkEnvironment()
+}
+
+// newDualStackScheduler builds a scheduler wired to this dialer's family health.
+//
+// Every production construction goes through here, so a scheduler cannot be created without
+// health by accident - which is how the fast-fallback path ended up existing only in tests
+// while the production schedulers passed health: nil.
+func (d *DefaultDialer) newDualStackScheduler(fallbackDelay time.Duration) *candidateScheduler {
+	return &candidateScheduler{
+		fallbackDelay:      fallbackDelay,
+		health:             d.familyHealth,
+		networkEnvironment: d.networkEnvironment(),
+	}
 }
