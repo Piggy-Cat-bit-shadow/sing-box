@@ -62,3 +62,10 @@ cache.db
 # of the repository.
 config/apple/*.env
 !config/apple/*.env.example
+
+# Local Apple publishing configuration (bundle IDs, App Group, team). Personal to
+# one developer's App Store Connect setup, so it stays out of the repository. The
+# committed template is .env.apple.local.example.
+.env.apple.local
+.env.apple.local.*
+!.env.apple.local.example

@@ -344,6 +344,27 @@ check "no comment sits inside an argument list" \
   python3 "$root/scripts/ci/test-arglist.py"
 
 
+echo "== local publishing configuration =="
+# The publishing identifiers are personal, so they live in a git-ignored file
+# rather than in the repository or in GitHub secrets. These assertions guard the
+# two ways that could go wrong: the file becoming trackable, or a run silently
+# proceeding with the wrong identifiers.
+check "the local config file is git-ignored" \
+  bash -c 'git check-ignore -q .env.apple.local'
+check "the example template is committable" \
+  bash -c '! git check-ignore -q .env.apple.local.example'
+check "the template is tracked" \
+  bash -c 'git ls-files --error-unmatch .env.apple.local.example >/dev/null 2>&1 || test -f .env.apple.local.example'
+check "release-apple.sh loads the local file" \
+  grep -q '.env.apple.local' scripts/release-apple.sh
+check "an exported value takes precedence over the file" \
+  grep -q 'local_base_before' scripts/release-apple.sh
+check "the loader refuses a non-ignored file" \
+  grep -q 'refusing to read' scripts/release-apple.sh
+check "the local file is not tracked" \
+  bash -c '! git ls-files --error-unmatch .env.apple.local >/dev/null 2>&1'
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
