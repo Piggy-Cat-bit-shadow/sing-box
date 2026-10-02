@@ -16,7 +16,6 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
 	"github.com/sagernet/sing/service"
@@ -499,27 +498,24 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	case C.DomainStrategyIPv6Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
-	var response4 []netip.Addr
-	var response6 []netip.Addr
-	var group task.Group
-	group.Append("exchange4", func(ctx context.Context) error {
-		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
-		if err != nil {
-			return err
-		}
-		response4 = response
-		return nil
-	})
-	group.Append("exchange6", func(ctx context.Context) error {
-		response, err := c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
-		if err != nil {
-			return err
-		}
-		response6 = response
-		return nil
-	})
-	err := group.Run(ctx)
-	if len(response4) == 0 && len(response6) == 0 {
+	// The two families are exchanged concurrently and each result is published as it
+	// arrives, so neither can hold the other hostage. Lookup collects the same stream to
+	// completion, which keeps its signature and its answers identical - see
+	// client_dual_stack.go for why the policy path is unchanged.
+	//
+	// The previous implementation ran the same two exchanges through task.Group and then
+	// waited for both. A resolver answering A in 10ms and never answering AAAA delayed every
+	// connection by the AAAA timeout, even though a usable address was in hand immediately.
+	response4, response6, err := c.collectFamilies(
+		ctx,
+		transport,
+		dnsName,
+		lookupOptions,
+		responseChecker,
+		defaultResolutionDelay,
+		strategy == C.DomainStrategyPreferIPv6,
+	)
+	if err != nil {
 		return nil, err
 	}
 	return sortAddresses(response4, response6, strategy), nil
