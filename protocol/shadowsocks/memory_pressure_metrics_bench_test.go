@@ -1,0 +1,122 @@
+package shadowsocks
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/sagernet/sing-box/internal/memmetrics"
+	shadowss "github.com/sagernet/sing-shadowsocks2"
+	"github.com/sagernet/sing/common/bufio"
+	M "github.com/sagernet/sing/common/metadata"
+)
+
+// BenchmarkShadowMemoryPressureMeasured runs the pressure workload and reports the runtime
+// memory figures from INSIDE the process being measured.
+//
+// # Why this replaces the gctrace approach
+//
+// The previous harness set GODEBUG=gctrace=1 on `go test` and parsed its output. That had
+// three problems, all of which produced numbers that looked like evidence:
+//
+//   - the gctrace heap field is the heap at a cycle, not the runtime-managed memory the
+//     GOMEMLIMIT contract governs, so "did the limit engage" was decided from the wrong
+//     quantity;
+//   - the three "ms clock" phases were summed and reported as GC pause, when only part of
+//     one of them is stop-the-world;
+//   - GODEBUG is inherited by the whole process tree, so the compiler's and the go
+//     command's own GC was mixed into the workload's measurement.
+//
+// runtime/metrics has none of those problems: the metrics are read in-process, they are
+// the runtime's supported interface, and the pause figure comes from the STW histogram
+// rather than from phase timings.
+//
+// The figures are emitted as a single line the matrix harness parses, so the harness does
+// not need to understand gctrace at all.
+func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
+	method, err := shadowss.CreateMethod(context.Background(), "2022-blake3-aes-128-gcm",
+		shadowss.MethodOptions{Password: "AAAAAAAAAAAAAAAAAAAAAA=="})
+	if err != nil {
+		b.Skipf("method unavailable: %v", err)
+	}
+
+	recorder, err := memmetrics.NewRecorder()
+	if err != nil {
+		// Fail rather than skip: a benchmark that cannot measure the thing it exists to
+		// measure must not report a number.
+		b.Fatalf("runtime metrics unavailable, refusing to measure: %v", err)
+	}
+	start, err := memmetrics.Read()
+	if err != nil {
+		b.Fatalf("read runtime state: %v", err)
+	}
+
+	const payloadPerOp = 256 << 20
+
+	b.SetBytes(payloadPerOp)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		sink := &pressureSink{}
+		conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
+		destination := withStreamMTU(conn)
+		source := &fixedSizeReader{remaining: payloadPerOp}
+		b.StartTimer()
+
+		if _, err := bufio.Copy(destination, source); err != nil {
+			b.Fatal(err)
+		}
+		// Sample during the workload, not only at its ends: a soft limit keeps the runtime
+		// near a target BETWEEN collections, so an endpoint reading says nothing about the
+		// peak that actually approached jetsam.
+		recorder.Sample()
+	}
+	b.StopTimer()
+
+	delta, end, err := recorder.Finish()
+	if err != nil {
+		b.Fatalf("finish metrics: %v", err)
+	}
+
+	// One machine-readable line. The harness parses this and nothing else.
+	fmt.Printf("MEMMETRICS gogc=%d gomemlimit=%d managed_start=%d managed_peak=%d managed_end=%d "+
+		"gc_cycles=%d pause_total_ns=%d pause_count=%d pause_max_ns=%d heap_live=%d\n",
+		end.GOGCPercent,
+		end.GOMEMLIMITBytes,
+		delta.RuntimeManagedAtStart,
+		delta.RuntimeManagedPeak,
+		delta.RuntimeManagedAtEnd,
+		delta.GCCycles,
+		int64(delta.PauseTotalSeconds*1e9),
+		delta.PauseCount,
+		int64(delta.PauseMaxSeconds*1e9),
+		end.HeapLiveBytes,
+	)
+	_ = start
+}
+
+// TestMemoryPressureMetricsAreEmitted keeps the benchmark's contract honest.
+//
+// If the metrics line stopped being emitted, the harness would see missing data and could
+// silently fall back to reporting nothing, or worse, to a default. This asserts the
+// benchmark can read the runtime's figures at all.
+func TestMemoryPressureMetricsAreEmitted(t *testing.T) {
+	if !memmetrics.Supported() {
+		t.Fatal("the runtime must publish the metrics the pressure benchmark reports")
+	}
+	recorder, err := memmetrics.NewRecorder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta, state, err := recorder.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.GOMEMLIMITBytes == 0 {
+		t.Error("the memory limit must be reported even for an empty workload")
+	}
+	if delta.RuntimeManagedPeak == 0 {
+		t.Error("the runtime-managed figure must be non-zero")
+	}
+}

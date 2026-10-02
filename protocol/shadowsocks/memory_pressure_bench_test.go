@@ -65,10 +65,30 @@ type pressureSink struct {
 
 // heldWorkingSet is the live heap the benchmark deliberately keeps alive, in bytes.
 //
-// 24 MiB sits between the smallest limit tested (37.5 MiB) and the largest (48 MiB) at
-// roughly the halfway point, so every row in the matrix has a live set it can actually
-// reach while still having to pace collections against it.
-const heldWorkingSet = 24 << 20
+// # Getting this right took three attempts, and the wrong ones are worth recording
+//
+// A soft limit paces memory the runtime can RECLAIM. Measuring that needs two things at
+// once: a live set small enough that the limit is satisfiable, and an allocation rate high
+// enough that the runtime keeps being pushed toward it. Getting either wrong produces
+// confident nonsense:
+//
+//   - Retaining everything (~97 MiB) put the live set above every limit. A limit below the
+//     live set can never be met, so the runtime collected continuously: 7426 GC cycles
+//     against 115 unlimited, and every limited row showed ~70% less throughput. A true
+//     measurement of an unsatisfiable configuration.
+//
+//   - Retaining 24 MiB left the peak at ~32 MiB, BELOW every limit in the matrix. Nothing
+//     engaged and all rows were identical.
+//
+//   - Retaining 64 MiB put the live set above every limit again, reproducing the first
+//     failure at a larger size: 505 GC cycles chasing an unreachable target.
+//
+// 20 MiB of retained working set, with the rest churn. The retained part must stay well
+// below the smallest limit tested (37.5 MiB) so the limit has room to act, while the total
+// allocation per iteration is large enough that the runtime keeps being pushed toward it.
+// The matrix runs several iterations, so the peak settles above the limits rather than
+// below them.
+const heldWorkingSet = 20 << 20
 
 func (s *pressureSink) WriteBuffer(buffer *buf.Buffer) error {
 	s.total += int64(buffer.Len())

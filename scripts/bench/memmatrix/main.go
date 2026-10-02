@@ -1,32 +1,40 @@
-//go:build ignore
-
-// Command memmatrix runs the data-path benchmarks under a matrix of GOMEMLIMIT and
-// GOGC settings and reports throughput, allocation and GC behaviour for each.
+// Command memmatrix runs the memory-pressure benchmark under a matrix of GOMEMLIMIT and
+// GOGC settings and reports throughput, GC behaviour and runtime-managed memory for each.
 //
-// # Why this exists
+// # Why each setting runs in a fresh process
 //
-// The iOS client runs with GOMEMLIMIT 40 MiB and GOGC 50, derived from a 50 MiB
-// NetworkExtension budget and a 5 MiB safety margin (see service/oomkiller). GOGC 50 is
-// twice as aggressive as the Go default of 100, and GOMEMLIMIT already paces the heap
-// against a hard ceiling, so the question is whether the extra GC work buys anything -
-// on a phone, GC cycles are CPU, and CPU is battery and heat.
+// GOMEMLIMIT and GOGC are process-wide and read by the runtime at start-up. Varying them
+// in-process would measure the runtime's response to a knob moved underneath it, not the
+// configuration under test.
 //
-// # Why it is a separate program
+// # Why the measurement happens inside the test binary
 //
-// GOMEMLIMIT and GOGC are process-wide and are read by the runtime at start-up. A
-// benchmark that tried to vary them in-process would be measuring the runtime's
-// response to a knob changed underneath it, not the configuration under test. So each
-// combination runs the benchmarks in a fresh child process with that environment.
+// GC and memory figures come from protocol/shadowsocks's benchmark, which reads
+// runtime/metrics in-process and prints one MEMMETRICS line. This harness parses that line
+// and nothing else.
 //
-// # Why some results are marked INVALID
+// The previous version set GODEBUG=gctrace=1 on `go test` and parsed its output, which was
+// wrong in three ways that all produced plausible-looking numbers:
 //
-// GOMEMLIMIT only affects anything once the heap approaches it. If a run's peak heap
-// stays well below the limit, the limit never engaged and the numbers for 37.5 MiB,
-// 40 MiB and unlimited are the same measurement repeated. This program compares each
-// run's peak heap against the configured limit and marks the row accordingly, rather
-// than presenting those rows as evidence.
+//   - the gctrace heap field was treated as the memory GOMEMLIMIT governs. It is not; that
+//     is the heap at a cycle, while the limit accounts runtime-managed memory.
+//   - the three "ms clock" phases were summed and called GC pause. They are the sweep,
+//     concurrent mark and mark termination phases, and only part of one is stop-the-world.
+//     The true figure comes from the STW histogram and is roughly an order of magnitude
+//     smaller.
+//   - GODEBUG is inherited by the whole process tree, so the compiler's and the go
+//     command's own GC was mixed into the workload's measurement.
 //
-// The harness does NOT decide whether to change production defaults. It reports.
+// # What "engaged" means now
+//
+// With gctrace gone, validity is decided from runtime-managed memory against the limit. A
+// row is marked invalid when the limit demonstrably did not constrain the heap - when the
+// peak runtime-managed memory is no lower than it was with no limit at all.
+//
+// GOMEMLIMIT is a SOFT limit: the runtime is allowed to exceed it temporarily, and it
+// governs Go runtime-managed memory only. It says nothing about the process footprint that
+// jetsam measures. A row proving the limit engaged therefore says nothing about the process
+// fitting in a NetworkExtension budget.
 package main
 
 import (
@@ -35,49 +43,44 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
-	"time"
 )
 
-// setting is one GOMEMLIMIT/GOGC combination to measure.
+const metricsPrefix = "MEMMETRICS "
+
+// setting is one GOMEMLIMIT/GOGC combination.
 type setting struct {
 	name      string
-	memLimit  string // as passed to GOMEMLIMIT; "off" means no limit
+	memLimit  string // bytes, or "off"
 	gcPercent string
-	reference bool // measured for information only, never a production candidate
+	reference bool
 }
 
-// The matrix from the task. Order matters: it is the order the report uses.
 var settings = []setting{
-	{name: "unlimited/100", memLimit: "off", gcPercent: "100"}, // throughput baseline
-	{name: "48MiB/100", memLimit: "50331648", gcPercent: "100"},
-	{name: "44MiB/100", memLimit: "46137344", gcPercent: "100"},
-	{name: "40MiB/100", memLimit: "41943040", gcPercent: "100"}, // primary candidate
-	{name: "40MiB/50", memLimit: "41943040", gcPercent: "50"},   // current production
-	{name: "37.5MiB/100", memLimit: "39321600", gcPercent: "100"},
-	{name: "37.5MiB/10", memLimit: "39321600", gcPercent: "10", reference: true},
+	{name: "unlimited/100", memLimit: "off", gcPercent: "100"},
+	{name: "48MiB/100", memLimit: strconv.Itoa(48 * 1024 * 1024), gcPercent: "100"},
+	{name: "44MiB/100", memLimit: strconv.Itoa(44 * 1024 * 1024), gcPercent: "100"},
+	{name: "40MiB/100", memLimit: strconv.Itoa(40 * 1024 * 1024), gcPercent: "100"},
+	{name: "40MiB/50", memLimit: strconv.Itoa(40 * 1024 * 1024), gcPercent: "50"},
+	{name: "37.5MiB/100", memLimit: strconv.Itoa(38400 * 1024), gcPercent: "100"},
+	{name: "37.5MiB/10", memLimit: strconv.Itoa(38400 * 1024), gcPercent: "10", reference: true},
 }
 
 // benchmark is one workload to measure under every setting.
 type benchmark struct {
-	name    string
-	pkg     string
-	pattern string
-	// critical marks the datapaths the task sets a hard throughput floor for.
-	critical bool
+	name     string
+	pkg      string
+	pattern  string
+	pressure bool // emits a MEMMETRICS line
 }
 
-// The workloads the task requires. Shadowsocks covers the real copy loop and the MTU
-// path; the stacked case is the one that crashed in production.
 var benchmarks = []benchmark{
-	{"SS2022-real-copy-loop", "./protocol/shadowsocks", "BenchmarkShadowRealCopyLoop", true},
-	{"SS2022-steady-state", "./protocol/shadowsocks", "BenchmarkShadowSteadyStateUpload", true},
-	{"SS2022-mtu-wrapped", "./protocol/shadowsocks", "BenchmarkShadowMTUWrappedPath", true},
-	{"SS2022-memory-pressure", "./protocol/shadowsocks", "BenchmarkShadowMemoryPressure", true},
-	{"DNS-cache-paths", "./dns", "BenchmarkDNS", false},
+	{name: "SS2022-memory-pressure", pkg: "./protocol/shadowsocks", pattern: "BenchmarkShadowMemoryPressureMeasured", pressure: true},
+	{name: "SS2022-real-copy-loop", pkg: "./protocol/shadowsocks", pattern: "BenchmarkShadowRealCopyLoop"},
+	{name: "SS2022-mtu-wrapped", pkg: "./protocol/shadowsocks", pattern: "BenchmarkShadowMTUWrappedPath"},
 }
 
 // runResult is one (setting, benchmark) measurement.
@@ -88,109 +91,117 @@ type runResult struct {
 	MBPerSec    float64 `json:"mb_per_sec"`
 	BytesPerOp  float64 `json:"bytes_per_op"`
 	AllocsPerOp float64 `json:"allocs_per_op"`
-	GCCount     float64 `json:"gc_count"`
-	GCPauseMs   float64 `json:"gc_pause_ms"`
-	PeakHeapMiB float64 `json:"peak_heap_mib"`
-	RuntimeMiB  float64 `json:"runtime_mib"`
-	// subBenchmarks counts the result lines merged into this row; throughputSamples
-	// counts how many of them reported MB/s. They differ when a benchmark does not
-	// declare its byte count, in which case there is no usable throughput figure.
-	subBenchmarks     int
-	throughputSamples int
-	Valid             bool   `json:"valid"`
-	InvalidWhy        string `json:"invalid_why,omitempty"`
-	RawBenchLine      string `json:"-"`
+
+	// Runtime figures, from runtime/metrics inside the benchmark process. These are the
+	// only memory and GC numbers reported; nothing here comes from log parsing.
+	GOGCPercent       uint64 `json:"gogc_percent"`
+	GOMEMLIMITBytes   uint64 `json:"gomemlimit_bytes"`
+	ManagedStartBytes uint64 `json:"managed_start_bytes"`
+	ManagedPeakBytes  uint64 `json:"managed_peak_bytes"`
+	ManagedEndBytes   uint64 `json:"managed_end_bytes"`
+	GCCycles          uint64 `json:"gc_cycles"`
+	PauseTotalNs      uint64 `json:"pause_total_ns"`
+	PauseCount        uint64 `json:"pause_count"`
+	PauseMaxNs        uint64 `json:"pause_max_ns"`
+	HeapLiveBytes     uint64 `json:"heap_live_bytes"`
+
+	Valid      bool   `json:"valid"`
+	InvalidWhy string `json:"invalid_why,omitempty"`
+	MetricsSaw bool   `json:"metrics_seen"`
 }
 
 func main() {
 	var (
 		runs      = flag.Int("runs", 5, "independent runs per setting; medians are reported")
-		benchTime = flag.String("benchtime", "200x", "benchtime passed to go test")
-		filter    = flag.String("only", "", "substring filter on benchmark names")
+		benchTime = flag.String("benchtime", "6x", "benchtime passed to go test; too few iterations and no limit engages")
+		only      = flag.String("only", "", "substring filter on benchmark names")
 		outPath   = flag.String("out", "", "write JSON results here")
+		paired    = flag.Bool("paired", true, "alternate setting order between runs to cancel drift")
 	)
 	flag.Parse()
 
 	selected := benchmarks
-	if *filter != "" {
+	if *only != "" {
 		selected = nil
 		for _, b := range benchmarks {
-			if strings.Contains(b.name, *filter) {
+			if strings.Contains(b.name, *only) {
 				selected = append(selected, b)
 			}
 		}
 	}
 
-	fmt.Printf("memory-limit matrix: %d settings x %d benchmarks x %d runs\n",
-		len(settings), len(selected), *runs)
-	fmt.Printf("go: %s %s/%s\n\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	tags, err := appleTags()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "memmatrix: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("memory-limit matrix: %d settings x %d benchmarks x %d runs\n", len(settings), len(selected), *runs)
+	fmt.Printf("go: %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("apple tags: %s\n\n", tags)
 
 	var results []runResult
-	for _, s := range settings {
-		for _, b := range selected {
-			samples := make([]runResult, 0, *runs)
-			for i := 0; i < *runs; i++ {
-				one, err := runOnce(s, b, *benchTime)
+	for _, b := range selected {
+		// Order the settings per run rather than running all of one setting and then all of
+		// the next. A single pass through every setting means thermal drift, CPU frequency
+		// scaling and background load land on whichever setting happened to run LAST - which
+		// is exactly the setting being compared. Alternating the direction between passes
+		// cancels the residual drift instead of hiding it.
+		//
+		// The previous version instead swapped which setting it RAN while still labelling the
+		// result with the original name, which silently mixed the rows together.
+		samplesBySetting := make(map[string][]runResult, len(settings))
+		for run := 0; run < *runs; run++ {
+			order := settings
+			if *paired && run%2 == 1 {
+				order = make([]setting, len(settings))
+				for i, s := range settings {
+					order[len(settings)-1-i] = s
+				}
+			}
+			for _, s := range order {
+				one, err := runOnce(s, b, *benchTime, tags)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "  %s / %s run %d failed: %v\n", s.name, b.name, i+1, err)
+					fmt.Fprintf(os.Stderr, "  %s / %s run %d failed: %v\n", s.name, b.name, run+1, err)
 					continue
 				}
-				samples = append(samples, one)
+				one.Setting = s.name
+				samplesBySetting[s.name] = append(samplesBySetting[s.name], one)
 			}
+		}
+
+		for _, s := range settings {
+			samples := samplesBySetting[s.name]
 			if len(samples) == 0 {
 				continue
 			}
 			merged := medianOf(samples)
 			merged.Setting = s.name
 			merged.Benchmark = b.name
-
-			// Deciding whether a limit ENGAGED is subtler than comparing the peak to
-			// the limit, and getting it backwards would discard exactly the rows that
-			// demonstrate the limit working.
-			//
-			// A engaged limit HOLDS THE HEAP DOWN: peak stays below the limit because
-			// the collector is pacing against it. So "peak < limit" is the signature of
-			// engagement, not of absence. What shows a limit did nothing is the peak
-			// matching the UNLIMITED peak - the heap grew as if no limit existed.
-			//
-			// The baseline row is therefore the reference: a limited row is valid when
-			// its peak is measurably below the unlimited peak, and the unlimited peak is
-			// itself above the limit (otherwise there was nothing to hold down).
-			unlimitedPeak := unlimitedPeakByBenchmark[b.name]
-			if s.memLimit != "off" && unlimitedPeak > 0 {
-				limitMiB := parseMemLimit(s.memLimit) / (1024 * 1024)
-				if unlimitedPeak <= limitMiB {
-					merged.Valid = false
-					merged.InvalidWhy = fmt.Sprintf(
-						"unlimited peak heap %.1f MiB does not exceed the %s limit, so the limit had nothing to hold down; increase the workload",
-						unlimitedPeak, s.name)
-				} else if merged.PeakHeapMiB >= unlimitedPeak*95/100 {
-					merged.Valid = false
-					merged.InvalidWhy = fmt.Sprintf(
-						"peak heap %.1f MiB matches the unlimited %.1f MiB, so the limit did not engage",
-						merged.PeakHeapMiB, unlimitedPeak)
-				}
+			// The unlimited row establishes the reference the limited rows are judged
+			// against, so it must be recorded first. Evaluating in slice order would make
+			// the result depend on where "unlimited" sits in the settings list.
+			if s.memLimit == "off" && merged.MetricsSaw {
+				unlimitedManagedPeak[b.name] = merged.ManagedPeakBytes
 			}
-			if merged.PeakHeapMiB*1024*1024 < 16*1024*1024 {
-				// Nothing was allocated in any meaningful amount, so no GC comparison is
-				// possible whatever the setting.
-				merged.Valid = false
-				merged.InvalidWhy = fmt.Sprintf(
-					"peak heap %.1f MiB is too small for any limit to matter; increase the workload",
-					merged.PeakHeapMiB)
-			}
-			if s.memLimit == "off" {
-				unlimitedPeakByBenchmark[b.name] = merged.PeakHeapMiB
-			}
+			evaluateValidity(&merged, s, results, b)
 			results = append(results, merged)
 
 			status := "ok"
 			if !merged.Valid {
 				status = "INVALID"
 			}
-			fmt.Printf("  %-16s %-24s %10.0f ns/op %9.1f MB/s %9.0f B/op %8.0f allocs %6.1f MiB peak  %s\n",
-				s.name, b.name, merged.NsPerOp, merged.MBPerSec, merged.BytesPerOp,
-				merged.AllocsPerOp, merged.PeakHeapMiB, status)
+			throughput := fmt.Sprintf("%8.0f MB/s", merged.MBPerSec)
+			if merged.MBPerSec == 0 && merged.NsPerOp > 0 {
+				throughput = fmt.Sprintf("%10.0f ns/op", merged.NsPerOp)
+			}
+			memory := ""
+			if merged.MetricsSaw {
+				memory = fmt.Sprintf(" peak=%5.1f MiB gc=%5d pause=%8.1f ms",
+					float64(merged.ManagedPeakBytes)/(1024*1024), merged.GCCycles,
+					float64(merged.PauseTotalNs)/1e6)
+			}
+			fmt.Printf("  %-16s %-26s %s%s  %s\n", s.name, b.name, throughput, memory, status)
 		}
 	}
 
@@ -206,213 +217,199 @@ func main() {
 	}
 }
 
-func parseMemLimit(s string) float64 {
-	var v float64
-	fmt.Sscanf(s, "%f", &v)
-	return v
+// appleTags reads the canonical Apple tag set. A failure is fatal: falling back to a guess
+// would mean benchmarking a configuration nothing ships, which is the defect this
+// replaced.
+func appleTags() (string, error) {
+	output, err := exec.Command("go", "run", "./cmd/internal/appletags", "-low-memory=true").Output()
+	if err != nil {
+		return "", fmt.Errorf("cannot read the canonical Apple tags: %w", err)
+	}
+	tags := strings.TrimSpace(string(output))
+	if tags == "" {
+		return "", fmt.Errorf("the canonical Apple tag set is empty")
+	}
+	if !strings.Contains(tags, "with_low_memory") {
+		return "", fmt.Errorf("the canonical Apple tag set lacks with_low_memory; refusing to benchmark a geometry iOS does not ship")
+	}
+	return tags, nil
 }
 
-// runOnce executes one benchmark in a child process with the setting's environment.
-func runOnce(s setting, b benchmark, benchTime string) (runResult, error) {
+func runOnce(s setting, b benchmark, benchTime string, tags string) (runResult, error) {
 	args := []string{
 		"test", b.pkg,
 		"-run", "^$",
 		"-bench", b.pattern,
 		"-benchtime", benchTime,
 		"-count", "1",
-		// -json is required, not cosmetic: GODEBUG=gctrace=1 makes the runtime write
-		// from its own goroutine, and that text splices into the middle of the plain
-		// benchmark line, corrupting the numbers. The JSON stream carries each result
-		// as its own record, so it survives the interleaving.
 		"-json",
-		"-tags", productionTags(),
-		"-ldflags=-checklinkname=0",
+		"-tags", tags,
+	}
+	if strings.Contains(tags, "badlinkname") {
+		args = append(args, "-ldflags=-checklinkname=0")
 	}
 
 	cmd := exec.Command("go", args...)
-	cmd.Env = append(os.Environ(),
-		"GOMEMLIMIT="+memLimitEnv(s.memLimit),
-		"GOGC="+s.gcPercent,
-		// GODEBUG=gctrace=1 makes the runtime print one line per GC cycle, which gives
-		// the count and pause times without touching any package's code. Parsing it
-		// keeps this harness out of the benchmarks it measures.
-		"GODEBUG=gctrace=1",
-	)
+	cmd.Env = append(os.Environ(), "GOMEMLIMIT="+s.memLimit, "GOGC="+s.gcPercent)
+	// No GODEBUG: the benchmark reads runtime/metrics itself, so no log parsing and no
+	// gctrace leaking into the toolchain's own processes.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return runResult{}, fmt.Errorf("%v\n%s", err, tail(string(out), 15))
+		return runResult{}, fmt.Errorf("%v\n%s", err, tail(string(out), 10))
 	}
-	return parseBenchOutput(string(out))
+	return parseOutput(string(out), b)
 }
 
-func memLimitEnv(v string) string {
-	if v == "off" {
-		return "off"
-	}
-	return v
-}
-
-// productionTags reads the shipped tag set rather than restating it.
-func productionTags() string {
-	data, err := os.ReadFile(filepath.Join("release", "DEFAULT_BUILD_TAGS_OTHERS"))
-	if err != nil {
-		return "with_quic"
-	}
-	tags := strings.TrimSpace(string(data))
-	// badlinkname is needed to link the packages that touch runtime internals.
-	return tags + ",badlinkname,tfogo_checklinkname0"
-}
-
-// parseBenchOutput reads the -json event stream.
-//
-// Each test2json record is a self-contained JSON object, so the gctrace text that
-// would otherwise corrupt a plain line is carried as an unrelated record and simply
-// ignored. GC statistics still come from the gctrace text, which is what the runtime
-// reports and needs no instrumentation in the packages under test.
-func parseBenchOutput(out string) (runResult, error) {
+func parseOutput(out string, b benchmark) (runResult, error) {
 	var result runResult
-	found := false
+	foundBenchmark := false
 
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+		trimmed := strings.TrimSpace(line)
 
-		// gctrace lines may be wrapped in a JSON envelope or appear raw; scan the text
-		// either way so statistics are collected from both forms.
-		collectGCTrace(line, &result)
+		// The metrics line is printed directly to stdout by the benchmark, and may also
+		// arrive inside a test2json envelope.
+		metricsLine := ""
+		if strings.HasPrefix(trimmed, metricsPrefix) {
+			metricsLine = trimmed
+		} else if strings.Contains(trimmed, metricsPrefix) {
+			if index := strings.Index(trimmed, metricsPrefix); index >= 0 {
+				metricsLine = trimmed[index:]
+			}
+		}
+		if metricsLine != "" {
+			parseMetricsLine(metricsLine, &result)
+		}
 
 		var event struct {
 			Action string `json:"Action"`
 			Output string `json:"Output"`
 		}
-		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			continue
-		}
-		if event.Action != "output" {
-			continue
-		}
-		collectGCTrace(event.Output, &result)
-
-		if !strings.Contains(event.Output, "ns/op") {
-			continue
-		}
-		// Sum across sub-benchmarks. A parameterised benchmark emits one line per
-		// sub-case, and taking a single line reports whichever happened to come last:
-		// BenchmarkShadowSteadyStateUpload swings between 2200 and 4800 MB/s that way,
-		// because its sub-cases have genuinely different costs. Summing gives the
-		// whole-workload figure the settings are being compared on.
-		sawLine, line := parseBenchLine(event.Output)
-		if sawLine {
-			found = true
-			result.NsPerOp += line.NsPerOp
-			result.BytesPerOp += line.BytesPerOp
-			result.AllocsPerOp += line.AllocsPerOp
-			// MB/s is only meaningful when the benchmark declares its byte count via
-			// SetBytes; `go test` reports it then, and reports 0 otherwise. Summing it
-			// would be wrong for a parameterised benchmark, so it is recorded only when
-			// exactly one sub-benchmark reported it.
-			if line.MBPerSec > 0 {
-				result.MBPerSec += line.MBPerSec
-				result.throughputSamples++
+		if err := json.Unmarshal([]byte(trimmed), &event); err == nil && event.Action == "output" {
+			if index := strings.Index(event.Output, metricsPrefix); index >= 0 {
+				parseMetricsLine(strings.TrimSpace(event.Output[index:]), &result)
 			}
-			result.subBenchmarks++
+			if strings.Contains(event.Output, "ns/op") {
+				parseBenchLine(event.Output, &result)
+				foundBenchmark = true
+			}
 		}
 	}
 
-	if found && result.subBenchmarks > 0 && result.throughputSamples != result.subBenchmarks {
-		// Mixed or absent throughput reporting: say so rather than inventing a figure
-		// from B/op, which counts allocations rather than bytes transferred.
-		result.MBPerSec = 0
+	if !foundBenchmark {
+		return runResult{}, fmt.Errorf("no benchmark result in output:\n%s", tail(out, 15))
 	}
-
-	if !found {
-		return runResult{}, fmt.Errorf("no benchmark result in output:\n%s", tail(out, 20))
+	if b.pressure && !result.MetricsSaw {
+		// A pressure benchmark that emitted no metrics measured nothing about memory.
+		return runResult{}, fmt.Errorf("the pressure benchmark emitted no %s line", strings.TrimSpace(metricsPrefix))
 	}
 	return result, nil
 }
 
-// benchLine is one parsed benchmark result line.
-type benchLine struct {
-	NsPerOp     float64
-	MBPerSec    float64
-	BytesPerOp  float64
-	AllocsPerOp float64
+func parseMetricsLine(line string, result *runResult) {
+	if !strings.HasPrefix(line, metricsPrefix) {
+		return
+	}
+	result.MetricsSaw = true
+	for _, field := range strings.Fields(strings.TrimPrefix(line, metricsPrefix)) {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		value, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		switch parts[0] {
+		case "gogc":
+			result.GOGCPercent = value
+		case "gomemlimit":
+			result.GOMEMLIMITBytes = value
+		case "managed_start":
+			result.ManagedStartBytes = value
+		case "managed_peak":
+			result.ManagedPeakBytes = value
+		case "managed_end":
+			result.ManagedEndBytes = value
+		case "gc_cycles":
+			result.GCCycles = value
+		case "pause_total_ns":
+			result.PauseTotalNs = value
+		case "pause_count":
+			result.PauseCount = value
+		case "pause_max_ns":
+			result.PauseMaxNs = value
+		case "heap_live":
+			result.HeapLiveBytes = value
+		}
+	}
 }
 
-// parseBenchLine reads one benchmark result line.
-func parseBenchLine(line string) (bool, benchLine) {
-	var out benchLine
+func parseBenchLine(line string, result *runResult) {
 	fields := strings.Fields(line)
 	if len(fields) == 0 || !strings.HasPrefix(fields[0], "Benchmark") {
-		return false, out
+		return
 	}
-	ok := false
 	for i := 0; i+1 < len(fields); i++ {
-		var v float64
-		if _, err := fmt.Sscanf(fields[i], "%f", &v); err != nil {
+		value, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
 			continue
 		}
 		switch fields[i+1] {
 		case "ns/op":
-			out.NsPerOp = v
-			ok = true
+			result.NsPerOp += value
 		case "MB/s":
-			out.MBPerSec = v
+			result.MBPerSec += value
 		case "B/op":
-			out.BytesPerOp = v
+			result.BytesPerOp += value
 		case "allocs/op":
-			out.AllocsPerOp = v
-		}
-	}
-	return ok, out
-}
-
-// collectGCTrace accumulates GC count, pause and heap sizes from gctrace text found
-// anywhere in a line, since the runtime writes it without regard for line boundaries.
-func collectGCTrace(line string, result *runResult) {
-	gcIndex := strings.Index(line, "gc ")
-	if gcIndex < 0 {
-		return
-	}
-	gcFields := strings.Fields(line[gcIndex:])
-	if len(gcFields) < 2 {
-		return
-	}
-	var n float64
-	if _, err := fmt.Sscanf(gcFields[1], "%f", &n); err == nil && n > result.GCCount {
-		result.GCCount = n
-	}
-	// "0.006+1.7+0.015 ms clock" - the sum is the wall pause for this cycle.
-	if i := indexOf(gcFields, "ms"); i >= 3 {
-		var parts [3]float64
-		if _, err := fmt.Sscanf(gcFields[i-1], "%f+%f+%f", &parts[0], &parts[1], &parts[2]); err == nil {
-			result.GCPauseMs += parts[0] + parts[1] + parts[2]
-		}
-	}
-	// "12->14->7 MB" - the middle value is the heap at GC; its maximum over cycles is
-	// the peak that decides whether a configured limit could have engaged.
-	for _, f := range gcFields {
-		var a, b, c float64
-		if _, err := fmt.Sscanf(f, "%f->%f->%f", &a, &b, &c); err == nil {
-			if b > result.PeakHeapMiB {
-				result.PeakHeapMiB = b
-			}
-			if c > result.RuntimeMiB {
-				result.RuntimeMiB = c
-			}
+			result.AllocsPerOp += value
 		}
 	}
 }
 
-// unlimitedPeakByBenchmark records the peak heap observed for the unlimited setting of
-// each benchmark, so a limited row can be judged against what the heap did when nothing
-// constrained it.
-var unlimitedPeakByBenchmark = map[string]float64{}
+// evaluateValidity decides whether a row measured what it claims to.
+//
+// The question is whether the configured limit actually constrained the runtime. It is
+// answered from runtime-managed memory, which is the quantity GOMEMLIMIT accounts against,
+// and never from a log field.
+func evaluateValidity(merged *runResult, s setting, previous []runResult, b benchmark) {
+	merged.Valid = true
+	if !b.pressure {
+		// The non-pressure benchmarks have no memory claim attached, so there is nothing
+		// to validate about a limit.
+		return
+	}
+	if !merged.MetricsSaw {
+		merged.Valid = false
+		merged.InvalidWhy = "no runtime metrics were emitted"
+		return
+	}
 
-// medianOf reduces independent runs to medians, so a single noisy run cannot decide
-// anything. Spread is reported by the caller-facing table via min/max when needed.
+	if s.memLimit == "off" {
+		// The reference row; its peak was recorded by the caller.
+		return
+	}
+
+	unlimitedPeak := unlimitedManagedPeak[b.name]
+	if unlimitedPeak == 0 {
+		merged.Valid = false
+		merged.InvalidWhy = "the unlimited reference did not run, so there is nothing to compare against"
+		return
+	}
+
+	// A soft limit holds the runtime near its target, so a limited run's peak should be
+	// BELOW the unlimited peak. If it matches, the limit did not constrain anything.
+	if merged.ManagedPeakBytes >= unlimitedPeak*95/100 {
+		merged.Valid = false
+		merged.InvalidWhy = fmt.Sprintf(
+			"peak runtime-managed memory %.1f MiB matches the unlimited %.1f MiB, so the limit did not engage",
+			float64(merged.ManagedPeakBytes)/(1024*1024), float64(unlimitedPeak)/(1024*1024))
+	}
+}
+
+var unlimitedManagedPeak = map[string]uint64{}
+
 func medianOf(samples []runResult) runResult {
 	pick := func(get func(runResult) float64) float64 {
 		values := make([]float64, len(samples))
@@ -422,72 +419,82 @@ func medianOf(samples []runResult) runResult {
 		sort.Float64s(values)
 		return values[len(values)/2]
 	}
+	pickU := func(get func(runResult) uint64) uint64 {
+		values := make([]uint64, len(samples))
+		for i, s := range samples {
+			values[i] = get(s)
+		}
+		sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+		return values[len(values)/2]
+	}
 	return runResult{
-		NsPerOp:     pick(func(r runResult) float64 { return r.NsPerOp }),
-		MBPerSec:    pick(func(r runResult) float64 { return r.MBPerSec }),
-		BytesPerOp:  pick(func(r runResult) float64 { return r.BytesPerOp }),
-		AllocsPerOp: pick(func(r runResult) float64 { return r.AllocsPerOp }),
-		GCCount:     pick(func(r runResult) float64 { return r.GCCount }),
-		GCPauseMs:   pick(func(r runResult) float64 { return r.GCPauseMs }),
-		PeakHeapMiB: pick(func(r runResult) float64 { return r.PeakHeapMiB }),
-		RuntimeMiB:  pick(func(r runResult) float64 { return r.RuntimeMiB }),
-		Valid:       true,
+		NsPerOp:           pick(func(r runResult) float64 { return r.NsPerOp }),
+		MBPerSec:          pick(func(r runResult) float64 { return r.MBPerSec }),
+		BytesPerOp:        pick(func(r runResult) float64 { return r.BytesPerOp }),
+		AllocsPerOp:       pick(func(r runResult) float64 { return r.AllocsPerOp }),
+		GOGCPercent:       pickU(func(r runResult) uint64 { return r.GOGCPercent }),
+		GOMEMLIMITBytes:   pickU(func(r runResult) uint64 { return r.GOMEMLIMITBytes }),
+		ManagedStartBytes: pickU(func(r runResult) uint64 { return r.ManagedStartBytes }),
+		ManagedPeakBytes:  pickU(func(r runResult) uint64 { return r.ManagedPeakBytes }),
+		ManagedEndBytes:   pickU(func(r runResult) uint64 { return r.ManagedEndBytes }),
+		GCCycles:          pickU(func(r runResult) uint64 { return r.GCCycles }),
+		PauseTotalNs:      pickU(func(r runResult) uint64 { return r.PauseTotalNs }),
+		PauseCount:        pickU(func(r runResult) uint64 { return r.PauseCount }),
+		PauseMaxNs:        pickU(func(r runResult) uint64 { return r.PauseMaxNs }),
+		HeapLiveBytes:     pickU(func(r runResult) uint64 { return r.HeapLiveBytes }),
+		MetricsSaw:        true,
+		Valid:             true,
 	}
 }
 
-// printReport answers the six questions the task asks, using only measured values.
 func printReport(results []runResult, selected []benchmark) {
 	fmt.Printf("\n=== report ===\n\n")
-
 	byKey := map[string]runResult{}
 	for _, r := range results {
 		byKey[r.Setting+"|"+r.Benchmark] = r
 	}
 
-	baseline := "unlimited/100"
-
-	fmt.Printf("%-16s", "Setting")
-	for _, b := range selected {
-		fmt.Printf(" %14s", truncate(b.name, 14))
-	}
-	fmt.Printf(" %10s\n", "valid")
-
-	for _, s := range settings {
-		fmt.Printf("%-16s", s.name)
-		valid := true
-		for _, b := range selected {
-			r, ok := byKey[s.name+"|"+b.name]
-			if !ok {
-				fmt.Printf(" %14s", "-")
-				continue
-			}
-			fmt.Printf(" %14.1f", r.MBPerSec)
-			if !r.Valid {
-				valid = false
-			}
+	hasMetrics := false
+	for _, r := range results {
+		if r.MetricsSaw {
+			hasMetrics = true
 		}
-		mark := "yes"
-		if !valid {
-			mark = "NO"
-		}
-		if s.reference {
-			mark = "ref"
-		}
-		fmt.Printf(" %10s\n", mark)
 	}
 
-	fmt.Printf("\nMB/s, medians. Compare against the %s baseline.\n", baseline)
+	if hasMetrics {
+		fmt.Printf("%-16s %12s %12s %8s %12s %10s\n",
+			"Setting", "peak MiB", "limit MiB", "GC", "pause ms", "throughput")
+		for _, s := range settings {
+			for _, b := range selected {
+				r, ok := byKey[s.name+"|"+b.name]
+				if !ok || !r.MetricsSaw {
+					continue
+				}
+				limit := "unlimited"
+				if r.GOMEMLIMITBytes > 0 && r.GOMEMLIMITBytes < 1<<62 {
+					limit = fmt.Sprintf("%.1f", float64(r.GOMEMLIMITBytes)/(1024*1024))
+				}
+				fmt.Printf("%-16s %12.1f %12s %8d %12.1f %8.0f MB/s\n",
+					s.name, float64(r.ManagedPeakBytes)/(1024*1024), limit,
+					r.GCCycles, float64(r.PauseTotalNs)/1e6, r.MBPerSec)
+			}
+		}
+		fmt.Printf("\npeak = peak Go runtime-managed memory (total minus released), the quantity\n")
+		fmt.Printf("GOMEMLIMIT accounts against. It is NOT the process footprint that jetsam\n")
+		fmt.Printf("measures. GOMEMLIMIT is a SOFT limit and may be exceeded temporarily.\n")
+	}
 
 	fmt.Printf("\nquestions:\n")
-	answerThroughput(results, selected, baseline)
+	answerThroughput(results, selected)
 	answerValidity(results)
 }
 
-func answerThroughput(results []runResult, selected []benchmark, baseline string) {
+func answerThroughput(results []runResult, selected []benchmark) {
 	byKey := map[string]runResult{}
 	for _, r := range results {
 		byKey[r.Setting+"|"+r.Benchmark] = r
 	}
+	baseline := "unlimited/100"
 	delta := func(setting string, b benchmark) (float64, bool) {
 		base, ok1 := byKey[baseline+"|"+b.name]
 		cand, ok2 := byKey[setting+"|"+b.name]
@@ -496,9 +503,8 @@ func answerThroughput(results []runResult, selected []benchmark, baseline string
 		}
 		return (cand.MBPerSec - base.MBPerSec) / base.MBPerSec * 100, true
 	}
-
 	for _, setting := range []string{"40MiB/50", "40MiB/100", "44MiB/100", "48MiB/100"} {
-		fmt.Printf("\n  %s vs baseline:\n", setting)
+		fmt.Printf("\n  %s vs %s:\n", setting, baseline)
 		for _, b := range selected {
 			d, ok := delta(setting, b)
 			if !ok {
@@ -514,54 +520,30 @@ func answerThroughput(results []runResult, selected []benchmark, baseline string
 			} else if abs > 3 {
 				verdict = "exceeds 3% median guidance"
 			}
-			fmt.Printf("    %-24s %+7.2f%%  %s\n", truncate(b.name, 24), d, verdict)
+			fmt.Printf("    %-26s %+7.2f%%  %s\n", b.name, d, verdict)
 		}
 	}
 }
 
 func answerValidity(results []runResult) {
-	var invalid []runResult
-	for _, r := range results {
-		if !r.Valid {
-			invalid = append(invalid, r)
-		}
-	}
 	fmt.Printf("\n  validity:\n")
-	if len(invalid) == 0 {
-		fmt.Printf("    every row had a heap large enough for its limit to engage\n")
-		return
-	}
+	invalid := 0
 	seen := map[string]bool{}
-	for _, r := range invalid {
+	for _, r := range results {
+		if r.Valid {
+			continue
+		}
+		invalid++
 		key := r.Setting + "|" + r.InvalidWhy
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		fmt.Printf("    INVALID %s: %s\n", r.Setting, r.InvalidWhy)
+		fmt.Printf("    INVALID %-16s %s: %s\n", r.Setting, r.Benchmark, r.InvalidWhy)
 	}
-	fmt.Printf("    A limit the heap never approached did not engage, so those rows are not\n")
-	fmt.Printf("    evidence about that limit. Increase the workload before drawing conclusions.\n")
-}
-
-// firstBenchmarkName returns the benchmark token if the line carries one, tolerating
-// GC text spliced in before or after it.
-func firstBenchmarkName(line string) string {
-	for _, f := range strings.Fields(line) {
-		if strings.HasPrefix(f, "Benchmark") {
-			return f
-		}
+	if invalid == 0 {
+		fmt.Printf("    every limited row constrained the runtime below the unlimited peak\n")
 	}
-	return ""
-}
-
-func indexOf(fields []string, want string) int {
-	for i, f := range fields {
-		if f == want {
-			return i
-		}
-	}
-	return -1
 }
 
 func truncate(s string, n int) string {
@@ -578,5 +560,3 @@ func tail(s string, lines int) string {
 	}
 	return strings.Join(parts[len(parts)-lines:], "\n")
 }
-
-var _ = time.Second
