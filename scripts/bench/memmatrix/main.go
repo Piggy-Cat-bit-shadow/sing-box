@@ -158,6 +158,13 @@ func main() {
 	fmt.Printf("apple tags: %s\n\n", tags)
 
 	var results []runResult
+	// rawSamples preserves every individual run, not just the merged median.
+	//
+	// A median alone cannot show the spread, and a claim like "no more than 3% regression"
+	// needs the individual runs to be checkable rather than taken on trust. The previous
+	// version wrote only the medians, so the raw evidence for a release decision was discarded
+	// the moment the process exited.
+	var rawSamples []runResult
 	for _, b := range selected {
 		// Order the settings per run rather than running all of one setting and then all of
 		// the next. A single pass through every setting means thermal drift, CPU frequency
@@ -183,7 +190,9 @@ func main() {
 					continue
 				}
 				one.Setting = s.name
+				one.Benchmark = b.name
 				samplesBySetting[s.name] = append(samplesBySetting[s.name], one)
+				rawSamples = append(rawSamples, one)
 			}
 		}
 
@@ -225,7 +234,16 @@ func main() {
 	printReport(results, selected)
 
 	if *outPath != "" {
-		data, _ := json.MarshalIndent(results, "", "  ")
+		// The medians stay at the top level so existing consumers keep working; the raw runs
+		// are added alongside them under a clearly separate key.
+		document := struct {
+			Merged []runResult `json:"merged"`
+			Runs   []runResult `json:"runs"`
+		}{
+			Merged: results,
+			Runs:   rawSamples,
+		}
+		data, _ := json.MarshalIndent(document, "", "  ")
 		if err := os.WriteFile(*outPath, data, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "write %s: %v\n", *outPath, err)
 		} else {
@@ -246,8 +264,21 @@ func appleTags() (string, error) {
 	if tags == "" {
 		return "", fmt.Errorf("the canonical Apple tag set is empty")
 	}
-	if !strings.Contains(tags, "with_low_memory") {
-		return "", fmt.Errorf("the canonical Apple tag set lacks with_low_memory; refusing to benchmark a geometry iOS does not ship")
+	// The mobile-only tag set is read from the SAME command, so this benchmark never
+	// hard-codes a tag name. A literal here could silently keep checking for a tag that no
+	// longer exists, which is how the low-memory gate itself once passed while checking
+	// nothing.
+	mobileOnly, err := exec.Command("go", "run", "./cmd/internal/appletags", "-mobile-only").Output()
+	if err != nil {
+		return "", fmt.Errorf("cannot read the mobile-only Apple tags: %w", err)
+	}
+	lowMemoryTag := strings.TrimSpace(string(mobileOnly))
+	if lowMemoryTag == "" {
+		return "", fmt.Errorf("the mobile-only Apple tag set is empty")
+	}
+	if !strings.Contains(tags, lowMemoryTag) {
+		return "", fmt.Errorf("the canonical Apple tag set lacks %s; refusing to benchmark a "+
+			"geometry iOS does not ship", lowMemoryTag)
 	}
 	return tags, nil
 }

@@ -1,0 +1,217 @@
+{
+  "description": "Focused GOGC comparison under a 40 MiB GOMEMLIMIT (the canonical NetworkExtension policy's armed threshold): GOGC 50 vs GOGC 100.",
+  "method": {
+    "pairs": 10,
+    "alternating": true,
+    "benchtime": "6x",
+    "note": "Each setting runs in a fresh process because GOMEMLIMIT and GOGC are read at start-up. The harness alternates setting order between runs so thermal drift and CPU frequency scaling cannot land on one setting."
+  },
+  "metric_meanings": {
+    "pause_total_ns_exact": "Delta of runtime.MemStats.PauseTotalNs, an exact integer nanosecond counter. NOT a histogram bucket estimate.",
+    "pause_max_upper_bound_ns": "Largest histogram bucket UPPER BOUND among pauses in this run, with the start histogram subtracted. An upper bound, not a measured maximum.",
+    "continuous_runtime_managed_peak_bytes": "Peak of /memory/classes/total:bytes minus /memory/classes/heap/released:bytes, sampled every 1 ms for the whole workload rather than only at workload boundaries.",
+    "gomemlimit_is_soft": "GOMEMLIMIT is a soft limit and may be exceeded temporarily. Overshoot is recorded below rather than denied."
+  },
+  "benchmarks": {
+    "SS2022-memory-pressure": {
+      "gogc_50": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 5632.37,
+          "min": 0,
+          "max": 5705.87
+        },
+        "gc_cycles": {
+          "median": 27.5,
+          "min": 21,
+          "max": 35
+        },
+        "pause_total_ns_exact": {
+          "median": 942021.5,
+          "min": 707290,
+          "max": 1656747
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 114688.0,
+          "min": 28672,
+          "max": 196608
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 39459080.0,
+          "min": 34244872,
+          "max": 40298760
+        },
+        "gomemlimit_bytes": 41943040.0
+      },
+      "gogc_100": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 5750.705,
+          "min": 0,
+          "max": 5791.08
+        },
+        "gc_cycles": {
+          "median": 13.0,
+          "min": 12,
+          "max": 16
+        },
+        "pause_total_ns_exact": {
+          "median": 430707.5,
+          "min": 400248,
+          "max": 604540
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 40960.0,
+          "min": 28672,
+          "max": 196608
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 40589576.0,
+          "min": 40503560,
+          "max": 41101576
+        },
+        "gomemlimit_bytes": 41943040.0
+      },
+      "throughput_delta_pct": 2.100980581886489
+    },
+    "SS2022-real-copy-loop": {
+      "gogc_50": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 5420.2,
+          "min": 5293.77,
+          "max": 5487.01
+        },
+        "gc_cycles": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_total_ns_exact": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "gomemlimit_bytes": 0.0
+      },
+      "gogc_100": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 5420.08,
+          "min": 5168.23,
+          "max": 5656.299999999999
+        },
+        "gc_cycles": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_total_ns_exact": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "gomemlimit_bytes": 0.0
+      },
+      "throughput_delta_pct": -0.0022139404450000157
+    },
+    "SS2022-mtu-wrapped": {
+      "gogc_50": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 1029.12,
+          "min": 1006.28,
+          "max": 1064.45
+        },
+        "gc_cycles": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_total_ns_exact": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "gomemlimit_bytes": 0.0
+      },
+      "gogc_100": {
+        "runs": 10,
+        "throughput_mb_per_sec": {
+          "median": 1051.385,
+          "min": 1006.83,
+          "max": 1063.62
+        },
+        "gc_cycles": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_total_ns_exact": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "pause_max_upper_bound_ns": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "continuous_runtime_managed_peak_bytes": {
+          "median": 0.0,
+          "min": 0,
+          "max": 0
+        },
+        "gomemlimit_bytes": 0.0
+      },
+      "throughput_delta_pct": 2.163498911691552
+    }
+  },
+  "primary_comparison": {
+    "benchmark": "SS2022-memory-pressure",
+    "throughput_delta_pct": 2.100980581886489,
+    "gc_cycles_reduction_pct": 52.72727272727272,
+    "exact_pause_total_reduction_pct": 54.278378996657715,
+    "gomemlimit_overshoot_bytes": {
+      "gogc_50_max": -1644280.0,
+      "gogc_100_max": -841464.0
+    }
+  },
+  "verdict": {
+    "worst_throughput_delta_pct_across_all_benchmarks": -0.0022139404450000157,
+    "systematic_regression_over_3pct": false,
+    "gc_cycles_lower_at_100": true,
+    "keep_gogc_100": true,
+    "reason": "No benchmark regressed beyond 3%; GOGC 100 more than halved GC cycles and the exact pause total. The previous decision to keep GOGC 100 stands on this data."
+  }
+}
