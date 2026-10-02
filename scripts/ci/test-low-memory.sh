@@ -91,7 +91,17 @@ packages=(
   ./transport/masque       # datagram sizing
   ./route                  # splice eligibility and the UDP copy path
   ./dns/...                # response sizing
-  ./common/...             # shared buffering helpers
+
+  # Only the common packages that actually touch buffer geometry, not ./common/... .
+  # The wildcard pulled in common/netns, whose TestUnshareNamespace needs CAP_SYS_ADMIN
+  # and fails in a CI container for reasons unrelated to buffer sizes - it has nothing
+  # to do with buf.BufferSize in the first place. Discovered by the gate failing in CI
+  # on exactly that package.
+  ./common/badtls
+  ./common/ktls
+  ./common/listener
+  ./common/tls
+
   ./service/oomkiller      # the Apple memory policy itself
   ./experimental/libbox    # applies that policy
 )
