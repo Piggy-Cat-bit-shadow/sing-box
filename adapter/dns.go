@@ -13,6 +13,41 @@ import (
 	"github.com/miekg/dns"
 )
 
+// DNSFamilyResult is one address family's outcome from a dual-stack lookup.
+type DNSFamilyResult struct {
+	// IPv6 reports which family this result is for.
+	IPv6 bool
+	// Addresses are the usable addresses for this family, empty when none were returned.
+	Addresses []netip.Addr
+	// Err is the lookup error, if any. A nil error with no addresses means the family
+	// answered with nothing usable, which is not a failure of the other family.
+	Err error
+}
+
+// DNSDualStackRouter is an OPTIONAL capability for resolving both families incrementally.
+//
+// # Why optional
+//
+// The connection path needs each family's addresses as they arrive, so a late family can join
+// a race already in progress. The complete-lookup contract Lookup provides cannot express
+// that. Adding the method to DNSRouter itself would force every implementation and every mock
+// to provide it, so it is a separate interface that callers type-assert for and fall back from.
+//
+// # What an implementation must NOT do
+//
+// It must not issue its own queries. Every exchange has to pass through the same rule
+// evaluation, transport selection, response checking, caching, singleflight, ECS handling and
+// negative caching as Lookup. A second query path that bypasses any of that is worse than a
+// slower one, because it silently changes what policy applies.
+type DNSDualStackRouter interface {
+	// LookupFamilies resolves both families concurrently and calls publish once per family,
+	// as each completes. publish must be safe to call from different goroutines.
+	//
+	// It returns an error only when neither family could be resolved at all. A family that
+	// fails while the other succeeds is reported through its own DNSFamilyResult.
+	LookupFamilies(ctx context.Context, domain string, options DNSQueryOptions, publish func(DNSFamilyResult)) error
+}
+
 type DNSRouter interface {
 	Lifecycle
 	Exchange(ctx context.Context, message *dns.Msg, options DNSQueryOptions) (*dns.Msg, error)
