@@ -36,6 +36,11 @@ type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
+	// Session-level splice diagnostics. Counters only: one atomic add per UDP
+	// session, never per packet. See splice_diagnostics.go for why, and for what
+	// these numbers can and cannot tell you.
+	spliceDiagnostics spliceDiagnostics
+	spliceTelemetry   spliceTelemetry
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {

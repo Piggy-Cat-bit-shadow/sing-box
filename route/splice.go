@@ -26,81 +26,11 @@ type spliceTarget struct {
 }
 
 func unwrapSpliceTarget(conn any, allowOffload bool) (spliceTarget, bool) {
-	var target spliceTarget
-	for {
-		readCounter, isReadCounter := conn.(N.ReadCounter)
-		writeCounter, isWriteCounter := conn.(N.WriteCounter)
-		if isReadCounter || isWriteCounter {
-			if !isReadCounter || !isWriteCounter {
-				return spliceTarget{}, false
-			}
-			reader, readCounters := readCounter.UnwrapReader()
-			writer, writeCounters := writeCounter.UnwrapWriter()
-			if any(reader) != any(writer) {
-				return spliceTarget{}, false
-			}
-			target.readCounters = append(target.readCounters, readCounters...)
-			target.writeCounters = append(target.writeCounters, writeCounters...)
-			conn = reader
-			continue
-		}
-		packetReadCounter, isPacketReadCounter := conn.(N.PacketReadCounter)
-		packetWriteCounter, isPacketWriteCounter := conn.(N.PacketWriteCounter)
-		if isPacketReadCounter || isPacketWriteCounter {
-			if !isPacketReadCounter || !isPacketWriteCounter {
-				return spliceTarget{}, false
-			}
-			reader, readCounters := packetReadCounter.UnwrapPacketReader()
-			writer, writeCounters := packetWriteCounter.UnwrapPacketWriter()
-			if any(reader) != any(writer) {
-				return spliceTarget{}, false
-			}
-			target.readCounters = append(target.readCounters, readCounters...)
-			target.writeCounters = append(target.writeCounters, writeCounters...)
-			conn = reader
-			continue
-		}
-		if allowOffload {
-			upstream, offload := N.UnwrapPacketOffload(conn)
-			if offload != nil {
-				socket, isSocket := upstream.(tun.SpliceSocket)
-				if !isSocket {
-					return spliceTarget{}, false
-				}
-				target.socket = socket
-				target.offload = offload
-				return target, true
-			}
-		}
-		readerWithUpstream, isReaderWithUpstream := conn.(N.ReaderWithUpstream)
-		if !isReaderWithUpstream || !readerWithUpstream.ReaderReplaceable() {
-			return spliceTarget{}, false
-		}
-		writerWithUpstream, isWriterWithUpstream := conn.(N.WriterWithUpstream)
-		if !isWriterWithUpstream || !writerWithUpstream.WriterReplaceable() {
-			return spliceTarget{}, false
-		}
-		socket, isSocket := conn.(tun.SpliceSocket)
-		if isSocket {
-			target.socket = socket
-			return target, true
-		}
-		withUpstream, hasUpstream := conn.(common.WithUpstream)
-		if hasUpstream {
-			conn = withUpstream.Upstream()
-			continue
-		}
-		upstreamReader, hasUpstreamReader := conn.(N.WithUpstreamReader)
-		upstreamWriter, hasUpstreamWriter := conn.(N.WithUpstreamWriter)
-		if !hasUpstreamReader || !hasUpstreamWriter {
-			return spliceTarget{}, false
-		}
-		reader := upstreamReader.UpstreamReader()
-		if reader != upstreamWriter.UpstreamWriter() {
-			return spliceTarget{}, false
-		}
-		conn = reader
-	}
+	// Delegates to the reason-aware variant so there is a single implementation of
+	// the walk. Keeping two copies would let the reason threading drift from the
+	// decision it is supposed to describe.
+	target, _, ok := unwrapSpliceTargetWithReason(conn, allowOffload)
+	return target, ok
 }
 
 func (m *ConnectionManager) spliceClose(ctx context.Context, conn io.Closer, remote io.Closer, onClose N.CloseHandlerFunc) N.CloseHandlerFunc {
@@ -172,53 +102,9 @@ type spliceSource struct {
 }
 
 func unwrapSpliceSource(conn N.PacketConn) (spliceSource, bool) {
-	var source spliceSource
-	writer, writeCounters := N.UnwrapCountPacketWriter(conn, nil)
-	natWriter, isNATWriter := N.CastPacketWriter[*tun.UDPNatConn](writer)
-	if !isNATWriter {
-		return spliceSource{}, false
-	}
-	source.writeCounters = writeCounters
-	var reader N.PacketReader = conn
-	for {
-		readCounter, isReadCounter := reader.(N.PacketReadCounter)
-		if isReadCounter {
-			upstreamReader, readCounters := readCounter.UnwrapPacketReader()
-			source.readCounters = append(source.readCounters, readCounters...)
-			reader = upstreamReader
-			continue
-		}
-		natReader, isNATReader := reader.(*tun.UDPNatConn)
-		if isNATReader {
-			if natReader != natWriter {
-				return spliceSource{}, false
-			}
-			source.natConn = natReader
-			return source, true
-		}
-		cachedReader, isCached := reader.(N.CachedPacketReader)
-		if isCached {
-			source.cachedReaders = append(source.cachedReaders, cachedReader)
-		} else {
-			readerWithUpstream, isReaderWithUpstream := reader.(N.ReaderWithUpstream)
-			if !isReaderWithUpstream || !readerWithUpstream.ReaderReplaceable() {
-				return spliceSource{}, false
-			}
-		}
-		withUpstream, hasUpstream := reader.(common.WithUpstream)
-		if hasUpstream {
-			reader, _ = withUpstream.Upstream().(N.PacketReader)
-		} else {
-			upstreamReader, hasUpstreamReader := reader.(N.WithUpstreamReader)
-			if !hasUpstreamReader {
-				return spliceSource{}, false
-			}
-			reader, _ = upstreamReader.UpstreamReader().(N.PacketReader)
-		}
-		if reader == nil {
-			return spliceSource{}, false
-		}
-	}
+	// Delegates to the reason-aware variant; see unwrapSpliceTarget above.
+	source, _, ok := unwrapSpliceSourceWithReason(conn)
+	return source, ok
 }
 
 func (s *spliceSource) takeCached() []*N.PacketBuffer {
@@ -244,12 +130,17 @@ func (m *ConnectionManager) splicePacketConnection(ctx context.Context, conn N.P
 	if isFakeIP {
 		source = fakeIPConn.NetPacketConn
 	}
-	spliceSource, isSpliceSource := unwrapSpliceSource(source)
+	// One attempt is counted per session, never per packet: this path runs once for
+	// a flow, and a per-datagram counter here would itself become contention.
+	m.spliceTelemetry.recordAttempt()
+	spliceSource, sourceReason, isSpliceSource := unwrapSpliceSourceWithReason(source)
 	if !isSpliceSource {
+		m.spliceDiagnostics.record(sourceReason)
 		return conn, false
 	}
-	target, isTarget := unwrapSpliceTarget(remote, true)
+	target, targetReason, isTarget := unwrapSpliceTargetWithReason(remote, true)
 	if !isTarget {
+		m.spliceDiagnostics.record(targetReason)
 		return conn, false
 	}
 	if destinationAddress.IsValid() {
@@ -281,7 +172,19 @@ func (m *ConnectionManager) splicePacketConnection(ctx context.Context, conn N.P
 		FrontHeadroom: N.CalculateFrontHeadroom(remote),
 		RearHeadroom:  N.CalculateRearHeadroom(remote),
 	}) {
+		// The socket was found and handed over; packets now bypass userspace.
+		m.spliceTelemetry.recordSuccess()
 		return conn, true
+	}
+	// Splice() declined. It returns a bool with no reason, and the two situations it
+	// covers - the socket could not be attached, or the platform has no splice
+	// support - are not distinguishable here. Rather than invent a reason the code
+	// cannot produce, count it as attach_failed only when a socket was actually
+	// offered and the failure is therefore about attachment.
+	if target.socket != nil {
+		m.spliceDiagnostics.record(spliceReasonAttachFailed)
+	} else {
+		m.spliceDiagnostics.record(spliceReasonPlatformUnsupported)
 	}
 	if len(cached) == 0 {
 		return conn, false
