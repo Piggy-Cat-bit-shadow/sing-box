@@ -319,10 +319,19 @@ for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testfli
     grep -q 'signingStyle' "$builder"
   check "$(basename "$builder") asserts the archive is signed" \
     grep -q "the archive is signed" "$builder"
-  check "$(basename "$builder") asserts an Apple Distribution authority" \
-    grep -q "Authority=Apple Distribution" "$builder"
-  check "$(basename "$builder") asserts the profile is not device-scoped" \
-    grep -q "ProvisionedDevices" "$builder"
+  # iOS asserts a distribution authority on the exported IPA, because the export
+  # writes it out. macOS cannot: the export uploads a package and leaves nothing
+  # local, and the archive is development-signed by design (that is what carries the
+  # entitlements Apple validates). Assert the right thing for each.
+  if [ "$(basename "$builder")" = "build-ios-testflight.sh" ]; then
+    check "the iOS export is verified as distribution-signed" \
+      grep -q "Authority=Apple Distribution" "$builder"
+  else
+    check "the macOS export relies on Apple accepting the upload" \
+      grep -q "EXPORT SUCCEEDED\|export_status" "$builder"
+  fi
+  check "$(basename "$builder") verifies what it uploaded" \
+    grep -q "verify what was uploaded\|verify the EXPORTED product" "$builder"
 done
 
 echo "== a product that is not signed must never be reported as a success =="
@@ -333,7 +342,7 @@ check "the iOS builder verifies the exported IPA" \
   grep -q "the export reported success but produced no IPA" scripts/ci/build-ios-testflight.sh
 check "the exports are verified, not just produced" \
   bash -c 'grep -q "verify the EXPORTED product" scripts/ci/build-ios-testflight.sh && \
-           grep -q "verify the EXPORTED product" scripts/ci/build-macos-testflight.sh'
+           grep -q "verify what was uploaded" scripts/ci/build-macos-testflight.sh'
 
 echo "== no signing setting is silently dropped by a stray comment =="
 # A '#' line inside a backslash-continued argument list is consumed as part of the

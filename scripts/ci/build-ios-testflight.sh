@@ -295,6 +295,9 @@ if [ "$export_status" -eq 0 ]; then
     if "$@" >/dev/null 2>&1; then echo "  PASS: $name"; else echo "  FAIL: $name" >&2; vfail=1; fi
   }
   vgate "exported app is signed" codesign --verify --strict "$vapp"
+  # The exported IPA IS distribution-signed for iOS: the export writes it out, and
+  # Xcode re-signs during export. This differs from macOS, where the export uploads a
+  # package and leaves nothing local to inspect.
   vgate "signed by Apple Distribution" \
     bash -c "codesign -dvvv '$vapp' 2>&1 | grep -q 'Authority=Apple Distribution'"
   vgate "signature belongs to our team" \

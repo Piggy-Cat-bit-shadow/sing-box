@@ -249,31 +249,43 @@ xcodebuild -exportArchive \
 export_status=${PIPESTATUS[0]}
 set -e
 
-# --- verify the EXPORTED product --------------------------------------------
+# --- verify what was uploaded ------------------------------------------------
+#
+# A macOS App Store export uploads a .pkg and leaves the export directory empty, so
+# there is no local artifact to inspect afterwards. What CAN be verified is the
+# archive the upload was built from, and the fact that Apple accepted it.
+#
+# Note the archive is DEVELOPMENT-signed on purpose: that is what carries the
+# entitlements Apple validates, and the distribution re-signing happens inside the
+# export. Asserting a distribution authority or a device-free profile against the
+# archive would therefore fail on a build that uploaded successfully - which is
+# exactly what an earlier version of this check did.
 if [ "$export_status" -eq 0 ]; then
-  # A macOS App Store export produces a .pkg, not an .app: the store wraps the
-  # bundle. Expanding it would need installer tooling, so the checks stay on the
-  # archive's product plus the export result, and the distribution signature is
-  # asserted from the packaging log that Xcode writes.
-  pkg="$(find "$export_dir" -maxdepth 1 -name '*.pkg' | head -1)"
-  exp_app="$(find "$archive_path/Products/Applications" -maxdepth 1 -name '*.app' -type d | head -1)"
   vfail=0
   vgate() {
     local name="$1"; shift
     if "$@" >/dev/null 2>&1; then echo "  PASS: $name"; else echo "  FAIL: $name" >&2; vfail=1; fi
   }
-  vgate "the export produced a package" test -n "$pkg"
-  vgate "signed by Apple Distribution" \
-    bash -c "codesign -dvvv '$exp_app' 2>&1 | grep -q 'Authority=Apple Distribution'"
-  vgate "signature belongs to our team" \
-    bash -c "codesign -dvvv '$exp_app' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
-  vgate "embeds an App Store provisioning profile" \
-    test -f "$exp_app/Contents/embedded.provisionprofile"
-  vgate "profile is not device-scoped" \
-    bash -c "! security cms -D -i '$exp_app/Contents/embedded.provisionprofile' 2>/dev/null | grep -q ProvisionedDevices"
+  profile="$app/Contents/embedded.provisionprofile"
+  vgate "the uploaded archive is signed" codesign --verify --strict "$app"
+  vgate "the signature belongs to our team" \
+    bash -c "codesign -dvvv '$app' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
+  vgate "it embeds a provisioning profile" test -f "$profile"
+  vgate "the profile authorises this app id" \
+    bash -c "security cms -D -i '$profile' 2>/dev/null | grep -q '$APPLE_MACOS_APP_BUNDLE_ID'"
   vgate "no upstream team anywhere in the signature" \
-    bash -c "! codesign -dvvv '$exp_app' 2>&1 | grep -q P8XK3KHB48"
-  [ "$vfail" -eq 0 ] || { echo "FAIL: the exported package is not a valid distribution build" >&2; exit 1; }
+    bash -c "! codesign -dvvv '$app' 2>&1 | grep -q P8XK3KHB48"
+  # The entitlements Apple validated. These must be present on the archive; they are
+  # what a missing-entitlement rejection is about.
+  vgate "carries the network extension entitlement" \
+    bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.networkextension"
+  vgate "carries the App Group" \
+    bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.security.application-groups"
+  vgate "is sandboxed" \
+    bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.security.app-sandbox"
+  vgate "has no multicast entitlement" \
+    bash -c "! codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.multicast"
+  [ "$vfail" -eq 0 ] || { echo "FAIL: the uploaded build is not what it should be" >&2; exit 1; }
 fi
 
 echo
