@@ -170,6 +170,16 @@ jobs:
             ./common/httpclient ./common/tls ./include ./route
           echo "PASS: focused unit tests under $TAGS"
 
+      - name: low-memory data paths
+        # The iOS client is built with with_low_memory, which halves buf.BufferSize
+        # from 32 KiB to 16 KiB and moves the in-place framing boundary with it. That
+        # is not equivalent to the default build: a production crash came out of
+        # exactly this gap, and a test in this repository had been failing unnoticed
+        # under the tag because nothing ran it. The script fails closed if the Apple
+        # build stops using with_low_memory, so this gate cannot rot into testing a
+        # configuration nothing ships.
+        run: ./scripts/ci/test-low-memory.sh
+
       - name: production contract tests (registry + topology)
         # The nine contract assertions that decide whether the shipped binary can
         # serve the production topology at all:
