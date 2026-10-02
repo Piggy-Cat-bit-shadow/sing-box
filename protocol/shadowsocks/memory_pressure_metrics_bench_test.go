@@ -53,6 +53,21 @@ func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
 
 	const payloadPerOp = 256 << 20
 
+	// A continuous sampler runs for the WHOLE measured section, on a fixed cadence.
+	//
+	// The previous code called recorder.Sample() once per completed 256 MiB copy - that is,
+	// only at workload BOUNDARIES. A soft limit does not hold the runtime at the limit; it
+	// allows an overshoot between collections and then brings it back, so the peak is a
+	// transient in the MIDDLE of a copy. Sampling at the edges measured the peak of the
+	// boundary readings, not the peak.
+	//
+	// The same sampler and cadence are used for every configuration in the matrix, so the
+	// overhead is shared and cannot favour one side.
+	sampler, err := memmetrics.NewContinuousSampler(memmetrics.SamplerOptions{})
+	if err != nil {
+		b.Fatalf("start continuous sampler: %v", err)
+	}
+
 	b.SetBytes(payloadPerOp)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -67,12 +82,13 @@ func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
 		if _, err := bufio.Copy(destination, source); err != nil {
 			b.Fatal(err)
 		}
-		// Sample during the workload, not only at its ends: a soft limit keeps the runtime
-		// near a target BETWEEN collections, so an endpoint reading says nothing about the
-		// peak that actually approached jetsam.
-		recorder.Sample()
 	}
 	b.StopTimer()
+
+	// Stop waits for the sampling goroutine, so nothing outlives the measurement.
+	sampler.Stop()
+	continuousPeak := sampler.Peak()
+	continuousTicks := sampler.Ticks()
 
 	delta, end, err := recorder.Finish()
 	if err != nil {
@@ -87,7 +103,7 @@ func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
 	// pause_total_ns, which claimed an exactness it did not have.
 	fmt.Printf("MEMMETRICS gogc=%d gomemlimit=%d managed_start=%d managed_peak=%d managed_end=%d "+
 		"gc_cycles=%d pause_total_ns=%d pause_count=%d pause_max_upper_bound_ns=%d "+
-		"pause_upper_bound_total_ns=%d heap_live=%d\n",
+		"pause_upper_bound_total_ns=%d heap_live=%d continuous_peak=%d continuous_ticks=%d\n",
 		end.GOGCPercent,
 		end.GOMEMLIMITBytes,
 		delta.RuntimeManagedAtStart,
@@ -99,6 +115,8 @@ func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
 		int64(delta.PauseMaxUpperBound*1e9),
 		int64(delta.PauseUpperBoundTotal*1e9),
 		end.HeapLiveBytes,
+		continuousPeak,
+		continuousTicks,
 	)
 	_ = start
 }

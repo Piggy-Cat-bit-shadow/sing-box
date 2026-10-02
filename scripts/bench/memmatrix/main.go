@@ -110,7 +110,17 @@ type runResult struct {
 	PauseMaxUpperBoundNs uint64 `json:"pause_max_upper_bound_ns"`
 	// PauseUpperBoundTotalNs is the histogram estimate, advisory only.
 	PauseUpperBoundTotalNs uint64 `json:"pause_upper_bound_total_ns"`
-	HeapLiveBytes          uint64 `json:"heap_live_bytes"`
+	// ContinuousPeakBytes is the runtime-managed peak observed by a sampler running for the
+	// whole workload, rather than only at workload boundaries.
+	//
+	// ManagedPeakBytes comes from a Recorder that is sampled at copy boundaries, so it
+	// understates a transient that rises and falls within one copy. ContinuousPeakBytes is the
+	// figure to trust for "how close did this get to the limit".
+	ContinuousPeakBytes uint64 `json:"continuous_peak_bytes"`
+	// ContinuousTicks is how many observations the sampler completed. It distinguishes
+	// "the workload never rose" from "the sampler never ran", which look identical otherwise.
+	ContinuousTicks uint64 `json:"continuous_ticks"`
+	HeapLiveBytes   uint64 `json:"heap_live_bytes"`
 
 	Valid      bool   `json:"valid"`
 	InvalidWhy string `json:"invalid_why,omitempty"`
@@ -348,6 +358,10 @@ func parseMetricsLine(line string, result *runResult) {
 			result.PauseMaxUpperBoundNs = value
 		case "pause_upper_bound_total_ns":
 			result.PauseUpperBoundTotalNs = value
+		case "continuous_peak":
+			result.ContinuousPeakBytes = value
+		case "continuous_ticks":
+			result.ContinuousTicks = value
 		case "heap_live":
 			result.HeapLiveBytes = value
 		}
@@ -451,6 +465,8 @@ func medianOf(samples []runResult) runResult {
 		PauseCount:             pickU(func(r runResult) uint64 { return r.PauseCount }),
 		PauseMaxUpperBoundNs:   pickU(func(r runResult) uint64 { return r.PauseMaxUpperBoundNs }),
 		PauseUpperBoundTotalNs: pickU(func(r runResult) uint64 { return r.PauseUpperBoundTotalNs }),
+		ContinuousPeakBytes:    pickU(func(r runResult) uint64 { return r.ContinuousPeakBytes }),
+		ContinuousTicks:        pickU(func(r runResult) uint64 { return r.ContinuousTicks }),
 		HeapLiveBytes:          pickU(func(r runResult) uint64 { return r.HeapLiveBytes }),
 		MetricsSaw:             true,
 		Valid:                  true,

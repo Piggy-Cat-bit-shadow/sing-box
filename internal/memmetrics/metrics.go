@@ -95,6 +95,9 @@ type Delta struct {
 // reader holds reusable sample slices so repeated reads do not allocate.
 type reader struct {
 	samples []metrics.Sample
+	// managedSamples is a separate slice for the continuous sampler, so a sampler reading
+	// concurrently with a Recorder does not share mutable sample state.
+	managedSamples []metrics.Sample
 }
 
 func newReader() *reader {
