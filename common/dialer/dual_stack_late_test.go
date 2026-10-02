@@ -275,3 +275,123 @@ func TestLateStreamCloseDoesNotStrandTheRace(t *testing.T) {
 }
 
 var _ = M.Socksaddr{}
+
+// --- end-to-end through resolveDialer (§43, §44, §45) ------------------------------
+
+// TestEndToEndLateFamilyWins is this round's final gate (§43).
+//
+// It drives the whole production path:
+//
+//	resolveDialer -> DNS router family stream -> candidate scheduler -> fake TCP dialer
+//
+// with the failure model that matters:
+//
+//	IPv4 resolves at 5ms and BLACKHOLES
+//	IPv6 resolves at 200ms and is HEALTHY
+//	prefer IPv6
+//
+// The IPv4 attempt must start as soon as it is known - the connection is not held back waiting
+// for AAAA. When IPv6 arrives it must join the SAME race and win, well before the IPv4 connect
+// timeout would have expired. Under the previous static-list design the late family could not
+// participate at all.
+func TestEndToEndLateFamilyWins(t *testing.T) {
+	const fallbackDelay = 100 * time.Millisecond
+
+	blackhole4 := netip.MustParseAddr("192.0.2.1")
+	late6 := netip.MustParseAddr("2001:db8::1")
+
+	router := &fakeDomainRouter{
+		addressesA:    []netip.Addr{blackhole4},
+		delayA:        5 * time.Millisecond,
+		addressesAAAA: []netip.Addr{late6},
+		delayAAAA:     200 * time.Millisecond,
+	}
+	inner := &recordingDialer{failBlackhole: map[netip.Addr]bool{blackhole4: true}}
+	dialer := newDomainTestDialer(router, inner, true, fallbackDelay)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", M.ParseSocksaddr("example.test:443"))
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// The gate: the late healthy family won, and it did so well inside the connect timeout.
+	require.Less(t, elapsed, time.Second,
+		"the late family must win promptly, not after the IPv4 connect timeout")
+	require.Contains(t, inner.attempts(), blackhole4,
+		"the fast family must start as soon as it is known, not wait for its sibling")
+	require.Contains(t, inner.attempts(), late6,
+		"the late family must join the race rather than being discarded")
+}
+
+// TestEndToEndLateFamilyWinsMirror is §44.
+//
+// The mirror direction. A fix that only handled the IPv6 case would pass the previous test and
+// fail this one.
+func TestEndToEndLateFamilyWinsMirror(t *testing.T) {
+	const fallbackDelay = 100 * time.Millisecond
+
+	blackhole6 := netip.MustParseAddr("2001:db8::1")
+	late4 := netip.MustParseAddr("192.0.2.1")
+
+	router := &fakeDomainRouter{
+		addressesAAAA: []netip.Addr{blackhole6},
+		delayAAAA:     5 * time.Millisecond,
+		addressesA:    []netip.Addr{late4},
+		delayA:        200 * time.Millisecond,
+	}
+	inner := &recordingDialer{failBlackhole: map[netip.Addr]bool{blackhole6: true}}
+	dialer := newDomainTestDialer(router, inner, true, fallbackDelay)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", M.ParseSocksaddr("example.test:443"))
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Less(t, elapsed, time.Second,
+		"the late IPv4 family must win promptly, not after the IPv6 connect timeout")
+	require.Contains(t, inner.attempts(), blackhole6)
+	require.Contains(t, inner.attempts(), late4,
+		"the late IPv4 family must join the race rather than being discarded")
+}
+
+// TestEndToEndPreferredFirstHasNoAddedDelay is §23 and §46.
+//
+// When the preferred family answers first, the grace period must not delay it. An added 50ms on
+// every healthy IPv6 connection would be a serious regression, and one that no correctness test
+// would catch.
+func TestEndToEndPreferredFirstHasNoAddedDelay(t *testing.T) {
+	healthy6 := netip.MustParseAddr("2001:db8::1")
+	healthy4 := netip.MustParseAddr("192.0.2.1")
+
+	router := &fakeDomainRouter{
+		addressesAAAA: []netip.Addr{healthy6},
+		delayAAAA:     5 * time.Millisecond,
+		addressesA:    []netip.Addr{healthy4},
+		delayA:        500 * time.Millisecond,
+	}
+	inner := &recordingDialer{}
+	dialer := newDomainTestDialer(router, inner, true, 100*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", M.ParseSocksaddr("example.test:443"))
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	// The preferred family answered at 5ms and the other family is 500ms away. If the grace
+	// period were applied to a preferred-first answer, this would take at least 50ms.
+	require.Less(t, elapsed, preferredFamilyGrace,
+		"a preferred-first answer must not be delayed by the grace period")
+}
