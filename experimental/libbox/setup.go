@@ -105,25 +105,21 @@ func ReloadSetupOptions(options *SetupOptions) {
 		if sOOMMemoryLimit > 0 {
 			runtimeMemoryLimit := oomkiller.RuntimeMemoryLimit(uint64(sOOMMemoryLimit))
 			debug.SetMemoryLimit(int64(runtimeMemoryLimit))
-			// One startup line, computed from the values actually applied.
+			// One startup line, reporting what the runtime actually has in force.
 			//
-			// The effective iOS memory policy is the product of a budget, a safety
-			// margin and a GC percentage that live across three files, so a device log
-			// otherwise gives no way to confirm what is really in force. On a phone this
-			// is the difference between "the client is collecting too aggressively" and
-			// guessing, so the numbers are reported once at setup.
+			// The effective iOS memory policy is the product of a budget, a safety margin
+			// and a GC percentage that live across three files, so a device log otherwise
+			// gives no way to confirm what is really set. On a phone this is the
+			// difference between "the client is collecting too aggressively" and guessing.
 			//
-			// Nothing here is hot-path: this runs a single time per process start. The
-			// values are read after being set rather than restated, so the line cannot
-			// drift from the policy it describes.
+			// The values are read from runtime/metrics, which has no side effects. The
+			// previous version called debug.SetGCPercent(-1) to make it return the current
+			// value, and -1 does not mean "read" - it means "disable garbage collection".
+			// A memory diagnostic was briefly turning the collector off.
+			//
+			// Nothing here is hot-path: it runs once per process start.
 			if C.IsIos {
-				// SetGCPercent(-1) reports the current percentage without changing it.
-				currentGCPercent := debug.SetGCPercent(-1)
-				debug.SetGCPercent(currentGCPercent)
-				log.Info("[Memory] NetworkExtension budget=",
-					byteformats.FormatMemoryBytes(uint64(sOOMMemoryLimit)),
-					" runtime_limit=", byteformats.FormatMemoryBytes(runtimeMemoryLimit),
-					" GOGC=", currentGCPercent)
+				log.Info(runtimeMemoryDiagnostic(uint64(sOOMMemoryLimit), readRuntimeMemoryState()))
 			}
 		} else {
 			debug.SetMemoryLimit(math.MaxInt64)

@@ -61,6 +61,27 @@ type timerConfig struct {
 }
 
 func buildTimerConfig(options option.OOMKillerServiceOptions, memoryLimit uint64, policyMode policyMode, killerDisabled bool) (timerConfig, error) {
+	// Inside an iOS NetworkExtension the policy is a PLATFORM safety contract, not a
+	// tunable. A profile may not widen the sampling gap or shrink the footprint margin,
+	// because the Go runtime soft limit is derived from the same margin: letting a profile
+	// set one and not the other policed the process against two different notions of
+	// "safe", and the failure mode is the process being killed rather than a slow request.
+	//
+	// Returning the canonical config here, before any option is read, is what makes the
+	// two layers consistent by construction instead of by convention.
+	if policyMode == policyModeNetworkExtension {
+		policy := canonicalNetworkExtensionPolicy
+		return timerConfig{
+			memoryLimit:     policy.memoryLimit(),
+			safetyMargin:    policy.safetyMargin,
+			hasSafetyMargin: true,
+			minInterval:     policy.minInterval,
+			maxInterval:     policy.maxInterval,
+			policyMode:      policyMode,
+			killerDisabled:  killerDisabled,
+		}, nil
+	}
+
 	minInterval := defaultMinInterval
 	if options.MinInterval != 0 {
 		minInterval = time.Duration(options.MinInterval.Build())
@@ -380,8 +401,22 @@ func computeLimitThresholds(memoryLimit uint64, safetyMargin uint64) pressureThr
 	}
 }
 
+// RuntimeMemoryLimit returns the Go runtime soft limit for a given process budget.
+//
+// It is the "armed" threshold - the budget less two safety margins - and it shares the
+// derivation with the canonical NetworkExtension policy rather than repeating the
+// arithmetic. When this and the timer thresholds were computed independently they could
+// disagree about the same budget, which is exactly the fork this helper removes.
 func RuntimeMemoryLimit(memoryLimit uint64) uint64 {
 	return computeLimitThresholds(memoryLimit, defaultSafetyMargin).armed
+}
+
+// runtimeMemoryLimitForPolicy is the runtime soft limit the canonical policy implies.
+//
+// Callers inside a NetworkExtension use this rather than recomputing from the budget, so
+// the value cannot diverge from the thresholds the timer enforces.
+func runtimeMemoryLimitForPolicy() uint64 {
+	return canonicalNetworkExtensionPolicy.runtimeMemoryLimit()
 }
 
 func (t *adaptiveTimer) availableThresholds(sample memorySample) pressureThresholds {

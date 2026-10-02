@@ -1,7 +1,11 @@
 package oomkiller
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
+
+	"github.com/sagernet/sing-box/option"
 )
 
 // Pins the Apple NetworkExtension memory policy.
@@ -119,5 +123,136 @@ func TestRuntimeMemoryLimit_Scales(t *testing.T) {
 			t.Errorf("RuntimeMemoryLimit(%d MiB): want %d MiB, got %d MiB",
 				tc.budget/1024/1024, tc.want/1024/1024, got/1024/1024)
 		}
+	}
+}
+
+// --- the canonical policy cannot be split by a profile (§1) ----------------------
+
+// buildNetworkExtensionConfig runs the REAL entry point a profile reaches, so these
+// tests constrain buildTimerConfig itself rather than a restatement of its arithmetic.
+//
+// A test that called computeLimitThresholds directly would pass even if buildTimerConfig
+// went on honouring a profile-supplied margin, which is precisely the fork that existed.
+func buildNetworkExtensionConfig(t *testing.T, profileJSON string) timerConfig {
+	t.Helper()
+	options := option.OOMKillerServiceOptions{}
+	if profileJSON != "" {
+		if err := json.Unmarshal([]byte(profileJSON), &options); err != nil {
+			t.Fatalf("profile %s: %v", profileJSON, err)
+		}
+	}
+	config, err := buildTimerConfig(
+		options,
+		canonicalNetworkExtensionPolicy.memoryLimit(),
+		policyModeNetworkExtension,
+		false,
+	)
+	if err != nil {
+		t.Fatalf("buildTimerConfig: %v", err)
+	}
+	return config
+}
+
+func requireCanonicalPolicy(t *testing.T, config timerConfig, profile string) {
+	t.Helper()
+	policy := canonicalNetworkExtensionPolicy
+
+	if config.memoryLimit != policy.memoryLimit() {
+		t.Errorf("%s: budget %d, want %d", profile, config.memoryLimit, policy.memoryLimit())
+	}
+	if config.safetyMargin != policy.safetyMargin {
+		t.Errorf("%s: safety margin %d, want %d", profile, config.safetyMargin, policy.safetyMargin)
+	}
+	if !config.hasSafetyMargin {
+		t.Errorf("%s: the margin must be set, or the timer cannot derive its thresholds", profile)
+	}
+	if config.minInterval != policy.minInterval {
+		t.Errorf("%s: min interval %v, want %v", profile, config.minInterval, policy.minInterval)
+	}
+	if config.maxInterval != policy.maxInterval {
+		t.Errorf("%s: max interval %v, want %v", profile, config.maxInterval, policy.maxInterval)
+	}
+	if config.policyMode != policyModeNetworkExtension {
+		t.Errorf("%s: policy mode %d, want network extension", profile, config.policyMode)
+	}
+
+	// The footprint thresholds the timer enforces and the Go runtime soft limit must come
+	// from the SAME margin, or the process is policed against two different notions of
+	// safe.
+	thresholds := computeLimitThresholds(config.memoryLimit, config.safetyMargin)
+	if thresholds.armed != policy.runtimeMemoryLimit() {
+		t.Errorf("%s: timer armed threshold %d disagrees with the Go runtime limit %d",
+			profile, thresholds.armed, policy.runtimeMemoryLimit())
+	}
+	if thresholds.armed != RuntimeMemoryLimit(config.memoryLimit) {
+		t.Errorf("%s: %d disagrees with RuntimeMemoryLimit(%d)",
+			profile, thresholds.armed, config.memoryLimit)
+	}
+}
+
+func TestNetworkExtensionPolicyIgnoresProfileOverrides(t *testing.T) {
+	// Every one of these profiles weakens or stretches a platform safety limit. None may
+	// take effect inside a NetworkExtension.
+	profiles := []struct {
+		name string
+		json string
+	}{
+		{"no profile", ""},
+		{"safety margin shrunk to 1 MiB", `{"safety_margin":"1m"}`},
+		{"safety margin widened to 10 MiB", `{"safety_margin":"10m"}`},
+		{"tiny min interval", `{"min_interval":"1ms"}`},
+		{"huge max interval", `{"max_interval":"30m"}`},
+		{"both intervals", `{"min_interval":"1ms","max_interval":"30m"}`},
+		{"custom memory limit", `{"memory_limit":"200m"}`},
+		{"everything at once", `{"memory_limit":"200m","safety_margin":"1m","min_interval":"1ms","max_interval":"30m"}`},
+	}
+	for _, profile := range profiles {
+		t.Run(profile.name, func(t *testing.T) {
+			requireCanonicalPolicy(t, buildNetworkExtensionConfig(t, profile.json), profile.name)
+		})
+	}
+}
+
+func TestNetworkExtensionPolicyIgnoresAnExistingServiceBlock(t *testing.T) {
+	// A profile that already declares an oomkiller service is the realistic case: the
+	// operator has a block, and its values must still not reach the platform policy.
+	config := buildNetworkExtensionConfig(t, `{
+		"memory_limit": "200m",
+		"safety_margin": "1m",
+		"min_interval": "2s",
+		"max_interval": "5m"
+	}`)
+	requireCanonicalPolicy(t, config, "existing service block")
+}
+
+func TestNetworkExtensionPolicyIsUnchangedByRepeatedBuilds(t *testing.T) {
+	// Building twice with different profiles must not accumulate state.
+	first := buildNetworkExtensionConfig(t, `{"safety_margin":"1m"}`)
+	second := buildNetworkExtensionConfig(t, "")
+	if first.safetyMargin != second.safetyMargin ||
+		first.minInterval != second.minInterval ||
+		first.maxInterval != second.maxInterval {
+		t.Fatal("the policy must not depend on what was built before it")
+	}
+}
+
+func TestProfileStillTunableOutsideNetworkExtension(t *testing.T) {
+	// The negative control: this must stay tunable for ordinary processes. If the
+	// short-circuit applied everywhere, a legitimate non-iOS deployment would lose the
+	// ability to configure its own OOM killer.
+	options := option.OOMKillerServiceOptions{}
+	if err := json.Unmarshal([]byte(`{"safety_margin":"8m","min_interval":"2s","max_interval":"30s"}`), &options); err != nil {
+		t.Fatal(err)
+	}
+	config, err := buildTimerConfig(options, 100*1024*1024, policyModeMemoryLimit, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.safetyMargin != 8*1024*1024 {
+		t.Errorf("outside a NetworkExtension the profile margin must be honoured, got %d", config.safetyMargin)
+	}
+	if config.minInterval != 2*time.Second || config.maxInterval != 30*time.Second {
+		t.Errorf("outside a NetworkExtension the profile intervals must be honoured, got %v/%v",
+			config.minInterval, config.maxInterval)
 	}
 }
