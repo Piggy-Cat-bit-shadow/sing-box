@@ -109,9 +109,13 @@ if [ "$APPLE_SIGNING_MODE" != "unsigned" ]; then
   # value fails with `No Account for Team "<wrong>"`, which reads as a missing
   # account even though the account is present and signed in.
   if [ -z "${APPLE_TEAM_ID:-}" ]; then
+    # `|| true` matters: on a machine with no Apple Development certificate (CI,
+    # or a fresh checkout) `security` exits non-zero, and under `set -o pipefail`
+    # that aborts the whole assignment - turning "no certificate to detect a team
+    # from" into a hard failure of a script that only needed a fallback value.
     detected_team="$(security find-certificate -a -c "Apple Development" -p 2>/dev/null \
       | openssl x509 -noout -subject 2>/dev/null \
-      | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u | head -1)"
+      | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u | head -1 || true)"
     if [ -n "$detected_team" ]; then
       APPLE_TEAM_ID="$detected_team"
       APPLE_TEAM_ID_DETECTED=1

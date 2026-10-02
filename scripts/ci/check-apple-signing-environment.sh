@@ -65,9 +65,12 @@ else
   # in the certificate's NAME is a different thing - the individual certificate
   # identifier - and matching on it rejects a correct team while accepting a wrong
   # one: for "Apple Development: <name> (KH7DK5S5M7)" the team here is TAFD7BAGYZ.
+  # `|| true`: with no certificate present, `security` exits non-zero and
+  # `set -o pipefail` would abort here - reporting a pipeline failure instead of
+  # the real problem, which is that there is no certificate.
   cert_teams="$(security find-certificate -a -c "Apple Development" -p 2>/dev/null \
     | openssl x509 -noout -subject 2>/dev/null \
-    | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u)"
+    | tr ',' '\n' | grep -oE 'OU=[A-Z0-9]+' | cut -d= -f2 | sort -u || true)"
   printf '%s\n' "$cert_teams" | sed 's/^/    certificate team (OU): /'
   if ! printf '%s\n' "$cert_teams" | grep -qx "$APPLE_TEAM_ID"; then
     echo "    FAIL: no certificate's team (OU) matches APPLE_TEAM_ID=$APPLE_TEAM_ID." >&2

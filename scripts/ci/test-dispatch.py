@@ -11,13 +11,17 @@ being dropped or wired to the wrong builder.
 """
 import re
 import sys
+from typing import Optional
 
 TARGETS = ("testflight", "testflight-ios", "testflight-macos")
 IOS = "build-ios-testflight.sh"
 MACOS = "build-macos-testflight.sh"
 
 
-def arm_body(src: str, target: str) -> str | None:
+def arm_body(src: str, target: str) -> Optional[str]:
+    # Optional rather than `str | None`: the macOS system Python is 3.9, where the
+    # PEP 604 union syntax is evaluated at def time and raises TypeError, so this
+    # file would not import on the very runners it has to run on.
     # Match "  target)" ... ";;" - the combined target has no suffix, so anchor the
     # name to avoid `testflight` also matching inside `testflight-ios`.
     m = re.search(rf"\n  {re.escape(target)}\)(.*?);;", src, re.S)
