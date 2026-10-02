@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -506,19 +507,74 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	// The previous implementation ran the same two exchanges through task.Group and then
 	// waited for both. A resolver answering A in 10ms and never answering AAAA delayed every
 	// connection by the AAAA timeout, even though a usable address was in hand immediately.
-	response4, response6, err := c.collectFamilies(
+	// Lookup is the COMPLETE-lookup contract: callers use it for routing, rule matching,
+	// candidate lists published on metadata and diagnostics, and all of them expect the whole
+	// address set. Taking the streaming path here would return only the first family to
+	// answer, silently halving the result for every one of them.
+	//
+	// Latency-oriented streaming belongs to the connection path, which has its own entry
+	// point. A fast lookup must not be bought by giving routing an incomplete answer.
+	response4, response6, err := c.collectFamiliesComplete(
 		ctx,
 		transport,
 		dnsName,
 		lookupOptions,
 		responseChecker,
-		defaultResolutionDelay,
-		strategy == C.DomainStrategyPreferIPv6,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return sortAddresses(response4, response6, strategy), nil
+}
+
+// collectFamiliesComplete runs both family exchanges and waits for BOTH.
+//
+// This is the previous task.Group behaviour, kept because Lookup's contract depends on it:
+// callers need the complete set, not the fastest answer.
+func (c *Client) collectFamiliesComplete(
+	ctx context.Context,
+	transport adapter.DNSTransport,
+	dnsName string,
+	options adapter.DNSQueryOptions,
+	responseChecker func(response *dns.Msg) bool,
+) ([]netip.Addr, []netip.Addr, error) {
+	var (
+		response4 []netip.Addr
+		response6 []netip.Addr
+		err4      error
+		err6      error
+		access    sync.Mutex
+		waitGroup sync.WaitGroup
+	)
+
+	exchange := func(qType uint16, ipv6 bool) {
+		defer waitGroup.Done()
+		addresses, err := c.lookupToExchange(ctx, transport, dnsName, qType, options, responseChecker)
+		access.Lock()
+		if ipv6 {
+			response6 = addresses
+			err6 = err
+		} else {
+			response4 = addresses
+			err4 = err
+		}
+		access.Unlock()
+	}
+
+	waitGroup.Add(2)
+	go exchange(dns.TypeA, false)
+	go exchange(dns.TypeAAAA, true)
+	waitGroup.Wait()
+
+	access.Lock()
+	defer access.Unlock()
+	if len(response4) == 0 && len(response6) == 0 {
+		if err := E.Errors(err4, err6); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, E.New("no address for ", dnsName)
+	}
+	return response4, response6, nil
 }
 
 func (c *Client) ClearCache() {

@@ -446,3 +446,41 @@ func (c *atomic32) Load() int32 {
 	defer c.access.Unlock()
 	return c.value
 }
+
+// TestLookupReturnsTheCompleteSet is the §28/§29 regression.
+//
+// Lookup is the complete-lookup contract. Callers use it for routing, rule matching, the
+// candidate list published on metadata, and diagnostics - all of which expect the whole
+// address set. Streaming it would silently halve the answer for every one of them: routing
+// would evaluate rules against one family while the other was still in flight.
+//
+// A lagging family must therefore be WAITED FOR, even though the connection path deliberately
+// does not wait.
+func TestLookupReturnsTheCompleteSet(t *testing.T) {
+	transport := &familySchedulingTransport{
+		delayA:      0,
+		delayAAAA:   80 * time.Millisecond, // slower than the streaming grace period
+		addressA:    "192.0.2.1",
+		addressAAAA: "2001:db8::1",
+	}
+	client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	addresses, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{}, nil)
+	require.NoError(t, err)
+
+	var has4, has6 bool
+	for _, address := range addresses {
+		if address.Is4() || address.Is4In6() {
+			has4 = true
+		} else {
+			has6 = true
+		}
+	}
+	require.True(t, has4, "Lookup must return the IPv4 address")
+	require.True(t, has6,
+		"Lookup must WAIT for the slower family: an incomplete set changes routing and rule matching")
+}
