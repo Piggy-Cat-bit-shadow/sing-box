@@ -100,10 +100,17 @@ type runResult struct {
 	ManagedPeakBytes  uint64 `json:"managed_peak_bytes"`
 	ManagedEndBytes   uint64 `json:"managed_end_bytes"`
 	GCCycles          uint64 `json:"gc_cycles"`
-	PauseTotalNs      uint64 `json:"pause_total_ns"`
-	PauseCount        uint64 `json:"pause_count"`
-	PauseMaxNs        uint64 `json:"pause_max_ns"`
-	HeapLiveBytes     uint64 `json:"heap_live_bytes"`
+	// PauseTotalNs is the exact cumulative STW pause for the run, from the runtime's own
+	// nanosecond counter.
+	PauseTotalNs uint64 `json:"pause_total_ns"`
+	PauseCount   uint64 `json:"pause_count"`
+	// PauseMaxUpperBoundNs is the largest histogram bucket UPPER BOUND among this run's
+	// pauses. It is a bound, not a measured maximum - the runtime does not expose one - and the
+	// field name keeps that visible in the JSON so a report cannot quietly treat it as exact.
+	PauseMaxUpperBoundNs uint64 `json:"pause_max_upper_bound_ns"`
+	// PauseUpperBoundTotalNs is the histogram estimate, advisory only.
+	PauseUpperBoundTotalNs uint64 `json:"pause_upper_bound_total_ns"`
+	HeapLiveBytes          uint64 `json:"heap_live_bytes"`
 
 	Valid      bool   `json:"valid"`
 	InvalidWhy string `json:"invalid_why,omitempty"`
@@ -337,8 +344,10 @@ func parseMetricsLine(line string, result *runResult) {
 			result.PauseTotalNs = value
 		case "pause_count":
 			result.PauseCount = value
-		case "pause_max_ns":
-			result.PauseMaxNs = value
+		case "pause_max_upper_bound_ns":
+			result.PauseMaxUpperBoundNs = value
+		case "pause_upper_bound_total_ns":
+			result.PauseUpperBoundTotalNs = value
 		case "heap_live":
 			result.HeapLiveBytes = value
 		}
@@ -428,22 +437,23 @@ func medianOf(samples []runResult) runResult {
 		return values[len(values)/2]
 	}
 	return runResult{
-		NsPerOp:           pick(func(r runResult) float64 { return r.NsPerOp }),
-		MBPerSec:          pick(func(r runResult) float64 { return r.MBPerSec }),
-		BytesPerOp:        pick(func(r runResult) float64 { return r.BytesPerOp }),
-		AllocsPerOp:       pick(func(r runResult) float64 { return r.AllocsPerOp }),
-		GOGCPercent:       pickU(func(r runResult) uint64 { return r.GOGCPercent }),
-		GOMEMLIMITBytes:   pickU(func(r runResult) uint64 { return r.GOMEMLIMITBytes }),
-		ManagedStartBytes: pickU(func(r runResult) uint64 { return r.ManagedStartBytes }),
-		ManagedPeakBytes:  pickU(func(r runResult) uint64 { return r.ManagedPeakBytes }),
-		ManagedEndBytes:   pickU(func(r runResult) uint64 { return r.ManagedEndBytes }),
-		GCCycles:          pickU(func(r runResult) uint64 { return r.GCCycles }),
-		PauseTotalNs:      pickU(func(r runResult) uint64 { return r.PauseTotalNs }),
-		PauseCount:        pickU(func(r runResult) uint64 { return r.PauseCount }),
-		PauseMaxNs:        pickU(func(r runResult) uint64 { return r.PauseMaxNs }),
-		HeapLiveBytes:     pickU(func(r runResult) uint64 { return r.HeapLiveBytes }),
-		MetricsSaw:        true,
-		Valid:             true,
+		NsPerOp:                pick(func(r runResult) float64 { return r.NsPerOp }),
+		MBPerSec:               pick(func(r runResult) float64 { return r.MBPerSec }),
+		BytesPerOp:             pick(func(r runResult) float64 { return r.BytesPerOp }),
+		AllocsPerOp:            pick(func(r runResult) float64 { return r.AllocsPerOp }),
+		GOGCPercent:            pickU(func(r runResult) uint64 { return r.GOGCPercent }),
+		GOMEMLIMITBytes:        pickU(func(r runResult) uint64 { return r.GOMEMLIMITBytes }),
+		ManagedStartBytes:      pickU(func(r runResult) uint64 { return r.ManagedStartBytes }),
+		ManagedPeakBytes:       pickU(func(r runResult) uint64 { return r.ManagedPeakBytes }),
+		ManagedEndBytes:        pickU(func(r runResult) uint64 { return r.ManagedEndBytes }),
+		GCCycles:               pickU(func(r runResult) uint64 { return r.GCCycles }),
+		PauseTotalNs:           pickU(func(r runResult) uint64 { return r.PauseTotalNs }),
+		PauseCount:             pickU(func(r runResult) uint64 { return r.PauseCount }),
+		PauseMaxUpperBoundNs:   pickU(func(r runResult) uint64 { return r.PauseMaxUpperBoundNs }),
+		PauseUpperBoundTotalNs: pickU(func(r runResult) uint64 { return r.PauseUpperBoundTotalNs }),
+		HeapLiveBytes:          pickU(func(r runResult) uint64 { return r.HeapLiveBytes }),
+		MetricsSaw:             true,
+		Valid:                  true,
 	}
 }
 

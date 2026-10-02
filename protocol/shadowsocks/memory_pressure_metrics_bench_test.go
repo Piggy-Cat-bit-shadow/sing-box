@@ -80,17 +80,24 @@ func BenchmarkShadowMemoryPressureMeasured(b *testing.B) {
 	}
 
 	// One machine-readable line. The harness parses this and nothing else.
+	// pause_total_ns is the EXACT cumulative STW pause for this run, from the runtime's own
+	// nanosecond counter. pause_max_upper_bound_ns is the largest histogram bucket upper bound
+	// among this run's pauses and is named as a bound, because a pause in bucket [a,b) could be
+	// anywhere in that range. The previous output reported the histogram estimate as
+	// pause_total_ns, which claimed an exactness it did not have.
 	fmt.Printf("MEMMETRICS gogc=%d gomemlimit=%d managed_start=%d managed_peak=%d managed_end=%d "+
-		"gc_cycles=%d pause_total_ns=%d pause_count=%d pause_max_ns=%d heap_live=%d\n",
+		"gc_cycles=%d pause_total_ns=%d pause_count=%d pause_max_upper_bound_ns=%d "+
+		"pause_upper_bound_total_ns=%d heap_live=%d\n",
 		end.GOGCPercent,
 		end.GOMEMLIMITBytes,
 		delta.RuntimeManagedAtStart,
 		delta.RuntimeManagedPeak,
 		delta.RuntimeManagedAtEnd,
 		delta.GCCycles,
-		int64(delta.PauseTotalSeconds*1e9),
+		delta.PauseTotalNs,
 		delta.PauseCount,
-		int64(delta.PauseMaxSeconds*1e9),
+		int64(delta.PauseMaxUpperBound*1e9),
+		int64(delta.PauseUpperBoundTotal*1e9),
 		end.HeapLiveBytes,
 	)
 	_ = start

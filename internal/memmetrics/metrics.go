@@ -26,6 +26,7 @@ package memmetrics
 
 import (
 	"errors"
+	"runtime"
 	"runtime/metrics"
 )
 
@@ -71,9 +72,24 @@ type Delta struct {
 	RuntimeManagedPeak    uint64
 	RuntimeManagedAtStart uint64
 	RuntimeManagedAtEnd   uint64
-	PauseTotalSeconds     float64
-	PauseCount            uint64
-	PauseMaxSeconds       float64
+	// PauseTotalNs is the EXACT cumulative stop-the-world pause time for this interval, from
+	// runtime.MemStats.PauseTotalNs - an integer nanosecond counter the runtime maintains.
+	//
+	// It replaces a histogram-based estimate. Summing bucket upper bounds times counts can only
+	// overstate, by up to one bucket width per pause, and reporting that as a total conflated a
+	// measurement with a bound.
+	PauseTotalNs uint64
+	// PauseCount is how many pauses this interval produced, from the histogram delta.
+	PauseCount uint64
+	// PauseMaxUpperBound is the largest bucket UPPER BOUND among this interval's pauses.
+	//
+	// It is an upper bound, not a measured maximum. The runtime publishes pauses as a
+	// histogram and does not expose a true maximum, so this is the tightest honest statement
+	// available - and the name says so rather than calling it "max pause".
+	PauseMaxUpperBound float64
+	// PauseUpperBoundTotal is the histogram estimate for this interval. Advisory, and strictly
+	// less trustworthy than PauseTotalNs.
+	PauseUpperBoundTotal float64
 }
 
 // reader holds reusable sample slices so repeated reads do not allocate.
@@ -141,10 +157,25 @@ func (r *reader) read() (State, error) {
 }
 
 // pauseSnapshot captures the GC pause histogram.
+//
+// # Why the per-bucket counts are kept
+//
+// A cumulative histogram describes the whole process, so its largest bucket says nothing about
+// THIS benchmark: the worst pause may belong to a collection that finished before the run
+// started. Keeping the counts lets Finish subtract the starting histogram and describe only the
+// pauses this run produced.
+//
+// # What the total means
+//
+// histogramUpperBoundTotal sums bucket UPPER BOUNDS times counts. It is an approximation, named
+// accordingly, and can only overstate a pause by at most one bucket width per sample. It is
+// recorded for the distribution and must never be reported as an exact pause total.
 type pauseSnapshot struct {
+	counts  []uint64
+	buckets []float64
 	count   uint64
-	total   float64
-	maxSeen float64
+	// histogramUpperBoundTotal is an approximation, not a measured total.
+	histogramUpperBoundTotal float64
 }
 
 func (r *reader) pauses() (pauseSnapshot, error) {
@@ -156,24 +187,76 @@ func (r *reader) pauses() (pauseSnapshot, error) {
 			return pauseSnapshot{}, ErrMetricUnavailable
 		}
 		histogram := sample.Value.Float64Histogram()
-		var snapshot pauseSnapshot
+
+		snapshot := pauseSnapshot{
+			counts:  make([]uint64, len(histogram.Counts)),
+			buckets: make([]float64, len(histogram.Buckets)),
+		}
+		copy(snapshot.counts, histogram.Counts)
+		copy(snapshot.buckets, histogram.Buckets)
+
 		for i, count := range histogram.Counts {
 			if count == 0 {
 				continue
 			}
 			snapshot.count += count
-			// Use the upper bound of the bucket as the representative pause.
+			// The bucket's UPPER bound, used only as a representative value. This is an
+			// approximation and the field name says so.
 			if i+1 < len(histogram.Buckets) {
-				upper := histogram.Buckets[i+1]
-				snapshot.total += upper * float64(count)
-				if upper > snapshot.maxSeen {
-					snapshot.maxSeen = upper
-				}
+				snapshot.histogramUpperBoundTotal += histogram.Buckets[i+1] * float64(count)
 			}
 		}
 		return snapshot, nil
 	}
 	return pauseSnapshot{}, ErrMetricUnavailable
+}
+
+// intervalPauseStats describes ONLY the pauses that happened between two snapshots.
+type intervalPauseStats struct {
+	// Count is how many pauses this interval produced.
+	Count uint64
+	// MaxUpperBound is the largest bucket UPPER BOUND among the interval's pauses.
+	//
+	// It is an upper bound, not a measured maximum: a pause recorded in the bucket [a,b) could
+	// be anywhere in that range. The name says so, because reporting it as "max pause" would
+	// overstate it by up to one bucket width.
+	MaxUpperBound float64
+	// UpperBoundTotal is the sum of bucket upper bounds times counts, for this interval only.
+	UpperBoundTotal float64
+}
+
+// interval computes the pauses attributable to the span between two snapshots.
+//
+// # Why not use the end histogram's largest bucket
+//
+// The end histogram describes the PROCESS, not the run. A benchmark starting after a large
+// collection inherits that collection's slowest pause as its own maximum, which makes every run
+// look alike and hides the very regression being measured.
+//
+// Subtracting bucket counts isolates the interval: a bucket contributes only if its count GREW,
+// and the interval maximum is the largest bucket that grew.
+func (s pauseSnapshot) interval(previous pauseSnapshot) intervalPauseStats {
+	var stats intervalPauseStats
+	for i, count := range s.counts {
+		var previousCount uint64
+		if i < len(previous.counts) {
+			previousCount = previous.counts[i]
+		}
+		if count <= previousCount {
+			continue
+		}
+		added := count - previousCount
+		stats.Count += added
+
+		if i+1 < len(s.buckets) {
+			upper := s.buckets[i+1]
+			stats.UpperBoundTotal += upper * float64(added)
+			if upper > stats.MaxUpperBound {
+				stats.MaxUpperBound = upper
+			}
+		}
+	}
+	return stats
 }
 
 // Recorder samples runtime memory repeatedly during a workload and reports the peak
@@ -190,8 +273,11 @@ type Recorder struct {
 	reader   *reader
 	start    State
 	startPau pauseSnapshot
-	peak     uint64
-	samples  int
+	// startPauseTotalNs is the exact cumulative pause counter at the start, so the interval
+	// total can be computed by subtraction.
+	startPauseTotalNs uint64
+	peak              uint64
+	samples           int
 }
 
 // NewRecorder reads the starting state.
@@ -205,7 +291,15 @@ func NewRecorder() (*Recorder, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Recorder{reader: reader, start: start, startPau: pauses, peak: start.RuntimeManagedBytes}, nil
+	var memoryStats runtime.MemStats
+	runtime.ReadMemStats(&memoryStats)
+	return &Recorder{
+		reader:            reader,
+		start:             start,
+		startPau:          pauses,
+		startPauseTotalNs: memoryStats.PauseTotalNs,
+		peak:              start.RuntimeManagedBytes,
+	}, nil
 }
 
 // Sample records the current runtime-managed memory into the peak.
@@ -234,18 +328,37 @@ func (r *Recorder) Finish() (Delta, State, error) {
 		r.peak = end.RuntimeManagedBytes
 	}
 
+	interval := endPauses.interval(r.startPau)
+
 	delta := Delta{
 		RuntimeManagedAtStart: r.start.RuntimeManagedBytes,
 		RuntimeManagedAtEnd:   end.RuntimeManagedBytes,
 		RuntimeManagedPeak:    r.peak,
-		PauseCount:            endPauses.count - r.startPau.count,
-		PauseMaxSeconds:       endPauses.maxSeen,
+		PauseCount:            interval.Count,
+		// The interval's largest bucket UPPER BOUND. Named as an upper bound because that is
+		// what it is: a pause in bucket [a,b) could be anywhere in that range, so this
+		// overstates by up to one bucket width.
+		PauseMaxUpperBound: interval.MaxUpperBound,
+		// An approximation, kept for the distribution only.
+		PauseUpperBoundTotal: interval.UpperBoundTotal,
 	}
 	if end.GCCycles >= r.start.GCCycles {
 		delta.GCCycles = end.GCCycles - r.start.GCCycles
 	}
-	if endPauses.total >= r.startPau.total {
-		delta.PauseTotalSeconds = endPauses.total - r.startPau.total
+
+	// The EXACT cumulative stop-the-world pause total comes from runtime.MemStats, which
+	// reports it as an integer nanosecond counter maintained by the runtime itself.
+	//
+	// The histogram cannot supply this. Summing bucket upper bounds times counts is an
+	// estimate that can only overstate, and the previous code reported that estimate under a
+	// name - PauseTotalSeconds - that claimed exactness. A benchmark comparing two
+	// configurations on an inflated, quantised figure is comparing bucket widths as much as
+	// pause behaviour.
+	var memoryStats runtime.MemStats
+	runtime.ReadMemStats(&memoryStats)
+	endPauseTotalNs := memoryStats.PauseTotalNs
+	if endPauseTotalNs >= r.startPauseTotalNs {
+		delta.PauseTotalNs = endPauseTotalNs - r.startPauseTotalNs
 	}
 	return delta, end, nil
 }
