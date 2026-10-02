@@ -71,23 +71,29 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-# An ARCHIVE must be signed for DISTRIBUTION, not development.
+# Signing strategy: DEVELOPMENT archive, DISTRIBUTION export.
 #
-# Asking for "Apple Development" makes Xcode request an iOS *Development* profile,
-# which is device-scoped and therefore impossible for a team with no registered
-# device:
+# This is Xcode's own model and the reason the earlier attempts failed. Two wrong
+# approaches, both of which look reasonable:
 #
-#   Communication with Apple failed: Your team has no devices from which to
-#   generate a provisioning profile.
+#   Pinning CODE_SIGN_IDENTITY="Apple Development" makes the archive ask Apple for
+#   an iOS *Development* profile, which is device-scoped:
+#     Communication with Apple failed: Your team has no devices from which to
+#     generate a provisioning profile.
 #
-# "Apple Distribution" produces an App Store profile instead, which needs no
-# device, so TestFlight does not depend on device registration at all.
+#   Pinning "Apple Distribution" makes every target the project leaves on automatic
+#   refuse to build, because the project also sets PROVISIONING_PROFILE_SPECIFIER=""
+#   on those targets:
+#     ... is automatically signed for development, but a conflicting code signing
+#     identity Apple Distribution has been manually specified.
 #
-# CODE_SIGN_STYLE=Automatic must stay: clearing PROVISIONING_PROFILE_SPECIFIER while
-# pinning an identity makes Xcode treat signing as manual, which disables automatic
-# provisioning entirely ("Automatic signing is disabled and unable to generate a
-# profile").
-echo "archiving (Release, iphoneos, arm64, Apple Distribution)"
+# So the identity is not an input at all. `archive` produces a development-signed
+# archive, and `-exportArchive` with method app-store-connect RE-SIGNS it for
+# distribution - which is the step that can use a local Apple Distribution
+# certificate or a cloud-managed one obtained through the signed-in account. That
+# is why TestFlight needs no local distribution certificate and no registered
+# device; only the export step touches distribution signing.
+echo "archiving (Release, iphoneos, arm64; development-signed archive)"
 rm -rf "$archive_path"
 xcodebuild archive \
   -project "$client/sing-box.xcodeproj" \
@@ -102,7 +108,6 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
-  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   -allowProvisioningUpdates \
@@ -131,7 +136,7 @@ built_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 
 built_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Info.plist" 2>/dev/null || echo '?')"
 built_bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist" 2>/dev/null || echo '?')"
 echo "  CFBundleShortVersionString: $built_version"
-echo "  CFBundleVersion:           $built_bundle"
+echo "  CFBundleVersion:           $built_build"
 echo "  CFBundleIdentifier:        $built_bundle"
 
 # --- pre-upload gate ----------------------------------------------------------

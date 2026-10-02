@@ -227,6 +227,70 @@ fi
 restore_overlay
 
 
+echo "== one App Store record: the two main bundle ids must match =="
+# A single App Store Connect record requires one bundle id across platforms, and it
+# cannot be changed after the first upload, so this is checked before anything is
+# archived rather than discovered at upload time.
+main_ids() {
+  APPLE_SIGNING_MODE=testflight APPLE_BASE_BUNDLE_ID="$1" APPLE_APP_GROUP_ID="group.$1" \
+    ./scripts/ci/apple-signing-config.sh --print
+}
+ios_main="$(main_ids "$TEST_BASE" | sed -n 's/^APPLE_IOS_APP_BUNDLE_ID=//p')"
+macos_main="$(main_ids "$TEST_BASE" | sed -n 's/^APPLE_MACOS_APP_BUNDLE_ID=//p')"
+macos_standalone="$(main_ids "$TEST_BASE" | sed -n 's/^APPLE_MACOS_STANDALONE_BUNDLE_ID=//p')"
+check "the iOS main bundle id is the configured base" test "$ios_main" = "$TEST_BASE"
+check "the macOS main bundle id equals the iOS one" test -n "$macos_main" -a "$macos_main" = "$ios_main"
+check "the Developer ID product keeps its own id" \
+  test -n "$macos_standalone" -a "$macos_standalone" != "$macos_main"
+
+echo "== the App Store macOS target is the sandboxed one =="
+# SFM (<base>) is the App Store app. SFM.System (<base>.standalone) is the
+# unsandboxed Developer ID product that installs a privileged helper and a System
+# Extension, and is deliberately not part of the record.
+check "SFM is sandboxed" \
+  grep -q "com.apple.security.app-sandbox" clients/apple/SFM/SFM.entitlements
+check "SFM.System is not sandboxed" \
+  bash -c '! grep -q "com.apple.security.app-sandbox" clients/apple/SFM.System/SFM.entitlements'
+check "SFM carries the in-process packet tunnel provider" \
+  grep -q "packet-tunnel-provider" clients/apple/SFM/SFM.entitlements
+check "SFM.System carries the System Extension variant" \
+  grep -q "packet-tunnel-provider-systemextension" clients/apple/SFM.System/SFM.entitlements
+
+echo "== both platforms have a TestFlight builder =="
+check "the iOS TestFlight builder exists" test -x scripts/ci/build-ios-testflight.sh
+check "the macOS TestFlight builder exists" test -x scripts/ci/build-macos-testflight.sh
+expects_fail "the macOS builder refuses a non-testflight mode" \
+  ./scripts/ci/build-macos-testflight.sh --archive-only
+check "the macOS builder guards the single-record invariant" \
+  grep -q "must match for a single" scripts/ci/build-macos-testflight.sh
+check "the macOS builder refuses an unsandboxed archive" \
+  grep -q "no System Extension embedded" scripts/ci/build-macos-testflight.sh
+
+echo "== the unified entry point dispatches correctly =="
+check "testflight-ios is documented" \
+  bash -c './scripts/release-apple.sh --help | grep -q testflight-ios'
+check "testflight-macos is documented" \
+  bash -c './scripts/release-apple.sh --help | grep -q testflight-macos'
+check "testflight-ios runs only iOS" \
+  python3 "$root/scripts/ci/test-dispatch.py" testflight-ios
+check "testflight-macos runs only macOS" \
+  python3 "$root/scripts/ci/test-dispatch.py" testflight-macos
+check "testflight runs both platforms, iOS first" \
+  python3 "$root/scripts/ci/test-dispatch.py" testflight
+
+echo "== CI stays unsigned and carries no signing secrets =="
+check "the CI job still builds the unsigned IPA" \
+  grep -q "build-ios-ipa.sh" .github/workflows/client-apple.yml
+check "CI never references a distribution identity or key" \
+  bash -c '! grep -qE "Apple Distribution|Apple Development|\.p12|\.p8" .github/workflows/client-apple.yml'
+check "no signing material is tracked" \
+  bash -c '! git ls-files | grep -qiE "\.(p12|pfx|p8|cer|mobileprovision|provisionprofile)$"'
+# Exclude this file: it contains the search pattern as a literal, so a naive grep
+# matches itself and reports a private key that does not exist.
+check "no private key block is tracked" \
+  bash -c '! git grep -lI "BEGIN .*PRIVATE KEY" -- . ":(exclude)scripts/ci/test-apple-signing.sh" 2>/dev/null | grep -q .'
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

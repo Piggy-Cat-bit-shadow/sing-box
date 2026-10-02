@@ -5,7 +5,9 @@
 #   ./scripts/release-apple.sh development        signed iOS IPA and macOS DMG
 #   ./scripts/release-apple.sh development-ios    signed iOS IPA
 #   ./scripts/release-apple.sh development-macos  signed macOS DMG
-#   ./scripts/release-apple.sh testflight         TestFlight archive and upload
+#   ./scripts/release-apple.sh testflight         iOS and macOS, one App Record
+#   ./scripts/release-apple.sh testflight-ios     iOS only
+#   ./scripts/release-apple.sh testflight-macos   macOS only
 #   ./scripts/release-apple.sh unsigned           unsigned IPA and DMG (CI parity)
 #
 # # Why this exists
@@ -25,7 +27,8 @@ cd "$root"
 
 target="${1:-development}"
 case "$target" in
-  development|development-ios|development-macos|testflight) ;;
+  development|development-ios|development-macos) ;;
+  testflight|testflight-ios|testflight-macos) ;;
   unsigned) ;;
   ""|-h|--help)
     sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
@@ -33,12 +36,18 @@ case "$target" in
     ;;
   *)
     echo "release-apple.sh: unknown target '$target'" >&2
-    echo "  expected one of: development, development-ios, development-macos, testflight, unsigned" >&2
+    echo "  expected one of: development, development-ios, development-macos," >&2
+    echo "                   testflight, testflight-ios, testflight-macos, unsigned" >&2
     exit 2
     ;;
 esac
 
-export APPLE_SIGNING_MODE="${APPLE_SIGNING_MODE:-$([ "$target" = "unsigned" ] && echo unsigned || ([ "$target" = "testflight" ] && echo testflight || echo development))}"
+case "$target" in
+  unsigned)                             _default_mode=unsigned ;;
+  testflight|testflight-ios|testflight-macos) _default_mode=testflight ;;
+  *)                                    _default_mode=development ;;
+esac
+export APPLE_SIGNING_MODE="${APPLE_SIGNING_MODE:-$_default_mode}"
 export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
 
 eval "$(./scripts/ci/apple-signing-config.sh)"
@@ -97,12 +106,46 @@ do_macos() {
   ./scripts/ci/verify-apple-signed-artifact.sh macos-dmg dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
 }
 
+# The single-record product model. Both platforms ship as one App Store Connect
+# record, which is only possible because the two main apps share a bundle id.
+print_topology() {
+  cat <<EOF
+  App:        JiejieBox
+  Bundle ID:  $APPLE_IOS_APP_BUNDLE_ID
+  Platforms:  iOS, macOS
+  Record:     one App Store Connect record (universal purchase)
+
+  The macOS App Store app is the SFM target. SFM.System ($APPLE_MACOS_STANDALONE_BUNDLE_ID)
+  is a separate Developer ID product - it is unsandboxed and installs a privileged
+  helper and a System Extension - and is deliberately NOT part of this record.
+EOF
+}
+
 case "$target" in
   development)       do_ios; do_macos ;;
   development-ios)   do_ios ;;
   development-macos) do_macos ;;
   unsigned)          do_ios; do_macos ;;
-  testflight)        step "build and upload TestFlight"; ./scripts/ci/build-ios-testflight.sh ;;
+
+  testflight-ios)
+    step "App Store Connect topology"; print_topology
+    step "build and upload iOS TestFlight"; ./scripts/ci/build-ios-testflight.sh
+    ;;
+
+  testflight-macos)
+    step "App Store Connect topology"; print_topology
+    step "build and upload macOS TestFlight"; ./scripts/ci/build-macos-testflight.sh
+    ;;
+
+  testflight)
+    # One shared configuration, one Libbox build, one overlay, then both platforms.
+    # Building Libbox and applying the overlay once matters: they are the slow steps
+    # and applying the overlay twice is refused by design (it fails closed), so the
+    # combined target cannot simply call the two individual ones.
+    step "App Store Connect topology"; print_topology
+    step "build and upload iOS TestFlight"; ./scripts/ci/build-ios-testflight.sh
+    step "build and upload macOS TestFlight"; ./scripts/ci/build-macos-testflight.sh
+    ;;
 esac
 
 # ---------------------------------------------------------------------------

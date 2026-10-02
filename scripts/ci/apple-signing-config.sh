@@ -189,9 +189,24 @@ fi
 # so one value keeps the whole set consistent.
 base="${APPLE_BASE_BUNDLE_ID:-$UPSTREAM_BUNDLE_PREFIX.sfamt}"
 APPLE_IOS_APP_BUNDLE_ID="$base"
+# The macOS App Store app is the SFM target, and it already uses the SAME bundle
+# identifier as iOS. That is what makes one App Store Connect record possible:
+#
+#   SFI        <base>             sandboxed, packet-tunnel-provider   (iOS)
+#   SFM        <base>             sandboxed, packet-tunnel-provider   (macOS)
+#   SFM.System <base>.standalone  no sandbox, System Extension        (Developer ID)
+#
+# SFM.System is upstream's stand-alone distribution: it installs a System Extension
+# and a privileged helper, so it cannot be sandboxed and is not an App Store product.
+# It keeps the .standalone suffix and is NOT part of the single-record model. The
+# suffix is load-bearing rather than cosmetic - it appears in code-signing
+# requirement strings (CommandXPC, RootHelperService, the helper's launchd plist),
+# so those must keep matching whatever that target is actually called.
 APPLE_IOS_EXTENSION_BUNDLE_ID="$base.extension"
-APPLE_MACOS_APP_BUNDLE_ID="$base.standalone"
+APPLE_MACOS_APP_BUNDLE_ID="$base"
 APPLE_MACOS_SYSTEM_EXTENSION_BUNDLE_ID="$base.system"
+# The Developer ID stand-alone product, which is not an App Store record.
+APPLE_MACOS_STANDALONE_BUNDLE_ID="$base.standalone"
 
 group="${APPLE_APP_GROUP_ID:-group.$UPSTREAM_BUNDLE_PREFIX.sfamt}"
 
@@ -208,6 +223,7 @@ APPLE_APP_GROUP_ID=$group
 APPLE_IOS_APP_BUNDLE_ID=$APPLE_IOS_APP_BUNDLE_ID
 APPLE_IOS_EXTENSION_BUNDLE_ID=$APPLE_IOS_EXTENSION_BUNDLE_ID
 APPLE_MACOS_APP_BUNDLE_ID=$APPLE_MACOS_APP_BUNDLE_ID
+APPLE_MACOS_STANDALONE_BUNDLE_ID=$APPLE_MACOS_STANDALONE_BUNDLE_ID
 APPLE_MACOS_SYSTEM_EXTENSION_BUNDLE_ID=$APPLE_MACOS_SYSTEM_EXTENSION_BUNDLE_ID
 EOF
   exit 0
@@ -226,5 +242,6 @@ APPLE_APP_GROUP_ID=$group
 APPLE_IOS_APP_BUNDLE_ID=$APPLE_IOS_APP_BUNDLE_ID
 APPLE_IOS_EXTENSION_BUNDLE_ID=$APPLE_IOS_EXTENSION_BUNDLE_ID
 APPLE_MACOS_APP_BUNDLE_ID=$APPLE_MACOS_APP_BUNDLE_ID
+APPLE_MACOS_STANDALONE_BUNDLE_ID=$APPLE_MACOS_STANDALONE_BUNDLE_ID
 APPLE_MACOS_SYSTEM_EXTENSION_BUNDLE_ID=$APPLE_MACOS_SYSTEM_EXTENSION_BUNDLE_ID
 EOF
