@@ -231,8 +231,14 @@ echo "== one App Store record: the two main bundle ids must match =="
 # A single App Store Connect record requires one bundle id across platforms, and it
 # cannot be changed after the first upload, so this is checked before anything is
 # archived rather than discovered at upload time.
+# APPLE_TEAM_ID is passed explicitly. Relying on auto-detection would make these
+# assertions depend on the machine having a signing certificate, and on CI there is
+# none - the config layer would then (correctly) refuse testflight mode for a
+# missing team, and the test would fail for a reason that has nothing to do with
+# bundle identifiers.
 main_ids() {
-  APPLE_SIGNING_MODE=testflight APPLE_BASE_BUNDLE_ID="$1" APPLE_APP_GROUP_ID="group.$1" \
+  APPLE_SIGNING_MODE=testflight APPLE_TEAM_ID="$TEST_TEAM" \
+    APPLE_BASE_BUNDLE_ID="$1" APPLE_APP_GROUP_ID="group.$1" \
     ./scripts/ci/apple-signing-config.sh --print
 }
 ios_main="$(main_ids "$TEST_BASE" | sed -n 's/^APPLE_IOS_APP_BUNDLE_ID=//p')"
