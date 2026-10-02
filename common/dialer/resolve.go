@@ -3,6 +3,7 @@ package dialer
 import (
 	"context"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -97,7 +98,27 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		return nil, err
 	}
 	if !destination.IsDomain() {
-		return d.dialer.DialContext(ctx, network, destination)
+		// A literal destination. It may still be worth recovering the other address family:
+		// the application has usually already resolved the name, so a connection to one
+		// address has nothing to fall back to if that address's family is broken. Sniffing
+		// recovered the domain; this turns it back into candidates.
+		//
+		// Recovery is refused when it does not apply, so an unusual situation degrades to the
+		// previous single-candidate dial rather than to a surprising one.
+		recovered := d.recoverCandidates(ctx, destination)
+		if len(recovered) == 0 {
+			return d.dialer.DialContext(ctx, network, destination)
+		}
+		// The original destination stays a candidate, ordered by the shared planner so the
+		// configured family preference survives the recovery.
+		strategy := d.queryOptions.Strategy
+		candidates := MergeOriginalDestination(destination.Addr, recovered, strategy)
+		plan := planCandidates(candidates, destination.Addr, strategy)
+		scheduler := &candidateScheduler{fallbackDelay: d.fallbackDelay}
+		conn, _, err := scheduler.dial(ctx, plan, func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
+			return d.dialer.DialContext(attemptCtx, network, M.SocksaddrFrom(address, destination.Port))
+		})
+		return conn, err
 	}
 	ctx = log.ContextWithOverrideLevel(ctx, log.LevelDebug)
 	addresses, err := d.router.Lookup(ctx, destination.Fqdn, d.queryOptions)
