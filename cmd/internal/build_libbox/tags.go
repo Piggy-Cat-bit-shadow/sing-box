@@ -1,8 +1,7 @@
 package main
 
 import (
-	"sort"
-	"strings"
+	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 )
 
 // Canonical Apple build tag sets.
@@ -30,83 +29,49 @@ import (
 // macOS is NOT, and adding it there would make macOS tests exercise a geometry macOS does
 // not ship.
 
-// appleSharedTags are applied to every Apple target.
-var appleSharedTags = []string{
-	"with_quic",
-	"with_wireguard",
-	"with_utls",
-	"with_naive_outbound",
-	"with_clash_api",
-	"with_usbip",
-	"with_openvpn",
-	"with_openconnect",
-	"badlinkname",
-	"tfogo_checklinkname0",
-	"with_tailscale",
-	"ts_omit_logtail",
-	"ts_omit_ssh",
-	"ts_omit_drive",
-	"ts_omit_taildrop",
-	"ts_omit_webclient",
-	"ts_omit_doctor",
-	"ts_omit_capture",
-	"ts_omit_kube",
-	"ts_omit_aws",
-	"ts_omit_synology",
-	"ts_omit_bird",
-}
-
-// appleDarwinTags are added for Apple targets.
-var appleDarwinTags = []string{
-	"with_dhcp",
-	"grpcnotrace",
-}
-
-// appleLowMemoryTag is what the iOS and tvOS builds add, and macOS does not.
-const appleLowMemoryTag = "with_low_memory"
-
-// appleDeploymentTags returns the tags an Apple build uses for a target family.
+// The Apple tag lists live in cmd/internal/applebuildtags and are imported, not repeated.
 //
-// lowMemory reports whether the target is a phone/tablet/tv family: iOS, tvOS and their
-// simulators get with_low_memory; macOS does not.
-func appleDeploymentTags(lowMemory bool) []string {
-	tags := make([]string, 0, len(appleSharedTags)+len(appleDarwinTags)+1)
-	tags = append(tags, appleSharedTags...)
-	tags = append(tags, appleDarwinTags...)
-	if lowMemory {
-		tags = append(tags, appleLowMemoryTag)
-	}
-	return tags
-}
-
-// AppleDeploymentTags is the exported form, for tooling that needs the shipped set.
+// They used to be defined here AND in cmd/internal/appletags, kept in agreement by a test that
+// parsed this file's source. That caught a tag added to one copy but not the other; it could
+// not catch a question asked wrongly in both. The mixed-target macOS leak was exactly that -
+// both lists identical, contract test green, defect in how the shared set was derived.
 //
-// It is sorted so a caller comparing two sets is not defeated by ordering, and returned as
-// a fresh slice so a caller cannot mutate the canonical lists.
-func AppleDeploymentTags(lowMemory bool) []string {
-	tags := appleDeploymentTags(lowMemory)
-	sort.Strings(tags)
-	return tags
+// See applebuildtags.CommonTags for why a mobile-only tag must never enter the common set.
+
+// AppleDeploymentTags is the full tag set a single Apple platform ships.
+//
+// It describes the SEMANTIC result for that platform. What gomobile is handed is different:
+// the common set via -tags, plus the mobile-only set via -tags-not-macos. See CommonTagString
+// and LowMemoryTagString.
+func AppleDeploymentTags(platform string) []string {
+	return applebuildtags.FullDeploymentTags(platform)
 }
 
 // AppleDeploymentTagString is AppleDeploymentTags joined for -tags.
-func AppleDeploymentTagString(lowMemory bool) string {
-	return strings.Join(AppleDeploymentTags(lowMemory), ",")
+func AppleDeploymentTagString(platform string) string {
+	return applebuildtags.FullDeploymentTagString(platform)
 }
 
-// appleDeploymentTagsForTarget maps a gomobile -target value to the tags that family ships.
+// CommonTagString is the tag set gomobile receives via -tags for ANY Apple target.
+func CommonTagString() string {
+	return applebuildtags.CommonTagString()
+}
+
+// LowMemoryTagString is the mobile-only tag set gomobile receives via -tags-not-macos.
+func LowMemoryTagString() string {
+	return applebuildtags.LowMemoryTagString()
+}
+
+// appleDeploymentTagsForTarget returns the COMMON tag set for a gomobile -target value.
 //
-// iOS and tvOS (and their simulators) get with_low_memory because libbox passes
-// -tags-not-macos=with_low_memory; macOS is built without it. Deriving the set from the
-// target means the builder cannot disagree with AppleDeploymentTags about which platforms
-// are low-memory.
+// It deliberately ignores which platforms are in the list. A previous version inspected the
+// target, decided "some target here is mobile", and folded with_low_memory into the common set.
+// For `ios,macos` - which is what the Apple CI builds - that enabled low-memory geometry on
+// macOS, and the accompanying -tags-not-macos could not remove it, because -tags had already
+// turned it on.
+//
+// The common set is now the same for every Apple target by construction, so there is no
+// target for the bug to depend on.
 func appleDeploymentTagsForTarget(bindTarget string) []string {
-	lowMemory := false
-	for _, target := range strings.Split(bindTarget, ",") {
-		switch strings.TrimSpace(target) {
-		case "ios", "iossimulator", "tvos", "tvossimulator":
-			lowMemory = true
-		}
-	}
-	return appleDeploymentTags(lowMemory)
+	return applebuildtags.TargetTags(bindTarget)
 }

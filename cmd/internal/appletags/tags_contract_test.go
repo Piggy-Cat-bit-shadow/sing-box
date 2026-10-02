@@ -1,160 +1,83 @@
 package main
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
-	"sort"
-	"strings"
 	"testing"
+
+	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 )
 
-// Contract test: this command's tag set must equal the builder's.
+// The contract these tests used to enforce - that this command's tag lists equal the builder's -
+// is now enforced by the compiler, because both import cmd/internal/applebuildtags.
 //
-// # Why this test exists rather than a shared import
+// The old test parsed the builder's SOURCE TEXT and compared string slices. That catches a tag
+// added to one copy and not the other. It cannot catch a question asked wrongly in both copies,
+// which is how the mixed-target macOS leak survived with both lists byte-identical and this
+// test green.
 //
-// The builder lives in cmd/internal/build_libbox, which is package main and cannot be
-// imported. The two lists could therefore drift silently, which is exactly the problem this
-// work removed at the CI level - so it must not be reintroduced one level down.
-//
-// Rather than trust two lists to stay in step, this reads the builder's actual source and
-// extracts the tags it declares, then compares. If someone adds a tag to the builder and
-// forgets this command, this fails.
-func TestAppleTagsMatchTheBuilder(t *testing.T) {
-	builderSource, err := os.ReadFile(filepath.Join("..", "build_libbox", "tags.go"))
-	if err != nil {
-		t.Fatalf("cannot read the builder's tag definition: %v", err)
-	}
-	source := string(builderSource)
+// What remains worth testing is the semantics a caller depends on.
 
-	shared := extractStringSlice(t, source, "appleSharedTags = []string{")
-	darwin := extractStringSlice(t, source, "appleDarwinTags = []string{")
-	lowMemoryTag := extractStringConst(t, source, "appleLowMemoryTag")
-
-	if len(shared) == 0 {
-		t.Fatal("extracted no shared tags from the builder; the parser or the source changed")
-	}
-
-	compare := func(name string, want []string, got []string) {
-		t.Helper()
-		sortedWant := append([]string(nil), want...)
-		sortedGot := append([]string(nil), got...)
-		sort.Strings(sortedWant)
-		sort.Strings(sortedGot)
-		if strings.Join(sortedWant, ",") != strings.Join(sortedGot, ",") {
-			t.Errorf("%s differs from the builder:\n  builder: %v\n  appletags: %v",
-				name, sortedWant, sortedGot)
+// TestCanonicalTagsMatchTheSharedDefinition checks the command reports what the package defines.
+func TestCanonicalTagsMatchTheSharedDefinition(t *testing.T) {
+	for _, platform := range applebuildtags.ApplePlatforms() {
+		got := canonicalAppleTags(platform.Name)
+		want := applebuildtags.FullDeploymentTags(platform.Name)
+		if len(got) != len(want) {
+			t.Fatalf("%s: got %d tags, want %d", platform.Name, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("%s: tag %d = %q, want %q", platform.Name, i, got[i], want[i])
+			}
 		}
 	}
-
-	compare("shared tags", shared, appleSharedTagList)
-	compare("darwin tags", darwin, appleDarwinTagList)
-	if lowMemoryTag != appleLowMemoryTagName {
-		t.Errorf("low-memory tag: builder %q, appletags %q", lowMemoryTag, appleLowMemoryTagName)
-	}
 }
 
-func TestLowMemoryTagIsOnlyInTheMobileSet(t *testing.T) {
-	// iOS and tvOS ship with_low_memory; macOS does not. Adding it to macOS would make
-	// macOS tests exercise a buffer geometry macOS does not ship.
-	mobile := canonicalAppleTags(true)
-	desktop := canonicalAppleTags(false)
-
-	if !contains(mobile, appleLowMemoryTagName) {
-		t.Error("the iOS/tvOS set must contain with_low_memory")
-	}
-	if contains(desktop, appleLowMemoryTagName) {
-		t.Error("the macOS set must NOT contain with_low_memory")
-	}
-
-	// The mobile set is exactly the desktop set plus the low-memory tag.
-	desktopWithTag := append(append([]string(nil), desktop...), appleLowMemoryTagName)
-	sort.Strings(desktopWithTag)
-	if strings.Join(desktopWithTag, ",") != strings.Join(mobile, ",") {
-		t.Errorf("the mobile set must be the desktop set plus with_low_memory\n  desktop+tag: %v\n  mobile: %v",
-			desktopWithTag, mobile)
-	}
-}
-
-func TestCommandOutputMatchesTheCanonicalSet(t *testing.T) {
-	// The command is what the CI scripts consume, so its OUTPUT is compared, not just the
-	// underlying function. A command that printed something else would leave the gate
-	// testing the wrong tags while this test passed.
-	output, err := exec.Command("go", "run", ".", "-low-memory=true").Output()
-	if err != nil {
-		t.Fatalf("running appletags: %v", err)
-	}
-	printed := strings.Split(strings.TrimSpace(string(output)), ",")
-	sort.Strings(printed)
-
-	want := canonicalAppleTags(true)
-	if strings.Join(printed, ",") != strings.Join(want, ",") {
-		t.Errorf("printed tags differ from the canonical set:\n  printed: %v\n  want:    %v", printed, want)
-	}
-}
-
-func TestMacOSOutputHasNoLowMemoryTag(t *testing.T) {
-	output, err := exec.Command("go", "run", ".", "-low-memory=false").Output()
-	if err != nil {
-		t.Fatalf("running appletags: %v", err)
-	}
-	if strings.Contains(string(output), appleLowMemoryTagName) {
-		t.Fatalf("the macOS output must not contain %s, got %q", appleLowMemoryTagName, output)
-	}
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
+// TestMobilePlatformsCarryLowMemoryAndMacOSDoesNot is the semantic contract, stated per
+// platform rather than per tag-list.
+func TestMobilePlatformsCarryLowMemoryAndMacOSDoesNot(t *testing.T) {
+	for _, platform := range applebuildtags.ApplePlatforms() {
+		tags := canonicalAppleTags(platform.Name)
+		hasLowMemory := false
+		for _, tag := range tags {
+			if tag == applebuildtags.LowMemoryTag {
+				hasLowMemory = true
+			}
+		}
+		if platform.LowMemory && !hasLowMemory {
+			t.Fatalf("%s must carry %q", platform.Name, applebuildtags.LowMemoryTag)
+		}
+		if !platform.LowMemory && hasLowMemory {
+			t.Fatalf("%s must not carry %q", platform.Name, applebuildtags.LowMemoryTag)
 		}
 	}
-	return false
 }
 
-// extractStringSlice reads a `name = []string{ ... }` literal's contents.
-func extractStringSlice(t *testing.T, source string, marker string) []string {
-	t.Helper()
-	start := strings.Index(source, marker)
-	if start < 0 {
-		t.Fatalf("marker %q not found in the builder source", marker)
-	}
-	rest := source[start+len(marker):]
-	end := strings.Index(rest, "}")
-	if end < 0 {
-		t.Fatalf("unterminated literal after %q", marker)
-	}
-	var values []string
-	for _, line := range strings.Split(rest[:end], "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, `"`) {
-			continue
-		}
-		value := strings.TrimSuffix(strings.TrimPrefix(line, `"`), `",`)
-		value = strings.TrimSuffix(value, `"`)
-		if value != "" {
-			values = append(values, value)
+// TestCommonSetNeverCarriesLowMemory is the invariant that makes the mixed-target leak
+// impossible: the set gomobile receives via -tags is shared by every target, so a mobile-only
+// tag in it would reach macOS where -tags-not-macos cannot remove it.
+func TestCommonSetNeverCarriesLowMemory(t *testing.T) {
+	for _, tag := range applebuildtags.CommonTags() {
+		if tag == applebuildtags.LowMemoryTag {
+			t.Fatalf("the common set contains %q; it would be enabled on macOS too", applebuildtags.LowMemoryTag)
 		}
 	}
-	return values
+	if commonAppleTagString() == "" {
+		t.Fatal("the common tag string must not be empty")
+	}
 }
 
-// extractStringConst reads a `name = "value"` constant.
-func extractStringConst(t *testing.T, source string, marker string) string {
-	t.Helper()
-	start := strings.Index(source, marker)
-	if start < 0 {
-		t.Fatalf("constant %q not found in the builder source", marker)
+// TestMobileOnlySetCarriesTheTag confirms the per-platform channel still does its job.
+func TestMobileOnlySetCarriesTheTag(t *testing.T) {
+	hasLowMemory := false
+	for _, tag := range applebuildtags.LowMemoryMobileTags() {
+		if tag == applebuildtags.LowMemoryTag {
+			hasLowMemory = true
+		}
 	}
-	rest := source[start+len(marker):]
-	first := strings.Index(rest, `"`)
-	if first < 0 {
-		t.Fatalf("no value for constant %q", marker)
+	if !hasLowMemory {
+		t.Fatalf("the mobile-only set must carry %q or iOS would lose its geometry", applebuildtags.LowMemoryTag)
 	}
-	rest = rest[first+1:]
-	second := strings.Index(rest, `"`)
-	if second < 0 {
-		t.Fatalf("unterminated value for constant %q", marker)
+	if lowMemoryAppleTagString() == "" {
+		t.Fatal("the mobile-only tag string must not be empty")
 	}
-	return rest[:second]
 }

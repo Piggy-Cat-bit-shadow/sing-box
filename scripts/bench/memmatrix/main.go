@@ -221,7 +221,7 @@ func main() {
 // would mean benchmarking a configuration nothing ships, which is the defect this
 // replaced.
 func appleTags() (string, error) {
-	output, err := exec.Command("go", "run", "./cmd/internal/appletags", "-low-memory=true").Output()
+	output, err := exec.Command("go", "run", "./cmd/internal/appletags", "-platform", "ios").Output()
 	if err != nil {
 		return "", fmt.Errorf("cannot read the canonical Apple tags: %w", err)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,9 +68,8 @@ func init() {
 	// the memory benchmark all read ONE definition. Three hand-maintained lists that are
 	// supposed to agree eventually do not, and the failure is silent: the tests keep
 	// passing against a tag set nothing ships.
-	sharedTags = append(sharedTags, appleSharedTags...)
-	darwinTags = append(darwinTags, appleDarwinTags...)
-	notMemcTags = append(notMemcTags, appleLowMemoryTag)
+	sharedTags = append(sharedTags, applebuildtags.CommonTags()...)
+	notMemcTags = append(notMemcTags, applebuildtags.LowMemoryMobileTags()...)
 	debugTags = append(debugTags, "debug")
 }
 
@@ -205,7 +205,10 @@ func buildApple() {
 		"-v",
 		"-target", bindTarget,
 		"-libname=box",
-		"-tags-not-macos=with_low_memory",
+		// The mobile-only geometry, applied per platform. This is the ONLY channel that can
+		// express "iOS gets it, macOS does not": -tags below is common to every target, so a
+		// mobile-only tag placed there would reach macOS regardless of this flag.
+		"-tags-not-macos=" + LowMemoryTagString(),
 		"-iosversion=15.0",
 		"-macosversion=13.0",
 		"-tvosversion=17.0",
@@ -220,9 +223,12 @@ func buildApple() {
 		args = append(args, debugFlags...)
 	}
 
-	// iOS, tvOS and their simulators ship with_low_memory; macOS does not. The build
-	// target already encodes that split, so the tag set is derived from it rather than
-	// assumed, and a mismatch with the canonical definition is impossible.
+	// The COMMON tag set. iOS, tvOS and their simulators additionally receive
+	// with_low_memory through -tags-not-macos above.
+	//
+	// This set is identical for every Apple target by construction, because -tags applies to
+	// all of them. Folding the mobile-only tag in here would enable it on macOS in a mixed
+	// build, and no per-platform flag could undo that.
 	tags := appleDeploymentTagsForTarget(bindTarget)
 	if debugEnabled {
 		tags = append(tags, debugTags...)

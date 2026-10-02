@@ -1,58 +1,32 @@
 package main
 
 import (
-	"sort"
-	"strings"
+	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 )
 
-// canonicalAppleTags mirrors the builder's definition.
+// The Apple tag lists are imported from cmd/internal/applebuildtags, not repeated here.
 //
-// The builder's tag lists live in cmd/internal/build_libbox, which is package main and
-// therefore cannot be imported. Rather than duplicate the list - the exact failure this
-// work exists to remove - a contract test compares this output against the builder's and
-// fails if they ever diverge. The test is the single source of truth; this is a view of it.
-func canonicalAppleTags(lowMemory bool) []string {
-	tags := make([]string, 0, len(appleSharedTagList)+len(appleDarwinTagList)+1)
-	tags = append(tags, appleSharedTagList...)
-	tags = append(tags, appleDarwinTagList...)
-	if lowMemory {
-		tags = append(tags, appleLowMemoryTagName)
-	}
-	sort.Strings(tags)
-	return tags
+// This file previously held a byte-for-byte copy of the builder's lists and relied on a test
+// that parsed the builder's source to keep them equal. Two copies kept in sync by a parser
+// cannot catch a question asked wrongly in both places, which is exactly how the mixed-target
+// macOS leak survived a green contract test. One imported definition cannot diverge at all.
+
+// canonicalAppleTags returns the full tag set a single Apple platform ships.
+func canonicalAppleTags(platform string) []string {
+	return applebuildtags.FullDeploymentTags(platform)
 }
 
-// appleSharedTagList must equal build_libbox's appleSharedTags; see the contract test.
-var appleSharedTagList = []string{
-	"with_quic",
-	"with_wireguard",
-	"with_utls",
-	"with_naive_outbound",
-	"with_clash_api",
-	"with_usbip",
-	"with_openvpn",
-	"with_openconnect",
-	"badlinkname",
-	"tfogo_checklinkname0",
-	"with_tailscale",
-	"ts_omit_logtail",
-	"ts_omit_ssh",
-	"ts_omit_drive",
-	"ts_omit_taildrop",
-	"ts_omit_webclient",
-	"ts_omit_doctor",
-	"ts_omit_capture",
-	"ts_omit_kube",
-	"ts_omit_aws",
-	"ts_omit_synology",
-	"ts_omit_bird",
+// canonicalAppleTagString is canonicalAppleTags joined for -tags.
+func canonicalAppleTagString(platform string) string {
+	return applebuildtags.FullDeploymentTagString(platform)
 }
 
-var appleDarwinTagList = []string{
-	"with_dhcp",
-	"grpcnotrace",
+// commonAppleTagString is the tag set gomobile receives via -tags for ANY Apple target.
+func commonAppleTagString() string {
+	return applebuildtags.CommonTagString()
 }
 
-const appleLowMemoryTagName = "with_low_memory"
-
-var _ = strings.Join
+// lowMemoryAppleTagString is the mobile-only set gomobile receives via -tags-not-macos.
+func lowMemoryAppleTagString() string {
+	return applebuildtags.LowMemoryTagString()
+}

@@ -34,14 +34,41 @@ cd "$root"
 # This gate is only meaningful while the iOS build really does use with_low_memory.
 # If that ever changes, running these tests with the tag would be checking a
 # configuration nothing ships - worse than no gate, because it looks like coverage.
-if ! grep -q 'appleLowMemoryTag' cmd/internal/build_libbox/tags.go; then
-  echo "FAIL: the Apple libbox build no longer declares a low-memory tag." >&2
-  echo "  iOS would be built with the default 32 KiB buffers, so this gate would test" >&2
-  echo "  a configuration that is not shipped." >&2
-  echo "  Apple iOS low-memory contract changed; review required." >&2
+# Ask the source of truth which platform ships what, rather than grepping an implementation
+# file for a symbol name. The previous check searched build_libbox/tags.go for a variable name,
+# so it broke the moment the definitions moved into an importable package - and it could only
+# ever prove a name existed, never that the resulting tags were right.
+#
+# Two separate facts are asserted, because they are genuinely separate now:
+#   - the COMMON set gomobile passes via -tags must NOT contain with_low_memory, or macOS
+#     receives mobile geometry it must never have in a mixed ios,macos build;
+#   - the mobile-only set passed via -tags-not-macos MUST contain it, or iOS silently loses
+#     the 16 KiB buffers this gate exists to test.
+common_tags="$(go run ./cmd/internal/appletags -common 2>&1)"
+mobile_tags="$(go run ./cmd/internal/appletags -mobile-only 2>&1)"
+if [ -z "$common_tags" ] || [ -z "$mobile_tags" ]; then
+  echo "FAIL: could not read the Apple tag sets from cmd/internal/appletags." >&2
   exit 1
 fi
-echo "low-memory contract: with_low_memory is still passed to the Apple libbox build"
+case "$common_tags" in
+  *with_low_memory*)
+    echo "FAIL: the COMMON Apple tag set contains with_low_memory." >&2
+    echo "  gomobile applies -tags to every target, so this enables mobile buffer geometry" >&2
+    echo "  on macOS in a mixed ios,macos build, where -tags-not-macos cannot remove it." >&2
+    exit 1
+    ;;
+esac
+case "$mobile_tags" in
+  *with_low_memory*)
+    ;;
+  *)
+    echo "FAIL: the mobile-only Apple tag set does not contain with_low_memory." >&2
+    echo "  iOS would be built with the default 32 KiB buffers, so this gate would test" >&2
+    echo "  a configuration that is not shipped." >&2
+    exit 1
+    ;;
+esac
+echo "low-memory contract: mobile-only set carries with_low_memory; common set does not"
 
 # --- Apple tags, from the one definition the builder uses ---------------------
 #
@@ -55,7 +82,7 @@ echo "low-memory contract: with_low_memory is still passed to the Apple libbox b
 #
 # cmd/internal/appletags prints the canonical set from the same source build_libbox uses.
 # A contract test in that package fails if the two ever diverge.
-apple_tags="$(go run ./cmd/internal/appletags -low-memory=true 2>&1)"
+apple_tags="$(go run ./cmd/internal/appletags -platform ios 2>&1)"
 if [ -z "$apple_tags" ]; then
   echo "FAIL: could not read the canonical Apple tag set from cmd/internal/appletags." >&2
   echo "  Refusing to fall back to a guess: a gate testing unknown tags is worse than none." >&2
