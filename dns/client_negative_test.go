@@ -10,6 +10,8 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/atomic"
+	"github.com/sagernet/sing/common/logger"
+	"github.com/stretchr/testify/require"
 )
 
 // Tests for QNAME-wide NXDOMAIN negative caching.
@@ -114,10 +116,17 @@ func negativeQuery(name string, qtype uint16) *mDNS.Msg {
 
 func newNegativeClient(t *testing.T, transport *negativeTransport) *Client {
 	t.Helper()
-	return NewClient(ClientOptions{
+	client := NewClient(ClientOptions{
 		Context: context.Background(),
 		Logger:  log.NewNOPFactory().Logger(),
 	})
+	// Start() is what wires the caches, and production reaches it the same way: the DNS
+	// Router calls client.Start() during its own start stage. Constructing without it
+	// used to be enough when the negative cache was initialised from the memory-exact
+	// path, which is precisely the coupling that left persistent-backend deployments
+	// without a name cache. Tests now follow the real lifecycle.
+	client.Start()
+	return client
 }
 
 // exchange runs one query through the same entry point the router uses.
@@ -390,6 +399,7 @@ func TestNXDomain_DisableCacheIsHonoured(t *testing.T) {
 		Logger:       log.NewNOPFactory().Logger(),
 		DisableCache: true,
 	})
+	client.Start()
 
 	if _, err := exchange(t, client, transport, negativeQuery("nocache.example.", mDNS.TypeA)); err != nil {
 		t.Fatal(err)
@@ -498,6 +508,7 @@ func BenchmarkDNSCacheMiss(b *testing.B) {
 		Logger:       log.NewNOPFactory().Logger(),
 		DisableCache: true,
 	})
+	client.Start()
 	message := benchmarkQuery(mDNS.TypeA)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -506,4 +517,344 @@ func BenchmarkDNSCacheMiss(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// --- TTL decrement (§9) ---------------------------------------------------------
+
+func TestNXDomain_ReportsRemainingTTLNotOriginal(t *testing.T) {
+	// A verdict recorded at TTL 5 must not still claim 5 seconds a second later. A client
+	// that honours negative caching would otherwise hold the name far longer than the
+	// authoritative server asked for.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 5, 5)
+	}}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("ttl.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	response, err := exchange(t, client, transport, negativeQuery("ttl.example.", mDNS.TypeAAAA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, mDNS.RcodeNameError, response.Rcode)
+	require.Equal(t, 1, transport.count(), "the name-wide verdict must still be serving this")
+
+	soa := findSOA(t, response)
+	// Deliberately a range rather than an exact value: the scheduler decides how much of
+	// the second elapsed, and pinning 3 or 4 would make this flaky rather than strict.
+	require.Greater(t, soa.Hdr.Ttl, uint32(0), "the remaining TTL must not have run out")
+	require.Less(t, soa.Hdr.Ttl, uint32(5),
+		"the reported TTL must be the REMAINING lifetime, not the original 5 seconds")
+}
+
+func findSOA(t *testing.T, response *mDNS.Msg) *mDNS.SOA {
+	t.Helper()
+	for _, record := range response.Ns {
+		if soa, isSOA := record.(*mDNS.SOA); isSOA {
+			return soa
+		}
+	}
+	t.Fatal("the cached NXDOMAIN must carry its SOA authority")
+	return nil
+}
+
+// --- CNAME safety (§10) ---------------------------------------------------------
+
+func cnameNXDomainResponse(request *mDNS.Msg) *mDNS.Msg {
+	response := new(mDNS.Msg)
+	response.SetReply(request)
+	response.Rcode = mDNS.RcodeNameError
+	// The alias exists; its TARGET does not. This is the shape that must not be widened
+	// to the queried name.
+	response.Answer = []mDNS.RR{&mDNS.CNAME{
+		Hdr:    mDNS.RR_Header{Name: request.Question[0].Name, Rrtype: mDNS.TypeCNAME, Class: mDNS.ClassINET, Ttl: 300},
+		Target: "missing.example.",
+	}}
+	response.Ns = []mDNS.RR{soaAuthority("example.org.", 300, 300)}
+	return response
+}
+
+func TestNXDomain_CNAMEChainIsNotWidenedToQNAME(t *testing.T) {
+	// A terminal NXDOMAIN reached through a CNAME says the TARGET is absent, not the name
+	// that was asked about. Caching that name-wide would make the alias itself look
+	// non-existent for every record type.
+	transport := &negativeTransport{respond: cnameNXDomainResponse}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("alias.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A different type for the same name must go upstream, because no name-wide verdict
+	// was justified.
+	if _, err := exchange(t, client, transport, negativeQuery("alias.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 2, transport.count(),
+		"an NXDOMAIN that travelled through a CNAME must not answer other types locally")
+}
+
+func TestNXDomain_CNAMEQueryNotAnsweredAsNXDOMAIN(t *testing.T) {
+	// The strongest form of the same rule: querying the CNAME itself must not be answered
+	// from a name-wide verdict, because the alias demonstrably exists.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		if request.Question[0].Qtype == mDNS.TypeCNAME {
+			response := new(mDNS.Msg)
+			response.SetReply(request)
+			response.Rcode = mDNS.RcodeSuccess
+			response.Answer = []mDNS.RR{&mDNS.CNAME{
+				Hdr:    mDNS.RR_Header{Name: request.Question[0].Name, Rrtype: mDNS.TypeCNAME, Class: mDNS.ClassINET, Ttl: 300},
+				Target: "missing.example.",
+			}}
+			return response
+		}
+		return cnameNXDomainResponse(request)
+	}}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("alias.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := exchange(t, client, transport, negativeQuery("alias.example.", mDNS.TypeCNAME))
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, mDNS.RcodeSuccess, response.Rcode,
+		"the alias exists, so a CNAME query must not be answered NXDOMAIN from the cache")
+	require.NotEmpty(t, response.Answer)
+}
+
+// --- real SOA TTL, not the rewritten value (§11) --------------------------------
+
+func TestNXDomain_ZeroSOATTLIsNotPromotedByNameWide(t *testing.T) {
+	// The zone said "do not cache this" with a zero negative TTL. An operator's rewrite_ttl
+	// must not turn that into a name-wide verdict: the exact cache may honour the rewrite,
+	// but widening a non-cacheable answer across every record type is a different act.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 0, 0) // min(0,0) = 0
+	}}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("zero.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exchange(t, client, transport, negativeQuery("zero.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 2, transport.count(),
+		"a zero negative TTL must not be promoted to a name-wide verdict")
+}
+
+// --- persistent backend (§12) ---------------------------------------------------
+
+// persistentStore is a fake adapter.DNSCacheStore, standing in for a real persistent
+// exact-cache backend such as a Redis or file store.
+//
+// It stores nothing: the point of the test is that the NAME-WIDE cache works independently
+// of whichever exact backend exists, so a store that never returns a hit is the strongest
+// form of the assertion - any local answer must have come from the name cache.
+type persistentStore struct {
+	saved int
+}
+
+func (s *persistentStore) LoadDNSCache(string, string, uint16) ([]byte, time.Time, bool) {
+	return nil, time.Time{}, false
+}
+
+func (s *persistentStore) SaveDNSCache(string, string, uint16, []byte, time.Time) error {
+	s.saved++
+	return nil
+}
+
+func (s *persistentStore) SaveDNSCacheAsync(string, string, uint16, []byte, time.Time, logger.Logger) {
+	s.saved++
+}
+
+func (s *persistentStore) ClearDNSCache() error { return nil }
+
+func TestNXDomain_WorksWithPersistentBackend(t *testing.T) {
+	// The name-wide cache must not depend on the memory exact backend being the one in
+	// use. Initialising it from initializeMemoryCache meant a persistent deployment got no
+	// name cache at all, and every record type cost its own upstream query.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	store := &persistentStore{}
+	client := NewClient(ClientOptions{
+		Context:  context.Background(),
+		Logger:   log.NewNOPFactory().Logger(),
+		DNSCache: func() adapter.DNSCacheStore { return store },
+	})
+	client.Start()
+	require.Nil(t, client.cache, "the memory exact cache must not be in use for this test")
+	require.NotNil(t, client.nxdomainCache, "the name-wide cache must exist independently")
+
+	if _, err := exchange(t, client, transport, negativeQuery("persist.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exchange(t, client, transport, negativeQuery("persist.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 1, transport.count(),
+		"the name-wide verdict must serve the second type even with a persistent exact cache")
+}
+
+// --- idempotent init (§13) ------------------------------------------------------
+
+func TestNXDomain_InitializeIsIdempotent(t *testing.T) {
+	// Called twice, the cache must not be recreated: doing so would silently drop every
+	// verdict already recorded, with extra upstream queries as the only symptom.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("idem.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	before := client.nxdomainCache
+	require.Equal(t, 1, client.nxdomainCache.Len())
+
+	client.initializeNXDomainCache()
+
+	require.Same(t, before, client.nxdomainCache, "re-initialising must not replace the cache")
+	require.Equal(t, 1, client.nxdomainCache.Len(), "existing verdicts must survive")
+}
+
+// --- ClearCache (§14) -----------------------------------------------------------
+
+func TestNXDomain_ClearCacheClearsNegativeCache(t *testing.T) {
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	client := newNegativeClient(t, transport)
+
+	if _, err := exchange(t, client, transport, negativeQuery("clear.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exchange(t, client, transport, negativeQuery("clear.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 1, transport.count(), "the verdict must be serving before the clear")
+
+	client.ClearCache()
+
+	if _, err := exchange(t, client, transport, negativeQuery("clear.example.", mDNS.TypeHTTPS)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 2, transport.count(),
+		"ClearCache must discard name-wide verdicts, or it did not clear the state the caller asked about")
+}
+
+// --- disable_expire coherence (§15) ---------------------------------------------
+
+func TestNXDomain_DisableExpireKeepsVerdicts(t *testing.T) {
+	// The ordinary exact cache ignores lifetimes under disable_expire, so the name-wide
+	// cache must too. Expiring one and not the other would answer neighbouring query types
+	// inconsistently for no reason an operator could observe or intend.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 1, 1)
+	}}
+	client := NewClient(ClientOptions{
+		Context:       context.Background(),
+		Logger:        log.NewNOPFactory().Logger(),
+		DisableExpire: true,
+	})
+	client.Start()
+
+	if _, err := exchange(t, client, transport, negativeQuery("noexpire.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if _, err := exchange(t, client, transport, negativeQuery("noexpire.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 1, transport.count(),
+		"disable_expire must keep name-wide verdicts, as it does for the exact cache")
+}
+
+// --- positive vs negative coexistence (§16) -------------------------------------
+
+func TestNXDomain_PositiveExactCacheWinsOverNegativeName(t *testing.T) {
+	// The real question is precedence, and the earlier version of this test could not
+	// answer it: it asked for A twice, so it never created a negative verdict at all.
+	//
+	// This establishes a positive A, then an NXDOMAIN for the SAME NAME under a different
+	// type, then asks for A again. The positive entry must still win, from the exact cache.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		if request.Question[0].Qtype == mDNS.TypeA {
+			return FixedResponse(request.Id, request.Question[0], []netip.Addr{netip.MustParseAddr("192.0.2.7")}, 300)
+		}
+		return nxdomainResponse(request, 300, 300)
+	}}
+	client := newNegativeClient(t, transport)
+
+	first, err := exchange(t, client, transport, negativeQuery("mixed.example.", mDNS.TypeA))
+	require.NoError(t, err)
+	require.NotEmpty(t, first.Answer, "precondition: A must be positive")
+
+	// Create the contradicting name-wide verdict.
+	if _, err := exchange(t, client, transport, negativeQuery("mixed.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 2, transport.count(), "precondition: the AAAA must have gone upstream")
+
+	// The positive entry must still be served, and must not be clobbered.
+	third, err := exchange(t, client, transport, negativeQuery("mixed.example.", mDNS.TypeA))
+	require.NoError(t, err)
+	require.Equal(t, mDNS.RcodeSuccess, third.Rcode,
+		"the exact positive entry must win over the name-wide negative verdict")
+	require.NotEmpty(t, third.Answer, "the positive answer must still carry its address")
+	require.Equal(t, 2, transport.count(),
+		"the positive hit must not cost an upstream query")
+}
+
+// --- namespace separation (§17) -------------------------------------------------
+
+func TestNXDomain_ECSSubnetNamespaceIsSeparate(t *testing.T) {
+	// A verdict reached with one client subnet must not answer a different one: an
+	// authoritative server is entitled to give different answers per subnet.
+	transport := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	client := newNegativeClient(t, transport)
+
+	withSubnet := adapter.DNSQueryOptions{ClientSubnet: netip.MustParsePrefix("192.0.2.0/24")}
+	if _, err := client.Exchange(context.Background(), transport,
+		negativeQuery("ecs.example.", mDNS.TypeA), withSubnet, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	otherSubnet := adapter.DNSQueryOptions{ClientSubnet: netip.MustParsePrefix("198.51.100.0/24")}
+	if _, err := client.Exchange(context.Background(), transport,
+		negativeQuery("ecs.example.", mDNS.TypeAAAA), otherSubnet, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	require.Equal(t, 2, transport.count(),
+		"a different client subnet is a different namespace and must go upstream")
+}
+
+func TestNXDomain_EnvironmentNamespaceIsSeparate(t *testing.T) {
+	// Same reasoning for the transport environment: a network change can change the answer.
+	first := &negativeTransport{respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	second := &negativeTransport{tag: "other-env", respond: func(request *mDNS.Msg) *mDNS.Msg {
+		return nxdomainResponse(request, 300, 300)
+	}}
+	client := newNegativeClient(t, first)
+
+	if _, err := exchange(t, client, first, negativeQuery("env.example.", mDNS.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exchange(t, client, second, negativeQuery("env.example.", mDNS.TypeAAAA)); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 1, second.count(),
+		"a different transport environment must be asked, not answered from another namespace")
 }

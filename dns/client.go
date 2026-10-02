@@ -177,6 +177,12 @@ func (c *Client) Start() {
 	if c.dnsCache == nil {
 		c.initializeMemoryCache()
 	}
+	// The name-wide negative cache is a bounded in-memory HOT cache and is independent of
+	// whichever exact backend is configured. Initialising it from initializeMemoryCache
+	// meant a deployment with a persistent exact cache never got one at all: every
+	// NXDOMAIN would be recorded only under its own QTYPE and the name would cost one
+	// upstream query per record type, which is the whole thing this cache exists to avoid.
+	c.initializeNXDomainCache()
 }
 
 func (c *Client) initializeMemoryCache() {
@@ -184,7 +190,6 @@ func (c *Client) initializeMemoryCache() {
 		return
 	}
 	c.cache = common.Must1(freelru.New[dnsCacheKey, *dns.Msg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32, true))
-	c.initializeNXDomainCache()
 }
 
 func extractNegativeTTL(response *dns.Msg) (uint32, bool) {
@@ -521,6 +526,9 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 }
 
 func (c *Client) ClearCache() {
+	// A clear that left name-wide NXDOMAIN verdicts behind would answer subsequent
+	// queries from exactly the state the caller asked to discard.
+	c.clearNXDomainCache()
 	if c.cache != nil {
 		c.cache.Purge()
 	}

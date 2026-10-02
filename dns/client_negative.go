@@ -74,6 +74,9 @@ type nxdomainCacheEntry struct {
 	// the authorities the upstream provided (the SOA in particular). It is copied and
 	// re-questioned on every hit; it is never handed out as-is.
 	response *mDNS.Msg
+	// negativeTTL is the RFC 2308 lifetime the verdict was recorded with, so a hit can
+	// report what remains of it rather than replaying the original value.
+	negativeTTL time.Duration
 }
 
 // nxdomainCacheCapacity bounds the name cache.
@@ -99,6 +102,12 @@ func nxdomainCacheForCapacity(cacheCapacity uint32) uint32 {
 // disabled, so a client built with disable_cache has no negative cache either.
 func (c *Client) initializeNXDomainCache() {
 	if c.disableCache {
+		return
+	}
+	// Idempotent. This is called from Client.Start as well as from the memory-cache
+	// path, and re-creating the cache would silently discard every verdict already
+	// recorded - a behaviour change with no symptom other than extra upstream queries.
+	if c.nxdomainCache != nil {
 		return
 	}
 	capacity := nxdomainCacheForCapacity(c.cacheCapacity)
@@ -143,15 +152,46 @@ func (c *Client) storeNXDomain(key dnsCacheKey, response *mDNS.Msg, timeToLive u
 	if len(response.Question) != 1 {
 		return
 	}
-	if _, hasSOA := extractNegativeTTL(response); !hasSOA {
-		// Without a SOA there is no RFC 2308 TTL to respect, and inventing one would
-		// extend an incomplete answer across every record type.
+	// A terminal NXDOMAIN that travelled through a CNAME does NOT mean the QNAME is
+	// absent: it means the alias target is. Widening it to the QNAME would make
+	// "AAAA <alias>" fail locally as NXDOMAIN even though the alias itself exists and has
+	// an A record, and would even wrongly answer a CNAME query for it.
+	//
+	// Following the chain authoritatively is a larger change than this one; until then the
+	// safe rule is to cache name-wide only when the answer section is empty.
+	if len(response.Answer) > 0 {
+		return
+	}
+	// A name-wide verdict must come from the SOA, not from whatever TTL the response
+	// carries after rewriting.
+	//
+	// timeToLive is computed after applyResponseOptions, so an operator's rewrite_ttl can
+	// raise it. If the authoritative negative TTL was 0 - meaning the zone did not ask for
+	// this answer to be cached at all - a rewrite must not promote it into a verdict that
+	// then answers every other query type for that name for the rewritten duration. The
+	// ordinary exact cache is free to keep applying the rewrite; only this widening is
+	// gated on the real value.
+	soaTTL, hasSOA := extractNegativeTTL(response)
+	if !hasSOA || soaTTL == 0 {
+		return
+	}
+
+	entry := &nxdomainCacheEntry{
+		response:    response.Copy(),
+		negativeTTL: time.Second * time.Duration(soaTTL),
+	}
+	// Mirror storeCache exactly. Under disable_expire the ordinary cache stores WITHOUT a
+	// lifetime, and freelru's Get() skips anything that has one - so registering a lifetime
+	// here would leave the entry present in the map but unreachable, and the two caches
+	// would disagree about the same client configuration.
+	if c.disableExpire {
+		c.nxdomainCache.Add(nxdomainKeyFrom(key), entry)
 		return
 	}
 	c.nxdomainCache.AddWithLifetime(
 		nxdomainKeyFrom(key),
-		&nxdomainCacheEntry{response: response.Copy()},
-		time.Second*time.Duration(timeToLive),
+		entry,
+		time.Second*time.Duration(soaTTL),
 	)
 }
 
@@ -166,14 +206,68 @@ func (c *Client) loadNXDomain(key dnsCacheKey, question mDNS.Question, requestID
 	if c.nxdomainCache == nil {
 		return nil, false
 	}
-	entry, loaded := c.nxdomainCache.Get(nxdomainKeyFrom(key))
+	nxKey := nxdomainKeyFrom(key)
+
+	// disable_expire means the ordinary cache keeps entries regardless of their lifetime,
+	// so this one must behave the same way. Letting the negative cache expire on its own
+	// TTL while the exact cache never does would answer one query type from an expired
+	// verdict while its neighbour is served indefinitely - a difference in behaviour that
+	// no operator asked for and cannot observe.
+	if c.disableExpire {
+		// Stored without a lifetime by storeNXDomain, exactly like the exact cache, so a
+		// plain Get is the matching read.
+		entry, loaded := c.nxdomainCache.Get(nxKey)
+		if !loaded || entry == nil || entry.response == nil {
+			return nil, false
+		}
+		// Zero remaining means "no lifetime", which the exact cache also reports as 0.
+		return nxdomainResponseFor(entry, question, requestID, 0), true
+	}
+
+	entry, expireAt, loaded := c.nxdomainCache.GetWithLifetimeNoExpire(nxKey)
 	if !loaded || entry == nil || entry.response == nil {
 		return nil, false
 	}
+
+	timeNow := time.Now()
+	if timeNow.After(expireAt) {
+		// Lapsed. Remove it so the next lookup is a clean miss, then let the caller go
+		// upstream rather than answering from a stale verdict.
+		c.nxdomainCache.Remove(nxKey)
+		return nil, false
+	}
+
+	// Report what REMAINS of the negative TTL, not the value it was stored with. Without
+	// this a verdict recorded at TTL 300 would still claim 300 seconds ninety-five
+	// seconds later, and a client that honours negative caching would hold the name for
+	// longer than the authoritative server said.
+	remaining := max(int(expireAt.Sub(timeNow).Seconds()), 0)
+	return nxdomainResponseFor(entry, question, requestID, uint32(remaining)), true
+}
+
+// nxdomainResponseFor builds the reply for the question being asked now.
+//
+// Every field that describes the QUESTION comes from the current request; only the
+// verdict - NXDOMAIN, and the SOA authority that carries the negative TTL - is reused.
+// Replaying the stored message would answer an AAAA query with an A question, which is a
+// protocol error a resolver is entitled to discard.
+func nxdomainResponseFor(entry *nxdomainCacheEntry, question mDNS.Question, requestID uint16, remainingTTL uint32) *mDNS.Msg {
 	response := entry.response.Copy()
 	response.Id = requestID
 	response.Question = []mDNS.Question{question}
-	// The authority section carries the SOA whose TTL the caller is about to be told;
-	// the remaining lifetime is applied from the cache entry on the way out.
-	return response, true
+	// The SOA TTL is what tells the client how long to cache the non-existence, so it
+	// carries the remaining lifetime rather than the original.
+	normalizeTTL(response, remainingTTL)
+	return response
+}
+
+// clearNXDomainCache discards every name-wide verdict.
+//
+// Locking is deliberately absent: the underlying LRU is safe for concurrent use, and
+// ClearCache already documents the same best-effort semantics as the exact cache.
+func (c *Client) clearNXDomainCache() {
+	if c.nxdomainCache == nil {
+		return
+	}
+	c.nxdomainCache.Purge()
 }
