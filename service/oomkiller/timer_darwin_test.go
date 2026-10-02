@@ -5,9 +5,7 @@ package oomkiller
 import (
 	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/sagernet/sing-box/log"
 	tun "github.com/sagernet/sing-tun"
 )
 
@@ -31,27 +29,6 @@ import (
 //   - pressure was rewritten from None back to Critical, re-arming a report for a service the
 //     user had stopped and that other components read;
 //   - FreeOSMemory and the cache flush ran for a service nobody owns any more.
-
-func newPressureTestTimer(pressure *atomic.Uint32) *adaptiveTimer {
-	// network and connections are nil, which poll() already handles: it guards both with a
-	// nil check before use. That keeps this test about the lifecycle ordering rather than
-	// about faking a network stack.
-	return newAdaptiveTimer(
-		log.NewNOPFactory().Logger(),
-		nil,
-		nil,
-		nil,
-		nil,
-		pressure,
-		timerConfig{
-			policyMode:   policyModeNetworkExtension,
-			minInterval:  10 * time.Millisecond,
-			maxInterval:  time.Second,
-			memoryLimit:  50 * 1024 * 1024,
-			safetyMargin: 5 * 1024 * 1024,
-		},
-	)
-}
 
 // TestLatePressureCallbackDoesNotRunCleanupAfterClose is the §5 regression.
 //
