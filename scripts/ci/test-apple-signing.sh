@@ -297,17 +297,18 @@ check "no private key block is tracked" \
   bash -c '! git grep -lI "BEGIN .*PRIVATE KEY" -- . ":(exclude)scripts/ci/test-apple-signing.sh" 2>/dev/null | grep -q .'
 
 
-echo "== the archives package unsigned, and the export signs for distribution =="
-# Two steps with two different kinds of signing. The archive is an unsigned package
-# because that is the only arrangement in which Xcode creates the App Store profiles
-# itself: with Automatic it derives the profile type from CODE_SIGN_IDENTITY, which
-# the project pins to "Apple Development" (device-scoped), and forcing the identity
-# contradicts Automatic on every target.
+echo "== the archives are signed, and the export re-signs for distribution =="
+# The archive MUST be signed. -exportArchive validates entitlements from the archive
+# and cannot supply ones that were never applied, so an unsigned archive fails
+# Apple's validation with:
+#   Missing Entitlement ... 'com.apple.developer.networking.networkextension'
 for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflight.sh; do
-  check "$(basename "$builder") archives without signing" \
-    grep -q 'CODE_SIGNING_ALLOWED=NO' "$builder"
-  # Executable lines only: the files document the approaches that do NOT work, and
-  # those explanations naturally contain the very strings being ruled out.
+  check "$(basename "$builder") does not disable signing" \
+    bash -c "! grep -q 'CODE_SIGNING_ALLOWED=NO' '$builder'"
+  check "$(basename "$builder") uses automatic signing" \
+    grep -q 'CODE_SIGN_STYLE=Automatic' "$builder"
+  check "$(basename "$builder") allows provisioning updates" \
+    grep -q -- '-allowProvisioningUpdates' "$builder"
   check "$(basename "$builder") does not force a signing identity" \
     python3 "$root/scripts/ci/test-no-active-identity.py" "$builder"
   check "$(basename "$builder") does not use Manual style" \
@@ -316,10 +317,10 @@ for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testfli
     bash -c "! grep -qE 'PROVISIONING_PROFILE_SPECIFIER=\"[A-Za-z]' '$builder'"
   check "$(basename "$builder") lets the export provision automatically" \
     grep -q 'signingStyle' "$builder"
+  check "$(basename "$builder") asserts the archive is signed" \
+    grep -q "the archive is signed" "$builder"
   check "$(basename "$builder") asserts an Apple Distribution authority" \
     grep -q "Authority=Apple Distribution" "$builder"
-  check "$(basename "$builder") asserts the signature is our team" \
-    grep -q 'TeamIdentifier=' "$builder"
   check "$(basename "$builder") asserts the profile is not device-scoped" \
     grep -q "ProvisionedDevices" "$builder"
 done

@@ -71,43 +71,28 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-# TWO STEPS, TWO DIFFERENT KINDS OF SIGNING
+# THE ARCHIVE MUST BE SIGNED
 #
-# `archive` here produces an UNSIGNED package, and `-exportArchive` below applies
-# App Store distribution signing. That split is not a workaround; it is the only
-# arrangement in which Xcode will create the App Store profiles itself.
+# An earlier version of this script produced an unsigned archive and relied on
+# -exportArchive to sign it. That does not work, and Apple's validator says so:
 #
-# What does not work, each verified rather than assumed:
+#   Missing Entitlement. The bundle 'sing-box.app' is missing entitlement
+#   'com.apple.developer.networking.networkextension'.
+#   Invalid Info.plist value. NSExtensionFileProviderDocumentGroup ... must match
+#   values contained in the com.apple.security.application-groups entitlement.
+#   The given value ... was not found because this entitlement was not present.
 #
-#   Automatic + the project's identity
-#     The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well
-#     as Debug, so Xcode asks Apple for an iOS *App Development* profile. Those are
-#     device-scoped:
-#       Communication with Apple failed: Your team has no devices from which to
-#       generate a provisioning profile.
+# -exportArchive validates the archive's entitlements and only re-signs what
+# validates; it cannot supply entitlements that were never applied. An unsigned
+# archive carries none, so every capability reads as missing. The entitlements
+# files themselves are correct.
 #
-#   Automatic + CODE_SIGN_IDENTITY="Apple Distribution"
-#     Automatic derives the profile type FROM the identity, so overriding the
-#     identity while leaving Automatic is a contradiction on every target,
-#     dependencies included:
-#       ... is automatically signed for development, but a conflicting code signing
-#       identity Apple Distribution has been manually specified.
-#
-#   Manual + CODE_SIGN_IDENTITY="Apple Distribution"
-#     No conflict, and it asks for the right profile type - but Manual will not
-#     create profiles, and none exist for these App IDs yet.
-#
-#   CODE_SIGN_IDENTITY="" with signing still allowed
-#     "succeeded" while producing "code object is not signed at all". An empty
-#     identity means skip signing, so this is a false positive that has been
-#     mistaken for success more than once. The gate below exists to catch it.
-#
-# At export, Xcode has the App Store destination and the distribution certificate,
-# so it creates the App Store profiles and signs with them. Verified on a real
-# export: Authority "Apple Distribution: yongjie huang (TAFD7BAGYZ)", profile
-# "iOS Team Store Provisioning Profile", ProvisionedDevices absent (App Store
-# profiles are not device-scoped), get-task-allow false.
-echo "archiving (Release, iphoneos, arm64; unsigned package, signed at export)"
+# The archive is therefore signed with automatic signing. That needs a provisioning
+# profile to exist, and with the project's Apple Development identity it is a
+# development profile, which requires at least one registered device. Development
+# profiles are sufficient here: the export re-signs for distribution, which is where
+# the App Store profile is created.
+echo "archiving (Release, iphoneos, arm64; automatic signing, re-signed at export)"echo "archiving (Release, iphoneos, arm64; unsigned package, signed at export)"
 rm -rf "$archive_path"
 # Clear the derived data too. Xcode caches the resolved package graph and the
 # build settings derived from it, and a cache written while the archive still used
@@ -130,9 +115,8 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
+  CODE_SIGN_STYLE=Automatic \
+  -allowProvisioningUpdates \
   -skipPackagePluginValidation \
   2>&1 | tail -120
 # `tail -60` keeps the report readable while still showing the resolved signing
@@ -184,6 +168,11 @@ gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.neko
 gate "bundle id matches the configured base" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
+# The archive must be signed: entitlements only exist on a signed bundle, and Apple
+# validates them from the archive rather than from the export.
+gate "the archive is signed" codesign --verify --strict "$app"
+gate "the archive carries the network extension entitlement" \
+  bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.networkextension"
 
 # Entitlements come from the built extension, which exists regardless of signing.
 # They are read here rather than after export because a capability that is wrong in

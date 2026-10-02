@@ -101,11 +101,10 @@ while IFS= read -r pkg; do
 done < <(find "$work/dd/SourcePackages/checkouts" -maxdepth 2 -name Package.swift 2>/dev/null | sort)
 [ "$removed_plugins" -eq 0 ] && echo "  note: no SwiftLint plug-in attachment found"
 
-# Unsigned package here; App Store distribution signing happens at -exportArchive
-# below, which is where Xcode can create the App Store profiles itself. The reasons
-# the archive cannot be signed directly are set out in build-ios-testflight.sh and
-# are the same on both platforms.
-echo "archiving (Release, macOS, arm64; unsigned package, signed at export)"
+# The archive must be SIGNED so that it carries entitlements: -exportArchive
+# validates them from the archive and cannot supply ones that were never applied.
+# See build-ios-testflight.sh for the full explanation and Apple's exact wording.
+echo "archiving (Release, macOS, arm64; automatic signing, re-signed at export)"echo "archiving (Release, macOS, arm64; unsigned package, signed at export)"
 # Only the archive is cleared. DerivedData is NOT, because the resolve step above
 # populated it and stripped the SwiftLint plug-in from its checkouts; deleting it
 # here would restore the plug-in and the build would abort loading sourcekitdInProc.
@@ -123,9 +122,8 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
-  CODE_SIGNING_ALLOWED=NO \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGN_IDENTITY="" \
+  CODE_SIGN_STYLE=Automatic \
+  -allowProvisioningUpdates \
   -skipPackagePluginValidation \
   2>&1 | tail -120
 
@@ -163,6 +161,11 @@ gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.neko
 gate "bundle id matches the iOS app id" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
+# The archive must be signed: entitlements exist only on a signed bundle, and Apple
+# validates them from the archive rather than from the export.
+gate "the archive is signed" codesign --verify --strict "$app"
+gate "the archive carries the network extension entitlement" \
+  bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.networkextension"
 
 # Mac App Store distribution requires the sandbox. Without it the app cannot be
 # submitted at all, and a build that gets this far would fail later at Apple.
