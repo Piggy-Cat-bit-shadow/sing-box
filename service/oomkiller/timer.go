@@ -435,18 +435,80 @@ func (t *adaptiveTimer) availableThresholds(sample memorySample) pressureThresho
 	}
 }
 
+// intervalForState returns how long to wait before the next observation.
+//
+// # The fresh-start ramp
+//
+// A fresh timer polls at minInterval, then DOUBLES on each normal sample until it reaches
+// maxInterval. The previous code special-cased the first normal poll as
+//
+//	if t.currentInterval == 0 { t.currentInterval = t.maxInterval }
+//
+// which skipped the entire ladder: the only guaranteed observations were at 100ms and then
+// 10s later. With the canonical policy - a 50 MiB budget, a 5 MiB margin and a 45 MiB trigger -
+// a native or Swift allocation burst of more than 5 MiB during that ten-second gap would never
+// be seen by the timer.
+//
+// # Why the gap was not covered elsewhere
+//
+// The dispatch memory-pressure source is NOT a substitute. DISPATCH_MEMORYPRESSURE_CRITICAL is
+// a SYSTEM-WIDE signal: it reports that the kernel is under pressure generally, not that this
+// process is approaching its own limit. It can fire for another app's allocations, and there is
+// no guarantee it fires before a per-process jetsam high-water mark is reached. The timer is the
+// only component that observes THIS process's phys_footprint on a schedule, so the schedule has
+// to be dense enough to be useful.
+//
+// # Why a ramp rather than a permanent fast poll
+//
+// Polling at 100ms forever would close the gap completely and cost a wakeup every 100ms for the
+// entire life of a tunnel that is usually idle - battery spent observing a process that is not
+// changing. The ramp concentrates the observations where the risk is: shortly after start, and
+// whenever memory is actually moving. The cost is a bounded number of extra wakeups - 100ms,
+// 200ms, 400ms, ... up to 10s, so about seven extra polls - and it is measured rather than
+// assumed; see the cadence benchmark.
+//
+// # Where the risk actually is
+//
+// A process that is genuinely growing rarely stays in the normal state: it crosses the armed
+// threshold and returns to minInterval on its own. The ramp's job is to make sure it is SEEN
+// crossing.
 func (t *adaptiveTimer) intervalForState() time.Duration {
 	switch {
 	case t.forceMinInterval || t.state != pressureStateNormal || !t.pressureBaselineTime.IsZero():
+		// Pressure, or a recent pressure event: observe closely.
 		t.currentInterval = t.minInterval
 	default:
 		if t.currentInterval == 0 {
-			t.currentInterval = t.maxInterval
+			// The first normal sample after start (or after a reset). Begin the ramp from the
+			// bottom rather than jumping to the ceiling.
+			t.currentInterval = t.minInterval
 		} else {
 			t.currentInterval = min(t.currentInterval*2, t.maxInterval)
 		}
 	}
 	return t.currentInterval
+}
+
+// intervalScheduleForDiagnostics returns the observation schedule a fresh timer follows while
+// everything stays normal, for reporting and for tests.
+//
+// It exists so the ramp's shape is a stated property rather than something a reader has to
+// derive by simulating the timer.
+func intervalScheduleForDiagnostics(minInterval time.Duration, maxInterval time.Duration, steps int) []time.Duration {
+	if steps <= 0 {
+		return nil
+	}
+	schedule := make([]time.Duration, 0, steps)
+	current := time.Duration(0)
+	for i := 0; i < steps; i++ {
+		if current == 0 {
+			current = minInterval
+		} else {
+			current = min(current*2, maxInterval)
+		}
+		schedule = append(schedule, current)
+	}
+	return schedule
 }
 
 func (t *adaptiveTimer) logDetails(sample memorySample) string {
