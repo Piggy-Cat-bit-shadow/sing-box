@@ -106,16 +106,32 @@ type Recorder struct {
 }
 
 type timelineRow struct {
-	At              string `json:"at"`
-	State           string `json:"state"`
-	MemoryBytes     uint64 `json:"memoryBytes"`
-	AvailableBytes  uint64 `json:"availableBytes,omitempty"`
+	At             string `json:"at"`
+	State          string `json:"state"`
+	MemoryBytes    uint64 `json:"memoryBytes"`
+	AvailableBytes uint64 `json:"availableBytes,omitempty"`
+	// GoMemoryBytes is /memory/classes/total:bytes - the runtime's total managed memory.
+	// It is NOT the figure GOMEMLIMIT constrains; see GoRuntimeManagedBytes.
 	GoMemoryBytes   uint64 `json:"goMemoryBytes,omitempty"`
 	GoHeapLiveBytes uint64 `json:"goHeapLiveBytes,omitempty"`
 	GoStackBytes    uint64 `json:"goStackBytes,omitempty"`
 	Goroutines      uint64 `json:"goroutines,omitempty"`
 	GCCycles        uint64 `json:"gcCycles,omitempty"`
 	Connections     int    `json:"connections,omitempty"`
+
+	// The GOMEMLIMIT view of the process, recorded alongside the Go heap figures rather
+	// than replacing them, so old reports keep their meaning.
+	//
+	// GoRuntimeManagedBytes is the quantity the GOMEMLIMIT contract accounts against:
+	// /memory/classes/total:bytes minus /memory/classes/heap/released:bytes. Reporting
+	// total alone would overstate what the limit governs, because released memory is no
+	// longer charged to the runtime.
+	GoRuntimeManagedBytes uint64 `json:"goRuntimeManagedBytes,omitempty"`
+	// GoMemoryLimitBytes is the soft limit itself at sample time, so a report shows what
+	// the runtime was actually paced against rather than what was configured at startup.
+	GoMemoryLimitBytes uint64 `json:"goMemoryLimitBytes,omitempty"`
+	// GOGCPercent is the collector target at sample time.
+	GOGCPercent uint64 `json:"gogcPercent,omitempty"`
 }
 
 type eventRecord struct {
@@ -176,6 +192,12 @@ func NewRecorder(options RecorderOptions) *Recorder {
 			{Name: "/memory/classes/heap/stacks:bytes"},
 			{Name: "/sched/goroutines:goroutines"},
 			{Name: "/gc/cycles/total:gc-cycles"},
+			// Runtime-managed memory per the GOMEMLIMIT contract is
+			// total - heap/released. Recording the two inputs lets a reader derive it and
+			// see the accounting rather than taking one number on trust.
+			{Name: "/memory/classes/heap/released:bytes"},
+			{Name: "/gc/gomemlimit:bytes"},
+			{Name: "/gc/gogc:percent"},
 		},
 		lastSnapshotAt: make(map[string]time.Time),
 	}
@@ -327,16 +349,24 @@ func (r *Recorder) sample(sample memorySample, state pressureState, connections 
 	}
 	metrics.Read(r.metricsSamples)
 	gcCycles := r.metricsSamples[4].Value.Uint64()
+	runtimeTotal := r.metricsSamples[0].Value.Uint64()
+	heapReleased := r.metricsSamples[5].Value.Uint64()
 	row := timelineRow{
 		At:              now.UTC().Format(time.RFC3339),
 		State:           state.String(),
 		MemoryBytes:     sample.usage,
 		AvailableBytes:  sample.available,
-		GoMemoryBytes:   r.metricsSamples[0].Value.Uint64(),
+		GoMemoryBytes:   runtimeTotal,
 		GoHeapLiveBytes: r.metricsSamples[1].Value.Uint64(),
 		GoStackBytes:    r.metricsSamples[2].Value.Uint64(),
 		Goroutines:      r.metricsSamples[3].Value.Uint64(),
 		Connections:     connections,
+		// GOMEMLIMIT accounting: total minus released. Saturating, because a runtime
+		// could in principle report released > total transiently and an underflow would
+		// wrap to an enormous number that reads as a catastrophic event.
+		GoRuntimeManagedBytes: subtractFloor(runtimeTotal, heapReleased),
+		GoMemoryLimitBytes:    r.metricsSamples[6].Value.Uint64(),
+		GOGCPercent:           r.metricsSamples[7].Value.Uint64(),
 	}
 	if r.hasRow {
 		row.GCCycles = gcCycles - r.previousGCCycles
@@ -601,6 +631,17 @@ func (r *Recorder) chownTree(directory string) {
 	for _, entry := range entries {
 		r.chown(filepath.Join(directory, entry.Name()))
 	}
+}
+
+// subtractFloor returns a - b, or 0 when b exceeds a.
+//
+// An unsigned underflow here would produce a near-2^64 value that a reader would take for
+// a catastrophic allocation event, which is worse than reporting zero.
+func subtractFloor(a uint64, b uint64) uint64 {
+	if b > a {
+		return 0
+	}
+	return a - b
 }
 
 func appendRecord(path string, record any) error {

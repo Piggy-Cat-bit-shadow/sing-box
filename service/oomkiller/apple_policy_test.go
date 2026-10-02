@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/memory"
 )
 
 // Pins the Apple NetworkExtension memory policy.
@@ -254,5 +255,51 @@ func TestProfileStillTunableOutsideNetworkExtension(t *testing.T) {
 	if config.minInterval != 2*time.Second || config.maxInterval != 30*time.Second {
 		t.Errorf("outside a NetworkExtension the profile intervals must be honoured, got %v/%v",
 			config.minInterval, config.maxInterval)
+	}
+}
+
+// --- available-memory semantics (§4) --------------------------------------------
+
+func TestReadMemorySampleUsesThePlatformsOwnSupportAnswer(t *testing.T) {
+	// availableKnown must follow whether the platform PROVIDES the figure, not whether the
+	// policy mode could use it. Treating an unsupported platform's zero as a measurement
+	// means "no memory available", which would put a healthy process into permanent
+	// critical pressure.
+	sample := readMemorySample(policyModeNetworkExtension)
+
+	// phys_footprint is always available and is the primary signal.
+	if sample.usage == 0 {
+		t.Error("the process footprint must always be sampled")
+	}
+
+	if memory.AvailableAvailable() {
+		if !sample.availableKnown {
+			t.Error("the platform supports available-memory, so the sample must be marked known")
+		}
+	} else if sample.availableKnown {
+		t.Error("the platform does NOT support available-memory, so the sample must not be marked known")
+	}
+}
+
+func TestReadMemorySampleDoesNotReportUnknownAsZero(t *testing.T) {
+	// The distinction the fix preserves: unknown is not the same as zero.
+	for _, mode := range []policyMode{policyModeAvailable, policyModeNetworkExtension} {
+		sample := readMemorySample(mode)
+		if !sample.availableKnown && sample.available != 0 {
+			t.Errorf("mode %v: an unknown figure must not carry a value, got %d", mode, sample.available)
+		}
+	}
+}
+
+func TestReadMemorySampleIgnoresAvailableForOtherModes(t *testing.T) {
+	// Modes that do not use available-memory must not sample it at all.
+	for _, mode := range []policyMode{policyModeNone, policyModeMemoryLimit} {
+		sample := readMemorySample(mode)
+		if sample.availableKnown {
+			t.Errorf("mode %v must not read available-memory", mode)
+		}
+		if sample.usage == 0 {
+			t.Errorf("mode %v must still sample the process footprint", mode)
+		}
 	}
 }

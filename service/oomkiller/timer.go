@@ -481,13 +481,29 @@ func nextPressureState(current pressureState, shouldTrigger, shouldArm, shouldSt
 	return pressureStateNormal
 }
 
+// readMemorySample reads the process footprint, and the available-memory figure when the
+// platform actually provides one.
+//
+// # Why availableKnown is not simply set by mode
+//
+// The previous version marked the sample "known" whenever the mode was one that could use
+// it. That conflates two different states: "the platform says there are N bytes free" and
+// "this platform has no such API". On the second, memory.Available() returns 0, and a
+// zero read as a real measurement means "no memory available" - the timer would treat a
+// healthy process on an unsupported platform as being in permanent critical pressure.
+//
+// memory.AvailableAvailable() is the platform's own answer to whether the figure is
+// meaningful, so it decides. phys_footprint (memory.Total()) remains the primary signal
+// and is always available.
 func readMemorySample(mode policyMode) memorySample {
 	sample := memorySample{
 		usage: memory.Total(),
 	}
 	if mode == policyModeAvailable || mode == policyModeNetworkExtension {
-		sample.availableKnown = true
-		sample.available = memory.Available()
+		if memory.AvailableAvailable() {
+			sample.available = memory.Available()
+			sample.availableKnown = true
+		}
 	}
 	return sample
 }
