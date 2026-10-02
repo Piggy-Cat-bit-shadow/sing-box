@@ -73,11 +73,37 @@ type candidateScheduler struct {
 //   - every losing conn, including a late success, has been Closed before returning
 //   - every started goroutine has exited before returning
 func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attempt dialAttemptFunc) (net.Conn, netip.Addr, error) {
+	return s.dialWithLateCandidates(ctx, plan, nil, attempt)
+}
+
+// dialWithLateCandidates runs the race and accepts further candidates while it is in progress.
+//
+// # Why late candidates matter
+//
+// A and AAAA resolve independently, and one can answer far later than the other. Waiting for
+// both before starting means either a connection that stalls on the slow family, or a candidate
+// list that never contains the family that would have won. Letting a late family join a race
+// already under way is what makes the slow answer useful.
+//
+// # What stays the same
+//
+// Exactly one winner; one fallback-timer owner; bounded launch (one new candidate per fallback
+// interval, or immediately after a hard failure); synchronous loser cleanup; no re-ordering or
+// restarting of a candidate that has already been launched.
+//
+// lateCandidates may be nil, in which case this is the previous static behaviour exactly. A
+// closed channel means resolution has finished, so the scheduler knows no more are coming and
+// can stop waiting for them.
+func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan candidatePlan, lateCandidates <-chan dualStackCandidate, attempt dialAttemptFunc) (net.Conn, netip.Addr, error) {
 	candidates := plan.candidates
-	switch len(candidates) {
-	case 0:
+	if len(candidates) == 0 && lateCandidates == nil {
 		return nil, netip.Addr{}, E.New("no dial candidates")
-	case 1:
+	}
+	switch {
+	case len(candidates) == 0:
+		// Nothing to start with. A late stream was supplied, so wait for it rather than
+		// failing: the fast family may simply not have answered yet.
+	case len(candidates) == 1 && lateCandidates == nil:
 		// The hot path, and the common case for a literal IP with no recovery.
 		//
 		// No goroutine, no timer, no channel, no race state. A "dual-stack" scheduler that
@@ -176,22 +202,34 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 		closeLosers()
 	}()
 
+	// Launch state is a growable queue rather than a fixed slice, so a candidate arriving
+	// while the race is in progress can be appended without disturbing anything already
+	// launched. Already-started candidates are never re-ordered or restarted.
+	launch := append([]dualStackCandidate(nil), candidates...)
+	// seen deduplicates across the initial set and every late arrival, including the original
+	// literal candidate when one was supplied.
+	seen := make(map[netip.Addr]struct{}, len(candidates)+2)
+	for _, candidate := range candidates {
+		seen[candidate.address] = struct{}{}
+	}
+
 	// Decide the launch order. With recent family failure recorded, the first candidate of
 	// each family starts together so a broken family costs no delay at all.
-	launch := candidates
-	immediatePair := false
-	if s.health != nil && len(candidates) > 1 {
-		if s.health.fallbackImmediately(s.networkEnvironment, candidates[0].family, candidates[1].family) {
-			immediatePair = true
+	nextIndex := 0
+	if len(launch) > 0 {
+		startAttempt(launch[0])
+		nextIndex = 1
+		if len(launch) > 1 && s.health != nil {
+			if s.health.fallbackImmediately(s.networkEnvironment, launch[0].family, launch[1].family) {
+				startAttempt(launch[1])
+				nextIndex = 2
+			}
 		}
 	}
 
-	startAttempt(launch[0])
-	nextIndex := 1
-	if immediatePair {
-		startAttempt(launch[1])
-		nextIndex = 2
-	}
+	// resolutionFinished tracks whether the late-candidate stream has closed. Until it does,
+	// the race cannot conclude that the candidate set is complete.
+	resolutionFinished := lateCandidates == nil
 
 	var (
 		timer     *time.Timer
@@ -224,14 +262,53 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 	}
 	defer stopTimer()
 
-	if nextIndex < len(launch) {
-		resetTimer()
+	armTimerIfPending := func() {
+		if nextIndex < len(launch) {
+			resetTimer()
+		} else {
+			stopTimer()
+		}
+	}
+	if len(launch) > 0 {
+		armTimerIfPending()
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, netip.Addr{}, ctx.Err()
+
+		case candidate, stillOpen := <-lateCandidates:
+			if !stillOpen {
+				// Resolution finished: no more candidates can arrive.
+				lateCandidates = nil
+				resolutionFinished = true
+				if nextIndex >= len(launch) && started == len(failures) && started > 0 {
+					if len(failures) == 0 {
+						return nil, netip.Addr{}, E.Cause(lastErr, "dial failed")
+					}
+					return nil, netip.Addr{}, E.Errors(failures...)
+				}
+				continue
+			}
+			if _, duplicate := seen[candidate.address]; duplicate {
+				// Already known, whether from the initial plan, an earlier late arrival, or
+				// the original literal destination. Deduplication is by canonical address, so
+				// an IPv4-mapped form and its IPv4 form count as one.
+				continue
+			}
+			seen[candidate.address] = struct{}{}
+
+			// A late candidate joins the queue. If nothing is currently pending it starts at
+			// once, so a family that answers after the race began is not made to wait for a
+			// fallback interval that was scheduled before it existed.
+			launch = append(launch, candidate)
+			if nextIndex >= len(launch)-1 {
+				startAttempt(candidate)
+				nextIndex = len(launch)
+			}
+			armTimerIfPending()
+			continue
 
 		case result := <-results:
 			if result.err == nil && result.conn != nil {
@@ -272,8 +349,8 @@ func (s *candidateScheduler) dial(ctx context.Context, plan candidatePlan, attem
 				}
 				continue
 			}
-			if started == len(failures) {
-				// Everything has failed.
+			if started == len(failures) && nextIndex >= len(launch) && resolutionFinished {
+				// Everything that will ever be attempted has failed.
 				if len(failures) == 0 {
 					return nil, netip.Addr{}, E.Cause(lastErr, "dial failed")
 				}
