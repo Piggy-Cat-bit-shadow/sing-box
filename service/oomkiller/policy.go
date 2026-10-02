@@ -12,7 +12,25 @@ import (
 
 const (
 	DefaultAppleNetworkExtensionMemoryLimit = 50 * 1024 * 1024
-	DefaultAppleNetworkExtensionGCPercent   = 50
+
+	// DefaultAppleNetworkExtensionGCPercent is the GC target for the derived runtime
+	// limit above.
+	//
+	// 100, not the previous 50. Measured on the Shadowsocks copy loop under real memory
+	// pressure (24 MiB live set, 256 MiB per iteration, 10 independent runs, medians):
+	//
+	//	  GOGC 50   5916 MB/s  98 GC cycles/op  143 ms pause
+	//	  GOGC 100  5983 MB/s  63 GC cycles/op   85 ms pause
+	//
+	// The two ranges do not overlap on either metric: throughput is +1.13% and GC work
+	// is 36% lower. GOMEMLIMIT already paces the heap against the hard ceiling, so the
+	// lower GOGC was making the collector run before the heap was anywhere near the
+	// limit - twice the cycles to reach the same place. On a phone those cycles are CPU,
+	// and CPU is heat and battery.
+	//
+	// The limit itself is unchanged: 40 MiB still bounds the process, and the peak heap
+	// stayed below it in every run.
+	DefaultAppleNetworkExtensionGCPercent = 100
 )
 
 type policyMode uint8

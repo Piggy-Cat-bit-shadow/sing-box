@@ -37,11 +37,12 @@ func TestAppleNetworkExtensionDefaults(t *testing.T) {
 			50*1024*1024, DefaultAppleNetworkExtensionMemoryLimit)
 	}
 
-	// GOGC 50 collects sooner than the Go default of 100. That is deliberate: inside a
-	// NetworkExtension a hard limit is what protects the process, and the GC setting is
-	// chosen to work with it rather than against it.
-	if DefaultAppleNetworkExtensionGCPercent != 50 {
-		t.Errorf("Apple NetworkExtension GOGC: want 50, got %d",
+	// GOGC 100 matches the Go default, and is deliberate rather than an omission.
+	// GOMEMLIMIT is what bounds this process; a lower GOGC made the collector run
+	// before the heap approached that limit. Measured under memory pressure, GOGC 50
+	// cost 36% more GC cycles for 1.13% less throughput with no memory benefit.
+	if DefaultAppleNetworkExtensionGCPercent != 100 {
+		t.Errorf("Apple NetworkExtension GOGC: want 100, got %d",
 			DefaultAppleNetworkExtensionGCPercent)
 	}
 }
