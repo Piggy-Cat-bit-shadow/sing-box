@@ -98,9 +98,39 @@ func ReloadSetupOptions(options *SetupOptions) {
 		sPlatformMetadata = nil
 	}
 	if sOOMKillerEnabled {
-		if sOOMMemoryLimit == 0 && C.IsIos {
-			sOOMMemoryLimit = oomkiller.DefaultAppleNetworkExtensionMemoryLimit
-			debug.SetGCPercent(oomkiller.DefaultAppleNetworkExtensionGCPercent)
+		// On iOS the OOM killer only ever means the PacketTunnel NetworkExtension, and that
+		// deployment has a CANONICAL policy: a 50 MiB fallback budget with a 100 GC target.
+		//
+		// The timer already forces that canonical policy on iOS under a NetworkExtension -
+		// see resolvePolicyMode, which ignores every override and returns the canonical budget.
+		// The Go runtime settings here were computed from the EXTERNAL OomMemoryLimit instead,
+		// which let the two halves disagree:
+		//
+		//	OomMemoryLimit = 200 MiB on iOS
+		//	  timer budget   =  50 MiB   (canonical, from the policy)
+		//	  GOMEMLIMIT     = 190 MiB   (RuntimeMemoryLimit(200 MiB))
+		//	  GOGC           = runtime default, NOT the canonical 100
+		//
+		// That is the same policy split the config profile used to allow, through a different
+		// door: the runtime paced against 190 MiB while the timer policed 50 MiB, and the
+		// collector target was whatever the runtime default happened to be.
+		//
+		// The external value is therefore ignored on iOS, and the canonical budget and GC
+		// target are applied unconditionally. Ignoring it is the correct behaviour rather
+		// than a workaround: an iOS NetworkExtension's memory limit is imposed by the system,
+		// not chosen by the caller, so a caller-supplied number is not a setting - it is a
+		// disagreement with the system.
+		// The decision is a pure function so it can be tested on any platform. An earlier
+		// version was inline behind C.IsIos, which meant the only place it could be exercised
+		// was an iOS build - and a policy that can only be checked on one platform is a policy
+		// that is usually wrong on that platform.
+		effectiveLimit, gcPercent, applyGCPercent := resolveOOMKillerRuntimePolicy(
+			sOOMMemoryLimit,
+			C.IsIos,
+		)
+		sOOMMemoryLimit = effectiveLimit
+		if applyGCPercent {
+			debug.SetGCPercent(gcPercent)
 		}
 		if sOOMMemoryLimit > 0 {
 			runtimeMemoryLimit := oomkiller.RuntimeMemoryLimit(uint64(sOOMMemoryLimit))
@@ -221,4 +251,29 @@ func FormatFQDN(fqdn string) string {
 
 func ProxyDisplayType(proxyType string) string {
 	return C.ProxyDisplayName(proxyType)
+}
+
+// resolveOOMKillerRuntimePolicy maps a requested memory limit to the limit and GC target the Go
+// runtime should actually use.
+//
+// # Why the iOS branch ignores its input
+//
+// On iOS the OOM killer only ever means the PacketTunnel NetworkExtension, whose memory limit is
+// imposed by the SYSTEM rather than chosen by the caller. The timer already forces the canonical
+// budget there (see resolvePolicyMode, which ignores every override), so honouring an external
+// number in the runtime settings would pace the Go runtime against one budget while the timer
+// policed another.
+//
+// Concretely, an override of 200 MiB used to produce a 50 MiB timer budget, a 190 MiB
+// GOMEMLIMIT and a non-canonical GOGC - the same policy split the config profile used to allow.
+//
+// Ignoring the input is therefore the correct behaviour, not a workaround: a caller-supplied
+// number is not a setting here, it is a disagreement with the system.
+func resolveOOMKillerRuntimePolicy(requestedLimit int64, isIOS bool) (effectiveLimit int64, gcPercent int, applyGCPercent bool) {
+	if isIOS {
+		return oomkiller.DefaultAppleNetworkExtensionMemoryLimit,
+			oomkiller.DefaultAppleNetworkExtensionGCPercent,
+			true
+	}
+	return requestedLimit, 0, false
 }
