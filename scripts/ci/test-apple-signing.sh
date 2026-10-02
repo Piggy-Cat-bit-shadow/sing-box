@@ -386,6 +386,73 @@ for script in scripts/release-apple.sh scripts/ci/apple-signing-config.sh \
 done
 
 
+echo "== iOS branding: the product is JiejieBox, the core is sing-box =="
+# The product brand and the core name are deliberately separate. The app presents as
+# JiejieBox; the SFI target, scheme, bundle id, entitlements, URL scheme and the
+# sing-box core all keep their names, because those are compatibility or technical
+# identifiers rather than branding.
+branding_applied=0
+if APPLE_SIGNING_MODE=development APPLE_TEAM_ID="$TEST_TEAM" \
+   APPLE_BASE_BUNDLE_ID="$TEST_BASE" APPLE_APP_GROUP_ID="group.$TEST_BASE" \
+   ./scripts/ci/prepare-apple-client.sh >/dev/null 2>&1; then
+  branding_applied=1
+fi
+
+if [ "$branding_applied" = "1" ]; then
+  pbx="clients/apple/sing-box.xcodeproj/project.pbxproj"
+  scheme="clients/apple/sing-box.xcodeproj/xcshareddata/xcschemes/SFI.xcscheme"
+
+  check "the branding overlay renamed SFI" \
+    grep -q 'INFOPLIST_KEY_CFBundleDisplayName = "JiejieBox"' "$pbx"
+  check "the SFI scheme points at the renamed product" \
+    grep -q 'BuildableName = "JiejieBox.app"' "$scheme"
+  check "the UI test buildable is untouched" \
+    grep -q 'BuildableName = "SFIUITests.xctest"' "$scheme"
+
+  # Only SFI may change: SFT and SFM also declare PRODUCT_NAME = "sing-box", and
+  # renaming them would be a branding migration this task explicitly excludes.
+  sfi_configs="$(python3 "$root/scripts/ci/test-branding-scope.py" clients/apple)"
+  check "only the SFI configurations were renamed" test "$sfi_configs" = "2"
+
+  echo "  -- compatibility must be preserved --"
+  check "the bundle identifier setting is unchanged" \
+    grep -q 'PRODUCT_BUNDLE_IDENTIFIER = "$(BASE_PACKAGE_IDENTIFIER)"' "$pbx"
+  check "the App Group setting is unchanged" \
+    grep -q 'APP_GROUP_IDENTIFIER = "group.\$(BASE_PACKAGE_IDENTIFIER)"' "$pbx"
+  check "the Extension product name is unchanged" \
+    bash -c "! grep -q 'PRODUCT_NAME = \"JiejieBox\";' clients/apple/Extension/Info.plist 2>/dev/null"
+  check "the sing-box URL scheme is unchanged" \
+    grep -q 'sing-box' clients/apple/SFI/Info.plist
+  check "the SFI target is still called SFI" \
+    grep -q 'Build configuration list for PBXNativeTarget "SFI"' "$pbx"
+
+  echo "  -- the submodule must be untouched as a repository --"
+  check "the parent gitlink is unchanged" \
+    test "$(git ls-tree HEAD clients/apple | awk '{print $3}')" = "2b1763a80f2c1dee1ab3ac62d84dbda7dc5178f4"
+  check "the submodule HEAD is still the pinned commit" \
+    test "$(git -C clients/apple rev-parse HEAD)" = "2b1763a80f2c1dee1ab3ac62d84dbda7dc5178f4"
+  check "the branding change is uncommitted in the submodule" \
+    bash -c 'test -n "$(git -C clients/apple status --porcelain)"'
+else
+  echo "  FAIL: could not apply the overlay; skipping branding assertions" >&2
+  fail=$((fail + 1))
+fi
+restore_overlay
+
+echo "== the branding overlay fails closed =="
+# If the pinned client changes so the anchors no longer match, the overlay must
+# refuse rather than silently skip - a branding overlay that stops working would
+# ship an app still called sing-box, which is the bug it exists to fix.
+check "the overlay verifies its anchors" \
+  grep -q "does not match the expected structure" scripts/ci/apply-apple-branding-overlay.py
+check "the overlay refuses to guess at the scheme" \
+  grep -q "refusing to guess" scripts/ci/apply-apple-branding-overlay.py
+check "the TestFlight builder does not hardcode a product name" \
+  bash -c "! grep -qE '^app=.*(sing-box|JiejieBox)\.app' scripts/ci/build-ios-testflight.sh"
+check "the TestFlight builder fails on an ambiguous archive" \
+  grep -q "expected exactly one application" scripts/ci/build-ios-testflight.sh
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

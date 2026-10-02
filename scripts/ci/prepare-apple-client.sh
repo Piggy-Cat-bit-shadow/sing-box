@@ -159,6 +159,22 @@ echo "  [compatibility] notification send(_:)   -> untouched, single implementat
 python3 "$root/scripts/ci/fix-apple-team-id.py" "$submodule_path"
 
 # ---------------------------------------------------------------------------
+# 1c. [branding] Present the iOS app as JiejieBox.
+# ---------------------------------------------------------------------------
+# The product brand is JiejieBox; the underlying core remains sing-box. Only the
+# SFI target's product name and display name change, so the installed app is
+# JiejieBox.app with CFBundleDisplayName=JiejieBox.
+#
+# Everything technical or compatibility-related is left alone: the SFI target and
+# scheme names, the bundle identifier, the App Group, entitlements, the sing-box://
+# URL scheme, and every other target (SFT, SFM, SFM.System, the extensions). The
+# overlay resolves SFI's build configurations from the project's own configuration
+# lists rather than by string search, because three targets share
+# PRODUCT_NAME = "sing-box" and a global replacement would rename the tvOS and
+# macOS apps too.
+python3 "$root/scripts/ci/apply-apple-branding-overlay.py" "$submodule_path"
+
+# ---------------------------------------------------------------------------
 # 2. [entitlements] Multicast switch and App Group consistency.
 # ---------------------------------------------------------------------------
 # Multicast Networking must be requested from Apple separately, so it is off by

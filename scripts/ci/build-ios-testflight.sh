@@ -148,16 +148,23 @@ if [ ! -d "$archive_path" ]; then
   exit 1
 fi
 
-app="$archive_path/Products/Applications/sing-box.app"
-if [ ! -d "$app" ]; then
-  # The product name is not the scheme name; find whatever was produced.
-  app="$(find "$archive_path/Products/Applications" -maxdepth 1 -name '*.app' -type d | head -1)"
-fi
-if [ -z "$app" ] || [ ! -d "$app" ]; then
-  echo "FAIL: the archive contains no application bundle" >&2
-  find "$archive_path/Products" -maxdepth 3 -type d 2>/dev/null | head -10 >&2
+# Discover the application bundle rather than assuming its name.
+#
+# The product name is deliberately not the scheme name, and the branding overlay
+# changes it (the SFI scheme produces JiejieBox.app). Hardcoding either value would
+# make this script wrong the moment branding changes, so it reads the archive.
+# Fail closed on anything other than exactly one application: picking one of several
+# would silently archive the wrong product.
+app_dir="$archive_path/Products/Applications"
+app_count="$(find "$app_dir" -maxdepth 1 -name '*.app' -type d 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$app_count" != "1" ]; then
+  echo "FAIL: expected exactly one application in the archive, found $app_count" >&2
+  find "$app_dir" -maxdepth 1 -name '*.app' -type d 2>/dev/null | sed 's/^/      /' >&2
+  echo "      Archiving an ambiguous archive could ship the wrong product." >&2
   exit 1
 fi
+app="$(find "$app_dir" -maxdepth 1 -name '*.app' -type d | head -1)"
+echo "archived app: $(basename "$app")"
 echo "archived app: $app"
 
 # Record what was actually built, for the report and BUILD-INFO.

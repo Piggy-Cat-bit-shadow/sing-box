@@ -151,8 +151,9 @@ fi
 xcodebuild build "${build_settings[@]}" 2>&1 | tail -40
 
 # --- 3. Locate the built app. ---------------------------------------------------
-# The bundle name is NOT the scheme name: the SFI scheme produces `sing-box.app`.
-# Read it from the scheme so a rename upstream cannot silently break this.
+# The bundle name is NOT the scheme name, and it is not fixed either: the branding
+# overlay renames the SFI product (currently JiejieBox.app). Read it from the scheme
+# so neither an upstream rename nor a branding change can silently break this.
 product_name="$(grep -oE 'BuildableName = "[^"]*\.app"' "$client/sing-box.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')"
 if [ -z "$product_name" ]; then
   echo "FAIL: could not determine the product name for scheme $scheme" >&2
