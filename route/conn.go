@@ -36,11 +36,10 @@ type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
-	// Session-level splice diagnostics. Counters only: one atomic add per UDP
-	// session, never per packet. See splice_diagnostics.go for why, and for what
-	// these numbers can and cannot tell you.
+	// Session-level splice diagnostics. One atomic add per UDP session, never per
+	// packet. See splice_diagnostics.go for why, and for what these numbers can and
+	// cannot tell you.
 	spliceDiagnostics spliceDiagnostics
-	spliceTelemetry   spliceTelemetry
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
@@ -76,6 +75,15 @@ func (m *ConnectionManager) CloseAll() {
 
 func (m *ConnectionManager) Close() error {
 	m.CloseAll()
+	// One line per tunnel lifetime, and only when UDP actually went through the splice
+	// decision. This is the only place the diagnostics are reported, deliberately: a
+	// per-session or per-packet log would be the very cost the counters exist to measure.
+	//
+	// Emitting it here means a real-device run needs no instrumentation at all - start the
+	// VPN, use the app, stop the VPN, read one line from the log.
+	if snapshot := m.SpliceDiagnostics(); snapshot.Attempts > 0 {
+		m.logger.Info(snapshot.SpliceSummary())
+	}
 	return nil
 }
 

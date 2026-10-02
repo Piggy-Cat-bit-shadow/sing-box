@@ -1,6 +1,9 @@
 package route
 
 import (
+	"fmt"
+	"reflect"
+	"strings"
 	"sync/atomic"
 
 	"github.com/sagernet/sing-tun"
@@ -82,13 +85,19 @@ const (
 
 	// --- attach and platform ------------------------------------------------
 
-	// spliceReasonAttachFailed: the socket was found but handing it to the NAT conn
-	// failed, typically because the socket already had an owner or was closing.
-	spliceReasonAttachFailed
-	// spliceReasonPlatformUnsupported: the flow was eligible but the platform has
-	// no splice support, so it fell back. This is an expected steady state rather
-	// than a defect.
-	spliceReasonPlatformUnsupported
+	// spliceReasonSpliceRejected: the flow was eligible - source and target both unwrapped
+	// - but tun's Splice returned false.
+	//
+	// This is deliberately ONE reason rather than several. UDPNatConn.Splice returns a
+	// bare bool, and its false paths include the writer not being a GoPacketConn, the
+	// platform lacking socket support, NAT origin/destination that the splice cannot
+	// express, owner.Attach being refused (typically an existing owner), socket conversion
+	// failing, and family mismatches. None of that is observable from here, so splitting
+	// it would mean guessing - and a device report that says "attach_failed" when the real
+	// cause was platform support is worse than one that says less.
+	//
+	// Splitting this needs sing-tun to report why, not sing-box to infer it.
+	spliceReasonSpliceRejected
 )
 
 // String returns a stable lowercase name, for tests and diagnostic output.
@@ -117,72 +126,84 @@ func (r spliceReason) String() string {
 		return "target_no_upstream"
 	case spliceReasonTargetUpstreamMismatch:
 		return "target_upstream_mismatch"
-	case spliceReasonAttachFailed:
-		return "attach_failed"
-	case spliceReasonPlatformUnsupported:
-		return "platform_unsupported"
+	case spliceReasonSpliceRejected:
+		return "splice_rejected"
 	default:
 		return "unknown"
 	}
 }
 
 // spliceReasonCount is the number of distinct reasons, used to size the counters.
-const spliceReasonCount = int(spliceReasonPlatformUnsupported) + 1
+const spliceReasonCount = int(spliceReasonSpliceRejected) + 1
 
 // spliceReasonMax is the largest valid reason, for bounds checks.
-const spliceReasonMax = spliceReasonPlatformUnsupported
+const spliceReasonMax = spliceReasonSpliceRejected
 
-// spliceDiagnostics accumulates session-level splice outcomes.
+// spliceDiagnostics counts how each UDP session's splice decision ended.
 //
-// Access is a single atomic add on the session path and an atomic load per counter
-// when a snapshot is taken. There is no lock, no allocation and nothing to contend
-// on beyond the counter being incremented, which is the smallest cost that still
-// produces a usable ratio on a real device.
+// # One write per session
+//
+// Every session increments exactly ONE counter, once, at the moment its decision is
+// final. There is no separate attempts counter and no separate success counter: a session
+// that wrote two of them would be two atomic operations on the hot path, and it would also
+// make the invariant below impossible to state, let alone check.
+//
+//	Attempts == Successes + sum(Reasons)
+//
+// That holds by construction here, because every session contributes exactly one to
+// exactly one bucket, and the snapshot is derived from the same array.
+//
+// The cost is one atomic add per flow - not per packet. A per-datagram counter at video
+// call rates would itself be a source of the contention being investigated.
 type spliceDiagnostics struct {
 	counters [spliceReasonCount]atomic.Uint64
 }
 
-// record notes one session outcome.
-func (d *spliceDiagnostics) record(reason spliceReason) {
-	if int(reason) < spliceReasonCount {
-		d.counters[reason].Add(1)
+// recordOutcome is the single write a session performs.
+func (d *spliceDiagnostics) recordOutcome(outcome spliceReason) {
+	if int(outcome) < spliceReasonCount {
+		d.counters[outcome].Add(1)
 	}
 }
 
-// snapshot returns a copy of the counters, indexed by reason.
-func (d *spliceDiagnostics) snapshot() map[string]uint64 {
-	out := make(map[string]uint64, spliceReasonCount)
+// total is the number of sessions that reached a decision.
+func (d *spliceDiagnostics) total() uint64 {
+	var total uint64
 	for i := range d.counters {
-		if v := d.counters[i].Load(); v != 0 {
-			out[spliceReason(i).String()] = v
+		total += d.counters[i].Load()
+	}
+	return total
+}
+
+// successes is the number of sessions that spliced.
+func (d *spliceDiagnostics) successes() uint64 {
+	return d.counters[spliceReasonSuccess].Load()
+}
+
+// snapshot returns the non-zero FAILURE buckets, keyed by reason name.
+//
+// Success is excluded, and that is load-bearing rather than cosmetic: SpliceSnapshot
+// reports Successes separately, so including it here as well would count every spliced
+// session twice and break Attempts == Successes + sum(Reasons) - the invariant that makes
+// a device report self-consistent.
+func (d *spliceDiagnostics) snapshot() map[string]uint64 {
+	snapshot := make(map[string]uint64, spliceReasonCount)
+	for i := range d.counters {
+		if spliceReason(i) == spliceReasonSuccess {
+			continue
+		}
+		if count := d.counters[i].Load(); count > 0 {
+			snapshot[spliceReason(i).String()] = count
 		}
 	}
-	return out
+	return snapshot
 }
-
-// total returns the number of sessions recorded.
-func (d *spliceDiagnostics) total() uint64 {
-	var sum uint64
-	for i := range d.counters {
-		sum += d.counters[i].Load()
-	}
-	return sum
-}
-
-// spliceAttempts counts every session that reached the splice decision, and
-// spliceSuccesses counts those that spliced. Kept as two counters rather than
-// derived from the reason table so that the success ratio is a single subtraction
-// and cannot be skewed by a reason being added later.
-type spliceTelemetry struct {
-	attempts  atomic.Uint64
-	successes atomic.Uint64
-}
-
-func (t *spliceTelemetry) recordAttempt() { t.attempts.Add(1) }
-func (t *spliceTelemetry) recordSuccess() { t.successes.Add(1) }
 
 // SpliceSnapshot is an immutable view of the splice diagnostics, for tests and for
 // on-device observation.
+//
+// Attempts, Successes and Reasons are all derived from the same counter array, so they
+// cannot disagree: Attempts is its total and Successes is one of its buckets.
 type SpliceSnapshot struct {
 	// Attempts is the number of UDP sessions that reached the splice decision.
 	Attempts uint64
@@ -208,8 +229,8 @@ func (s SpliceSnapshot) Ratio() float64 {
 // reasons. Reading it allocates a small map and has no effect on forwarding.
 func (m *ConnectionManager) SpliceDiagnostics() SpliceSnapshot {
 	return SpliceSnapshot{
-		Attempts:  m.spliceTelemetry.attempts.Load(),
-		Successes: m.spliceTelemetry.successes.Load(),
+		Attempts:  m.spliceDiagnostics.total(),
+		Successes: m.spliceDiagnostics.successes(),
 		Reasons:   m.spliceDiagnostics.snapshot(),
 	}
 }
@@ -297,23 +318,26 @@ func unwrapSpliceTargetWithReason(conn any, allowOffload bool) (spliceTarget, sp
 	}
 }
 
-// sameConn reports whether two upstream values refer to the same connection.
+// sameConn reports whether two values are the same connection.
 //
-// The original compared `any(reader) != any(writer)`, which panics for a
-// non-comparable dynamic type. Identical behaviour for comparable values, and a
-// false result instead of a panic otherwise.
-func sameConn(a any, b any) (equal bool) {
+// It replaces a direct any(a) != any(b) comparison, which PANICS when a dynamic type is
+// not comparable - inside the splice decision, on a packet path. The first version of this
+// recovered from that panic, but a panic used for ordinary control flow is expensive and
+// obscures what the code means: the question here is simply "are these the same
+// connection", and it has a direct answer.
+//
+// The types are compared first. Different types are never the same connection, and two
+// comparable values of the same type can be compared safely with ==. Anything
+// non-comparable (a slice, a map, a func) reports false, which is the safe direction: it
+// refuses a splice rather than joining two flows.
+func sameConn(a any, b any) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
-	// Comparing non-comparable dynamic types panics; treat that as "not the same
-	// connection", which is the safe direction - it refuses a splice rather than
-	// joining two flows.
-	defer func() {
-		if recover() != nil {
-			equal = false
-		}
-	}()
+	typeA, typeB := reflect.TypeOf(a), reflect.TypeOf(b)
+	if typeA != typeB || !typeA.Comparable() {
+		return false
+	}
 	return a == b
 }
 
@@ -365,4 +389,32 @@ func unwrapSpliceSourceWithReason(conn N.PacketConn) (spliceSource, spliceReason
 			return spliceSource{}, spliceReasonSourceNoUpstream, false
 		}
 	}
+}
+
+// SpliceSummary renders the diagnostics as one stable line.
+//
+// Real-device A/B is the only way to settle whether splicing is actually happening on a
+// phone, and getting Go-level numbers off a device is awkward. This is the minimum that
+// makes it possible: start the VPN, run the call, stop the VPN, read one line.
+//
+// The format is fixed and the reasons are emitted in enum order, never map order, so two
+// runs can be compared by eye and by diff. It is produced once per tunnel lifetime by the
+// caller - never per session and never per packet.
+func (s SpliceSnapshot) SpliceSummary() string {
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "UDP splice diagnostics: attempts=%d successes=%d ratio=%.3f",
+		s.Attempts, s.Successes, s.Ratio())
+
+	// Enum order, so the output is stable between runs. A map would rotate key order and
+	// make two device logs needlessly hard to compare.
+	for i := 0; i < spliceReasonCount; i++ {
+		reason := spliceReason(i)
+		if reason == spliceReasonSuccess {
+			continue
+		}
+		if count := s.Reasons[reason.String()]; count > 0 {
+			fmt.Fprintf(&summary, " %s=%d", reason.String(), count)
+		}
+	}
+	return summary.String()
 }

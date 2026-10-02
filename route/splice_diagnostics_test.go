@@ -2,6 +2,8 @@ package route
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Tests for the splice diagnostics.
@@ -23,16 +25,21 @@ func TestSpliceDiagnostics_EmptySnapshot(t *testing.T) {
 
 func TestSpliceDiagnostics_RecordsEachReason(t *testing.T) {
 	var d spliceDiagnostics
-	d.record(spliceReasonSuccess)
-	d.record(spliceReasonSuccess)
-	d.record(spliceReasonSourceNotReplaceable)
+	d.recordOutcome(spliceReasonSuccess)
+	d.recordOutcome(spliceReasonSuccess)
+	d.recordOutcome(spliceReasonSourceNotReplaceable)
 
-	snap := d.snapshot()
-	if snap["success"] != 2 {
-		t.Errorf("success: want 2, got %d", snap["success"])
+	// Success is reported through successes(), NOT through the reason table. Listing it in
+	// both places would double-count every spliced session and break the
+	// Attempts == Successes + sum(Reasons) invariant the device report relies on.
+	if _, present := d.snapshot()["success"]; present {
+		t.Error("success must not appear in the reason table; it has its own accessor")
 	}
-	if snap["source_not_replaceable"] != 1 {
-		t.Errorf("source_not_replaceable: want 1, got %d", snap["source_not_replaceable"])
+	if d.successes() != 2 {
+		t.Errorf("successes: want 2, got %d", d.successes())
+	}
+	if got := d.snapshot()["source_not_replaceable"]; got != 1 {
+		t.Errorf("source_not_replaceable: want 1, got %d", got)
 	}
 	if d.total() != 3 {
 		t.Errorf("total: want 3, got %d", d.total())
@@ -43,7 +50,7 @@ func TestSpliceDiagnostics_ZeroReasonsAreOmitted(t *testing.T) {
 	// A snapshot reports only what happened, so an absent key means "never seen"
 	// rather than "seen zero times" - which keeps on-device output readable.
 	var d spliceDiagnostics
-	d.record(spliceReasonTargetNoUpstream)
+	d.recordOutcome(spliceReasonTargetNoUpstream)
 	snap := d.snapshot()
 	if _, present := snap["success"]; present {
 		t.Error("a reason that never occurred must not appear in the snapshot")
@@ -57,7 +64,7 @@ func TestSpliceDiagnostics_OutOfRangeReasonIsIgnored(t *testing.T) {
 	// Bounds check: a future reason added without widening spliceReasonCount must
 	// not write out of bounds.
 	var d spliceDiagnostics
-	d.record(spliceReason(200))
+	d.recordOutcome(spliceReason(200))
 	if d.total() != 0 {
 		t.Fatalf("an out-of-range reason must not be recorded, total=%d", d.total())
 	}
@@ -135,4 +142,146 @@ func TestSameConn(t *testing.T) {
 			t.Error("distinct uncomparable values must not compare equal")
 		}
 	}()
+}
+
+// --- one outcome per session (§19) ----------------------------------------------
+
+func TestSpliceDiagnostics_AttemptsInvariantHolds(t *testing.T) {
+	// Attempts == Successes + sum(Reasons), by construction. This is the property that
+	// makes a device report self-consistent: if a session could write two counters, or
+	// none, the totals would drift and a ratio computed from them would be meaningless.
+	var d spliceDiagnostics
+	d.recordOutcome(spliceReasonSuccess)
+	d.recordOutcome(spliceReasonSuccess)
+	d.recordOutcome(spliceReasonSuccess)
+	d.recordOutcome(spliceReasonSourceNotNAT)
+	d.recordOutcome(spliceReasonSpliceRejected)
+	d.recordOutcome(spliceReasonTargetNoUpstream)
+
+	snapshot := SpliceSnapshot{
+		Attempts:  d.total(),
+		Successes: d.successes(),
+		Reasons:   d.snapshot(),
+	}
+
+	require.EqualValues(t, 6, snapshot.Attempts)
+	require.EqualValues(t, 3, snapshot.Successes)
+
+	var reasonSum uint64
+	for _, count := range snapshot.Reasons {
+		reasonSum += count
+	}
+	// Reasons excludes success, so success plus reasons is the whole population.
+	require.EqualValues(t, snapshot.Attempts, snapshot.Successes+reasonSum,
+		"every session must contribute to exactly one bucket")
+
+	// And success must not appear in the reason table, or it would be counted twice.
+	_, successInReasons := snapshot.Reasons["success"]
+	require.False(t, successInReasons, "success must not also be listed as a reason")
+}
+
+func TestSpliceDiagnostics_OutcomeCountsOneBucketOnly(t *testing.T) {
+	// A single session must move exactly one counter.
+	var d spliceDiagnostics
+	d.recordOutcome(spliceReasonTargetNotReplaceable)
+
+	require.EqualValues(t, 1, d.total())
+	require.EqualValues(t, 0, d.successes())
+	require.Len(t, d.snapshot(), 1)
+}
+
+// --- the device-readable summary (§20) ------------------------------------------
+
+func TestSpliceSnapshot_SummaryFormatIsStable(t *testing.T) {
+	snapshot := SpliceSnapshot{
+		Attempts:  123,
+		Successes: 100,
+		Reasons: map[string]uint64{
+			"source_not_replaceable": 5,
+			"splice_rejected":        18,
+		},
+	}
+
+	got := snapshot.SpliceSummary()
+	require.Equal(t,
+		"UDP splice diagnostics: attempts=123 successes=100 ratio=0.813 source_not_replaceable=5 splice_rejected=18",
+		got)
+}
+
+func TestSpliceSnapshot_SummaryReasonOrderIsDeterministic(t *testing.T) {
+	// The reason order must come from the enum, not from map iteration. A rotating order
+	// would make two device logs hard to compare by eye or by diff, which is the only
+	// thing this line is for.
+	snapshot := SpliceSnapshot{
+		Attempts:  3,
+		Successes: 0,
+		Reasons: map[string]uint64{
+			"source_not_nat":     1,
+			"target_no_upstream": 1,
+			"splice_rejected":    1,
+		},
+	}
+
+	first := snapshot.SpliceSummary()
+	for i := 0; i < 50; i++ {
+		require.Equal(t, first, snapshot.SpliceSummary(),
+			"the summary must render identically every time")
+	}
+}
+
+func TestSpliceSnapshot_SummaryOmitsZeroReasons(t *testing.T) {
+	snapshot := SpliceSnapshot{Attempts: 2, Successes: 2, Reasons: map[string]uint64{}}
+	require.Equal(t,
+		"UDP splice diagnostics: attempts=2 successes=2 ratio=1.000",
+		snapshot.SpliceSummary())
+}
+
+// --- sameConn without a recover-driven control flow (§21) -----------------------
+
+func TestSameConn_UncomparableTypesDoNotPanic(t *testing.T) {
+	// The previous implementation recovered from the panic that == raises on an
+	// uncomparable dynamic type. Using a panic for ordinary control flow is expensive and
+	// hides the intent; the answer here is simply that two distinct uncomparable values are
+	// not the same connection.
+	require.NotPanics(t, func() {
+		require.False(t, sameConn([]int{1}, []int{1}))
+		require.False(t, sameConn(map[string]int{"a": 1}, map[string]int{"a": 1}))
+	})
+
+	// Comparable values must still behave exactly as == would.
+	shared := &socketConn{}
+	require.True(t, sameConn(shared, shared), "the same pointer is the same connection")
+	require.False(t, sameConn(&socketConn{}, &socketConn{}), "distinct pointers differ")
+	require.True(t, sameConn(nil, nil))
+	require.False(t, sameConn(shared, nil))
+	require.False(t, sameConn(nil, shared))
+
+	// Different types are never the same connection, even when both are nil-able.
+	require.False(t, sameConn(&socketConn{}, 42))
+}
+
+func TestSameConn_ComparableStructs(t *testing.T) {
+	// An interface holding a comparable but non-pointer type must compare by value, which
+	// is what == would have done.
+	type marker struct{ id int }
+	require.True(t, sameConn(marker{1}, marker{1}))
+	require.False(t, sameConn(marker{1}, marker{2}))
+}
+
+// --- no invented reasons (§18) --------------------------------------------------
+
+func TestSpliceReason_NoInventedSpliceFailureReasons(t *testing.T) {
+	// tun's Splice returns a bare bool covering platform support, NAT expressibility,
+	// Attach refusal, socket conversion and family mismatch. sing-box cannot tell those
+	// apart, so it must report one reason rather than guess between them.
+	names := make([]string, 0, spliceReasonCount)
+	for i := 0; i < spliceReasonCount; i++ {
+		names = append(names, spliceReason(i).String())
+	}
+
+	require.Contains(t, names, "splice_rejected")
+	require.NotContains(t, names, "attach_failed",
+		"attach failure is not distinguishable from other Splice false paths")
+	require.NotContains(t, names, "platform_unsupported",
+		"platform support is not distinguishable from other Splice false paths")
 }

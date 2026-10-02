@@ -130,17 +130,18 @@ func (m *ConnectionManager) splicePacketConnection(ctx context.Context, conn N.P
 	if isFakeIP {
 		source = fakeIPConn.NetPacketConn
 	}
-	// One attempt is counted per session, never per packet: this path runs once for
-	// a flow, and a per-datagram counter here would itself become contention.
-	m.spliceTelemetry.recordAttempt()
+	// The session records exactly one outcome, once, when its decision is final. See
+	// spliceDiagnostics: attempts and successes are derived from this same array, so a
+	// second write here would both cost another atomic on the session path and break the
+	// invariant Attempts == Successes + sum(Reasons).
 	spliceSource, sourceReason, isSpliceSource := unwrapSpliceSourceWithReason(source)
 	if !isSpliceSource {
-		m.spliceDiagnostics.record(sourceReason)
+		m.spliceDiagnostics.recordOutcome(sourceReason)
 		return conn, false
 	}
 	target, targetReason, isTarget := unwrapSpliceTargetWithReason(remote, true)
 	if !isTarget {
-		m.spliceDiagnostics.record(targetReason)
+		m.spliceDiagnostics.recordOutcome(targetReason)
 		return conn, false
 	}
 	if destinationAddress.IsValid() {
@@ -173,19 +174,19 @@ func (m *ConnectionManager) splicePacketConnection(ctx context.Context, conn N.P
 		RearHeadroom:  N.CalculateRearHeadroom(remote),
 	}) {
 		// The socket was found and handed over; packets now bypass userspace.
-		m.spliceTelemetry.recordSuccess()
+		m.spliceDiagnostics.recordOutcome(spliceReasonSuccess)
 		return conn, true
 	}
-	// Splice() declined. It returns a bool with no reason, and the two situations it
-	// covers - the socket could not be attached, or the platform has no splice
-	// support - are not distinguishable here. Rather than invent a reason the code
-	// cannot produce, count it as attach_failed only when a socket was actually
-	// offered and the failure is therefore about attachment.
-	if target.socket != nil {
-		m.spliceDiagnostics.record(spliceReasonAttachFailed)
-	} else {
-		m.spliceDiagnostics.record(spliceReasonPlatformUnsupported)
-	}
+	// Splice() declined, and it returns a bare bool. Its false paths inside sing-tun
+	// include platform support, NAT expressibility, owner.Attach being refused, socket
+	// conversion and family mismatch - none of which is observable from here, so
+	// inferring which one happened would mean guessing from a single fact.
+	//
+	// An earlier version split this into attach_failed and platform_unsupported based on
+	// whether a socket was present. That distinction is not real: a socket is always
+	// present whenever this line is reached, so the split could only ever have reported
+	// one of the two, and it would have been wrong about the cause.
+	m.spliceDiagnostics.recordOutcome(spliceReasonSpliceRejected)
 	if len(cached) == 0 {
 		return conn, false
 	}
