@@ -110,6 +110,16 @@ func (p candidatePlan) addresses() []netip.Addr {
 	return addresses
 }
 
+// MergeOriginalDestination combines resolved candidates with the address the client chose.
+//
+// It is exported because the router needs the same ordering rules the dialer will apply, so
+// that the list it publishes on the metadata is already in the order the scheduler will use.
+// Having the router build the list one way and the scheduler reorder it another is exactly
+// the kind of split this package exists to remove.
+func MergeOriginalDestination(original netip.Addr, resolved []netip.Addr, strategy C.DomainStrategy) []netip.Addr {
+	return planCandidates(resolved, original, strategy).addresses()
+}
+
 // planCandidates orders addresses for dual-stack racing.
 //
 // strategy is the caller's preference. originalDestination, when valid, is the address the

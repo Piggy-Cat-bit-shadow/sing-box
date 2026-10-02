@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
@@ -931,30 +932,124 @@ func (r *Router) actionSniff(
 	return
 }
 
+// actionResolve resolves a name into dial candidates.
+//
+// # Why a literal destination with a sniffed domain also resolves
+//
+// The action used to resolve only when Destination was itself a domain. In a TUN
+// deployment the application has usually already resolved the name and connects to an
+// address, so Destination is a literal and the action did nothing - even though sniffing
+// had recovered the domain into metadata.Domain. The result was a connection with exactly
+// one candidate: whichever family the application happened to pick. With a broken IPv6 path
+// and a healthy IPv4 one, there was no alternative to fall back to, so Happy Eyeballs had
+// nothing to race.
+//
+// # Destination is NOT rewritten
+//
+// Resolving a sniffed domain produces dial CANDIDATES. The routing decision has already
+// been made, and rules such as geoip, ip_cidr, ip_version and private-IP checks are
+// specified in terms of the address the client actually connected to. Replacing
+// metadata.Destination with a resolved address would silently change which rules match.
+// Destination therefore keeps meaning "what the client asked for" and
+// DestinationAddresses means "where we may dial instead".
 func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionResolve) error {
+	lookupName := resolveLookupName(metadata)
+	if lookupName == "" {
+		return nil
+	}
+
+	var transport adapter.DNSTransport
+	if action.Server != "" {
+		var loaded bool
+		transport, loaded = r.dnsTransport.Transport(action.Server)
+		if !loaded {
+			return E.New("DNS server not found: ", action.Server)
+		}
+	}
+	addresses, err := r.dns.Lookup(adapter.WithContext(ctx, metadata), lookupName, adapter.DNSQueryOptions{
+		Transport:              transport,
+		Strategy:               action.Strategy,
+		DisableCache:           action.DisableCache,
+		DisableOptimisticCache: action.DisableOptimisticCache,
+		RewriteTTL:             action.RewriteTTL,
+		Timeout:                action.Timeout,
+		ClientSubnet:           action.ClientSubnet,
+	})
+	if err != nil {
+		return err
+	}
+	metadata.DestinationAddresses = mergeOriginalDestination(metadata.Destination, addresses, action.Strategy)
+	r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
+	return nil
+}
+
+// resolveLookupName reports which name to resolve, or empty when there is nothing to do.
+//
+// A domain destination is resolved directly. An IP destination is resolved through the
+// sniffed domain when one was recovered, because that is the name the client actually
+// wanted and it is the only source of the other address family.
+func resolveLookupName(metadata *adapter.InboundContext) string {
 	if metadata.Destination.IsDomain() {
-		var transport adapter.DNSTransport
-		if action.Server != "" {
-			var loaded bool
-			transport, loaded = r.dnsTransport.Transport(action.Server)
-			if !loaded {
-				return E.New("DNS server not found: ", action.Server)
+		return metadata.Destination.Fqdn
+	}
+	if !metadata.Destination.IsIP() {
+		return ""
+	}
+	return validSniffedDomain(metadata.Domain)
+}
+
+// validSniffedDomain returns the domain to resolve, or empty when the sniffed value is not
+// usable.
+//
+// The check is deliberately strict. A sniffed domain is attacker-influenced input - it is
+// derived from bytes the remote peer chose - and it is about to be sent to a resolver. A
+// value that is empty, over-long, contains a NUL or a space, or carries an IP literal is
+// rejected rather than resolved.
+func validSniffedDomain(domain string) string {
+	switch {
+	case domain == "":
+		return ""
+	case len(domain) > 253:
+		return ""
+	case strings.ContainsAny(domain, "\x00 \t\r\n/"):
+		return ""
+	}
+	// A sniffed "domain" that is actually an address literal must not be resolved.
+	if _, err := netip.ParseAddr(domain); err == nil {
+		return ""
+	}
+	// A single trailing dot is the FQDN form; anything else must contain a dot to be a
+	// plausible domain rather than a bare hostname fragment from a partial parse.
+	trimmed := strings.TrimSuffix(domain, ".")
+	if trimmed == "" || !strings.Contains(trimmed, ".") {
+		return ""
+	}
+	for _, label := range strings.Split(trimmed, ".") {
+		if label == "" || len(label) > 63 {
+			return ""
+		}
+		for _, char := range label {
+			isAlnum := (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')
+			if !isAlnum && char != '-' && char != '_' {
+				return ""
 			}
 		}
-		addresses, err := r.dns.Lookup(adapter.WithContext(ctx, metadata), metadata.Destination.Fqdn, adapter.DNSQueryOptions{
-			Transport:              transport,
-			Strategy:               action.Strategy,
-			DisableCache:           action.DisableCache,
-			DisableOptimisticCache: action.DisableOptimisticCache,
-			RewriteTTL:             action.RewriteTTL,
-			Timeout:                action.Timeout,
-			ClientSubnet:           action.ClientSubnet,
-		})
-		if err != nil {
-			return err
-		}
-		metadata.DestinationAddresses = addresses
-		r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
 	}
-	return nil
+	return trimmed
+}
+
+// mergeOriginalDestination combines resolved candidates with the address the client chose,
+// using the shared planner so the order published on the metadata is the order the dialer
+// will use.
+//
+// The original is kept because the resolved set may not contain it: a CDN answering
+// differently per query, a split-horizon resolver, or a cached mapping. Dropping it would
+// discard a destination the client is demonstrably able to reach. It is appended within its
+// own family rather than promoted, so the configured family preference survives - a recovery
+// must not quietly overrule the strategy.
+func mergeOriginalDestination(original M.Socksaddr, resolved []netip.Addr, strategy C.DomainStrategy) []netip.Addr {
+	if !original.IsIP() {
+		return resolved
+	}
+	return dialer.MergeOriginalDestination(original.Addr, resolved, strategy)
 }
