@@ -297,6 +297,41 @@ check "no private key block is tracked" \
   bash -c '! git grep -lI "BEGIN .*PRIVATE KEY" -- . ":(exclude)scripts/ci/test-apple-signing.sh" 2>/dev/null | grep -q .'
 
 
+echo "== the archives request DISTRIBUTION signing, not development =="
+# Regression guard for a real defect: the project pins CODE_SIGN_IDENTITY =
+# "Apple Development" in Release as well as Debug, so an archive that overrides
+# nothing asks Apple for a device-scoped DEVELOPMENT profile and fails with
+#
+#   No profiles for '<id>' were found: Xcode couldn't find any iOS App Development
+#   provisioning profiles
+#
+# which reads like a device problem but is a signing-mode problem. Both archives
+# must therefore state the distribution identity, and must pair it with Manual
+# style: Automatic derives the profile type from the identity, and the mismatch is
+# rejected on every target as "automatically signed for development, but a
+# conflicting code signing identity Apple Distribution has been manually
+# specified".
+for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflight.sh; do
+  check "$(basename "$builder") requests Apple Distribution" \
+    grep -q 'CODE_SIGN_IDENTITY="Apple Distribution"' "$builder"
+  check "$(basename "$builder") uses Manual style with it" \
+    grep -q 'CODE_SIGN_STYLE=Manual' "$builder"
+  check "$(basename "$builder") declares no development identity" \
+    bash -c "! grep -qE 'CODE_SIGN_IDENTITY=\"Apple Development\"' '$builder'"
+  check "$(basename "$builder") rejects an unsigned product" \
+    grep -q "signed for distribution" "$builder"
+done
+
+echo "== a product that is not signed at all must never pass =="
+# "code object is not signed at all" is what an empty identity yields: the build
+# succeeds and nothing uploadable is produced. An earlier probe was misread this
+# way, so the guard is asserted rather than assumed.
+check "the iOS builder checks for a real distribution signature" \
+  grep -q "codesign -dv '\$app' 2>&1 | grep -q 'Apple Distribution'" scripts/ci/build-ios-testflight.sh
+check "the iOS builder requires an embedded profile" \
+  grep -q "embedded.mobileprovision" scripts/ci/build-ios-testflight.sh
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

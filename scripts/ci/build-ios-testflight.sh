@@ -71,29 +71,7 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-# Signing strategy: DEVELOPMENT archive, DISTRIBUTION export.
-#
-# This is Xcode's own model and the reason the earlier attempts failed. Two wrong
-# approaches, both of which look reasonable:
-#
-#   Pinning CODE_SIGN_IDENTITY="Apple Development" makes the archive ask Apple for
-#   an iOS *Development* profile, which is device-scoped:
-#     Communication with Apple failed: Your team has no devices from which to
-#     generate a provisioning profile.
-#
-#   Pinning "Apple Distribution" makes every target the project leaves on automatic
-#   refuse to build, because the project also sets PROVISIONING_PROFILE_SPECIFIER=""
-#   on those targets:
-#     ... is automatically signed for development, but a conflicting code signing
-#     identity Apple Distribution has been manually specified.
-#
-# So the identity is not an input at all. `archive` produces a development-signed
-# archive, and `-exportArchive` with method app-store-connect RE-SIGNS it for
-# distribution - which is the step that can use a local Apple Distribution
-# certificate or a cloud-managed one obtained through the signed-in account. That
-# is why TestFlight needs no local distribution certificate and no registered
-# device; only the export step touches distribution signing.
-echo "archiving (Release, iphoneos, arm64; development-signed archive)"
+echo "archiving (Release, iphoneos, arm64, Apple Distribution)"
 rm -rf "$archive_path"
 xcodebuild archive \
   -project "$client/sing-box.xcodeproj" \
@@ -107,7 +85,31 @@ xcodebuild archive \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
+  # DISTRIBUTION signing, stated explicitly.
+  #
+  # The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well as
+  # Debug, so an archive that overrides nothing asks Apple for an *iOS App
+  # Development* profile - which is device-scoped, and therefore impossible on a
+  # team with no registered device:
+  #
+  #   No profiles for '<base>.extension' were found: Xcode couldn't find any
+  #   iOS App Development provisioning profiles matching '<base>.extension'
+  #
+  # That error reads like a device problem but is a signing-mode problem. An App
+  # Store archive must be signed for distribution.
+  #
+  # CODE_SIGN_STYLE must be Manual alongside it. Automatic derives the profile type
+  # from the identity, so overriding the identity while leaving Automatic produces a
+  # contradiction on every target, dependencies included:
+  #
+  #   ... is automatically signed for development, but a conflicting code signing
+  #   identity Apple Distribution has been manually specified.
+  #
+  # Manual with the distribution identity is accepted and requests the right profile
+  # types ("requires a provisioning profile with the App Groups and Network
+  # Extensions features").
+  CODE_SIGN_STYLE=Manual \
+  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   -allowProvisioningUpdates \
@@ -158,6 +160,14 @@ gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.neko
 gate "bundle id matches the configured base" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
 gate "main app is signed" codesign --verify --strict "$app"
+# An empty or missing identity makes xcodebuild succeed while producing a product
+# that is "code object is not signed at all". That looks like a passing build and is
+# worthless, and it is exactly how an earlier probe was misread, so assert the real
+# thing: a distribution signature that can actually be uploaded.
+gate "main app is signed for distribution" \
+  bash -c "codesign -dv '$app' 2>&1 | grep -q 'Apple Distribution'"
+gate "main app embeds a provisioning profile" \
+  test -f "$app/embedded.mobileprovision"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
 
 # The Packet Tunnel extension is the product; a TestFlight build without it is

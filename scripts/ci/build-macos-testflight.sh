@@ -115,7 +115,14 @@ xcodebuild archive \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  CODE_SIGN_STYLE=Automatic \
+  # Distribution signing, for the same reason as the iOS archive: the project pins
+  # CODE_SIGN_IDENTITY = "Apple Development" in Release, so an archive that
+  # overrides nothing asks Apple for a *Mac App Development* profile, which is
+  # device-scoped. Manual style must accompany the distribution identity, because
+  # Automatic derives the profile type from the identity and the two then
+  # contradict each other on every target.
+  CODE_SIGN_STYLE=Manual \
+  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   -allowProvisioningUpdates \
@@ -155,7 +162,11 @@ gate() {
 gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.nekohasekai.*) exit 1;; *) exit 0;; esac"
 gate "bundle id matches the iOS app id" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
-gate "main app is signed" codesign --verify --strict "$app/Contents/MacOS/"* 2>/dev/null || codesign --verify --strict "$app"
+gate "main app is signed" codesign --verify --strict "$app"
+# Guard against an empty identity, which makes the build succeed while producing a
+# product that is not signed at all - a passing build with nothing uploadable.
+gate "main app is signed for distribution" \
+  bash -c "codesign -dv '$app' 2>&1 | grep -q 'Apple Distribution'"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
 
 # Mac App Store distribution requires the sandbox. Without it the app cannot be
