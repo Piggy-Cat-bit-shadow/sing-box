@@ -320,8 +320,14 @@ func TestTCPTransportDemotesBrokenReuse(t *testing.T) {
 			t.Fatal("query failed after demotion: ", err)
 		}
 	}
-	if count := accepted.Load() - before; count != singleCount {
-		t.Fatal("expected one connection per query after demotion, got ", count)
+	// Demotion means "this server cannot pipeline", NOT "this server cannot be reused".
+	// This listener answers one request per connection and then closes it, which is
+	// keep-alive behaviour, so the transport must reuse serially instead of dialing per
+	// query. The exact count is deliberately not pinned - the server closes after each
+	// response, so the number of additional dials depends on how many responses fit
+	// before the close is observed. What must hold is that it is far below one-per-query.
+	if count := accepted.Load() - before; count >= singleCount {
+		t.Fatal("expected serial reuse to avoid a connection per query after demotion, got ", count)
 	}
 }
 

@@ -40,6 +40,14 @@ type queryMultiplexerOptions struct {
 type queryMultiplexer struct {
 	options    queryMultiplexerOptions
 	connection *ConnPool[*multiplexConn]
+	// serial is the reuse pool for servers that do NOT support concurrent outstanding
+	// queries. See dispatch: "unsupported" means "no pipelining", not "no reuse", and
+	// dialing per query was paying a TCP handshake for a server that is happy to answer
+	// sequentially on one connection.
+	//
+	// ConnPoolOrdered gives exactly the required shape: one holder at a time, an idle
+	// list, and stale-connection eviction through IsAlive.
+	serial *ConnPool[*multiplexConn]
 
 	queryAccess sync.Mutex
 	queryId     uint16
@@ -95,6 +103,20 @@ func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 			},
 		}),
 	}
+	multiplexer.serial = NewConnPool(ConnPoolOptions[*multiplexConn]{
+		Mode: ConnPoolOrdered,
+		IsAlive: func(conn *multiplexConn) bool {
+			// A connection whose read loop saw death is not reusable, and neither is a
+			// nil one. The readEpoch check mirrors the shared path: a non-zero epoch on a
+			// connection that is being handed back means it already died once.
+			return conn != nil && conn.readEpoch.Load() == 0
+		},
+		Close: func(conn *multiplexConn, cause error) {
+			if conn != nil {
+				conn.Close()
+			}
+		},
+	})
 	multiplexer.keepIdle.Store(true)
 	return multiplexer
 }
@@ -106,16 +128,30 @@ func (m *queryMultiplexer) SetKeepIdleConnections(keep bool) {
 
 func (m *queryMultiplexer) CloseIdleConnections() {
 	m.connection.CloseIdle()
+	// The serial pool holds its own idle connection. Leaving it out here would keep a TCP
+	// socket open to the resolver after the caller asked for idle connections to be
+	// dropped - which is the whole point of this call on a mobile device.
+	m.serial.CloseIdle()
 }
 
 func (m *queryMultiplexer) closeIdleConnection() {
 	if !m.keepIdle.Load() {
 		m.connection.CloseIdle()
+		// Same reasoning as CloseIdleConnections: with keep-idle disabled, no pooled
+		// connection may outlive the query that created it.
+		m.serial.CloseIdle()
 	}
 }
 
 func (m *queryMultiplexer) Close() error {
-	return m.connection.Close()
+	// Both pools must be closed. Missing the serial pool would leave a connection open
+	// and, worse, let a query after Close still succeed by dialing through it - Close is
+	// supposed to make this transport unusable.
+	err := m.connection.Close()
+	if serialErr := m.serial.Close(); err == nil {
+		err = serialErr
+	}
+	return err
 }
 
 func (m *queryMultiplexer) Reset() {
@@ -128,6 +164,10 @@ func (m *queryMultiplexer) Reset() {
 		m.demoteFailures.Store(0)
 	}
 	m.connection.Reset()
+	// A Reset drops cached connections so the next query re-dials - used when the network
+	// has changed. The serial pool must follow, or a query after Reset would keep using a
+	// connection established on the old path.
+	m.serial.Reset()
 }
 
 func (m *queryMultiplexer) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -158,20 +198,58 @@ func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, call
 	m.exchangeAsync(ctx, message, callback, retryReadError)
 }
 
+// exchangeSingle answers one query on a connection that is NOT used concurrently.
+//
+// # What changed, and why it matters
+//
+// "The server cannot pipeline" was being treated as "the connection cannot be reused",
+// so every query paid a full TCP handshake and teardown. Plenty of resolvers refuse
+// concurrent outstanding queries but are perfectly happy to answer sequentially on a
+// kept-alive connection - which is the overwhelmingly common case and costs one dial
+// rather than one per query.
+//
+// The connection now comes from the serial pool, and is returned for reuse only when it
+// is still healthy. The one-outstanding-query invariant is enforced structurally rather
+// than by convention: ConnPoolOrdered holds at most one connection out at a time, so
+// two callers cannot both be mid-query on the same socket.
 func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	conn, err := m.options.dial(ctx)
+	conn, created, err := m.serial.Acquire(ctx, m.dialSerialConn)
 	if err != nil {
 		callback(nil, err)
 		return
 	}
-	defer conn.Close()
+
+	// reusable records whether the connection may go back to the idle pool. Any failure
+	// after the request is written leaves the stream in an unknown position, so it must
+	// be discarded rather than reused - a stale response would otherwise be delivered to
+	// the next query.
+	reusable := false
+	closeConn := func() {
+		if conn != nil {
+			conn.Close()
+			conn = nil
+		}
+	}
+	defer func() {
+		if conn != nil {
+			m.serial.Release(conn, reusable)
+		}
+	}()
+
+	// Closing on context cancellation is what makes a timeout actually interrupt a read
+	// that is already in flight. It also means the connection must NOT be reused
+	// afterwards: the close happened underneath the caller.
 	stop := context.AfterFunc(ctx, func() {
-		conn.Close()
+		if conn != nil {
+			conn.Close()
+		}
 	})
 	defer stop()
+
 	err = m.options.write(conn, message, message.Id)
 	if err != nil {
 		ctxErr := ctx.Err()
+		closeConn()
 		if ctxErr != nil {
 			callback(nil, ctxErr)
 			return
@@ -184,8 +262,19 @@ func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg
 		response, err = m.options.readNext(conn)
 		if err != nil {
 			ctxErr := ctx.Err()
+			closeConn()
 			if ctxErr != nil {
 				callback(nil, ctxErr)
+				return
+			}
+			// A read failure on a REUSED connection usually means the server closed an
+			// idle connection between queries, which is normal and must not surface as an
+			// error to the caller. Retry once on a fresh connection.
+			if !created {
+				// Retry once, on a fresh connection, and report whatever that returns.
+				// Bounded at one attempt: a server that closes every connection would
+				// otherwise be retried forever.
+				m.retrySerialOnce(ctx, message, callback)
 				return
 			}
 			callback(nil, E.Cause(err, "read response"))
@@ -195,9 +284,37 @@ func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg
 			continue
 		}
 		response.Id = message.Id
+		// Completed cleanly: the stream is exactly at a message boundary, so the
+		// connection is safe to hand to the next query.
+		reusable = true
 		callback(response, nil)
 		return
 	}
+}
+
+// retrySerialOnce re-runs a query exactly once after a REUSED connection failed.
+//
+// A read failure on a reused connection usually means the server closed an idle
+// connection between queries. That is normal keep-alive behaviour and must not surface
+// as an error, so the query is retried on a fresh connection. The retry is deliberately
+// bounded at one attempt - the retried call comes back through exchangeSingle with
+// created=true, and a failure there is reported rather than retried again.
+func (m *queryMultiplexer) retrySerialOnce(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	if ctx.Err() != nil {
+		callback(nil, ctx.Err())
+		return
+	}
+	go m.exchangeSingle(ctx, message, callback)
+}
+
+// dialSerialConn dials for the serial pool, wrapping the transport's own dialer so the
+// pool caches multiplexConn values like the shared path does.
+func (m *queryMultiplexer) dialSerialConn(ctx context.Context) (*multiplexConn, error) {
+	conn, err := m.options.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &multiplexConn{Conn: conn}, nil
 }
 
 func (m *queryMultiplexer) maybeStartProbe(ctx context.Context, message *mDNS.Msg) {
