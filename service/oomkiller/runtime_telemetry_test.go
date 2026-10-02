@@ -41,3 +41,25 @@ func TestSubtractFloorDoesNotUnderflow(t *testing.T) {
 		t.Errorf("subtractFloor(20,10) = %d, want 10", got)
 	}
 }
+
+func TestObservedBudgetIsAdvisoryAndAbsentWithoutSupport(t *testing.T) {
+	// The estimate must refuse to produce a number when the platform does not provide
+	// available memory, rather than reporting the footprint alone as if it were a budget.
+	unknown := ReportStatus{PeakMemory: 30 * 1024 * 1024}
+	if _, ok := unknown.ObservedBudget(); ok {
+		t.Error("without available memory there is no observed budget to report")
+	}
+
+	known := ReportStatus{
+		PeakMemory:     30 * 1024 * 1024,
+		MinAvailable:   20 * 1024 * 1024,
+		AvailableKnown: true,
+	}
+	budget, ok := known.ObservedBudget()
+	if !ok {
+		t.Fatal("a known available figure must produce an estimate")
+	}
+	if budget != 50*1024*1024 {
+		t.Errorf("observed budget %d, want footprint plus available", budget)
+	}
+}

@@ -65,13 +65,42 @@ type RecorderOptions struct {
 }
 
 type ReportStatus struct {
-	StartedAt      time.Time
-	RecordedAt     time.Time
-	MemoryLimit    uint64
-	PeakMemory     uint64
+	StartedAt  time.Time
+	RecordedAt time.Time
+	// MemoryLimit is the configured process budget the policy polices against.
+	MemoryLimit uint64
+	// PeakMemory is the peak PROCESS FOOTPRINT (phys_footprint via memory.Total()), which
+	// includes Go heap, stacks, GC metadata and every native allocation. It is NOT the
+	// quantity GOMEMLIMIT governs - see ObservedBudget below for that distinction.
+	PeakMemory uint64
+	// MinAvailable is the lowest available-memory figure observed, when the platform
+	// provides one. AvailableKnown reports whether it means anything: on a platform without
+	// os_proc_available_memory the value is zero because the API is absent, not because the
+	// device was out of memory.
 	MinAvailable   uint64
 	AvailableKnown bool
 	Snapshots      int
+}
+
+// ObservedBudget is an ADVISORY, instantaneous estimate of the budget the process appears to
+// have, derived from the footprint and the platform's available-memory figure.
+//
+// # What it is not
+//
+// It is not a system limit, not a contract, and not cached anywhere. Apple has changed the
+// NetworkExtension limit before and may again, and it varies by device, so a value observed
+// on one phone at one moment is an observation. Treating it as fixed would make the policy
+// silently wrong the moment Apple changes the number.
+//
+// It exists so a real-device run can report what the process actually appeared to be
+// working within, which is the input a future controller would need. No controller reads it:
+// deriving a live policy from it would be a guess presented as configuration, and the
+// benchmarks behind that decision would be macOS ones.
+func (s ReportStatus) ObservedBudget() (uint64, bool) {
+	if !s.AvailableKnown {
+		return 0, false
+	}
+	return s.PeakMemory + s.MinAvailable, true
 }
 
 type Recorder struct {

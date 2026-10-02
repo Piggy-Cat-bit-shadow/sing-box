@@ -36,16 +36,22 @@ import (
 // because restating it is how a test stops testing anything.
 
 func TestAppleNetworkExtensionDefaults(t *testing.T) {
-	// 50 MiB is the client's documented NetworkExtension budget.
+	// 50 MiB is a fallback/tuning default and an observed packet-tunnel budget. It is NOT a
+	// documented Apple limit or a contract: Apple has changed the NetworkExtension limit
+	// before and may again, and it differs between devices.
 	if DefaultAppleNetworkExtensionMemoryLimit != 50*1024*1024 {
 		t.Errorf("Apple NetworkExtension budget: want 50 MiB (%d), got %d",
 			50*1024*1024, DefaultAppleNetworkExtensionMemoryLimit)
 	}
 
 	// GOGC 100 matches the Go default, and is deliberate rather than an omission.
-	// GOMEMLIMIT is what bounds this process; a lower GOGC made the collector run
-	// before the heap approached that limit. Measured under memory pressure, GOGC 50
-	// cost 36% more GC cycles for 1.13% less throughput with no memory benefit.
+	// GOMEMLIMIT paces the Go runtime's managed memory; the Darwin OOM timer is what watches
+	// the whole process footprint. GOMEMLIMIT alone does not bound the process. A lower GOGC
+	// made the collector run before the heap approached the soft limit.
+	//
+	// Measured under memory pressure with the corrected runtime-metrics harness, GOGC 50
+	// cost 56% more GC cycles and 56% more STW pause for 2.13% less throughput, with a lower
+	// runtime-managed peak - so the extra collection work bought nothing.
 	if DefaultAppleNetworkExtensionGCPercent != 100 {
 		t.Errorf("Apple NetworkExtension GOGC: want 100, got %d",
 			DefaultAppleNetworkExtensionGCPercent)
