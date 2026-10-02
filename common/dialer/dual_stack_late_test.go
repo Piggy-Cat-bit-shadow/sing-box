@@ -395,3 +395,42 @@ func TestEndToEndPreferredFirstHasNoAddedDelay(t *testing.T) {
 	require.Less(t, elapsed, preferredFamilyGrace,
 		"a preferred-first answer must not be delayed by the grace period")
 }
+
+// TestPreferredGraceHasOneOwner is §22 and §25.
+//
+// The grace period must add at most 50ms, not 50ms twice. An earlier design had a DNS collector
+// and a caller each waiting their own grace, which doubled the worst case - and worse, the
+// double wait is invisible unless a test measures the total.
+//
+// Here the preferred family never answers and the non-preferred family answers immediately. The
+// total time from call to first attempt must be bounded by ONE grace period plus scheduling
+// overhead, not two.
+func TestPreferredGraceHasOneOwner(t *testing.T) {
+	healthy4 := netip.MustParseAddr("192.0.2.1")
+
+	router := &fakeDomainRouter{
+		addressesA: []netip.Addr{healthy4},
+		delayA:     0,
+		// The preferred family never answers.
+		delayAAAA: -1,
+	}
+	inner := &recordingDialer{}
+	dialer := newDomainTestDialer(router, inner, true, 5*time.Second) // fallback must not mask the grace
+	dialer.queryOptions.Strategy = C.DomainStrategyPreferIPv6
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", M.ParseSocksaddr("example.test:443"))
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	// One grace period plus generous scheduling headroom. If two grace periods were applied in
+	// sequence this would be at least 100ms.
+	require.Less(t, elapsed, 2*preferredFamilyGrace,
+		"the grace period must have exactly one owner; two would double the worst case")
+	require.GreaterOrEqual(t, elapsed, preferredFamilyGrace/2,
+		"the non-preferred family should still have waited for the preferred one")
+}
