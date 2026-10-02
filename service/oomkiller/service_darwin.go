@@ -7,29 +7,35 @@ package oomkiller
 
 // One monitor per process, owned entirely by this file.
 //
-// # Why the source is no longer read through a global
+// # Ownership of the dispatch source
 //
-// The event handler used to read its own source back out of the mutable global
-// memoryPressureSource:
+// This preamble is plain C, not Objective-C: the file has no .m and nothing here is compiled
+// with ARC. Under plain C, OS_OBJECT_USE_OBJC is 0, so dispatch objects are NOT automatically
+// reference counted and dispatch_retain/dispatch_release are ordinary function calls.
 //
-//     unsigned long status = dispatch_source_get_data(memoryPressureSource);
+// dispatch_source_create() returns a +1 reference that the caller owns. Cancelling a source
+// stops further deliveries but does NOT consume that reference, so a create/cancel pair with no
+// release leaks the source - and repeated start/stop cycles leak one each time.
 //
-// The handler is delivered on a dispatch queue, so it can be queued and then run after
-// stopMemoryPressureMonitor() has already set that global to NULL - a null dereference on
-// a background queue, in the process whose job is to survive memory pressure. The value
-// was not even used: the Go callback ignored its argument.
+// An earlier version of this file claimed the event handler's block captured `source` and that
+// the capture kept it alive, so no release was needed. That was wrong twice over: the handler
+// body is `^{ goMemoryPressureCallback(); }`, which does not mention `source` at all, so there
+// was never a capture to retain anything; and a capture would not have balanced the create
+// anyway, because the +1 from create is the caller's to release regardless of what the handler
+// references.
 //
-// The handler now captures the source it was installed on, which is a strong reference
-// that outlives cancellation, so a late callback reads its own source and nothing else.
-// That also removes the cross-talk case where a callback belonging to a cancelled source
-// read the NEW source's data.
+// The lifecycle is therefore: create holds +1, stop removes the global reference FIRST, then
+// cancels, then releases the caller's +1. A handler already queued when cancel runs still
+// executes safely - it touches only Go state, never `source`, which is what makes the release
+// safe here.
+
 static dispatch_source_t memoryPressureSource;
 
 extern void goMemoryPressureCallback(void);
 
 static void startMemoryPressureMonitor() {
 	if (memoryPressureSource != NULL) {
-		// Already running. Starting again would leak the previous source and leave it
+		// Already running. Creating a second source would leak the first and leave it
 		// delivering events nobody owns.
 		return;
 	}
@@ -44,12 +50,14 @@ static void startMemoryPressureMonitor() {
 		return;
 	}
 
-	// The block captures `source` by value. Under ARC-free C blocks, dispatch objects are
-	// reference counted by libdispatch, and a block capture retains; that is what keeps
-	// this valid if the handler runs after cancellation.
+	// The handler deliberately does NOT reference `source`. It needs no data from it - the Go
+	// callback takes no argument - and not capturing it removes any question of the block
+	// keeping a cancelled source alive or reading a newer source's state.
 	dispatch_source_set_event_handler(source, ^{
 		goMemoryPressureCallback();
 	});
+
+	// Publish before activating, so a handler that runs immediately finds the global set.
 	memoryPressureSource = source;
 	dispatch_activate(source);
 }
@@ -59,16 +67,21 @@ static void stopMemoryPressureMonitor() {
 	if (source == NULL) {
 		return;
 	}
-	// Clear the global FIRST so a concurrent start cannot observe a cancelled source as
+
+	// Detach from the global FIRST so a concurrent start cannot observe a cancelled source as
 	// the live one and skip creating its own.
 	memoryPressureSource = NULL;
 
-	// Cancel stops further deliveries. The block's own capture keeps `source` alive until
-	// any already-queued invocation has run, so this needs no explicit release: under
-	// libdispatch's reference counting the capture is the reference that matters, and
-	// calling dispatch_release here would risk releasing a source a queued handler still
-	// holds.
+	// Cancel stops further deliveries. It does NOT release.
 	dispatch_source_cancel(source);
+
+	// Balance the +1 from dispatch_source_create. Without this every start/stop cycle leaks a
+	// dispatch source - a real leak in a service started and stopped as the tunnel comes up
+	// and down.
+	//
+	// This is safe even if a handler was already queued: the handler does not touch `source`,
+	// and libdispatch keeps the object alive until any in-flight handler returns.
+	dispatch_release(source);
 }
 */
 import "C"
@@ -90,6 +103,23 @@ import (
 // exactly the conditions that decide whether the dispatch source is left running or
 // leaked. They are ordinary Go state and can be tested on any platform, which matters
 // because the C half can only be exercised by a real Darwin build.
+//
+// # Why the transition happens inside the lock
+//
+// An earlier version returned a bool - "you are first" / "you are last" - and let the caller
+// call Start or Stop after unlocking. That leaves a window:
+//
+//	add:    lock, append, see first, unlock ................ call Start()
+//	remove:      lock, remove, see last, unlock, call Stop()      call Start()
+//
+// The interleaving marked above ends with an EMPTY registry and a RUNNING monitor: Stop ran
+// before Start, so Start's "already running?" check saw nothing and created a source that
+// nothing will ever stop. The registry and the monitor disagree permanently, and the source
+// keeps delivering pressure events for services that are gone.
+//
+// Holding one lock across both the state change and the transition removes the window. The
+// monitor's own Start/Stop must not call back into this registry, or the lock would deadlock;
+// see pressureMonitor.
 type pressureRegistry struct {
 	access   sync.Mutex
 	services []*Service
@@ -98,6 +128,14 @@ type pressureRegistry struct {
 
 // pressureMonitor is the process-wide monitor, abstracted so the registry's decisions can
 // be tested without dispatching.
+//
+// # Start and Stop must not re-enter the registry
+//
+// The registry calls these while holding its lifecycle lock. An implementation that called
+// back into the registry - to notify, log through it, or read its service list - would
+// deadlock. dispatchPressureMonitor calls straight into C, and the dispatch callback path
+// reaches the registry only through a snapshot taken before dispatch, never from inside
+// Start or Stop.
 type pressureMonitor interface {
 	Start()
 	Stop()
@@ -110,33 +148,36 @@ func (dispatchPressureMonitor) Stop()  { C.stopMemoryPressureMonitor() }
 
 var globalPressureRegistry = &pressureRegistry{monitor: dispatchPressureMonitor{}}
 
-// add registers a service and reports whether the monitor should be started.
+// add registers a service and starts the monitor if this is the first one.
 //
-// The decision is made while holding the lock, so two services starting concurrently
-// cannot both believe they are first and create two monitors.
-func (r *pressureRegistry) add(service *Service) (startMonitor bool) {
+// Registration and the start transition are one serialized operation, so the registry cannot
+// report an empty set while a monitor it started is still running.
+func (r *pressureRegistry) add(service *Service) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	r.services = append(r.services, service)
-	return len(r.services) == 1
+	if len(r.services) == 1 && r.monitor != nil {
+		r.monitor.Start()
+	}
 }
 
-// remove unregisters a service and reports whether the monitor should be stopped.
+// remove unregisters a service and stops the monitor if this was the last one.
 //
-// It reports true only when the LAST service leaves. Removing a service that is not
-// present is not an error - Close can legitimately be called twice - and it must not be
-// mistaken for the last one leaving, or a second Close on an already-removed service
-// would tear down a monitor other services still need.
-func (r *pressureRegistry) remove(service *Service) (stopMonitor bool) {
+// Removing a service that is not present is not an error - Close can legitimately be called
+// twice - and it must not be mistaken for the last one leaving, or a second Close on an
+// already-removed service would tear down a monitor other services still need.
+func (r *pressureRegistry) remove(service *Service) {
 	r.access.Lock()
 	defer r.access.Unlock()
 	for i, existing := range r.services {
 		if existing == service {
 			r.services = append(r.services[:i], r.services[i+1:]...)
-			return len(r.services) == 0
+			if len(r.services) == 0 && r.monitor != nil {
+				r.monitor.Stop()
+			}
+			return
 		}
 	}
-	return false
 }
 
 // snapshot returns the currently registered services.
@@ -163,9 +204,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		return err
 	}
 	if s.timerConfig.policyMode == policyModeNetworkExtension {
-		if globalPressureRegistry.add(s) {
-			globalPressureRegistry.monitor.Start()
-		}
+		// Registration and the start transition are one serialized operation. Splitting them
+		// let a concurrent Close stop a monitor this Start had not started yet, leaving an
+		// empty registry and a running source.
+		globalPressureRegistry.add(s)
 	}
 	return nil
 }
@@ -173,9 +215,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 func (s *Service) Close() error {
 	s.stopTimer()
 	if s.timerConfig.policyMode == policyModeNetworkExtension {
-		if globalPressureRegistry.remove(s) {
-			globalPressureRegistry.monitor.Stop()
-		}
+		globalPressureRegistry.remove(s)
 	}
 	return nil
 }
