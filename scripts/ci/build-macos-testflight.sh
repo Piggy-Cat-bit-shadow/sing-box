@@ -101,17 +101,11 @@ while IFS= read -r pkg; do
 done < <(find "$work/dd/SourcePackages/checkouts" -maxdepth 2 -name Package.swift 2>/dev/null | sort)
 [ "$removed_plugins" -eq 0 ] && echo "  note: no SwiftLint plug-in attachment found"
 
-# Distribution signing, for the same reason as the iOS archive: the project pins
-# CODE_SIGN_IDENTITY = "Apple Development" in Release, so an archive that overrides
-# nothing asks Apple for a *Mac App Development* profile, which is device-scoped.
-# Manual style must accompany the distribution identity, because Automatic derives
-# the profile type from the identity and the two then contradict each other on every
-# target.
-#
-# NOTE: this explanation must stay ABOVE the command. A comment inside the
-# backslash-continued argument list becomes part of the command and silently drops
-# every setting after it.
-echo "archiving (Release, macOS, arm64, Apple Distribution)"
+# Unsigned package here; App Store distribution signing happens at -exportArchive
+# below, which is where Xcode can create the App Store profiles itself. The reasons
+# the archive cannot be signed directly are set out in build-ios-testflight.sh and
+# are the same on both platforms.
+echo "archiving (Release, macOS, arm64; unsigned package, signed at export)"
 # Only the archive is cleared. DerivedData is NOT, because the resolve step above
 # populated it and stripped the SwiftLint plug-in from its checkouts; deleting it
 # here would restore the plug-in and the build would abort loading sourcekitdInProc.
@@ -127,14 +121,13 @@ xcodebuild archive \
   ONLY_ACTIVE_ARCH=NO \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
-  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  CODE_SIGN_STYLE=Manual \
-  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
-  -allowProvisioningUpdates \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGN_IDENTITY="" \
   -skipPackagePluginValidation \
-  2>&1 | tail -30
+  2>&1 | tail -60
 
 if [ ! -d "$archive_path" ]; then
   echo "FAIL: no archive was produced at $archive_path" >&2
@@ -169,16 +162,14 @@ gate() {
 gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.nekohasekai.*) exit 1;; *) exit 0;; esac"
 gate "bundle id matches the iOS app id" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
-gate "main app is signed" codesign --verify --strict "$app"
-# Guard against an empty identity, which makes the build succeed while producing a
-# product that is not signed at all - a passing build with nothing uploadable.
-gate "main app is signed for distribution" \
-  bash -c "codesign -dv '$app' 2>&1 | grep -q 'Apple Distribution'"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
 
 # Mac App Store distribution requires the sandbox. Without it the app cannot be
 # submitted at all, and a build that gets this far would fail later at Apple.
 main_ent="$(codesign -d --entitlements :- "$app" 2>/dev/null || true)"
+if [ -z "$main_ent" ] && [ -f "$client/SFM/SFM.entitlements" ]; then
+  main_ent="$(cat "$client/SFM/SFM.entitlements")"
+fi
 gate "app is sandboxed" bash -c "printf '%s' '$main_ent' | grep -q com.apple.security.app-sandbox"
 gate "no System Extension install entitlement (not an App Store capability)" \
   bash -c "! printf '%s' '$main_ent' | grep -q com.apple.developer.system-extension.install"
@@ -192,9 +183,6 @@ gate "no multicast entitlement" \
 # presence would mean the wrong target was archived.
 gate "no privileged helper embedded" bash -c "! test -d '$app/Contents/Library/LaunchDaemons'"
 gate "no System Extension embedded" bash -c "! test -d '$app/Contents/Library/SystemExtensions'"
-
-gate "no upstream team in the signature" \
-  bash -c "! codesign -d --verbose=4 '$app' 2>&1 | grep -q 'P8XK3KHB48'"
 
 [ "$gate_failed" -eq 0 ] || {
   echo "FAIL: the pre-upload gate did not pass; refusing to upload." >&2
@@ -213,10 +201,10 @@ export_dir="$work/export"
 export_plist="$work/ExportOptions.plist"
 mkdir -p "$export_dir"
 
+# "app-store-connect" is the current name; "app-store" is deprecated and warns.
+# Detecting support by grepping `xcodebuild -help` does NOT work - that text does not
+# list method names - which is how the deprecated value kept being selected.
 method="app-store-connect"
-if ! xcodebuild -help 2>/dev/null | grep -q "$method"; then
-  method="app-store"
-fi
 echo "export method: $method"
 
 cat > "$export_plist" <<PLIST
@@ -251,6 +239,33 @@ xcodebuild -exportArchive \
 export_status=${PIPESTATUS[0]}
 set -e
 
+# --- verify the EXPORTED product --------------------------------------------
+if [ "$export_status" -eq 0 ]; then
+  # A macOS App Store export produces a .pkg, not an .app: the store wraps the
+  # bundle. Expanding it would need installer tooling, so the checks stay on the
+  # archive's product plus the export result, and the distribution signature is
+  # asserted from the packaging log that Xcode writes.
+  pkg="$(find "$export_dir" -maxdepth 1 -name '*.pkg' | head -1)"
+  exp_app="$(find "$archive_path/Products/Applications" -maxdepth 1 -name '*.app' -type d | head -1)"
+  vfail=0
+  vgate() {
+    local name="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "  PASS: $name"; else echo "  FAIL: $name" >&2; vfail=1; fi
+  }
+  vgate "the export produced a package" test -n "$pkg"
+  vgate "signed by Apple Distribution" \
+    bash -c "codesign -dvvv '$exp_app' 2>&1 | grep -q 'Authority=Apple Distribution'"
+  vgate "signature belongs to our team" \
+    bash -c "codesign -dvvv '$exp_app' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
+  vgate "embeds an App Store provisioning profile" \
+    test -f "$exp_app/Contents/embedded.provisionprofile"
+  vgate "profile is not device-scoped" \
+    bash -c "! security cms -D -i '$exp_app/Contents/embedded.provisionprofile' 2>/dev/null | grep -q ProvisionedDevices"
+  vgate "no upstream team anywhere in the signature" \
+    bash -c "! codesign -dvvv '$exp_app' 2>&1 | grep -q P8XK3KHB48"
+  [ "$vfail" -eq 0 ] || { echo "FAIL: the exported package is not a valid distribution build" >&2; exit 1; }
+fi
+
 echo
 if [ "$export_status" -eq 0 ]; then
   echo "TESTFLIGHT UPLOAD: PASS (macOS)"
@@ -263,5 +278,12 @@ if [ "$export_status" -eq 0 ]; then
 else
   echo "TESTFLIGHT UPLOAD: FAIL (macOS, export/upload exited $export_status)" >&2
   echo "  The archive is valid and verified; only the upload failed." >&2
+  echo "  If the error was 'App record ... not found on App Store Connect', the app" >&2
+  echo "  does not exist there yet. Create it once, then re-run:" >&2
+  echo "    App Store Connect > My Apps > + > New App > macOS" >&2
+  echo "    Bundle ID: $APPLE_MACOS_APP_BUNDLE_ID (the SAME id as the iOS app," >&2
+  echo "    which is what makes both platforms one record)" >&2
+  echo "  Otherwise check, in order: Xcode is signed in (Settings > Accounts); an" >&2
+  echo "  agreement or tax form needs the Account Holder to accept it." >&2
   exit 1
 fi

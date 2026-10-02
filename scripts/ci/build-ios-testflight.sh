@@ -71,36 +71,43 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-# DISTRIBUTION signing, stated explicitly.
+# TWO STEPS, TWO DIFFERENT KINDS OF SIGNING
 #
-# The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well as
-# Debug, so an archive that overrides nothing asks Apple for an *iOS App
-# Development* profile - which is device-scoped, and therefore impossible on a team
-# with no registered device:
+# `archive` here produces an UNSIGNED package, and `-exportArchive` below applies
+# App Store distribution signing. That split is not a workaround; it is the only
+# arrangement in which Xcode will create the App Store profiles itself.
 #
-#   No profiles for '<base>.extension' were found: Xcode couldn't find any
-#   iOS App Development provisioning profiles matching '<base>.extension'
+# What does not work, each verified rather than assumed:
 #
-# That error reads like a device problem but is a signing-mode problem; an App Store
-# archive must be signed for distribution.
+#   Automatic + the project's identity
+#     The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well
+#     as Debug, so Xcode asks Apple for an iOS *App Development* profile. Those are
+#     device-scoped:
+#       Communication with Apple failed: Your team has no devices from which to
+#       generate a provisioning profile.
 #
-# CODE_SIGN_STYLE must be Manual alongside the identity. Automatic derives the
-# profile type FROM the identity, so overriding the identity while leaving Automatic
-# contradicts itself on every target, dependencies included:
+#   Automatic + CODE_SIGN_IDENTITY="Apple Distribution"
+#     Automatic derives the profile type FROM the identity, so overriding the
+#     identity while leaving Automatic is a contradiction on every target,
+#     dependencies included:
+#       ... is automatically signed for development, but a conflicting code signing
+#       identity Apple Distribution has been manually specified.
 #
-#   ... is automatically signed for development, but a conflicting code signing
-#   identity Apple Distribution has been manually specified.
+#   Manual + CODE_SIGN_IDENTITY="Apple Distribution"
+#     No conflict, and it asks for the right profile type - but Manual will not
+#     create profiles, and none exist for these App IDs yet.
 #
-# With Manual + Apple Distribution Xcode asks for the right profile types
-# ("requires a provisioning profile with the App Groups and Network Extensions
-# features"), and with no distribution certificate present it says so plainly:
-# 'No signing certificate "iOS Distribution" found'.
+#   CODE_SIGN_IDENTITY="" with signing still allowed
+#     "succeeded" while producing "code object is not signed at all". An empty
+#     identity means skip signing, so this is a false positive that has been
+#     mistaken for success more than once. The gate below exists to catch it.
 #
-# NOTE: keep this explanation ABOVE the command. A comment inside the
-# backslash-continued argument list is consumed as part of the command, silently
-# dropping every setting that follows it - which is how an earlier version of this
-# file passed no signing overrides at all while appearing to.
-echo "archiving (Release, iphoneos, arm64, Apple Distribution)"
+# At export, Xcode has the App Store destination and the distribution certificate,
+# so it creates the App Store profiles and signs with them. Verified on a real
+# export: Authority "Apple Distribution: yongjie huang (TAFD7BAGYZ)", profile
+# "iOS Team Store Provisioning Profile", ProvisionedDevices absent (App Store
+# profiles are not device-scoped), get-task-allow false.
+echo "archiving (Release, iphoneos, arm64; unsigned package, signed at export)"
 rm -rf "$archive_path"
 # Clear the derived data too. Xcode caches the resolved package graph and the
 # build settings derived from it, and a cache written while the archive still used
@@ -121,12 +128,11 @@ xcodebuild archive \
   ONLY_ACTIVE_ARCH=NO \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
-  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  CODE_SIGN_STYLE=Manual \
-  CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
-  -allowProvisioningUpdates \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGN_IDENTITY="" \
   -skipPackagePluginValidation \
   2>&1 | tail -60
 # `tail -60` keeps the report readable while still showing the resolved signing
@@ -177,32 +183,24 @@ gate() {
 gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.nekohasekai.*) exit 1;; *) exit 0;; esac"
 gate "bundle id matches the configured base" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
-gate "main app is signed" codesign --verify --strict "$app"
-# An empty or missing identity makes xcodebuild succeed while producing a product
-# that is "code object is not signed at all". That looks like a passing build and is
-# worthless, and it is exactly how an earlier probe was misread, so assert the real
-# thing: a distribution signature that can actually be uploaded.
-gate "main app is signed for distribution" \
-  bash -c "codesign -dv '$app' 2>&1 | grep -q 'Apple Distribution'"
-gate "main app embeds a provisioning profile" \
-  test -f "$app/embedded.mobileprovision"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
 
-# The Packet Tunnel extension is the product; a TestFlight build without it is
-# useless even though it would upload fine.
+# Entitlements come from the built extension, which exists regardless of signing.
+# They are read here rather than after export because a capability that is wrong in
+# the project is worth catching before the upload attempt.
 appex="$app/PlugIns/Extension.appex"
 gate "Packet Tunnel extension is present" test -d "$appex"
-gate "Packet Tunnel is signed" codesign --verify --strict "$appex"
-
 if [ -d "$appex" ]; then
   ent="$(codesign -d --entitlements :- "$appex" 2>/dev/null || true)"
+  # The archive is unsigned, so entitlements may not be readable from the signature.
+  # Fall back to the entitlements file the build actually used.
+  if [ -z "$ent" ] && [ -f "$client/Extension/Extension.entitlements" ]; then
+    ent="$(cat "$client/Extension/Extension.entitlements")"
+  fi
   gate "Packet Tunnel has packet-tunnel-provider" bash -c "printf '%s' '$ent' | grep -q packet-tunnel-provider"
   gate "no multicast entitlement" bash -c "! printf '%s' '$ent' | grep -q com.apple.developer.networking.multicast"
   gate "Packet Tunnel has an App Group" bash -c "printf '%s' '$ent' | grep -q application-groups"
 fi
-
-# The upstream identity must not appear anywhere in the signed result.
-gate "no upstream team in the signature" bash -c "! codesign -d --verbose=4 '$app' 2>&1 | grep -q 'P8XK3KHB48'"
 
 [ "$gate_failed" -eq 0 ] || {
   echo "FAIL: the pre-upload gate did not pass; refusing to upload." >&2
@@ -226,11 +224,11 @@ export_dir="$work/export"
 export_plist="$work/ExportOptions.plist"
 mkdir -p "$export_dir"
 
+# "app-store-connect" is the current name; "app-store" is deprecated and warns.
+# Detecting support by grepping `xcodebuild -help` does NOT work - that text does not
+# list method names - which is how the deprecated value kept being selected. This
+# Xcode accepts app-store-connect, so use it directly.
 method="app-store-connect"
-if ! xcodebuild -help 2>/dev/null | grep -q "$method"; then
-  # Older Xcode calls the same destination "app-store".
-  method="app-store"
-fi
 echo "export method: $method"
 
 cat > "$export_plist" <<PLIST
@@ -267,6 +265,46 @@ xcodebuild -exportArchive \
 export_status=${PIPESTATUS[0]}
 set -e
 
+# --- verify the EXPORTED product ------------------------------------------
+# This is where distribution signing is actually proven. Asserting it on the
+# archive would only be satisfiable by an unsigned build, and an unsigned build
+# "succeeds" while producing nothing uploadable - a false positive that has been
+# mistaken for success before.
+if [ "$export_status" -eq 0 ]; then
+  ipa="$(find "$export_dir" -maxdepth 1 -name '*.ipa' | head -1)"
+  if [ -z "$ipa" ]; then
+    echo "FAIL: the export reported success but produced no IPA" >&2
+    exit 1
+  fi
+  echo "verify: $(basename "$ipa")"
+
+  vwork="$(mktemp -d)"
+  unzip -q "$ipa" -d "$vwork"
+  vapp="$(find "$vwork/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
+  vfail=0
+  vgate() {
+    local name="$1"; shift
+    if "$@" >/dev/null 2>&1; then echo "  PASS: $name"; else echo "  FAIL: $name" >&2; vfail=1; fi
+  }
+  vgate "exported app is signed" codesign --verify --strict "$vapp"
+  vgate "signed by Apple Distribution" \
+    bash -c "codesign -dvvv '$vapp' 2>&1 | grep -q 'Authority=Apple Distribution'"
+  vgate "signature belongs to our team" \
+    bash -c "codesign -dvvv '$vapp' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
+  vgate "embeds an App Store provisioning profile" test -f "$vapp/embedded.mobileprovision"
+  # An App Store profile is not device-scoped; a profile listing devices would mean
+  # this is a development or ad-hoc build, which TestFlight would reject.
+  vgate "profile is not device-scoped" \
+    bash -c "! security cms -D -i '$vapp/embedded.mobileprovision' 2>/dev/null | grep -q ProvisionedDevices"
+  vgate "built for release (get-task-allow false)" \
+    bash -c "security cms -D -i '$vapp/embedded.mobileprovision' 2>/dev/null | grep -A1 get-task-allow | grep -q '<false/>'"
+  vgate "Packet Tunnel extension is signed" codesign --verify --strict "$vapp/PlugIns/Extension.appex"
+  vgate "no upstream team anywhere in the signature" \
+    bash -c "! codesign -dvvv '$vapp' 2>&1 | grep -q P8XK3KHB48"
+  rm -rf "$vwork"
+  [ "$vfail" -eq 0 ] || { echo "FAIL: the exported IPA is not a valid distribution build" >&2; exit 1; }
+fi
+
 echo
 if [ "$export_status" -eq 0 ]; then
   echo "TESTFLIGHT UPLOAD: PASS"
@@ -282,9 +320,16 @@ if [ "$export_status" -eq 0 ]; then
 else
   echo "TESTFLIGHT UPLOAD: FAIL (export/upload exited $export_status)" >&2
   echo "  The archive itself is valid and was verified; only the upload failed." >&2
-  echo "  Common causes, in order of likelihood:" >&2
-  echo "    - Xcode is not signed in: Xcode > Settings > Accounts" >&2
-  echo "    - the app record does not exist yet in App Store Connect" >&2
-  echo "    - an agreement or tax form needs accepting by the Account Holder" >&2
+  # "App record ... not found" is the expected first-run state and is a one-off
+  # manual step, not a build defect. Lead with it rather than making the reader
+  # work through a list of unrelated possibilities.
+  echo "  If the error was 'App record ... not found on App Store Connect', the app" >&2
+  echo "  does not exist there yet. Create it once, then re-run:" >&2
+  echo "    App Store Connect > My Apps > + > New App > iOS" >&2
+  echo "    Bundle ID: $APPLE_IOS_APP_BUNDLE_ID (must match exactly)" >&2
+  echo "  This is required once per app, not per build, and it is the only step in" >&2
+  echo "  the TestFlight flow that cannot be done from the command line." >&2
+  echo "  Otherwise check, in order: Xcode is signed in (Settings > Accounts); an" >&2
+  echo "  agreement or tax form needs the Account Holder to accept it." >&2
   exit 1
 fi

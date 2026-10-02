@@ -297,40 +297,42 @@ check "no private key block is tracked" \
   bash -c '! git grep -lI "BEGIN .*PRIVATE KEY" -- . ":(exclude)scripts/ci/test-apple-signing.sh" 2>/dev/null | grep -q .'
 
 
-echo "== the archives request DISTRIBUTION signing, not development =="
-# Regression guard for a real defect: the project pins CODE_SIGN_IDENTITY =
-# "Apple Development" in Release as well as Debug, so an archive that overrides
-# nothing asks Apple for a device-scoped DEVELOPMENT profile and fails with
-#
-#   No profiles for '<id>' were found: Xcode couldn't find any iOS App Development
-#   provisioning profiles
-#
-# which reads like a device problem but is a signing-mode problem. Both archives
-# must therefore state the distribution identity, and must pair it with Manual
-# style: Automatic derives the profile type from the identity, and the mismatch is
-# rejected on every target as "automatically signed for development, but a
-# conflicting code signing identity Apple Distribution has been manually
-# specified".
+echo "== the archives package unsigned, and the export signs for distribution =="
+# Two steps with two different kinds of signing. The archive is an unsigned package
+# because that is the only arrangement in which Xcode creates the App Store profiles
+# itself: with Automatic it derives the profile type from CODE_SIGN_IDENTITY, which
+# the project pins to "Apple Development" (device-scoped), and forcing the identity
+# contradicts Automatic on every target.
 for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflight.sh; do
-  check "$(basename "$builder") requests Apple Distribution" \
-    grep -q 'CODE_SIGN_IDENTITY="Apple Distribution"' "$builder"
-  check "$(basename "$builder") uses Manual style with it" \
-    grep -q 'CODE_SIGN_STYLE=Manual' "$builder"
-  check "$(basename "$builder") declares no development identity" \
-    bash -c "! grep -qE 'CODE_SIGN_IDENTITY=\"Apple Development\"' '$builder'"
-  check "$(basename "$builder") rejects an unsigned product" \
-    grep -q "signed for distribution" "$builder"
+  check "$(basename "$builder") archives without signing" \
+    grep -q 'CODE_SIGNING_ALLOWED=NO' "$builder"
+  # Executable lines only: the files document the approaches that do NOT work, and
+  # those explanations naturally contain the very strings being ruled out.
+  check "$(basename "$builder") does not force a signing identity" \
+    python3 "$root/scripts/ci/test-no-active-identity.py" "$builder"
+  check "$(basename "$builder") does not use Manual style" \
+    bash -c "! grep -q 'CODE_SIGN_STYLE=Manual' '$builder'"
+  check "$(basename "$builder") does not hardcode a profile name" \
+    bash -c "! grep -qE 'PROVISIONING_PROFILE_SPECIFIER=\"[A-Za-z]' '$builder'"
+  check "$(basename "$builder") lets the export provision automatically" \
+    grep -q 'signingStyle' "$builder"
+  check "$(basename "$builder") asserts an Apple Distribution authority" \
+    grep -q "Authority=Apple Distribution" "$builder"
+  check "$(basename "$builder") asserts the signature is our team" \
+    grep -q 'TeamIdentifier=' "$builder"
+  check "$(basename "$builder") asserts the profile is not device-scoped" \
+    grep -q "ProvisionedDevices" "$builder"
 done
 
-echo "== a product that is not signed at all must never pass =="
-# "code object is not signed at all" is what an empty identity yields: the build
-# succeeds and nothing uploadable is produced. An earlier probe was misread this
-# way, so the guard is asserted rather than assumed.
-check "the iOS builder checks for a real distribution signature" \
-  grep -q "codesign -dv '\$app' 2>&1 | grep -q 'Apple Distribution'" scripts/ci/build-ios-testflight.sh
-check "the iOS builder requires an embedded profile" \
-  grep -q "embedded.mobileprovision" scripts/ci/build-ios-testflight.sh
-
+echo "== a product that is not signed must never be reported as a success =="
+# An empty identity with signing still enabled makes xcodebuild report success while
+# producing "code object is not signed at all". That has been mistaken for a passing
+# distribution build twice, so the assertions live on the EXPORTED product.
+check "the iOS builder verifies the exported IPA" \
+  grep -q "the export reported success but produced no IPA" scripts/ci/build-ios-testflight.sh
+check "the exports are verified, not just produced" \
+  bash -c 'grep -q "verify the EXPORTED product" scripts/ci/build-ios-testflight.sh && \
+           grep -q "verify the EXPORTED product" scripts/ci/build-macos-testflight.sh'
 
 echo "== no signing setting is silently dropped by a stray comment =="
 # A '#' line inside a backslash-continued argument list is consumed as part of the
