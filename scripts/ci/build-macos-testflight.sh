@@ -101,7 +101,20 @@ while IFS= read -r pkg; do
 done < <(find "$work/dd/SourcePackages/checkouts" -maxdepth 2 -name Package.swift 2>/dev/null | sort)
 [ "$removed_plugins" -eq 0 ] && echo "  note: no SwiftLint plug-in attachment found"
 
-echo "archiving (Release, macOS, arm64)"
+# Distribution signing, for the same reason as the iOS archive: the project pins
+# CODE_SIGN_IDENTITY = "Apple Development" in Release, so an archive that overrides
+# nothing asks Apple for a *Mac App Development* profile, which is device-scoped.
+# Manual style must accompany the distribution identity, because Automatic derives
+# the profile type from the identity and the two then contradict each other on every
+# target.
+#
+# NOTE: this explanation must stay ABOVE the command. A comment inside the
+# backslash-continued argument list becomes part of the command and silently drops
+# every setting after it.
+echo "archiving (Release, macOS, arm64, Apple Distribution)"
+# Only the archive is cleared. DerivedData is NOT, because the resolve step above
+# populated it and stripped the SwiftLint plug-in from its checkouts; deleting it
+# here would restore the plug-in and the build would abort loading sourcekitdInProc.
 rm -rf "$archive_path"
 xcodebuild archive \
   -project "$client/sing-box.xcodeproj" \
@@ -115,12 +128,6 @@ xcodebuild archive \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  # Distribution signing, for the same reason as the iOS archive: the project pins
-  # CODE_SIGN_IDENTITY = "Apple Development" in Release, so an archive that
-  # overrides nothing asks Apple for a *Mac App Development* profile, which is
-  # device-scoped. Manual style must accompany the distribution identity, because
-  # Automatic derives the profile type from the identity and the two then
-  # contradict each other on every target.
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \

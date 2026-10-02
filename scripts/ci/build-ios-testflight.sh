@@ -71,8 +71,45 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
+# DISTRIBUTION signing, stated explicitly.
+#
+# The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well as
+# Debug, so an archive that overrides nothing asks Apple for an *iOS App
+# Development* profile - which is device-scoped, and therefore impossible on a team
+# with no registered device:
+#
+#   No profiles for '<base>.extension' were found: Xcode couldn't find any
+#   iOS App Development provisioning profiles matching '<base>.extension'
+#
+# That error reads like a device problem but is a signing-mode problem; an App Store
+# archive must be signed for distribution.
+#
+# CODE_SIGN_STYLE must be Manual alongside the identity. Automatic derives the
+# profile type FROM the identity, so overriding the identity while leaving Automatic
+# contradicts itself on every target, dependencies included:
+#
+#   ... is automatically signed for development, but a conflicting code signing
+#   identity Apple Distribution has been manually specified.
+#
+# With Manual + Apple Distribution Xcode asks for the right profile types
+# ("requires a provisioning profile with the App Groups and Network Extensions
+# features"), and with no distribution certificate present it says so plainly:
+# 'No signing certificate "iOS Distribution" found'.
+#
+# NOTE: keep this explanation ABOVE the command. A comment inside the
+# backslash-continued argument list is consumed as part of the command, silently
+# dropping every setting that follows it - which is how an earlier version of this
+# file passed no signing overrides at all while appearing to.
 echo "archiving (Release, iphoneos, arm64, Apple Distribution)"
 rm -rf "$archive_path"
+# Clear the derived data too. Xcode caches the resolved package graph and the
+# build settings derived from it, and a cache written while the archive still used
+# the project's development identity keeps that identity in play: the build then
+# asks Apple for an iOS *App Development* profile even though the command line says
+# Apple Distribution, which makes a signing-mode problem look like a device problem.
+# Reproduced by running the identical command line against a fresh directory, where
+# it correctly requests distribution.
+rm -rf "$work/dd"
 xcodebuild archive \
   -project "$client/sing-box.xcodeproj" \
   -scheme SFI \
@@ -85,36 +122,17 @@ xcodebuild archive \
   BASE_PACKAGE_IDENTIFIER="$APPLE_BASE_BUNDLE_ID" \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-  # DISTRIBUTION signing, stated explicitly.
-  #
-  # The project pins CODE_SIGN_IDENTITY = "Apple Development" in Release as well as
-  # Debug, so an archive that overrides nothing asks Apple for an *iOS App
-  # Development* profile - which is device-scoped, and therefore impossible on a
-  # team with no registered device:
-  #
-  #   No profiles for '<base>.extension' were found: Xcode couldn't find any
-  #   iOS App Development provisioning profiles matching '<base>.extension'
-  #
-  # That error reads like a device problem but is a signing-mode problem. An App
-  # Store archive must be signed for distribution.
-  #
-  # CODE_SIGN_STYLE must be Manual alongside it. Automatic derives the profile type
-  # from the identity, so overriding the identity while leaving Automatic produces a
-  # contradiction on every target, dependencies included:
-  #
-  #   ... is automatically signed for development, but a conflicting code signing
-  #   identity Apple Distribution has been manually specified.
-  #
-  # Manual with the distribution identity is accepted and requests the right profile
-  # types ("requires a provisioning profile with the App Groups and Network
-  # Extensions features").
   CODE_SIGN_STYLE=Manual \
   CODE_SIGN_IDENTITY="Apple Distribution" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
   -allowProvisioningUpdates \
   -skipPackagePluginValidation \
-  2>&1 | tail -30
+  2>&1 | tail -60
+# `tail -60` keeps the report readable while still showing the resolved signing
+# settings and the profile types Xcode asked for. Truncating harder than this hid
+# the very lines that distinguish a development profile request from a distribution
+# one, which is the difference between a signing-mode bug and a device problem.
 
 if [ ! -d "$archive_path" ]; then
   echo "FAIL: no archive was produced at $archive_path" >&2

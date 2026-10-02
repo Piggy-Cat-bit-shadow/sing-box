@@ -332,6 +332,16 @@ check "the iOS builder requires an embedded profile" \
   grep -q "embedded.mobileprovision" scripts/ci/build-ios-testflight.sh
 
 
+echo "== no signing setting is silently dropped by a stray comment =="
+# A '#' line inside a backslash-continued argument list is consumed as part of the
+# command, so every setting after it never reaches xcodebuild. The archive then runs
+# with the project's own development identity while the script appears to request
+# distribution - a signing-mode bug disguised as a device problem, which is exactly
+# how this file was broken and how long it took to find.
+check "no comment sits inside an argument list" \
+  python3 "$root/scripts/ci/test-arglist.py"
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
