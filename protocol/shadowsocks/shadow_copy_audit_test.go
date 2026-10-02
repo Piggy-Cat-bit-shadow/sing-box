@@ -393,7 +393,12 @@ func BenchmarkShadowSteadyStateUpload(b *testing.B) {
 	// Both ends are derived from production rather than written as literals, so this keeps
 	// measuring the real shortfall if either the pooled buffer size or the framing rule changes.
 	inPlaceLimit := streamWriterMTU()
-	for _, payloadSize := range []int{1400, 16384, inPlaceLimit, buf.BufferSize} {
+	// 16 KiB is a mid-range payload here, but under with_low_memory it EQUALS
+	// buf.BufferSize, so the literal would silently duplicate the case below it and
+	// stop being a distinct measurement point. Deriving it keeps the set distinct in
+	// both builds.
+	midRange := min(16<<10, buf.BufferSize/2)
+	for _, payloadSize := range []int{1400, midRange, inPlaceLimit, buf.BufferSize} {
 		b.Run(itoa(payloadSize), func(b *testing.B) {
 			sink := &copyDetectingWriter{}
 			conn := method.DialEarlyConn(sink, M.ParseSocksaddrHostPort("target.example", 443))
