@@ -79,16 +79,41 @@ func (c *mtuAdvertisingConn) WriterMTU() int { return c.mtu }
 // there would be nothing to advertise against.
 func withStreamMTU(conn net.Conn) net.Conn {
 	extendedWriter, isExtended := conn.(N.ExtendedWriter)
-	frontHeadroom, hasFront := conn.(N.FrontHeadroom)
-	rearHeadroom, hasRear := conn.(N.RearHeadroom)
-	if !isExtended || !hasFront || !hasRear {
+	if !isExtended {
 		return conn
 	}
+	// Read the geometry for the WHOLE writer chain, not just this conn's own layer.
+	//
+	// Reading conn.(N.FrontHeadroom).FrontHeadroom() takes only the immediate
+	// Shadowsocks writer's local requirement and ignores everything beneath it. When
+	// another writer sits below and prepends its own header, the advertised headroom
+	// is short by exactly that much and the buffer overflows at the deeper layer.
+	//
+	// The observed production panic was that case: SS2022 over ShadowTLS v3.
+	//
+	//   mtuAdvertisingConn -> SS2022 clientConn -> ShadowTLS verifiedConn -> TCP
+	//
+	// SS2022 needs 2 + 16 = 18 front, ShadowTLS verifiedConn prepends
+	// tlsHmacHeaderSize = 9, and verifiedConn.WriteBuffer calls ExtendHeader(9). Taking
+	// only the local 18 advertised 18 while 27 was required, so a fully packed pooled
+	// buffer had 0 bytes free when ShadowTLS asked for 9:
+	//
+	//   panic: buffer overflow: capacity 16384, start 0, need 9
+	//
+	// and 16384 is exactly streamWriterMTU() + 18 + 16 under with_low_memory, which is
+	// what iOS Libbox is built with.
+	//
+	// CalculateFrontHeadroom walks the chain through WithUpstreamWriter/WithUpstream
+	// and sums every layer, so the wrapper advertises what the stack actually needs.
+	// It returns 0 when nothing in the chain asks for headroom, so the previous
+	// "unsupported writer" outcome is preserved rather than replaced by a guess.
+	frontHeadroom := N.CalculateFrontHeadroom(conn)
+	rearHeadroom := N.CalculateRearHeadroom(conn)
 	return &mtuAdvertisingConn{
 		Conn:           conn,
 		extendedWriter: extendedWriter,
-		frontHeadroom:  frontHeadroom.FrontHeadroom(),
-		rearHeadroom:   rearHeadroom.RearHeadroom(),
+		frontHeadroom:  frontHeadroom,
+		rearHeadroom:   rearHeadroom,
 		mtu:            streamWriterMTU(),
 	}
 }

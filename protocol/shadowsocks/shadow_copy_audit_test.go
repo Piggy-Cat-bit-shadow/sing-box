@@ -197,7 +197,16 @@ func TestShadowSteadyStateUploadFramesInPlace(t *testing.T) {
 	firstFrames := sink.frames
 
 	// Steady state: the write that carries the bulk of any transfer.
-	const payloadSize = 16 << 10
+	//
+	// Derived from BufferSize rather than fixed at 16 KiB. With a literal, this test
+	// only exercised the standard 32 KiB build: under with_low_memory BufferSize IS
+	// 16 KiB, so a 16 KiB payload sits exactly on the copy boundary and the writer
+	// copies instead of framing in place - failing for a reason that says nothing
+	// about correctness, and leaving the iOS configuration untested.
+	//
+	// The in-place limit is streamWriterMTU(), so a payload just under it exercises
+	// the path this test is about in every build.
+	payloadSize := streamWriterMTU()
 	payload := make([]byte, payloadSize)
 	for i := range payload {
 		payload[i] = byte(i)
