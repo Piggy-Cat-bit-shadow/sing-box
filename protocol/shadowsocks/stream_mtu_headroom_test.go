@@ -233,6 +233,15 @@ func TestStreamMTU_OldImplementationWouldFail(t *testing.T) {
 	require.Panics(t, func() {
 		_ = real.(N.ExtendedWriter).WriteBuffer(steady)
 	}, "a buffer sized for only the SS layer must overflow at the layer beneath")
+
+	// The expected panic aborts the writer mid-frame, so nothing downstream released this
+	// buffer. buf.NewSize takes its backing array from the POOL (Get) and marks it
+	// managed, so leaving it here would permanently remove one pooled buffer from a pool
+	// that is a fixed resource - a test that leaks a little on every run.
+	//
+	// Release after the recover, not Leak(): Leak() is a debug assertion that panics on a
+	// non-zero refcount, which is the opposite of cleanup.
+	steady.Release()
 }
 
 // --- the copy loop ------------------------------------------------------------
