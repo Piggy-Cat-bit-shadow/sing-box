@@ -3,18 +3,28 @@
 #
 # Usage: prepare-apple-client.sh [--submodule-sha <sha>]
 #
-# # Two independent overlays
+# # Three independent overlays
 #
-# This script applies exactly two overlays, kept separate on purpose so one can be
-# retired without disturbing the other:
+# This script applies three overlays, kept separate on purpose so any one can be retired
+# without disturbing the others:
 #
 #   [compatibility]    Adapts the pinned Apple client to this fork's libbox API.
 #                      Needed because the client is pinned and its generated
 #                      bindings drifted. This is a build-time source adaptation.
+#                      Steps 1 and 1b.
 #
-#   [personal-signing] Removes the multicast entitlement, which has to be requested
-#                      from Apple separately. Once that is granted, this overlay is
-#                      simply dropped and the compatibility overlay is untouched.
+#   [branding]         Presents the iOS app product as JiejieBox. Scoped to the SFI
+#                      target's Debug and Release configurations only, and applied by
+#                      build-configuration id rather than by text replacement, because
+#                      three targets share PRODUCT_NAME = "sing-box". Step 1c.
+#
+#   [entitlements]     Adjusts entitlements: the multicast switch, which has to be
+#                      requested from Apple separately and is dropped for a personal
+#                      build, plus App Group consistency. Once multicast is granted this
+#                      overlay is simply dropped and the others are untouched. Step 2.
+#
+# An earlier version of this comment said "two overlays" and omitted branding entirely,
+# which stopped matching the script as soon as branding was added.
 #
 # # Why an overlay rather than editing the submodule
 #

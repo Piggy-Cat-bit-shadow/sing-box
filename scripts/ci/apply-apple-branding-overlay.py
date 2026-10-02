@@ -26,20 +26,31 @@ rather than branding:
     SFT, SFM, SFM.System and every extension target
 
 Three targets share PRODUCT_NAME = "sing-box" (SFI, SFT, SFM). A global string
-replacement would rename the tvOS and macOS apps too, so the edit is addressed by
-build-configuration id, resolved from the project's own configuration lists.
+replacement would rename the tvOS and macOS apps too, so every edit is addressed by
+build-configuration id.
+
+# Why edits are addressed by id and not by block text
+
+The previous version located each configuration block by regex, then wrote the result
+with `src.replace(old_body, new_body, 1)`. That is a text replacement with an assumption
+attached: it only lands on the intended configuration if no other configuration's body
+text is identical or a superset. Two build configurations with the same settings -
+which is exactly what Debug and Release often are - would make the choice of victim
+depend on file order rather than on identity.
+
+This version computes the byte span of each `XCBuildConfiguration` block and splices by
+offset, so the id decides what is edited and position in the file is irrelevant.
 
 # Fail closed
 
 The anchors are the upstream values themselves. If the pinned client is updated and
-these settings change or move, this script fails rather than silently skipping -
-a branding overlay that quietly stops working would ship an app still called
-sing-box, which is the bug it exists to fix.
+these settings change or move, this script fails rather than silently skipping - a
+branding overlay that quietly stops working would ship an app still called sing-box,
+which is the bug it exists to fix.
 """
 import re
 import sys
 
-# Target -> the upstream values this overlay expects to find, and their replacements.
 EXPECTED = {
     "INFOPLIST_KEY_CFBundleDisplayName": ("sing-box", "JiejieBox"),
     "PRODUCT_NAME": ("sing-box", "JiejieBox"),
@@ -47,54 +58,76 @@ EXPECTED = {
 
 TARGET = "SFI"
 
-# The scheme refers to the built product by its bundle name, so it has to follow the
-# rename. Only the application buildable entry changes: SFIUITests.xctest is a
-# different buildable in the same scheme and must be left alone.
+# The configurations this overlay is scoped to. Named explicitly so that a new
+# configuration appearing upstream is a failure rather than something that silently gets
+# branded: "Profile" or "Staging" could legitimately need a different product name, and
+# guessing would ship a build nobody reviewed.
+EXPECTED_CONFIG_NAMES = {"Debug", "Release"}
+
 SCHEME = "sing-box.xcodeproj/xcshareddata/xcschemes/SFI.xcscheme"
 SCHEME_OLD = 'BuildableName = "sing-box.app"'
 SCHEME_NEW = 'BuildableName = "JiejieBox.app"'
 
 
-def patch_scheme(client: str) -> int:
-    """Rewrite the SFI scheme's application BuildableName. Returns change count."""
-    path = f"{client}/{SCHEME}"
-    try:
-        src = open(path, encoding="utf-8").read()
-    except FileNotFoundError:
-        print(f"apply-apple-branding-overlay: {path} is missing", file=sys.stderr)
-        raise SystemExit(1)
-
-    if SCHEME_NEW in src and SCHEME_OLD not in src:
-        return 0  # already applied
-    if SCHEME_OLD not in src:
-        print(
-            "apply-apple-branding-overlay: the SFI scheme does not reference "
-            f'{SCHEME_OLD!r}; refusing to guess.',
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-
-    count = src.count(SCHEME_OLD)
-    open(path, "w", encoding="utf-8").write(src.replace(SCHEME_OLD, SCHEME_NEW))
-    return count
+def fail(message: str, details: list[str] | None = None) -> None:
+    print(f"apply-apple-branding-overlay: {message}", file=sys.stderr)
+    for detail in details or []:
+        print(f"    - {detail}", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def config_ids_for_target(src: str, target: str) -> list[str]:
-    """Build-configuration ids belonging to `target`, in file order."""
+    """Build-configuration ids belonging to `target`, in file order.
+
+    Only the buildConfigurations array is read. The surrounding XCConfigurationList also
+    contains defaultConfigurationIsVisible and defaultConfigurationName, and a naive scan
+    for 24-character words picks up fragments of those names as if they were ids - which
+    the earlier version did, and which then resolved to no block at all.
+    """
     m = re.search(
         r'Build configuration list for PBXNativeTarget "' + re.escape(target) + r'" \*/ = \{(.*?)\n\t\t\};',
         src,
         re.S,
     )
     if not m:
-        print(f"apply-apple-branding-overlay: no configuration list for target {TARGET}", file=sys.stderr)
-        raise SystemExit(1)
+        fail(f"no configuration list for target {target}")
+
+    array = re.search(r"buildConfigurations = \((.*?)\);", m.group(1), re.S)
+    if not array:
+        fail(f"the configuration list for {target} has no buildConfigurations array")
+
+    # Each entry is `<id> /* <name> */`. Requiring the comment form keeps this to real
+    # entries rather than anything else that happens to look like an id.
     ids, seen = [], set()
-    for cid in re.findall(r"(\w{24})", m.group(1)):
+    for cid in re.findall(r"([0-9A-Fa-f]{24}) /\*", array.group(1)):
         if cid not in seen:
             seen.add(cid)
             ids.append(cid)
+    if not ids:
+        fail(f"the configuration list for {target} yielded no configuration ids")
     return ids
+
+
+def block_span(src: str, cid: str) -> tuple[int, int, str, str] | None:
+    """Locate one XCBuildConfiguration block by id.
+
+    Returns (start, end, name, body). The span covers exactly this configuration's
+    text, so a splice at these offsets cannot touch another block however similar its
+    contents are.
+    """
+    header = re.compile(
+        rf'{re.escape(cid)} /\* (\w+) \*/ = \{{\s*isa = XCBuildConfiguration;',
+    )
+    m = header.search(src)
+    if not m:
+        return None
+    # The block ends at the first line that is exactly two tabs and a closing brace,
+    # which is the indentation every XCBuildConfiguration in this file uses.
+    end_marker = src.find("\n\t\t};", m.end())
+    if end_marker < 0:
+        return None
+    end = end_marker + len("\n\t\t};")
+    return m.start(), end, m.group(1), src[m.start():end]
 
 
 def settable(block: str, key: str) -> str | None:
@@ -102,84 +135,190 @@ def settable(block: str, key: str) -> str | None:
     return m.group(1) if m else None
 
 
+def brand_block(block: str) -> str:
+    for key, (old, new) in EXPECTED.items():
+        block = re.sub(
+            rf'^(\s*{re.escape(key)} = )"{re.escape(old)}";',
+            rf'\g<1>"{new}";',
+            block,
+            flags=re.M,
+        )
+    return block
+
+
+def is_branded(block: str) -> bool:
+    return all(settable(block, key) == new for key, (_, new) in EXPECTED.items())
+
+
+def is_upstream(block: str) -> bool:
+    return all(settable(block, key) == old for key, (old, _) in EXPECTED.items())
+
+
+def patch_scheme(client: str) -> int:
+    """Rewrite the SFI scheme's application BuildableName. Returns change count.
+
+    Only the app buildable is touched. An earlier version replaced every occurrence of
+    the app name in the file, which would have renamed SFIUITests.xctest if it had
+    matched; this asserts on the exact buildable string instead and reports what it
+    found.
+    """
+    path = f"{client}/{SCHEME}"
+    try:
+        src = open(path, encoding="utf-8").read()
+    except FileNotFoundError:
+        fail(f"{path} is missing")
+
+    old_count = src.count(SCHEME_OLD)
+    new_count = src.count(SCHEME_NEW)
+
+    if new_count > 0 and old_count == 0:
+        return 0  # already applied
+    if old_count == 0:
+        fail(
+            "the SFI scheme does not reference the expected application buildable",
+            [f"looked for {SCHEME_OLD!r}", "refusing to guess at the intended rename"],
+        )
+
+    open(path, "w", encoding="utf-8").write(src.replace(SCHEME_OLD, SCHEME_NEW))
+    return old_count
+
+
+def scheme_state(client: str) -> str:
+    """"old", "new", or fail on anything ambiguous."""
+    path = f"{client}/{SCHEME}"
+    try:
+        src = open(path, encoding="utf-8").read()
+    except FileNotFoundError:
+        fail(f"{path} is missing")
+
+    old_count = src.count(SCHEME_OLD)
+    new_count = src.count(SCHEME_NEW)
+    if old_count > 0 and new_count > 0:
+        fail(
+            "the SFI scheme references BOTH the old and new buildable names",
+            [
+                f"{SCHEME_OLD!r} x{old_count}",
+                f"{SCHEME_NEW!r} x{new_count}",
+                "this is a partially applied state that cannot be resolved safely",
+            ],
+        )
+    if old_count > 0:
+        return "old"
+    if new_count > 0:
+        return "new"
+    fail(
+        "the SFI scheme references neither buildable name",
+        [f"looked for {SCHEME_OLD!r} and {SCHEME_NEW!r}"],
+    )
+
+
 def main() -> int:
+    if len(sys.argv) != 2:
+        fail("usage: apply-apple-branding-overlay.py <client-dir>")
     client = sys.argv[1]
     path = f"{client}/sing-box.xcodeproj/project.pbxproj"
     try:
         src = open(path, encoding="utf-8").read()
     except FileNotFoundError:
-        print(f"apply-apple-branding-overlay: {path} is missing", file=sys.stderr)
-        return 1
+        fail(f"{path} is missing")
 
+    # --- resolve the SFI configurations by id ---------------------------------
     ids = config_ids_for_target(src, TARGET)
 
-    blocks = {}
+    # Resolve the listed ids to their names first, so an unrecognised configuration is
+    # reported as a scope change rather than as a missing block.
+    listed = []
     for cid in ids:
-        m = re.search(
-            rf'{cid} /\* (\w+) \*/ = \{{\s*isa = XCBuildConfiguration;(.*?)\n\t\t\}};',
-            src,
-            re.S,
-        )
-        if m:
-            blocks[cid] = (m.group(1), m.group(2))
-
-    if not blocks:
-        print("apply-apple-branding-overlay: no build configurations resolved for SFI", file=sys.stderr)
-        return 1
-
-    # --- already applied? -----------------------------------------------------
-    already = all(
-        settable(body, key) == new
-        for _, body in blocks.values()
-        for key, (_, new) in EXPECTED.items()
-    )
-    if already:
-        print("  [branding] already applied")
-        return 0
-
-    # --- verify every anchor BEFORE editing anything --------------------------
-    problems = []
-    for cid, (name, body) in blocks.items():
-        for key, (old, _new) in EXPECTED.items():
-            current = settable(body, key)
-            if current != old:
-                problems.append(
-                    f"SFI {name}: {key} is {current!r}, expected {old!r}"
-                )
-    if problems:
-        print("apply-apple-branding-overlay: the pinned client does not match the expected structure.", file=sys.stderr)
-        print("  Refusing to edit: a fuzzy replacement could rename other targets.", file=sys.stderr)
-        for p in problems:
-            print(f"    - {p}", file=sys.stderr)
-        return 1
-
-    # --- apply, by exact block substitution -----------------------------------
-    changed = 0
-    for cid, (_name, body) in blocks.items():
-        new_body = body
-        for key, (old, new) in EXPECTED.items():
-            new_body = re.sub(
-                rf'^(\s*{re.escape(key)} = )"{re.escape(old)}";',
-                rf'\g<1>"{new}";',
-                new_body,
-                flags=re.M,
+        found = block_span(src, cid)
+        if found is None:
+            fail(
+                "the SFI configuration list references an id with no matching block",
+                [cid, "the project structure is not the one this overlay was written for"],
             )
-        if new_body != body:
-            src = src.replace(body, new_body, 1)
-            changed += 1
+        listed.append((cid,) + found)
 
-    if changed != len(blocks):
-        print(
-            f"apply-apple-branding-overlay: edited {changed} of {len(blocks)} SFI configurations",
-            file=sys.stderr,
+    names = {name for _, _, _, name, _ in listed}
+
+    # Check the SCOPE before anything else. A new configuration upstream is the case this
+    # overlay must not guess about.
+    if names != EXPECTED_CONFIG_NAMES:
+        fail(
+            "the SFI target's configuration set is not the expected one",
+            [
+                f"found {sorted(names)}",
+                f"expected {sorted(EXPECTED_CONFIG_NAMES)}",
+                "a new configuration may need different branding; review required",
+            ],
         )
-        return 1
 
-    open(path, "w", encoding="utf-8").write(src)
-    print(f"  [branding] SFI product renamed to JiejieBox in {changed} configurations")
+    spans = {cid: (start, end, name, block) for cid, start, end, name, block in listed}
+    # New name upstream means new scope. Refuse rather than brand something unreviewed.
+    if names != EXPECTED_CONFIG_NAMES:
+        fail(
+            "the SFI target's configuration set is not the expected one",
+            [
+                f"found {sorted(names)}",
+                f"expected {sorted(EXPECTED_CONFIG_NAMES)}",
+                "a new configuration may need different branding; review required",
+            ],
+        )
+    if len(spans) != len(EXPECTED_CONFIG_NAMES):
+        fail(
+            "the SFI target resolves to more configurations than expected",
+            [f"resolved {len(spans)} ids for {sorted(names)}"],
+        )
 
-    scheme_changed = patch_scheme(client)
-    if scheme_changed:
+    # --- partial states -------------------------------------------------------
+    branded = {cid for cid, (_, _, _, b) in spans.items() if is_branded(b)}
+    upstream = {cid for cid, (_, _, _, b) in spans.items() if is_upstream(b)}
+    unknown = set(spans) - branded - upstream
+
+    if unknown:
+        details = []
+        for cid in sorted(unknown):
+            _, _, name, block = spans[cid]
+            current = {k: settable(block, k) for k in EXPECTED}
+            details.append(f"SFI {name}: {current}")
+        fail(
+            "some SFI configurations are in neither the upstream nor the branded state",
+            details + ["refusing to edit a partially branded project"],
+        )
+    if branded and upstream:
+        fail(
+            "SFI configurations disagree: some are branded and some are not",
+            [
+                f"branded: {sorted(spans[c][2] for c in branded)}",
+                f"upstream: {sorted(spans[c][2] for c in upstream)}",
+            ],
+        )
+
+    scheme = scheme_state(client)
+    changed_ids = 0
+
+    if len(branded) == len(spans):
+        # Project fully branded. The scheme is validated above, so a project-new /
+        # scheme-old state is finished rather than reported as done - the previous
+        # version returned success here without ever looking at the scheme.
+        print("  [branding] project already applied")
+    else:
+        # Splice by descending offset so earlier spans stay valid.
+        for cid in sorted(spans, key=lambda c: spans[c][0], reverse=True):
+            start, end, name, block = spans[cid]
+            branded_block = brand_block(block)
+            if branded_block == block:
+                fail("a configuration needed branding but no substitution matched", [f"SFI {name}"])
+            src = src[:start] + branded_block + src[end:]
+            changed_ids += 1
+        if changed_ids != len(spans):
+            fail(
+                f"edited {changed_ids} of {len(spans)} SFI configurations",
+                ["refusing to write a partial result"],
+            )
+        open(path, "w", encoding="utf-8").write(src)
+        print(f"  [branding] SFI product renamed to JiejieBox in {changed_ids} configurations")
+
+    if scheme == "old":
+        scheme_changed = patch_scheme(client)
         print(f"  [branding] SFI scheme BuildableName updated ({scheme_changed} references)")
     else:
         print("  [branding] SFI scheme already up to date")

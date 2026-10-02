@@ -412,7 +412,16 @@ if [ "$branding_applied" = "1" ]; then
   # Only SFI may change: SFT and SFM also declare PRODUCT_NAME = "sing-box", and
   # renaming them would be a branding migration this task explicitly excludes.
   sfi_configs="$(python3 "$root/scripts/ci/test-branding-scope.py" clients/apple)"
-  check "only the SFI configurations were renamed" test "$sfi_configs" = "2"
+  # The scope script verifies both directions - SFI branded AND every other target,
+  # the URL scheme, bundle id and App Group untouched - and exits non-zero on any
+  # problem. Its exit status is strictly stronger than counting occurrences, which a
+  # blanket replacement would have satisfied.
+  if python3 "$root/scripts/ci/test-branding-scope.py" clients/apple >/dev/null 2>&1; then
+    check "only the SFI configurations were renamed" true
+  else
+    check "only the SFI configurations were renamed" false
+    python3 "$root/scripts/ci/test-branding-scope.py" clients/apple 2>&1 | sed 's/^/      /' || true
+  fi
 
   echo "  -- compatibility must be preserved --"
   check "the bundle identifier setting is unchanged" \
@@ -443,8 +452,10 @@ echo "== the branding overlay fails closed =="
 # If the pinned client changes so the anchors no longer match, the overlay must
 # refuse rather than silently skip - a branding overlay that stops working would
 # ship an app still called sing-box, which is the bug it exists to fix.
-check "the overlay verifies its anchors" \
-  grep -q "does not match the expected structure" scripts/ci/apply-apple-branding-overlay.py
+check "the overlay refuses a partially branded project" \
+  grep -q "neither the upstream nor the branded state" scripts/ci/apply-apple-branding-overlay.py
+check "the overlay refuses an unexpected configuration set" \
+  grep -q "configuration set is not the expected one" scripts/ci/apply-apple-branding-overlay.py
 check "the overlay refuses to guess at the scheme" \
   grep -q "refusing to guess" scripts/ci/apply-apple-branding-overlay.py
 check "the TestFlight builder does not hardcode a product name" \

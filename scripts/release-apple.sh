@@ -133,9 +133,9 @@ do_ios() {
 
 do_macos() {
   step "build signed macOS DMG"
-  ./scripts/ci/build-macos-dmg.sh dist/apple/JiejieBox-macOS-${APPLE_SIGNING_MODE}.dmg
+  ./scripts/ci/build-macos-dmg.sh dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
   step "verify the signed DMG"
-  ./scripts/ci/verify-apple-signed-artifact.sh macos-dmg dist/apple/JiejieBox-macOS-${APPLE_SIGNING_MODE}.dmg
+  ./scripts/ci/verify-apple-signed-artifact.sh macos-dmg dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
 }
 
 # The single-record product model. Both platforms ship as one App Store Connect
