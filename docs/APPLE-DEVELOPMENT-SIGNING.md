@@ -68,6 +68,15 @@ different things:
 | development | Apple Development | iOS/Mac App Development | **yes** |
 | TestFlight | Apple Distribution | App Store | **no** |
 
+The archive is signed by Xcode's **automatic** signing, and distribution re-signing
+happens at `-exportArchive`, which is the step that can use either a local Apple
+Distribution certificate or a cloud-managed one obtained through the signed-in
+account. Pinning an identity at the archive step breaks this: `"Apple Development"`
+makes it request a device-scoped development profile, and `"Apple Distribution"`
+conflicts with every target the project leaves on automatic
+(*"... is automatically signed for development, but a conflicting code signing
+identity ... has been manually specified"*).
+
 A development profile is device-scoped, so a team with no registered devices cannot
 be issued one at all. An App Store distribution profile is not device-scoped, so
 TestFlight does not depend on device registration — but it does require an **Apple
@@ -442,6 +451,38 @@ artifact; the message names the missing values.
 When you want to distribute a DMG to other Macs, that is a separate change: a
 `developer-id` signing mode plus notarization and stapling.
 
+## One App Store record for both platforms
+
+The product ships as a **single** App Store Connect record:
+
+```text
+App:        JiejieBox
+Bundle ID:  top.jiejie12131.jiejiebox
+Platforms:  iOS, macOS
+```
+
+That only works because the two main apps share a bundle identifier, which the
+project already arranges — there are two macOS apps, and only one is an App Store
+product:
+
+| Target | Bundle ID | Sandbox | Distribution |
+|---|---|---|---|
+| `SFI` | `<base>` | yes | iOS App Store |
+| `SFM` | `<base>` | yes | **macOS App Store** |
+| `SFM.System` | `<base>.standalone` | no | Developer ID, outside the store |
+
+`SFM.System` is upstream's stand-alone build: it installs a privileged helper
+(`RootHelper`) and a System Extension, and declares
+`com.apple.developer.system-extension.install`. A sandboxed App Store app may not do
+either, so it is not part of the record and keeps its own identifier. Its
+`.standalone` suffix is load-bearing rather than cosmetic — it appears inside the
+code-signing requirement strings in `CommandXPC`, `RootHelperService` and the
+helper's launchd plist, so those must keep matching that target's real name.
+
+The bundle identifier is **frozen after the first upload**, so
+`build-macos-testflight.sh` refuses to archive unless the macOS and iOS ids are
+identical, rather than letting a second record be created by accident.
+
 ## TestFlight
 
 TestFlight needs an **Apple Distribution** certificate (not Apple Development)
@@ -458,10 +499,14 @@ export APPLE_TEAM_ID=ABCDE12345
 export APPLE_BASE_BUNDLE_ID=com.example.jiejiebox
 export APPLE_APP_GROUP_ID=group.com.example.jiejiebox
 
-./scripts/release-apple.sh testflight
+./scripts/release-apple.sh testflight          # both platforms
+./scripts/release-apple.sh testflight-ios      # iOS only
+./scripts/release-apple.sh testflight-macos    # macOS only
 ```
 
-That runs `scripts/ci/build-ios-testflight.sh`, which:
+`testflight` runs the iOS builder and then the macOS builder against one shared
+configuration, so the two cannot drift apart. The iOS builder
+(`scripts/ci/build-ios-testflight.sh`):
 
 1. archives with `xcodebuild archive` in Release — not a re-signed development IPA,
    because the archive is what reproduces the bundle layout App Store Connect
