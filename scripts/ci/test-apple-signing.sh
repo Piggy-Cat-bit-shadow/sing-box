@@ -323,13 +323,8 @@ for builder in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testfli
   # writes it out. macOS cannot: the export uploads a package and leaves nothing
   # local, and the archive is development-signed by design (that is what carries the
   # entitlements Apple validates). Assert the right thing for each.
-  if [ "$(basename "$builder")" = "build-ios-testflight.sh" ]; then
-    check "the iOS export is verified as distribution-signed" \
-      grep -q "Authority=Apple Distribution" "$builder"
-  else
-    check "the macOS export relies on Apple accepting the upload" \
-      grep -q "EXPORT SUCCEEDED\|export_status" "$builder"
-  fi
+  check "$(basename "$builder") checks the entitlements Apple validated" \
+    grep -q "carries the network extension entitlement" "$builder"
   check "$(basename "$builder") verifies what it uploaded" \
     grep -q "verify what was uploaded\|verify the EXPORTED product" "$builder"
 done
@@ -338,10 +333,14 @@ echo "== a product that is not signed must never be reported as a success =="
 # An empty identity with signing still enabled makes xcodebuild report success while
 # producing "code object is not signed at all". That has been mistaken for a passing
 # distribution build twice, so the assertions live on the EXPORTED product.
-check "the iOS builder verifies the exported IPA" \
-  grep -q "the export reported success but produced no IPA" scripts/ci/build-ios-testflight.sh
-check "the exports are verified, not just produced" \
-  bash -c 'grep -q "verify the EXPORTED product" scripts/ci/build-ios-testflight.sh && \
+check "the iOS builder verifies the uploaded build" \
+  grep -q "verify what was uploaded" scripts/ci/build-ios-testflight.sh
+# Both platforms verify the archive the upload was built from: with
+# destination=upload neither writes a local artifact, so there is nothing else to
+# inspect, and an earlier check that expected an IPA reported a false negative on
+# uploads that had actually succeeded.
+check "the uploads are verified, not just produced" \
+  bash -c 'grep -q "verify what was uploaded" scripts/ci/build-ios-testflight.sh && \
            grep -q "verify what was uploaded" scripts/ci/build-macos-testflight.sh'
 
 echo "== no signing setting is silently dropped by a stray comment =="

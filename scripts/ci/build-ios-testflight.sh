@@ -273,47 +273,41 @@ xcodebuild -exportArchive \
 export_status=${PIPESTATUS[0]}
 set -e
 
-# --- verify the EXPORTED product ------------------------------------------
-# This is where distribution signing is actually proven. Asserting it on the
-# archive would only be satisfiable by an unsigned build, and an unsigned build
-# "succeeds" while producing nothing uploadable - a false positive that has been
-# mistaken for success before.
+# --- verify what was uploaded ------------------------------------------------
+#
+# destination=upload sends the build to App Store Connect and writes NO local
+# artifact: the export directory is empty afterwards, for iOS exactly as for macOS.
+# An earlier version of this check expected an IPA there and reported
+# "the export reported success but produced no IPA" on uploads that had in fact
+# succeeded - a false negative in the check, not a failed build.
+#
+# So verify the thing that is both checkable and meaningful: the archive the upload
+# was built from. It is DEVELOPMENT-signed by design - that is what carries the
+# entitlements Apple validates, and the distribution re-signing happens inside the
+# export - so asserting a distribution authority here would fail on a good build.
 if [ "$export_status" -eq 0 ]; then
-  ipa="$(find "$export_dir" -maxdepth 1 -name '*.ipa' | head -1)"
-  if [ -z "$ipa" ]; then
-    echo "FAIL: the export reported success but produced no IPA" >&2
-    exit 1
-  fi
-  echo "verify: $(basename "$ipa")"
-
-  vwork="$(mktemp -d)"
-  unzip -q "$ipa" -d "$vwork"
-  vapp="$(find "$vwork/Payload" -maxdepth 1 -name '*.app' -type d | head -1)"
   vfail=0
   vgate() {
     local name="$1"; shift
     if "$@" >/dev/null 2>&1; then echo "  PASS: $name"; else echo "  FAIL: $name" >&2; vfail=1; fi
   }
-  vgate "exported app is signed" codesign --verify --strict "$vapp"
-  # The exported IPA IS distribution-signed for iOS: the export writes it out, and
-  # Xcode re-signs during export. This differs from macOS, where the export uploads a
-  # package and leaves nothing local to inspect.
-  vgate "signed by Apple Distribution" \
-    bash -c "codesign -dvvv '$vapp' 2>&1 | grep -q 'Authority=Apple Distribution'"
-  vgate "signature belongs to our team" \
-    bash -c "codesign -dvvv '$vapp' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
-  vgate "embeds an App Store provisioning profile" test -f "$vapp/embedded.mobileprovision"
-  # An App Store profile is not device-scoped; a profile listing devices would mean
-  # this is a development or ad-hoc build, which TestFlight would reject.
-  vgate "profile is not device-scoped" \
-    bash -c "! security cms -D -i '$vapp/embedded.mobileprovision' 2>/dev/null | grep -q ProvisionedDevices"
-  vgate "built for release (get-task-allow false)" \
-    bash -c "security cms -D -i '$vapp/embedded.mobileprovision' 2>/dev/null | grep -A1 get-task-allow | grep -q '<false/>'"
-  vgate "Packet Tunnel extension is signed" codesign --verify --strict "$vapp/PlugIns/Extension.appex"
+  profile="$app/embedded.mobileprovision"
+  vgate "the uploaded archive is signed" codesign --verify --strict "$app"
+  vgate "the signature belongs to our team" \
+    bash -c "codesign -dvvv '$app' 2>&1 | grep -q 'TeamIdentifier=$APPLE_TEAM_ID'"
+  vgate "it embeds a provisioning profile" test -f "$profile"
+  vgate "the profile authorises this app id" \
+    bash -c "security cms -D -i '$profile' 2>/dev/null | grep -q '$APPLE_IOS_APP_BUNDLE_ID'"
   vgate "no upstream team anywhere in the signature" \
-    bash -c "! codesign -dvvv '$vapp' 2>&1 | grep -q P8XK3KHB48"
-  rm -rf "$vwork"
-  [ "$vfail" -eq 0 ] || { echo "FAIL: the exported IPA is not a valid distribution build" >&2; exit 1; }
+    bash -c "! codesign -dvvv '$app' 2>&1 | grep -q P8XK3KHB48"
+  # The entitlements Apple validated: a missing-entitlement rejection is about these.
+  vgate "carries the network extension entitlement" \
+    bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.networkextension"
+  vgate "carries the App Group" \
+    bash -c "codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.security.application-groups"
+  vgate "has no multicast entitlement" \
+    bash -c "! codesign -d --entitlements :- '$app' 2>/dev/null | grep -q com.apple.developer.networking.multicast"
+  [ "$vfail" -eq 0 ] || { echo "FAIL: the uploaded build is not what it should be" >&2; exit 1; }
 fi
 
 echo
