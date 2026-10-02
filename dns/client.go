@@ -48,6 +48,9 @@ type Client struct {
 	networkManager    adapter.NetworkManager
 	logger            logger.ContextLogger
 	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
+	// QNAME-wide negative verdicts for NXDOMAIN, keyed without Qtype. See
+	// client_negative.go: one name costs one upstream query, not one per record type.
+	nxdomainCache     *freelru.Cache[nxdomainCacheKey, *nxdomainCacheEntry]
 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 }
@@ -181,6 +184,7 @@ func (c *Client) initializeMemoryCache() {
 		return
 	}
 	c.cache = common.Must1(freelru.New[dnsCacheKey, *dns.Msg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32, true))
+	c.initializeNXDomainCache()
 }
 
 func extractNegativeTTL(response *dns.Msg) (uint32, bool) {
@@ -319,6 +323,16 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 					return nil, response, exchangeDone, nil
 				}
 			}
+			// The exact cache missed. Before any upstream work, check whether this NAME
+			// is already known not to exist: RFC 2308 makes NXDOMAIN a statement about
+			// the name, so one verdict answers every record type and the name costs one
+			// query rather than one per type. This sits after the exact lookup so a
+			// still-valid positive answer always wins.
+			if negative, hit := c.loadNXDomain(cacheKey, question, message.Id); hit {
+				logCachedResponse(c.logger, ctx, negative, int(computeTimeToLive(negative)))
+				operation.release()
+				return nil, negative, exchangeDone, nil
+			}
 			if !loaded {
 				break
 			}
@@ -381,6 +395,18 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 		cacheKey, storable := c.finishCacheKey(transport, operation.cacheKey)
 		if storable {
 			c.storeCache(cacheKey, response, timeToLive)
+			// A validated NXDOMAIN is a statement about the NAME, so record it once
+			// and let every other record type for that name reuse it. Reaching here
+			// means the response already passed the checker above, the exchange
+			// succeeded, and caching is enabled.
+			//
+			// storeNXDomain re-checks the conditions that make widening safe:
+			// RcodeNameError, a usable SOA TTL, and a single question. NODATA and the
+			// error rcodes never reach it, because disableCache already excludes them
+			// above.
+			if response.Rcode == dns.RcodeNameError {
+				c.storeNXDomain(cacheKey, response, timeToLive)
+			}
 		}
 	}
 	response.Id = operation.messageId
@@ -570,6 +596,9 @@ func (c *Client) questionCache(ctx context.Context, transport adapter.DNSTranspo
 	cacheKey := c.newCacheKey(transport, question, message, options)
 	response, _, isStale := c.loadResponse(cacheKey)
 	if response == nil {
+		// The name-wide NXDOMAIN lookup lives in beginExchange, which is the single
+		// cache entry point for both Exchange and ExchangeAsync. Doing it here as well
+		// would be a second site to keep in step for no additional coverage.
 		return nil, ErrNotCached
 	}
 	if isStale {
