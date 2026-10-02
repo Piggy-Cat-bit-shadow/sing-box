@@ -103,7 +103,28 @@ func ReloadSetupOptions(options *SetupOptions) {
 			debug.SetGCPercent(oomkiller.DefaultAppleNetworkExtensionGCPercent)
 		}
 		if sOOMMemoryLimit > 0 {
-			debug.SetMemoryLimit(int64(oomkiller.RuntimeMemoryLimit(uint64(sOOMMemoryLimit))))
+			runtimeMemoryLimit := oomkiller.RuntimeMemoryLimit(uint64(sOOMMemoryLimit))
+			debug.SetMemoryLimit(int64(runtimeMemoryLimit))
+			// One startup line, computed from the values actually applied.
+			//
+			// The effective iOS memory policy is the product of a budget, a safety
+			// margin and a GC percentage that live across three files, so a device log
+			// otherwise gives no way to confirm what is really in force. On a phone this
+			// is the difference between "the client is collecting too aggressively" and
+			// guessing, so the numbers are reported once at setup.
+			//
+			// Nothing here is hot-path: this runs a single time per process start. The
+			// values are read after being set rather than restated, so the line cannot
+			// drift from the policy it describes.
+			if C.IsIos {
+				// SetGCPercent(-1) reports the current percentage without changing it.
+				currentGCPercent := debug.SetGCPercent(-1)
+				debug.SetGCPercent(currentGCPercent)
+				log.Info("[Memory] NetworkExtension budget=",
+					byteformats.FormatMemoryBytes(uint64(sOOMMemoryLimit)),
+					" runtime_limit=", byteformats.FormatMemoryBytes(runtimeMemoryLimit),
+					" GOGC=", currentGCPercent)
+			}
 		} else {
 			debug.SetMemoryLimit(math.MaxInt64)
 		}
