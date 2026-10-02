@@ -83,10 +83,16 @@ fi
 # explanation - the same removal applies here, and to the resolved checkouts in
 # DerivedData only, never to the pinned submodule.
 echo "resolving packages"
-xcodebuild -resolvePackageDependencies \
-  -project "$client/sing-box.xcodeproj" \
-  -scheme "$scheme" \
-  -derivedDataPath "$work/dd" >/dev/null 2>&1 || true
+for attempt in 1 2 3; do
+  if xcodebuild -resolvePackageDependencies \
+      -project "$client/sing-box.xcodeproj" \
+      -scheme "$scheme" \
+      -derivedDataPath "$work/dd" >/dev/null 2>&1; then
+    break
+  fi
+  echo "  resolve attempt $attempt failed (network); retrying"
+  sleep 5
+done
 
 removed_plugins=0
 while IFS= read -r pkg; do
@@ -104,7 +110,7 @@ done < <(find "$work/dd/SourcePackages/checkouts" -maxdepth 2 -name Package.swif
 # The archive must be SIGNED so that it carries entitlements: -exportArchive
 # validates them from the archive and cannot supply ones that were never applied.
 # See build-ios-testflight.sh for the full explanation and Apple's exact wording.
-echo "archiving (Release, macOS, arm64; automatic signing, re-signed at export)"echo "archiving (Release, macOS, arm64; unsigned package, signed at export)"
+echo "archiving (Release, macOS, arm64; automatic signing, re-signed at export)"
 # Only the archive is cleared. DerivedData is NOT, because the resolve step above
 # populated it and stripped the SwiftLint plug-in from its checkouts; deleting it
 # here would restore the plug-in and the build would abort loading sourcekitdInProc.
@@ -122,6 +128,7 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
+  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
   -allowProvisioningUpdates \
   -skipPackagePluginValidation \

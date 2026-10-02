@@ -366,6 +366,18 @@ check "the local file is not tracked" \
   bash -c '! git ls-files --error-unmatch .env.apple.local >/dev/null 2>&1'
 
 
+echo "== the Apple scripts are syntactically valid =="
+# A concatenated echo left two commands on one line, which `bash -n` accepts but
+# which runs the wrong command. Checking every script here catches that class
+# before a 20-minute build does.
+for script in scripts/release-apple.sh scripts/ci/apple-signing-config.sh \
+              scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflight.sh \
+              scripts/ci/build-ios-ipa.sh scripts/ci/build-macos-dmg.sh \
+              scripts/ci/prepare-apple-client.sh scripts/ci/check-apple-signing-environment.sh; do
+  check "$(basename "$script") parses" bash -n "$script"
+done
+
+
 echo
 echo "test-apple-signing: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1

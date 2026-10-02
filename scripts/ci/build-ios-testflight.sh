@@ -92,7 +92,25 @@ fi
 # development profile, which requires at least one registered device. Development
 # profiles are sufficient here: the export re-signs for distribution, which is where
 # the App Store profile is created.
-echo "archiving (Release, iphoneos, arm64; automatic signing, re-signed at export)"echo "archiving (Release, iphoneos, arm64; unsigned package, signed at export)"
+# Resolve packages as a separate step.
+#
+# The archive otherwise resolves the package graph inline, and a transient network
+# failure there aborts the whole build with exit 74 ("Could not resolve package
+# dependencies: RPC failed"), which reads like a project problem and is not. Doing
+# it first also means the resolve can be retried without rebuilding anything.
+echo "resolving packages"
+for attempt in 1 2 3; do
+  if xcodebuild -resolvePackageDependencies \
+      -project "$client/sing-box.xcodeproj" \
+      -scheme SFI \
+      -derivedDataPath "$work/dd" >/dev/null 2>&1; then
+    break
+  fi
+  echo "  resolve attempt $attempt failed (network); retrying"
+  sleep 5
+done
+
+echo "archiving (Release, iphoneos, arm64; automatic signing, re-signed at export)"
 rm -rf "$archive_path"
 # Clear the derived data too. Xcode caches the resolved package graph and the
 # build settings derived from it, and a cache written while the archive still used
@@ -115,6 +133,7 @@ xcodebuild archive \
   APP_GROUP_IDENTIFIER="$APPLE_APP_GROUP_ID" \
   MARKETING_VERSION="$marketing_version" \
   CURRENT_PROJECT_VERSION="$build_number" \
+  DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
   CODE_SIGN_STYLE=Automatic \
   -allowProvisioningUpdates \
   -skipPackagePluginValidation \
