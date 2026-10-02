@@ -34,8 +34,8 @@ cd "$root"
 # This gate is only meaningful while the iOS build really does use with_low_memory.
 # If that ever changes, running these tests with the tag would be checking a
 # configuration nothing ships - worse than no gate, because it looks like coverage.
-if ! grep -q 'tags-not-macos=with_low_memory' cmd/internal/build_libbox/main.go; then
-  echo "FAIL: the Apple libbox build no longer passes with_low_memory." >&2
+if ! grep -q 'appleLowMemoryTag' cmd/internal/build_libbox/tags.go; then
+  echo "FAIL: the Apple libbox build no longer declares a low-memory tag." >&2
   echo "  iOS would be built with the default 32 KiB buffers, so this gate would test" >&2
   echo "  a configuration that is not shipped." >&2
   echo "  Apple iOS low-memory contract changed; review required." >&2
@@ -43,37 +43,49 @@ if ! grep -q 'tags-not-macos=with_low_memory' cmd/internal/build_libbox/main.go;
 fi
 echo "low-memory contract: with_low_memory is still passed to the Apple libbox build"
 
-# --- production tags, derived not invented ------------------------------------
+# --- Apple tags, from the one definition the builder uses ---------------------
 #
-# The data-path packages are not buildable with a bare tag set: transport/http needs
-# with_quic for client_h3.go, and the production tag files list everything the shipped
-# binaries use. The set is read from the repository rather than restated here, so it
-# cannot drift from what is actually built.
+# The data-path packages are not buildable with a bare tag set, and they must be tested
+# with the tags the APPLE CLIENT SHIPS, not a desktop set that happens to compile.
 #
-# DEFAULT_BUILD_TAGS_OTHERS is the non-Windows, non-Apple client set, which is what the
-# Apple libbox build itself extends with with_low_memory.
-tags_file="release/DEFAULT_BUILD_TAGS_OTHERS"
-if [ ! -f "$tags_file" ]; then
-  echo "FAIL: $tags_file is missing; cannot derive the production tag set." >&2
+# This previously read release/DEFAULT_BUILD_TAGS_OTHERS, which is the non-Windows DESKTOP
+# client set. That set differs from what libbox builds, so the gate was checking a
+# configuration no Apple binary uses - coverage that reads as coverage while testing
+# something else.
+#
+# cmd/internal/appletags prints the canonical set from the same source build_libbox uses.
+# A contract test in that package fails if the two ever diverge.
+apple_tags="$(go run ./cmd/internal/appletags -low-memory=true 2>&1)"
+if [ -z "$apple_tags" ]; then
+  echo "FAIL: could not read the canonical Apple tag set from cmd/internal/appletags." >&2
+  echo "  Refusing to fall back to a guess: a gate testing unknown tags is worse than none." >&2
   exit 1
 fi
-production_tags="$(tr -d '[:space:]' < "$tags_file")"
-if [ -z "$production_tags" ]; then
-  echo "FAIL: $tags_file is empty." >&2
-  exit 1
-fi
-test_tags="$production_tags,with_low_memory"
+case "$apple_tags" in
+  *with_low_memory*)
+    ;;
+  *)
+    echo "FAIL: the Apple iOS/tvOS tag set does not contain with_low_memory." >&2
+    echo "  Apple iOS low-memory contract changed; review required." >&2
+    exit 1
+    ;;
+esac
+test_tags="$apple_tags"
 
-# libbox references runtime internals that the linker rejects unless the linkname
-# escape hatch is enabled, so its tests need the same two tags and linker flag the
-# libbox build itself uses. Both are read from that build rather than restated.
-if ! grep -q 'badlinkname' cmd/internal/build_libbox/main.go; then
-  echo "FAIL: the libbox build no longer passes badlinkname." >&2
-  echo "  Apple iOS low-memory contract changed; review required." >&2
-  exit 1
-fi
-libbox_tags="$test_tags,badlinkname,tfogo_checklinkname0"
-echo "low-memory tags: with_low_memory appended to $tags_file"
+# libbox references runtime internals the linker rejects unless the linkname escape hatch
+# is enabled. Those tags now arrive with the canonical set, so this asserts they are
+# present rather than re-adding them.
+case "$test_tags" in
+  *badlinkname*)
+    ;;
+  *)
+    echo "FAIL: the canonical Apple tag set is missing badlinkname." >&2
+    echo "  Apple iOS low-memory contract changed; review required." >&2
+    exit 1
+    ;;
+esac
+libbox_tags="$test_tags"
+echo "low-memory tags: canonical Apple set from cmd/internal/appletags (with_low_memory present)"
 
 # --- the packages that depend on buffer geometry ------------------------------
 #
