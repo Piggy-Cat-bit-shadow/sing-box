@@ -119,8 +119,10 @@ type splittingConn struct {
 	writer N.PacketWriter
 }
 
-func (c *splittingConn) UpstreamReader() any { return c.reader }
-func (c *splittingConn) UpstreamWriter() any { return c.writer }
+func (c *splittingConn) UpstreamReader() any     { return c.reader }
+func (c *splittingConn) UpstreamWriter() any     { return c.writer }
+func (c *splittingConn) ReaderReplaceable() bool { return true }
+func (c *splittingConn) WriterReplaceable() bool { return true }
 
 // opaqueConn hides its upstream entirely, standing for a wrapper that transforms
 // packets. The unwrap must refuse rather than assume it is transparent.
@@ -253,3 +255,75 @@ func TestSpliceTarget_StopsAtFirstSocket(t *testing.T) {
 
 var _ tun.SpliceSocket = (*fakeSpliceSocket)(nil)
 var _ tun.SpliceSocket = (*socketConn)(nil)
+
+// --- reasons ------------------------------------------------------------------
+
+func TestSpliceTargetWithReason_ReportsTheFailingStep(t *testing.T) {
+	// The reason must name the step that actually refused, otherwise an on-device
+	// report would point at the wrong code.
+	cases := []struct {
+		name string
+		conn any
+		want spliceReason
+	}{
+		{
+			name: "wrapper that hides its upstream",
+			conn: &opaqueConn{PacketConn: &socketConn{socket: &fakeSpliceSocket{}}},
+			want: spliceReasonTargetNotReplaceable,
+		},
+		{
+			name: "irreplaceable wrapper",
+			conn: &nonReplaceableConn{PacketConn: &socketConn{socket: &fakeSpliceSocket{}}},
+			want: spliceReasonTargetNotReplaceable,
+		},
+		{
+			name: "mismatched reader and writer",
+			conn: &splittingConn{
+				PacketConn: &socketConn{socket: &fakeSpliceSocket{}},
+				reader:     &socketConn{socket: &fakeSpliceSocket{}},
+				writer:     &socketConn{socket: &fakeSpliceSocket{}},
+			},
+			want: spliceReasonTargetUpstreamMismatch,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, reason, ok := unwrapSpliceTargetWithReason(tc.conn, false)
+			if ok {
+				t.Fatal("expected refusal")
+			}
+			if reason != tc.want {
+				t.Errorf("reason: want %s, got %s", tc.want, reason)
+			}
+		})
+	}
+}
+
+func TestSpliceTargetWithReason_SuccessIsReported(t *testing.T) {
+	_, reason, ok := unwrapSpliceTargetWithReason(&socketConn{socket: &fakeSpliceSocket{}}, false)
+	if !ok {
+		t.Fatal("expected success")
+	}
+	if reason != spliceReasonSuccess {
+		t.Errorf("reason: want success, got %s", reason)
+	}
+}
+
+func TestSpliceTargetWithReason_AgreesWithTheThinWrapper(t *testing.T) {
+	// unwrapSpliceTarget delegates to the reason-aware variant, so the two must never
+	// disagree about eligibility. If they ever do, the reason describes a decision
+	// that was not the one taken.
+	conns := []any{
+		&socketConn{socket: &fakeSpliceSocket{}},
+		&counterConn{PacketConn: &socketConn{socket: &fakeSpliceSocket{}}},
+		&opaqueConn{PacketConn: &socketConn{socket: &fakeSpliceSocket{}}},
+		&nonReplaceableConn{PacketConn: &socketConn{socket: &fakeSpliceSocket{}}},
+	}
+	for i, conn := range conns {
+		_, thin := unwrapSpliceTarget(conn, false)
+		_, _, withReason := unwrapSpliceTargetWithReason(conn, false)
+		if thin != withReason {
+			t.Errorf("conn %d: thin=%v reason-aware=%v", i, thin, withReason)
+		}
+	}
+}
