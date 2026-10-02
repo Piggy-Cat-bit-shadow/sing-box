@@ -30,11 +30,20 @@ var oomReportProfiles = []string{
 
 type oomReportMetadata struct {
 	reportMetadata
-	RecordedAt      string `json:"recordedAt"`
-	MemoryLimit     string `json:"memoryLimit,omitempty"`
-	MemoryUsage     string `json:"memoryUsage"`
+	RecordedAt  string `json:"recordedAt"`
+	MemoryLimit string `json:"memoryLimit,omitempty"`
+	MemoryUsage string `json:"memoryUsage"`
+	// AvailableMemory is formatted only when AvailableKnown is true. The two are written
+	// together so a reader cannot mistake an absent value for a measured zero.
 	AvailableMemory string `json:"availableMemory,omitempty"`
-	Snapshots       int    `json:"snapshots,omitempty,string"`
+	// AvailableKnown distinguishes "the platform does not report available memory" from "the
+	// device was measured at zero available". Without it a report cannot tell a platform
+	// without the API from a device that was genuinely out of memory.
+	AvailableKnown bool `json:"availableKnown"`
+	// ObservedBudget is the advisory same-instant budget, when one was observed. It is omitted
+	// rather than written as zero when no same-instant sample exists.
+	ObservedBudget string `json:"observedBudget,omitempty"`
+	Snapshots      int    `json:"snapshots,omitempty,string"`
 }
 
 func OOMRecorderOptions(startedService *daemon.StartedService) oomkiller.RecorderOptions {
@@ -53,8 +62,14 @@ func OOMRecorderOptions(startedService *daemon.StartedService) oomkiller.Recorde
 			if status.MemoryLimit > 0 {
 				metadata.MemoryLimit = byteformats.FormatMemoryBytes(status.MemoryLimit)
 			}
+			metadata.AvailableKnown = status.AvailableKnown
 			if status.AvailableKnown {
 				metadata.AvailableMemory = byteformats.FormatMemoryBytes(status.MinAvailable)
+			}
+			// Only a same-instant observation is reported. Extrema from different samples are
+			// deliberately not combined; see ReportStatus.ObservedBudget.
+			if budget, ok := status.ObservedBudget(); ok {
+				metadata.ObservedBudget = byteformats.FormatMemoryBytes(budget)
 			}
 			return metadata
 		},

@@ -50,16 +50,36 @@ func TestObservedBudgetIsAdvisoryAndAbsentWithoutSupport(t *testing.T) {
 		t.Error("without available memory there is no observed budget to report")
 	}
 
+	// A known figure must be reported from a SAME-INSTANT observation.
+	//
+	// This previously constructed PeakMemory + MinAvailable directly and expected their sum,
+	// which is the cross-sample arithmetic that was wrong: those are two extrema from
+	// potentially different moments, and adding them describes a state the process may never
+	// have been in. The budget is now recorded per sample, where both halves are simultaneous.
 	known := ReportStatus{
-		PeakMemory:     30 * 1024 * 1024,
-		MinAvailable:   20 * 1024 * 1024,
-		AvailableKnown: true,
+		BudgetObserved:       true,
+		PeakMemory:           30 * 1024 * 1024,
+		MinAvailable:         20 * 1024 * 1024,
+		AvailableKnown:       true,
+		LatestObservedBudget: 35 * 1024 * 1024,
 	}
 	budget, ok := known.ObservedBudget()
 	if !ok {
 		t.Fatal("a known available figure must produce an estimate")
 	}
-	if budget != 50*1024*1024 {
-		t.Errorf("observed budget %d, want footprint plus available", budget)
+	if budget != 35*1024*1024 {
+		t.Errorf("observed budget = %d, want the same-instant observation %d rather than "+
+			"peak+min %d", budget, 35*1024*1024, known.PeakMemory+known.MinAvailable)
+	}
+
+	// Extrema alone must NOT produce a budget: without a same-instant observation there is
+	// nothing to report.
+	extremaOnly := ReportStatus{
+		PeakMemory:     30 * 1024 * 1024,
+		MinAvailable:   20 * 1024 * 1024,
+		AvailableKnown: true,
+	}
+	if _, ok := extremaOnly.ObservedBudget(); ok {
+		t.Error("peak and minimum from separate samples must not be added into a budget")
 	}
 }

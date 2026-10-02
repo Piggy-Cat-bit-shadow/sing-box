@@ -80,27 +80,55 @@ type ReportStatus struct {
 	MinAvailable   uint64
 	AvailableKnown bool
 	Snapshots      int
+
+	// BudgetObserved reports whether at least one sample was taken with BOTH the footprint and
+	// the available-memory figure available at the same instant.
+	BudgetObserved bool
+	// LatestObservedBudget is the most recent same-instant (usage + available) figure.
+	LatestObservedBudget uint64
+	// MinObservedBudget and MaxObservedBudget bound the same-instant figures seen.
+	//
+	// These are observations, not a range the process is guaranteed to stay within. They exist
+	// because the budget is only meaningful when both halves describe the SAME moment; see
+	// ObservedBudget.
+	MinObservedBudget uint64
+	MaxObservedBudget uint64
 }
 
 // ObservedBudget is an ADVISORY, instantaneous estimate of the budget the process appears to
-// have, derived from the footprint and the platform's available-memory figure.
+// have, from a single sample where both halves were available at the same moment.
 //
 // # What it is not
 //
 // It is not a system limit, not a contract, and not cached anywhere. Apple has changed the
-// NetworkExtension limit before and may again, and it varies by device, so a value observed
-// on one phone at one moment is an observation. Treating it as fixed would make the policy
+// NetworkExtension limit before and may again, and it varies by device, so a value observed on
+// one phone at one moment is an observation. Treating it as fixed would make the policy
 // silently wrong the moment Apple changes the number.
 //
-// It exists so a real-device run can report what the process actually appeared to be
-// working within, which is the input a future controller would need. No controller reads it:
-// deriving a live policy from it would be a guess presented as configuration, and the
-// benchmarks behind that decision would be macOS ones.
+// It exists so a real-device run can report what the process actually appeared to be working
+// within, which is the input a future controller would need. No controller reads it: deriving a
+// live policy from it would be a guess presented as configuration, and the benchmarks behind
+// that decision would be macOS ones.
+//
+// # Why it is no longer peak + minimum
+//
+// The previous implementation returned PeakMemory + MinAvailable. Those are two EXTREMA taken
+// from different samples, potentially far apart in time, and adding them describes a state the
+// process may never have been in.
+//
+// A concrete example: if the footprint peaked at 90 MB early, then a large allocation was freed
+// and available memory later fell to 10 MB while the footprint sat at 30 MB, then peak +
+// minimum = 100 MB. But the largest budget actually observed was the moment those two readings
+// were simultaneous - 40 MB in that scenario. The old figure overstated the budget by more than
+// double, and it was labelled an instantaneous observation.
+//
+// The value is now computed per sample, where usage and available describe the same instant,
+// and three figures are kept so the spread is visible rather than a single invented number.
 func (s ReportStatus) ObservedBudget() (uint64, bool) {
-	if !s.AvailableKnown {
+	if !s.BudgetObserved {
 		return 0, false
 	}
-	return s.PeakMemory + s.MinAvailable, true
+	return s.LatestObservedBudget, true
 }
 
 type Recorder struct {
@@ -135,10 +163,17 @@ type Recorder struct {
 }
 
 type timelineRow struct {
-	At             string `json:"at"`
-	State          string `json:"state"`
-	MemoryBytes    uint64 `json:"memoryBytes"`
+	At          string `json:"at"`
+	State       string `json:"state"`
+	MemoryBytes uint64 `json:"memoryBytes"`
+	// AvailableBytes is the platform's available-memory figure AT THIS SAMPLE.
+	//
+	// AvailableKnown MUST be read alongside it. A bare `availableBytes,omitempty` conflates two
+	// different facts: on a platform without os_proc_available_memory the figure is absent
+	// because the API does not exist, and a device genuinely at zero available memory would
+	// serialise identically. Absent means "not known", and the flag is what says so.
 	AvailableBytes uint64 `json:"availableBytes,omitempty"`
+	AvailableKnown bool   `json:"availableKnown"`
 	// GoMemoryBytes is /memory/classes/total:bytes - the runtime's total managed memory.
 	// It is NOT the figure GOMEMLIMIT constrains; see GoRuntimeManagedBytes.
 	GoMemoryBytes   uint64 `json:"goMemoryBytes,omitempty"`
@@ -164,13 +199,15 @@ type timelineRow struct {
 }
 
 type eventRecord struct {
-	Type             string        `json:"t"`
-	At               string        `json:"at"`
-	Policy           string        `json:"policy,omitempty"`
-	State            string        `json:"state,omitempty"`
-	Reason           string        `json:"reason,omitempty"`
-	MemoryBytes      uint64        `json:"memoryBytes,omitempty"`
+	Type        string `json:"t"`
+	At          string `json:"at"`
+	Policy      string `json:"policy,omitempty"`
+	State       string `json:"state,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	MemoryBytes uint64 `json:"memoryBytes,omitempty"`
+	// AvailableBytes is meaningful only when AvailableKnown is true. See timelineRow.
 	AvailableBytes   uint64        `json:"availableBytes,omitempty"`
+	AvailableKnown   bool          `json:"availableKnown"`
 	MemoryAfterBytes uint64        `json:"memoryAfterBytes,omitempty"`
 	MemoryLimit      uint64        `json:"memoryLimit,omitempty"`
 	TriggerBytes     uint64        `json:"triggerBytes,omitempty"`
@@ -290,7 +327,12 @@ func (r *Recorder) WriteReport() error {
 	if err != nil {
 		return err
 	}
-	r.appendEventLocked(eventRecord{Type: eventTypeReport, MemoryBytes: sample.usage, AvailableBytes: sample.available})
+	r.appendEventLocked(eventRecord{
+		Type:           eventTypeReport,
+		MemoryBytes:    sample.usage,
+		AvailableBytes: sample.available,
+		AvailableKnown: sample.availableKnown,
+	})
 	err = copyDirectory(r.draftPath, destPath)
 	if err != nil {
 		os.RemoveAll(destPath)
@@ -385,6 +427,7 @@ func (r *Recorder) sample(sample memorySample, state pressureState, connections 
 		State:           state.String(),
 		MemoryBytes:     sample.usage,
 		AvailableBytes:  sample.available,
+		AvailableKnown:  sample.availableKnown,
 		GoMemoryBytes:   runtimeTotal,
 		GoHeapLiveBytes: r.metricsSamples[1].Value.Uint64(),
 		GoStackBytes:    r.metricsSamples[2].Value.Uint64(),
@@ -419,7 +462,12 @@ func (r *Recorder) recordPressure(sample memorySample) {
 	defer r.access.Unlock()
 	r.observeLocked(sample)
 	r.denseUntil = time.Now().Add(denseSampleWindow)
-	r.appendEventLocked(eventRecord{Type: eventTypePressure, MemoryBytes: sample.usage, AvailableBytes: sample.available})
+	r.appendEventLocked(eventRecord{
+		Type:           eventTypePressure,
+		MemoryBytes:    sample.usage,
+		AvailableBytes: sample.available,
+		AvailableKnown: sample.availableKnown,
+	})
 }
 
 func (r *Recorder) recordStateChange(state pressureState, sample memorySample) {
@@ -427,7 +475,13 @@ func (r *Recorder) recordStateChange(state pressureState, sample memorySample) {
 	defer r.access.Unlock()
 	r.observeLocked(sample)
 	r.denseUntil = time.Now().Add(denseSampleWindow)
-	r.appendEventLocked(eventRecord{Type: eventTypeState, State: state.String(), MemoryBytes: sample.usage, AvailableBytes: sample.available})
+	r.appendEventLocked(eventRecord{
+		Type:           eventTypeState,
+		State:          state.String(),
+		MemoryBytes:    sample.usage,
+		AvailableBytes: sample.available,
+		AvailableKnown: sample.availableKnown,
+	})
 }
 
 func (r *Recorder) recordReset(reason string, before memorySample, after memorySample, connections int, reportOnly bool) {
@@ -440,6 +494,7 @@ func (r *Recorder) recordReset(reason string, before memorySample, after memoryS
 		Reason:           reason,
 		MemoryBytes:      before.usage,
 		AvailableBytes:   before.available,
+		AvailableKnown:   before.availableKnown,
 		MemoryAfterBytes: after.usage,
 		Connections:      connections,
 		ReportOnly:       reportOnly,
@@ -522,6 +577,7 @@ func (r *Recorder) snapshot(reason string, sample memorySample, heapDump bool, f
 		Prefix:         prefix,
 		MemoryBytes:    sample.usage,
 		AvailableBytes: sample.available,
+		AvailableKnown: sample.availableKnown,
 		Runtime:        stats,
 		HeapDump:       heapDumped,
 	})
@@ -557,6 +613,26 @@ func (r *Recorder) observeLocked(sample memorySample) {
 	if sample.availableKnown && (!r.status.AvailableKnown || sample.available < r.status.MinAvailable) {
 		r.status.AvailableKnown = true
 		r.status.MinAvailable = sample.available
+	}
+
+	// The budget is computed HERE, where usage and available describe the same instant, and
+	// never by combining extrema from different samples. See ObservedBudget.
+	if sample.availableKnown {
+		observed := sample.usage + sample.available
+		if !r.status.BudgetObserved {
+			r.status.BudgetObserved = true
+			r.status.LatestObservedBudget = observed
+			r.status.MinObservedBudget = observed
+			r.status.MaxObservedBudget = observed
+			return
+		}
+		r.status.LatestObservedBudget = observed
+		if observed < r.status.MinObservedBudget {
+			r.status.MinObservedBudget = observed
+		}
+		if observed > r.status.MaxObservedBudget {
+			r.status.MaxObservedBudget = observed
+		}
 	}
 }
 
