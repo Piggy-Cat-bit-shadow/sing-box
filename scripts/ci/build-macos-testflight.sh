@@ -127,7 +127,7 @@ xcodebuild archive \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGN_IDENTITY="" \
   -skipPackagePluginValidation \
-  2>&1 | tail -60
+  2>&1 | tail -120
 
 if [ ! -d "$archive_path" ]; then
   echo "FAIL: no archive was produced at $archive_path" >&2

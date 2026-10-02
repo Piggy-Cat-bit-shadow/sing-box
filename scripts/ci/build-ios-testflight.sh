@@ -134,7 +134,7 @@ xcodebuild archive \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGN_IDENTITY="" \
   -skipPackagePluginValidation \
-  2>&1 | tail -60
+  2>&1 | tail -120
 # `tail -60` keeps the report readable while still showing the resolved signing
 # settings and the profile types Xcode asked for. Truncating harder than this hid
 # the very lines that distinguish a development profile request from a distribution
