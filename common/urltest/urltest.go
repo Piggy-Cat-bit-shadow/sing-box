@@ -1,31 +1,57 @@
 package urltest
 
 import (
-	"context"
-	"crypto/tls"
-	"net"
-	"net/http"
-	"net/url"
 	"sync"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
-	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/common/observable"
 )
 
+// scopedHistoryKey identifies one measurement: a node measured against a specific target.
+//
+// # Why the tag alone was wrong
+//
+// A delay belongs to a (node, target) pair. Keying by tag meant "Hong Kong to gstatic" and
+// "Hong Kong to Cloudflare" were the same entry, so whichever was measured last decided what a
+// URLTest group configured for the other target would select from.
+type scopedHistoryKey struct {
+	Tag   string
+	Scope MeasurementScope
+}
+
+// latestHistoryRecord remembers which scope produced a tag's most recent result, so the entry can
+// be re-pointed at another scope when that one is deleted instead of vanishing.
+type latestHistoryRecord struct {
+	History *adapter.URLTestHistory
+	Scope   MeasurementScope
+}
+
+// HistoryStorage holds node measurements.
+//
+// It keeps two views of the same data:
+//
+//	latest  one entry per tag, for display - "show the most recent measurement of this node"
+//	scoped  one entry per (tag, target), for decisions - selection, interval skipping, health
+//
+// They are maintained together on every store. The split exists because those two questions have
+// different answers: a UI showing "most recent" is correct and useful, while a group selecting a
+// node must only consider results measured against its own target.
 type HistoryStorage struct {
-	access       sync.RWMutex
-	delayHistory map[string]*adapter.URLTestHistory
-	updateHooks  []*observable.Subscriber[struct{}]
+	access sync.RWMutex
+
+	// delayHistory is the most recent successful measurement per tag, for display.
+	delayHistory map[string]latestHistoryRecord
+
+	// scopedHistory is per (tag, target), and is what selection and skipping read.
+	scopedHistory map[scopedHistoryKey]*adapter.URLTestHistory
+
+	updateHooks []*observable.Subscriber[struct{}]
 }
 
 func NewHistoryStorage() *HistoryStorage {
 	return &HistoryStorage{
-		delayHistory: make(map[string]*adapter.URLTestHistory),
+		delayHistory:  make(map[string]latestHistoryRecord),
+		scopedHistory: make(map[scopedHistoryKey]*adapter.URLTestHistory),
 	}
 }
 
@@ -41,25 +67,114 @@ func (s *HistoryStorage) NotifyUpdated() {
 	s.notifyUpdated()
 }
 
+// LoadURLTestHistory returns the tag's most recent measurement, whatever target produced it.
+//
+// This is the DISPLAY accessor: the native node list and the Clash UI want "the last result for
+// this node", and a result measured against any target answers that question. It must not be used
+// to make selection decisions - use LoadURLTestHistoryFor for that.
 func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
 	if s == nil {
 		return nil
 	}
 	s.access.RLock()
 	defer s.access.RUnlock()
-	return s.delayHistory[tag]
+	return s.delayHistory[tag].History
 }
 
+// LoadURLTestHistoryFor returns the tag's measurement for one specific target.
+//
+// Selection, interval skipping and health checks must use this: a fresh result against a
+// different target says nothing about the target being tested.
+func (s *HistoryStorage) LoadURLTestHistoryFor(tag string, scope MeasurementScope) *adapter.URLTestHistory {
+	if s == nil {
+		return nil
+	}
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return s.scopedHistory[scopedHistoryKey{Tag: tag, Scope: scope}]
+}
+
+// DeleteURLTestHistory removes every measurement for a tag, including the display entry.
+//
+// Used when the node itself is gone rather than when one target failed.
 func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 	s.access.Lock()
 	delete(s.delayHistory, tag)
+	for key := range s.scopedHistory {
+		if key.Tag == tag {
+			delete(s.scopedHistory, key)
+		}
+	}
 	s.notifyUpdated()
 	s.access.Unlock()
 }
 
-func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
+// DeleteURLTestHistoryFor removes one target's measurement for a tag.
+//
+// # Why it re-points the display entry instead of deleting it
+//
+// A failed test against one target is not a reason to show nothing. The node may have a perfectly
+// good result against another target, and that is still the most recent thing known about it. The
+// display entry therefore moves to the newest remaining measurement, and is only removed when no
+// measurement remains at all.
+func (s *HistoryStorage) DeleteURLTestHistoryFor(tag string, scope MeasurementScope) {
 	s.access.Lock()
-	s.delayHistory[tag] = history
+	delete(s.scopedHistory, scopedHistoryKey{Tag: tag, Scope: scope})
+
+	if latest, ok := s.delayHistory[tag]; ok && latest.Scope == scope {
+		if replacement, replacementScope, found := s.newestScopedLocked(tag); found {
+			s.delayHistory[tag] = latestHistoryRecord{History: replacement, Scope: replacementScope}
+		} else {
+			delete(s.delayHistory, tag)
+		}
+	}
+	s.notifyUpdated()
+	s.access.Unlock()
+}
+
+// newestScopedLocked returns the tag's most recent remaining measurement.
+// The caller must hold the write lock.
+func (s *HistoryStorage) newestScopedLocked(tag string) (*adapter.URLTestHistory, MeasurementScope, bool) {
+	var (
+		newest      *adapter.URLTestHistory
+		newestScope MeasurementScope
+		found       bool
+	)
+	for key, history := range s.scopedHistory {
+		if key.Tag != tag || history == nil {
+			continue
+		}
+		if !found || history.Time.After(newest.Time) {
+			newest = history
+			newestScope = key.Scope
+			found = true
+		}
+	}
+	return newest, newestScope, found
+}
+
+// StoreURLTestHistory records a measurement against the default target.
+//
+// Kept for callers that measure the default target only. A caller that knows its target should
+// use StoreURLTestHistoryFor so the result lands in the right scope.
+func (s *HistoryStorage) StoreURLTestHistory(tag string, history *adapter.URLTestHistory) {
+	scope, err := NewMeasurementScope(DefaultURLTestURL, nil)
+	if err != nil {
+		// The default target is a compile-time constant; if it ever fails to normalise the
+		// storage would silently drop results, so it is recorded rather than swallowed.
+		panic(err)
+	}
+	s.StoreURLTestHistoryFor(tag, scope, history)
+}
+
+// StoreURLTestHistoryFor records a measurement for one target.
+//
+// The display entry is updated at the same time, because the caller has just measured the node and
+// that is by definition the most recent thing known about it.
+func (s *HistoryStorage) StoreURLTestHistoryFor(tag string, scope MeasurementScope, history *adapter.URLTestHistory) {
+	s.access.Lock()
+	s.scopedHistory[scopedHistoryKey{Tag: tag, Scope: scope}] = history
+	s.delayHistory[tag] = latestHistoryRecord{History: history, Scope: scope}
 	s.notifyUpdated()
 	s.access.Unlock()
 }
@@ -75,147 +190,4 @@ func (s *HistoryStorage) Close() error {
 	defer s.access.Unlock()
 	s.updateHooks = nil
 	return nil
-}
-
-// URLTest measures the delay to a node using the unified-delay semantics.
-//
-// (The displayed delay follows Mihomo unified-delay=true semantics: the first HEAD warms the
-// proxy, TCP, TLS and HTTP path; the second HEAD on the reusable transport is the one timed.)
-//
-// This is a proxy round-trip measurement, not an ICMP ping and not a physical link RTT.
-//
-// # The algorithm, and why it is exactly this
-//
-//	start := now
-//	dial once
-//	one http.Transport + one http.Client
-//	HEAD #1                     <- warm-up, NOT timed
-//	secondStart := now
-//	HEAD #2                     <- timed, reusing the same connection
-//	delay = now - secondStart   (on success)
-//
-// The first request is what pays for everything with a fixed cost: the proxy handshake, the
-// target TCP connect, the TLS handshake, and whatever protocol warm-up a transport needs. Those
-// costs are real but they are not what the user is being shown - the user is being shown how
-// long the node takes once it is already up, which is what makes the number comparable between
-// nodes with very different handshake prices.
-//
-// # Why the previous implementation is gone
-//
-// It timed from just after DialContext, with one protocol-specific exception:
-//
-//	if N.NeedHandshakeForWrite(instance) { start = time.Now() }
-//
-// That reset the clock for early/lazy-handshake protocols but not for ordinary ones, so two
-// nodes could report the same number while one included its dial and handshake and the other
-// did not. The unified-delay scheme removes the need for any such special case: the warm-up
-// request absorbs the difference, and the timed request measures only the steady state.
-//
-// The previous multiplex pre-warm is also gone. It ran an ADDITIONAL full urlTest before this
-// one when multiplexing was enabled, because a cold multiplex session would otherwise be paid
-// on the first request. The first HEAD now provides that warm-up for every protocol, so keeping
-// both would have meant three or more round trips and a number that matches no other client.
-func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
-	return urlTest(ctx, link, detour)
-}
-
-func urlTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
-	if link == "" {
-		// The default target is unchanged: this work changes the TIMING, not the destination,
-		// so a before/after difference is attributable to the algorithm.
-		link = "https://www.gstatic.com/generate_204"
-	}
-	linkURL, err := url.Parse(link)
-	if err != nil {
-		return
-	}
-	hostname := linkURL.Hostname()
-	port := linkURL.Port()
-	if port == "" {
-		switch linkURL.Scheme {
-		case "http":
-			port = "80"
-		case "https":
-			port = "443"
-		}
-	}
-
-	// start marks the beginning of the whole attempt. It is used only by the fallback path when
-	// the second request fails; the normal result is measured from secondStart instead.
-	start := time.Now()
-
-	// One dial for the whole measurement. Both requests share it through the transport below.
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
-	if err != nil {
-		return
-	}
-	defer instance.Close()
-
-	// ONE transport for both requests. Creating a second transport, or closing this one between
-	// requests, would force the second request to dial and hand shake again - which is precisely
-	// the cost the warm-up exists to exclude, and would make the measurement meaningless.
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return instance, nil
-		},
-		TLSClientConfig: &tls.Config{
-			Time:    ntp.TimeFuncFromContext(ctx),
-			RootCAs: adapter.RootPoolFromContext(ctx),
-		},
-	}
-	client := http.Client{
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: C.TCPTimeout,
-	}
-	defer client.CloseIdleConnections()
-
-	// --- request 1: the warm-up, not timed ---
-	firstRequest, err := http.NewRequest(http.MethodHead, link, nil)
-	if err != nil {
-		return
-	}
-	firstStart := time.Now()
-	firstResponse, err := client.Do(firstRequest.WithContext(ctx))
-	firstElapsed := time.Since(firstStart)
-	if err != nil {
-		// A node that cannot complete the warm-up is not usable. There is nothing to measure,
-		// and continuing to a second request would only produce a number for a broken path.
-		return
-	}
-	firstResponse.Body.Close()
-
-	// --- request 2: the measured one ---
-	secondStart := time.Now()
-	secondRequest, err := http.NewRequest(http.MethodHead, link, nil)
-	if err != nil {
-		return
-	}
-	secondResponse, secondErr := client.Do(secondRequest.WithContext(ctx))
-	if secondErr == nil {
-		secondResponse.Body.Close()
-		warmElapsed := time.Since(secondStart)
-		// Debug only: this runs once per measurement, not per packet, but the durations are
-		// still computed lazily so an unlogged call pays nothing for them.
-		if commonLogDebug {
-			debugURLTest(firstElapsed, warmElapsed, true)
-		}
-		return uint16(warmElapsed / time.Millisecond), nil
-	}
-
-	// The second request failed. Mihomo does not move `start` to secondStart in this case, so
-	// the result falls back to the FIRST request's path rather than being reported as a failure:
-	// the node demonstrably answered once, and a warm-up request that cannot be repeated is not
-	// evidence that the node is down.
-	//
-	// `start` here is the beginning of the whole attempt, which is what the pre-unified-delay
-	// path measured - the same fallback semantics Mihomo has, reproduced deliberately rather
-	// than "improved", so the two clients agree.
-	fallbackElapsed := time.Since(start)
-	if commonLogDebug {
-		debugURLTest(firstElapsed, fallbackElapsed, false)
-	}
-	return uint16(fallbackElapsed / time.Millisecond), nil
 }

@@ -1,44 +1,29 @@
 package urltest
 
 import (
-	"time"
+	"sync/atomic"
 
 	"github.com/sagernet/sing/common/logger"
 )
 
-// urlTestDebugLogger is set once by the box, when debug logging is enabled.
+// debugConfig is the URLTest diagnostic configuration.
 //
-// A package-level variable is acceptable here because there is exactly one logger per process
-// and it is write-once during startup; the alternative - threading a logger through every
-// caller - would change signatures for a diagnostic that is not part of the measurement.
-var (
-	urlTestDebugLogger logger.Logger
-	commonLogDebug     bool
-)
-
-// SetDebugLogger enables the per-measurement diagnostic line.
-//
-// It is deliberately NOT wired into the hot path of connection handling: it affects only
-// URLTest, which runs once per measurement.
-func SetDebugLogger(logger logger.Logger, enabled bool) {
-	urlTestDebugLogger = logger
-	commonLogDebug = enabled
+// It is stored behind a single atomic pointer rather than as separate flag and logger variables
+// because the two are read together: a measurement that observed the new enabled flag alongside
+// the old logger would log through a logger the operator had just replaced. One pointer means one
+// generation, so a reader can never see half of an update.
+type debugConfig struct {
+	logger  logger.Logger
+	enabled bool
 }
 
-// debugURLTest records the two phases of a measurement.
+// currentDebugConfig holds the active configuration. It is written once during box setup and read
+// once per measurement, never on a packet path.
+var currentDebugConfig atomic.Pointer[debugConfig]
+
+// SetDebugLogger installs the diagnostic logger.
 //
-// It does not claim the connection was reused: that cannot be observed from here without
-// instrumenting the transport, and reporting an unverified `reused=true` would be worse than
-// reporting nothing.
-func debugURLTest(first time.Duration, warm time.Duration, warmSucceeded bool) {
-	if urlTestDebugLogger == nil {
-		return
-	}
-	if warmSucceeded {
-		urlTestDebugLogger.Debug("urltest first_request=", first,
-			" warm_request=", warm, " warm_reused=assumed")
-		return
-	}
-	urlTestDebugLogger.Debug("urltest first_request=", first,
-		" warm_request=failed", " fallback=first_path")
+// Passing a nil logger, or enabled false, disables the diagnostic line.
+func SetDebugLogger(log logger.Logger, enabled bool) {
+	currentDebugConfig.Store(&debugConfig{logger: log, enabled: enabled})
 }
