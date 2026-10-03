@@ -83,14 +83,36 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		defer cancel()
 
 		// A URLTest group is measured through its own entry point, because it OWNS a configured
-		// target and a measurement scope that this endpoint cannot reconstruct. What it does not own
-		// is a caller-supplied override: passing `url` or `expected` to this endpoint cannot be
-		// honoured for such a group without measuring something other than what its health check
-		// means, and silently measuring its configured target instead would report a result the
-		// client did not ask for.
+		// target and a measurement scope that this endpoint cannot reconstruct.
 		//
-		// Refusing the override explicitly is the honest answer. The response says so, rather than
-		// returning 200 with a measurement of a target the client never named.
+		// # Why an override is refused rather than honoured
+		//
+		// The parameters are not silently ignored: supplying `url` or `expected` here is refused with
+		// a 400, because this group cannot honour them without measuring something its health check
+		// does not mean, and returning 200 for a measurement of a target the client never named would
+		// be worse than refusing.
+		//
+		// # The contract this follows, checked rather than assumed
+		//
+		// Mihomo's /group/{name}/delay DOES pass both parameters into the group:
+		//
+		//	dm, err := group.URLTest(ctx, url, expectedStatus)
+		//
+		// so the parameters are not meaningless in that API. But its URLTest group does not use the
+		// URL it is handed:
+		//
+		//	func (u *URLTest) URLTest(ctx, url string, expectedStatus ...) {
+		//	    return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
+		//	}
+		//
+		// It substitutes its own configured target and ignores the argument, so a Mihomo client that
+		// passes `url` receives a result measured against a different target, with no indication of
+		// it. That is the silent ignore this endpoint exists to avoid.
+		//
+		// The decision here is therefore: keep measuring the group's own configured target (the
+		// semantics that are actually implemented, and the only ones this group can honour), and say
+		// so when a caller asks for something else, instead of reporting a result for a target that
+		// was never measured.
 		if _, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
 			if r.URL.Query().Get("url") != "" || r.URL.Query().Get("expected") != "" {
 				render.Status(r, http.StatusBadRequest)

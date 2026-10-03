@@ -395,3 +395,82 @@ func TestGenericGroupDelayIsCancelledWithTheRequest(t *testing.T) {
 			"measurement is running on a context that does not observe the client")
 	}
 }
+
+// urlTestGroupStub is a group that reports itself as a URLTest group.
+//
+// It exists so the handler's branch for a group that owns its own measurement scope can be exercised
+// without building a real URLTest group.
+type urlTestGroupStub struct {
+	plainGroup
+	calls atomic.Int32
+}
+
+func (g *urlTestGroupStub) URLTest(ctx context.Context) (map[string]uint16, error) {
+	g.calls.Add(1)
+	return map[string]uint16{"a": 42}, nil
+}
+
+func (g *urlTestGroupStub) PerformUpdateCheck() {}
+
+// TestURLTestGroupDelayRefusesAnOverride is §13/§14.
+//
+// A URLTest group owns a configured target and a measurement scope this endpoint cannot reconstruct.
+// Supplying `url` or `expected` cannot be honoured for it, so the request is refused rather than
+// answered with a measurement of a target the client did not name.
+//
+// # The contract this follows, checked rather than assumed
+//
+// Mihomo's /group/{name}/delay passes both parameters into the group, but its URLTest group ignores
+// the URL it is handed and substitutes its own configured target:
+//
+//	func (u *URLTest) URLTest(ctx, url string, expectedStatus ...) {
+//	    return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
+//	}
+//
+// So the parameters reach the group and are then discarded. Reproducing that would mean answering
+// 200 for a measurement of a different target than the caller asked for, which is the silent ignore
+// this endpoint must not do.
+func TestURLTestGroupDelayRefusesAnOverride(t *testing.T) {
+	member := &fakeGroupMember{tag: "a"}
+	group := &urlTestGroupStub{plainGroup: plainGroup{tag: "urltest", members: []adapter.Outbound{member}, selected: member}}
+
+	server := &Server{
+		ctx:            context.Background(),
+		outbound:       &groupOutboundManager{byTag: map[string]adapter.Outbound{"a": member}, all: []adapter.Outbound{member}},
+		urlTestHistory: urltest.NewHistoryStorage(),
+		logger:         log.NewNOPFactory().NewLogger("clashapi-test"),
+	}
+
+	for _, override := range []string{"url=http://example.com/generate_204", "expected=204", "url=http://example.com/x&expected=200-299"} {
+		t.Run(override, func(t *testing.T) {
+			before := group.calls.Load()
+			recorder := callGroupDelayHandler(t, server, group, "timeout=5000&"+override)
+
+			require.Equal(t, http.StatusBadRequest, recorder.Code,
+				"an override this group cannot honour must be refused, not silently replaced by a "+
+					"measurement of its own configured target")
+			require.Equal(t, before, group.calls.Load(),
+				"and the group must not have been measured for the refused request")
+		})
+	}
+}
+
+// TestURLTestGroupDelayWithoutOverrideMeasures is the corresponding positive case.
+func TestURLTestGroupDelayWithoutOverrideMeasures(t *testing.T) {
+	member := &fakeGroupMember{tag: "a"}
+	group := &urlTestGroupStub{plainGroup: plainGroup{tag: "urltest", members: []adapter.Outbound{member}, selected: member}}
+
+	server := &Server{
+		ctx:            context.Background(),
+		outbound:       &groupOutboundManager{byTag: map[string]adapter.Outbound{"a": member}, all: []adapter.Outbound{member}},
+		urlTestHistory: urltest.NewHistoryStorage(),
+		logger:         log.NewNOPFactory().NewLogger("clashapi-test"),
+	}
+
+	recorder := callGroupDelayHandler(t, server, group, "timeout=5000")
+	require.Equal(t, http.StatusOK, recorder.Code,
+		"a URLTest group measured against its own configured target is the supported request")
+	require.Equal(t, int32(1), group.calls.Load())
+	require.Contains(t, recorder.Body.String(), "42",
+		"and the group's own result is what is returned")
+}
