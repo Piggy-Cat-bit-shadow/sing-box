@@ -3,9 +3,14 @@ package openconnect
 import (
 	"net/netip"
 	"time"
+
+	"github.com/sagernet/sing-openconnect"
 )
 
-const DefaultMTU = 1500
+const (
+	DefaultMTU     = 1500
+	PacketHeadroom = openconnect.PacketHeadroom
+)
 
 type Configuration struct {
 	MTU                      uint32

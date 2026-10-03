@@ -172,6 +172,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		UDPNATMax:       options.UDPNATMax,
 		InterfaceFinder: networkManager.InterfaceFinder(),
 		Name:            options.Name,
+		NamePrefix:      "oc",
 		MTU:             openconnecttransport.DefaultMTU,
 		Configuration: device.Configuration{
 			MTU: openconnecttransport.DefaultMTU,
@@ -425,13 +426,13 @@ func (e *Endpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return nil
 		})
 		e.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(e.loopContext)
-		device, err := device.New(*e.deviceOptions)
+		tunnelDevice, err := device.New(*e.deviceOptions)
 		if err != nil {
 			return err
 		}
-		scope.Add(device.Close)
-		device.SetPacketWriter(e.writePacketBuffers)
-		e.device = device
+		scope.Add(tunnelDevice.Close)
+		tunnelDevice.SetPacketWriter(e.writePacketBuffers)
+		e.device = tunnelDevice
 		e.deviceOptions = nil
 	case adapter.StartStatePostStart:
 		var loopGroup sync.WaitGroup

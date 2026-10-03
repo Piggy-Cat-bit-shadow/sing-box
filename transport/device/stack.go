@@ -29,7 +29,8 @@ type stackDevice struct {
 
 func newStackDevice(options Options) (*stackDevice, error) {
 	device := &stackDevice{
-		options: options,
+		baseDevice: baseDevice{packetHeadroom: options.PacketHeadroom},
+		options:    options,
 	}
 	device.inet4Address, device.inet6Address = firstAddresses(options.Configuration.Address)
 	device.memoryTun = tun.NewMemoryTun(tun.MemoryTunOptions{

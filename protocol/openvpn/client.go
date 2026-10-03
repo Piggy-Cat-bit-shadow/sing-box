@@ -608,13 +608,13 @@ func (c *ClientEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 			return nil
 		})
 		c.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(c.ctx)
-		device, err := device.New(*c.deviceOptions)
+		tunnelDevice, err := device.New(*c.deviceOptions)
 		if err != nil {
 			return err
 		}
-		scope.Add(device.Close)
-		device.SetPacketWriter(c.writePacketBuffers)
-		c.device = device
+		scope.Add(tunnelDevice.Close)
+		tunnelDevice.SetPacketWriter(c.writePacketBuffers)
+		c.device = tunnelDevice
 		c.deviceOptions = nil
 	case adapter.StartStatePostStart:
 		var loopGroup sync.WaitGroup

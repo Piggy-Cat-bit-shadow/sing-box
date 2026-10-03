@@ -330,10 +330,19 @@ func TestHTTPForwardAuthRetry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusProxyAuthRequired, response.StatusCode)
 	require.Contains(t, response.Header.Get("Proxy-Authenticate"), "Basic")
-	require.False(t, response.Close)
+	// This fork CLOSES an HTTP/1.1 connection after rejecting a CONNECT, where upstream kept it
+	// alive. RFC 9931 §4.3 describes the request-smuggling shape that reuse creates on a shared
+	// byte stream: bytes the client already sent are read as a second request the rejected one
+	// never authorised. The close is deliberate and is asserted by
+	// test/jiejie/jiejie_masque_rfc9931_connect_close_test.go.
+	require.True(t, response.Close)
 	_, err = io.ReadAll(response.Body)
 	require.NoError(t, err)
 	response.Body.Close()
+	// The retry therefore runs on a fresh connection, which is what a compliant client does.
+	conn, err = net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(int(serverPort)))
+	require.NoError(t, err)
+	reader = std_bufio.NewReader(conn)
 	request, err := http.NewRequest(http.MethodGet, origin.url("/hello"), nil)
 	require.NoError(t, err)
 	request.Header.Set("User-Agent", "")

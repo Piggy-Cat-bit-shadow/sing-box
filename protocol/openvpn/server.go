@@ -115,6 +115,7 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		UDPNATMax:       options.UDPNATMax,
 		InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
 		Name:            options.Name,
+		NamePrefix:      "ovpn",
 		MTU:             options.MTU,
 		Configuration: device.Configuration{
 			MTU:     options.MTU,
@@ -162,13 +163,13 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 			return nil
 		})
 		s.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(s.ctx)
-		device, err := device.New(*s.deviceOptions)
+		tunnelDevice, err := device.New(*s.deviceOptions)
 		if err != nil {
 			return err
 		}
-		scope.Add(device.Close)
-		device.SetPacketWriter(s.writePacketBuffersByDestination)
-		s.device = device
+		scope.Add(tunnelDevice.Close)
+		tunnelDevice.SetPacketWriter(s.writePacketBuffersByDestination)
+		s.device = tunnelDevice
 		s.deviceOptions = nil
 		return nil
 	}
