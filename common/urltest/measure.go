@@ -233,13 +233,22 @@ func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Di
 	//
 	// The destination was validated by ParseMeasurementTarget, so an unusable port fails there
 	// rather than being handed to a detour to discover.
-	dialStart := time.Now()
+	// The dial duration is only meaningful for the debug record, so the clock is only read when that
+	// record will be produced - the same treatment the warm-up and timed requests already get. On the
+	// disabled path this is a clock read per measurement that nothing consumes.
+	var dialElapsed time.Duration
+	var dialStart time.Time
+	if debugEnabled {
+		dialStart = time.Now()
+	}
 	instance, err := detour.DialContext(ctx, "tcp", target.Destination)
 	if err != nil {
 		return Measurement{}, err
 	}
 	defer instance.Close()
-	dialElapsed := time.Since(dialStart)
+	if debugEnabled {
+		dialElapsed = time.Since(dialStart)
+	}
 
 	transport := newMeasurementTransport(instance, ctx)
 

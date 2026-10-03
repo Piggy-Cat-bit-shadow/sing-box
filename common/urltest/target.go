@@ -250,9 +250,19 @@ const maxExpectedStatusRanges = 28
 //	200/204/301-399
 //	200,204,301-399
 //
-// A reversed range is normalised rather than rejected ("299-200" means "200-299"), matching
-// Mihomo, because the intent is unambiguous. Anything else - a non-numeric token, an empty
-// element, a zero status, a value beyond uint16 - is an error.
+// Three lenient cases are deliberate, because Mihomo's own parser accepts them and refusing one
+// would reject a configuration that works there:
+//
+//	empty tokens are skipped     "204,", "204//200" and "[200-299]" are valid
+//	brackets are trimmed
+//	a reversed range is swapped  "299-200" means "200-299"
+//
+// A zero status is also accepted, since Mihomo's ParseUint takes it; it matches nothing a real
+// server sends, which makes it harmless rather than useful.
+//
+// Rejected: a non-numeric token, a malformed range, and a bound beyond uint16. The last is a
+// deliberate divergence - Mihomo parses through uint64 and truncates, so "65536" silently becomes 0
+// there, which would give two different expressions the same identity.
 func ParseExpectedStatus(value string) (ExpectedStatus, error) {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" || trimmed == "*" {

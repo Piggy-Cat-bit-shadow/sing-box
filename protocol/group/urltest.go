@@ -995,9 +995,22 @@ func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.Out
 	b.Wait()
 
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistoryFor(RealTag(outboundGroup, N.NetworkTCP), scope)
-		if groupHistory != nil {
-			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
+		// A nested group reports the delay of whichever leaf it currently selects.
+		//
+		// # Where that figure comes from depends on what this round WROTE
+		//
+		// A health round stores under the group's scope, so the health layer holds this round's
+		// result for the selected leaf. A DISPLAY-ONLY round stores in the display layer instead and
+		// never touches health, so reading health here returned either nothing or - worse - a value
+		// left by an earlier automatic check. The client was then shown a number that did not come
+		// from the measurement it asked for.
+		//
+		// The leaf this round measured is therefore resolved the same way in both cases, and the
+		// result is taken from THIS round's own per-tag results. That is the measurement that just
+		// ran, for both modes, and it cannot be a stale value from another layer.
+		realLeaf := RealTag(outboundGroup, N.NetworkTCP)
+		if delay, measured := testBatch.result[realLeaf]; measured {
+			testBatch.result[outboundGroup.Tag()] = delay
 		}
 	}
 	return testBatch.result
