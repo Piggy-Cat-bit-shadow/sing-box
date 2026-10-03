@@ -166,15 +166,56 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return s.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 }
 
-func RealTag(detour adapter.Outbound, network string) string {
+// ResolveURLTestLeaf resolves a detour to the real leaf outbound behind it.
+//
+// A plain outbound resolves to itself; a group resolves to its current selection, and that
+// selection may itself be a group. The result is the node that would actually carry the traffic,
+// which is what a measurement's result must be attributed to.
+//
+// # Why this must be resolved BEFORE measuring
+//
+// A group's selection can change while a measurement is in flight - a periodic check may finish,
+// or a failing connection may clear it. Resolving afterwards would attribute the delay to whatever
+// the group had moved TO, which may never have been measured at all. The caller resolves once, up
+// front, and the attribution is then a fact about the connection that was actually tested.
+//
+// # Cycles
+//
+// A configuration can describe a cycle, and the traversal must not recurse into it. Each visited
+// outbound is recorded by identity, so a cycle is detected on the second visit rather than followed
+// forever. The previous implementation was a bare loop with no record, so a cycle hung.
+func ResolveURLTestLeaf(detour adapter.Outbound, network string) (adapter.Outbound, error) {
+	if detour == nil {
+		return nil, E.New("nil detour")
+	}
+	visited := make(map[adapter.Outbound]struct{}, 4)
 	for {
 		group, isGroup := detour.(adapter.OutboundGroup)
 		if !isGroup {
-			return detour.Tag()
+			return detour, nil
 		}
-		detour = group.Selected(network)
-		if detour == nil {
-			return ""
+		if _, seen := visited[detour]; seen {
+			return nil, E.New("outbound group cycle detected at ", detour.Tag())
 		}
+		visited[detour] = struct{}{}
+
+		next := group.Selected(network)
+		if next == nil {
+			return nil, E.New("outbound group ", group.Tag(), " has no selected member for ", network)
+		}
+		detour = next
 	}
+}
+
+// RealTag resolves a detour to the tag of its real leaf outbound, or empty if it cannot be
+// resolved.
+//
+// It is a convenience wrapper over ResolveURLTestLeaf: a caller that needs the outbound itself, or
+// that needs to distinguish "no selection" from "cycle", should use that directly.
+func RealTag(detour adapter.Outbound, network string) string {
+	leaf, err := ResolveURLTestLeaf(detour, network)
+	if err != nil || leaf == nil {
+		return ""
+	}
+	return leaf.Tag()
 }

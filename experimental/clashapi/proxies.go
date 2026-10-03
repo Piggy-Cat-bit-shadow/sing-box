@@ -200,8 +200,13 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		//
 		// An empty URL still means "use the default"; an explicit scheme is honoured.
 		url := query.Get("url")
+		// The timeout must be a POSITIVE number of milliseconds.
+		//
+		// ParseInt accepted a negative value, and a negative duration makes the context already
+		// expired - so "timeout=-1" produced an instant, meaningless "measurement" that looked
+		// like a failed probe rather than a bad request.
 		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 16)
-		if err != nil {
+		if err != nil || timeout <= 0 {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, ErrBadRequest)
 			return
@@ -219,8 +224,38 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		}
 
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
+
+		// Resolve the leaf ONCE, before measuring.
+		//
+		// A group's selection can move while the measurement is in flight, so resolving afterwards
+		// - which is what RealTag did at the end - could attribute the delay to a node that was
+		// never measured. The attribution must be a fact about the connection that was tested, so
+		// the leaf is fixed up front and the measurement runs against it.
+		proxy, leafErr := group.ResolveURLTestLeaf(proxy, N.NetworkTCP)
+		if leafErr != nil {
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
+
+		// The measurement context is derived from the SERVER's context, not from Background.
+		//
+		// Measure reads the Box's own services out of the context - the certificate roots it must
+		// trust and the NTP clock it timestamps with. Starting from Background discarded both, so
+		// an HTTPS probe through a private root or against a skewed clock failed here while the
+		// identical native or group measurement succeeded: same engine, same node, different
+		// answer purely because of which context reached it.
+		//
+		// The request's own context is wired in as well, so a client that disconnects cancels the
+		// measurement instead of leaving it to run on.
+		ctx, cancel := context.WithCancel(server.ctx)
+		stopRequestWatch := context.AfterFunc(r.Context(), cancel)
+		defer stopRequestWatch()
 		defer cancel()
+
+		// The caller's requested timeout applies on top, inside the Box's lifetime.
+		ctx, cancelTimeout := context.WithTimeout(ctx, time.Millisecond*time.Duration(timeout))
+		defer cancelTimeout()
 
 		measurement, measureErr := urltest.Measure(ctx, urltest.MeasureOptions{
 			Link:           url,
@@ -236,7 +271,8 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		// was never about its target. A group maintains its own selection from its own periodic
 		// checks, and when this probe happens to use the same target, the scoped result is simply
 		// available to the group's next check.
-		realTag := group.RealTag(proxy, N.NetworkTCP)
+		// The leaf was resolved before the measurement, so its tag is the node that was measured.
+		realTag := proxy.Tag()
 		if measureErr == nil {
 			// DISPLAY ONLY.
 			//
