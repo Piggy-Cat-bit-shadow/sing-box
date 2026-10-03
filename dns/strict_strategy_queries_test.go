@@ -35,11 +35,6 @@ type queryRecordingTransport struct {
 	qTypes   []uint16
 	addressA string
 	address6 string
-
-	// rulePrefix, when set, makes the transport behave as if a rule applied by checking the
-	// effective strategy it was handed via options - recorded separately so a test can assert the
-	// policy that actually reached the exchange.
-	lastStrategy C.DomainStrategy
 }
 
 func (t *queryRecordingTransport) Type() string                   { return "recorder" }
@@ -177,11 +172,20 @@ func TestPreferStrategyQueriesBothFamilies(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			var results []adapter.DNSFamilyResult
+			// The publisher is invoked from each family's goroutine, so the collected slice is
+			// guarded rather than appended to concurrently.
+			var (
+				resultsAccess sync.Mutex
+				results       []adapter.DNSFamilyResult
+			)
 			err := router.LookupFamilies(ctx, "prefer.test.", adapter.DNSQueryOptions{
 				Transport: transport,
 				Strategy:  strategy,
-			}, func(result adapter.DNSFamilyResult) { results = append(results, result) })
+			}, func(result adapter.DNSFamilyResult) {
+				resultsAccess.Lock()
+				results = append(results, result)
+				resultsAccess.Unlock()
+			})
 			require.NoError(t, err)
 
 			observed := transport.observed()
@@ -189,8 +193,12 @@ func TestPreferStrategyQueriesBothFamilies(t *testing.T) {
 			require.Contains(t, observed, mDNS.TypeAAAA)
 
 			// Both published results must report the same effective strategy.
-			require.NotEmpty(t, results)
-			for _, result := range results {
+			resultsAccess.Lock()
+			published := append([]adapter.DNSFamilyResult(nil), results...)
+			resultsAccess.Unlock()
+
+			require.NotEmpty(t, published)
+			for _, result := range published {
 				require.Equal(t, strategy, result.EffectiveStrategy,
 					"the effective strategy reported must be the one that applied")
 			}
