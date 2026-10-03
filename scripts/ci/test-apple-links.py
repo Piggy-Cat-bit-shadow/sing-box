@@ -89,14 +89,62 @@ def main() -> int:
         check(doc in src, f"upstream documentation link disappeared: {doc}")
 
     # --- the click mechanism ------------------------------------------------------
-    # Both product links must be real Link(destination:) views.
-    link_bodies = re.findall(r"Link\(destination: URL\(string: String\((?:localized: )?\"[^\"]+\"\)\)!\)", src)
-    check(len(link_bodies) >= 5,
-          f"expected the About section's links to be SwiftUI Link views, found {len(link_bodies)}")
+    #
+    # Each link is matched together with the row it activates and the URL it opens, in one
+    # expression. Counting Link views anywhere in the file - which an earlier version did - would
+    # pass on a file whose Documentation link is a Link and whose Source Code row is a plain Text,
+    # because the total would still clear the threshold. The URL being present somewhere and a Link
+    # being present somewhere is not the claim; the claim is that THIS row is a Link to THIS URL.
+    def link_expression(url: str, label: str) -> str:
+        """A Link to `url` whose view body carries `label`.
 
-    for blocker in TAP_BLOCKERS:
-        check(blocker not in src,
-              f"{blocker} appears in the About section and could swallow the tap")
+        The label may be a Label(_:systemImage:) row in a Form or a Text in a context menu, so both
+        are accepted - but only when they sit inside THIS Link's closure, immediately after the URL.
+        """
+        return (
+            r'Link\(destination: URL\(string: String\("' + re.escape(url) + r'"\)\)!\)\s*\{\s*'
+            r'(?:Label|Text)\("' + re.escape(label) + r'"'
+        )
+
+    for label, url in (("Source Code", FORK_SOURCE), ("Releases", FORK_RELEASES)):
+        match = re.search(link_expression(url, label), src)
+        check(match is not None,
+              f"the {label} row is not a Link(destination:) opening {url}. A Link elsewhere in the "
+              f"file, or the bare URL string, does not make this row clickable to that destination")
+
+    # Releases lives in the Source Code row's contextMenu. Asserted structurally, because the
+    # product expectation is a long-press / right-click item: if the URL appeared in the About
+    # section without that relationship, the row would look present but have no context menu.
+    source_row = re.search(
+        r'Link\(destination: URL\(string: String\("' + re.escape(FORK_SOURCE) + r'"\)\)!\)'
+        r'(.*?)(?:RequestReviewButton|^\s*#if)',
+        src,
+        re.S | re.M,
+    )
+    check(source_row is not None, "the Source Code row's body could not be read")
+    if source_row is not None:
+        body = source_row.group(1)
+        check("contextMenu" in body,
+              "the Source Code row has no contextMenu, so Releases is not reachable from it")
+        check(FORK_RELEASES in body,
+              "the Source Code contextMenu does not contain the fork releases URL")
+
+    # --- tap blockers -------------------------------------------------------------
+    #
+    # Scoped to the two rows under test, not the whole file. A blanket scan would fail on an
+    # unrelated control elsewhere in Settings, and SwiftUI's .overlay is not itself a tap blocker -
+    # so the check is about what is attached to THESE links.
+    for label, pattern in (("Source Code", link_expression(FORK_SOURCE, "Source Code")),
+                           ("Releases", link_expression(FORK_RELEASES, "Releases"))):
+        match = re.search(pattern, src)
+        if match is None:
+            continue
+        # The modifiers between the Link and the end of its label closure.
+        start = match.start()
+        window = src[start:start + 400]
+        for blocker in TAP_BLOCKERS:
+            check(blocker not in window,
+                  f"{blocker} appears in the {label} row and could swallow the tap")
 
     # The Rate row goes through FormButton, which is a plain Button(action:) - a real
     # action rather than a decorative row. Apple's review API may legitimately show no
