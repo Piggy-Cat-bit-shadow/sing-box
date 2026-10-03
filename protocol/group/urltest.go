@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -429,6 +430,12 @@ func NewURLTestGroupWithExpected(ctx context.Context, outboundManager adapter.Ou
 func (g *URLTestGroup) PostStart() {
 	g.access.Lock()
 	defer g.access.Unlock()
+	// A closed group is terminal. Setting started here would leave the group reporting itself
+	// started while it is closed, and would queue background work for a group whose services are
+	// gone - the exact contradiction `closed` exists to prevent.
+	if g.closed {
+		return
+	}
 	g.started = true
 	g.lastActive.Store(time.Now())
 	go g.CheckOutbounds(g.ctx, false)
@@ -593,7 +600,75 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 	return g.urlTest(ctx, true)
 }
 
-func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
+// operationContext anchors a health operation to the group's own Box context.
+//
+// # Why the caller's context cannot be the base
+//
+// The group owns g.ctx, which carries the Box's services - the URL-test Coordinator, the certificate
+// roots, the time service - and the group's lifetime. The public entries used to pass the CALLER's
+// context straight through to Measure, and the production callers are the Clash API (the HTTP
+// request's context) and the native command client (a gRPC context). Neither carries Box services,
+// so supplying one replaced the Box context entirely and three invariants broke together:
+//
+//   - the per-Box concurrency limit did not apply, because the Coordinator could not be reached
+//   - a private-root endpoint failed here while the identical native measurement succeeded, because
+//     the roots could not be reached
+//   - Close did not cancel the measurement, because Close cancels g.ctx and the measurement was not
+//     using it
+//
+// The caller's context therefore contributes only what a caller legitimately owns: a deadline and
+// cancellation. Everything else comes from the group.
+//
+// It returns an error when the group is terminal, so no network work starts for a group whose
+// services are gone.
+func (g *URLTestGroup) operationContext(caller context.Context) (context.Context, context.CancelFunc, error) {
+	if g.ctx.Err() != nil {
+		return nil, nil, os.ErrClosed
+	}
+
+	// Values and lifetime come from g.ctx.
+	operationCtx, cancelOperation := context.WithCancel(g.ctx)
+
+	if caller == nil {
+		return operationCtx, cancelOperation, nil
+	}
+
+	// The caller's deadline is layered ON TOP, so it still bounds the operation while the group's
+	// own cancellation stays in force.
+	if deadline, hasDeadline := caller.Deadline(); hasDeadline {
+		var cancelDeadline context.CancelFunc
+		operationCtx, cancelDeadline = context.WithDeadline(operationCtx, deadline)
+		cancelBase := cancelOperation
+		cancelOperation = func() {
+			cancelDeadline()
+			cancelBase()
+		}
+	}
+
+	// The caller's cancellation is wired in WITHOUT becoming the base. A caller that gives up stops
+	// the operation, and a caller that never cancels cannot keep it alive past Close - which is
+	// what the group's own context still governs.
+	stopCallerWatch := context.AfterFunc(caller, cancelOperation)
+	cancelBase := cancelOperation
+	cancelOperation = func() {
+		stopCallerWatch()
+		cancelBase()
+	}
+
+	return operationCtx, cancelOperation, nil
+}
+
+func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]uint16, error) {
+	// Anchor to the group's own Box context before anything else.
+	//
+	// A terminal group returns here, so a closed group cannot start a health round at all - its
+	// services are gone and any result would be written for a group that no longer exists.
+	ctx, cancelOperation, contextErr := g.operationContext(caller)
+	if contextErr != nil {
+		return make(map[string]uint16), nil
+	}
+	defer cancelOperation()
+
 	if g.checking.Swap(true) {
 		// A round is already running, so this one cannot proceed.
 		//
