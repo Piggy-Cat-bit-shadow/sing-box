@@ -282,3 +282,27 @@ func TestCoordinatorWaitDoesNotDeleteHealthWithoutDial(t *testing.T) {
 			"node was never tested, so nothing was learned about it - and a queue wait is not "+
 			"health evidence")
 }
+
+// TestBusyForcedRoundReportsFailureRatherThanAnEmptySuccess is grey zone A.
+//
+// The Clash API assigns the returned map and serialises it as the response body, so an empty map
+// with a nil error tells the client "the test succeeded and every node is unreachable". A busy
+// group cannot serve the request now, which is a failure to answer - not an answer of "nothing".
+func TestBusyForcedRoundReportsFailureRatherThanAnEmptySuccess(t *testing.T) {
+	node := &observingOutbound{tag: "node-a"}
+	group, _ := newGroupFixture(t, "https://probe.example/generate_204", node)
+	group.selected.Store(&selectedState{tcp: node, udp: node})
+
+	// A round is already running, so a forced round cannot proceed.
+	require.False(t, group.checking.Swap(true))
+
+	result, err := group.URLTest(context.Background())
+
+	require.Error(t, err,
+		"a forced round that could not run reported success with an empty result. The Clash API "+
+			"serialises that map as the response body, so the client is told the test succeeded and "+
+			"every node is unreachable, when in fact nothing was measured at all")
+
+	group.checking.Store(false)
+	_ = result
+}

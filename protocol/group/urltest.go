@@ -684,7 +684,19 @@ func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]u
 		// The request is therefore queued. The worker that owns this round will run it afterwards.
 		if force {
 			g.queueForcedRecheck()
+			// A caller that asked for a SYNCHRONOUS result must not be told it succeeded.
+			//
+			// The deferred round has not run yet, so no result exists. Returning an empty map with a
+			// nil error says "every node is unreachable", and the Clash API serialises exactly that
+			// as the response body with HTTP 200 - a client asking to test a group would be told the
+			// test completed and found nothing usable.
+			//
+			// The work is not lost: it is queued and will run. What cannot be reported is a result
+			// that does not exist yet, so the caller is told the round was deferred.
+			return nil, E.New("health check already in progress; the forced round was queued")
 		}
+		// A periodic round is genuinely redundant here: the running round measures the same members
+		// against the same target. Nothing is owed and nothing was requested synchronously.
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
