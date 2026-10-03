@@ -266,7 +266,10 @@ type URLTestGroup struct {
 	ticker                       *time.Ticker
 	close                        chan struct{}
 	started                      bool
-	lastActive                   common.TypedValue[time.Time]
+	// closed is the terminal state. It is set by Close under access and checked by Touch, so a
+	// Touch can never start background work on a closed group.
+	closed     bool
+	lastActive common.TypedValue[time.Time]
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
@@ -322,11 +325,16 @@ func (g *URLTestGroup) PostStart() {
 }
 
 func (g *URLTestGroup) Touch() {
-	if !g.started {
-		return
-	}
 	g.access.Lock()
 	defer g.access.Unlock()
+
+	// Both flags are read UNDER THE LOCK. The started check used to happen before it, which was a
+	// data race against PostStart and Close, and let a Touch interleave with a Close: it could
+	// observe started == true, then register a ticker and a pause callback on a group that was
+	// being torn down, leaving a background task running after close.
+	if !g.started || g.closed {
+		return
+	}
 	if g.ticker != nil {
 		g.lastActive.Store(time.Now())
 		return
@@ -340,13 +348,30 @@ func (g *URLTestGroup) Touch() {
 func (g *URLTestGroup) Close() error {
 	g.access.Lock()
 	defer g.access.Unlock()
-	if g.ticker == nil {
+
+	// Idempotent: a second Close must not stop a ticker twice, unregister a nil element, or close
+	// an already-closed channel.
+	if g.closed {
 		return nil
 	}
-	g.ticker.Stop()
-	g.ticker = nil
-	g.pause.UnregisterCallback(g.pauseCallback)
-	g.pauseCallback = nil
+
+	// Terminal BEFORE anything else. A group that only cleared its ticker would still report
+	// itself started, so a concurrent or later Touch could start fresh background work on it -
+	// which is exactly what "closed" has to prevent.
+	g.closed = true
+	g.started = false
+
+	// The ticker may never have been created: a group can be started and closed without being
+	// touched. The previous early return in that case skipped the terminal transition entirely,
+	// leaving the group startable.
+	if g.ticker != nil {
+		g.ticker.Stop()
+		g.ticker = nil
+	}
+	if g.pauseCallback != nil {
+		g.pause.UnregisterCallback(g.pauseCallback)
+		g.pauseCallback = nil
+	}
 	close(g.close)
 	return nil
 }
