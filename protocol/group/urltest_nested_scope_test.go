@@ -137,3 +137,56 @@ func (m *taggedOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
 	outbound, loaded := m.byTag[tag]
 	return outbound, loaded
 }
+
+// TestNestedGroupCycleTerminates is §5.5.
+//
+// A configuration can in principle describe a cycle. The nested traversal introduced for the
+// parent-scope fix recurses through group members, so a cycle must terminate rather than recursing
+// until the stack overflows.
+//
+// The traversal is guarded by the batch's `checked` set, which records each tag before descending.
+// This test asserts that a self-referential group - the smallest cycle - is visited once.
+func TestNestedGroupCycleTerminates(t *testing.T) {
+	selfReferential, _ := newGroupFixture(t, "https://self.example/probe")
+
+	manager := &taggedOutboundManager{}
+
+	// The group lists itself as a member. Traversal would recurse forever without the guard.
+	loop := &URLTest{
+		Adapter: outbound.NewAdapter(C.TypeURLTest, "loop",
+			[]string{N.NetworkTCP}, []string{"loop"}),
+		group: selfReferential,
+		link:  "https://self.example/probe",
+		tags:  []string{"loop"},
+	}
+	manager.byTag = map[string]adapter.Outbound{"loop": loop}
+
+	runner, _ := batch.New(context.Background(), batch.WithConcurrencyNum[any](10))
+	testBatch := &urlTestBatch{
+		ctx:      context.Background(),
+		outbound: manager,
+		history:  selfReferential.history,
+		logger:   selfReferential.logger,
+		scope:    selfReferential.scope,
+		batch:    runner,
+		checked:  make(map[string]bool),
+		result:   make(map[string]uint16),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		testBatch.test([]adapter.Outbound{loop}, loop.link, 0, true)
+	}()
+
+	select {
+	case <-done:
+		// Terminated. The guard did its job.
+	case <-time.After(5 * time.Second):
+		t.Fatal("nested traversal did not terminate for a self-referential group; a cycle must " +
+			"be detected rather than recursed into until the stack overflows")
+	}
+
+	require.True(t, testBatch.checked["loop"],
+		"the group must have been visited, so this test is not passing because nothing happened")
+}
