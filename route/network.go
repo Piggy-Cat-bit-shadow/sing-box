@@ -428,6 +428,21 @@ func (r *NetworkManager) RegisterAutoRedirectOutputMark(mark uint32) error {
 	return nil
 }
 
+// UnregisterAutoRedirectOutputMark releases a claim taken by RegisterAutoRedirectOutputMark.
+//
+// # Why a release path is required
+//
+// The claim is taken during a TUN inbound's CONSTRUCTOR, and that constructor can still fail
+// afterwards - the DNS-mode and mark-registration steps that follow it return errors. A failed
+// constructor is discarded without Close, so without this the claim would be permanent: the manager
+// would believe an auto-redirect was active forever, and a later VALID configuration would be
+// refused with "only one auto-redirect can be configured" although nothing was running.
+//
+// It is idempotent, because both a failed constructor and a later Close may release.
+func (r *NetworkManager) UnregisterAutoRedirectOutputMark() {
+	r.autoRedirectOutputMark = 0
+}
+
 func (r *NetworkManager) AutoRedirectOutputMark() uint32 {
 	return r.autoRedirectOutputMark
 }

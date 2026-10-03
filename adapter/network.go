@@ -26,6 +26,10 @@ type NetworkManager interface {
 	ProtectFunc() control.Func
 	DefaultOptions() NetworkOptions
 	RegisterAutoRedirectOutputMark(mark uint32) error
+	// UnregisterAutoRedirectOutputMark releases a claim taken by RegisterAutoRedirectOutputMark.
+	// The claim is taken during a constructor that can still fail, so a release path is required
+	// or the slot is lost permanently.
+	UnregisterAutoRedirectOutputMark()
 	AutoRedirectOutputMark() uint32
 	AutoRedirectOutputMarkFunc() control.Func
 	RegisterBridgeInterface(interfaceName string)
