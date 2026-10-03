@@ -116,6 +116,12 @@ func ParseMeasurementTarget(link string) (MeasurementTarget, error) {
 	// --- ScopeURL: canonical, for identity only ---
 	scopeURL := requestURL
 	scopeURL.Host = canonicalScopeHost(hostname, portNumber, port, scheme)
+	// An omitted path and an explicit "/" are the same request target: HTTP requires the request
+	// line to carry a path, so an empty one is sent as "/". Only the IDENTITY is normalised here;
+	// RequestURL keeps exactly what was configured, and the transport adds the "/" itself.
+	if scopeURL.Path == "" {
+		scopeURL.Path = "/"
+	}
 
 	// The destination is built by the metadata parser, so a numeric literal becomes an IP
 	// destination and a hostname becomes a domain.
@@ -144,9 +150,16 @@ func ParseMeasurementTarget(link string) (MeasurementTarget, error) {
 // address.
 func canonicalScopeHost(hostname string, portNumber uint64, explicitPort string, scheme string) string {
 	host := hostname
-	// A DNS name is case-insensitive. An IP literal is not a name, so its case is left alone -
-	// addresses are lowercased anyway, and rewriting them would be pointless churn.
-	if !isIPLiteral(hostname) {
+	if address, addressErr := netip.ParseAddr(hostname); addressErr == nil {
+		// An IP literal is canonicalised to its ADDRESS, not merely lowercased.
+		//
+		// One address has many legal spellings - `2001:0DB8:0:0::1` and `2001:db8::1` are the same
+		// address - so keying the identity on the spelling splits one endpoint into several
+		// scopes, and a group that measures more than one spelling sees half-histories. The
+		// destination was already canonical; only the identity disagreed with it.
+		host = address.String()
+	} else {
+		// A DNS name is case-insensitive.
 		host = strings.ToLower(hostname)
 	}
 	if strings.Contains(host, ":") {
