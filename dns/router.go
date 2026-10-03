@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -46,11 +47,14 @@ type Router struct {
 	rules                 []adapter.DNSRule
 	defaultDomainStrategy C.DomainStrategy
 	dnsReverseMapping     *freelru.Cache[netip.Addr, string]
-	platformInterface     adapter.PlatformInterface
-	legacyDNSMode         bool
-	rulesAccess           sync.RWMutex
-	started               bool
-	closing               bool
+	// networkGeneration advances on every ResetNetwork so a DNS response can be attributed to the
+	// network its request was issued on.
+	networkGeneration atomic.Uint64
+	platformInterface adapter.PlatformInterface
+	legacyDNSMode     bool
+	rulesAccess       sync.RWMutex
+	started           bool
+	closing           bool
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -1133,8 +1137,52 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	}, nil, nil
 }
 
+// dnsGeneration returns the current network generation.
+//
+// It advances on every ResetNetwork, so a response can be attributed to the network its request
+// was issued on rather than to whatever network happens to be current when it arrives.
+func (r *Router) dnsGeneration() uint64 {
+	return r.networkGeneration.Load()
+}
+
+// recordReverseMappingForGeneration records a mapping only if the response belongs to the current
+// network generation.
+//
+// It returns whether the mapping was recorded, which is what makes the guard testable rather than
+// merely asserted.
+func (r *Router) recordReverseMappingForGeneration(generation uint64, answer reverseMappingAnswer) bool {
+	if generation != r.networkGeneration.Load() {
+		return false
+	}
+	if r.dnsReverseMapping == nil {
+		return false
+	}
+	r.dnsReverseMapping.AddWithLifetime(answer.address, answer.domain, answer.lifetime)
+	return true
+}
+
+// reverseMappingAnswer is one address-to-name mapping learned from a DNS answer.
+type reverseMappingAnswer struct {
+	address  netip.Addr
+	domain   string
+	lifetime time.Duration
+}
+
 func (r *Router) recordReverseMapping(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
-	if r.dnsReverseMapping != nil && len(message.Question) > 0 && response != nil && len(response.Answer) > 0 {
+	r.recordReverseMappingFrom(message, response, transport, r.dnsGeneration())
+}
+
+// recordReverseMappingFrom records a mapping only if the response belongs to the given network
+// generation.
+//
+// The generation is captured when the REQUEST is issued and compared here, when the response
+// arrives. A request that spans a network change therefore cannot write into the cache the change
+// just cleared: its answer describes the network it was asked on, not the one that is current now.
+func (r *Router) recordReverseMappingFrom(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport, generation uint64) {
+	if r.dnsReverseMapping == nil || generation != r.networkGeneration.Load() {
+		return
+	}
+	if len(message.Question) > 0 && response != nil && len(response.Answer) > 0 {
 		if transport == nil || transport.Type() != C.DNSTypeFakeIP {
 			for _, answer := range response.Answer {
 				switch record := answer.(type) {
@@ -1419,6 +1467,11 @@ func (r *Router) ResetNetwork() {
 	if r.dnsReverseMapping != nil {
 		r.dnsReverseMapping.Purge()
 	}
+	// The purge removes what is already recorded; advancing the generation stops a response that
+	// was issued before the change from re-adding it. Without this, a request in flight across the
+	// change would refill the cache it was just cleared of, and the new network would inherit a
+	// name learned on the old one.
+	r.networkGeneration.Add(1)
 }
 
 func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
