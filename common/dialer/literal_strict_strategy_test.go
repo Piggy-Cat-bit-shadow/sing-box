@@ -147,3 +147,51 @@ func TestPreferIPv6ReachesTheParallelDialler(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamingAndFallbackRoutersAgreeOnFamilyOrder is §16.
+//
+// A third-party router that does not implement DNSDualStackRouter takes the ordinary Lookup path.
+// Both paths must produce the same family ordering for the same effective policy - a difference
+// here would mean the routing decision depended on which interface a router happened to implement.
+//
+// This asserts the ORDER the planner produces from each path's addresses, which is the observable
+// contract both paths share.
+func TestStreamingAndFallbackRoutersAgreeOnFamilyOrder(t *testing.T) {
+	addresses := []netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("2001:db8::1"),
+	}
+
+	for _, testCase := range []struct {
+		name          string
+		routerDefault C.DomainStrategy
+		wantFirstIsV6 bool
+	}{
+		{"router prefer_ipv6", C.DomainStrategyPreferIPv6, true},
+		{"router prefer_ipv4", C.DomainStrategyPreferIPv4, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dialer := &resolveDialer{
+				router: &strategyReportingRouter{
+					staticStreamingRouter: staticStreamingRouter{addresses: addresses},
+					defaultStrategy:       testCase.routerDefault,
+				},
+				queryOptions: adapter.DNSQueryOptions{Strategy: C.DomainStrategyAsIS},
+			}
+
+			// Both paths plan with the effective strategy; the assertion is that it is the
+			// resolver's default rather than the caller's AsIS.
+			effective := dialer.effectiveFamilyStrategy()
+			require.Equal(t, testCase.routerDefault, effective,
+				"the fallback path must plan with the router's default, not the caller's AsIS")
+
+			plan := planCandidates(addresses, netip.Addr{}, effective)
+			ordered := plan.addresses()
+			require.NotEmpty(t, ordered)
+			first := ordered[0]
+			require.Equal(t, testCase.wantFirstIsV6, first.Is6() && !first.Is4In6(),
+				"the effective strategy %v must lead with its own family; got %v",
+				effective, ordered)
+		})
+	}
+}

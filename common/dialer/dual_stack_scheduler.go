@@ -358,12 +358,64 @@ func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan ca
 			// A late candidate joins the queue. If nothing is currently pending it starts at
 			// once, so a family that answers after the race began is not made to wait for a
 			// fallback interval that was scheduled before it existed.
+			//
+			// "Nothing pending" is the whole condition, and it is why nextIndex is advanced to
+			// len(launch) here: the candidate that starts has consumed its slot, so the NEXT
+			// arrival sees something pending and waits for the timer instead of starting too.
+			//
+			// Starting every arrival immediately is what let a preferred family lose the race to
+			// the family it was preferred over. The feeder emits the preferred family first, but
+			// when both arrived within microseconds each was started on its own goroutine and the
+			// dial order became whichever goroutine reached the dialer first - so the preference
+			// held by the feeder was discarded here. The cadence is what makes the stream order
+			// authoritative.
 			launch = append(launch, candidate)
-			if nextIndex >= len(launch)-1 {
+
+			// Start at once when nothing is queued ahead of this candidate AND no cadence is
+			// currently armed.
+			//
+			// The second half is what keeps a burst ordered. Without it the test below is true
+			// for every arrival in a burst - after the first start nextIndex equals len(launch),
+			// and the queue then grows by one per arrival - so each arrival started immediately
+			// on its own goroutine and the dial order became a goroutine race. A pending timer IS
+			// the cadence, so while one is armed the arrival queues instead.
+			if nextIndex >= len(launch)-1 && timerChan == nil {
+				// Nothing was pending, so this candidate starts at once rather than waiting out
+				// a fallback interval that was scheduled before it existed.
 				startAttempt(candidate)
 				nextIndex = len(launch)
+
+				// The cadence STILL applies to whatever follows in this burst.
+				//
+				// Each late candidate was started the instant it arrived, so two candidates
+				// arriving back to back both started immediately - each on its own goroutine -
+				// and the dial ORDER became whichever goroutine reached the dialer first. That
+				// discarded the ordering the feeder had just established: it holds the
+				// non-preferred family and emits the preferred one first, precisely so the
+				// preferred family leads.
+				//
+				// Arming the timer here (rather than only when the queue is non-empty) makes the
+				// arrival order authoritative: the first candidate of a burst starts now, the next
+				// waits for the interval, exactly as if both had been known at the start.
+				//
+				// This does not defer a genuinely late arrival: by the time the timer fires the
+				// queue is drained, so the next arrival finds it fired and starts immediately.
+				resetTimer()
+				continue
 			}
-			armTimerIfPending()
+
+			// Something is already pending, so a timer is already counting down toward it.
+			//
+			// The timer is NOT re-armed here. Re-arming on every arrival restarts the countdown
+			// from that arrival, so a family stream that keeps producing addresses postpones the
+			// pending launch for as long as the stream continues - the schedule is measured from
+			// the last arrival instead of from the last launch. With every dial blocking, so that
+			// no failure can advance the schedule either, a steady trickle of late candidates
+			// starved the pending launch entirely.
+			//
+			// Leaving the timer alone keeps the cadence anchored to the last launch, which is what
+			// the delay is defined to be. A newly arrived candidate joins the queue behind the
+			// pending one and is reached on schedule.
 			continue
 
 		case result := <-results:
