@@ -357,12 +357,18 @@ func TestTCPFailureClearsOnlyTheTCPSelection(t *testing.T) {
 	require.Same(t, nodeBOut, state.udp,
 		"a TCP failure must not clear the UDP selection")
 
-	// And the full invalidation, which also discards the measurement for this target.
-	group.invalidateSelected(N.NetworkTCP, nodeAOut)
+	// The full traffic-failure path clears the selection but PRESERVES the measurement.
+	//
+	// A failed business connection is not evidence about the node: the target may have refused
+	// it, its port may be closed, or the remote may have reset. Deleting a correct measurement on
+	// that basis would let a website being down move the group to a worse node.
+	group.clearSelectionFor(N.NetworkTCP, nodeAOut)
 
-	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scope),
-		"a TCP failure is evidence about the TCP path the measurement describes, so the "+
-			"measurement for this target is discarded")
+	require.Nil(t, group.selected.Load().tcp,
+		"the failing TCP selection is still cleared, so the next connection can use another node")
+	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", scope),
+		"a traffic failure must not discard the measurement for this target; only a failed "+
+			"health check is evidence about health")
 
 	_ = nodeA
 	_ = nodeB
@@ -390,7 +396,7 @@ func TestUDPFailureClearsOnlyTheUDPSelection(t *testing.T) {
 	require.Same(t, nodeBOut, state.tcp,
 		"a UDP failure must not clear the TCP selection")
 
-	group.invalidateSelected(N.NetworkUDP, nodeAOut)
+	group.clearSelectionFor(N.NetworkUDP, nodeAOut)
 
 	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", scope),
 		"the measurement describes the TCP path, and a UDP failure says nothing about it, so "+
@@ -411,7 +417,7 @@ func TestFailureOfANonSelectedNodeLeavesSelectionAlone(t *testing.T) {
 	group.selected.Store(&selectedState{tcp: nodeBOut, udp: nodeBOut})
 
 	// node-a failed, but node-b is selected now.
-	group.invalidateSelected(N.NetworkUDP, nodeAOut)
+	group.clearSelectionFor(N.NetworkUDP, nodeAOut)
 
 	state := group.selected.Load()
 	require.Same(t, nodeBOut, state.tcp, "an unrelated failure must not disturb the TCP selection")
@@ -461,8 +467,12 @@ func TestDialFailureClearsTheTCPSelection(t *testing.T) {
 }
 
 func TestDialFailureIsScopedToThisTarget(t *testing.T) {
-	// A failure against this group's target says nothing about a measurement made against another
-	// target, so only this scope may be discarded.
+	// A traffic failure preserves every measurement, including this group's own.
+	//
+	// The scoping property is still asserted - a failure must never disturb another target's
+	// measurement - but the stronger statement now holds too: it does not disturb its own, because
+	// a failed business connection is not evidence that the node is unhealthy. Reconciling the two
+	// is what the health recheck is for.
 	nodeAOut := &stubOutbound{tag: "node-a", dialErr: errStubDial}
 	nodeBOut := &stubOutbound{tag: "node-b"}
 
@@ -482,8 +492,9 @@ func TestDialFailureIsScopedToThisTarget(t *testing.T) {
 	_, dialErr := dialThrough(group, N.NetworkTCP, M.ParseSocksaddr("1.2.3.4:443"))
 	require.Error(t, dialErr)
 
-	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", ownScope),
-		"this group's target was measured over the path that just failed, so its result is discarded")
+	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", ownScope),
+		"a failed business connection must not discard this group's own measurement; only a "+
+			"failed health check is evidence about health")
 	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", otherScope),
 		"a failure against this group's target must not discard another target's measurement")
 }

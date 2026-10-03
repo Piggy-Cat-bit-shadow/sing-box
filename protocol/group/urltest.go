@@ -202,7 +202,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	// A real connection failed, so the node is not usable now regardless of what an earlier
 	// measurement said. Only this target's result is invalidated, and only if this outbound is
 	// still the selected one - a concurrent update may already have moved on.
-	s.group.invalidateSelected(network, outbound)
+	s.group.clearSelectionFor(network, outbound)
 	return nil, err
 }
 
@@ -223,7 +223,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.invalidateSelected(N.NetworkUDP, outbound)
+	s.group.clearSelectionFor(N.NetworkUDP, outbound)
 	return nil, err
 }
 
@@ -558,39 +558,46 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 	}
 }
 
-// invalidateSelected drops a node that just failed a real connection.
+// clearSelectionFor drops the failed outbound from the live selection WITHOUT touching its health
+// evidence, and requests a bounded health recheck.
 //
-// # Why a measurement is not enough on its own
+// # Why a traffic failure is not evidence about the node
 //
-// History records how a node behaved when tested. A node can pass every test and still fail to
-// carry traffic - the endpoint moved, the credentials were revoked, a middlebox started dropping
-// the flow - and a selection that keeps pointing at it makes every subsequent connection fail
-// until the next interval.
+// This used to delete the node's measurement, on the reasoning that a real connection failing says
+// something about the node regardless of what a test showed. It does not. DialContext reports
+// whatever went wrong on the path, and the overwhelming majority of causes have nothing to do with
+// the proxy: the target refused the connection, the target's port is closed, the remote reset, the
+// destination does not exist. A node that carried the connection perfectly produces every one of
+// them.
+//
+// Deleting a correct measurement because a website was down is not merely wasteful - the recheck it
+// triggers re-selects from the reduced set, so the group can move to a WORSE node on the strength
+// of a third party refusing a connection.
+//
+// So a traffic failure clears the SELECTION (the caller needs a working path now) and requests a
+// recheck. The recheck is what decides whether the node is actually unhealthy, and only its failure
+// removes the measurement.
+//
+// # Why the selection is still cleared
+//
+// The node just failed to carry traffic, so keeping it selected would make the next connection fail
+// the same way. Clearing it lets the immediate re-selection pick another node; if the recheck
+// confirms the node is healthy, the measurement is still there and it can be chosen again.
 //
 // # Why the comparison
 //
-// The current selection is re-read under the lock and compared: a concurrent update may already
-// have replaced this outbound, and clearing the newer choice would undo that work.
+// The current selection is re-read under the lock and compared: a concurrent update may already have
+// replaced this outbound, and clearing the newer choice would undo that work.
 //
-// # Why only a TCP failure discards the measurement
+// # Why only TCP clears the measurement's meaning
 //
-// A delay measurement dials over TCP - URLTest establishes a TCP path through the outbound and
-// speaks HTTP over it. The stored value is therefore a statement about the TCP path, and it
-// remains true after a UDP failure. Discarding it because UDP failed would throw away correct
-// information and, because TCP and UDP selection read the same entry, would move the TCP
-// selection as a side effect of a UDP problem.
-//
-// So a UDP failure clears only the UDP selection: the group picks another node for UDP traffic
-// immediately, while the TCP-path measurement stays available for the next selection round. A TCP
-// failure is evidence about the path the measurement describes, so it discards the measurement.
-//
-// The result is published as one generation and the normal update check runs, which re-selects
-// from whatever scoped history remains.
-func (g *URLTestGroup) invalidateSelected(network string, failed adapter.Outbound) {
+// A delay measurement dials over TCP and speaks HTTP over it, so the stored value describes the TCP
+// path and remains true after a UDP failure. TCP and UDP selection read the same entry, so a UDP
+// failure must not move the TCP selection as a side effect.
+func (g *URLTestGroup) clearSelectionFor(network string, failed adapter.Outbound) {
 	if failed == nil {
 		return
 	}
-	realTag := RealTag(failed, network)
 
 	g.updateAccess.Lock()
 	previous := g.selected.Load()
@@ -618,18 +625,29 @@ func (g *URLTestGroup) invalidateSelected(network string, failed adapter.Outboun
 	}
 	g.updateAccess.Unlock()
 
-	// Only this target's result is invalidated, and only when the failure is evidence about the
-	// path the measurement describes. Another target's measurement of the same node is a
-	// different observation and remains valid either way.
-	if N.NetworkName(network) == N.NetworkTCP {
-		g.history.DeleteURLTestHistoryFor(realTag, g.scope)
-	}
-
 	if cleared {
-		// Try to pick a replacement immediately rather than leaving the group without a selection
-		// until the next interval.
-		g.performUpdateCheck()
+		// Request a health recheck rather than deleting the measurement. The recheck is
+		// single-flight, so a burst of failing connections produces one round of probes rather
+		// than one per failure.
+		g.requestHealthRecheck()
 	}
+}
+
+// requestHealthRecheck asks for one background health check, collapsing concurrent requests.
+//
+// A burst of failing connections must not start a burst of probes: each would dial every member,
+// which on a mobile device is exactly the traffic storm a health check exists to avoid. The group
+// already has a single-flight guard for its checks, so this defers to it and does not add a second
+// mechanism.
+func (g *URLTestGroup) requestHealthRecheck() {
+	go func() {
+		defer func() {
+			if recovered := recover(); recovered != nil && g.logger != nil {
+				g.logger.Error("health recheck panicked: ", recovered)
+			}
+		}()
+		g.CheckOutbounds(g.ctx, false)
+	}()
 }
 
 // clearSelected is invalidateSelected without the re-selection, so the cleared generation can be
