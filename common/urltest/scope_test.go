@@ -129,14 +129,16 @@ func TestParseExpectedStatusMatches(t *testing.T) {
 }
 
 func TestParseExpectedStatusRejectsMalformedInput(t *testing.T) {
+	// Genuinely malformed: no reading of these yields a set of statuses.
+	//
+	// Note which spellings are NOT here. "", "204//200" and "204," are all accepted, because
+	// Mihomo's own parser skips empty tokens - see expected_status_parity_test.go for the
+	// compatibility matrix and the reasoning.
 	for _, input := range []string{
 		"abc",
-		"0",
 		"204-",
 		"-204",
 		"200--299",
-		"204//200",
-		"204,",
 		"70000",
 		"204-abc",
 	} {
@@ -145,6 +147,15 @@ func TestParseExpectedStatusRejectsMalformedInput(t *testing.T) {
 			require.Error(t, err, "malformed expected status must be refused: %q", input)
 		})
 	}
+}
+
+func TestParseExpectedStatusZeroIsAccepted(t *testing.T) {
+	// "0" is a valid bound in Mihomo (ParseUint accepts it), so it is accepted here. It matches
+	// nothing a real server sends, which makes it harmless rather than useful.
+	expected, err := ParseExpectedStatus("0")
+	require.NoError(t, err, "Mihomo accepts 0, so refusing it would reject a valid expression")
+	require.True(t, expected.Match(0))
+	require.False(t, expected.Match(200))
 }
 
 func TestParseExpectedStatusRangeCountBound(t *testing.T) {
