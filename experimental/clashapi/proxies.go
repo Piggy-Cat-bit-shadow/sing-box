@@ -237,10 +237,17 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		// checks, and when this probe happens to use the same target, the scoped result is simply
 		// available to the group's next check.
 		realTag := group.RealTag(proxy, N.NetworkTCP)
-		if measureErr != nil {
-			server.urlTestHistory.DeleteURLTestHistoryFor(realTag, measurement.Scope)
-		} else {
-			server.urlTestHistory.StoreURLTestHistoryFor(realTag, measurement.Scope, &adapter.URLTestHistory{
+		if measureErr == nil {
+			// DISPLAY ONLY.
+			//
+			// A manual probe asks "how fast is this node against the URL I typed". It is not
+			// measured against any group's target, so it must not become selection evidence - and
+			// writing it into the health map would let a user grow that map without bound by
+			// testing arbitrary URLs.
+			//
+			// A failure records nothing at all. Failing this URL does not disprove a previous
+			// success against another one, and the request already reports the failure.
+			server.urlTestHistory.StoreDisplayHistory(realTag, measurement.Scope, &adapter.URLTestHistory{
 				Time:  time.Now(),
 				Delay: measurement.Delay,
 			})

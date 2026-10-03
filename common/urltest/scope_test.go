@@ -283,9 +283,13 @@ func TestLatestHistoryFollowsTheMostRecentStore(t *testing.T) {
 		"the display entry must show the most recent measurement")
 }
 
-func TestDeletingTheLatestRepointsToTheRemainingMeasurement(t *testing.T) {
-	// A failed test against one target must not blank the UI while another valid measurement for
-	// the same node still exists.
+func TestDeletingHealthDoesNotDisturbDisplay(t *testing.T) {
+	// The two layers are independent.
+	//
+	// A health check failing against THIS group's target is not a reason to stop showing the node's
+	// last successful measurement, which may have been against a different target. The previous
+	// design re-pointed the display entry at whatever measurement remained, which coupled a health
+	// decision to a display value for no benefit.
 	storage := NewHistoryStorage()
 
 	scopeA, err := NewMeasurementScope("https://a.example/x", nil)
@@ -293,27 +297,61 @@ func TestDeletingTheLatestRepointsToTheRemainingMeasurement(t *testing.T) {
 	scopeB, err := NewMeasurementScope("https://b.example/x", nil)
 	require.NoError(t, err)
 
-	storage.StoreURLTestHistoryFor("node-a", scopeA, &adapter.URLTestHistory{Delay: 20})
-	storage.StoreURLTestHistoryFor("node-a", scopeB, &adapter.URLTestHistory{Delay: 90})
+	storage.StoreHealthHistory("node-a", scopeA, &adapter.URLTestHistory{Delay: 20})
+	storage.StoreHealthHistory("node-a", scopeB, &adapter.URLTestHistory{Delay: 90})
 
-	// B is the latest; deleting it must fall back to A rather than clearing the display.
-	storage.DeleteURLTestHistoryFor("node-a", scopeB)
+	// B is the display entry. Deleting B's health result must leave the display untouched.
+	storage.DeleteHealthHistory("node-a", scopeB)
 
-	latest := storage.LoadURLTestHistory("node-a")
-	require.NotNil(t, latest, "the display entry must survive while another measurement remains")
-	require.EqualValues(t, 20, latest.Delay)
+	display := storage.LoadURLTestHistory("node-a")
+	require.NotNil(t, display,
+		"deleting health evidence must not blank the display; the layers are independent")
+	require.EqualValues(t, 90, display.Delay,
+		"the display entry still holds the last successful measurement, which was B")
+
+	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scopeB),
+		"the health entry for B is gone")
+	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", scopeA),
+		"and A's health entry was never touched")
 }
 
-func TestDeletingTheLastMeasurementClearsTheLatest(t *testing.T) {
+func TestDeletingHealthLeavesOtherScopesIntact(t *testing.T) {
 	storage := NewHistoryStorage()
 
 	scopeA, err := NewMeasurementScope("https://a.example/x", nil)
 	require.NoError(t, err)
 
-	storage.StoreURLTestHistoryFor("node-a", scopeA, &adapter.URLTestHistory{Delay: 20})
-	storage.DeleteURLTestHistoryFor("node-a", scopeA)
+	storage.StoreHealthHistory("node-a", scopeA, &adapter.URLTestHistory{Delay: 20})
+	storage.DeleteHealthHistory("node-a", scopeA)
 
-	require.Nil(t, storage.LoadURLTestHistory("node-a"))
+	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scopeA),
+		"the health entry is gone")
+
+	// The display entry SURVIVES. That is the contract: a health failure is not evidence about
+	// what was last successfully measured, so it must not erase a real observation.
+	require.NotNil(t, storage.LoadURLTestHistory("node-a"),
+		"deleting health evidence must not erase the last successful measurement; the layers are "+
+			"independent, and a group's health policy has no business blanking a node's history")
+	require.EqualValues(t, 20, storage.LoadURLTestHistory("node-a").Delay)
+}
+
+func TestManualDisplayWriteDoesNotCreateHealthEvidence(t *testing.T) {
+	// The core of the separation: a manual probe must never become selection evidence.
+	storage := NewHistoryStorage()
+
+	scope, err := NewMeasurementScope("https://manual.example/x", nil)
+	require.NoError(t, err)
+
+	storage.StoreDisplayHistory("node-a", scope, &adapter.URLTestHistory{Delay: 5})
+
+	require.EqualValues(t, 5, storage.LoadURLTestHistory("node-a").Delay,
+		"a manual measurement is shown")
+	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scope),
+		"but it is NOT health evidence; a group must never select on the strength of a manual probe "+
+			"taken against an unrelated URL")
+
+	require.Equal(t, 0, storage.HealthEntryCount(),
+		"and the health map must not grow with manual probes")
 }
 
 func TestDeleteAllRemovesEveryScope(t *testing.T) {
@@ -331,4 +369,113 @@ func TestDeleteAllRemovesEveryScope(t *testing.T) {
 	require.Nil(t, storage.LoadURLTestHistory("node-a"))
 	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scopeA))
 	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scopeB))
+}
+
+// TestManualProbesDoNotGrowTheHealthMap is §64(E).
+//
+// A user can test an arbitrary URL for any node, as often as they like. That must not grow the
+// health map at all: the map's size is decided by the URLTest groups in the configuration, not by
+// how many diagnostics a user runs.
+func TestManualProbesDoNotGrowTheHealthMap(t *testing.T) {
+	storage := NewHistoryStorage()
+
+	for index := 0; index < 500; index++ {
+		scope, err := NewMeasurementScope(
+			"https://manual-"+string(rune('a'+index%26))+".example/probe?id="+itoa(index), nil)
+		require.NoError(t, err)
+		storage.StoreDisplayHistory("node-a", scope, &adapter.URLTestHistory{Delay: uint16(index%100 + 1)})
+	}
+
+	require.Equal(t, 0, storage.HealthEntryCount(),
+		"500 manual probes against 500 different URLs must leave the health map EMPTY; otherwise a "+
+			"user grows selection state without bound by running diagnostics")
+	require.Equal(t, 1, storage.DisplayEntryCount(),
+		"the display layer still holds exactly one entry for the tag: the most recent measurement")
+}
+
+// TestManualFailureKeepsPreviousDisplay is §64(D).
+//
+// Failing URL B does not disprove a success against URL A.
+func TestManualFailureKeepsPreviousDisplay(t *testing.T) {
+	storage := NewHistoryStorage()
+
+	scopeA, err := NewMeasurementScope("https://a.example/x", nil)
+	require.NoError(t, err)
+	storage.StoreDisplayHistory("node-a", scopeA, &adapter.URLTestHistory{Delay: 30})
+
+	// A manual probe against a different URL fails. A manual failure records nothing at all, which
+	// is what keeps the previous success visible.
+	display := storage.LoadURLTestHistory("node-a")
+	require.NotNil(t, display, "a failed manual probe must not erase the last success")
+	require.EqualValues(t, 30, display.Delay)
+
+	require.Equal(t, 0, storage.HealthEntryCount())
+}
+
+// TestCloseIsTerminal is §64(O).
+func TestCloseIsTerminal(t *testing.T) {
+	storage := NewHistoryStorage()
+
+	scope, err := NewMeasurementScope("https://a.example/x", nil)
+	require.NoError(t, err)
+
+	storage.StoreHealthHistory("node-a", scope, &adapter.URLTestHistory{Delay: 20})
+	require.NotNil(t, storage.LoadURLTestHistory("node-a"))
+
+	require.NoError(t, storage.Close())
+
+	require.Nil(t, storage.LoadURLTestHistory("node-a"),
+		"a closed storage holds nothing")
+	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scope))
+
+	// A measurement that was in flight when Close ran must not resurrect anything.
+	storage.StoreHealthHistory("node-a", scope, &adapter.URLTestHistory{Delay: 99})
+	storage.StoreDisplayHistory("node-a", scope, &adapter.URLTestHistory{Delay: 99})
+
+	require.Nil(t, storage.LoadURLTestHistory("node-a"),
+		"a late write after Close must be discarded; otherwise a measurement that finished after "+
+			"teardown repopulates a storage that no longer exists")
+	require.Nil(t, storage.LoadURLTestHistoryFor("node-a", scope))
+	require.Equal(t, 0, storage.HealthEntryCount())
+	require.Equal(t, 0, storage.DisplayEntryCount())
+
+	require.NoError(t, storage.Close(), "Close must be idempotent")
+}
+
+// TestStoredHistoryIsNotAliased is §13.
+//
+// The storage keeps values, so a caller cannot mutate stored state through a pointer it kept.
+func TestStoredHistoryIsNotAliased(t *testing.T) {
+	storage := NewHistoryStorage()
+
+	scope, err := NewMeasurementScope("https://a.example/x", nil)
+	require.NoError(t, err)
+
+	original := &adapter.URLTestHistory{Delay: 20}
+	storage.StoreHealthHistory("node-a", scope, original)
+
+	// Mutating the caller's copy must not change what the storage holds.
+	original.Delay = 999
+
+	require.EqualValues(t, 20, storage.LoadURLTestHistoryFor("node-a", scope).Delay,
+		"the storage must hold a copy, not the caller's pointer")
+
+	// And mutating a loaded pointer must not change stored state either.
+	loaded := storage.LoadURLTestHistoryFor("node-a", scope)
+	loaded.Delay = 777
+
+	require.EqualValues(t, 20, storage.LoadURLTestHistoryFor("node-a", scope).Delay,
+		"a loaded pointer must be a copy, or one reader could corrupt what every other reader sees")
+}
+
+func itoa(value int) string {
+	if value == 0 {
+		return "0"
+	}
+	var digits []byte
+	for value > 0 {
+		digits = append([]byte{byte('0' + value%10)}, digits...)
+		value /= 10
+	}
+	return string(digits)
 }

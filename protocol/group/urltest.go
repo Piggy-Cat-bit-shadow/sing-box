@@ -522,11 +522,47 @@ type urlTestBatch struct {
 	batch   *batch.Batch[any]
 	checked map[string]bool
 	groups  []adapter.OutboundGroup
-	access  sync.Mutex
-	result  map[string]uint16
+	// mode decides which evidence layer this round may write.
+	mode   TestHistoryMode
+	access sync.Mutex
+	result map[string]uint16
+}
+
+// TestHistoryMode says which evidence a measurement round is allowed to write.
+//
+// The distinction is not cosmetic. Selection reads the health layer, so a manual diagnostic that
+// wrote there could move live traffic on the strength of a measurement taken against an unrelated
+// URL - and would let a user grow that layer without bound by testing arbitrary URLs.
+type TestHistoryMode int
+
+const (
+	// TestHistoryDisplayOnly records what was measured, for display, and nothing else.
+	//
+	// Used by every manual entry point: a Clash delay probe, a native single-node test, and a
+	// native test of a generic group. None of them measured against a group's own target.
+	TestHistoryDisplayOnly TestHistoryMode = iota
+
+	// TestHistoryHealth records automatic health evidence, which selection reads.
+	//
+	// Used only by a URLTest group checking its own configured target.
+	TestHistoryHealth
+)
+
+// TestHistoryModeFromForce maps the historical force flag onto the explicit mode.
+//
+// Deprecated naming kept so existing internal callers stay readable: a forced round is an automatic
+// health check, an unforced one is the periodic check, and both are health.
+func TestHistoryModeFromForce(force bool) TestHistoryMode {
+	_ = force
+	return TestHistoryHealth
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
+	return URLTestOutboundsWithMode(ctx, outboundManager, history, logger, outbounds, link, interval, force, TestHistoryHealth)
+}
+
+// URLTestOutboundsWithMode runs one measurement round and records it according to mode.
+func URLTestOutboundsWithMode(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, mode TestHistoryMode) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	// The target is resolved once for the whole batch. An unusable one means there is nothing to
 	// measure, so the batch reports no results rather than failing every node individually.
@@ -545,6 +581,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 		batch:    b,
 		checked:  make(map[string]bool),
 		result:   make(map[string]uint16),
+		mode:     mode,
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
@@ -610,16 +647,25 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testErr)
-					// Only this target's result is removed.
-					b.history.DeleteURLTestHistoryFor(tag, b.scope)
+					if b.mode == TestHistoryHealth {
+						// Only this target's health result is removed. The display entry is left
+						// alone: a failed check against this group's target does not invalidate a
+						// previous success against another one.
+						b.history.DeleteHealthHistory(tag, b.scope)
+					}
 				} else {
 					b.logger.Debug("outbound ", tag, " available: ", measurement.Delay, "ms")
 					// The scope comes from the measurement itself, so the key cannot disagree
 					// with what was actually requested.
-					b.history.StoreURLTestHistoryFor(tag, measurement.Scope, &adapter.URLTestHistory{
+					health := &adapter.URLTestHistory{
 						Time:  time.Now(),
 						Delay: measurement.Delay,
-					})
+					}
+					if b.mode == TestHistoryHealth {
+						b.history.StoreHealthHistory(tag, measurement.Scope, health)
+					} else {
+						b.history.StoreDisplayHistory(tag, measurement.Scope, health)
+					}
 					b.access.Lock()
 					b.result[tag] = measurement.Delay
 					b.access.Unlock()

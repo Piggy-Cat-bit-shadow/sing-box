@@ -747,16 +747,24 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 			itOutbound, _ := boxService.outboundManager.Outbound(it)
 			return itOutbound
 		}))
-		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
+		// DISPLAY ONLY. A user testing a generic group is running a diagnostic, not asking the
+		// group to re-decide: a Selector has no configured target to check against, and its members
+		// were not measured against any group's scope. Writing health evidence here would let a
+		// manual test move selection.
+		go group.URLTestOutboundsWithMode(boxService.ctx, boxService.outboundManager, historyStorage,
+			boxService.logFactory.Logger(), outbounds, "", 0, true, group.TestHistoryDisplayOnly)
 	} else {
 		go func() {
-			// The measurement reports its own scope, so the history key cannot disagree with the
-			// target that was actually requested.
+			// DISPLAY ONLY. This is a manual diagnostic against whatever URL was requested, not a
+			// measurement of any group's target, so it must not become selection evidence. Writing
+			// it into the health map would also let a user grow that map without bound by testing
+			// arbitrary URLs.
+			//
+			// A failure records nothing: it does not disprove an earlier success against another
+			// URL, and the caller already receives the error.
 			measurement, err := urltest.Measure(boxService.ctx, urltest.MeasureOptions{}, outbound)
-			if err != nil {
-				historyStorage.DeleteURLTestHistoryFor(outboundTag, measurement.Scope)
-			} else {
-				historyStorage.StoreURLTestHistoryFor(outboundTag, measurement.Scope, &adapter.URLTestHistory{
+			if err == nil {
+				historyStorage.StoreDisplayHistory(outboundTag, measurement.Scope, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: measurement.Delay,
 				})
