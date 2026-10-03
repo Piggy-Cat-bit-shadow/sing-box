@@ -301,7 +301,12 @@ func TestStartIsIdempotentOrReplacesCleanly(t *testing.T) {
 	// A second group can be built and started without the first one's resources interfering.
 	second, _ := newLifecycleFixture(t)
 	second.PostStart()
-	require.NotEqual(t, firstCtx, second.backgroundContext(),
+	// Compared by IDENTITY, not with require.NotEqual.
+	//
+	// A context carries its own mutexes and atomics, so reflect.DeepEqual walks state that the
+	// runtime is free to be mutating - which the race detector correctly reports. Pointer identity
+	// is what "each group owns its own context" actually means.
+	require.NotSame(t, firstCtx, second.backgroundContext(),
 		"each group owns its own background context")
 	require.NoError(t, second.Close())
 }
