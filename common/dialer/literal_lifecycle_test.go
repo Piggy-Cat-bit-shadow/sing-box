@@ -390,3 +390,87 @@ func TestLiteralOriginalWinnerCancelsRecovery(t *testing.T) {
 			"2s; it is waiting for the caller's 30s deadline instead of the race being decided")
 	}
 }
+
+// slowSecondFamilyRouter publishes IPv4 at once and IPv6 only after a long delay, and blocks the
+// complete Lookup until both are available - exactly like a real router answering one family
+// quickly and the other slowly.
+type slowSecondFamilyRouter struct {
+	adapter.DNSRouter
+	fast     netip.Addr
+	slow     netip.Addr
+	fastIsV6 bool
+	slowWait time.Duration
+}
+
+func (r *slowSecondFamilyRouter) LookupFamilies(ctx context.Context, domain string, options adapter.DNSQueryOptions, publish func(adapter.DNSFamilyResult)) error {
+	// fastIsV6 decides which family answers immediately. The other one is what the test makes slow.
+	publish(adapter.DNSFamilyResult{IPv6: r.fastIsV6, Addresses: []netip.Addr{r.fast}})
+	select {
+	case <-time.After(r.slowWait):
+		publish(adapter.DNSFamilyResult{IPv6: !r.fastIsV6, Addresses: []netip.Addr{r.slow}})
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+// Lookup is the COMPLETE contract: it waits for both families.
+func (r *slowSecondFamilyRouter) Lookup(ctx context.Context, domain string, options adapter.DNSQueryOptions) ([]netip.Addr, error) {
+	select {
+	case <-time.After(r.slowWait):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return []netip.Addr{r.fast, r.slow}, nil
+}
+
+// TestLiteralRecoveryUsesOneReadyFamilyWithoutWaiting is §25.
+//
+// The recovered IPv4 is available in milliseconds and the AAAA query takes seconds. Recovery must
+// use the IPv4 as soon as it arrives; waiting for the complete address set turns a working fallback
+// into a multi-second stall.
+func TestLiteralRecoveryUsesOneReadyFamilyWithoutWaiting(t *testing.T) {
+	// The original is IPv4 and the policy is ipv6_only, so the original is excluded and recovery
+	// supplies the address. The family the policy admits (IPv6) is the one that answers FAST, so
+	// a streaming recovery can connect immediately; the excluded family is the slow one.
+	original := netip.MustParseAddr("203.0.113.1")
+	recoveredFast := netip.MustParseAddr("2001:db8::9")
+	recoveredSlow := netip.MustParseAddr("192.0.2.9")
+
+	router := &slowSecondFamilyRouter{
+		fast:     recoveredFast,
+		slow:     recoveredSlow,
+		fastIsV6: true,
+		slowWait: 3 * time.Second,
+	}
+	inner := &lifecycleDialer{answers: map[netip.Addr]lifecycleAnswer{
+		// The original is excluded by the strict policy below, so recovery is the only path.
+		original:      {delay: 5 * time.Millisecond, success: true},
+		recoveredFast: {delay: 5 * time.Millisecond, success: true},
+		recoveredSlow: {delay: 5 * time.Millisecond, success: true},
+	}}
+	dialer := &resolveDialer{
+		router:        router,
+		dialer:        inner,
+		parallel:      true,
+		fallbackDelay: 5 * time.Millisecond,
+		// ipv6_only excludes the IPv4 original, forcing recovery to supply the address.
+		queryOptions: adapter.DNSQueryOptions{Strategy: C.DomainStrategyIPv6Only},
+	}
+
+	ctx, cancel := context.WithTimeout(sniffedContext(t, context.Background()), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	conn, err := dialer.DialContext(ctx, "tcp", M.SocksaddrFrom(original, 443))
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Less(t, elapsed, 1500*time.Millisecond,
+		"recovery took %v; the first usable family must be used as soon as it arrives rather than "+
+			"waiting for the complete address set", elapsed)
+
+	require.Equal(t, 1, inner.dialCount(recoveredFast),
+		"the family that answered first is the one the policy admits, so it must be used")
+}

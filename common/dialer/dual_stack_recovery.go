@@ -89,12 +89,58 @@ func (d *resolveDialer) recoverCandidates(ctx context.Context, destination M.Soc
 	// moment the original address connects, so a lookup that ignored cancellation would keep
 	// running DNS for a connection that is already established.
 	recoveryCtx := withoutAddressRecovery(log.ContextWithOverrideLevel(ctx, log.LevelDebug))
-	recovered, err := d.router.Lookup(recoveryCtx, domain, d.queryOptions)
-	if err != nil {
-		// Recovery is a best-effort improvement. A failure must not turn a connection that
-		// would otherwise have been attempted into an error the user never asked for.
-		return nil
+
+	// Recovery streams when the router can, so a family that has answered is usable immediately.
+	//
+	// The complete Lookup waits for BOTH families, which is right for a routing decision that
+	// needs the whole address set and wrong here: recovery exists to provide a fallback as soon as
+	// one is available. With a resolver answering A in 10ms and AAAA in 3s, waiting for the
+	// complete set made the recovered IPv4 unusable for three seconds - turning a working fallback
+	// into a stall.
+	//
+	// The first usable family is therefore returned as soon as it arrives. Only if the streaming
+	// interface is unavailable does this fall back to the complete lookup, which keeps third-party
+	// routers working exactly as before.
+	var recovered []netip.Addr
+	if dualStackRouter, supportsStreaming := d.router.(adapter.DNSDualStackRouter); supportsStreaming {
+		collected := make(chan []netip.Addr, 1)
+		streamCtx, cancelStream := context.WithCancel(recoveryCtx)
+		defer cancelStream()
+
+		go func() {
+			_ = dualStackRouter.LookupFamilies(streamCtx, domain, d.queryOptions,
+				func(result adapter.DNSFamilyResult) {
+					if len(result.Addresses) == 0 {
+						return
+					}
+					select {
+					case collected <- result.Addresses:
+					case <-streamCtx.Done():
+					}
+				})
+			// The stream ended without producing anything usable.
+			select {
+			case collected <- nil:
+			case <-streamCtx.Done():
+			}
+		}()
+
+		select {
+		case first := <-collected:
+			recovered = first
+		case <-recoveryCtx.Done():
+			return nil
+		}
+	} else {
+		addresses, err := d.router.Lookup(recoveryCtx, domain, d.queryOptions)
+		if err != nil {
+			// Recovery is a best-effort improvement. A failure must not turn a connection that
+			// would otherwise have been attempted into an error the user never asked for.
+			return nil
+		}
+		recovered = addresses
 	}
+
 	if len(recovered) == 0 {
 		return nil
 	}
