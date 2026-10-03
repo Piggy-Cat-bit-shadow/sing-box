@@ -184,6 +184,11 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 	// would make the failure-path read indistinguishable from a nil error.
 	lookupDone := make(chan error, 1)
 
+	// lookupFinished closes when the resolver goroutine has returned, whether or not it published
+	// anything. It distinguishes "still resolving" from "finished with nothing to say", which the
+	// published-result signal alone cannot express.
+	lookupFinished := make(chan struct{})
+
 	// producers tracks the two producer goroutines so the winner path can prove they have
 	// exited rather than merely assuming it. A test can then assert termination deterministically
 	// instead of counting goroutines and hoping.
@@ -232,6 +237,7 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 		// The error is published, not discarded. Without it a resolution failure would be
 		// reported as "no dial candidates", which describes a symptom and hides the cause.
 		lookupDone <- err
+		close(lookupFinished)
 	}()
 
 	// --- producer 2: the feeder ---
@@ -349,9 +355,23 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 	}()
 
 	// Wait for the first result so a completely failing lookup is reported as a lookup error
-	// rather than as an empty dial. A context ending first is also honoured.
+	// rather than as an empty dial.
+	//
+	// # Why the producer's own completion is also watched
+	//
+	// DNSDualStackRouter is an OPTIONAL interface, and an implementation may report a failure by
+	// RETURNING AN ERROR without ever calling publish - which is an ordinary way to say "this
+	// lookup failed". Waiting only for a published result meant such a router blocked the dial
+	// until the caller's entire context expired, turning an immediate DNS failure into a connect
+	// timeout.
+	//
+	// lookupFinished closes when the resolver goroutine is done, so an error with no results is
+	// acted on at once rather than waited out. A context ending first is still honoured.
 	select {
 	case <-firstReady:
+	case <-lookupFinished:
+		// The resolver returned without publishing anything. Let the terminal handling below
+		// report its error, which is more informative than a timeout.
 	case <-ctx.Done():
 		cancelResolution()
 		producers.Wait()
