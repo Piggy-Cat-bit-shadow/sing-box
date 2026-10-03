@@ -54,6 +54,11 @@ type lifecycleAnswer struct {
 	delay   time.Duration
 	success bool
 	block   bool
+	// ignoreCancel makes the attempt produce a connection even after the context is done, which
+	// models a dial that was already past its point of cancellation - a completed syscall, or an
+	// implementation that does not observe the context. That is the case the loser-ownership logic
+	// exists for: the connection exists whether or not anyone wants it.
+	ignoreCancel bool
 }
 
 func (d *lifecycleDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -71,10 +76,14 @@ func (d *lifecycleDialer) DialContext(ctx context.Context, network string, desti
 		return nil, ctx.Err()
 	}
 	if answer.delay > 0 {
-		select {
-		case <-time.After(answer.delay):
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if answer.ignoreCancel {
+			time.Sleep(answer.delay)
+		} else {
+			select {
+			case <-time.After(answer.delay):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 	}
 	if !answer.success {
@@ -101,6 +110,24 @@ func (d *lifecycleDialer) trackedConns() []*owningConn {
 	d.access.Lock()
 	defer d.access.Unlock()
 	return append([]*owningConn(nil), d.conns...)
+}
+
+// waitForConnOtherThan blocks until a connection other than the excluded one exists.
+//
+// This replaces a sleep: the test needs to observe the loser's connection having been handed out
+// before asserting that the owner closed it. Waiting on the fact makes the assertion meaningful;
+// sleeping and hoping makes it a race the test happens to win.
+func (d *lifecycleDialer) waitForConnOtherThan(exclude *owningConn, timeout time.Duration) *owningConn {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, conn := range d.trackedConns() {
+			if conn != exclude {
+				return conn
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
 }
 
 // lifecycleRouter recovers the given addresses, optionally after a delay.
@@ -183,9 +210,12 @@ func TestLiteralOriginalWinnerClosesRecoveredLateSuccess(t *testing.T) {
 	recovered := netip.MustParseAddr("192.0.2.2")
 
 	inner := &lifecycleDialer{answers: map[netip.Addr]lifecycleAnswer{
-		original: {delay: time.Millisecond, success: true},
-		// The recovered attempt is slow enough to lose, and succeeds anyway.
-		recovered: {delay: 300 * time.Millisecond, success: true},
+		// The original is slower than the grace timer, so the recovered race really starts - and
+		// still wins it.
+		original: {delay: 40 * time.Millisecond, success: true},
+		// The recovered attempt loses the race and produces a connection anyway, because it is
+		// past its cancellation point.
+		recovered: {delay: 200 * time.Millisecond, success: true, ignoreCancel: true},
 	}}
 	dialer := &resolveDialer{
 		router:        &lifecycleRouter{addresses: []netip.Addr{recovered}},
@@ -205,17 +235,25 @@ func TestLiteralOriginalWinnerClosesRecoveredLateSuccess(t *testing.T) {
 	winner, isTracked := conn.(*owningConn)
 	require.True(t, isTracked, "the winner must be the tracked connection")
 
-	// Let a late recovered success land, then account for every connection handed out.
-	time.Sleep(500 * time.Millisecond)
+	// The race really ran, so the recovered attempt really was in flight when the original won.
+	require.GreaterOrEqual(t, inner.dialCount(recovered), 1,
+		"the recovered race must have started for this test to exercise a losing recovered worker")
 
-	for _, tracked := range inner.trackedConns() {
-		if tracked == winner {
-			continue
-		}
-		require.Equal(t, int32(1), tracked.closeCount(),
-			"a losing connection - including one that succeeded late - must be closed exactly "+
-				"once by the owner; a buffered result nobody reads leaks it")
-	}
+	// Wait for the recovered attempt to have produced its connection, then for the owner to have
+	// closed it. A channel barrier rather than a sleep: the assertion must be about a fact, not
+	// about having waited long enough.
+	lateConn := inner.waitForConnOtherThan(winner, 3*time.Second)
+	require.NotNil(t, lateConn,
+		"the recovered attempt was expected to succeed after losing; without it this test would "+
+			"pass vacuously")
+
+	require.Eventually(t, func() bool { return lateConn.closeCount() == 1 },
+		3*time.Second, time.Millisecond,
+		"a losing connection - including one that succeeded late - must be closed exactly once by "+
+			"the owner; a buffered result nobody reads leaks it")
+
+	require.Equal(t, int32(1), lateConn.closeCount(),
+		"and it must not be closed twice, which would mean two owners")
 }
 
 // TestLiteralRecoveredWinnerClosesOriginalLateSuccess is §27.
@@ -227,8 +265,9 @@ func TestLiteralRecoveredWinnerClosesOriginalLateSuccess(t *testing.T) {
 	recovered := netip.MustParseAddr("192.0.2.2")
 
 	inner := &lifecycleDialer{answers: map[netip.Addr]lifecycleAnswer{
-		// The original is slow but will succeed; it loses the race to the recovered candidate.
-		original:  {delay: 400 * time.Millisecond, success: true},
+		// The original is slow but produces a connection anyway: it is past its cancellation
+		// point, so the connection exists even though the race was already decided.
+		original:  {delay: 400 * time.Millisecond, success: true, ignoreCancel: true},
 		recovered: {delay: 30 * time.Millisecond, success: true},
 	}}
 	dialer := &resolveDialer{
@@ -249,16 +288,18 @@ func TestLiteralRecoveredWinnerClosesOriginalLateSuccess(t *testing.T) {
 	winner, isTracked := conn.(*owningConn)
 	require.True(t, isTracked)
 
-	time.Sleep(600 * time.Millisecond)
+	// The cancelled original still produces a connection; the owner must close it.
+	lateConn := inner.waitForConnOtherThan(winner, 3*time.Second)
+	require.NotNil(t, lateConn,
+		"the original was expected to succeed after losing the race; without it this test would "+
+			"pass vacuously")
 
-	for _, tracked := range inner.trackedConns() {
-		if tracked == winner {
-			continue
-		}
-		require.Equal(t, int32(1), tracked.closeCount(),
-			"the cancelled original's late connection must be closed exactly once; leaving it to a "+
-				"buffered channel nobody reads leaks a socket")
-	}
+	require.Eventually(t, func() bool { return lateConn.closeCount() == 1 },
+		3*time.Second, time.Millisecond,
+		"the cancelled original's late connection must be closed exactly once; leaving it to a "+
+			"buffered channel nobody reads leaks a socket")
+
+	require.Equal(t, int32(1), lateConn.closeCount())
 }
 
 // TestLiteralParentCancelExitsAllWorkers is §30.

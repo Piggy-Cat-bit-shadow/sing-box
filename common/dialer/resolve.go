@@ -497,6 +497,37 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 
 	original := make(chan literalDialResult, 1)
 
+	// originalWorkers lets this function wait for the original attempt before returning, and
+	// claimed records whether its connection was handed to the caller.
+	//
+	// # Why the original needs an owner at all
+	//
+	// The original attempt is dialled directly. Cancelling it, which the deferred cancelOriginal
+	// does, only stops a dial that has not reached its point of no return: a completed syscall, or
+	// an implementation that does not observe the context, still produces a connection. That
+	// connection is written into a buffered channel, and if nobody reads it the socket is never
+	// closed.
+	//
+	// The recovered side already handled this by waiting for its worker and then draining. The
+	// original had no equivalent, so a losing original's socket leaked. It is collected the same
+	// way: wait for the worker, then drain and close anything unclaimed.
+	//
+	// The drain happens after the worker has exited, so the buffered read cannot miss a result
+	// that is about to arrive - which is what a read at return time would do.
+	var originalWorkers sync.WaitGroup
+	claimed := false
+
+	defer func() {
+		if claimed {
+			return
+		}
+		// cancelOriginal has already run (it is deferred earlier, so it runs after this one);
+		// wait explicitly so the worker cannot write after the drain.
+		cancelOriginal()
+		originalWorkers.Wait()
+		d.closeLateOriginal(original)
+	}()
+
 	// A hard single-family strategy applies to the ORIGINAL address too.
 	//
 	// planCandidates enforces "only means only" by dropping the other family, but the original
@@ -506,7 +537,9 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 	// The EFFECTIVE strategy, not the caller's raw value. See effectiveFamilyStrategy.
 	originalAllowed := addressAllowedByStrategy(destination.Addr, d.effectiveFamilyStrategy())
 	if originalAllowed {
+		originalWorkers.Add(1)
 		go func() {
+			defer originalWorkers.Done()
 			conn, err := d.dialer.DialContext(originalCtx, network, destination)
 			original <- literalDialResult{conn: conn, err: err}
 		}()
@@ -535,6 +568,7 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 	select {
 	case result := <-original:
 		if result.err == nil {
+			claimed = true
 			return result.conn, nil
 		}
 		// The original failed. Recovery still gets its chance.
@@ -562,6 +596,7 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 			if result.err != nil {
 				return nil, result.err
 			}
+			claimed = true
 			return result.conn, nil
 		}
 
@@ -583,6 +618,7 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 		select {
 		case result := <-original:
 			if result.err == nil {
+				claimed = true
 				return result.conn, nil
 			}
 			return d.dialRecoveredOrReport(ctx, network, destination, addresses, result.err)
@@ -902,6 +938,12 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 	workers.Wait()
 	d.closeLateRecovered(recoveredResult)
 
+	// The original's worker is not waited on here: it belongs to the caller. But a connection it
+	// produces after losing is still a socket nobody else will close, so it is collected on the
+	// same terms as the recovered side. cancelOriginal was called above, so by the time control
+	// reaches the caller's deferred cancel the channel holds either the result or nothing.
+	d.closeLateOriginal(original)
+
 	if winner != nil {
 		return winner, nil
 	}
@@ -913,14 +955,39 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 	return nil, raceCtx.Err()
 }
 
-// closeLateRecovered closes a recovered connection that arrived after the race was decided.
+// closeLateRecovered closes a connection the recovered worker produced after the race was decided.
 //
-// The channel is buffered with capacity one and the worker sends exactly once, so this is a
-// non-blocking read: either the result is already there, or the worker exited without producing
-// one. There is no third case, and no detached cleanup goroutine is needed.
+// It must be called only AFTER workers.Wait(), which is what makes the buffered read safe: the
+// worker has either already sent its one result or will never send one. Reading before that point
+// would take the default branch and leak whichever connection arrived a moment later.
 func (d *resolveDialer) closeLateRecovered(recoveredResult <-chan literalDialResult) {
+	d.closeLateResult(recoveredResult)
+}
+
+// closeLateOriginal closes a connection the ORIGINAL worker produced after the race was decided.
+//
+// # Why this is needed
+//
+// The original's worker belongs to the caller, but the CONNECTION it produces when it loses belongs
+// to nobody. The deferred cancelOriginal normally prevents that connection from existing at all,
+// which is why the gap was not visible: a dial that respects cancellation returns an error and
+// never creates a socket. A dial already past its cancellation point - a completed syscall, or an
+// implementation that does not observe the context - still produces one, and it was written into a
+// buffered channel that nothing ever read.
+//
+// Cancelling the worker is not the same as taking its socket.
+func (d *resolveDialer) closeLateOriginal(original <-chan literalDialResult) {
+	d.closeLateResult(original)
+}
+
+// closeLateResult drains a one-shot attempt channel and closes whatever it holds.
+//
+// The channel is buffered with capacity one and the worker sends exactly once, and both callers
+// invoke this only after the worker has exited. The read is therefore guaranteed to find the
+// result if there is one, rather than racing it and leaking on a miss.
+func (d *resolveDialer) closeLateResult(results <-chan literalDialResult) {
 	select {
-	case result := <-recoveredResult:
+	case result := <-results:
 		if result.conn != nil {
 			result.conn.Close()
 		}
