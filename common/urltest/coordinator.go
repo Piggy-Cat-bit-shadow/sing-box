@@ -49,9 +49,18 @@ func (c *Coordinator) Acquire(ctx context.Context) (func(), error) {
 	}
 	select {
 	case c.slots <- struct{}{}:
+		// The release closure holds a plain bool, NOT an atomic.
+		//
+		// That is correct because the closure is called by the goroutine that acquired it - Measure
+		// defers it immediately, and it is the only caller. An atomic would suggest a cross-goroutine
+		// release is supported, which it is not: if one were ever introduced, the guard would need to
+		// become atomic AND the slot ownership would need rethinking, because freeing a slot from
+		// another goroutine says nothing about which measurement finished.
+		//
+		// The guard exists so a double call cannot free a slot twice, which would hand it to a second
+		// measurement while the first still believed it owned it.
 		var released bool
 		return func() {
-			// Guarded so a double release cannot corrupt the count by freeing a slot twice.
 			if released {
 				return
 			}
