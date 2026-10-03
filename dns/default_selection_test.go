@@ -158,3 +158,54 @@ func TestConcurrentFakeIPAndNormalDoNotBothClaimDefault(t *testing.T) {
 			"the FakeIP create failed, so it must not have been installed")
 	}
 }
+
+// TestFakeIPTypeWithoutTheCapabilityIsRefused closes a latent panic.
+//
+// The installer asserted adapter.FakeIPTransport on any transport reporting the fakeip type. The
+// built-in one implements it, so the built-in registry cannot reach the failure - but the registry
+// is extensible, and a type name is a string a transport reports about itself. An assert on it is a
+// process-wide panic waiting for a third-party transport that gets the string wrong.
+//
+// The refusal must also leave the manager exactly as it was: no half-installed transport, and no
+// entry in the tag or default maps pointing at something that was discarded.
+func TestFakeIPTypeWithoutTheCapabilityIsRefused(t *testing.T) {
+	registry := &incapableFakeIPRegistry{}
+	// A configured default tag, so the "a fakeip server cannot be the default" pre-check does not
+	// fire first and the capability assertion is the one under test.
+	manager := NewTransportManager(log.NewNOPFactory().Logger(), registry, nil, "configured-default")
+	manager.logger = log.NewNOPFactory().Logger()
+
+	err := manager.Create(context.Background(), manager.logger, "bad-fakeip", "fakeip", nil)
+	require.Error(t, err,
+		"a transport that reports the fakeip type without the capability must be refused, not "+
+			"asserted into a panic")
+	require.Contains(t, err.Error(), "fakeip capability")
+
+	manager.access.Lock()
+	defer manager.access.Unlock()
+	require.Empty(t, manager.transports, "nothing may remain installed")
+	require.NotContains(t, manager.transportByTag, "bad-fakeip")
+	require.Nil(t, manager.fakeIPTransport)
+}
+
+// incapableFakeIPRegistry produces a transport that reports the fakeip type but cannot serve it.
+type incapableFakeIPRegistry struct {
+	adapter.DNSTransportRegistry
+}
+
+func (r *incapableFakeIPRegistry) CreateDNSTransport(ctx context.Context, logger log.ContextLogger, tag string, transportType string, options any) (adapter.DNSTransport, error) {
+	// No Store method, so it does not satisfy adapter.FakeIPTransport.
+	return &incapableTransport{tag: tag}, nil
+}
+
+type incapableTransport struct {
+	adapter.DNSTransport
+	tag string
+}
+
+func (t *incapableTransport) Type() string                         { return "fakeip" }
+func (t *incapableTransport) Tag() string                          { return t.tag }
+func (t *incapableTransport) Dependencies() []string               { return nil }
+func (t *incapableTransport) Start(stage adapter.StartStage) error { return nil }
+func (t *incapableTransport) Close() error                         { return nil }
+func (t *incapableTransport) Reset()                               {}

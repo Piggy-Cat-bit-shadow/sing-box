@@ -316,7 +316,25 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 		}
 	}
 	if transport.Type() == C.DNSTypeFakeIP {
-		m.fakeIPTransport = transport.(adapter.FakeIPTransport)
+		// An unchecked assertion here would take down the process when a registered FakeIP transport
+		// does not implement the FakeIP capability. The shipped one does, so this is not reachable
+		// through the built-in registry - but the registry is extensible, and a type name is a string
+		// any transport may report about itself.
+		//
+		// Failing closed is the same choice the rest of this installer makes: refuse the install and
+		// release what was built, rather than panic or install something that cannot serve the
+		// capability it advertises.
+		fakeIPTransport, isFakeIPTransport := transport.(adapter.FakeIPTransport)
+		if !isFakeIPTransport {
+			// Undo the install. The lock is released by the deferred Unlock, so it must NOT be
+			// released here: doing both panics on a double unlock.
+			m.transports = m.transports[:len(m.transports)-1]
+			delete(m.transportByTag, tag)
+			defer common.Close(transport)
+			return E.New("dns server ", tag, " reports type ", transport.Type(),
+				" but does not implement the fakeip capability")
+		}
+		m.fakeIPTransport = fakeIPTransport
 	}
 	return nil
 }
