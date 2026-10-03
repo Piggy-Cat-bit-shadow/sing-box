@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -253,4 +255,51 @@ func TestNoDebugCallbackComputesNothing(t *testing.T) {
 
 	_, err := Measure(context.Background(), MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
 	require.NoError(t, err, "a measurement without a debug callback must still succeed")
+}
+
+// TestOversizedResponseHeadersFailClosed is §55, §64(T).
+//
+// The transport caps response headers at 256 KiB, far below the ~10 MiB net/http default. A health
+// check needs a few hundred bytes; the default would let an unusual or hostile endpoint make the
+// process allocate ten megabytes per measurement, which matters on a 50 MiB NetworkExtension
+// budget.
+func TestOversizedResponseHeadersFailClosed(t *testing.T) {
+	// Comfortably above the cap.
+	oversized := strings.Repeat("x", 300<<10)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("X-Oversized", oversized)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := &countingDialer{}
+	_, err := Measure(context.Background(), MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
+
+	require.Error(t, err,
+		"response headers beyond the cap must fail the measurement rather than being buffered; the "+
+			"net/http default is about 10 MiB, which an unusual endpoint could make the process "+
+			"allocate for every measurement")
+	require.EqualValues(t, 1, dialer.dials.Load(),
+		"and the failure must not cause a second dial")
+}
+
+// TestOrdinaryResponseHeadersSucceed is the control.
+//
+// Without it, a transport that rejected every response would pass the test above.
+func TestOrdinaryResponseHeadersSucceed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		// A realistic CDN-ish header set.
+		for index := 0; index < 20; index++ {
+			writer.Header().Set("X-Header-"+strconv.Itoa(index), strings.Repeat("v", 200))
+		}
+		writer.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := &countingDialer{}
+	measurement, err := Measure(context.Background(), MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
+
+	require.NoError(t, err, "ordinary headers must not trip the cap")
+	require.GreaterOrEqual(t, measurement.Delay, uint16(1))
 }
