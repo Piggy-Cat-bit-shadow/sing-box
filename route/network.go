@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,26 +35,14 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
-	ctx                 context.Context
-	logger              logger.ContextLogger
-	router              adapter.Router
-	interfaceFinder     *control.DefaultInterfaceFinder
-	networkInterfaces   common.TypedValue[[]adapter.NetworkInterface]
-	autoDetectInterface bool
-	defaultOptions      adapter.NetworkOptions
-	// autoRedirectOutputMark is the fwmark applied to traffic leaving through the auto-redirect.
-	//
-	// # Why it is atomic
-	//
-	// AutoRedirectOutputMarkFunc returns a dial-control callback that common/dialer installs on
-	// EVERY outbound connection's Control chain, and that callback reads this field. Reading it
-	// under a mutex would put a lock on every dial's control path for a value that changes once at
-	// startup; a plain uint32 makes the read race with the write.
-	//
-	// The value the callback observes must also be whole: it either applies the configured mark or
-	// applies nothing, and those are different routing instructions - a torn read could leave a
-	// connection unmarked and let it escape the redirect.
-	autoRedirectOutputMark  atomic.Uint32
+	ctx                     context.Context
+	logger                  logger.ContextLogger
+	router                  adapter.Router
+	interfaceFinder         *control.DefaultInterfaceFinder
+	networkInterfaces       common.TypedValue[[]adapter.NetworkInterface]
+	autoDetectInterface     bool
+	defaultOptions          adapter.NetworkOptions
+	autoRedirectOutputMark  uint32
 	bridgeInterfaceAccess   sync.Mutex
 	bridgeInterfaces        []string
 	networkMonitor          tun.NetworkUpdateMonitor
@@ -434,14 +421,15 @@ func (r *NetworkManager) DefaultOptions() adapter.NetworkOptions {
 }
 
 func (r *NetworkManager) RegisterAutoRedirectOutputMark(mark uint32) error {
-	if !r.autoRedirectOutputMark.CompareAndSwap(0, mark) {
+	if r.autoRedirectOutputMark > 0 {
 		return E.New("only one auto-redirect can be configured")
 	}
+	r.autoRedirectOutputMark = mark
 	return nil
 }
 
 func (r *NetworkManager) AutoRedirectOutputMark() uint32 {
-	return r.autoRedirectOutputMark.Load()
+	return r.autoRedirectOutputMark
 }
 
 func (r *NetworkManager) RegisterBridgeInterface(interfaceName string) {
@@ -460,25 +448,10 @@ func (r *NetworkManager) BridgeInterfaces() []string {
 
 func (r *NetworkManager) AutoRedirectOutputMarkFunc() control.Func {
 	return func(network, address string, conn syscall.RawConn) error {
-		// One load, used for both the test and the mark, so the callback cannot see "configured"
-		// and then act on a different value.
-		mark := r.autoRedirectOutputMark.Load()
-		if mark == 0 {
+		if r.autoRedirectOutputMark == 0 {
 			return nil
 		}
-		// control.RoutingMark returns a NIL Func on every platform without SO_MARK support -
-		// darwin, windows and the BSDs - so calling it unconditionally panics with a nil pointer
-		// dereference the first time any outbound connection is dialled.
-		//
-		// That is reachable from an ordinary configuration: a darwin TUN inbound with
-		// `auto_redirect` and no platform auto-redirect registers a mark, and this callback is
-		// installed on every dial's control chain. The platform simply has no fwmark to apply, so
-		// the correct behaviour is to apply nothing rather than to crash.
-		markFunc := control.RoutingMark(mark)
-		if markFunc == nil {
-			return nil
-		}
-		return markFunc(network, address, conn)
+		return control.RoutingMark(r.autoRedirectOutputMark)(network, address, conn)
 	}
 }
 
