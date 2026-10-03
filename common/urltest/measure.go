@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -16,6 +17,48 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 )
+
+// newMeasurementTransport builds the HTTP transport used for both requests of one measurement.
+//
+// # The one-shot handoff
+//
+// The pre-dialed connection is handed to net/http AT MOST ONCE. Returning it unconditionally was
+// wrong ownership: net/http may call DialContext again, and for an idempotent request like HEAD it
+// does so when a connection it already used fails. The transport would then be given a connection
+// that is already closed.
+//
+// The sentinel keeps the guarantee the caller depends on - one measurement, one outbound
+// connection - and turns a would-be silent reuse into an error that the second-request handling
+// already classifies as a repeat-request failure, so the node stays usable through the fallback.
+func newMeasurementTransport(instance net.Conn, ctx context.Context) *http.Transport {
+	var handedOut atomic.Bool
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if !handedOut.CompareAndSwap(false, true) {
+				return nil, errURLTestConnectionNotReusable
+			}
+			return instance, nil
+		},
+		TLSClientConfig: &tls.Config{
+			Time:    ntp.TimeFuncFromContext(ctx),
+			RootCAs: adapter.RootPoolFromContext(ctx),
+		},
+		// A health check needs a few hundred bytes of headers at most. The default ceiling is
+		// about 10 MiB, which an unusual or hostile endpoint could make the process allocate for
+		// every measurement - memory that matters on a 50 MiB NetworkExtension budget.
+		//
+		// 256 KiB is far above any real CDN response and far below the default.
+		MaxResponseHeaderBytes: 256 << 10,
+	}
+}
+
+// errURLTestConnectionNotReusable is returned when the transport asks for a second connection.
+//
+// It is a plain error, not a timeout and not a cancellation, so the second-request handling treats
+// it as a repeat-request failure and keeps the node usable through the Mihomo fallback - which is
+// the correct reading: the node answered once, and only the transport's attempt to obtain another
+// connection failed.
+var errURLTestConnectionNotReusable = errors.New("URL test transport attempted to open a second connection")
 
 // MeasureOptions describes one measurement request.
 type MeasureOptions struct {
@@ -108,18 +151,8 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 	defer instance.Close()
 	dialElapsed := time.Since(dialStart)
 
-	// ONE transport for both requests. A second transport, or closing this one in between, would
-	// force the second request to dial and handshake again - exactly the cost the warm-up exists
-	// to exclude.
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return instance, nil
-		},
-		TLSClientConfig: &tls.Config{
-			Time:    ntp.TimeFuncFromContext(ctx),
-			RootCAs: adapter.RootPoolFromContext(ctx),
-		},
-	}
+	transport := newMeasurementTransport(instance, ctx)
+
 	client := http.Client{
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
