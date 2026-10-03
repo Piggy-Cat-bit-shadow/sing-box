@@ -70,23 +70,31 @@ func (o *passthroughOutbound) DialContext(ctx context.Context, network string, d
 	return dialer.DialContext(ctx, network, destination.String())
 }
 
-// TestSingleMeasurementImplementationProducesTheSameDelayForEveryCaller is the core contract.
+// TestURLTestEntryPointPerformsOneUnifiedMeasurement pins the public entry point's behaviour.
 //
-// The same node and the same target are measured repeatedly through the public entry point, and
-// every caller-facing value - the returned delay and what gets stored in history - must come
-// from that one measurement with the same semantics.
-func TestSingleMeasurementImplementationProducesTheSameDelayForEveryCaller(t *testing.T) {
+// # What this proves, and what it does not
+//
+// It proves that ONE call to the package's entry point performs one unified-delay measurement -
+// two HEAD requests, HEAD-only, no GET - and returns the warm timing.
+//
+// It does NOT prove that the Clash API, the native API and the URLTest group agree, because it
+// does not call them; those paths have their own tests in their own packages. The name says what
+// is actually exercised rather than claiming whole-system coverage from a unit test.
+//
+// What makes agreement plausible rather than coincidental is structural and checkable by
+// inspection: there is one measurement implementation in this package, and the callers call it.
+// A test that asserted otherwise from here would be asserting something it cannot observe.
+func TestURLTestEntryPointPerformsOneUnifiedMeasurement(t *testing.T) {
 	target := newCountingTarget(t, false)
 	outbound := &passthroughOutbound{tag: "node-a"}
 
-	// This mirrors what every caller does: call URLTest, store the result in history.
+	// The measurement path every caller uses.
 	delay, err := URLTest(context.Background(), target.server.URL+"/generate_204", outbound)
 	require.NoError(t, err)
 
-	// Exactly two requests, which is the unified-delay signature. A second implementation would
-	// show up here as a different count.
+	// Exactly two requests, the unified-delay signature.
 	require.EqualValues(t, 2, target.requests.Load(),
-		"every caller must observe the same two-request measurement")
+		"one call must perform exactly one two-request measurement")
 	require.EqualValues(t, 2, target.headCount.Load())
 	require.EqualValues(t, 0, target.getCount.Load(),
 		"GET must never be used; the measurement is HEAD-only")

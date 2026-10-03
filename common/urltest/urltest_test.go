@@ -2,7 +2,6 @@ package urltest
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +12,8 @@ import (
 
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
@@ -30,6 +31,18 @@ import (
 // These must be deterministic and offline. Timing assertions against a public endpoint would be
 // both flaky and dependent on infrastructure, so every case below serves its own responses from
 // a local listener whose per-request delay the test controls.
+
+// measureForTest calls the production measurement with the default expected-status set.
+//
+// Tests use the real entry point rather than a test-only reimplementation, so the timing,
+// timeout and status behaviour they assert is the behaviour that ships.
+func measureForTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) {
+	result, err := Measure(ctx, MeasureOptions{Link: link}, detour)
+	if err != nil {
+		return 0, err
+	}
+	return result.Delay, nil
+}
 
 // requestRecord captures one observed request.
 type requestRecord struct {
@@ -137,7 +150,7 @@ func TestFirstRequestIsWarmUpAndIsNotTimed(t *testing.T) {
 		return 0
 	})
 
-	delay, err := urlTest(context.Background(), server.url(), directDialer{})
+	delay, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.NoError(t, err)
 
 	// Generous bound so CI load cannot make this flaky, while still proving the 120ms warm-up
@@ -159,7 +172,7 @@ func TestDelayTracksSecondRequestNotTheSum(t *testing.T) {
 		return 40 * time.Millisecond
 	})
 
-	delay, err := urlTest(context.Background(), server.url(), directDialer{})
+	delay, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.NoError(t, err)
 
 	require.GreaterOrEqual(t, int(delay), 35, "the second request's own cost must be included")
@@ -172,7 +185,7 @@ func TestDelayTracksSecondRequestNotTheSum(t *testing.T) {
 func TestBothRequestsReuseTheSameConnection(t *testing.T) {
 	server := newDelayServer(t, func(int) time.Duration { return 0 })
 
-	_, err := urlTest(context.Background(), server.url(), directDialer{})
+	_, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.NoError(t, err)
 
 	require.Equal(t, 2, server.count(), "two HEAD requests must be sent")
@@ -188,7 +201,7 @@ func TestBothRequestsReuseTheSameConnection(t *testing.T) {
 func TestBothRequestsUseHEAD(t *testing.T) {
 	server := newDelayServer(t, func(int) time.Duration { return 0 })
 
-	_, err := urlTest(context.Background(), server.url(), directDialer{})
+	_, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.NoError(t, err)
 
 	requests := server.snapshot()
@@ -211,7 +224,7 @@ func TestSecondRequestFailureStillReportsTheNodeAsUsable(t *testing.T) {
 		return -1
 	})
 
-	delay, err := urlTest(context.Background(), server.url(), directDialer{})
+	delay, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.NoError(t, err,
 		"a node that answered the warm-up must not be reported as dead just because the repeat "+
 			"failed; Mihomo falls back to the first request's result instead")
@@ -230,7 +243,7 @@ func TestSecondRequestFailureStillReportsTheNodeAsUsable(t *testing.T) {
 // --- E. dial failure (§12E) ------------------------------------------------------------
 
 func TestDialFailureFails(t *testing.T) {
-	_, err := urlTest(context.Background(), "http://127.0.0.1:1/", directDialer{})
+	_, err := measureForTest(context.Background(), "http://127.0.0.1:1/", directDialer{})
 	require.Error(t, err, "a node that cannot be dialled must fail")
 }
 
@@ -244,7 +257,7 @@ func TestFirstRequestFailureFails(t *testing.T) {
 		return 0
 	})
 
-	_, err := urlTest(context.Background(), server.url(), directDialer{})
+	_, err := measureForTest(context.Background(), server.url(), directDialer{})
 	require.Error(t, err,
 		"if the warm-up fails there is nothing to measure, and continuing would produce a "+
 			"number for a broken path")
@@ -262,7 +275,7 @@ func TestExactlyTwoRequestsPerMeasurement(t *testing.T) {
 	server := newDelayServer(t, func(int) time.Duration { return 0 })
 
 	for run := 0; run < 5; run++ {
-		_, err := urlTest(context.Background(), server.url(), directDialer{})
+		_, err := measureForTest(context.Background(), server.url(), directDialer{})
 		require.NoError(t, err)
 	}
 
@@ -299,7 +312,7 @@ func TestContextCancellationIsRespected(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err := urlTest(ctx, server.url(), directDialer{})
+	_, err := measureForTest(ctx, server.url(), directDialer{})
 	elapsed := time.Since(start)
 
 	require.Error(t, err, "a cancelled measurement must fail rather than hang")
@@ -310,13 +323,18 @@ func TestContextCancellationIsRespected(t *testing.T) {
 // --- benchmark ------------------------------------------------------------------------
 
 func BenchmarkURLTestUnifiedDelay(b *testing.B) {
-	server := newDelayServer(&testing.T{}, func(int) time.Duration { return 0 })
-	_ = fmt.Sprintf("%s", server.url())
+	// A benchmark builds its own fixture rather than borrowing the test helper: a zero-value
+	// testing.T is not a valid lifecycle - it has no cleanup registry, so t.Cleanup inside the
+	// helper would panic, and the server would never be closed.
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := urlTest(context.Background(), server.url(), directDialer{})
+		_, err := measureForTest(context.Background(), server.URL+"/generate_204", directDialer{})
 		if err != nil {
 			b.Fatal(err)
 		}

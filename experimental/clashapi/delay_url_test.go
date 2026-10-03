@@ -194,3 +194,54 @@ func TestClashDelayHandlerUsesHEAD(t *testing.T) {
 		}
 	}
 }
+
+// --- expected status (§12, §42) ---------------------------------------------------------
+
+// TestClashDelayRejectsMalformedExpected pins that the parameter is validated, not ignored.
+//
+// A malformed expression silently treated as "no constraint" would measure against the wrong
+// acceptance rule and report a delay for a node the caller considers unhealthy.
+func TestClashDelayRejectsMalformedExpected(t *testing.T) {
+	target := newDelayTargetServer(t)
+	outbound := &recordingOutbound{}
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/proxies/node/delay?timeout=5000&url="+target.server.URL+"/generate_204&expected=not-a-status", nil)
+	request = request.WithContext(context.WithValue(request.Context(), CtxKeyProxy, outbound))
+
+	recorder := httptest.NewRecorder()
+	getProxyDelay(&Server{
+		ctx:            context.Background(),
+		outbound:       stubOutboundManager{},
+		urlTestHistory: urltest.NewHistoryStorage(),
+	})(recorder, request)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code,
+		"a malformed expected expression must be refused rather than ignored")
+	require.Zero(t, target.count.Load(),
+		"nothing may be measured once the request is rejected")
+}
+
+// TestClashDelayAcceptsValidExpected confirms the parameter reaches the measurement.
+func TestClashDelayAcceptsValidExpected(t *testing.T) {
+	target := newDelayTargetServer(t)
+	outbound := &recordingOutbound{}
+
+	for _, expression := range []string{"204", "200-299", "200/204", "*"} {
+		t.Run(expression, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet,
+				"/proxies/node/delay?timeout=5000&url="+target.server.URL+"/generate_204&expected="+expression, nil)
+			request = request.WithContext(context.WithValue(request.Context(), CtxKeyProxy, outbound))
+
+			recorder := httptest.NewRecorder()
+			getProxyDelay(&Server{
+				ctx:            context.Background(),
+				outbound:       stubOutboundManager{},
+				urlTestHistory: urltest.NewHistoryStorage(),
+			})(recorder, request)
+
+			require.Equal(t, http.StatusOK, recorder.Code,
+				"a valid expected expression must be accepted")
+		})
+	}
+}
