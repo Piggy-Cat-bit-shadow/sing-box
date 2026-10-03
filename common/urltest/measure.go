@@ -148,17 +148,25 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) 
 // error, because a caller that has stopped waiting must not be handed a success - doing so
 // produced a "successful" history entry for a request the Clash layer had already reported as a
 // timeout, and inside the URLTest group it raced against the batch's own context.
+// withMeasurementTimeout bounds ctx by timeout, without ever extending a caller's own deadline.
+//
+// Applying the timeout UNCONDITIONALLY is what makes the result min(parent, now+timeout). Passing a
+// shorter timeout than the parent's remaining time narrows the deadline; passing a longer one leaves
+// the parent's in place, because context.WithTimeout only ever tightens. The previous version only
+// applied the timeout when the caller had NO deadline, so a caller with a 60s deadline got 60s
+// instead of C.TCPTimeout - the measurement was effectively unbounded relative to what it intended.
+//
+// It is a separate function so a test can exercise the three cases with millisecond timeouts rather
+// than waiting out the real one.
+func withMeasurementTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, timeout)
+}
+
 func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Measurement, error) {
-	// ONE deadline for the whole measurement.
-	//
-	// The dial, the warm-up request and the timed request all run under this context, so the total
-	// cost is bounded by C.TCPTimeout rather than by that much per phase. A caller that already set
-	// an earlier deadline keeps it: the measurement must never extend the caller's own limit.
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, C.TCPTimeout)
-		defer cancel()
-	}
+	// ONE deadline for the whole measurement, and it is the EARLIER of the caller's and ours.
+	var cancelMeasurement context.CancelFunc
+	ctx, cancelMeasurement = withMeasurementTimeout(ctx, C.TCPTimeout)
+	defer cancelMeasurement()
 
 	normalized, err := NormalizeURLTestURL(options.Link)
 	if err != nil {
