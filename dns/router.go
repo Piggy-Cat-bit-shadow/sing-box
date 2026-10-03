@@ -1157,20 +1157,22 @@ func (r *Router) dnsGeneration() uint64 {
 	return r.networkGeneration.Load()
 }
 
-// recordReverseMappingForGeneration records a mapping only if the response belongs to the current
-// network generation.
+// reverseMappingGenerationCurrent reports whether a captured generation still describes the live
+// network.
 //
-// It returns whether the mapping was recorded, which is what makes the guard testable rather than
-// merely asserted.
-func (r *Router) recordReverseMappingForGeneration(generation uint64, answer reverseMappingAnswer) bool {
-	if generation != r.networkGeneration.Load() {
-		return false
-	}
+// # Why this is one function rather than a condition written twice
+//
+// The guard appeared twice: inline in recordReverseMappingFrom, and again in a test-facing helper
+// that recorded a mapping. Two copies of one rule can drift, and the drift is invisible in the worst
+// direction - production could be corrected while the test-facing copy kept the old behaviour, so the
+// tests would keep passing against a rule the product no longer follows.
+//
+// The condition lives here, and both callers use it.
+func (r *Router) reverseMappingGenerationCurrent(generation uint64) bool {
 	if r.dnsReverseMapping == nil {
 		return false
 	}
-	r.dnsReverseMapping.AddWithLifetime(answer.address, answer.domain, answer.lifetime)
-	return true
+	return generation == r.networkGeneration.Load()
 }
 
 // reverseMappingAnswer is one address-to-name mapping learned from a DNS answer.
@@ -1187,7 +1189,7 @@ type reverseMappingAnswer struct {
 // arrives. A request that spans a network change therefore cannot write into the cache the change
 // just cleared: its answer describes the network it was asked on, not the one that is current now.
 func (r *Router) recordReverseMappingFrom(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport, generation uint64) {
-	if r.dnsReverseMapping == nil || generation != r.networkGeneration.Load() {
+	if !r.reverseMappingGenerationCurrent(generation) {
 		return
 	}
 	if len(message.Question) > 0 && response != nil && len(response.Answer) > 0 {

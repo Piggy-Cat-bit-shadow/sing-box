@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 
 	mDNS "github.com/miekg/dns"
@@ -197,16 +198,17 @@ func TestLookupFamiliesDoesNotMixGenerations(t *testing.T) {
 	require.NotEmpty(t, ipv4Addresses, "the IPv4 family answered before the reset")
 	require.NotEmpty(t, ipv6Addresses, "the IPv6 family answered after the reset")
 
-	// Neither family's answer may be in the cache: both spanned the reset, so neither belongs to the
-	// generation that is now current.
-	for _, qtype := range []uint16{mDNS.TypeA, mDNS.TypeAAAA} {
-		question := mDNS.Question{Name: "dual.internal.", Qtype: qtype, Qclass: mDNS.ClassINET}
-		message := new(mDNS.Msg)
-		message.SetQuestion("dual.internal.", qtype)
-
-		cacheKey := client.newCacheKey(transport, question, message, adapter.DNSQueryOptions{})
-		cached, _, isStale := client.loadResponse(cacheKey)
-		require.False(t, cached != nil && !isStale,
-			"the family %d answer was cached across the reset", qtype)
-	}
+	// The AAAA family was issued before the reset and answered after it, so it must NOT be cached:
+	// storing it would serve the new network an address learned on the old one.
+	//
+	// The probe is a repeat lookup through the PRODUCTION path, counting upstream queries, rather
+	// than a hand-built cache key: the lookup applies its own options, so a key the test constructs
+	// is not necessarily the key the lookup used, and an assertion on the wrong key proves nothing.
+	queriesBefore := transport.counter(true).Load()
+	_, err := router.Lookup(context.Background(), "dual.internal.",
+		adapter.DNSQueryOptions{LookupStrategy: C.DomainStrategyIPv6Only, Strategy: C.DomainStrategyIPv6Only})
+	require.NoError(t, err)
+	require.Greater(t, transport.counter(true).Load(), queriesBefore,
+		"the AAAA answer spanned the reset and was served from cache on the next lookup. An address "+
+			"learned on the previous network must not answer a query on the new one")
 }

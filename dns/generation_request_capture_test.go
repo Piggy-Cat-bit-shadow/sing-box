@@ -255,7 +255,14 @@ func TestResetNetworkClosesTheWindowBeforePurging(t *testing.T) {
 	})
 
 	address := netip.MustParseAddr("203.0.113.12")
-	answer := reverseMappingAnswer{address: address, domain: "window.example", lifetime: time.Minute}
+	message := new(mDNS.Msg)
+	message.SetQuestion("window.example.", mDNS.TypeA)
+	response := new(mDNS.Msg)
+	response.SetReply(message)
+	response.Answer = append(response.Answer, &mDNS.A{
+		Hdr: mDNS.RR_Header{Name: "window.example.", Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 300},
+		A:   address.AsSlice(),
+	})
 
 	// A request issued before the reset, whose response arrives during it.
 	capturedGeneration := router.dnsGeneration()
@@ -267,7 +274,9 @@ func TestResetNetworkClosesTheWindowBeforePurging(t *testing.T) {
 	// still considered current. This is the window.
 	purgeThenCheck := func() bool {
 		router.dnsReverseMapping.Purge()
-		return router.recordReverseMappingForGeneration(capturedGeneration, answer)
+		router.recordReverseMappingFrom(message, response, nil, capturedGeneration)
+		_, loaded := router.LookupReverseMapping(address)
+		return loaded
 	}
 	require.True(t, purgeThenCheck(),
 		"this documents the old ordering's window: a capture from before the reset is accepted after "+
@@ -275,7 +284,9 @@ func TestResetNetworkClosesTheWindowBeforePurging(t *testing.T) {
 
 	// Now perform ResetNetwork for real and confirm the window is closed afterwards.
 	router.ResetNetwork()
-	require.False(t, router.recordReverseMappingForGeneration(capturedGeneration, answer),
+	router.recordReverseMappingFrom(message, response, nil, capturedGeneration)
+	_, afterReset := router.LookupReverseMapping(address)
+	require.False(t, afterReset,
 		"after ResetNetwork a capture from before it must be refused")
 	require.EqualValues(t, capturedGeneration+1, router.dnsGeneration(),
 		"and the reset advances the generation exactly once")
@@ -293,6 +304,14 @@ func TestResetNetworkOrderIsBarrierFirst(t *testing.T) {
 	router := newRouterForGenerationTest(t, &blockingReverseTransport{tag: "unused-3", entered: make(chan struct{}), release: make(chan struct{})})
 
 	address := netip.MustParseAddr("203.0.113.13")
+	message := new(mDNS.Msg)
+	message.SetQuestion("late.example.", mDNS.TypeA)
+	response := new(mDNS.Msg)
+	response.SetReply(message)
+	response.Answer = append(response.Answer, &mDNS.A{
+		Hdr: mDNS.RR_Header{Name: "late.example.", Rrtype: mDNS.TypeA, Class: mDNS.ClassINET, Ttl: 300},
+		A:   address.AsSlice(),
+	})
 	router.dnsReverseMapping.Add(address, "before-reset.example")
 
 	// A request issued before the reset.
@@ -307,11 +326,9 @@ func TestResetNetworkOrderIsBarrierFirst(t *testing.T) {
 	// ...AND the generation must already be advanced, so the pre-reset capture is stale.
 	require.NotEqual(t, capturedGeneration, router.dnsGeneration(),
 		"the generation must advance as part of the same reset")
-	require.False(t, router.recordReverseMappingForGeneration(capturedGeneration, reverseMappingAnswer{
-		address:  address,
-		domain:   "late.example",
-		lifetime: time.Minute,
-	}), "a capture from before the reset must not be recordable after it")
+	router.recordReverseMappingFrom(message, response, nil, capturedGeneration)
+	_, lateLoaded := router.LookupReverseMapping(address)
+	require.False(t, lateLoaded, "a capture from before the reset must not be recordable after it")
 }
 
 // TestResetNetworkIsABarrierFromItsFirstInstruction is the discriminating form of B1.
