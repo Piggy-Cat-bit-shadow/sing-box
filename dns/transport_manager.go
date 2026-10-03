@@ -245,55 +245,86 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 	if tag == "" {
 		return os.ErrInvalid
 	}
+	// Reject a duplicate BEFORE constructing anything.
+	//
+	// Constructing first and replacing afterwards discards an object whose constructor side effects
+	// cannot be undone - the bridge outbound claims a process-global slot, for example - and it
+	// silently runs a configuration the user did not write.
+	//
+	// The tag check is taken under the same lock that installs, so two concurrent Creates for one
+	// tag cannot both pass the check.
+	m.access.Lock()
+	if _, loaded := m.transportByTag[tag]; loaded {
+		m.access.Unlock()
+		return E.New("dns server ", tag, " already exists")
+	}
+	// Every reason the install could be refused is checked HERE, while nothing has been mutated.
+	// See installTransport.
+	if isDefaultCandidate(m, tag) && transportType == C.DNSTypeFakeIP {
+		m.access.Unlock()
+		return E.New("default server cannot be fakeip")
+	}
+	if transportType == C.DNSTypeFakeIP && m.fakeIPTransport != nil {
+		m.access.Unlock()
+		return E.New("multiple fakeip server are not supported")
+	}
+	m.access.Unlock()
+
 	transport, err := m.registry.CreateDNSTransport(ctx, logger, tag, transportType, options)
 	if err != nil {
 		return err
 	}
+
 	m.access.Lock()
 	defer m.access.Unlock()
+
+	// Re-check under the lock: another goroutine may have installed this tag or a fakeip server
+	// while the constructor ran. A loser releases what it built rather than leaking it.
+	if _, loaded := m.transportByTag[tag]; loaded {
+		_ = common.Close(transport)
+		return E.New("dns server ", tag, " already exists")
+	}
+	if transport.Type() == C.DNSTypeFakeIP && m.fakeIPTransport != nil {
+		_ = common.Close(transport)
+		return E.New("multiple fakeip server are not supported")
+	}
+	if isDefaultCandidate(m, tag) && transport.Type() == C.DNSTypeFakeIP {
+		_ = common.Close(transport)
+		return E.New("default server cannot be fakeip")
+	}
+
 	if m.started {
 		for _, stage := range adapter.ListStartStages {
 			err = adapter.LegacyStart(transport, stage)
 			if err != nil {
+				_ = common.Close(transport)
 				return E.Cause(err, stage, " dns/", transport.Type(), "[", transport.Tag(), "]")
 			}
 		}
 	}
-	if existsTransport, loaded := m.transportByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsTransport)
-			if err != nil {
-				return E.Cause(err, "close dns/", existsTransport.Type(), "[", existsTransport.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.transports, func(it adapter.DNSTransport) bool {
-			return it == existsTransport
-		})
-		if existsIndex == -1 {
-			panic("invalid inbound index")
-		}
-		m.transports = append(m.transports[:existsIndex], m.transports[existsIndex+1:]...)
-	}
+
 	m.transports = append(m.transports, transport)
 	m.transportByTag[tag] = transport
 	dependencies := transport.Dependencies()
 	for _, dependency := range dependencies {
 		m.dependByTag[dependency] = append(m.dependByTag[dependency], tag)
 	}
-	if tag == m.defaultTag || (m.defaultTag == "" && m.defaultTransport == nil) {
-		if transport.Type() == C.DNSTypeFakeIP {
-			return E.New("default server cannot be fakeip")
-		}
+	if isDefaultCandidate(m, tag) {
 		m.defaultTransport = transport
 		if m.started {
 			m.logger.Info("updated default server to ", transport.Tag())
 		}
 	}
 	if transport.Type() == C.DNSTypeFakeIP {
-		if m.fakeIPTransport != nil {
-			return E.New("multiple fakeip server are not supported")
-		}
 		m.fakeIPTransport = transport.(adapter.FakeIPTransport)
 	}
 	return nil
+}
+
+// isDefaultCandidate reports whether a tag would become the default server.
+//
+// It must be evaluated BEFORE anything is installed, so the FakeIP rule can be enforced without
+// mutating the manager first. The caller holds the lock.
+func isDefaultCandidate(m *TransportManager, tag string) bool {
+	return tag == m.defaultTag || (m.defaultTag == "" && m.defaultTransport == nil)
 }
