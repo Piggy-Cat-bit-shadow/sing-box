@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	sbdns "github.com/sagernet/sing-box/dns"
 	sbtransport "github.com/sagernet/sing-box/dns/transport"
@@ -165,9 +166,8 @@ func TestJiejieMinimalDNSTruncatedTCPFallback(t *testing.T) {
 
 	// A UDP-only transport, exactly as the production registry registers it.
 	udpTransport := newTestUDPTransport(t, server.address)
-	// The multiplexer keeps a background goroutine alive; close it so the suite's
-	// goroutine-leak check stays clean.
-	t.Cleanup(func() { _ = udpTransport.Close() })
+	// The multiplexer keeps a background goroutine alive. newTestUDPTransport registers the scope
+	// that owns it with t.Cleanup, so the suite's goroutine-leak check stays clean.
 
 	message := new(mDNS.Msg)
 	message.SetQuestion(mDNS.Fqdn(queryName), mDNS.TypeA)
@@ -299,6 +299,11 @@ func newTestUDPTransport(t *testing.T, address string) *sbtransport.UDPTransport
 		serverAddr,
 	)
 	require.NotNil(t, transport)
+	// Teardown is scope-owned: the transport has no Close of its own, so the scope that starts it is
+	// what releases the multiplexer's background goroutine.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	require.NoError(t, transport.Start(adapter.StartStateStart, scope))
+	t.Cleanup(func() { _ = scope.Close() })
 	return transport
 }
 

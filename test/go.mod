@@ -20,7 +20,7 @@ require (
 	github.com/sagernet/sing-quic v0.7.2-0.20260929152029-258509488380
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929152116-0a3456819ce7
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b
-	github.com/sagernet/sing-tun v0.9.7-0.20260929152201-837976228ca2
+	github.com/sagernet/sing-tun v0.9.7-0.20261002083955-3f8acd9da65b
 	github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd
 	github.com/spyzhov/ajson v0.9.4
 	github.com/stretchr/testify v1.12.0
@@ -157,7 +157,6 @@ require (
 	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 // indirect
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf // indirect
 	github.com/sagernet/nftables v0.3.0-mod.4 // indirect
-	github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be // indirect
 	github.com/sagernet/sing-cloudflared v0.1.4-0.20260929150702-b3a1e8f3018c // indirect
 	github.com/sagernet/sing-mux v0.3.10-0.20260928104022-13d386f5efbd // indirect
 	github.com/sagernet/sing-openconnect v0.1.1-0.20260929151226-29757281a247 // indirect
@@ -215,4 +214,8 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-	replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260930000459-0428bc73b0df
+
+replace github.com/sagernet/cronet-go => github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c
+
+replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94
