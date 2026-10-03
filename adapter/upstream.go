@@ -38,6 +38,20 @@ func NewUpstreamHandler(
 // It sets the flag ONLY from an explicit declaration. It deliberately does not infer a fixed
 // destination from anything else: an ordinary SOCKS UDP session has a destination on its first
 // datagram too, and treating that as "fixed" would pin the session to one address.
+// applyUDPConnectGuarded promotes a fixed-destination declaration unless the session carries a
+// destination on every datagram.
+//
+// A UoT session with per-datagram destinations is explicitly NOT fixed-destination: connecting it
+// would pin the session to whichever address the first datagram happened to use and break every
+// later one. The guard therefore belongs at every entry point, not only in the router - an entry
+// that skipped it would promote exactly the sessions the guard exists to exclude.
+func applyUDPConnectGuarded(metadata *InboundContext, conn N.PacketConn) {
+	if metadata.UoTDatagramDestinations {
+		return
+	}
+	ApplyUDPConnect(metadata, conn)
+}
+
 func ApplyUDPConnect(metadata *InboundContext, conn N.PacketConn) {
 	if conn == nil || metadata == nil {
 		return
@@ -138,24 +152,31 @@ type routeHandlerWrapper struct {
 }
 
 func (r *routeHandlerWrapper) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	// A copy per session, for the same reason as the packet path below.
+	metadata := r.metadata
 	if source.IsValid() {
-		r.metadata.Source = source
+		metadata.Source = source
 	}
 	if destination.IsValid() {
-		r.metadata.Destination = destination
+		metadata.Destination = destination
 	}
-	r.router.RouteConnectionEx(ctx, conn, r.metadata, onClose)
+	r.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
 func (r *routeHandlerWrapper) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	// A COPY per session. The wrapper is built once and reused for every session on this inbound,
+	// so writing into r.metadata directly made everything session-specific - Source, Destination
+	// and UDPConnect - sticky: a session that declared a fixed destination left UDPConnect set
+	// for the next session, which never declared one.
+	metadata := r.metadata
 	if source.IsValid() {
-		r.metadata.Source = source
+		metadata.Source = source
 	}
 	if destination.IsValid() {
-		r.metadata.Destination = destination
+		metadata.Destination = destination
 	}
-	ApplyUDPConnect(&r.metadata, conn)
-	r.router.RoutePacketConnectionEx(ctx, conn, r.metadata, onClose)
+	applyUDPConnectGuarded(&metadata, conn)
+	r.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
 func NewRouteContextHandler(
@@ -191,6 +212,6 @@ func (r *routeContextHandlerWrapper) NewPacketConnectionEx(ctx context.Context, 
 	if destination.IsValid() {
 		metadata.Destination = destination
 	}
-	ApplyUDPConnect(metadata, conn)
+	applyUDPConnectGuarded(metadata, conn)
 	r.router.RoutePacketConnectionEx(ctx, conn, *metadata, onClose)
 }
