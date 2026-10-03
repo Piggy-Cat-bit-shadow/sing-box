@@ -933,6 +933,17 @@ func (g *URLTestGroup) requestHealthRecheck() {
 	}
 
 	g.recheckAccess.Lock()
+	// Re-check terminal INSIDE the lock that records the debt.
+	//
+	// The check above runs before this lock, so a Close can land in between. Without this second
+	// check the request would record debt on a group that can never serve it, and - because the
+	// group is terminal - that debt is exactly what the exit path has to retire, so nothing is
+	// gained by admitting it. Refusing here keeps "requested > served" meaning "work that is still
+	// possible".
+	if g.ctx.Err() != nil {
+		g.recheckAccess.Unlock()
+		return
+	}
 	// Record the debt. This is the whole point of the redesign: whether or not a round is running,
 	// the request is remembered, because a forced probe that never happens leaves the node that
 	// just failed to carry traffic eligible for selection on the strength of the measurement the
@@ -1017,8 +1028,20 @@ func (g *URLTestGroup) drainHealthRechecks() {
 			// worker replay the same panicking round without bound.
 			g.recheckServed = servingMark
 		}
+
+		// A TERMINAL group owes nothing.
+		//
+		// Its remaining debt can never be served, so it must be retired rather than carried. The
+		// comparison below is otherwise permanently true on a canceled group - every exiting worker
+		// would spawn a replacement, which would start, find the context canceled, exit, and spawn
+		// another. Close did not stop the group's health work; it converted it into goroutine churn
+		// that outlives the group.
+		if g.ctx.Err() != nil {
+			g.recheckServed = g.recheckRequested
+		}
+
 		retired = g.recheckServed
-		replacement := g.recheckRequested > retired
+		replacement := g.ctx.Err() == nil && g.recheckRequested > retired
 		if replacement {
 			// Claim the worker slot while still holding the lock, so a request arriving now either
 			// observes a worker or starts one itself. There is no window in which it waits for a
