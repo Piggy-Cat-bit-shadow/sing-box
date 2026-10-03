@@ -185,6 +185,45 @@ python3 "$root/scripts/ci/fix-apple-team-id.py" "$submodule_path"
 python3 "$root/scripts/ci/apply-apple-branding-overlay.py" "$submodule_path"
 
 # ---------------------------------------------------------------------------
+# 1d. [links] Source Code and Releases point at this fork.
+# ---------------------------------------------------------------------------
+# Two links in Settings > About are product attribution: the row that opens the source
+# repository, and the Releases item in its context menu. Both ship pointing at upstream
+# SagerNet/sing-box, which is the wrong product for this fork.
+#
+# The Documentation, Changelog and Configuration links are deliberately NOT touched.
+# They point at sing-box.sagernet.org, which is the upstream project's technical
+# documentation and remains correct for a downstream client: the fork changes who
+# publishes the app, not where the protocol is documented. Rewriting them to a GitHub
+# README would replace maintained documentation with something that is not a
+# substitute for it. The Sponsors links are left alone for the same reason - they
+# credit the upstream author and there is no fork sponsor configuration to substitute.
+#
+# This is a separate script from branding because the semantics differ: branding is
+# about the product name, links are about fork ownership and external destination.
+# They happen to share a lifetime, so they are applied in the same preparation step.
+#
+# Both iOS and macOS go through this script, so neither product can end up with the
+# upstream attribution while the other has the fork's.
+echo "overlay [links]: source and releases -> Piggy-Cat-bit-shadow/sing-box"
+python3 "$root/scripts/ci/apply-apple-link-overlay.py" "$submodule_path"
+
+# Verified rather than assumed: the checker asserts the fork links are present exactly
+# once AND that the upstream documentation links survived, so a preparation that
+# dropped or rewrote the docs is caught here rather than shipped.
+if ! python3 "$root/scripts/ci/check-apple-links.py" "$submodule_path"; then
+  echo "prepare-apple-client.sh: the link overlay did not produce the expected source" >&2
+  exit 1
+fi
+
+# Provenance, so the GitHub Actions log records which client was prepared and where its
+# two product links point. The checker above already proved these values; printing them
+# makes the run auditable without reading the source out of the artifact.
+echo "[apple-links] submodule=$actual_sha"
+echo "[apple-links] source=https://github.com/Piggy-Cat-bit-shadow/sing-box"
+echo "[apple-links] releases=https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"
+
+# ---------------------------------------------------------------------------
 # 2. [entitlements] Multicast switch and App Group consistency.
 # ---------------------------------------------------------------------------
 # Multicast Networking must be requested from Apple separately, so it is off by
