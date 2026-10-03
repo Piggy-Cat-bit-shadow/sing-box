@@ -143,9 +143,14 @@ func TestMergeOriginalDestinationPreservesFamilyPreference(t *testing.T) {
 	require.Equal(t, netip.MustParseAddr("192.0.2.1"), merged[0],
 		"prefer_ipv4 must still lead with IPv4 even when the original is IPv6")
 
+	// With prefer_ipv6 the family order is IPv6 first, and WITHIN that family the original
+	// leads: it is the endpoint the application selected, and it outranks addresses obtained by
+	// re-resolving a sniffed name. The IPv4 family still interleaves behind it.
 	merged6 := mergeOriginalDestination(original, resolved, C.DomainStrategyPreferIPv6)
-	require.Equal(t, netip.MustParseAddr("2001:db8::1"), merged6[0],
-		"prefer_ipv6 must lead with IPv6")
+	require.Equal(t, netip.MustParseAddr("240e:1::1"), merged6[0],
+		"prefer_ipv6 must lead with IPv6, and the application's own address must lead within it")
+	require.Contains(t, merged6, netip.MustParseAddr("2001:db8::1"),
+		"the resolved IPv6 address must remain a candidate behind the original")
 }
 
 func TestMergeOriginalDestinationHonoursHardStrategies(t *testing.T) {

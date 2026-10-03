@@ -122,20 +122,31 @@ func TestPlanCandidatesHardStrategiesStaySingleFamily(t *testing.T) {
 
 func TestPlanCandidatesIncludesOriginalDestinationInItsFamily(t *testing.T) {
 	// The recovery case: the application chose an IPv6 literal, DNS returned both families.
-	// The original must remain a candidate, placed in its own family at that family's end
-	// so the resolver's ordering stays authoritative.
+	//
+	// The original must remain a candidate AND lead its own family. It is the endpoint the
+	// application selected, and it outranks addresses obtained by re-resolving a sniffed name -
+	// which can legitimately differ from what the application resolved. Placing it after them,
+	// as an earlier version did, let a recovery lookup push the application's own endpoint
+	// behind addresses it never asked for.
 	original := mustAddr(t, "240e:1::1")
 	v6a := mustAddr(t, "2001:db8::1")
 	v4a := mustAddr(t, "192.0.2.1")
 
-	// IPv6 leads (the original's family), and the original sits at the END of its family
-	// rather than ahead of the resolved addresses: the resolver's ordering is authoritative
-	// within a family, and the original is a recovery candidate, not a preferred one.
+	// IPv6 leads because AsIS follows the original's family, and the original leads WITHIN
+	// that family. The two families then interleave, so IPv4 takes the second slot - which is
+	// the RFC 8305 behaviour, not a demotion of the original.
+	//
+	// The property that matters is the FIRST candidate: it must be the application's own
+	// address, not one recovered by re-resolving the sniffed name.
 	plan := planCandidates([]netip.Addr{v4a, v6a}, original, C.DomainStrategyAsIS)
 	require.Equal(t,
-		[]string{v6a.String(), v4a.String(), original.String()},
+		[]string{original.String(), v4a.String(), v6a.String()},
 		planStrings(plan),
-		"AsIS keeps the original's family first, with the original appended within it")
+		"the original must lead, with the families interleaved behind it")
+	require.Equal(t, original, plan.candidates[0].address,
+		"the application's own endpoint must be dialled first")
+	require.True(t, plan.candidates[0].original,
+		"the leading candidate must be marked as the application's own address")
 }
 
 func TestPlanCandidatesDoesNotDuplicateTheOriginal(t *testing.T) {
@@ -205,4 +216,178 @@ func TestPlanCandidatesMarksOriginalProvenance(t *testing.T) {
 		}
 	}
 	require.True(t, foundOriginal, "the original destination must be present")
+}
+
+// --- original-literal precedence (A-H) -----------------------------------------------
+//
+// Every case asserts the EXACT candidate order, not merely that the original is present.
+// The defect these pin was precisely a present-but-misplaced address: when the resolver
+// returned the application's own address, the old presence check left it where the resolver
+// put it, so a re-resolved address could sit in front of the endpoint the application chose.
+
+func TestOriginalLiteralLeadsItsFamilyEvenWhenAlreadyResolved(t *testing.T) {
+	original := mustAddr(t, "192.0.2.4")
+	resolved := []netip.Addr{
+		mustAddr(t, "192.0.2.8"),
+		mustAddr(t, "192.0.2.4"), // the original, in the middle
+		mustAddr(t, "192.0.2.9"),
+	}
+
+	plan := planCandidates(resolved, original, C.DomainStrategyAsIS)
+	require.Equal(t,
+		[]string{"192.0.2.4", "192.0.2.8", "192.0.2.9"},
+		planStrings(plan),
+		"an original already present in the resolved list must be MOVED to the front of its "+
+			"family, not left where the resolver put it")
+}
+
+func TestOriginalLiteralPrecedenceMatrix(t *testing.T) {
+	cases := []struct {
+		name     string
+		resolved []string
+		original string
+		strategy C.DomainStrategy
+		want     []string
+	}{
+		{
+			// A. absent: must be ADDED to its family.
+			name:     "A absent IPv4 original is added to the IPv4 family",
+			resolved: []string{"192.0.2.8", "192.0.2.9"},
+			original: "192.0.2.4",
+			strategy: C.DomainStrategyAsIS,
+			want:     []string{"192.0.2.4", "192.0.2.8", "192.0.2.9"},
+		},
+		{
+			// B. present in the middle: must be MOVED, with no duplicate.
+			name:     "B IPv4 original present mid-list is promoted without duplication",
+			resolved: []string{"192.0.2.8", "192.0.2.4", "192.0.2.9"},
+			original: "192.0.2.4",
+			strategy: C.DomainStrategyAsIS,
+			want:     []string{"192.0.2.4", "192.0.2.8", "192.0.2.9"},
+		},
+		{
+			// C. the IPv6 mirror.
+			name:     "C IPv6 original present mid-list is promoted",
+			resolved: []string{"240e:1::8", "240e:1::4", "240e:1::9"},
+			original: "240e:1::4",
+			strategy: C.DomainStrategyPreferIPv6,
+			want:     []string{"240e:1::4", "240e:1::8", "240e:1::9"},
+		},
+		{
+			// D. the resolver returned the IPv4-mapped form of the original.
+			name:     "D IPv4-mapped duplicate is deduplicated canonically",
+			resolved: []string{"::ffff:192.0.2.4", "192.0.2.8"},
+			original: "192.0.2.4",
+			strategy: C.DomainStrategyAsIS,
+			want:     []string{"192.0.2.4", "192.0.2.8"},
+		},
+		{
+			// E. preference governs the FAMILY order; the original leads WITHIN its family.
+			name:     "E PreferIPv6 with an IPv4 original keeps IPv6 leading overall",
+			resolved: []string{"2001:db8::1", "192.0.2.8", "192.0.2.4"},
+			original: "192.0.2.4",
+			strategy: C.DomainStrategyPreferIPv6,
+			want:     []string{"2001:db8::1", "192.0.2.4", "192.0.2.8"},
+		},
+		{
+			// F. the symmetric case.
+			name:     "F PreferIPv4 with an IPv6 original keeps IPv4 leading overall",
+			resolved: []string{"192.0.2.1", "240e:1::8", "240e:1::4"},
+			original: "240e:1::4",
+			strategy: C.DomainStrategyPreferIPv4,
+			want:     []string{"192.0.2.1", "240e:1::4", "240e:1::8"},
+		},
+		{
+			// G. strict: no IPv6 may appear, and the original still leads its own family.
+			name:     "G IPv4Only admits no IPv6 and still promotes the IPv4 original",
+			resolved: []string{"192.0.2.8", "192.0.2.4", "2001:db8::1"},
+			original: "192.0.2.4",
+			strategy: C.DomainStrategyIPv4Only,
+			want:     []string{"192.0.2.4", "192.0.2.8"},
+		},
+		{
+			// H. the mirror.
+			name:     "H IPv6Only admits no IPv4 and still promotes the IPv6 original",
+			resolved: []string{"240e:1::8", "240e:1::4", "192.0.2.1"},
+			original: "240e:1::4",
+			strategy: C.DomainStrategyIPv6Only,
+			want:     []string{"240e:1::4", "240e:1::8"},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			resolved := make([]netip.Addr, 0, len(testCase.resolved))
+			for _, address := range testCase.resolved {
+				resolved = append(resolved, mustAddr(t, address))
+			}
+
+			plan := planCandidates(resolved, mustAddr(t, testCase.original), testCase.strategy)
+			require.Equal(t, testCase.want, planStrings(plan),
+				"the candidate order must match exactly; an original that is present but "+
+					"misplaced is the failure this pins")
+
+			// No candidate may appear twice. A promotion implemented as an append rather than a
+			// move would duplicate the original, which addresses the ordering symptom while
+			// creating a second connection to the same host.
+			seen := make(map[string]struct{}, len(plan.candidates))
+			for _, candidate := range plan.candidates {
+				_, duplicate := seen[candidate.address.String()]
+				require.False(t, duplicate, "candidate %v appears more than once", candidate.address)
+				seen[candidate.address.String()] = struct{}{}
+			}
+
+			// Strict strategies must remain strict regardless of the original's family.
+			for _, candidate := range plan.candidates {
+				isV6 := candidate.address.Is6() && !candidate.address.Is4In6()
+				switch testCase.strategy {
+				case C.DomainStrategyIPv4Only:
+					require.False(t, isV6, "ipv4_only must not admit %v", candidate.address)
+				case C.DomainStrategyIPv6Only:
+					require.False(t, candidate.address.Is4() || candidate.address.Is4In6(),
+						"ipv6_only must not admit %v", candidate.address)
+				}
+			}
+		})
+	}
+}
+
+func TestOriginalLiteralPromotionPreservesResolvedOrderOtherwise(t *testing.T) {
+	// Only the original may move. Every other address must keep its relative resolver order,
+	// which is what makes this a promotion rather than a re-sort.
+	original := mustAddr(t, "192.0.2.5")
+	resolved := []netip.Addr{
+		mustAddr(t, "192.0.2.1"),
+		mustAddr(t, "192.0.2.2"),
+		mustAddr(t, "192.0.2.5"),
+		mustAddr(t, "192.0.2.3"),
+		mustAddr(t, "192.0.2.4"),
+	}
+
+	plan := planCandidates(resolved, original, C.DomainStrategyIPv4Only)
+	require.Equal(t,
+		[]string{"192.0.2.5", "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"},
+		planStrings(plan),
+		"the original moves; the resolver's ordering of everything else is preserved")
+}
+
+func TestOriginalLiteralKeptWhenAbsentFromResolved(t *testing.T) {
+	// The recovery case, which must not regress: the resolved set may not contain the
+	// application's address at all (a CDN answering differently, split-horizon DNS, a cached
+	// mapping), and the address must still appear in its family.
+	original := mustAddr(t, "240e:1::1")
+	resolved := []netip.Addr{mustAddr(t, "192.0.2.1")}
+
+	plan := planCandidates(resolved, original, C.DomainStrategyAsIS)
+	require.Equal(t, []string{"240e:1::1", "192.0.2.1"}, planStrings(plan),
+		"an absent original must be ADDED to its own family")
+
+	var found bool
+	for _, candidate := range plan.candidates {
+		if candidate.address == original {
+			found = true
+			require.True(t, candidate.original, "the added candidate must carry original provenance")
+		}
+	}
+	require.True(t, found)
 }

@@ -25,14 +25,30 @@ func NewUpstreamHandler(
 	}
 }
 
-// applyUDPConnect records a connection's fixed-destination declaration on the
-// metadata. Both packet wrappers call it so the two entry points cannot drift: a
-// tunnel that declares UDPConnectPacketConn must take the connected-UDP path no
-// matter which wrapper carried it to the router.
-func applyUDPConnect(metadata *InboundContext, conn N.PacketConn) {
-	if marker, isMarker := conn.(UDPConnectPacketConn); isMarker && marker.IsUDPConnect() {
-		metadata.UDPConnect = true
+// ApplyUDPConnect records a connection's fixed-destination declaration on the metadata.
+//
+// # Why it is exported
+//
+// The declaration is made by the INBOUND tunnel, and it has to be read at the point where the
+// original packet connection is still visible - before the router wraps it for caching,
+// destination guarding, connection tracking or FakeIP NAT. Those wrappers do not forward the
+// type assertion, so a reader placed after them silently stops working. The router performs
+// the read, so it needs this helper.
+//
+// It sets the flag ONLY from an explicit declaration. It deliberately does not infer a fixed
+// destination from anything else: an ordinary SOCKS UDP session has a destination on its first
+// datagram too, and treating that as "fixed" would pin the session to one address.
+func ApplyUDPConnect(metadata *InboundContext, conn N.PacketConn) {
+	if conn == nil || metadata == nil {
+		return
 	}
+	marker, isMarker := conn.(UDPConnectPacketConn)
+	if !isMarker || !marker.IsUDPConnect() {
+		return
+	}
+	// Only ever set, never clear: an explicit udp_connect rule action may already have set it,
+	// and a capability must not be able to turn a user's configuration off.
+	metadata.UDPConnect = true
 }
 
 var _ UpstreamHandlerAdapter = (*myUpstreamHandlerWrapper)(nil)
@@ -138,7 +154,7 @@ func (r *routeHandlerWrapper) NewPacketConnectionEx(ctx context.Context, conn N.
 	if destination.IsValid() {
 		r.metadata.Destination = destination
 	}
-	applyUDPConnect(&r.metadata, conn)
+	ApplyUDPConnect(&r.metadata, conn)
 	r.router.RoutePacketConnectionEx(ctx, conn, r.metadata, onClose)
 }
 
@@ -175,6 +191,6 @@ func (r *routeContextHandlerWrapper) NewPacketConnectionEx(ctx context.Context, 
 	if destination.IsValid() {
 		metadata.Destination = destination
 	}
-	applyUDPConnect(metadata, conn)
+	ApplyUDPConnect(metadata, conn)
 	r.router.RoutePacketConnectionEx(ctx, conn, *metadata, onClose)
 }

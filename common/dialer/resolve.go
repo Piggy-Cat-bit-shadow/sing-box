@@ -197,7 +197,19 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 	// preferredFamilyGrace before being fed through anyway, so a hung preferred family cannot
 	// withhold an answer already in hand. The preferred family is never held, so when it
 	// answers first the connection starts with no added delay at all.
+	// The preference is decided by the EFFECTIVE strategy reported by the resolver, not by
+	// d.queryOptions.Strategy.
+	//
+	// Strategy is frequently AsIS, which does not mean "no preference" - it means "use the DNS
+	// router's default", and that default may be prefer_ipv6. Reading the raw option would treat
+	// AsIS as "not PreferIPv6" and rank IPv4 first, so a resolver configured to prefer IPv6
+	// would get the opposite of its configuration on every connection.
+	//
+	// The value arrives with the first family result, so the decision is made inside the feeder
+	// rather than here. Until it is known, nothing is held back and nothing is preferred: the
+	// feeder falls back to the raw option, which is correct for every non-AsIS strategy.
 	preferIPv6 := strategy == C.DomainStrategyPreferIPv6
+	effectiveKnown := false
 	firstReady := make(chan struct{})
 	var readyOnce sync.Once
 
@@ -287,6 +299,21 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 			}
 
 			result := arrivalValue
+
+			// Adopt the resolver's effective preference, when the resolver reports one.
+			//
+			// A result that carries no effective strategy - an AsIS default, or a third-party
+			// router that predates this field - must NOT silently become "prefer IPv4". AsIS
+			// here means "no opinion was expressed", so the option the caller already supplied
+			// is kept. That is what makes this addition backward compatible instead of a
+			// behaviour change for every existing implementation.
+			if !effectiveKnown {
+				effectiveKnown = true
+				if result.EffectiveStrategy != C.DomainStrategyAsIS {
+					preferIPv6 = result.EffectiveStrategy == C.DomainStrategyPreferIPv6
+				}
+			}
+
 			if len(result.Addresses) == 0 {
 				continue
 			}
@@ -663,28 +690,60 @@ func strategyName(strategy C.DomainStrategy) string {
 //
 // # Ownership
 //
-// Exactly one connection is returned. The loser is closed, and the losing attempt is cancelled
-// through cancelOriginal, so nothing is left running when this returns.
+// Exactly one connection is returned. This is enforced, not asserted:
+//
+//	both attempts run under raceCtx
+//	the loser is cancelled
+//	the loser's worker is WAITED for before returning
+//	a loser that succeeded anyway is closed
+//
+// # Why a child context and a wait, rather than cancelling and hoping
+//
+// The earlier version ran the recovered race on the CALLER's context and kept no handle on its
+// worker. When the original won, the recovered attempt therefore kept dialling for as long as
+// the connection lived - and if it eventually succeeded, that connection was written to a
+// buffered channel nobody would ever read and was leaked, open, with no owner.
+//
+// Cancelling is not sufficient on its own either: a dial can have already established a
+// connection before the cancellation is observed, so the worker must be waited for and its
+// result inspected. That is what makes "the loser is closed" true rather than likely.
+//
+// The wait is bounded by the loser's own attempt, which is itself bounded by raceCtx and the
+// attempt timeout - so this cannot block on a dial that ignores cancellation forever.
 func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, original <-chan literalDialResult, cancelOriginal context.CancelFunc) (net.Conn, error) {
+	// raceCtx governs BOTH attempts. Cancelling it stops the loser's dial; waiting on the
+	// WaitGroup afterwards proves the loser is no longer running.
+	raceCtx, cancelRace := context.WithCancel(ctx)
+	defer cancelRace()
+
 	recoveredResult := make(chan literalDialResult, 1)
 
+	var workers sync.WaitGroup
+
+	// --- attempt 1: the recovered candidates ---
+	workers.Add(1)
 	go func() {
+		defer workers.Done()
 		strategy := d.queryOptions.Strategy
 		candidates := MergeOriginalDestination(destination.Addr, addresses, strategy)
-		conn, err := d.raceCandidates(ctx, network, destination, candidates, strategy)
+		// raceCtx, not ctx: this attempt must stop the moment the race is decided. Using the
+		// connection's context was the leak - it outlives the race by minutes.
+		conn, err := d.raceCandidates(raceCtx, network, destination, candidates, strategy)
 		recoveredResult <- literalDialResult{conn: conn, err: err}
 	}()
 
 	var (
-		winner     net.Conn
-		firstErr   error
-		haveErr    bool
-		originalOK bool
+		winner   net.Conn
+		firstErr error
+		haveErr  bool
 	)
-	for completed := 0; completed < 2 && winner == nil; completed++ {
+
+	// The original is not owned by this function; its worker belongs to the caller and is
+	// cancelled through cancelOriginal. It reports on the `original` channel, which is buffered,
+	// so a late result cannot block it and cannot be lost.
+	for winner == nil {
 		select {
 		case result := <-original:
-			originalOK = true
 			if result.err == nil {
 				winner = result.conn
 			} else if !haveErr {
@@ -698,14 +757,29 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 				firstErr = result.err
 				haveErr = true
 			}
-		case <-ctx.Done():
+			// The recovered attempt has reported. Whether it won or lost, it is finished.
+		case <-raceCtx.Done():
 			cancelOriginal()
-			return nil, ctx.Err()
+			cancelRace()
+			workers.Wait()
+			d.closeLateRecovered(recoveredResult)
+			return nil, raceCtx.Err()
+		}
+
+		if winner != nil {
+			break
 		}
 	}
 
-	// Stop the attempt that did not win.
+	// A winner exists. Stop the other side and make sure nothing survives this function.
 	cancelOriginal()
+	cancelRace()
+
+	// Wait for the recovered worker to finish, then take ownership of anything it produced.
+	// Without this wait, "the loser is closed" would be a claim about a goroutine that may not
+	// have run yet.
+	workers.Wait()
+	d.closeLateRecovered(recoveredResult)
 
 	if winner != nil {
 		return winner, nil
@@ -713,11 +787,24 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 	if haveErr {
 		return nil, firstErr
 	}
-	if !originalOK {
-		// Neither reported, which can only happen if the context ended.
-		return nil, ctx.Err()
+	// Neither attempt produced a connection and neither reported an error, which can only
+	// happen when the race context ended underneath them.
+	return nil, raceCtx.Err()
+}
+
+// closeLateRecovered closes a recovered connection that arrived after the race was decided.
+//
+// The channel is buffered with capacity one and the worker sends exactly once, so this is a
+// non-blocking read: either the result is already there, or the worker exited without producing
+// one. There is no third case, and no detached cleanup goroutine is needed.
+func (d *resolveDialer) closeLateRecovered(recoveredResult <-chan literalDialResult) {
+	select {
+	case result := <-recoveredResult:
+		if result.conn != nil {
+			result.conn.Close()
+		}
+	default:
 	}
-	return nil, ctx.Err()
 }
 
 // literalDialResult is one attempt's outcome on the literal-recovery path.
@@ -726,9 +813,26 @@ type literalDialResult struct {
 	err  error
 }
 
+// fallbackDelayOrDefault returns the delay that staggers connection candidates.
+//
+// # Why the default is the connection fallback delay, not the DNS grace
+//
+// This used to return preferredFamilyGrace - the 50ms window that governs how long the DNS layer
+// holds a non-preferred address family waiting for the preferred one. That is a RESOLUTION
+// timescale: it decides which family's answer is fed to the dialer first.
+//
+// The value returned here is a CONNECTION timescale: how long the original literal attempt gets
+// before the recovered candidates start. Borrowing the resolution constant conflated two
+// different decisions and made literal recovery start roughly six times sooner than the rest of
+// the dialer staggers candidates, so a healthy-but-slow original could be raced before it had a
+// realistic chance - losing the preference the application asked for.
+//
+// The connection timescale already has a definition in this project: N.DefaultFallbackDelay,
+// the same interval the candidate scheduler uses. Reusing it keeps one meaning for "stagger a
+// connection attempt" and avoids inventing a third constant that would drift from both.
 func (d *resolveDialer) fallbackDelayOrDefault() time.Duration {
 	if d.fallbackDelay > 0 {
 		return d.fallbackDelay
 	}
-	return preferredFamilyGrace
+	return N.DefaultFallbackDelay
 }

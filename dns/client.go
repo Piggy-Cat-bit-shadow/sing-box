@@ -499,21 +499,23 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	case C.DomainStrategyIPv6Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
-	// The two families are exchanged concurrently and each result is published as it
-	// arrives, so neither can hold the other hostage. Lookup collects the same stream to
-	// completion, which keeps its signature and its answers identical - see
-	// client_dual_stack.go for why the policy path is unchanged.
+	// Lookup is the COMPLETE-lookup contract, and this is deliberate.
 	//
-	// The previous implementation ran the same two exchanges through task.Group and then
-	// waited for both. A resolver answering A in 10ms and never answering AAAA delayed every
-	// connection by the AAAA timeout, even though a usable address was in hand immediately.
-	// Lookup is the COMPLETE-lookup contract: callers use it for routing, rule matching,
-	// candidate lists published on metadata and diagnostics, and all of them expect the whole
-	// address set. Taking the streaming path here would return only the first family to
-	// answer, silently halving the result for every one of them.
+	// Both families are exchanged concurrently but Lookup waits for BOTH. Callers use it for
+	// routing, rule matching, the candidate list published on metadata, and diagnostics, and
+	// every one of them expects the whole address set. Returning as soon as one family
+	// answered would hand routing a half-populated candidate list, which is a correctness
+	// change disguised as a latency improvement.
 	//
-	// Latency-oriented streaming belongs to the connection path, which has its own entry
-	// point. A fast lookup must not be bought by giving routing an incomplete answer.
+	// A family that answers slowly therefore delays the result. That is the intended
+	// trade-off here, and it is why latency-sensitive connection setup does NOT go through
+	// this function: a caller that wants to start connecting before both families have
+	// answered needs a different entry point, not a partial answer from this one.
+	//
+	// Concretely: a resolver answering A in 10ms and AAAA in 3s makes Lookup take about 3s.
+	// That is correct for routing. It would be wrong to shorten it by dropping the second
+	// family, because DestinationAddresses and the rule matcher would then see only half the
+	// addresses the resolver returned.
 	response4, response6, err := c.collectFamiliesComplete(
 		ctx,
 		transport,

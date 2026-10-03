@@ -36,18 +36,29 @@ func (r *Router) LookupFamilies(ctx context.Context, domain string, options adap
 		return E.New("nil result publisher")
 	}
 
-	// A strict strategy is a single-family request, reported once.
-	switch options.Strategy {
+	// The strategy that will actually be applied, which is NOT necessarily options.Strategy.
+	//
+	// AsIS means "use the resolver's default", and that default belongs to this router. Deciding
+	// single-family versus dual-family from the raw options would therefore treat a router
+	// configured for one family as a dual-family request, and would report a preference the
+	// connection layer could not see. Resolving it once, here, keeps this the only place that
+	// knows the answer.
+	effectiveStrategy := r.resolveLookupStrategy(options)
+
+	// A strict strategy is a single-family request, reported once. The check uses the EFFECTIVE
+	// strategy so a router default of ipv4_only or ipv6_only also issues a single query, rather
+	// than querying a family it has been configured never to use.
+	switch effectiveStrategy {
 	case C.DomainStrategyIPv4Only:
 		addresses, err := r.Lookup(ctx, domain, options)
-		publish(adapter.DNSFamilyResult{IPv6: false, Addresses: addresses, Err: err})
+		publish(adapter.DNSFamilyResult{IPv6: false, Addresses: addresses, Err: err, EffectiveStrategy: effectiveStrategy})
 		if err != nil && len(addresses) == 0 {
 			return err
 		}
 		return nil
 	case C.DomainStrategyIPv6Only:
 		addresses, err := r.Lookup(ctx, domain, options)
-		publish(adapter.DNSFamilyResult{IPv6: true, Addresses: addresses, Err: err})
+		publish(adapter.DNSFamilyResult{IPv6: true, Addresses: addresses, Err: err, EffectiveStrategy: effectiveStrategy})
 		if err != nil && len(addresses) == 0 {
 			return err
 		}
@@ -82,7 +93,14 @@ func (r *Router) LookupFamilies(ctx context.Context, domain string, options adap
 		}
 		access.Unlock()
 
-		publish(adapter.DNSFamilyResult{IPv6: ipv6, Addresses: addresses, Err: err})
+		publish(adapter.DNSFamilyResult{
+			IPv6:      ipv6,
+			Addresses: addresses,
+			Err:       err,
+			// Both families report the same effective strategy, so a consumer never has to
+			// decide which result to believe.
+			EffectiveStrategy: effectiveStrategy,
+		})
 	}
 
 	waitGroup.Add(2)

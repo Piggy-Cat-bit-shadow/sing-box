@@ -202,6 +202,30 @@ func (p *ConnPool[T]) removeConn(state *connPoolState[T], conn T, cause error) {
 	}
 }
 
+// CloseIdle closes connections that are currently IDLE, and nothing else.
+//
+// # Why ConnPoolOrdered needs its own branch
+//
+// The original implementation handled only ConnPoolSingle and returned immediately for any
+// other mode. So for the serial DNS pool - which is exactly ConnPoolOrdered - CloseIdle was a
+// silent no-op: CloseIdleConnections() and SetKeepIdleConnections(false) could not actually
+// release a serial keep-alive connection, and their names claimed otherwise.
+//
+// # What must never be closed
+//
+// Only connections sitting in the idle list. A connection that is checked out is owned by a
+// caller mid-query, and a connection still being dialled is owned by the dial path; closing
+// either would break an in-flight query. Neither is in the idle list, so detaching from the
+// list is what selects them correctly - this is not a guess about liveness.
+//
+// # Bookkeeping consistency
+//
+// state.all, state.idle and state.idleElements must agree. The connection is removed from the
+// list and from BOTH maps while the lock is held, so no reader can observe a connection that
+// is in one structure and not the others.
+//
+// The real Close happens OUTSIDE the lock: a socket close can block, and holding the pool mutex
+// across it would stall every other query behind an unrelated teardown.
 func (p *ConnPool[T]) CloseIdle() {
 	p.access.Lock()
 	if p.closed {
@@ -209,14 +233,53 @@ func (p *ConnPool[T]) CloseIdle() {
 		return
 	}
 	state := p.state
-	if p.options.Mode != ConnPoolSingle || !state.hasShared || state.sharedUsers > 0 || state.sharedWaiters > 0 {
+
+	switch p.options.Mode {
+	case ConnPoolSingle:
+		if !state.hasShared || state.sharedUsers > 0 || state.sharedWaiters > 0 {
+			p.access.Unlock()
+			return
+		}
+		conn := state.shared
+		p.removeConn(state, conn, net.ErrClosed)
 		p.access.Unlock()
-		return
+		p.options.Close(conn, net.ErrClosed)
+	case ConnPoolOrdered:
+		// Take the whole idle list while holding the lock, then close outside it.
+		idle := make([]T, 0, state.idle.Len())
+		for {
+			conn, ok := popIdle(&state.idle, state.idleElements)
+			if !ok {
+				break
+			}
+			delete(state.all, conn)
+			idle = append(idle, conn)
+		}
+		p.access.Unlock()
+
+		for _, conn := range idle {
+			p.options.Close(conn, net.ErrClosed)
+		}
+	default:
+		p.access.Unlock()
 	}
-	conn := state.shared
-	p.removeConn(state, conn, net.ErrClosed)
-	p.access.Unlock()
-	p.options.Close(conn, net.ErrClosed)
+}
+
+// popIdle removes the most recently added idle connection.
+//
+// The list is consulted through its own API rather than by index so the element bookkeeping in
+// idleElements stays in step; a connection left in idleElements after its element was removed
+// would be untracked but still counted as idle.
+func popIdle[T comparable](idle *list.List[T], elements map[T]*list.Element[T]) (T, bool) {
+	var zero T
+	element := idle.Back()
+	if element == nil {
+		return zero, false
+	}
+	conn := element.Value
+	idle.Remove(element)
+	delete(elements, conn)
+	return conn, true
 }
 
 func (p *ConnPool[T]) Reset() {

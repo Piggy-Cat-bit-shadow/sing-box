@@ -85,6 +85,9 @@ func (d *resolveDialer) recoverCandidates(ctx context.Context, destination M.Soc
 
 	// The lookup is logged at debug: it is an internal recovery step, not something the user
 	// asked for, and it must not add noise to the connection log.
+	// Cancellation is honoured by the router lookup below. The caller abandons this work the
+	// moment the original address connects, so a lookup that ignored cancellation would keep
+	// running DNS for a connection that is already established.
 	recoveryCtx := withoutAddressRecovery(log.ContextWithOverrideLevel(ctx, log.LevelDebug))
 	recovered, err := d.router.Lookup(recoveryCtx, domain, d.queryOptions)
 	if err != nil {

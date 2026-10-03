@@ -106,10 +106,21 @@ func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 	multiplexer.serial = NewConnPool(ConnPoolOptions[*multiplexConn]{
 		Mode: ConnPoolOrdered,
 		IsAlive: func(conn *multiplexConn) bool {
-			// A connection whose read loop saw death is not reusable, and neither is a
-			// nil one. The readEpoch check mirrors the shared path: a non-zero epoch on a
-			// connection that is being handed back means it already died once.
-			return conn != nil && conn.readEpoch.Load() == 0
+			// Only a nil connection is rejected here.
+			//
+			// This deliberately does NOT consult readEpoch. That counter is incremented by
+			// recvLoop, which only the shared/connection-oriented path runs; the serial path
+			// reads inline and never starts one, so readEpoch stays zero for the entire life
+			// of a serial connection and a readEpoch check would report every connection as
+			// healthy forever. An earlier comment claimed it detected a dead serial socket,
+			// which it cannot - it was measuring something the serial path never updates.
+			//
+			// Detecting a stale serial connection is done where it can actually be observed:
+			// the next read or write fails, the connection is invalidated, and the query is
+			// retried once on a genuinely fresh socket. That needs no syscall, no polling and
+			// no background goroutine, so it costs nothing on a healthy connection and does
+			// not burn power probing.
+			return conn != nil
 		},
 		Close: func(conn *multiplexConn, cause error) {
 			if conn != nil {
@@ -219,62 +230,196 @@ func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg
 		return
 	}
 
-	// reusable records whether the connection may go back to the idle pool. Any failure
-	// after the request is written leaves the stream in an unknown position, so it must
-	// be discarded rather than reused - a stale response would otherwise be delivered to
-	// the next query.
-	reusable := false
-	closeConn := func() {
-		if conn != nil {
-			conn.Close()
-			conn = nil
+	// THE POOL OWNS THIS CONNECTION. Every path out of this function must end in exactly one
+	// hand-back to the pool - Release(conn, true) for a healthy connection, or an invalidation
+	// for one that must not be reused. Calling conn.Close() directly and dropping the local
+	// reference, which an earlier version did, leaves the socket dead while the pool still
+	// tracks it in state.all: repeated server-side idle closes then accumulate dead objects.
+	//
+	// settled makes that "exactly one" structural rather than a property of every return path.
+	settled := false
+	releaseReusable := func() {
+		if settled {
+			return
 		}
+		settled = true
+		m.serial.Release(conn, true)
+	}
+	invalidate := func(cause error) {
+		if settled {
+			return
+		}
+		settled = true
+		m.serial.Invalidate(conn, cause)
 	}
 	defer func() {
-		if conn != nil {
-			m.serial.Release(conn, reusable)
-		}
+		// Any path that did not explicitly settle leaves the stream in an unknown position,
+		// so the connection is invalidated rather than reused.
+		invalidate(net.ErrClosed)
 	}()
 
-	// Closing on context cancellation is what makes a timeout actually interrupt a read
-	// that is already in flight. It also means the connection must NOT be reused
-	// afterwards: the close happened underneath the caller.
-	stop := context.AfterFunc(ctx, func() {
-		if conn != nil {
-			conn.Close()
-		}
+	// Closing on context cancellation is what makes a timeout interrupt a read or write that
+	// is already in flight.
+	//
+	// The callback captures a COPY of the connection pointer. It must not capture a variable
+	// the main goroutine can reassign: an earlier version closed over `conn` and then set
+	// `conn = nil` on the success path, which is a data race between the cancellation
+	// goroutine reading it and this goroutine writing it - and worse, a cancellation landing
+	// in that window would close a connection that had just been returned to the idle pool.
+	//
+	// The callback's ONLY job is to interrupt I/O. Pool bookkeeping stays with this goroutine.
+	interruptConn := conn
+	stopCancel := context.AfterFunc(ctx, func() {
+		interruptConn.Close()
 	})
-	defer stop()
 
 	err = m.options.write(conn, message, message.Id)
 	if err != nil {
-		ctxErr := ctx.Err()
-		closeConn()
-		if ctxErr != nil {
+		interruptStopped := stopCancel()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			invalidate(ctxErr)
 			callback(nil, ctxErr)
 			return
 		}
+		// A write failure on a REUSED connection is the other half of stale keep-alive
+		// handling. A server that closed an idle socket commonly surfaces as EPIPE or
+		// ECONNRESET on the NEXT write rather than as a read error, and the earlier
+		// implementation only retried the read case - so the write case returned a spurious
+		// error to the caller for a connection that was merely stale.
+		if !created && interruptStopped {
+			invalidate(err)
+			m.retrySerialOnce(ctx, message, callback)
+			return
+		}
+		invalidate(err)
 		callback(nil, E.Cause(err, "write request"))
 		return
 	}
+
 	for {
-		var response *mDNS.Msg
-		response, err = m.options.readNext(conn)
-		if err != nil {
-			ctxErr := ctx.Err()
-			closeConn()
-			if ctxErr != nil {
+		response, readErr := m.options.readNext(conn)
+		if readErr != nil {
+			interruptStopped := stopCancel()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				invalidate(ctxErr)
 				callback(nil, ctxErr)
 				return
 			}
-			// A read failure on a REUSED connection usually means the server closed an
-			// idle connection between queries, which is normal and must not surface as an
-			// error to the caller. Retry once on a fresh connection.
-			if !created {
-				// Retry once, on a fresh connection, and report whatever that returns.
-				// Bounded at one attempt: a server that closes every connection would
-				// otherwise be retried forever.
+			if !created && interruptStopped {
+				// The server closed an idle connection between queries. That is normal
+				// keep-alive behaviour, so retry once on a fresh connection.
+				invalidate(readErr)
 				m.retrySerialOnce(ctx, message, callback)
+				return
+			}
+			invalidate(readErr)
+			callback(nil, E.Cause(readErr, "read response"))
+			return
+		}
+		if response == nil {
+			continue
+		}
+
+		// The response is complete. Before allowing reuse, cancel the interrupt hook AND
+		// confirm it had not already started closing the connection.
+		//
+		// Checking ctx.Err() alone is not enough: cancellation can arrive at the same instant
+		// as the response, and a cancellation callback that has already begun Close() must not
+		// have its connection handed to the next query. stopCancel reports whether the
+		// callback was prevented from running at all, which is the only condition under which
+		// the socket is provably untouched.
+		interruptStopped := stopCancel()
+		if !interruptStopped {
+			invalidate(context.Canceled)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				callback(nil, ctxErr)
+				return
+			}
+			callback(nil, E.New("response received but the connection was interrupted"))
+			return
+		}
+
+		response.Id = message.Id
+		releaseReusable()
+		callback(response, nil)
+		return
+	}
+}
+
+// retrySerialOnce re-runs a query exactly once, on a connection that is guaranteed FRESH.
+//
+// # Why the retry must not simply re-enter the pool
+//
+// A stale idle connection is not the only one in the pool: the server may have closed several.
+// Invalidating the failed connection and calling Acquire again could hand back ANOTHER stale
+// idle connection, which fails the same way, and the retry would repeat - an unbounded loop
+// dressed up as a bounded one, with a dial or two per iteration.
+//
+// Clearing the pool's idle connections before re-acquiring is what makes "fresh" true rather
+// than hopeful. The failed connection is already invalidated by the caller, so this removes any
+// OTHER idle connection that might be stale too.
+//
+// # Boundedness
+//
+// The retry runs with a flag that forces a NEW connection regardless of what the pool holds.
+// Combined with the once-only call sites, a query performs at most one retry, and that retry
+// cannot itself be retried: a failure on a fresh connection is a real error and is reported.
+func (m *queryMultiplexer) retrySerialOnce(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	if ctx.Err() != nil {
+		callback(nil, ctx.Err())
+		return
+	}
+
+	// Drop every remaining idle serial connection. A server that closed one idle socket has
+	// very likely closed the others, and re-acquiring a different stale one would defeat the
+	// point of retrying.
+	m.serial.CloseIdle()
+
+	go m.exchangeSingleFresh(ctx, message, callback)
+}
+
+// exchangeSingleFresh is exchangeSingle with a forced new connection.
+//
+// It reports created=true semantics for the retry: the connection cannot have come from the
+// idle pool, because the pool's idle list was cleared and the acquire below dials directly.
+func (m *queryMultiplexer) exchangeSingleFresh(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	conn, err := m.dialSerialConn(ctx)
+	if err != nil {
+		callback(nil, err)
+		return
+	}
+	m.exchangeOnFreshConn(ctx, message, conn, callback)
+}
+
+// exchangeOnFreshConn runs one query on a connection this function owns outright.
+//
+// The connection is never handed to the pool, so there is no reuse decision to get wrong: it
+// is closed exactly once, on every path.
+func (m *queryMultiplexer) exchangeOnFreshConn(ctx context.Context, message *mDNS.Msg, conn *multiplexConn, callback func(response *mDNS.Msg, err error)) {
+	defer conn.Close()
+
+	interruptConn := conn
+	stopCancel := context.AfterFunc(ctx, func() {
+		interruptConn.Close()
+	})
+	defer stopCancel()
+
+	if err := m.options.write(conn, message, message.Id); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			callback(nil, ctxErr)
+			return
+		}
+		// A failure on a genuinely fresh connection is a real error. It is reported, not
+		// retried: retrying here is exactly the unbounded loop this path exists to avoid.
+		callback(nil, E.Cause(err, "write request"))
+		return
+	}
+
+	for {
+		response, err := m.options.readNext(conn)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				callback(nil, ctxErr)
 				return
 			}
 			callback(nil, E.Cause(err, "read response"))
@@ -284,27 +429,9 @@ func (m *queryMultiplexer) exchangeSingle(ctx context.Context, message *mDNS.Msg
 			continue
 		}
 		response.Id = message.Id
-		// Completed cleanly: the stream is exactly at a message boundary, so the
-		// connection is safe to hand to the next query.
-		reusable = true
 		callback(response, nil)
 		return
 	}
-}
-
-// retrySerialOnce re-runs a query exactly once after a REUSED connection failed.
-//
-// A read failure on a reused connection usually means the server closed an idle
-// connection between queries. That is normal keep-alive behaviour and must not surface
-// as an error, so the query is retried on a fresh connection. The retry is deliberately
-// bounded at one attempt - the retried call comes back through exchangeSingle with
-// created=true, and a failure there is reported rather than retried again.
-func (m *queryMultiplexer) retrySerialOnce(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	if ctx.Err() != nil {
-		callback(nil, ctx.Err())
-		return
-	}
-	go m.exchangeSingle(ctx, message, callback)
 }
 
 // dialSerialConn dials for the serial pool, wrapping the transport's own dialer so the

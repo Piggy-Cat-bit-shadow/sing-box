@@ -33,6 +33,7 @@ var (
 	_ dialer.ParallelNetworkDialer    = (*Outbound)(nil)
 	_ dialer.DirectDialer             = (*Outbound)(nil)
 	_ adapter.FlowOutbound            = (*Outbound)(nil)
+	_ adapter.BypassableOutbound      = (*Outbound)(nil)
 	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 )
 
@@ -263,4 +264,49 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 
 func (h *Outbound) IsEmpty() bool {
 	return h.isEmpty
+}
+
+// CanBypass reports whether a connection over this network to this literal destination is
+// equivalent to a plain OS connect, so the userspace data path can be skipped.
+//
+// # What it deliberately cannot see
+//
+// This is an OUTBOUND-level answer. It has no view of FakeIP state, sniffed domains, destination
+// rewrites, trackers, or how the outbound was selected - all of which decide whether a specific
+// connection is safe to bypass. The router owns that decision; this method only establishes that
+// the outbound itself would do nothing special.
+//
+// # Why isEmpty is the authoritative signal
+//
+// isEmpty already means "this direct outbound carries no dial configuration beyond a plain
+// connect". Re-listing the individual options here would create a second, silently divergent
+// copy of that judgement: a newly added dialer option would have to be remembered in two places,
+// and forgetting one would turn a configured outbound into a bypassed one. Reusing the existing
+// signal means a new option automatically disables the fast path until someone deliberately
+// accounts for it.
+//
+// # Why the loopback check cannot be skipped
+//
+// The direct outbound refuses to dial its own addresses, which is what prevents a TUN from
+// routing a connection back into itself. A bypass is a connect performed by the platform rather
+// than by this dialer, so this check is the only thing standing between the fast path and that
+// loop. It is evaluated against the live address list, not a snapshot.
+func (h *Outbound) CanBypass(network string, destination netip.Addr) bool {
+	if !h.isEmpty {
+		return false
+	}
+	if network != N.NetworkTCP && network != N.NetworkUDP {
+		// ICMP keeps its existing Flow semantics; anything else is not this optimisation's
+		// business.
+		return false
+	}
+	if !destination.IsValid() {
+		return false
+	}
+	// A zone-carrying address cannot be handed to the platform's direct path through this
+	// interface, which is keyed by address alone.
+	if destination.Zone() != "" {
+		return false
+	}
+	return !h.isMyLoopbackAddress(destination)
 }

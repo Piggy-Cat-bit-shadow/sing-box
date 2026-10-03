@@ -85,6 +85,38 @@ type FlowOutbound interface {
 	PreMatchFlow(network string, destination netip.Addr) PreMatchAction
 }
 
+// BypassableOutbound reports whether this outbound may be skipped entirely for a connection to a
+// literal destination, letting the platform's own direct path carry the traffic.
+//
+// # What it answers, and what it does not
+//
+// It answers ONE outbound-level question: "is this outbound, for this network and literal
+// destination, equivalent to connecting directly?" It knows nothing about the request it is
+// serving, and it must not guess: an outbound cannot see FakeIP state, sniffed domains,
+// destination rewrites, trackers or how it was selected.
+//
+// Whether a particular connection may take the fast path is therefore decided by the router,
+// which does have that context. The split matters because the dangerous mistakes are all
+// request-level, not outbound-level - an outbound that tried to decide alone would have to
+// assume, and assuming is how a FakeIP address reaches the real network.
+//
+// # Who implements it
+//
+// Only an outbound whose behaviour is provably identical to a plain OS connect for the
+// destination in question. A proxy, a group, an endpoint with its own socket handling, or a
+// direct outbound configured with bind addresses, routing marks, TFO/MPTCP, network strategy or
+// any other dial semantic must NOT implement it: bypassing those would silently discard
+// configuration the user asked for.
+type BypassableOutbound interface {
+	Outbound
+	// CanBypass reports whether a connection over this network to this literal destination may
+	// bypass the userspace data path.
+	//
+	// A false result is always safe and always available. Implementations must return false
+	// whenever they cannot prove equivalence.
+	CanBypass(network string, destination netip.Addr) bool
+}
+
 type OutboundRegistry interface {
 	option.OutboundOptionsRegistry
 	CreateOutbound(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) (Outbound, error)

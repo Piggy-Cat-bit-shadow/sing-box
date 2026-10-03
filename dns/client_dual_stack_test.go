@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"net/netip"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -166,4 +167,88 @@ func parseIPv6ForTest(value string) []byte {
 	address := netip.MustParseAddr(value)
 	raw := address.As16()
 	return raw[:]
+}
+
+// TestLookupWaitsForTheSlowFamilyAndLeavesNoOrphan is §11.
+//
+// Lookup must wait for BOTH families, and must not leave a family query running after it
+// returns. A partial-answer implementation would satisfy neither: it would return early, and
+// the abandoned exchange would keep running until its own timeout.
+func TestLookupWaitsForTheSlowFamilyAndLeavesNoOrphan(t *testing.T) {
+	const slowFamilyDelay = 250 * time.Millisecond
+
+	transport := &familySchedulingTransport{
+		delayA:      0,
+		delayAAAA:   slowFamilyDelay,
+		addressA:    "192.0.2.1",
+		addressAAAA: "2001:db8::1",
+	}
+	client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	addresses, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{}, nil)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+
+	// Both families present: this is the completeness guarantee.
+	var has4, has6 bool
+	for _, address := range addresses {
+		if address.Is4() || address.Is4In6() {
+			has4 = true
+		} else {
+			has6 = true
+		}
+	}
+	require.True(t, has4, "the IPv4 address must be present")
+	require.True(t, has6, "the IPv6 address must be present, even though it answered %v later",
+		slowFamilyDelay)
+
+	// The wait must be for the SLOW family, not a fixed grace period. Returning at ~50ms would
+	// mean the IPv6 answer was dropped.
+	require.GreaterOrEqual(t, elapsed, slowFamilyDelay,
+		"Lookup returned before the slow family answered, so its result was dropped")
+
+	// By the time Lookup returns, both exchanges have completed. The transport counted exactly
+	// two queries, so neither family was abandoned mid-flight.
+	require.EqualValues(t, 2, transport.queryCount.Load(),
+		"both family queries must have completed before Lookup returned")
+}
+
+// TestLookupCancellationUnwindsBothFamilies is the lifecycle half of §11.
+//
+// When the context ends, BOTH family exchanges must exit rather than one continuing to run
+// until its own timeout after Lookup has already returned.
+func TestLookupCancellationUnwindsBothFamilies(t *testing.T) {
+	// Both families block until the context ends, so neither can complete on its own.
+	transport := &familySchedulingTransport{
+		delayA:    -1,
+		delayAAAA: -1,
+	}
+	client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+	client.Start()
+
+	before := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	_, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{}, nil)
+	require.Error(t, err, "a lookup whose families never answer must fail")
+
+	// Give the unwinding a moment, then confirm the query goroutines are gone rather than
+	// lingering until a multi-second timeout.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= before+2 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("goroutines before=%d after=%d; a family query outlived Lookup",
+		before, runtime.NumGoroutine())
 }

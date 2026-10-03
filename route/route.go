@@ -246,6 +246,37 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+	// A packet connection that declares a FIXED destination takes the connected-UDP path.
+	//
+	// # Why this is the FIRST thing done, before anything can return early
+	//
+	// The capability belongs to the ORIGINAL inbound connection, and two things downstream would
+	// otherwise hide it:
+	//
+	//   - the InboundDetour early return below, which hands the connection to another inbound
+	//     before the later read was ever reached, so a detoured fixed-destination tunnel arrived
+	//     with UDPConnect unset;
+	//   - every wrapper the routing path applies afterwards (cache, destination guard, tracker,
+	//     FakeIP NAT), none of which forward the type assertion. A read placed after them would
+	//     silently stop working.
+	//
+	// Converting the capability into metadata here means the rest of the chain carries plain
+	// state and no consumer has to know the interface exists.
+	//
+	// # What authorises this
+	//
+	// The declaration alone. It is NOT inferred from "the session seems to have one
+	// destination": an ordinary SOCKS UDP session also has a destination on its first datagram,
+	// and treating that as fixed would pin the session to one address.
+	//
+	// The per-datagram guard is what keeps a UoT session that carries a destination on EVERY
+	// datagram out of the connected path: connecting it would pin the session to whichever
+	// address the first datagram happened to use and break the rest. It has to be checked here
+	// too, not only at the later site, because the detour return would skip that check.
+	if !metadata.UoTDatagramDestinations {
+		adapter.ApplyUDPConnect(&metadata, conn)
+	}
+
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -490,6 +521,135 @@ func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R
 	}
 }
 
+// canFastBypass reports whether this connection may skip the userspace data path entirely.
+//
+// # Allow-list, not deny-list
+//
+// Everything not explicitly proven safe returns false. The conditions below are the complete set
+// of reasons a plain direct connection is equivalent to an OS connect; anything the router
+// cannot see through - a sniffed domain, a rewritten destination, a tracker that must observe
+// the flow - disqualifies the connection. A miss costs one predicate call and falls through to
+// exactly the behaviour that existed before, so being conservative is free.
+//
+// # Ordering
+//
+// Cheapest and most selective first: type and string comparisons, then slice lengths, then the
+// interface assertion, and the outbound's own check last because it is the only part that
+// touches other state. This runs on every pre-match for every rule that routes to an outbound,
+// so the common miss must not do real work.
+//
+// # Why the arguments
+//
+// packetDestination is the destination the TUN flow was created for, before any rule could
+// rewrite it. Comparing against metadata.Destination is how an override, a FakeIP rewrite or a
+// sniff override_destination is detected - the fast path may only carry a connection to the
+// address the platform already put on the wire.
+func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestination M.Socksaddr, chain []adapter.Outbound, outbound adapter.Outbound) bool {
+	// v1 targets TUN only. ActionBypass is the platform handing the flow back to the OS's own
+	// routing; other inbounds have no equivalent, so they keep their existing path.
+	if metadata.InboundType != C.TypeTun {
+		return false
+	}
+
+	// Only the two protocols the optimisation was reasoned about. ICMP keeps its existing flow
+	// handling, and an unknown network is not this function's business.
+	if metadata.Network != N.NetworkTCP && metadata.Network != N.NetworkUDP {
+		return false
+	}
+
+	// A domain destination still needs resolution, so it cannot be bypassed.
+	if metadata.Destination.IsDomain() {
+		return false
+	}
+
+	// FakeIP addresses are placeholders belonging to the virtual range. Handing one to the OS
+	// routing table would send it somewhere meaningless, and the mapping back to the real
+	// destination is exactly the work the userspace path exists to do.
+	if metadata.FakeIP {
+		return false
+	}
+
+	// A recovered or sniffed domain means this connection may use dual-stack recovery, which
+	// lives in the dialer and would be skipped entirely. Preserving that behaviour is worth more
+	// than the bypass.
+	if metadata.Domain != "" {
+		return false
+	}
+
+	// A populated candidate list means resolve, recovery or candidate planning already took
+	// part in this connection.
+	if len(metadata.DestinationAddresses) > 0 {
+		return false
+	}
+
+	// The destination must be exactly what the flow was created for. Any difference means a
+	// rule rewrote it - override_address, override_port, a FakeIP rewrite, or a sniff that
+	// replaced the target - and the rewritten destination is the one the userspace path must
+	// dial.
+	if metadata.Destination != packetDestination {
+		return false
+	}
+	if metadata.RouteOriginalDestination.IsValid() {
+		return false
+	}
+
+	// A UoT session carrying per-datagram destinations is not a fixed target; treating it as one
+	// would pin the session to whichever address arrived first.
+	if metadata.UoTDatagramDestinations {
+		return false
+	}
+
+	// Connected UDP has its own socket and NAT semantics that this optimisation does not
+	// reproduce. Left on the existing path deliberately.
+	if metadata.UDPConnect {
+		return false
+	}
+
+	// A custom UDP timeout is applied by the userspace UDP path. The native bypass has its own
+	// lifetime semantics, so the two are not interchangeable.
+	if metadata.UDPTimeout > 0 {
+		return false
+	}
+
+	// Network selection, interface pinning and fallback are dialer behaviour that a bypass does
+	// not perform.
+	if metadata.NetworkStrategy != nil ||
+		len(metadata.NetworkType) > 0 ||
+		len(metadata.FallbackNetworkType) > 0 ||
+		metadata.FallbackDelay > 0 {
+		return false
+	}
+
+	// TLS fragmentation and spoofing rewrite the handshake in the userspace path. Bypassing
+	// would silently disable them.
+	if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSSpoof != "" {
+		return false
+	}
+
+	// A tracker observes connections; a bypassed flow would simply never appear in traffic
+	// statistics or the connections API. Silently losing accounting is not an acceptable
+	// optimisation, so the presence of any tracker disables the fast path for now.
+	if len(r.trackers) > 0 {
+		return false
+	}
+
+	// Only a connection that resolves to exactly one outbound, with nothing in front of it. A
+	// group introduces selection, lifecycle and accounting semantics of its own, and bypassing
+	// it would skip all of them even when the selected outbound happens to be direct.
+	if len(chain) != 1 {
+		return false
+	}
+
+	// Finally, the outbound itself must declare that it would do nothing special. This is the
+	// one condition the router cannot evaluate, so it is delegated rather than assumed.
+	bypassable, isBypassable := outbound.(adapter.BypassableOutbound)
+	if !isBypassable {
+		return false
+	}
+	return bypassable.CanBypass(metadata.Network, metadata.Destination.Addr)
+}
+
+// preMatchFlow resolves the outbound for a matched rule and decides how the flow proceeds.
 func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundContext, packetDestination M.Socksaddr, matchedRule adapter.Rule, outboundTag string) adapter.PreMatchResult {
 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
 	var outbound adapter.Outbound
@@ -507,6 +667,25 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 		return continueResult
 	}
 	outbound = chain[len(chain)-1]
+
+	// Direct Fast Path: a plain direct outbound with nothing special about this connection takes
+	// the platform's own path instead of a userspace one.
+	//
+	// This sits AFTER the rule loop has decided the outbound, so rule ordering is untouched: a
+	// reject, a proxy or an explicit bypass earlier in the chain has already returned, and this
+	// only ever applies to a connection that a normal match settled on direct.
+	//
+	// It sits BEFORE the FlowOutbound branch because the whole point is to avoid creating a
+	// userspace flow; discovering the flow could not be created and then backing out would
+	// already have paid the cost this exists to avoid.
+	//
+	// On any doubt canFastBypass returns false and nothing about the previous behaviour changes.
+	if r.canFastBypass(metadata, packetDestination, chain, outbound) {
+		r.logger.DebugContext(ctx, "pre-match: bypassing userspace for ", metadata.Network,
+			" connection from ", metadata.Source.AddrString(), " to ", metadata.Destination)
+		return adapter.PreMatchResult{Action: adapter.PreMatchBypass, Outbound: outbound}
+	}
+
 	flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound)
 	if !isFlowOutbound {
 		return continueResult

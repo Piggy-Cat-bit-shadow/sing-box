@@ -22,6 +22,23 @@ type DNSFamilyResult struct {
 	// Err is the lookup error, if any. A nil error with no addresses means the family
 	// answered with nothing usable, which is not a failure of the other family.
 	Err error
+	// EffectiveStrategy is the strategy the resolver actually applied, after its own defaults
+	// have been taken into account. Both families of one lookup report the same value.
+	//
+	// # Why the caller cannot derive this itself
+	//
+	// A connection-layer caller sees only DNSQueryOptions, whose Strategy is frequently AsIS.
+	// AsIS is not a preference - it means "use the resolver's default", and that default is
+	// owned by the DNS router (defaultDomainStrategy). A caller that read Strategy directly
+	// would therefore treat AsIS as "not PreferIPv6" and rank IPv4 first even when the resolver
+	// is configured to prefer IPv6, giving the opposite of the configured behaviour.
+	//
+	// The resolver is the only component that knows the effective value, so it reports it. The
+	// caller must not guess, and must not reach into DNS options to reconstruct it.
+	//
+	// AsIS is still reported as AsIS when nothing overrides it: the caller then keeps the
+	// existing project behaviour rather than inventing a third interpretation.
+	EffectiveStrategy C.DomainStrategy
 }
 
 // DNSDualStackRouter is an OPTIONAL capability for resolving both families incrementally.
