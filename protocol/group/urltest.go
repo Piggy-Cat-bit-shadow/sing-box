@@ -42,6 +42,8 @@ type URLTest struct {
 	logger   log.ContextLogger
 	tags     []string
 	link     string
+	// expectedStatus is the configured expression, kept for diagnostics.
+	expectedStatus string
 	// scope identifies the target this group measures against. Selection, skipping and health
 	// checks must only read measurements for THIS target.
 	scope                        urltest.MeasurementScope
@@ -61,6 +63,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		logger:                       logger,
 		tags:                         options.Outbounds,
 		link:                         options.URL,
+		expectedStatus:               options.ExpectedStatus,
 		interval:                     time.Duration(options.Interval),
 		tolerance:                    options.Tolerance,
 		idleTimeout:                  time.Duration(options.IdleTimeout),
@@ -95,7 +98,7 @@ func (s *URLTest) Start() error {
 		}
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+	group, err := NewURLTestGroupWithExpected(s.ctx, s.outbound, s.logger, outbounds, s.link, s.expectedStatus, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
 	if err != nil {
 		return err
 	}
@@ -262,6 +265,8 @@ type URLTestGroup struct {
 	logger           log.Logger
 	outbounds        []adapter.Outbound
 	link             string
+	// expected is the parsed status set its health checks accept, and is part of the scope.
+	expected urltest.ExpectedStatus
 	// scope identifies the target this group measures against, so selection and skipping only
 	// ever read measurements made against that same target.
 	scope       urltest.MeasurementScope
@@ -300,6 +305,15 @@ type URLTestGroup struct {
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
+	return NewURLTestGroupWithExpected(ctx, outboundManager, logger, outbounds, link, "", interval, tolerance, idleTimeout, interruptExternalConnections)
+}
+
+// NewURLTestGroupWithExpected builds a group whose health checks accept only the given HTTP
+// statuses.
+//
+// An empty expectedStatus means no constraint, which is the historical behaviour and keeps every
+// existing configuration working unchanged. A configuration that needs a strict 204 says so.
+func NewURLTestGroupWithExpected(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, expectedStatus string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, interruptExternalConnections bool) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -308,6 +322,16 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	}
 	if idleTimeout == 0 {
 		idleTimeout = C.DefaultURLTestIdleTimeout
+	}
+	// Durations are validated rather than assumed.
+	//
+	// A negative value used to reach time.NewTicker, which panics at runtime - long after the
+	// configuration was accepted, and with a stack trace instead of a diagnostic.
+	if interval < 0 {
+		return nil, E.New("interval must not be negative")
+	}
+	if idleTimeout < 0 {
+		return nil, E.New("idle_timeout must not be negative")
 	}
 	if interval > idleTimeout {
 		return nil, E.New("interval must be less or equal than idle_timeout")
@@ -321,7 +345,13 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	// Deferring this would let a group start, look healthy, and only discover after the first
 	// interval that every measurement fails - by which time the operator has been told nothing.
 	// The canonical URL is kept so the scope and what is actually requested are the same string.
-	scope, err := urltest.NewMeasurementScope(link, nil)
+	// The expected status is parsed HERE, with the target, so an unusable expression fails
+	// configuration rather than only surfacing when the first background check runs.
+	expected, err := urltest.ParseExpectedStatus(expectedStatus)
+	if err != nil {
+		return nil, E.Cause(err, "invalid expected_status")
+	}
+	scope, err := urltest.NewMeasurementScope(link, expected)
 	if err != nil {
 		return nil, E.Cause(err, "invalid URL test target")
 	}
@@ -337,6 +367,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		logger:                       logger,
 		outbounds:                    outbounds,
 		link:                         scope.URL,
+		expected:                     expected,
 		scope:                        scope,
 		interval:                     interval,
 		tolerance:                    tolerance,
@@ -450,7 +481,13 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if history == nil {
 			continue
 		}
-		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
+		// Widened to uint32 before adding.
+		//
+		// Both operands are uint16, so `history.Delay + g.tolerance` wraps: with a delay of 30000
+		// and a tolerance of 50000 the sum is 14464, and the comparison then prefers a node that
+		// is actually FAR slower. The tolerance is a ceiling on acceptable difference, and a
+		// ceiling that inverts the ordering is worse than no tolerance at all.
+		if minDelay == 0 || uint32(minDelay) > uint32(history.Delay)+uint32(g.tolerance) {
 			minDelay = history.Delay
 			minOutbound = detour
 		}
@@ -506,7 +543,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.interval, force)
+	result := URLTestOutboundsWithTarget(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, TestHistoryHealth)
 	g.performUpdateCheck()
 	return result, nil
 }
@@ -523,9 +560,11 @@ type urlTestBatch struct {
 	checked map[string]bool
 	groups  []adapter.OutboundGroup
 	// mode decides which evidence layer this round may write.
-	mode   TestHistoryMode
-	access sync.Mutex
-	result map[string]uint16
+	mode TestHistoryMode
+	// expected is the status set this round accepts, and is part of the scope it stores under.
+	expected urltest.ExpectedStatus
+	access   sync.Mutex
+	result   map[string]uint16
 }
 
 // TestHistoryMode says which evidence a measurement round is allowed to write.
@@ -563,10 +602,16 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 
 // URLTestOutboundsWithMode runs one measurement round and records it according to mode.
 func URLTestOutboundsWithMode(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool, mode TestHistoryMode) map[string]uint16 {
+	return URLTestOutboundsWithTarget(ctx, outboundManager, history, logger, outbounds, link, nil, interval, force, mode)
+}
+
+// URLTestOutboundsWithTarget runs one measurement round against an explicit status set.
+//
+// The target is resolved once for the whole batch. An unusable one means there is nothing to
+// measure, so the batch reports no results rather than failing every node individually.
+func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool, mode TestHistoryMode) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-	// The target is resolved once for the whole batch. An unusable one means there is nothing to
-	// measure, so the batch reports no results rather than failing every node individually.
-	scope, scopeErr := urltest.NewMeasurementScope(link, nil)
+	scope, scopeErr := urltest.NewMeasurementScope(link, expected)
 	if scopeErr != nil {
 		logger.Error("invalid URL test target: ", scopeErr)
 		return map[string]uint16{}
@@ -582,6 +627,7 @@ func URLTestOutboundsWithMode(ctx context.Context, outboundManager adapter.Outbo
 		checked:  make(map[string]bool),
 		result:   make(map[string]uint16),
 		mode:     mode,
+		expected: expected,
 	}
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
@@ -641,7 +687,10 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				// added nothing but a second race: when the context expired while the result was
 				// also ready, Go picked between the two cases at random and the measurement's
 				// outcome became non-deterministic.
-				measurement, testErr := urltest.Measure(testCtx, urltest.MeasureOptions{Link: link}, detour)
+				measurement, testErr := urltest.Measure(testCtx, urltest.MeasureOptions{
+					Link:           link,
+					ExpectedStatus: b.expected,
+				}, detour)
 				if testErr != nil {
 					if b.ctx.Err() != nil {
 						return nil, nil

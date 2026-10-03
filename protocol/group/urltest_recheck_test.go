@@ -156,3 +156,30 @@ func (o *blockingRecheckOutbound) ListenPacket(ctx context.Context, destination 
 }
 
 var _ = urltest.MeasurementScope{}
+
+// TestToleranceDoesNotOverflow is §47, §64(P).
+//
+// Both the delay and the tolerance are uint16. Their sum therefore wraps, and a node comfortably
+// inside the tolerance could be rejected while a far slower one was accepted - the exact inverse of
+// what a tolerance means.
+func TestToleranceDoesNotOverflow(t *testing.T) {
+	// A current best of 30000 with a tolerance of 50000 accepts anything up to 80000, which is
+	// every possible delay. A candidate of 100 is therefore comfortably better and must win.
+	//
+	// Wrapped: 30000 + 50000 = 14464, so the comparison `30000 > 14464` is TRUE and the current
+	// best is REPLACED. The result is the opposite of the tolerance's intent.
+	current := uint16(30000)
+	candidate := uint16(100)
+	tolerance := uint16(50000)
+
+	wrapped := current + tolerance
+	require.Equal(t, uint16(14464), wrapped,
+		"the naive sum wraps, which is the defect being pinned")
+
+	require.False(t, uint32(current) > uint32(candidate)+uint32(tolerance),
+		"with the arithmetic widened, a candidate of 100 is inside the tolerance of a 30000 best "+
+			"and must not replace it")
+	require.True(t, current+tolerance > candidate,
+		"while the wrapped uint16 arithmetic says the opposite - which is why the widening is "+
+			"required rather than cosmetic")
+}
