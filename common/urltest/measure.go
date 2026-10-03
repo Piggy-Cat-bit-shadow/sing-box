@@ -6,14 +6,12 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/url"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	E "github.com/sagernet/sing/common/exceptions"
-	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 )
@@ -186,27 +184,29 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 		defer release()
 	}
 
-	normalized, err := NormalizeURLTestURL(options.Link)
+	// ONE parse, three results.
+	//
+	// The request, the identity and the dial target are decided together and then used as decided.
+	// Deriving them separately - the previous code re-parsed the normalised string to find the host
+	// and port - is how a canonicalisation chosen for identity can end up changing what is fetched.
+	target, err := ParseMeasurementTarget(options.Link)
 	if err != nil {
 		return Measurement{}, err
 	}
-	scope := MeasurementScope{URL: normalized, Expected: options.ExpectedStatus.Canonical()}
+	scope := MeasurementScope{URL: target.ScopeURL, Expected: options.ExpectedStatus.Canonical()}
 
 	debugEnabled := options.Debug != nil
 	var debugReport MeasureDebug
-
-	parsed, err := url.Parse(normalized)
-	if err != nil {
-		return Measurement{}, err
-	}
-	destination := M.ParseSocksaddrHostPortStr(parsed.Hostname(), urlTestPort(parsed))
 
 	// measurementStart is used only by the fallback path, which reports the whole attempt's cost.
 	measurementStart := time.Now()
 
 	// One dial for the whole measurement; both requests share it through the transport below.
+	//
+	// The destination was validated by ParseMeasurementTarget, so an unusable port fails there
+	// rather than being handed to a detour to discover.
 	dialStart := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", destination)
+	instance, err := detour.DialContext(ctx, "tcp", target.Destination)
 	if err != nil {
 		return Measurement{}, err
 	}
@@ -230,7 +230,7 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 	var firstStatus int
 
 	// --- request 1: the warm-up, not timed ---
-	firstRequest, err := http.NewRequest(http.MethodHead, normalized, nil)
+	firstRequest, err := http.NewRequest(http.MethodHead, target.RequestURL, nil)
 	if err != nil {
 		return Measurement{}, err
 	}
@@ -257,7 +257,7 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 	}
 
 	// --- request 2: the measured one ---
-	secondRequest, err := http.NewRequest(http.MethodHead, normalized, nil)
+	secondRequest, err := http.NewRequest(http.MethodHead, target.RequestURL, nil)
 	if err != nil {
 		return Measurement{}, err
 	}

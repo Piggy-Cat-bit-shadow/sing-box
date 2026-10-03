@@ -1,12 +1,14 @@
 package urltest
 
 import (
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
 // DefaultURLTestURL is the target used when none is supplied.
@@ -32,14 +34,37 @@ const DefaultURLTestURL = "https://www.gstatic.com/generate_204"
 //   - the fragment is dropped, because a fragment is never sent to the server and so cannot
 //     describe a different measurement
 //   - path and query are preserved exactly, because they do change what is requested
-func NormalizeURLTestURL(link string) (string, error) {
+//
+// MeasurementTarget separates the three things a URL test target is used for.
+//
+// They were previously one normalised string, which conflated decisions that should be independent:
+//
+//	RequestURL   what is actually fetched - must stay exactly as the user wrote it
+//	ScopeURL     the identity a result is stored under - must be canonical
+//	Destination  what is dialled - must be validated before any connection is attempted
+//
+// Keeping them together meant a canonicalisation applied for identity could silently rewrite the
+// request (reordering a query string, rewriting the authority), and a malformed port was only
+// discovered once net/http tried to dial. Separating them lets each be exactly as strict, or as
+// permissive, as its own job requires.
+type MeasurementTarget struct {
+	// RequestURL is handed to http.NewRequest unchanged, apart from validation.
+	RequestURL string
+	// ScopeURL identifies the measurement. Equivalent spellings share one scope.
+	ScopeURL string
+	// Destination is the address to dial, already validated.
+	Destination M.Socksaddr
+}
+
+// ParseMeasurementTarget resolves a configured link into its three uses.
+func ParseMeasurementTarget(link string) (MeasurementTarget, error) {
 	if link == "" {
 		link = DefaultURLTestURL
 	}
 
 	parsed, err := url.Parse(link)
 	if err != nil {
-		return "", E.Cause(err, "parse URL test target ", link)
+		return MeasurementTarget{}, E.Cause(err, "parse URL test target ", link)
 	}
 
 	// A scheme is required. Without one, `example.com/x` would parse as a path and the request
@@ -48,30 +73,120 @@ func NormalizeURLTestURL(link string) (string, error) {
 	switch scheme {
 	case "http", "https":
 	case "":
-		return "", E.New("URL test target requires a scheme: ", link)
+		return MeasurementTarget{}, E.New("URL test target requires a scheme: ", link)
 	default:
 		// Rejecting the scheme is the whole point: a non-HTTP scheme cannot be measured by an
 		// HTTP request, and passing it on would connect to a host that is not the target.
-		return "", E.New("unsupported URL test scheme ", parsed.Scheme, " in ", link)
+		return MeasurementTarget{}, E.New("unsupported URL test scheme ", parsed.Scheme, " in ", link)
 	}
 
-	if parsed.Hostname() == "" {
-		return "", E.New("URL test target requires a host: ", link)
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return MeasurementTarget{}, E.New("URL test target requires a host: ", link)
 	}
-	if port := parsed.Port(); port != "" {
-		number, portErr := strconv.ParseUint(port, 10, 16)
-		if portErr != nil || number == 0 {
-			return "", E.New("invalid URL test port ", port, " in ", link)
+
+	// The port is validated and defaulted HERE, so an unusable target fails before a detour is
+	// asked to dial it. The previous version only rejected an explicitly bad port and left the
+	// default resolution to net/http.
+	port := parsed.Port()
+	var portNumber uint64
+	if port != "" {
+		portNumber, err = strconv.ParseUint(port, 10, 16)
+		if err != nil || portNumber == 0 {
+			return MeasurementTarget{}, E.New("invalid URL test port ", port, " in ", link)
 		}
+	} else if scheme == "https" {
+		portNumber = 443
+	} else {
+		portNumber = 80
 	}
 
-	// Drop the fragment: it is never transmitted, so it must not create a second scope for the
-	// same request.
-	parsed.Fragment = ""
-	parsed.RawFragment = ""
-	parsed.Scheme = scheme
+	// --- RequestURL: validate, but do not rewrite ---
+	//
+	// Only two changes are made, both because the fragment is never transmitted: it is dropped so
+	// it cannot create a second scope, and the scheme is lowercased because a scheme is
+	// case-insensitive by definition. The path, the query and its order, the authority and the
+	// host spelling are all left exactly as the user wrote them, so the request that is sent is
+	// the request that was configured.
+	requestURL := *parsed
+	requestURL.Fragment = ""
+	requestURL.RawFragment = ""
+	requestURL.Scheme = scheme
 
-	return parsed.String(), nil
+	// --- ScopeURL: canonical, for identity only ---
+	scopeURL := requestURL
+	scopeURL.Host = canonicalScopeHost(hostname, portNumber, port, scheme)
+
+	return MeasurementTarget{
+		RequestURL: requestURL.String(),
+		ScopeURL:   scopeURL.String(),
+		Destination: M.Socksaddr{
+			Fqdn: hostname,
+			Port: uint16(portNumber),
+		},
+	}, nil
+}
+
+// canonicalScopeHost renders the authority as an identity rather than as a request target.
+//
+// It lowercases a DNS hostname, because a hostname is case-insensitive, and omits the default port,
+// so "https://example.com:443/a" and "https://example.com/a" are one measurement. A non-default
+// port is kept, because it is a different endpoint.
+//
+// IPv6 literals are re-bracketed, since the bracket is part of the authority syntax and not of the
+// address.
+func canonicalScopeHost(hostname string, portNumber uint64, explicitPort string, scheme string) string {
+	host := hostname
+	// A DNS name is case-insensitive. An IP literal is not a name, so its case is left alone -
+	// addresses are lowercased anyway, and rewriting them would be pointless churn.
+	if !isIPLiteral(hostname) {
+		host = strings.ToLower(hostname)
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	// A port equal to the scheme's default is omitted, whether it was written explicitly or not.
+	//
+	// Checking the VALUE rather than whether one was supplied is what makes "https://host:443/a"
+	// and "https://host/a" one scope. Keying on explicitness instead would give the same endpoint
+	// two identities, which is the split this canonicalisation exists to prevent.
+	_ = explicitPort
+	if portNumber == defaultPortForScheme(scheme) {
+		return host
+	}
+	return host + ":" + strconv.FormatUint(portNumber, 10)
+}
+
+// defaultPortForScheme returns the port implied by a scheme.
+func defaultPortForScheme(scheme string) uint64 {
+	if scheme == "https" {
+		return 443
+	}
+	return 80
+}
+
+// isIPLiteral reports whether host is an IP address rather than a DNS name.
+func isIPLiteral(host string) bool {
+	if strings.Contains(host, ":") {
+		return true
+	}
+	// A dotted-quad-only check is deliberately avoided; a name with digits and dots is still a
+	// name, and lowercasing it is harmless either way.
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
+// NormalizeURLTestURL returns the canonical identity for a target.
+//
+// It is the scope accessor: a result is stored under this string. Callers that also need to make
+// the request or dial the host should use ParseMeasurementTarget, so the canonicalisation here
+// cannot leak into what is actually fetched.
+func NormalizeURLTestURL(link string) (string, error) {
+	target, err := ParseMeasurementTarget(link)
+	if err != nil {
+		return "", err
+	}
+	return target.ScopeURL, nil
 }
 
 // urlTestPort returns the port to dial for a normalised target.
