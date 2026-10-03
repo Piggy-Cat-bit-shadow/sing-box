@@ -66,10 +66,13 @@ func h3QUICVersions(t *testing.T, address string) []quic.Version {
 // no test failing, so the versions are asserted rather than inherited.
 func TestJiejieNaiveH3QUICVersionsMatchTheReference(t *testing.T) {
 	if !http3SupportLinked() {
-		t.Skipf("this build does not link HTTP/3 support (the production tag set " +
-			"omits protocol/naive/quic), so the QUIC version sets cannot be " +
-			"compared. Run under with_quic with the client profile. This is " +
-			"a SKIP, not a pass.")
+		// The gate is `with_quic`, which every shipped tag file carries
+		// (release/DEFAULT_BUILD_TAGS, _OTHERS and _WINDOWS all include it), so this
+		// fires only for a deliberately reduced build. It is stated as a fact about
+		// the build rather than a suggestion, because the test cannot compare QUIC
+		// version sets it never linked.
+		t.Skipf("this build does not link HTTP/3 support (no with_quic tag), so " +
+			"the QUIC version sets cannot be compared. This is a SKIP, not a pass.")
 	}
 	binary := caddyReferenceBinary(t)
 	if binary == "" {

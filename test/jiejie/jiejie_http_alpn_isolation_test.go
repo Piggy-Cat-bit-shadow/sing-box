@@ -1,14 +1,12 @@
 package jiejie_test
 
 import (
-	"context"
 	"crypto/tls"
 	"net"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -94,21 +92,15 @@ func negotiateMixedTCPALPN(t *testing.T, port uint16, offered []string) (string,
 	return conn.ConnectionState().NegotiatedProtocol, nil
 }
 
-// negotiateMixedQUICALPN performs a real QUIC handshake.
+// negotiateMixedQUICALPN negotiates against the mixed HTTP inbound, which presents
+// `example.org`.
+//
+// The handshake itself lives in negotiateQUICALPNWithServerName so the two callers cannot drift:
+// they differ only in this name, and a change to how the negotiation is performed - the timeout,
+// the QUIC config, the early-data behaviour - must apply to both.
 func negotiateMixedQUICALPN(t *testing.T, port uint16, offered []string) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, err := quic.DialAddrEarly(ctx, "127.0.0.1:"+strconv.Itoa(int(port)), &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         "example.org",
-		NextProtos:         offered,
-	}, &quic.Config{})
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = conn.CloseWithError(0, "") }()
-	return conn.ConnectionState().TLS.NegotiatedProtocol, nil
+	return negotiateQUICALPNWithServerName(t, port, "example.org", offered)
 }
 
 // TestJiejieHTTPInboundALPNIsolation is the measurement.
