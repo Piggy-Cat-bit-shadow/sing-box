@@ -697,6 +697,16 @@ func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestinati
 		return false
 	}
 
+	// Process metadata must have been OBTAINED, not merely absent.
+	//
+	// The rules above are consulted in PreMatch, which walks the whole rule set. A process rule
+	// evaluated against a nil ProcessInfo does not match, so a transient lookup failure is
+	// indistinguishable from "no process rule applies" - and the default direct outbound would
+	// then take an irreversible bypass chosen by missing data rather than by the configuration.
+	if !r.processMetadataIsProven(metadata) {
+		return false
+	}
+
 	// Only a connection that resolves to exactly one outbound, with nothing in front of it. A
 	// group introduces selection, lifecycle and accounting semantics of its own, and bypassing
 	// it would skip all of them even when the selected outbound happens to be direct.

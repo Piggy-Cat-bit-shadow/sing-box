@@ -35,6 +35,30 @@ func (r *Router) findProcessInfoCached(ctx context.Context, network string, sour
 	return result, err
 }
 
+// processMetadataIsProven reports whether the process metadata needed to judge a bypass was
+// actually obtained.
+//
+// The distinction it preserves is between "no process rule can apply" and "we could not find out".
+// PreMatch walks the whole rule set, so a process rule is evaluated against metadata.ProcessInfo;
+// when it is nil the rule simply does not match. A flow that then reaches the default direct
+// outbound would take an irreversible native bypass decided by the ABSENCE of metadata.
+//
+// Two cases genuinely have nothing to prove:
+//   - no searcher is configured, so no process rule can exist for this platform
+//   - the source is not local, so the lookup was never applicable
+//
+// Otherwise, ProcessInfo being nil after the search means the answer is unknown, and an unknown
+// answer must fail closed.
+func (r *Router) processMetadataIsProven(metadata *adapter.InboundContext) bool {
+	if r.processSearcher == nil {
+		return true
+	}
+	if metadata.ProcessInfo != nil {
+		return true
+	}
+	return !r.isLocalSource(metadata.Source.Addr)
+}
+
 func (r *Router) searchProcessInfo(ctx context.Context, metadata *adapter.InboundContext) {
 	if r.processSearcher == nil || metadata.ProcessInfo != nil || !r.isLocalSource(metadata.Source.Addr) {
 		return
