@@ -117,13 +117,20 @@ func ParseMeasurementTarget(link string) (MeasurementTarget, error) {
 	scopeURL := requestURL
 	scopeURL.Host = canonicalScopeHost(hostname, portNumber, port, scheme)
 
+	// The destination is built by the metadata parser, so a numeric literal becomes an IP
+	// destination and a hostname becomes a domain.
+	//
+	// Assigning Fqdn directly - which is what this used to do - labelled every target a DOMAIN
+	// whose text merely looked numeric. That is a different instruction on the wire: the proxy
+	// protocols encode ATYP IPv4, IPv6 or DOMAIN, so a DOMAIN "1.1.1.1" asks the remote end to
+	// resolve a literal the operator had already resolved, and an IPv6 literal has to survive as an
+	// address rather than as a bracketed name.
+	destination := M.ParseSocksaddrHostPort(hostname, uint16(portNumber))
+
 	return MeasurementTarget{
-		RequestURL: requestURL.String(),
-		ScopeURL:   scopeURL.String(),
-		Destination: M.Socksaddr{
-			Fqdn: hostname,
-			Port: uint16(portNumber),
-		},
+		RequestURL:  requestURL.String(),
+		ScopeURL:    scopeURL.String(),
+		Destination: destination,
 	}, nil
 }
 
