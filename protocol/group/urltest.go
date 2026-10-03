@@ -270,6 +270,15 @@ type URLTestGroup struct {
 	idleTimeout time.Duration
 	history     *urltest.HistoryStorage
 	checking    atomic.Bool
+	// recheckPending collapses a burst of failing connections into ONE recheck worker.
+	//
+	// checking alone is not enough: it makes the redundant work inside the health function return
+	// early, but every failure still starts its own goroutine. A burst of failing connections on a
+	// phone would create a burst of short-lived goroutines.
+	recheckPending atomic.Bool
+	// recheckRuns counts how many recheck workers actually started. It exists so a test can assert
+	// the single-flight guarantee as a fact rather than inferring it from timing.
+	recheckRuns atomic.Int32
 	// selected holds the TCP and UDP choices as ONE immutable generation.
 	//
 	// They were two bare interface fields, written by the background health check and read by
@@ -703,8 +712,8 @@ func (g *URLTestGroup) clearSelectionFor(network string, failed adapter.Outbound
 // already has a single-flight guard for its checks, so this defers to it and does not add a second
 // mechanism.
 func (g *URLTestGroup) requestHealthRecheck() {
-	// A closed group must not start work. The goroutine below would otherwise run a full health
-	// check against a torn-down group and write history for one that no longer exists.
+	// A closed group must not start work. The worker below would otherwise run a full health check
+	// against a torn-down group and write history for one that no longer exists.
 	g.access.Lock()
 	closed := g.closed
 	g.access.Unlock()
@@ -712,13 +721,32 @@ func (g *URLTestGroup) requestHealthRecheck() {
 		return
 	}
 
+	// ONE worker per burst. CompareAndSwap is what makes that a guarantee rather than a hope: a
+	// failing connection arriving while a recheck is already pending is dropped, not queued.
+	if !g.recheckPending.CompareAndSwap(false, true) {
+		return
+	}
+
 	go func() {
+		defer g.recheckPending.Store(false)
 		defer func() {
 			if recovered := recover(); recovered != nil && g.logger != nil {
 				g.logger.Error("health recheck panicked: ", recovered)
 			}
 		}()
-		g.CheckOutbounds(g.ctx, false)
+
+		if g.ctx.Err() != nil {
+			return
+		}
+		g.recheckRuns.Add(1)
+
+		// force = true. A recheck must actually PROBE.
+		//
+		// With force = false the batch skips any member whose measurement is younger than the
+		// interval - which is exactly the state a traffic failure leaves behind. Nothing would be
+		// re-measured, and the selection that follows would re-read the very measurement the
+		// failure just contradicted, so the node that could not carry traffic stayed eligible.
+		g.CheckOutbounds(g.ctx, true)
 	}()
 }
 
