@@ -76,6 +76,15 @@ type stubPacketConn struct{ net.PacketConn }
 func (c *stubPacketConn) Close() error { return nil }
 
 // newGroupFixture builds a URLTestGroup over the given members with a real HistoryStorage.
+
+// newTestURLTestWrapper builds a wrapper around an existing group, with the group published the way
+// Start publishes it. It exists because the group pointer is now atomic rather than a plain field.
+func newTestURLTestWrapper(group *URLTestGroup, logger log.ContextLogger) *URLTest {
+	wrapper := &URLTest{ctx: context.Background(), logger: logger}
+	wrapper.group.Store(group)
+	return wrapper
+}
+
 func newGroupFixture(t *testing.T, link string, members ...adapter.Outbound) (*URLTestGroup, *urltest.HistoryStorage) {
 	t.Helper()
 	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
@@ -515,15 +524,15 @@ func (e commonErr) Error() string { return string(e) }
 // The traffic entry points live on the URLTest wrapper, so the tests drive them there - that is
 // the code real connections execute.
 func referencingOutbound(group *URLTestGroup) []string {
-	return (&URLTest{group: group}).References()
+	return newTestURLTestWrapper(group, nil).References()
 }
 
 func dialThrough(group *URLTestGroup, network string, destination M.Socksaddr) (net.Conn, error) {
-	return (&URLTest{group: group, logger: log.NewNOPFactory().NewLogger("group")}).DialContext(
+	return newTestURLTestWrapper(group, log.NewNOPFactory().NewLogger("group")).DialContext(
 		context.Background(), network, destination)
 }
 
 func listenThrough(group *URLTestGroup, destination M.Socksaddr) (net.PacketConn, error) {
-	return (&URLTest{group: group, logger: log.NewNOPFactory().NewLogger("group")}).ListenPacket(
+	return newTestURLTestWrapper(group, log.NewNOPFactory().NewLogger("group")).ListenPacket(
 		context.Background(), destination)
 }

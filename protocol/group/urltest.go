@@ -47,11 +47,20 @@ type URLTest struct {
 	expectedStatus string
 	// scope identifies the target this group measures against. Selection, skipping and health
 	// checks must only read measurements for THIS target.
-	scope                        urltest.MeasurementScope
-	interval                     time.Duration
-	tolerance                    uint16
-	idleTimeout                  time.Duration
-	group                        *URLTestGroup
+	scope       urltest.MeasurementScope
+	interval    time.Duration
+	tolerance   uint16
+	idleTimeout time.Duration
+	// group is the live group, published atomically.
+	//
+	// It was a plain pointer guarded by checkAccess, but only the writers and two readers took that
+	// lock: the traffic path dereferenced it directly. Start replaces the pointer, so a dial could
+	// read it mid-replacement - a genuine data race on a field every packet touches, and an
+	// inconsistent read for the caller.
+	//
+	// An atomic pointer makes every read race-free without putting a lock on the traffic path, which
+	// is the same reasoning already applied to selectedState.
+	group                        atomic.Pointer[URLTestGroup]
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
 }
@@ -84,12 +93,13 @@ func (s *URLTest) Start() error {
 	// A health check already running kept running, for a group nothing could reach.
 	//
 	// Start is called once in the normal lifecycle, so this is about not leaking when it is not.
-	s.checkAccess.Lock()
-	if s.group != nil {
-		_ = s.group.Close()
-		s.group = nil
+	// Detach the previous group, then close it OUTSIDE any lock.
+	//
+	// Close runs an arbitrary lifecycle callback - the group unregisters pause callbacks and stops a
+	// ticker - so holding a lock across it would risk a deadlock.
+	if previous := s.group.Swap(nil); previous != nil {
+		_ = previous.Close()
 	}
-	s.checkAccess.Unlock()
 
 	outbounds := make([]adapter.Outbound, 0, len(s.tags))
 	for i, tag := range s.tags {
@@ -103,18 +113,19 @@ func (s *URLTest) Start() error {
 	if err != nil {
 		return err
 	}
-	s.group = group
+	s.group.Store(group)
 	return nil
 }
 
 func (s *URLTest) PostStart() error {
-	s.group.PostStart()
+	s.currentGroup().PostStart()
 	return nil
 }
 
 func (s *URLTest) Close() error {
+	// Detach atomically, so a concurrent Start cannot publish a group this Close then closes.
 	return common.Close(
-		common.PtrOrNil(s.group),
+		common.PtrOrNil(s.group.Swap(nil)),
 	)
 }
 
@@ -122,9 +133,21 @@ func (s *URLTest) All() []string {
 	return s.tags
 }
 
+// currentGroup returns the live group, or nil when the wrapper has none.
+//
+// Every reader goes through here, so the pointer is loaded once and the nil check cannot race with
+// a concurrent Start or Close.
+func (s *URLTest) currentGroup() *URLTestGroup {
+	return s.group.Load()
+}
+
 func (s *URLTest) Selected(network string) adapter.Outbound {
+	current := s.currentGroup()
+	if current == nil {
+		return nil
+	}
 	var outbound adapter.Outbound
-	if state := s.group.selected.Load(); state != nil {
+	if state := current.selected.Load(); state != nil {
 		if network == N.NetworkUDP {
 			outbound = state.udp
 		} else {
@@ -132,18 +155,22 @@ func (s *URLTest) Selected(network string) adapter.Outbound {
 		}
 	}
 	if outbound == nil {
-		outbound, _ = s.group.Select(network)
+		outbound, _ = current.Select(network)
 	}
 	return outbound
 }
 
 func (s *URLTest) AttachConnection(closer io.Closer) func() {
-	s.group.Touch()
-	return s.group.interruptGroup.Add(closer, true)
+	current := s.currentGroup()
+	if current == nil {
+		return func() {}
+	}
+	current.Touch()
+	return current.interruptGroup.Add(closer, true)
 }
 
 func (s *URLTest) References() []string {
-	group := s.group
+	group := s.currentGroup()
 	if group == nil {
 		return nil
 	}
@@ -162,19 +189,19 @@ func (s *URLTest) References() []string {
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.group.URLTest(ctx)
+	return s.currentGroup().URLTest(ctx)
 }
 
 func (s *URLTest) CheckOutbounds() {
-	s.group.CheckOutbounds(s.ctx, true)
+	s.currentGroup().CheckOutbounds(s.ctx, true)
 }
 
 func (s *URLTest) PerformUpdateCheck() {
-	s.group.performUpdateCheck()
+	s.currentGroup().performUpdateCheck()
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
-	group := s.group
+	group := s.currentGroup()
 	if group == nil {
 		return
 	}
@@ -192,9 +219,13 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 }
 
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	s.group.Touch()
+	current := s.currentGroup()
+	if current == nil {
+		return nil, os.ErrClosed
+	}
+	current.Touch()
 	var outbound adapter.Outbound
-	if state := s.group.selected.Load(); state != nil {
+	if state := current.selected.Load(); state != nil {
 		switch N.NetworkName(network) {
 		case N.NetworkTCP:
 			outbound = state.tcp
@@ -207,41 +238,45 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if outbound == nil {
-		outbound, _ = s.group.Select(network)
+		outbound, _ = current.Select(network)
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return current.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
 	// A real connection failed, so the node is not usable now regardless of what an earlier
 	// measurement said. Only this target's result is invalidated, and only if this outbound is
 	// still the selected one - a concurrent update may already have moved on.
-	s.group.clearSelectionFor(network, outbound)
+	current.clearSelectionFor(network, outbound)
 	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	s.group.Touch()
+	current := s.currentGroup()
+	if current == nil {
+		return nil, os.ErrClosed
+	}
+	current.Touch()
 	var outbound adapter.Outbound
-	if state := s.group.selected.Load(); state != nil {
+	if state := current.selected.Load(); state != nil {
 		outbound = state.udp
 	}
 	if outbound == nil {
-		outbound, _ = s.group.Select(N.NetworkUDP)
+		outbound, _ = current.Select(N.NetworkUDP)
 	}
 	if outbound == nil {
 		return nil, E.New("missing supported outbound")
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+		return current.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.clearSelectionFor(N.NetworkUDP, outbound)
+	current.clearSelectionFor(N.NetworkUDP, outbound)
 	return nil, err
 }
 
@@ -447,7 +482,7 @@ func (g *URLTestGroup) PostStart() {
 // than the process-wide display history. Selecting a member from one measurement and showing
 // another's delay is how a UI ends up contradicting the selection it is describing.
 func (s *URLTest) MeasurementScope() urltest.MeasurementScope {
-	return s.group.scope
+	return s.currentGroup().scope
 }
 
 // backgroundContext reports the context this group's background work runs on.

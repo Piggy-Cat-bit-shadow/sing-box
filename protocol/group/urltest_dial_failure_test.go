@@ -72,7 +72,7 @@ func TestTrafficDialFailureDoesNotDeleteHealthEvidence(t *testing.T) {
 	require.Equal(t, "node-a", selected.Tag(), "node-a is the fastest healthy node")
 
 	// A real connection through node-a fails - because the TARGET refused it.
-	outbound := &URLTest{group: group, ctx: context.Background(), logger: log.NewNOPFactory().NewLogger("urltest")}
+	outbound := newTestURLTestWrapper(group, log.NewNOPFactory().NewLogger("urltest"))
 	_, err := outbound.DialContext(context.Background(), N.NetworkTCP,
 		M.ParseSocksaddr("203.0.113.9:443"))
 	require.Error(t, err, "the dial must still report the failure to the caller")
@@ -102,7 +102,7 @@ func TestTrafficDialFailureStillAllowsReplacementForTheCaller(t *testing.T) {
 	storage.StoreURLTestHistoryFor("node-a", group.scope,
 		&adapter.URLTestHistory{Time: time.Now(), Delay: 20})
 
-	outbound := &URLTest{group: group, ctx: context.Background(), logger: log.NewNOPFactory().NewLogger("urltest")}
+	outbound := newTestURLTestWrapper(group, log.NewNOPFactory().NewLogger("urltest"))
 	_, err := outbound.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr("203.0.113.9:443"))
 	require.Error(t, err)
 

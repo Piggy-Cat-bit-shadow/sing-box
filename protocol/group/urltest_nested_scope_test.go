@@ -50,10 +50,10 @@ func TestNestedGroupIsMeasuredAgainstTheParentTarget(t *testing.T) {
 	childGroup, _ := newGroupFixture(t, childTarget, leafA, leafB)
 	child := &URLTest{
 		Adapter: outbound.NewAdapter(C.TypeURLTest, "child", []string{N.NetworkTCP}, []string{"leaf-a", "leaf-b"}),
-		group:   childGroup,
 		link:    childTarget,
 		tags:    []string{"leaf-a", "leaf-b"},
 	}
+	child.group.Store(childGroup)
 
 	parent, _ := newGroupFixture(t, parentTarget, child)
 
@@ -100,10 +100,10 @@ func TestNestedGroupSelectionIsNotMutatedByParentCheck(t *testing.T) {
 	childGroup, childStorage := newGroupFixture(t, "https://child.example/probe", leafA, leafB)
 	child := &URLTest{
 		Adapter: outbound.NewAdapter(C.TypeURLTest, "child", []string{N.NetworkTCP}, []string{"leaf-a", "leaf-b"}),
-		group:   childGroup,
 		link:    "https://child.example/probe",
 		tags:    []string{"leaf-a", "leaf-b"},
 	}
+	child.group.Store(childGroup)
 
 	// Give the child a definite selection of its own.
 	childStorage.StoreURLTestHistoryFor("leaf-b", childGroup.scope,
@@ -155,10 +155,10 @@ func TestNestedGroupCycleTerminates(t *testing.T) {
 	loop := &URLTest{
 		Adapter: outbound.NewAdapter(C.TypeURLTest, "loop",
 			[]string{N.NetworkTCP}, []string{"loop"}),
-		group: selfReferential,
-		link:  "https://self.example/probe",
-		tags:  []string{"loop"},
+		link: "https://self.example/probe",
+		tags: []string{"loop"},
 	}
+	loop.group.Store(selfReferential)
 	manager.byTag = map[string]adapter.Outbound{"loop": loop}
 
 	runner, _ := batch.New(context.Background(), batch.WithConcurrencyNum[any](10))

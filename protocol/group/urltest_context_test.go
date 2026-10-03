@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,9 +13,11 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/pause"
 
 	"github.com/stretchr/testify/require"
 )
@@ -305,4 +308,92 @@ func TestBusyForcedRoundReportsFailureRatherThanAnEmptySuccess(t *testing.T) {
 
 	group.checking.Store(false)
 	_ = result
+}
+
+// TestStartCloseInterfaceUpdatedGroupPointerIsRaceFree is grey zone B.
+//
+// Start replaces s.group, and the assignment happened OUTSIDE checkAccess - the lock was released
+// before it - while readers such as Selected, DialContext and InterfaceUpdated take that lock. The
+// pointer was therefore read and written concurrently.
+//
+// The readers are on the traffic path, so this is not a diagnostic-only window: a dial could observe
+// a group pointer that was mid-replacement.
+func TestStartCloseInterfaceUpdatedGroupPointerIsRaceFree(t *testing.T) {
+	node := &observingOutbound{tag: "node-a"}
+
+	// Built through the real constructor, so the wrapper is configured the way production does.
+	manager := &singleOutboundManager{outbound: node}
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(10))
+	// NewURLTest reads the outbound manager from the context, which is how production supplies it.
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
+
+	constructed, err := NewURLTest(ctx, nil,
+		log.NewNOPFactory().NewLogger("group"), "auto", option.URLTestOutboundOptions{
+			Outbounds: []string{"node-a"},
+			URL:       "https://probe.example/generate_204",
+		})
+	require.NoError(t, err)
+
+	urlTest := constructed.(*URLTest)
+
+	require.NoError(t, urlTest.Start())
+
+	var waitGroup sync.WaitGroup
+	stop := make(chan struct{})
+
+	// A reader on the traffic path, exactly as production does it.
+	waitGroup.Add(2)
+	go func() {
+		defer waitGroup.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = urlTest.Selected(N.NetworkTCP)
+		}
+	}()
+	go func() {
+		defer waitGroup.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = urlTest.Tag()
+		}
+	}()
+
+	// The writer: repeated Start, each of which replaces the pointer.
+	for attempt := 0; attempt < 50; attempt++ {
+		_ = urlTest.Start()
+	}
+
+	close(stop)
+	waitGroup.Wait()
+
+	require.NoError(t, urlTest.Close())
+}
+
+// singleOutboundManager serves one outbound by tag.
+type singleOutboundManager struct {
+	adapter.OutboundManager
+	outbound adapter.Outbound
+}
+
+func (m *singleOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	if m.outbound != nil && m.outbound.Tag() == tag {
+		return m.outbound, true
+	}
+	return nil, false
+}
+
+func (m *singleOutboundManager) Outbounds() []adapter.Outbound {
+	if m.outbound == nil {
+		return nil
+	}
+	return []adapter.Outbound{m.outbound}
 }
