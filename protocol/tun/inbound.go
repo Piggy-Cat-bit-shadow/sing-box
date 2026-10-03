@@ -39,29 +39,24 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 type Inbound struct {
-	tag               string
-	ctx               context.Context
-	router            adapter.Router
-	networkManager    adapter.NetworkManager
-	logger            log.ContextLogger
-	tunOptions        tun.Options
-	udpTimeout        time.Duration
-	udpMapping        tun.NATMapping
-	udpFiltering      tun.NATFiltering
-	udpNATMax         uint32
-	dnsHijackAddress  []netip.Addr
-	dnsHijackByPort   bool
-	stack             string
-	tunIf             tun.Tun
-	tunStack          tun.Stack
-	platformInterface adapter.PlatformInterface
-	platformOptions   option.TunPlatformOptions
-	autoRedirect      tun.AutoRedirect
-	// registeredOutputMark records that this inbound claimed the process-global auto-redirect
-	// output mark, so the claim is released on a construction failure or Close. Without it the
-	// claim is permanent: a failed constructor leaves the manager believing an auto-redirect is
-	// active, and a later valid configuration is refused for a limit nothing is using.
-	registeredOutputMark        bool
+	tag                         string
+	ctx                         context.Context
+	router                      adapter.Router
+	networkManager              adapter.NetworkManager
+	logger                      log.ContextLogger
+	tunOptions                  tun.Options
+	udpTimeout                  time.Duration
+	udpMapping                  tun.NATMapping
+	udpFiltering                tun.NATFiltering
+	udpNATMax                   uint32
+	dnsHijackAddress            []netip.Addr
+	dnsHijackByPort             bool
+	stack                       string
+	tunIf                       tun.Tun
+	tunStack                    tun.Stack
+	platformInterface           adapter.PlatformInterface
+	platformOptions             option.TunPlatformOptions
+	autoRedirect                tun.AutoRedirect
 	routeRuleSet                []adapter.RuleSet
 	routeRuleSetCallback        []*list.Element[adapter.RuleSetUpdateCallback]
 	routeExcludeRuleSet         []adapter.RuleSet
@@ -301,10 +296,6 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			if err != nil {
 				return nil, err
 			}
-			// The mark is process-global and this function can still fail below, in which case the
-			// object is discarded WITHOUT Close. Recording the claim on the inbound is what lets
-			// that failure path - and a later Close - release it.
-			inbound.registeredOutputMark = true
 		}
 	}
 	return inbound, nil
@@ -578,28 +569,11 @@ func (t *Inbound) Close() error {
 	// Releasing first also means the rule-set can never fire between the teardown and the release.
 	t.releaseRouteSetCallbacks()
 
-	// Release the process-global output mark claim, if this inbound took one.
-	t.releaseOutputMark()
-
 	return common.Close(
 		t.tunStack,
 		t.tunIf,
 		t.autoRedirect,
 	)
-}
-
-// releaseOutputMark returns the process-global auto-redirect output mark, once.
-//
-// It is guarded so a construction failure and a later Close cannot both release, and so a second
-// Close cannot release a claim belonging to another inbound.
-func (t *Inbound) releaseOutputMark() {
-	if !t.registeredOutputMark {
-		return
-	}
-	t.registeredOutputMark = false
-	if t.networkManager != nil {
-		t.networkManager.UnregisterAutoRedirectOutputMark()
-	}
 }
 
 // releaseRouteSetCallbacks unregisters everything Start registered and clears the stored elements.
