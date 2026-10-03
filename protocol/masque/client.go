@@ -266,7 +266,7 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	return clientEndpoint, nil
 }
 
-func (c *ClientEndpoint) Start(stage adapter.StartStage) error {
+func (c *ClientEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		c.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(c.ctx)
@@ -275,16 +275,15 @@ func (c *ClientEndpoint) Start(stage adapter.StartStage) error {
 			return err
 		}
 		tunnelDevice.SetPacketWriter(c.writePacketBuffers)
+		// The scope owns the device, so teardown does not depend on a hand-written Close.
+		scope.Add(tunnelDevice.Close)
 		c.device = tunnelDevice
 		c.deviceOptions = nil
 	case adapter.StartStatePostStart:
 		c.client.Start()
+		scope.Add(c.client.Close)
 	}
 	return nil
-}
-
-func (c *ClientEndpoint) Close() error {
-	return common.Close(c.client, c.device)
 }
 
 func (c *ClientEndpoint) UpdateConfiguration(configuration masque.Configuration) error {

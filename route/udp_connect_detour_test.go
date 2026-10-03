@@ -65,10 +65,10 @@ type stubInboundManager struct {
 	target adapter.Inbound
 }
 
-func (m *stubInboundManager) Start(stage adapter.StartStage) error { return nil }
-func (m *stubInboundManager) Close() error                         { return nil }
-func (m *stubInboundManager) Inbounds() []adapter.Inbound          { return nil }
-func (m *stubInboundManager) Remove(tag string) error              { return nil }
+func (m *stubInboundManager) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (m *stubInboundManager) Close() error                                               { return nil }
+func (m *stubInboundManager) Inbounds() []adapter.Inbound                                { return nil }
+func (m *stubInboundManager) Remove(tag string) error                                    { return nil }
 func (m *stubInboundManager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, inboundType string, options any) error {
 	return nil
 }

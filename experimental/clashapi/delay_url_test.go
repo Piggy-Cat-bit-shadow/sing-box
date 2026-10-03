@@ -332,11 +332,11 @@ type certificateStore struct {
 	pool *x509.CertPool
 }
 
-func (s *certificateStore) Name() string                         { return "test-certificate-store" }
-func (s *certificateStore) Start(stage adapter.StartStage) error { return nil }
-func (s *certificateStore) Close() error                         { return nil }
-func (s *certificateStore) Pool() *x509.CertPool                 { return s.pool }
-func (s *certificateStore) ExclusiveAnchors() bool               { return true }
+func (s *certificateStore) Name() string                                               { return "test-certificate-store" }
+func (s *certificateStore) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (s *certificateStore) Close() error                                               { return nil }
+func (s *certificateStore) Pool() *x509.CertPool                                       { return s.pool }
+func (s *certificateStore) ExclusiveAnchors() bool                                     { return true }
 
 // newTLSDelayTargetServer starts an HTTPS server whose certificate is trusted ONLY by the store it
 // returns, so a measurement succeeds if and only if that store reaches Measure's context.

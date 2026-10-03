@@ -94,7 +94,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return outbound, nil
 }
 
-func (s *URLTest) Start(stage adapter.StartStage) error {
+func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateStart:
 		// Dispose of any group from an earlier Start before replacing it.
@@ -150,10 +150,12 @@ func (s *URLTest) Start(stage adapter.StartStage) error {
 		}
 		s.group.Store(group)
 		s.lifecycleAccess.Unlock()
+		// The scope owns the group's teardown, registered against the group this Start installed,
+		// so a teardown that races Start cannot leave it running unreferenced.
+		scope.Add(group.Close)
 	case adapter.StartStateStarted:
-		// The staged lifecycle calls this once the object is live. The wrapper's PostStart is the
-		// guarded form: no group means closed or never started, which is reported rather than
-		// silently treated as success.
+		// PostStart goes through the wrapper's guarded form: no group means closed or never
+		// started, which is reported rather than silently treated as success.
 		return s.PostStart()
 	}
 	return nil

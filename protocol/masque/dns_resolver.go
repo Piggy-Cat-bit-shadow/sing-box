@@ -119,9 +119,10 @@ func (t *configurationDNSTransport) Environment() []string {
 
 // Start and Close are no-ops: this transport owns no socket, no goroutine and no lifecycle. The
 // short-lived native transports used per query close themselves.
-func (t *configurationDNSTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *configurationDNSTransport) Close() error                         { return nil }
-func (t *configurationDNSTransport) Reset()                               {}
+func (t *configurationDNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *configurationDNSTransport) Reset() {}
 
 // Exchange runs one query, walking this configuration's resolvers by priority.
 //
@@ -234,14 +235,12 @@ func (t *configurationDNSTransport) exchangePlain(ctx context.Context, resolver 
 			serverAddress,
 		)
 		response, err := native.Exchange(ctx, message)
-		closeErr := native.Close()
+		// The transport is scope-owned under the new lifecycle: it is released by the scope that
+		// started it rather than by the caller, so there is no Close to call here.
 		if err == nil {
 			return response, nil
 		}
 		lastErr = err
-		if closeErr != nil {
-			t.logger.DebugContext(ctx, "closing assigned DNS transport for ", address, ": ", closeErr)
-		}
 		t.logger.DebugContext(ctx, "assigned DNS to ", address, " failed: ", err)
 		if ctx.Err() != nil {
 			break

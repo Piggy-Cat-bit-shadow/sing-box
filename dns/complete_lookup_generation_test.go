@@ -50,13 +50,15 @@ type familyPhaseTransport struct {
 	once sync.Once
 }
 
-func (t *familyPhaseTransport) Type() string                         { return "family-phase" }
-func (t *familyPhaseTransport) Tag() string                          { return t.tag }
-func (t *familyPhaseTransport) Dependencies() []string               { return nil }
-func (t *familyPhaseTransport) Environment() []string                { return []string{"wifi"} }
-func (t *familyPhaseTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *familyPhaseTransport) Close() error                         { return nil }
-func (t *familyPhaseTransport) Reset()                               {}
+func (t *familyPhaseTransport) Type() string           { return "family-phase" }
+func (t *familyPhaseTransport) Tag() string            { return t.tag }
+func (t *familyPhaseTransport) Dependencies() []string { return nil }
+func (t *familyPhaseTransport) Environment() []string  { return []string{"wifi"} }
+func (t *familyPhaseTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *familyPhaseTransport) Close() error { return nil }
+func (t *familyPhaseTransport) Reset()       {}
 
 func (t *familyPhaseTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	if len(message.Question) == 0 {

@@ -53,13 +53,13 @@ type stepwiseTransport struct {
 	queries atomic.Int32
 }
 
-func (t *stepwiseTransport) Type() string                         { return "stepwise" }
-func (t *stepwiseTransport) Tag() string                          { return t.tag }
-func (t *stepwiseTransport) Dependencies() []string               { return nil }
-func (t *stepwiseTransport) Environment() []string                { return []string{"wifi"} }
-func (t *stepwiseTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *stepwiseTransport) Close() error                         { return nil }
-func (t *stepwiseTransport) Reset()                               {}
+func (t *stepwiseTransport) Type() string                                               { return "stepwise" }
+func (t *stepwiseTransport) Tag() string                                                { return t.tag }
+func (t *stepwiseTransport) Dependencies() []string                                     { return nil }
+func (t *stepwiseTransport) Environment() []string                                      { return []string{"wifi"} }
+func (t *stepwiseTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *stepwiseTransport) Close() error                                               { return nil }
+func (t *stepwiseTransport) Reset()                                                     {}
 
 func (t *stepwiseTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)

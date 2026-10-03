@@ -54,12 +54,14 @@ type blockingReverseTransport struct {
 	address netip.Addr
 }
 
-func (t *blockingReverseTransport) Type() string                         { return "blocking" }
-func (t *blockingReverseTransport) Tag() string                          { return t.tag }
-func (t *blockingReverseTransport) Dependencies() []string               { return nil }
-func (t *blockingReverseTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *blockingReverseTransport) Close() error                         { return nil }
-func (t *blockingReverseTransport) Reset()                               {}
+func (t *blockingReverseTransport) Type() string           { return "blocking" }
+func (t *blockingReverseTransport) Tag() string            { return t.tag }
+func (t *blockingReverseTransport) Dependencies() []string { return nil }
+func (t *blockingReverseTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *blockingReverseTransport) Close() error { return nil }
+func (t *blockingReverseTransport) Reset()       {}
 
 func (t *blockingReverseTransport) answer(message *mDNS.Msg) *mDNS.Msg {
 	response := new(mDNS.Msg)
@@ -384,11 +386,13 @@ type generationProbeTransport struct {
 	probe                     func() uint64
 }
 
-func (t *generationProbeTransport) Type() string                         { return "generation-probe" }
-func (t *generationProbeTransport) Tag() string                          { return t.tag }
-func (t *generationProbeTransport) Dependencies() []string               { return nil }
-func (t *generationProbeTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *generationProbeTransport) Close() error                         { return nil }
+func (t *generationProbeTransport) Type() string           { return "generation-probe" }
+func (t *generationProbeTransport) Tag() string            { return t.tag }
+func (t *generationProbeTransport) Dependencies() []string { return nil }
+func (t *generationProbeTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *generationProbeTransport) Close() error { return nil }
 
 func (t *generationProbeTransport) Reset() {
 	if t.probe != nil {

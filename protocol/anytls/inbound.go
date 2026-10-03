@@ -111,7 +111,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -120,8 +120,16 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
-	return h.listener.Start()
+	err := h.listener.Start()
+	if err != nil {
+		return err
+	}
+	// The scope owns teardown, so the hand-written Close below is gone: a resource that is not
+	// registered here would never be released.
+	scope.Add(h.listener.Close)
+	return nil
 }
 
 func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -156,10 +164,6 @@ func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadat
 	// still reported as errors elsewhere.
 	h.logger.DebugContext(ctx, "fallback connection to ", fallbackAddr)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(h.listener, h.tlsConfig)
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

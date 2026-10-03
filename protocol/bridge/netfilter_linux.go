@@ -508,6 +508,18 @@ func egressRoutes(routeTable int, family int, link netlink.Link, fallbackType in
 	return append(routes, defaultRoute)
 }
 
+// blackholeBridgeDefault drops traffic that would otherwise escape through whatever route the
+// main table happens to hold, used when a pinned egress interface disappears: the bridge must stop
+// forwarding rather than silently fall back to an unrelated path.
+func blackholeBridgeDefault(routeTable int, family int) {
+	_ = netlink.RouteReplace(&netlink.Route{
+		Table:  routeTable,
+		Family: family,
+		Type:   unix.RTN_BLACKHOLE,
+		Dst:    defaultDestination(family),
+	})
+}
+
 func activeBridgeFamilies(inet6Port netip.Addr) []int {
 	families := []int{unix.AF_INET}
 	if inet6Port.IsValid() {

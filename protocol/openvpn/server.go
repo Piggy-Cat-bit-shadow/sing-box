@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,7 +38,6 @@ var (
 type ServerEndpoint struct {
 	endpointBase
 	ctx            context.Context
-	loopContext    context.Context
 	cancelLoop     context.CancelFunc
 	options        option.OpenVPNServerEndpointOptions
 	serverOptions  ovpn.ServerOptions
@@ -48,7 +48,6 @@ type ServerEndpoint struct {
 	device         device.Device
 	localAddresses []netip.Prefix
 	started        atomic.Bool
-	readLoopDone   chan struct{}
 }
 
 type udpEgressPacketConn struct {
@@ -83,7 +82,6 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 			logger:  logger,
 		},
 		ctx:            ctx,
-		loopContext:    loopContext,
 		cancelLoop:     cancelLoop,
 		options:        options,
 		dnsRouter:      service.FromContext[adapter.DNSRouter](ctx),
@@ -105,24 +103,19 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
-	packetFrontHeadroom, packetRearHeadroom := serverOptions.DataPacketHeadroom()
 	serverEndpoint.deviceOptions = &device.Options{
-		Context:             ctx,
-		Logger:              logger,
-		System:              options.System,
-		Handler:             serverEndpoint,
-		UDPTimeout:          udpTimeout,
-		ICMPTimeout:         C.ICMPTimeout,
-		UDPMapping:          tun.NATMapping(options.UDPMapping),
-		UDPFiltering:        tun.NATFiltering(options.UDPFiltering),
-		UDPNATMax:           options.UDPNATMax,
-		InterfaceFinder:     service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
-		Name:                options.Name,
-		NamePrefix:          "ovpn",
-		MTU:                 options.MTU,
-		PacketFrontHeadroom: packetFrontHeadroom,
-		PacketRearHeadroom:  packetRearHeadroom,
-		Route:               serverEndpoint.routeOutbound,
+		Context:         ctx,
+		Logger:          logger,
+		System:          options.System,
+		Handler:         serverEndpoint,
+		UDPTimeout:      udpTimeout,
+		ICMPTimeout:     C.ICMPTimeout,
+		UDPMapping:      tun.NATMapping(options.UDPMapping),
+		UDPFiltering:    tun.NATFiltering(options.UDPFiltering),
+		UDPNATMax:       options.UDPNATMax,
+		InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
+		Name:            options.Name,
+		MTU:             options.MTU,
 		Configuration: device.Configuration{
 			MTU:     options.MTU,
 			Address: options.Address,
@@ -162,15 +155,20 @@ func validateServerTopology(topology string) error {
 	}
 }
 
-func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
+func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage == adapter.StartStateInitialize {
+		scope.Add(func() error {
+			s.cancelLoop()
+			return nil
+		})
 		s.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(s.ctx)
-		tunnelDevice, err := device.New(*s.deviceOptions)
+		device, err := device.New(*s.deviceOptions)
 		if err != nil {
 			return err
 		}
-		tunnelDevice.SetPacketWriter(s.writePacketBuffersByDestination)
-		s.device = tunnelDevice
+		scope.Add(device.Close)
+		device.SetPacketWriter(s.writePacketBuffersByDestination)
+		s.device = device
 		s.deviceOptions = nil
 		return nil
 	}
@@ -236,6 +234,7 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	scope.Add(s.listener.Close)
 	serverOptions := s.serverOptions
 	if streamListener != nil {
 		serverOptions.Transport.ListenAddress = streamListener.Addr().String()
@@ -244,35 +243,40 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
 	}
 	serverOptions.Transport.Listener = streamListener
 	serverOptions.Transport.PacketConn = packetConn
-	serverOptions.NewOutboundQueue = func(write func(buffers []*buf.Buffer)) ovpn.OutboundQueue {
-		return s.device.NewOutboundQueue(write)
+	// The headroom is the device's, so it is supplied as a closure once the device exists.
+	serverOptions.IncomingPacketHeadroom = func() int {
+		return s.device.FrontHeadroom()
 	}
-	serverOptions.IncomingPacketHeadroom = s.device.FrontHeadroom
 	server, err := ovpn.NewServer(serverOptions)
 	if err != nil {
 		if packetConn != nil {
 			_ = packetConn.Close()
 		}
-		s.listener.Close()
 		return err
 	}
 	s.server = server
+	var loopGroup sync.WaitGroup
+	scope.Add(func() error {
+		loopGroup.Wait()
+		return nil
+	})
+	scope.Add(server.Close)
 	err = s.device.Start()
 	if err != nil {
-		s.listener.Close()
-		server.Close()
 		return err
 	}
 	err = server.Start()
 	if err != nil {
-		s.device.Close()
-		s.listener.Close()
-		server.Close()
 		return err
 	}
 	s.started.Store(true)
-	s.readLoopDone = make(chan struct{})
-	go s.readLoop()
+	scope.Add(func() error {
+		s.started.Store(false)
+		return nil
+	})
+	loopGroup.Go(func() {
+		s.readLoop(scope.Context())
+	})
 	return nil
 }
 
@@ -611,12 +615,11 @@ func applyServerPushOptions(serverOptions *ovpn.ServerOptions, options option.Op
 	return nil
 }
 
-func (s *ServerEndpoint) readLoop() {
-	defer close(s.readLoopDone)
+func (s *ServerEndpoint) readLoop(ctx context.Context) {
 	for {
-		serverPacketBuffers, err := s.server.ReadDataPackets(s.loopContext)
+		serverPacketBuffers, err := s.server.ReadDataPackets(ctx)
 		if err != nil {
-			if E.IsClosedOrCanceled(err) || s.loopContext.Err() != nil {
+			if E.IsClosedOrCanceled(err) || ctx.Err() != nil {
 				return
 			}
 			s.logger.Error(E.Cause(err, "server terminated"))
@@ -633,27 +636,6 @@ func (s *ServerEndpoint) readLoop() {
 			return
 		}
 	}
-}
-
-func (s *ServerEndpoint) Close() error {
-	s.started.Store(false)
-	s.cancelLoop()
-	var serverErr error
-	if s.server != nil {
-		serverErr = s.server.Close()
-	}
-	if s.readLoopDone != nil {
-		<-s.readLoopDone
-	}
-	var deviceErr error
-	if s.device != nil {
-		deviceErr = s.device.Close()
-	}
-	var listenerErr error
-	if s.listener != nil {
-		listenerErr = s.listener.Close()
-	}
-	return E.Errors(serverErr, deviceErr, listenerErr)
 }
 
 func (s *ServerEndpoint) PreMatchFlow(network string, destination netip.Addr) adapter.PreMatchAction {
@@ -688,16 +670,15 @@ func (s *ServerEndpoint) WritePackets(packets [][]byte) error {
 	if !s.started.Load() {
 		return E.New("endpoint is not ready yet")
 	}
-	routeMisses, err := s.server.WriteDataPacketsByDestination(packets)
+	packetBuffers := make([]*buf.Buffer, len(packets))
+	for i, packet := range packets {
+		packetBuffers[i] = buf.As(packet)
+	}
+	routeMisses, err := s.server.WriteDataPacketBuffersByDestination(packetBuffers)
 	if len(routeMisses) > 0 {
 		s.writeRouteMisses(routeMisses)
 	}
 	return err
-}
-
-func (s *ServerEndpoint) routeOutbound(packet []byte) *tun.OutboundQueue {
-	outboundQueue, _ := s.server.RouteOutbound(packet).(*tun.OutboundQueue)
-	return outboundQueue
 }
 
 func (s *ServerEndpoint) writePacketBuffersByDestination(packetBuffers []*buf.Buffer) error {
@@ -725,6 +706,8 @@ func (s *ServerEndpoint) writeRouteMisses(routeMisses []*ovpn.RouteMissError) {
 	if len(replies) == 0 {
 		return
 	}
+	// Written back through the device rather than routed via a ReturnPath: the shared device
+	// abstraction exposes WriteInboundBuffers, and the ICMP error is addressed to the tunnel peer.
 	err := s.device.WriteInboundBuffers(replies)
 	if err != nil {
 		s.logger.Debug(E.Cause(err, "write ICMP error"))

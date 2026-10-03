@@ -64,13 +64,13 @@ type windowTransport struct {
 	queries     atomic.Int32
 }
 
-func (t *windowTransport) Type() string                         { return "window" }
-func (t *windowTransport) Tag() string                          { return t.tag }
-func (t *windowTransport) Dependencies() []string               { return nil }
-func (t *windowTransport) Environment() []string                { return t.environment }
-func (t *windowTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *windowTransport) Close() error                         { return nil }
-func (t *windowTransport) Reset()                               {}
+func (t *windowTransport) Type() string                                               { return "window" }
+func (t *windowTransport) Tag() string                                                { return t.tag }
+func (t *windowTransport) Dependencies() []string                                     { return nil }
+func (t *windowTransport) Environment() []string                                      { return t.environment }
+func (t *windowTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *windowTransport) Close() error                                               { return nil }
+func (t *windowTransport) Reset()                                                     {}
 
 func (t *windowTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)

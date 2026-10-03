@@ -42,12 +42,12 @@ type switchingTransport struct {
 	queries atomic.Int32
 }
 
-func (t *switchingTransport) Type() string                         { return "switching" }
-func (t *switchingTransport) Tag() string                          { return t.tag }
-func (t *switchingTransport) Dependencies() []string               { return nil }
-func (t *switchingTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *switchingTransport) Close() error                         { return nil }
-func (t *switchingTransport) Reset()                               {}
+func (t *switchingTransport) Type() string                                               { return "switching" }
+func (t *switchingTransport) Tag() string                                                { return t.tag }
+func (t *switchingTransport) Dependencies() []string                                     { return nil }
+func (t *switchingTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *switchingTransport) Close() error                                               { return nil }
+func (t *switchingTransport) Reset()                                                     {}
 
 func (t *switchingTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)

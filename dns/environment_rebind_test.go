@@ -117,11 +117,11 @@ func (t *rebindingTransport) breakConn() {
 // DNSTransportWithEnvironment. environmentHash returns 0 for a transport that does not, which would
 // make every cache key identical and every assertion below vacuous. Implementing the full set keeps
 // the type satisfying the interface for a reason the test can see.
-func (t *rebindingTransport) Tag() string                          { return t.tag }
-func (t *rebindingTransport) Type() string                         { return "test-rebinding" }
-func (t *rebindingTransport) Dependencies() []string               { return nil }
-func (t *rebindingTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *rebindingTransport) Close() error                         { return nil }
+func (t *rebindingTransport) Tag() string                                                { return t.tag }
+func (t *rebindingTransport) Type() string                                               { return "test-rebinding" }
+func (t *rebindingTransport) Dependencies() []string                                     { return nil }
+func (t *rebindingTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *rebindingTransport) Close() error                                               { return nil }
 
 // Reset mirrors the production transports: it drops the live connection so the next query dials
 // again. The test deliberately does NOT call this for the transition under test - the reconnect

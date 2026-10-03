@@ -292,7 +292,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.dnsHijackByPort = inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack
 		if !usePlatformAutoRedirect && options.NetNs == "" {
-			err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMark)
+			err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMarkOrDefault())
 			if err != nil {
 				return nil, err
 			}
@@ -341,7 +341,7 @@ func (t *Inbound) Tag() string {
 	return t.tag
 }
 
-func (t *Inbound) Start(stage adapter.StartStage) error {
+func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
@@ -459,14 +459,13 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "configure tun interface")
 		}
+		scope.Add(tunInterface.Close)
 		t.logger.Trace("creating stack")
 		t.tunIf = tunInterface
 		if t.platformInterface != nil {
 			err = t.platformInterface.ProcessPlatformOptions(t.platformOptions)
 			if err != nil {
-				closeError := t.tunIf.Close()
-				t.tunIf = nil
-				return E.Errors(E.Cause(err, "process platform options"), closeError)
+				return E.Cause(err, "process platform options")
 			}
 		}
 		var includeAllNetworks bool
@@ -497,6 +496,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return err
 		}
+		scope.Add(tunStack.Close)
 		t.tunStack = tunStack
 		t.logger.Info("started at ", t.tunOptions.Name)
 	case adapter.StartStatePostStart:
@@ -514,8 +514,9 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			return E.Cause(err, "starting TUN interface")
 		}
 		if t.autoRedirect != nil {
+			scope.Add(t.autoRedirect.Close)
 			monitor.Start("initialize auto-redirect")
-			err := t.autoRedirect.Start()
+			err = t.autoRedirect.Start()
 			monitor.Finish()
 			if err != nil {
 				return E.Cause(err, "auto-redirect")

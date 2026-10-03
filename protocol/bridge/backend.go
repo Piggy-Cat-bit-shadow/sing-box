@@ -41,9 +41,7 @@ type backendBase struct {
 	returnAccess sync.Mutex
 	returnPaths  []tun.Return
 
-	egressAccess      sync.Mutex
-	forwardingRestore []sysctlState
-	unregister        func()
+	egressAccess sync.Mutex
 
 	session       adapter.BridgeSession
 	currentEgress string
@@ -53,9 +51,11 @@ type backendBase struct {
 	indexAccess   sync.Mutex
 	indexAcquired bool
 
-	closeOnce sync.Once
-	closed    chan struct{}
-	readDone  chan struct{}
+	// closed is the scope's context channel, and readGroup joins the read loop. Both replace the
+	// fork's own closeOnce/readDone pair: the scope already owns cancellation and teardown, so a
+	// second, hand-rolled mechanism would be a parallel lifecycle for the same resource.
+	closed    <-chan struct{}
+	readGroup sync.WaitGroup
 }
 
 // init records the configuration. It deliberately acquires NOTHING.
@@ -69,7 +69,7 @@ type backendBase struct {
 // configuration had never reached.
 //
 // The index is claimed by acquireIndex, which Start calls and whose failure path releases it.
-func (b *backendBase) init(ctx context.Context, logger logger.ContextLogger, networkManager adapter.NetworkManager, tag string, options option.BridgeOutboundOptions) error {
+func (b *backendBase) init(ctx context.Context, logger logger.ContextLogger, networkManager adapter.NetworkManager, tag string, options option.BridgeOutboundOptions) {
 	b.ctx = ctx
 	b.logger = logger
 	b.networkManager = networkManager
@@ -79,7 +79,6 @@ func (b *backendBase) init(ctx context.Context, logger logger.ContextLogger, net
 		b.bridgeName = "bridge"
 	}
 	b.boundInterface = options.Interface
-	return nil
 }
 
 // acquireIndex claims this bridge's global slot and the addresses derived from it.
@@ -87,20 +86,40 @@ func (b *backendBase) init(ctx context.Context, logger logger.ContextLogger, net
 // It is safe to call more than once: only the first call allocates, so a repeated Start cannot
 // consume a second slot. It runs under indexAccess so the "already acquired" test and the claim are
 // one operation.
-func (b *backendBase) acquireIndex() error {
+//
+// The caller registers releaseIndex with the scope, so the slot's lifetime is owned by the same
+// mechanism that owns every other resource the object starts - not by how many times Close happens
+// to run.
+func (b *backendBase) acquireIndex() (uint32, error) {
 	b.indexAccess.Lock()
 	defer b.indexAccess.Unlock()
 	if b.indexAcquired {
-		return nil
+		return b.index, nil
 	}
 	index, err := allocateBridgeIndex()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	b.index = index
 	b.indexAcquired = true
 	b.inet4Port = addressAt(bridgeInet4Base, index)
 	b.inet6Port = addressAt(bridgeInet6Base, index)
+	return index, nil
+}
+
+// allocateIndex claims the slot and registers its release with the scope, so the scope owns the
+// slot exactly as it owns every other resource. Claiming is idempotent, so a repeated Start cannot
+// consume a second slot, and releasing is idempotent, so a failed start followed by Close cannot
+// free a slot another bridge has taken.
+func (b *backendBase) allocateIndex(scope *adapter.Scope) error {
+	_, err := b.acquireIndex()
+	if err != nil {
+		return err
+	}
+	scope.Add(func() error {
+		b.releaseIndex()
+		return nil
+	})
 	return nil
 }
 
@@ -143,12 +162,14 @@ func (b *backendBase) DetachReturn(returnPath tun.Return) error {
 	return nil
 }
 
-func (b *backendBase) registerMonitors(syncFunc func()) {
-	var unregisterFuncs []func()
+func (b *backendBase) registerMonitors(scope *adapter.Scope, syncFunc func()) {
 	networkMonitor := b.networkManager.NetworkMonitor()
 	if networkMonitor != nil {
 		networkElement := networkMonitor.RegisterCallback(syncFunc)
-		unregisterFuncs = append(unregisterFuncs, func() { networkMonitor.UnregisterCallback(networkElement) })
+		scope.Add(func() error {
+			networkMonitor.UnregisterCallback(networkElement)
+			return nil
+		})
 	} else if b.boundInterface != "" {
 		b.logger.Debug("network monitor unavailable, pinned egress will not track interface changes")
 	}
@@ -156,14 +177,10 @@ func (b *backendBase) registerMonitors(syncFunc func()) {
 		interfaceMonitor := b.networkManager.InterfaceMonitor()
 		if interfaceMonitor != nil {
 			interfaceElement := interfaceMonitor.RegisterCallback(func(_ *control.Interface, _ int) { syncFunc() })
-			unregisterFuncs = append(unregisterFuncs, func() { interfaceMonitor.UnregisterCallback(interfaceElement) })
-		}
-	}
-	if len(unregisterFuncs) > 0 {
-		b.unregister = func() {
-			for _, unregisterFunc := range unregisterFuncs {
-				unregisterFunc()
-			}
+			scope.Add(func() error {
+				interfaceMonitor.UnregisterCallback(interfaceElement)
+				return nil
+			})
 		}
 	}
 }
@@ -209,7 +226,6 @@ func (b *backendBase) resolveEgress() string {
 }
 
 func (b *backendBase) readLoop() {
-	defer close(b.readDone)
 	buffer := make([]byte, tun.PacketOffset+bridgeTunMTU)
 	for {
 		n, err := b.tunInterface.Read(buffer)

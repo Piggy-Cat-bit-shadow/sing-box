@@ -29,10 +29,10 @@ type certificateStore struct {
 	pool *x509.CertPool
 }
 
-func (s *certificateStore) Start(stage adapter.StartStage) error { return nil }
-func (s *certificateStore) Close() error                         { return nil }
-func (s *certificateStore) Pool() *x509.CertPool                 { return s.pool }
-func (s *certificateStore) ExclusiveAnchors() bool               { return false }
+func (s *certificateStore) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (s *certificateStore) Close() error                                               { return nil }
+func (s *certificateStore) Pool() *x509.CertPool                                       { return s.pool }
+func (s *certificateStore) ExclusiveAnchors() bool                                     { return false }
 
 // tlsContext returns a context whose root pool trusts the given certificate.
 func tlsContext(t *testing.T, server *httptest.Server) context.Context {

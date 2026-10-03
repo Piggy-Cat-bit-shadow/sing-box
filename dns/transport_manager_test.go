@@ -39,7 +39,7 @@ type stubTransport struct {
 func (t *stubTransport) Type() string           { return t.transportType }
 func (t *stubTransport) Tag() string            { return t.tag }
 func (t *stubTransport) Dependencies() []string { return nil }
-func (t *stubTransport) Start(stage adapter.StartStage) error {
+func (t *stubTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	t.started++
 	return t.startErr
 }
@@ -72,7 +72,7 @@ func (r *stubRegistry) OptionTypes() []string                          { return 
 // newManager returns a manager with a stub registry.
 func newManager() (*TransportManager, *stubRegistry) {
 	registry := &stubRegistry{}
-	return NewTransportManager(log.NewNOPFactory().NewLogger("dns-test"), registry, nil, ""), registry
+	return NewTransportManager(registry, nil, ""), registry
 }
 
 // snapshot captures the observable state, so "unchanged" is asserted rather than assumed.
@@ -218,7 +218,7 @@ func TestRefusedInstallConstructsNothing(t *testing.T) {
 // lock. The loser must release what it built rather than leaking it.
 func TestConcurrentDuplicateCreateReleasesTheLoser(t *testing.T) {
 	registry := &stubRegistry{}
-	manager := NewTransportManager(log.NewNOPFactory().NewLogger("dns-test"), registry, nil, "")
+	manager := NewTransportManager(registry, nil, "")
 	ctx := context.Background()
 	logger := log.NewNOPFactory().NewLogger("dns-test")
 

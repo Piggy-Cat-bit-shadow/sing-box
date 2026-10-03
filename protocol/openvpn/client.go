@@ -45,25 +45,23 @@ var (
 
 type ClientEndpoint struct {
 	endpointBase
-	ctx               context.Context
-	loopContext       context.Context
-	cancelLoop        context.CancelFunc
-	dnsRouter         adapter.DNSRouter
-	outboundDialer    N.Dialer
-	queryOptions      adapter.DNSQueryOptions
-	client            *ovpn.Client
-	deviceOptions     *device.Options
-	device            device.Device
-	onDemand          bool
-	stateAccess       sync.Mutex
-	state             atomic.Pointer[clientState]
-	dnsTransport      *DNSTransport
-	deviceStarted     bool
-	readLoopDone      chan struct{}
-	statusAccess      sync.Mutex
-	statusUpdated     chan struct{}
-	terminalError     string
-	challengeLoopDone chan struct{}
+	ctx            context.Context
+	loopContext    context.Context
+	cancelLoop     context.CancelFunc
+	dnsRouter      adapter.DNSRouter
+	outboundDialer N.Dialer
+	queryOptions   adapter.DNSQueryOptions
+	client         *ovpn.Client
+	deviceOptions  *device.Options
+	device         device.Device
+	onDemand       bool
+	stateAccess    sync.Mutex
+	state          atomic.Pointer[clientState]
+	dnsTransport   *DNSTransport
+	deviceStarted  bool
+	statusAccess   sync.Mutex
+	statusUpdated  chan struct{}
+	terminalError  string
 }
 
 type clientState struct {
@@ -125,32 +123,26 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
-	deviceMTU := options.MTU
-	if deviceMTU == 0 {
-		deviceMTU = ovpntransport.DefaultMTU
-	}
-	packetFrontHeadroom, packetRearHeadroom := clientOptions.DataPacketHeadroom()
 	clientEndpoint.deviceOptions = &device.Options{
-		Context:             ctx,
-		Logger:              logger,
-		System:              options.System,
-		Handler:             clientEndpoint,
-		UDPTimeout:          udpTimeout,
-		ICMPTimeout:         C.ICMPTimeout,
-		UDPMapping:          tun.NATMapping(options.UDPMapping),
-		UDPFiltering:        tun.NATFiltering(options.UDPFiltering),
-		UDPNATMax:           options.UDPNATMax,
-		InterfaceFinder:     service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
-		Name:                options.Name,
-		NamePrefix:          "ovpn",
-		MTU:                 deviceMTU,
-		PacketFrontHeadroom: packetFrontHeadroom,
-		PacketRearHeadroom:  packetRearHeadroom,
+		Context:         ctx,
+		Logger:          logger,
+		System:          options.System,
+		Handler:         clientEndpoint,
+		UDPTimeout:      udpTimeout,
+		ICMPTimeout:     C.ICMPTimeout,
+		UDPMapping:      tun.NATMapping(options.UDPMapping),
+		UDPFiltering:    tun.NATFiltering(options.UDPFiltering),
+		UDPNATMax:       options.UDPNATMax,
+		InterfaceFinder: service.FromContext[adapter.NetworkManager](ctx).InterfaceFinder(),
+		Name:            options.Name,
+		MTU:             options.MTU,
 		Configuration: device.Configuration{
-			MTU:     deviceMTU,
+			MTU:     options.MTU,
 			Address: clientOptions.Tunnel.LocalAddress,
 		},
 	}
+	// The headroom belongs to the device, which now exists, so it is supplied as a closure rather
+	// than a constant - the value is only knowable once the device has been created.
 	clientOptions.IncomingPacketHeadroom = func() int {
 		return clientEndpoint.device.FrontHeadroom()
 	}
@@ -604,43 +596,65 @@ func (c *ClientEndpoint) uninstallDNSTransport(dnsTransport *DNSTransport) {
 	c.stateAccess.Unlock()
 }
 
-func (c *ClientEndpoint) Start(stage adapter.StartStage) error {
-	if stage == adapter.StartStateInitialize {
+func (c *ClientEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateInitialize:
+		scope.Add(func() error {
+			c.notifyStatusUpdated()
+			return nil
+		})
+		scope.Add(func() error {
+			c.cancelLoop()
+			return nil
+		})
 		c.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(c.ctx)
-		tunnelDevice, err := device.New(*c.deviceOptions)
+		device, err := device.New(*c.deviceOptions)
 		if err != nil {
 			return err
 		}
-		tunnelDevice.SetPacketWriter(c.writePacketBuffers)
-		c.device = tunnelDevice
+		scope.Add(device.Close)
+		device.SetPacketWriter(c.writePacketBuffers)
+		c.device = device
 		c.deviceOptions = nil
-		return nil
+	case adapter.StartStatePostStart:
+		var loopGroup sync.WaitGroup
+		scope.Add(func() error {
+			loopGroup.Wait()
+			return nil
+		})
+		err := c.client.Start()
+		if err != nil {
+			return err
+		}
+		scope.Add(c.client.Close)
+		c.stateAccess.Lock()
+		c.updateState(func(state *clientState) {
+			state.started = true
+		})
+		c.stateAccess.Unlock()
+		scope.Add(func() error {
+			c.stateAccess.Lock()
+			c.updateState(func(state *clientState) {
+				state.started = false
+			})
+			c.stateAccess.Unlock()
+			return nil
+		})
+		loopGroup.Go(func() {
+			c.readLoop(scope.Context())
+		})
+		loopGroup.Go(func() {
+			c.watchChallenges(scope.Context())
+		})
 	}
-	if stage != adapter.StartStatePostStart {
-		return nil
-	}
-	err := c.client.Start()
-	if err != nil {
-		return err
-	}
-	c.stateAccess.Lock()
-	c.updateState(func(state *clientState) {
-		state.started = true
-	})
-	c.readLoopDone = make(chan struct{})
-	c.challengeLoopDone = make(chan struct{})
-	c.stateAccess.Unlock()
-	go c.readLoop()
-	go c.watchChallenges()
 	return nil
 }
 
-func (c *ClientEndpoint) readLoop() {
-	defer close(c.readLoopDone)
+func (c *ClientEndpoint) readLoop(ctx context.Context) {
 	for {
-		packetBuffers, err := c.client.ReadDataPackets(c.loopContext)
+		packetBuffers, err := c.client.ReadDataPackets(ctx)
 		if err != nil {
-			if E.IsClosedOrCanceled(err) || c.loopContext.Err() != nil {
+			if E.IsClosedOrCanceled(err) || ctx.Err() != nil {
 				return
 			}
 			c.logger.Error(E.Cause(err, "client terminated"))
@@ -658,26 +672,6 @@ func (c *ClientEndpoint) readLoop() {
 	}
 }
 
-func (c *ClientEndpoint) Close() error {
-	c.stateAccess.Lock()
-	c.updateState(func(state *clientState) {
-		state.started = false
-	})
-	readLoopDone := c.readLoopDone
-	challengeLoopDone := c.challengeLoopDone
-	c.stateAccess.Unlock()
-	c.cancelLoop()
-	err := common.Close(c.client, c.device)
-	if readLoopDone != nil {
-		<-readLoopDone
-	}
-	if challengeLoopDone != nil {
-		<-challengeLoopDone
-	}
-	c.notifyStatusUpdated()
-	return err
-}
-
 func (c *ClientEndpoint) InterfaceUpdated(ctx context.Context) {
 	c.client.RestartSession()
 }
@@ -687,9 +681,7 @@ func (c *ClientEndpoint) OnDemand() bool {
 }
 
 func (c *ClientEndpoint) SetKeepIdleConnections(keep bool) {
-	if keep {
-		c.client.Resume()
-	} else {
+	if !keep {
 		c.client.Suspend()
 	}
 }

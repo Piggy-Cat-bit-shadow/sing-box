@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 
@@ -102,18 +101,9 @@ func (d *tailcatDERP) resolve(ctx context.Context) (*tailcfg.DERPRegion, error) 
 	if err != nil {
 		return nil, E.Cause(err, "fetch DERP map")
 	}
-	region := derpMap.Regions[d.regionID]
-	if region == nil {
+	region, loaded := derpMap.Regions[d.regionID]
+	if !loaded {
 		return nil, E.New("DERP region ", d.regionID, " not found in ", d.mapURL)
-	}
-	if region.RegionID != d.regionID {
-		return nil, E.New("DERP region ", d.regionID, " has mismatched region ID ", region.RegionID, " in ", d.mapURL)
-	}
-	if len(region.Nodes) == 0 {
-		return nil, E.New("DERP region ", d.regionID, " has no nodes in ", d.mapURL)
-	}
-	if slices.Contains(region.Nodes, nil) {
-		return nil, E.New("DERP region ", d.regionID, " has a null node in ", d.mapURL)
 	}
 	return region, nil
 }

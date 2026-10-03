@@ -49,13 +49,15 @@ type fixedFingerprintTransport struct {
 	queries     atomic.Int32
 }
 
-func (t *fixedFingerprintTransport) Type() string                         { return "fixed-fingerprint" }
-func (t *fixedFingerprintTransport) Tag() string                          { return t.tag }
-func (t *fixedFingerprintTransport) Dependencies() []string               { return nil }
-func (t *fixedFingerprintTransport) Environment() []string                { return t.environment }
-func (t *fixedFingerprintTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *fixedFingerprintTransport) Close() error                         { return nil }
-func (t *fixedFingerprintTransport) Reset()                               {}
+func (t *fixedFingerprintTransport) Type() string           { return "fixed-fingerprint" }
+func (t *fixedFingerprintTransport) Tag() string            { return t.tag }
+func (t *fixedFingerprintTransport) Dependencies() []string { return nil }
+func (t *fixedFingerprintTransport) Environment() []string  { return t.environment }
+func (t *fixedFingerprintTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *fixedFingerprintTransport) Close() error { return nil }
+func (t *fixedFingerprintTransport) Reset()       {}
 
 func (t *fixedFingerprintTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)
@@ -224,13 +226,15 @@ type blockingGenerationTransport struct {
 	queries  atomic.Int32
 }
 
-func (t *blockingGenerationTransport) Type() string                         { return "blocking-generation" }
-func (t *blockingGenerationTransport) Tag() string                          { return t.tag }
-func (t *blockingGenerationTransport) Dependencies() []string               { return nil }
-func (t *blockingGenerationTransport) Environment() []string                { return []string{"wifi"} }
-func (t *blockingGenerationTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *blockingGenerationTransport) Close() error                         { return nil }
-func (t *blockingGenerationTransport) Reset()                               {}
+func (t *blockingGenerationTransport) Type() string           { return "blocking-generation" }
+func (t *blockingGenerationTransport) Tag() string            { return t.tag }
+func (t *blockingGenerationTransport) Dependencies() []string { return nil }
+func (t *blockingGenerationTransport) Environment() []string  { return []string{"wifi"} }
+func (t *blockingGenerationTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *blockingGenerationTransport) Close() error { return nil }
+func (t *blockingGenerationTransport) Reset()       {}
 
 func (t *blockingGenerationTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)

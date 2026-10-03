@@ -37,12 +37,12 @@ type queryRecordingTransport struct {
 	address6 string
 }
 
-func (t *queryRecordingTransport) Type() string                   { return "recorder" }
-func (t *queryRecordingTransport) Tag() string                    { return "recorder" }
-func (t *queryRecordingTransport) Dependencies() []string         { return nil }
-func (t *queryRecordingTransport) Start(adapter.StartStage) error { return nil }
-func (t *queryRecordingTransport) Close() error                   { return nil }
-func (t *queryRecordingTransport) Reset()                         {}
+func (t *queryRecordingTransport) Type() string                                   { return "recorder" }
+func (t *queryRecordingTransport) Tag() string                                    { return "recorder" }
+func (t *queryRecordingTransport) Dependencies() []string                         { return nil }
+func (t *queryRecordingTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (t *queryRecordingTransport) Close() error                                   { return nil }
+func (t *queryRecordingTransport) Reset()                                         {}
 
 func (t *queryRecordingTransport) observed() []uint16 {
 	t.access.Lock()

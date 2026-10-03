@@ -40,9 +40,9 @@ type negativeTransport struct {
 	tag string
 }
 
-func (t *negativeTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *negativeTransport) Close() error                         { return nil }
-func (t *negativeTransport) Type() string                         { return "negative" }
+func (t *negativeTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *negativeTransport) Close() error                                               { return nil }
+func (t *negativeTransport) Type() string                                               { return "negative" }
 func (t *negativeTransport) Tag() string {
 	if t.tag != "" {
 		return t.tag

@@ -46,11 +46,13 @@ type environmentTransport struct {
 	environment []string
 }
 
-func (t *environmentTransport) Tag() string                          { return t.tag }
-func (t *environmentTransport) Type() string                         { return "environment" }
-func (t *environmentTransport) Environment() []string                { return t.environment }
-func (t *environmentTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *environmentTransport) Close() error                         { return nil }
+func (t *environmentTransport) Tag() string           { return t.tag }
+func (t *environmentTransport) Type() string          { return "environment" }
+func (t *environmentTransport) Environment() []string { return t.environment }
+func (t *environmentTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *environmentTransport) Close() error { return nil }
 
 // newEnvironmentClient returns a client whose environment can be driven by the test.
 //

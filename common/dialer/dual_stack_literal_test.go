@@ -59,10 +59,10 @@ func newBlockingRecoveryRouter(addresses ...netip.Addr) *blockingRecoveryRouter 
 	}
 }
 
-func (r *blockingRecoveryRouter) Start(adapter.StartStage) error { return nil }
-func (r *blockingRecoveryRouter) Close() error                   { return nil }
-func (r *blockingRecoveryRouter) ClearCache()                    {}
-func (r *blockingRecoveryRouter) ResetNetwork()                  {}
+func (r *blockingRecoveryRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (r *blockingRecoveryRouter) Close() error                                   { return nil }
+func (r *blockingRecoveryRouter) ClearCache()                                    {}
+func (r *blockingRecoveryRouter) ResetNetwork()                                  {}
 func (r *blockingRecoveryRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }

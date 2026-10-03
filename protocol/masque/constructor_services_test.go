@@ -30,8 +30,10 @@ type stubTransportManager struct {
 	transports map[string]adapter.DNSTransport
 }
 
-func (m *stubTransportManager) Start(stage adapter.StartStage) error { return nil }
-func (m *stubTransportManager) Close() error                         { return nil }
+func (m *stubTransportManager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (m *stubTransportManager) Close() error { return nil }
 func (m *stubTransportManager) Transports() []adapter.DNSTransport {
 	out := make([]adapter.DNSTransport, 0, len(m.transports))
 	for _, transport := range m.transports {
@@ -57,12 +59,12 @@ type registryDNSTransport struct {
 	tag string
 }
 
-func (s *registryDNSTransport) Type() string                   { return "stub" }
-func (s *registryDNSTransport) Tag() string                    { return s.tag }
-func (s *registryDNSTransport) Dependencies() []string         { return nil }
-func (s *registryDNSTransport) Start(adapter.StartStage) error { return nil }
-func (s *registryDNSTransport) Close() error                   { return nil }
-func (s *registryDNSTransport) Reset()                         {}
+func (s *registryDNSTransport) Type() string                                   { return "stub" }
+func (s *registryDNSTransport) Tag() string                                    { return s.tag }
+func (s *registryDNSTransport) Dependencies() []string                         { return nil }
+func (s *registryDNSTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (s *registryDNSTransport) Close() error                                   { return nil }
+func (s *registryDNSTransport) Reset()                                         {}
 func (s *registryDNSTransport) Exchange(context.Context, *mDNS.Msg) (*mDNS.Msg, error) {
 	return nil, errTestBootstrapUnavailable
 }
@@ -79,17 +81,17 @@ func (s *registryDNSTransport) ExchangeAsync(context.Context, *mDNS.Msg, func(*m
 // wide; nothing on the constructor path under test reaches them.
 type stubNetworkManager struct{}
 
-func (m *stubNetworkManager) Start(stage adapter.StartStage) error               { return nil }
-func (m *stubNetworkManager) Close() error                                       { return nil }
-func (m *stubNetworkManager) Initialize(ruleSets []adapter.RuleSet)              {}
-func (m *stubNetworkManager) InterfaceFinder() control.InterfaceFinder           { return nil }
-func (m *stubNetworkManager) UpdateInterfaces() error                            { return nil }
-func (m *stubNetworkManager) DefaultNetworkInterface() *adapter.NetworkInterface { return nil }
-func (m *stubNetworkManager) NetworkInterfaces() []adapter.NetworkInterface      { return nil }
-func (m *stubNetworkManager) NetworkEnvironment() uint64                         { return 0 }
-func (m *stubNetworkManager) AutoDetectInterface() bool                          { return false }
-func (m *stubNetworkManager) AutoDetectInterfaceFunc() control.Func              { return nil }
-func (m *stubNetworkManager) ProtectFunc() control.Func                          { return nil }
+func (m *stubNetworkManager) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (m *stubNetworkManager) Close() error                                               { return nil }
+func (m *stubNetworkManager) Initialize(ruleSets []adapter.RuleSet)                      {}
+func (m *stubNetworkManager) InterfaceFinder() control.InterfaceFinder                   { return nil }
+func (m *stubNetworkManager) UpdateInterfaces() error                                    { return nil }
+func (m *stubNetworkManager) DefaultNetworkInterface() *adapter.NetworkInterface         { return nil }
+func (m *stubNetworkManager) NetworkInterfaces() []adapter.NetworkInterface              { return nil }
+func (m *stubNetworkManager) NetworkEnvironment() uint64                                 { return 0 }
+func (m *stubNetworkManager) AutoDetectInterface() bool                                  { return false }
+func (m *stubNetworkManager) AutoDetectInterfaceFunc() control.Func                      { return nil }
+func (m *stubNetworkManager) ProtectFunc() control.Func                                  { return nil }
 func (m *stubNetworkManager) DefaultOptions() adapter.NetworkOptions {
 	return adapter.NetworkOptions{}
 }

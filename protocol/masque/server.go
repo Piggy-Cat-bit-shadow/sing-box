@@ -145,7 +145,7 @@ func (s *ServerEndpoint) resolve(ctx context.Context, domain string) ([]netip.Ad
 	return s.dnsRouter.Lookup(ctx, domain, adapter.DNSQueryOptions{})
 }
 
-func (s *ServerEndpoint) Start(stage adapter.StartStage) error {
+func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		s.deviceOptions.MemoryPressure = oomkiller.MemoryPressure(s.ctx)

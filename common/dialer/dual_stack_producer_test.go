@@ -63,10 +63,10 @@ func newScriptedFamilyRouter() *scriptedFamilyRouter {
 	}
 }
 
-func (r *scriptedFamilyRouter) Start(adapter.StartStage) error { return nil }
-func (r *scriptedFamilyRouter) Close() error                   { return nil }
-func (r *scriptedFamilyRouter) ClearCache()                    {}
-func (r *scriptedFamilyRouter) ResetNetwork()                  {}
+func (r *scriptedFamilyRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (r *scriptedFamilyRouter) Close() error                                   { return nil }
+func (r *scriptedFamilyRouter) ClearCache()                                    {}
+func (r *scriptedFamilyRouter) ResetNetwork()                                  {}
 func (r *scriptedFamilyRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }

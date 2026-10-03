@@ -30,6 +30,13 @@ func (s *MemoryStorage) FakeIPMetadata() *adapter.FakeIPMetadata {
 	return nil
 }
 
+// FakeIPSaveMetadataAsync is a no-op for in-memory storage: there is no file to buffer into, so the
+// synchronous path is already complete. The method exists to satisfy adapter.FakeIPStorage, whose
+// persistent implementation uses the async form to batch writes.
+func (s *MemoryStorage) FakeIPSaveMetadataAsync(metadata *adapter.FakeIPMetadata) {
+	s.FakeIPSaveMetadata(metadata)
+}
+
 func (s *MemoryStorage) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
 	return nil
 }

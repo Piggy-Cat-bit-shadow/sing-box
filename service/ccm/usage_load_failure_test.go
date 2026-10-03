@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 
 	"github.com/stretchr/testify/require"
@@ -64,7 +65,7 @@ func TestLoadFailureDisablesTheTracker(t *testing.T) {
 		usageTracker: tracker,
 	}
 
-	service.loadUsageTracker()
+	service.loadUsageTracker(adapter.NewScope(context.Background(), log.NewNOPFactory().Logger()))
 
 	require.Nil(t, service.usageTracker,
 		"a tracker whose load failed must be dropped; keeping it means Close saves the empty "+
@@ -85,7 +86,7 @@ func TestHealthyLoadKeepsTheTracker(t *testing.T) {
 		usageTracker: tracker,
 	}
 
-	service.loadUsageTracker()
+	service.loadUsageTracker(adapter.NewScope(context.Background(), log.NewNOPFactory().Logger()))
 
 	require.NotNil(t, service.usageTracker,
 		"a successful load must keep the tracker, or usage statistics would never persist")
@@ -104,7 +105,7 @@ func TestMissingFileStillEnablesTracking(t *testing.T) {
 		usageTracker: tracker,
 	}
 
-	service.loadUsageTracker()
+	service.loadUsageTracker(adapter.NewScope(context.Background(), log.NewNOPFactory().Logger()))
 
 	require.NotNil(t, service.usageTracker,
 		"a first run has nothing to load and must still track usage")

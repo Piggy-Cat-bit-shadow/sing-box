@@ -77,10 +77,10 @@ var _ tun.Port = (*portDirectOutbound)(nil)
 // is not a FakeIP or reverse-mapped address.
 type verdictDNSRouter struct{ adapter.DNSRouter }
 
-func (r *verdictDNSRouter) Start(stage adapter.StartStage) error { return nil }
-func (r *verdictDNSRouter) Close() error                         { return nil }
-func (r *verdictDNSRouter) ClearCache()                          {}
-func (r *verdictDNSRouter) ResetNetwork()                        {}
+func (r *verdictDNSRouter) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (r *verdictDNSRouter) Close() error                                               { return nil }
+func (r *verdictDNSRouter) ClearCache()                                                {}
+func (r *verdictDNSRouter) ResetNetwork()                                              {}
 func (r *verdictDNSRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }
@@ -95,9 +95,9 @@ func (r *verdictDNSRouter) Lookup(ctx context.Context, domain string, options ad
 // skipped exactly as in a deployment without FakeIP.
 type verdictDNSTransport struct{ adapter.DNSTransportManager }
 
-func (m *verdictDNSTransport) Start(stage adapter.StartStage) error { return nil }
-func (m *verdictDNSTransport) Close() error                         { return nil }
-func (m *verdictDNSTransport) Transports() []adapter.DNSTransport   { return nil }
+func (m *verdictDNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (m *verdictDNSTransport) Close() error                                               { return nil }
+func (m *verdictDNSTransport) Transports() []adapter.DNSTransport                         { return nil }
 func (m *verdictDNSTransport) Transport(tag string) (adapter.DNSTransport, bool) {
 	return nil, false
 }

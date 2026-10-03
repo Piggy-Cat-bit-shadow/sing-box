@@ -52,13 +52,15 @@ type zeroEnvironmentTransport struct {
 	queries atomic.Int32
 }
 
-func (t *zeroEnvironmentTransport) Tag() string                          { return t.tag }
-func (t *zeroEnvironmentTransport) Type() string                         { return "zero-env" }
-func (t *zeroEnvironmentTransport) Dependencies() []string               { return nil }
-func (t *zeroEnvironmentTransport) Environment() []string                { return t.environment }
-func (t *zeroEnvironmentTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *zeroEnvironmentTransport) Close() error                         { return nil }
-func (t *zeroEnvironmentTransport) Reset()                               {}
+func (t *zeroEnvironmentTransport) Tag() string            { return t.tag }
+func (t *zeroEnvironmentTransport) Type() string           { return "zero-env" }
+func (t *zeroEnvironmentTransport) Dependencies() []string { return nil }
+func (t *zeroEnvironmentTransport) Environment() []string  { return t.environment }
+func (t *zeroEnvironmentTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *zeroEnvironmentTransport) Close() error { return nil }
+func (t *zeroEnvironmentTransport) Reset()       {}
 
 func (t *zeroEnvironmentTransport) Exchange(ctx context.Context, message *dns.Msg) (*dns.Msg, error) {
 	t.queries.Add(1)

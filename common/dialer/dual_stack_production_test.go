@@ -44,10 +44,10 @@ type fakeDomainRouter struct {
 	access  sync.Mutex
 }
 
-func (r *fakeDomainRouter) Start(stage adapter.StartStage) error { return nil }
-func (r *fakeDomainRouter) Close() error                         { return nil }
-func (r *fakeDomainRouter) ClearCache()                          {}
-func (r *fakeDomainRouter) ResetNetwork()                        {}
+func (r *fakeDomainRouter) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (r *fakeDomainRouter) Close() error                                               { return nil }
+func (r *fakeDomainRouter) ClearCache()                                                {}
+func (r *fakeDomainRouter) ResetNetwork()                                              {}
 
 func (r *fakeDomainRouter) Exchange(ctx context.Context, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, error) {
 	return nil, errors.New("not implemented")

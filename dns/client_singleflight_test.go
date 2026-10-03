@@ -65,12 +65,12 @@ type herdTransport struct {
 	queryCount atomic.Int32
 }
 
-func (t *herdTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *herdTransport) Close() error                         { return nil }
-func (t *herdTransport) Type() string                         { return "herd" }
-func (t *herdTransport) Tag() string                          { return "herd" }
-func (t *herdTransport) Dependencies() []string               { return nil }
-func (t *herdTransport) Reset()                               {}
+func (t *herdTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *herdTransport) Close() error                                               { return nil }
+func (t *herdTransport) Type() string                                               { return "herd" }
+func (t *herdTransport) Tag() string                                                { return "herd" }
+func (t *herdTransport) Dependencies() []string                                     { return nil }
+func (t *herdTransport) Reset()                                                     {}
 
 func (t *herdTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	index := t.queryCount.Add(1)

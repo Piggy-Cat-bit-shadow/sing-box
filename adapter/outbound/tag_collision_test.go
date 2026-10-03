@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/log"
 
 	"github.com/stretchr/testify/require"
 )
@@ -31,11 +30,11 @@ type collisionEndpoint struct {
 	tag string
 }
 
-func (e *collisionEndpoint) Type() string                         { return "collision-endpoint" }
-func (e *collisionEndpoint) Tag() string                          { return e.tag }
-func (e *collisionEndpoint) Network() []string                    { return []string{"tcp"} }
-func (e *collisionEndpoint) Start(stage adapter.StartStage) error { return nil }
-func (e *collisionEndpoint) Close() error                         { return nil }
+func (e *collisionEndpoint) Type() string                                               { return "collision-endpoint" }
+func (e *collisionEndpoint) Tag() string                                                { return e.tag }
+func (e *collisionEndpoint) Network() []string                                          { return []string{"tcp"} }
+func (e *collisionEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (e *collisionEndpoint) Close() error                                               { return nil }
 
 // collisionEndpointManager serves a fixed set of endpoints.
 type collisionEndpointManager struct {
@@ -63,7 +62,7 @@ func TestEndpointTagCollisionShadowsTheEndpoint(t *testing.T) {
 	endpoint := &collisionEndpoint{tag: "shared"}
 	endpointManager := &collisionEndpointManager{endpoints: map[string]adapter.Endpoint{"shared": endpoint}}
 
-	manager := NewManager(log.NewNOPFactory().NewLogger("test"), &stubRegistry{}, endpointManager, "")
+	manager := NewManager(&stubRegistry{}, endpointManager, "")
 
 	outbound := &stubOutbound{tag: "shared"}
 	installOutbound(t, manager, outbound)
@@ -87,7 +86,7 @@ func TestEndpointTagCollisionShadowsTheEndpoint(t *testing.T) {
 func TestCollidingTagIsDetectable(t *testing.T) {
 	endpoint := &collisionEndpoint{tag: "shared"}
 	endpointManager := &collisionEndpointManager{endpoints: map[string]adapter.Endpoint{"shared": endpoint}}
-	manager := NewManager(log.NewNOPFactory().NewLogger("test"), &stubRegistry{}, endpointManager, "")
+	manager := NewManager(&stubRegistry{}, endpointManager, "")
 
 	_, endpointExists := endpointManager.Get("shared")
 	_, outboundExists := manager.outboundByTag["shared"]

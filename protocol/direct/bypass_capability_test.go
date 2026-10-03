@@ -92,8 +92,8 @@ type networkManagerStub struct {
 	options adapter.NetworkOptions
 }
 
-func (m *networkManagerStub) Start(stage adapter.StartStage) error { return nil }
-func (m *networkManagerStub) Close() error                         { return nil }
+func (m *networkManagerStub) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (m *networkManagerStub) Close() error                                               { return nil }
 func (m *networkManagerStub) DefaultOptions() adapter.NetworkOptions {
 	return m.options
 }

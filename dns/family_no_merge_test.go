@@ -45,13 +45,15 @@ type gatedFamilyTransport struct {
 	once        sync.Once
 }
 
-func (t *gatedFamilyTransport) Type() string                         { return "gated-family" }
-func (t *gatedFamilyTransport) Tag() string                          { return t.tag }
-func (t *gatedFamilyTransport) Dependencies() []string               { return nil }
-func (t *gatedFamilyTransport) Environment() []string                { return []string{"wifi"} }
-func (t *gatedFamilyTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *gatedFamilyTransport) Close() error                         { return nil }
-func (t *gatedFamilyTransport) Reset()                               {}
+func (t *gatedFamilyTransport) Type() string           { return "gated-family" }
+func (t *gatedFamilyTransport) Tag() string            { return t.tag }
+func (t *gatedFamilyTransport) Dependencies() []string { return nil }
+func (t *gatedFamilyTransport) Environment() []string  { return []string{"wifi"} }
+func (t *gatedFamilyTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *gatedFamilyTransport) Close() error { return nil }
+func (t *gatedFamilyTransport) Reset()       {}
 
 func (t *gatedFamilyTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	response := new(mDNS.Msg)

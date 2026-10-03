@@ -127,7 +127,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
-func (h *Inbound) Start(stage adapter.StartStage) error {
+func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -136,18 +136,22 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "create TLS config")
 		}
+		scope.Add(h.tlsConfig.Close)
 	}
 	err := h.listener.Start()
 	if err != nil {
 		return err
 	}
+	// Registered before the HTTP/3 early return: the listener is already started by this point, and
+	// an early return that skipped this would leave it unclosed for the life of the process.
+	scope.Add(h.listener.Close)
 	if h.http3 {
-		return h.startHTTP3()
+		return h.startHTTP3(scope)
 	}
 	return nil
 }
 
-func (h *Inbound) startHTTP3() error {
+func (h *Inbound) startHTTP3(scope *adapter.Scope) error {
 	var metadata adapter.InboundContext
 	//nolint:staticcheck
 	metadata.InboundDetour = h.listener.ListenOptions().Detour
@@ -156,15 +160,10 @@ func (h *Inbound) startHTTP3() error {
 		return err
 	}
 	h.http3Server = http3Server
+	// Registered with the scope, which is now the single owner of teardown: the old hand-written
+	// Close list is gone, so a resource that is not added here is never released.
+	scope.Add(http3Server.Close)
 	return nil
-}
-
-func (h *Inbound) Close() error {
-	return common.Close(
-		h.listener,
-		h.http3Server,
-		h.tlsConfig,
-	)
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

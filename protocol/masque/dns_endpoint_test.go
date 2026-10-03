@@ -37,10 +37,10 @@ type recordingRouter struct {
 	err          error
 }
 
-func (r *recordingRouter) Start(stage adapter.StartStage) error { return nil }
-func (r *recordingRouter) Close() error                         { return nil }
-func (r *recordingRouter) ClearCache()                          {}
-func (r *recordingRouter) ResetNetwork()                        {}
+func (r *recordingRouter) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (r *recordingRouter) Close() error                                               { return nil }
+func (r *recordingRouter) ClearCache()                                                {}
+func (r *recordingRouter) ResetNetwork()                                              {}
 func (r *recordingRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }
@@ -421,12 +421,12 @@ type stubDNSTransport struct {
 	tag string
 }
 
-func (s *stubDNSTransport) Type() string                   { return "stub" }
-func (s *stubDNSTransport) Tag() string                    { return s.tag }
-func (s *stubDNSTransport) Dependencies() []string         { return nil }
-func (s *stubDNSTransport) Start(adapter.StartStage) error { return nil }
-func (s *stubDNSTransport) Close() error                   { return nil }
-func (s *stubDNSTransport) Reset()                         {}
+func (s *stubDNSTransport) Type() string                                   { return "stub" }
+func (s *stubDNSTransport) Tag() string                                    { return s.tag }
+func (s *stubDNSTransport) Dependencies() []string                         { return nil }
+func (s *stubDNSTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (s *stubDNSTransport) Close() error                                   { return nil }
+func (s *stubDNSTransport) Reset()                                         {}
 func (s *stubDNSTransport) Exchange(context.Context, *mDNS.Msg) (*mDNS.Msg, error) {
 	return nil, errTestDialFailed
 }

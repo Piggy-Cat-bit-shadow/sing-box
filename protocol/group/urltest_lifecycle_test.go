@@ -248,14 +248,14 @@ func TestDoubleStartDoesNotStrandTheFirstGroup(t *testing.T) {
 		link:     "https://probe.example/generate_204",
 	}
 
-	require.NoError(t, instance.Start(adapter.StartStateStart))
+	require.NoError(t, instance.Start(adapter.StartStateStart, adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())))
 	first := instance.currentGroup()
 	require.NotNil(t, first, "Start must install a group")
 	firstCtx := first.backgroundContext()
 	first.PostStart()
 
 	// A second Start on the same instance.
-	require.NoError(t, instance.Start(adapter.StartStateStart))
+	require.NoError(t, instance.Start(adapter.StartStateStart, adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())))
 	second := instance.currentGroup()
 	require.NotNil(t, second)
 

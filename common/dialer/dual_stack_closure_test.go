@@ -116,10 +116,10 @@ func newImmediateRecoveryRouter(addresses ...netip.Addr) *immediateRecoveryRoute
 	return &immediateRecoveryRouter{addresses: addresses}
 }
 
-func (r *immediateRecoveryRouter) Start(adapter.StartStage) error { return nil }
-func (r *immediateRecoveryRouter) Close() error                   { return nil }
-func (r *immediateRecoveryRouter) ClearCache()                    {}
-func (r *immediateRecoveryRouter) ResetNetwork()                  {}
+func (r *immediateRecoveryRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (r *immediateRecoveryRouter) Close() error                                   { return nil }
+func (r *immediateRecoveryRouter) ClearCache()                                    {}
+func (r *immediateRecoveryRouter) ResetNetwork()                                  {}
 func (r *immediateRecoveryRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }

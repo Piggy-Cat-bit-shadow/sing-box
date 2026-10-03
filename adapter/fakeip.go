@@ -17,6 +17,9 @@ type FakeIPStore interface {
 type FakeIPStorage interface {
 	FakeIPMetadata() *FakeIPMetadata
 	FakeIPSaveMetadata(metadata *FakeIPMetadata) error
+	// FakeIPSaveMetadataAsync writes the metadata without blocking the allocation path; the
+	// buffered cache file coalesces the writes. Added by upstream's storage-consistency fix.
+	FakeIPSaveMetadataAsync(metadata *FakeIPMetadata)
 	FakeIPStore(address netip.Addr, domain string) error
 	FakeIPStoreAsync(address netip.Addr, domain string, logger logger.Logger)
 	FakeIPLoad(address netip.Addr) (string, bool)

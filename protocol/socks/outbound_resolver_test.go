@@ -118,8 +118,8 @@ type recordingDNSRouter struct {
 
 // The embedded adapter.DNSRouter is nil, so every method the tests do not exercise needs an
 // explicit no-op; otherwise a nil-interface call would panic and hide the assertion.
-func (r *recordingDNSRouter) Start(adapter.StartStage) error { return nil }
-func (r *recordingDNSRouter) Close() error                   { return nil }
+func (r *recordingDNSRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (r *recordingDNSRouter) Close() error                                   { return nil }
 func (r *recordingDNSRouter) Exchange(context.Context, *mDNS.Msg, adapter.DNSQueryOptions) (*mDNS.Msg, error) {
 	return nil, E.New("not used")
 }
@@ -280,12 +280,12 @@ type socksTransportManager struct {
 	transports map[string]adapter.DNSTransport
 }
 
-func (m *socksTransportManager) Start(adapter.StartStage) error     { return nil }
-func (m *socksTransportManager) Close() error                       { return nil }
-func (m *socksTransportManager) Transports() []adapter.DNSTransport { return nil }
-func (m *socksTransportManager) Default() adapter.DNSTransport      { return nil }
-func (m *socksTransportManager) FakeIP() adapter.FakeIPTransport    { return nil }
-func (m *socksTransportManager) Remove(string) error                { return nil }
+func (m *socksTransportManager) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (m *socksTransportManager) Close() error                                   { return nil }
+func (m *socksTransportManager) Transports() []adapter.DNSTransport             { return nil }
+func (m *socksTransportManager) Default() adapter.DNSTransport                  { return nil }
+func (m *socksTransportManager) FakeIP() adapter.FakeIPTransport                { return nil }
+func (m *socksTransportManager) Remove(string) error                            { return nil }
 func (m *socksTransportManager) Create(context.Context, log.ContextLogger, string, string, any) error {
 	return nil
 }
@@ -298,12 +298,12 @@ func (m *socksTransportManager) Transport(tag string) (adapter.DNSTransport, boo
 // the derivation produced, not on a resolved answer.
 type socksDNSTransport struct{ tag string }
 
-func (s *socksDNSTransport) Type() string                   { return "stub" }
-func (s *socksDNSTransport) Tag() string                    { return s.tag }
-func (s *socksDNSTransport) Dependencies() []string         { return nil }
-func (s *socksDNSTransport) Start(adapter.StartStage) error { return nil }
-func (s *socksDNSTransport) Close() error                   { return nil }
-func (s *socksDNSTransport) Reset()                         {}
+func (s *socksDNSTransport) Type() string                                   { return "stub" }
+func (s *socksDNSTransport) Tag() string                                    { return s.tag }
+func (s *socksDNSTransport) Dependencies() []string                         { return nil }
+func (s *socksDNSTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (s *socksDNSTransport) Close() error                                   { return nil }
+func (s *socksDNSTransport) Reset()                                         {}
 func (s *socksDNSTransport) Exchange(context.Context, *mDNS.Msg) (*mDNS.Msg, error) {
 	return nil, E.New("stub transport is never queried")
 }

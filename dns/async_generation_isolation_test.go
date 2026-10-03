@@ -44,13 +44,13 @@ type asyncGatedTransport struct {
 	queries  atomic.Int32
 }
 
-func (t *asyncGatedTransport) Type() string                         { return "async-gated" }
-func (t *asyncGatedTransport) Tag() string                          { return t.tag }
-func (t *asyncGatedTransport) Dependencies() []string               { return nil }
-func (t *asyncGatedTransport) Environment() []string                { return []string{"wifi"} }
-func (t *asyncGatedTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *asyncGatedTransport) Close() error                         { return nil }
-func (t *asyncGatedTransport) Reset()                               {}
+func (t *asyncGatedTransport) Type() string                                               { return "async-gated" }
+func (t *asyncGatedTransport) Tag() string                                                { return t.tag }
+func (t *asyncGatedTransport) Dependencies() []string                                     { return nil }
+func (t *asyncGatedTransport) Environment() []string                                      { return []string{"wifi"} }
+func (t *asyncGatedTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *asyncGatedTransport) Close() error                                               { return nil }
+func (t *asyncGatedTransport) Reset()                                                     {}
 
 func (t *asyncGatedTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queries.Add(1)

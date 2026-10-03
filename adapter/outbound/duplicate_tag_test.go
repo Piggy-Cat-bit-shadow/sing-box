@@ -74,7 +74,7 @@ func installOutbound(t *testing.T, manager *Manager, outbound adapter.Outbound) 
 func TestDuplicateTagIsRejected(t *testing.T) {
 	existing := &stubOutbound{tag: "dup"}
 	registry := &stubRegistry{}
-	manager := NewManager(log.NewNOPFactory().NewLogger("test"), registry, nil, "")
+	manager := NewManager(registry, nil, "")
 	installOutbound(t, manager, existing)
 
 	err := manager.Create(context.Background(), nil, log.NewNOPFactory().NewLogger("test"),
@@ -101,7 +101,7 @@ func TestDuplicateTagIsRejected(t *testing.T) {
 func TestDuplicateTagDoesNotLeakTheReplacedObject(t *testing.T) {
 	existing := &stubOutbound{tag: "dup"}
 	registry := &stubRegistry{}
-	manager := NewManager(log.NewNOPFactory().NewLogger("test"), registry, nil, "")
+	manager := NewManager(registry, nil, "")
 	installOutbound(t, manager, existing)
 
 	_ = manager.Create(context.Background(), nil, log.NewNOPFactory().NewLogger("test"),

@@ -11,11 +11,11 @@ import (
 
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	http "github.com/sagernet/sing-box/transport/http"
 	"github.com/sagernet/sing-box/transport/masque"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -60,10 +60,10 @@ type fakeBootstrapRouter struct {
 	calls     int
 }
 
-func (r *fakeBootstrapRouter) Start(stage adapter.StartStage) error { return nil }
-func (r *fakeBootstrapRouter) Close() error                         { return nil }
-func (r *fakeBootstrapRouter) ClearCache()                          {}
-func (r *fakeBootstrapRouter) ResetNetwork()                        {}
+func (r *fakeBootstrapRouter) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (r *fakeBootstrapRouter) Close() error                                               { return nil }
+func (r *fakeBootstrapRouter) ClearCache()                                                {}
+func (r *fakeBootstrapRouter) ResetNetwork()                                              {}
 func (r *fakeBootstrapRouter) LookupReverseMapping(netip.Addr) (string, bool) {
 	return "", false
 }
@@ -101,6 +101,19 @@ func (r *fakeBootstrapRouter) lookupCount() int {
 // The context carries a fake DNS router through the service registry, which is the same
 // mechanism production uses (service.FromContext), so the constructor takes its normal path
 // rather than a test-only one.
+// closeEndpoint releases an endpoint built by buildTestEndpoint.
+//
+// Endpoints have no Close under the scoped lifecycle: teardown belongs to the scope that started
+// them. This test never starts these endpoints, so there is nothing to unwind - the helper exists so
+// the call sites read as teardown and fail loudly if that ever stops being true.
+func closeEndpoint(t *testing.T, endpoint adapter.Endpoint) error {
+	t.Helper()
+	if started, isStarted := endpoint.(interface{ Started() bool }); isStarted && started.Started() {
+		t.Fatal("this fixture does not start endpoints; close it through its scope instead")
+	}
+	return nil
+}
+
 func buildTestEndpoint(t *testing.T, router adapter.DNSRouter, serverAddress string, tlsOptions option.OutboundTLSOptions) (adapter.Endpoint, error) {
 	t.Helper()
 	ctx := newTestRegistryContext(router)
@@ -121,7 +134,7 @@ func buildTestEndpoint(t *testing.T, router adapter.DNSRouter, serverAddress str
 	}
 	// TLS is promoted from an embedded struct, so it cannot be set in the literal.
 	endpointOptions.TLS = &tlsOptions
-	return NewClientEndpoint(ctx, nil, logger.NOP(), "masque-test", endpointOptions)
+	return NewClientEndpoint(ctx, nil, log.NewNOPFactory().Logger(), "masque-test", endpointOptions)
 }
 
 // newBootstrapTLSOptions builds TLS options that will not be exercised by a real handshake.
@@ -151,7 +164,9 @@ func TestConstructorWiresBootstrapRecoveryIntoTheDialer(t *testing.T) {
 	router := &fakeBootstrapRouter{answer: []netip.Addr{netip.MustParseAddr("192.0.2.10")}}
 	endpoint, err := buildTestEndpoint(t, router, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err, "the constructor must accept a domain server with a bootstrap resolver")
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint, isClientEndpoint := endpoint.(*ClientEndpoint)
 	require.True(t, isClientEndpoint)
@@ -178,7 +193,9 @@ func TestConstructorLeavesHookNilWithoutAResolver(t *testing.T) {
 
 	endpoint, err := buildTestEndpoint(t, nil, "192.0.2.10", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 	require.Nil(t, http3ConnDialerOf(t, clientEndpoint),
@@ -199,7 +216,9 @@ func TestConstructorSetsTheHTTP3ConnDialer(t *testing.T) {
 	router := &fakeBootstrapRouter{answer: []netip.Addr{netip.MustParseAddr("192.0.2.10")}}
 	endpoint, err := buildTestEndpoint(t, router, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 	hook := http3ConnDialerOf(t, clientEndpoint)
@@ -221,7 +240,9 @@ func TestConstructorHookRacesTheResolvedCandidates(t *testing.T) {
 	}}
 	endpoint, err := buildTestEndpoint(t, router, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 	hook := http3ConnDialerOf(t, clientEndpoint)
@@ -263,7 +284,9 @@ func TestBootstrapRecoveryUsesTheCacheAfterTheResolverFails(t *testing.T) {
 	}
 	endpoint, err := buildTestEndpoint(t, router, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 	bootstrap, isBootstrap := httpClientDialer(t, clientEndpoint).(*bootstrapDialer)
@@ -299,7 +322,9 @@ func TestBootstrapRecoveryRemembersTheWinningAddress(t *testing.T) {
 	}
 	endpoint, err := buildTestEndpoint(t, router, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	bootstrap := httpClientDialer(t, endpoint.(*ClientEndpoint)).(*bootstrapDialer)
 
@@ -326,12 +351,12 @@ func TestBootstrapCacheIsPerEndpoint(t *testing.T) {
 	firstRouter := &fakeBootstrapRouter{answer: []netip.Addr{netip.MustParseAddr("192.0.2.10")}}
 	firstEndpoint, err := buildTestEndpoint(t, firstRouter, "first.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer firstEndpoint.Close()
+	defer func() { _ = closeEndpoint(t, firstEndpoint) }()
 
 	secondRouter := &fakeBootstrapRouter{answer: []netip.Addr{netip.MustParseAddr("198.51.100.20")}}
 	secondEndpoint, err := buildTestEndpoint(t, secondRouter, "second.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer secondEndpoint.Close()
+	defer func() { _ = closeEndpoint(t, secondEndpoint) }()
 
 	firstBootstrap := httpClientDialer(t, firstEndpoint.(*ClientEndpoint)).(*bootstrapDialer)
 	secondBootstrap := httpClientDialer(t, secondEndpoint.(*ClientEndpoint)).(*bootstrapDialer)
@@ -377,7 +402,7 @@ func TestConcurrentEndpointConstructionIsIndependent(t *testing.T) {
 		bootstrap := httpClientDialer(t, endpoint.(*ClientEndpoint)).(*bootstrapDialer)
 		require.NotNil(t, http3ConnDialerOf(t, endpoint.(*ClientEndpoint)))
 		caches = append(caches, bootstrap.cache)
-		require.NoError(t, endpoint.Close())
+		require.NoError(t, closeEndpoint(t, endpoint))
 	}
 	for i := range caches {
 		for j := i + 1; j < len(caches); j++ {
@@ -450,7 +475,9 @@ func TestConstructorAcceptsADNSAssignmentAndRoutesOnIt(t *testing.T) {
 	lookupRouter := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("10.0.0.99")}}
 	endpoint, err := buildTestEndpoint(t, lookupRouter, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 
@@ -493,7 +520,9 @@ func TestConstructorKeepsPREF64OutOfTheDNSCacheKey(t *testing.T) {
 	lookupRouter := &recordingRouter{answer: []netip.Addr{netip.MustParseAddr("10.0.0.99")}}
 	endpoint, err := buildTestEndpoint(t, lookupRouter, "masque.example", newBootstrapTLSOptions())
 	require.NoError(t, err)
-	defer endpoint.Close()
+	// Teardown is scope-owned under the new lifecycle; the endpoint has no Close of its own.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	defer func() { _ = scope.Close() }()
 
 	clientEndpoint := endpoint.(*ClientEndpoint)
 	assignment := &masque.DNSAssignment{

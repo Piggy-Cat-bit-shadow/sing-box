@@ -42,10 +42,7 @@ type backendLinux struct {
 
 func newBackend(ctx context.Context, logger logger.ContextLogger, networkManager adapter.NetworkManager, tag string, options option.BridgeOutboundOptions) (Backend, error) {
 	instance := &backendLinux{}
-	err := instance.init(ctx, logger, networkManager, tag, options)
-	if err != nil {
-		return nil, err
-	}
+	instance.init(ctx, logger, networkManager, tag, options)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	if platformInterface != nil && platformInterface.UsePlatformBridge() {
 		instance.platform = platformInterface
@@ -54,39 +51,39 @@ func newBackend(ctx context.Context, logger logger.ContextLogger, networkManager
 	if instance.ruleIndex == 0 {
 		instance.ruleIndex = defaultBridgeRuleIndex
 	}
-	instance.routeTable = options.IPRoute2TableIndex
-	if instance.routeTable == 0 {
-		instance.routeTable = defaultBridgeTableIndexBase + int(instance.index)
+	if instance.boundInterface != "" || instance.platform != nil {
+		instance.routeTable = options.IPRoute2TableIndex
 	}
 	return instance, nil
 }
 
-func (b *backendLinux) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		return nil
-	}
-	// Claim the global slot HERE, not in the constructor.
-	//
-	// This is the first point at which the object owns a running resource, and it is the point the
-	// failure path below can undo: a constructor has no such path, so a slot claimed there was lost
-	// whenever startup failed afterwards.
-	if err := b.acquireIndex(); err != nil {
-		return err
-	}
-	err := b.start()
-	if err != nil {
-		b.Close()
-		return err
+func (b *backendLinux) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateInitialize:
+		err := b.allocateIndex(scope)
+		if err != nil {
+			return err
+		}
+		if b.routeTable == 0 && (b.boundInterface != "" || b.platform != nil) {
+			b.routeTable = defaultBridgeTableIndexBase + int(b.index)
+		}
+	case adapter.StartStateStart:
+		b.closed = scope.Context().Done()
+		if b.platform != nil {
+			return b.startPlatform(scope)
+		}
+		return b.start(scope)
 	}
 	return nil
 }
 
-func (b *backendLinux) start() error {
-	if b.platform != nil {
-		return b.startPlatform()
-	}
+func (b *backendLinux) start(scope *adapter.Scope) error {
 	b.tunName = tun.CalculateInterfaceName(b.bridgeName)
 	b.nftTableName = "sing-box-" + b.tunName
+	scope.Add(func() error {
+		b.readGroup.Wait()
+		return nil
+	})
 	tunInterface, err := tun.New(tun.Options{
 		Name:                      b.tunName,
 		MTU:                       bridgeTunMTU,
@@ -98,12 +95,12 @@ func (b *backendLinux) start() error {
 	if err != nil {
 		return E.Cause(err, "create bridge tun")
 	}
+	scope.Add(tunInterface.Close)
 	b.tunInterface = tunInterface
 	err = tunInterface.Start()
 	if err != nil {
 		return E.Cause(err, "start bridge tun")
 	}
-	b.networkManager.RegisterBridgeInterface(b.tunName)
 	linuxTUN := tunInterface.(tun.LinuxTUN)
 	if linuxTUN.BatchSize() > 1 {
 		b.batchTUN = linuxTUN
@@ -119,12 +116,41 @@ func (b *backendLinux) start() error {
 	if err != nil {
 		return E.Cause(err, "set up bridge netfilter")
 	}
+	scope.Add(func() error {
+		b.egressAccess.Lock()
+		cleanupBridgeNetfilter(b.nftTableName)
+		b.egressAccess.Unlock()
+		return nil
+	})
 	if !inet6Active {
 		b.inet6Port = netip.Addr{}
 	}
-	b.forwardingRestore = enableBridgeForwarding(b.logger, b.tunName, b.inet4Port.IsValid(), b.inet6Port.IsValid())
-	b.syncEgress()
+	forwardingRestore := enableBridgeForwarding(b.logger, b.tunName, b.inet4Port.IsValid(), b.inet6Port.IsValid())
+	scope.Add(func() error {
+		restoreBridgeForwarding(forwardingRestore)
+		return nil
+	})
+	if b.routeTable != 0 {
+		scope.Add(func() error {
+			b.egressAccess.Lock()
+			flushBridgeRouteTable(b.routeTable)
+			b.egressAccess.Unlock()
+			return nil
+		})
+	}
+	if b.boundInterface != "" {
+		b.syncEgress()
+	}
+	// Whether the main table is preferred depends on whether a specific interface is bound: with one
+	// bound, the more specific rule wins; without one, the main table must be consulted.
 	preferMainTable := b.boundInterface == ""
+	scope.Add(func() error {
+		b.egressAccess.Lock()
+		removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET, b.inet4Port)
+		removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET6, b.inet6Port)
+		b.egressAccess.Unlock()
+		return nil
+	})
 	err = setupBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET, b.inet4Port)
 	if err != nil {
 		return E.Cause(err, "set up bridge routing")
@@ -135,19 +161,36 @@ func (b *backendLinux) start() error {
 		removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET6, b.inet6Port)
 		b.inet6Port = netip.Addr{}
 	}
-	b.closed = make(chan struct{})
-	b.readDone = make(chan struct{})
 	if b.batchTUN != nil {
-		go b.batchReadLoop()
+		b.readGroup.Go(b.batchReadLoop)
 	} else {
-		go b.readLoop()
+		b.readGroup.Go(b.readLoop)
 	}
 	egress := "auto"
 	if b.boundInterface != "" {
 		egress = b.boundInterface
+		monitor := b.networkManager.NetworkMonitor()
+		if monitor != nil {
+			element := monitor.RegisterCallback(func() { b.syncEgress() })
+			scope.Add(func() error {
+				monitor.UnregisterCallback(element)
+				return nil
+			})
+		} else {
+			b.logger.Debug("network monitor unavailable, pinned egress will not track interface changes")
+		}
+		b.syncEgress()
+	} else {
+		monitor := b.networkManager.InterfaceMonitor()
+		if monitor != nil {
+			element := monitor.RegisterCallback(func(_ *control.Interface, _ int) { b.updateClamp() })
+			scope.Add(func() error {
+				monitor.UnregisterCallback(element)
+				return nil
+			})
+		}
+		b.updateClamp()
 	}
-	b.registerMonitors(b.syncEgress)
-	b.syncEgress()
 	natMode := "masquerade"
 	if fullConeSupported() {
 		natMode = "full-cone NAT"
@@ -156,7 +199,7 @@ func (b *backendLinux) start() error {
 	return nil
 }
 
-func (b *backendLinux) startPlatform() error {
+func (b *backendLinux) startPlatform(scope *adapter.Scope) error {
 	session, err := b.platform.CreateBridge(adapter.BridgeOptions{
 		BridgeName: b.bridgeName,
 		MTU:        bridgeTunMTU,
@@ -168,12 +211,16 @@ func (b *backendLinux) startPlatform() error {
 	if err != nil {
 		return E.Cause(err, "create bridge")
 	}
+	scope.Add(session.Close)
 	b.session = session
 	b.tunName = session.Name()
-	b.networkManager.RegisterBridgeInterface(b.tunName)
 	if !session.Inet6Active() {
 		b.inet6Port = netip.Addr{}
 	}
+	scope.Add(func() error {
+		b.readGroup.Wait()
+		return nil
+	})
 	tunInterface, err := tun.New(tun.Options{
 		Name:           b.tunName,
 		MTU:            bridgeTunMTU,
@@ -184,6 +231,7 @@ func (b *backendLinux) startPlatform() error {
 	if err != nil {
 		return E.Cause(err, "create bridge tun")
 	}
+	scope.Add(tunInterface.Close)
 	b.tunInterface = tunInterface
 	err = tunInterface.Start()
 	if err != nil {
@@ -198,17 +246,18 @@ func (b *backendLinux) startPlatform() error {
 			b.writeBuffers[i] = make([]byte, b.writeHeadroom+maxPacketLength)
 		}
 	}
-	b.closed = make(chan struct{})
-	b.readDone = make(chan struct{})
 	if b.batchTUN != nil {
-		go b.batchReadLoop()
+		b.readGroup.Go(b.batchReadLoop)
 	} else {
-		go b.readLoop()
+		b.readGroup.Go(b.readLoop)
 	}
 	monitor := b.networkManager.InterfaceMonitor()
 	if monitor != nil {
 		element := monitor.RegisterCallback(func(_ *control.Interface, _ int) { b.syncSessionEgress() })
-		b.unregister = func() { monitor.UnregisterCallback(element) }
+		scope.Add(func() error {
+			monitor.UnregisterCallback(element)
+			return nil
+		})
 	}
 	b.syncSessionEgress()
 	egress := "auto"
@@ -216,40 +265,6 @@ func (b *backendLinux) startPlatform() error {
 		egress = b.boundInterface
 	}
 	b.logger.Info("bridge started at ", b.tunName, " (platform, egress ", egress, ")")
-	return nil
-}
-
-func (b *backendLinux) Close() error {
-	b.closeOnce.Do(func() {
-		if b.closed != nil {
-			close(b.closed)
-		}
-		if b.unregister != nil {
-			b.unregister()
-		}
-		if b.tunInterface != nil {
-			b.tunInterface.Close()
-		}
-		if b.readDone != nil {
-			<-b.readDone
-		}
-		if b.session != nil {
-			_ = b.session.Close()
-		} else {
-			b.egressAccess.Lock()
-			if b.tunName != "" {
-				cleanupBridgeNetfilter(b.nftTableName)
-				preferMainTable := b.boundInterface == ""
-				removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET, b.inet4Port)
-				removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, preferMainTable, unix.AF_INET6, b.inet6Port)
-				flushBridgeRouteTable(b.routeTable)
-			}
-			b.egressAccess.Unlock()
-			restoreBridgeForwarding(b.forwardingRestore)
-			b.forwardingRestore = nil
-		}
-		b.releaseIndex()
-	})
 	return nil
 }
 
@@ -301,17 +316,18 @@ func (b *backendLinux) WritePackets(packets [][]byte) error {
 // BatchRead completes any kernel-deferred checksums while splitting GRO frames
 // (virtio NEEDS_CSUM), so unlike readLoop no checksum fix is needed here.
 func (b *backendLinux) batchReadLoop() {
-	defer close(b.readDone)
 	batchSize := b.batchTUN.BatchSize()
 	sizes := make([]int, batchSize)
 	batch := make([][]byte, 0, batchSize)
 	headroom := -1
 	var (
-		buffers     [][]byte
-		returnPaths []tun.Return
-		readRetry   tun.ReadRetry
+		buffers   [][]byte
+		readRetry tun.ReadRetry
 	)
 	for {
+		b.returnAccess.Lock()
+		returnPaths := b.returnPaths
+		b.returnAccess.Unlock()
 		pathHeadroom := 0
 		if len(returnPaths) > 0 {
 			pathHeadroom = returnPaths[0].ReturnHeadroom()
@@ -338,9 +354,6 @@ func (b *backendLinux) batchReadLoop() {
 		} else {
 			readRetry.Reset()
 		}
-		b.returnAccess.Lock()
-		returnPaths = b.returnPaths
-		b.returnAccess.Unlock()
 		if n == 0 || len(returnPaths) == 0 {
 			continue
 		}
@@ -374,6 +387,9 @@ func (b *backendLinux) batchReadLoop() {
 	}
 }
 
+// The policy rules default to priority 100/101, ahead of sing-tun auto_route's rules,
+// so forwarded packets egress the physical interface instead of looping back into
+// a tun.
 func (b *backendLinux) syncEgress() {
 	b.egressAccess.Lock()
 	defer b.egressAccess.Unlock()
@@ -383,37 +399,63 @@ func (b *backendLinux) syncEgress() {
 	default:
 	}
 	b.updateClampLocked()
-	egress := b.resolveEgress()
-	var link netlink.Link
-	if egress != "" {
-		link, _ = netlink.LinkByName(egress)
-	}
-	fallbackType := unix.RTN_UNREACHABLE
-	if b.boundInterface != "" {
-		fallbackType = unix.RTN_BLACKHOLE
-	}
-	var routes []netlink.Route
-	for _, family := range activeBridgeFamilies(b.inet6Port) {
-		if link == nil {
-			routes = append(routes, unroutableBridgeRoute(b.routeTable, family, fallbackType))
-		} else {
-			routes = append(routes, egressRoutes(b.routeTable, family, link, fallbackType)...)
+	flushBridgeRouteTable(b.routeTable)
+	link, err := netlink.LinkByName(b.boundInterface)
+	if err != nil {
+		for _, family := range activeBridgeFamilies(b.inet6Port) {
+			blackholeBridgeDefault(b.routeTable, family)
 		}
-	}
-	if bridgeRoutesEqual(listBridgeRoutes(b.routeTable), routes) {
+		b.logger.Debug("pinned egress ", b.boundInterface, " absent, dropping forwarded traffic")
 		return
 	}
-	if link == nil {
-		if b.boundInterface != "" {
-			b.logger.Debug("bridge egress ", egress, " absent, dropping forwarded traffic")
-		} else {
-			b.logger.Debug("no default interface for bridge egress")
+	for _, family := range activeBridgeFamilies(b.inet6Port) {
+		b.syncEgressFamily(family, link.Attrs().Index)
+	}
+}
+
+func (b *backendLinux) syncEgressFamily(family int, linkIndex int) {
+	connected, err := netlink.RouteListFiltered(family, &netlink.Route{
+		LinkIndex: linkIndex,
+		Table:     unix.RT_TABLE_MAIN,
+	}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+	if err == nil {
+		for _, route := range connected {
+			if route.Gw != nil || route.Dst == nil {
+				continue
+			}
+			pinned := route
+			pinned.Table = b.routeTable
+			pinned.ILinkIndex = 0
+			_ = netlink.RouteReplace(&pinned)
 		}
 	}
-	err := applyBridgeRoutes(b.routeTable, routes, fallbackType)
-	if err != nil {
-		b.logger.Debug(E.Cause(err, "pin bridge egress default route"))
+	resolved, err := netlink.RouteGetWithOptions(probeAddress(family), &netlink.RouteGetOptions{Oif: b.boundInterface})
+	if err == nil && len(resolved) > 0 {
+		defaultRoute := &netlink.Route{
+			LinkIndex: linkIndex,
+			Table:     b.routeTable,
+			Dst:       defaultDestination(family),
+		}
+		if len(resolved[0].Gw) > 0 {
+			defaultRoute.Gw = resolved[0].Gw
+		}
+		err = netlink.RouteReplace(defaultRoute)
+		if err == nil {
+			return
+		}
 	}
+	blackholeBridgeDefault(b.routeTable, family)
+}
+
+func (b *backendLinux) updateClamp() {
+	b.egressAccess.Lock()
+	defer b.egressAccess.Unlock()
+	select {
+	case <-b.closed:
+		return
+	default:
+	}
+	b.updateClampLocked()
 }
 
 func (b *backendLinux) updateClampLocked() {

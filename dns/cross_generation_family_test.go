@@ -46,12 +46,14 @@ type familySelectiveTransport struct {
 	queries sync.Map // bool -> *atomic.Int32
 }
 
-func (t *familySelectiveTransport) Type() string                         { return "family-selective" }
-func (t *familySelectiveTransport) Tag() string                          { return t.tag }
-func (t *familySelectiveTransport) Dependencies() []string               { return nil }
-func (t *familySelectiveTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *familySelectiveTransport) Close() error                         { return nil }
-func (t *familySelectiveTransport) Reset()                               {}
+func (t *familySelectiveTransport) Type() string           { return "family-selective" }
+func (t *familySelectiveTransport) Tag() string            { return t.tag }
+func (t *familySelectiveTransport) Dependencies() []string { return nil }
+func (t *familySelectiveTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	return nil
+}
+func (t *familySelectiveTransport) Close() error { return nil }
+func (t *familySelectiveTransport) Reset()       {}
 
 func (t *familySelectiveTransport) counter(isIPv6 bool) *atomic.Int32 {
 	value, _ := t.queries.LoadOrStore(isIPv6, &atomic.Int32{})

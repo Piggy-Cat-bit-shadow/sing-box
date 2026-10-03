@@ -78,10 +78,10 @@ type stubOutboundManager struct {
 	def   adapter.Outbound
 }
 
-func (m *stubOutboundManager) Start(stage adapter.StartStage) error { return nil }
-func (m *stubOutboundManager) Close() error                         { return nil }
-func (m *stubOutboundManager) Outbounds() []adapter.Outbound        { return nil }
-func (m *stubOutboundManager) Remove(tag string) error              { return nil }
+func (m *stubOutboundManager) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (m *stubOutboundManager) Close() error                                               { return nil }
+func (m *stubOutboundManager) Outbounds() []adapter.Outbound                              { return nil }
+func (m *stubOutboundManager) Remove(tag string) error                                    { return nil }
 func (m *stubOutboundManager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
 	return nil
 }
@@ -423,8 +423,8 @@ func (g *stubGroup) Selected(network string) adapter.Outbound {
 // noopTracker satisfies the tracker interface without observing anything.
 type noopTracker struct{}
 
-func (noopTracker) Start(stage adapter.StartStage) error { return nil }
-func (noopTracker) Close() error                         { return nil }
+func (noopTracker) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (noopTracker) Close() error                                               { return nil }
 func (noopTracker) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	return conn
 }

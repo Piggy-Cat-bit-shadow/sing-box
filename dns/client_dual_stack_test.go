@@ -59,12 +59,12 @@ func (t *familySchedulingTransport) observedTypes() []uint16 {
 	return append([]uint16(nil), t.observed...)
 }
 
-func (t *familySchedulingTransport) Start(adapter.StartStage) error { return nil }
-func (t *familySchedulingTransport) Close() error                   { return nil }
-func (t *familySchedulingTransport) Type() string                   { return "family-scheduling" }
-func (t *familySchedulingTransport) Tag() string                    { return "family-scheduling" }
-func (t *familySchedulingTransport) Dependencies() []string         { return nil }
-func (t *familySchedulingTransport) Reset()                         {}
+func (t *familySchedulingTransport) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+func (t *familySchedulingTransport) Close() error                                   { return nil }
+func (t *familySchedulingTransport) Type() string                                   { return "family-scheduling" }
+func (t *familySchedulingTransport) Tag() string                                    { return "family-scheduling" }
+func (t *familySchedulingTransport) Dependencies() []string                         { return nil }
+func (t *familySchedulingTransport) Reset()                                         {}
 
 func (t *familySchedulingTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queryCount.Add(1)

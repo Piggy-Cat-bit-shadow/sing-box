@@ -195,7 +195,7 @@ func (r *pressureRegistry) count() int {
 	return len(r.services)
 }
 
-func (s *Service) Start(stage adapter.StartStage) error {
+func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -203,19 +203,19 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	scope.Add(func() error {
+		s.stopTimer()
+		return nil
+	})
 	if s.timerConfig.policyMode == policyModeNetworkExtension {
 		// Registration and the start transition are one serialized operation. Splitting them
-		// let a concurrent Close stop a monitor this Start had not started yet, leaving an
+		// let a concurrent teardown stop a monitor this Start had not started yet, leaving an
 		// empty registry and a running source.
 		globalPressureRegistry.add(s)
-	}
-	return nil
-}
-
-func (s *Service) Close() error {
-	s.stopTimer()
-	if s.timerConfig.policyMode == policyModeNetworkExtension {
-		globalPressureRegistry.remove(s)
+		scope.Add(func() error {
+			globalPressureRegistry.remove(s)
+			return nil
+		})
 	}
 	return nil
 }

@@ -145,7 +145,8 @@ func TestAcquireReleaseCycleIsBalanced(t *testing.T) {
 	before := usedIndexCount()
 
 	base := &backendBase{}
-	require.NoError(t, base.acquireIndex(), "acquiring an index succeeds")
+	_, err := base.acquireIndex()
+	require.NoError(t, err, "acquiring an index succeeds")
 	require.Equal(t, before+1, usedIndexCount(), "an acquired slot is held")
 
 	base.releaseIndex()
@@ -157,9 +158,12 @@ func TestAcquireIndexIsIdempotent(t *testing.T) {
 	before := usedIndexCount()
 
 	base := &backendBase{}
-	require.NoError(t, base.acquireIndex())
-	require.NoError(t, base.acquireIndex(), "a second Start must not allocate again")
-	require.NoError(t, base.acquireIndex())
+	_, err := base.acquireIndex()
+	require.NoError(t, err)
+	_, err = base.acquireIndex()
+	require.NoError(t, err, "a second Start must not allocate again")
+	_, err = base.acquireIndex()
+	require.NoError(t, err)
 	require.Equal(t, before+1, usedIndexCount(),
 		"repeated acquisition must hold exactly one slot, not one per call")
 
@@ -176,7 +180,8 @@ func TestReleaseIndexIsIdempotent(t *testing.T) {
 	before := usedIndexCount()
 
 	base := &backendBase{}
-	require.NoError(t, base.acquireIndex())
+	_, err := base.acquireIndex()
+	require.NoError(t, err)
 
 	base.releaseIndex()
 	base.releaseIndex()

@@ -41,20 +41,19 @@ type selectionTransport struct {
 	transportType string
 }
 
-func (t *selectionTransport) Type() string                         { return t.transportType }
-func (t *selectionTransport) Tag() string                          { return t.tag }
-func (t *selectionTransport) Dependencies() []string               { return nil }
-func (t *selectionTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *selectionTransport) Close() error                         { return nil }
-func (t *selectionTransport) Reset()                               {}
+func (t *selectionTransport) Type() string                                               { return t.transportType }
+func (t *selectionTransport) Tag() string                                                { return t.tag }
+func (t *selectionTransport) Dependencies() []string                                     { return nil }
+func (t *selectionTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *selectionTransport) Close() error                                               { return nil }
+func (t *selectionTransport) Reset()                                                     {}
 
 // TestConcurrentCreatesElectExactlyOneDefault is L1.
 //
 // Several normal servers racing for an unconfigured default slot must end with exactly one holder,
 // and the holder must be a transport that is actually installed - not a cancelled or discarded one.
 func TestConcurrentCreatesElectExactlyOneDefault(t *testing.T) {
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), &defaultTrackingRegistry{}, nil, "")
-	manager.logger = log.NewNOPFactory().Logger()
+	manager := NewTransportManager(&defaultTrackingRegistry{}, nil, "")
 
 	const creators = 8
 	var (
@@ -69,7 +68,7 @@ func TestConcurrentCreatesElectExactlyOneDefault(t *testing.T) {
 		go func(index int) {
 			defer waitGroup.Done()
 			<-start
-			err := manager.Create(context.Background(), manager.logger,
+			err := manager.Create(context.Background(), log.NewNOPFactory().Logger(),
 				"server-"+string(rune('a'+index)), "udp", nil)
 			access.Lock()
 			errs = append(errs, err)
@@ -115,8 +114,7 @@ func TestConcurrentCreatesElectExactlyOneDefault(t *testing.T) {
 // empty default slot, the FakeIP server must be refused rather than transiently becoming the default,
 // and the normal server must end up holding it.
 func TestConcurrentFakeIPAndNormalDoNotBothClaimDefault(t *testing.T) {
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), &defaultTrackingRegistry{}, nil, "")
-	manager.logger = log.NewNOPFactory().Logger()
+	manager := NewTransportManager(&defaultTrackingRegistry{}, nil, "")
 
 	var (
 		waitGroup sync.WaitGroup
@@ -129,12 +127,12 @@ func TestConcurrentFakeIPAndNormalDoNotBothClaimDefault(t *testing.T) {
 	go func() {
 		defer waitGroup.Done()
 		<-start
-		normalErr = manager.Create(context.Background(), manager.logger, "normal", "udp", nil)
+		normalErr = manager.Create(context.Background(), log.NewNOPFactory().Logger(), "normal", "udp", nil)
 	}()
 	go func() {
 		defer waitGroup.Done()
 		<-start
-		fakeIPErr = manager.Create(context.Background(), manager.logger, "fake", "fakeip", nil)
+		fakeIPErr = manager.Create(context.Background(), log.NewNOPFactory().Logger(), "fake", "fakeip", nil)
 	}()
 	close(start)
 	waitGroup.Wait()
@@ -173,10 +171,9 @@ func TestFakeIPTypeWithoutTheCapabilityIsRefused(t *testing.T) {
 	registry := &incapableFakeIPRegistry{}
 	// A configured default tag, so the "a fakeip server cannot be the default" pre-check does not
 	// fire first and the capability assertion is the one under test.
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), registry, nil, "configured-default")
-	manager.logger = log.NewNOPFactory().Logger()
+	manager := NewTransportManager(registry, nil, "configured-default")
 
-	err := manager.Create(context.Background(), manager.logger, "bad-fakeip", "fakeip", nil)
+	err := manager.Create(context.Background(), log.NewNOPFactory().Logger(), "bad-fakeip", "fakeip", nil)
 	require.Error(t, err,
 		"a transport that reports the fakeip type without the capability must be refused, not "+
 			"asserted into a panic")
@@ -201,10 +198,9 @@ func TestFakeIPTypeWithoutTheCapabilityIsRefused(t *testing.T) {
 // is undefined for most of them.
 func TestFakeIPInvalidTransportIsClosedExactlyOnce(t *testing.T) {
 	registry := &incapableFakeIPRegistry{}
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), registry, nil, "configured-default")
-	manager.logger = log.NewNOPFactory().Logger()
+	manager := NewTransportManager(registry, nil, "configured-default")
 
-	err := manager.Create(context.Background(), manager.logger, "bad-fakeip", "fakeip", nil)
+	err := manager.Create(context.Background(), log.NewNOPFactory().Logger(), "bad-fakeip", "fakeip", nil)
 	require.Error(t, err, "the invalid FakeIP transport is refused")
 
 	require.EqualValues(t, 1, registry.created.Load(), "exactly one transport was constructed")
@@ -219,8 +215,7 @@ func TestFakeIPInvalidTransportIsClosedExactlyOnce(t *testing.T) {
 // TestConcurrentInvalidFakeIPDoesNotLeak is Part G under concurrency.
 func TestConcurrentInvalidFakeIPDoesNotLeak(t *testing.T) {
 	registry := &incapableFakeIPRegistry{}
-	manager := NewTransportManager(log.NewNOPFactory().Logger(), registry, nil, "configured-default")
-	manager.logger = log.NewNOPFactory().Logger()
+	manager := NewTransportManager(registry, nil, "configured-default")
 
 	const attempts = 8
 	var (
@@ -233,7 +228,7 @@ func TestConcurrentInvalidFakeIPDoesNotLeak(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			<-start
-			_ = manager.Create(context.Background(), manager.logger, "bad-"+string(rune('a'+index)), "fakeip", nil)
+			_ = manager.Create(context.Background(), log.NewNOPFactory().Logger(), "bad-"+string(rune('a'+index)), "fakeip", nil)
 		}()
 	}
 	close(start)
@@ -297,8 +292,8 @@ func (t *incapableTransport) Close() error {
 	return nil
 }
 
-func (t *incapableTransport) Type() string                         { return "fakeip" }
-func (t *incapableTransport) Tag() string                          { return t.tag }
-func (t *incapableTransport) Dependencies() []string               { return nil }
-func (t *incapableTransport) Start(stage adapter.StartStage) error { return nil }
-func (t *incapableTransport) Reset()                               {}
+func (t *incapableTransport) Type() string                                               { return "fakeip" }
+func (t *incapableTransport) Tag() string                                                { return t.tag }
+func (t *incapableTransport) Dependencies() []string                                     { return nil }
+func (t *incapableTransport) Start(stage adapter.StartStage, scope *adapter.Scope) error { return nil }
+func (t *incapableTransport) Reset()                                                     {}
