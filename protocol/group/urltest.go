@@ -3,7 +3,6 @@ package group
 import (
 	"context"
 	"io"
-	"maps"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -493,17 +492,23 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			continue
 		}
 		switch nested := detour.(type) {
-		case *URLTest:
-			b.checked[tag] = true
-			b.groups = append(b.groups, nested)
-			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.group.urlTest(b.ctx, force)
-				b.access.Lock()
-				maps.Copy(b.result, nestedResult)
-				b.access.Unlock()
-				return nil, nil
-			})
 		case adapter.OutboundGroup:
+			// EVERY group member - including a nested URLTest group - is expanded down to its
+			// leaves and measured against THIS batch's target.
+			//
+			// A nested *URLTest used to be special-cased: it ran the child's own urlTest(), which
+			// measured the child's leaves against the CHILD's configured URL and rewrote the
+			// child's selection. The parent then folded those delays into its own ranking.
+			//
+			// Two things were wrong with that. The parent ranked a member by a delay measured
+			// against a target the parent never chose, so a member could win or lose on an
+			// unrelated measurement. And a parent's health check silently re-ran and mutated the
+			// child's policy, which is the child's own business.
+			//
+			// Recursing to leaves means the parent evaluates "what delay would this member give
+			// me, on my target, right now", which is what it actually needs to rank. The child's
+			// own selection is untouched; the child's own health check remains the only thing that
+			// changes it.
 			b.checked[tag] = true
 			b.groups = append(b.groups, nested)
 			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
