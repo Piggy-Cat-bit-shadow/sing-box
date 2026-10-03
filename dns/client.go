@@ -614,6 +614,31 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	// That is correct for routing. It would be wrong to shorten it by dropping the second
 	// family, because DestinationAddresses and the rule matcher would then see only half the
 	// addresses the resolver returned.
+	// The epoch this lookup belongs to, captured BEFORE either family is dispatched.
+	//
+	// # Why a complete lookup needs its own epoch
+	//
+	// collectFamiliesComplete runs A and AAAA as two independent exchanges, and each of those
+	// captures the generation when its own request is issued. A reset landing between them therefore
+	// splits them: the A half is answered on the network that has been left and the AAAA half on the
+	// one that is current. Both are individually well-formed, and the caller receives ONE address
+	// set that was never simultaneously true on any network - with nothing in the result
+	// distinguishing the halves.
+	//
+	// Unlike the streaming API, where each family is its own published observation and a superseded
+	// one simply loses a connection race, a complete lookup is a single claim about a name. The two
+	// halves have to belong to the same epoch for that claim to mean anything.
+	//
+	// Refusing is the minimal behaviour change: the caller's answer was never valid, so it is
+	// reported as an error rather than silently returned half-stale. The per-exchange generation
+	// guard still does its own job - nothing from a superseded family is cached either way.
+	var lookupEpoch uint64
+	var lookupHasEpoch bool
+	if c.networkGeneration != nil {
+		lookupEpoch = c.networkGeneration()
+		lookupHasEpoch = true
+	}
+
 	response4, response6, err := c.collectFamiliesComplete(
 		ctx,
 		transport,
@@ -624,6 +649,16 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	if err != nil {
 		return nil, err
 	}
+
+	// Refuse a set assembled across an epoch change.
+	//
+	// Checked after the family exchanges and before the result is assembled, so a split lookup can
+	// never be observed as a complete answer.
+	if lookupHasEpoch && c.networkGeneration() != lookupEpoch {
+		return nil, E.New("network changed while resolving ", dnsName,
+			"; the address families belong to different networks")
+	}
+
 	return sortAddresses(response4, response6, strategy), nil
 }
 

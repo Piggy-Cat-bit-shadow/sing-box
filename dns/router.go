@@ -1023,6 +1023,19 @@ func (r *Router) lookupWithRules(ctx context.Context, rules []adapter.DNSRule, d
 		response4 []netip.Addr
 		response6 []netip.Addr
 	)
+	// The epoch this complete lookup belongs to, captured BEFORE either family is dispatched.
+	//
+	// A and AAAA are two independent resolutions, and each captures the network generation when its
+	// own request is issued. A reset landing between them splits them: A is answered on the network
+	// that has been left and AAAA on the one that is current. Both halves are individually
+	// well-formed, and the caller receives ONE address set that was never simultaneously true on any
+	// network - with nothing in the result distinguishing them.
+	//
+	// A complete lookup is a single claim about a name, so its halves must share an epoch. The
+	// streaming entry point is deliberately different: each family is published as its own
+	// observation, so a superseded one simply loses a connection race there.
+	lookupEpoch := r.dnsGeneration()
+
 	var group task.Group
 	group.Append("exchange4", func(ctx context.Context) error {
 		result, err := r.lookupWithRulesType(ctx, rules, domain, mDNS.TypeA, lookupOptions)
@@ -1038,6 +1051,17 @@ func (r *Router) lookupWithRules(ctx context.Context, rules []adapter.DNSRule, d
 	if len(response4) == 0 && len(response6) == 0 {
 		return nil, err
 	}
+
+	// Refuse a set assembled across an epoch change, before it can be observed as a complete answer.
+	//
+	// Refusing is the minimal behaviour change: the answer was never valid, so it becomes an error
+	// rather than a silently half-stale success. The per-exchange generation guard keeps doing its
+	// own job - nothing from a superseded family is cached either way.
+	if r.dnsGeneration() != lookupEpoch {
+		return nil, E.New("network changed while resolving ", domain,
+			"; the address families belong to different networks")
+	}
+
 	return sortAddresses(response4, response6, strategy), nil
 }
 
