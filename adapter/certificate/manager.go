@@ -2,7 +2,6 @@ package certificate
 
 import (
 	"context"
-	"os"
 	"sync"
 	"time"
 
@@ -48,7 +47,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
 		m.logger.Trace(stage, " ", name)
 		startTime := time.Now()
-		err := adapter.LegacyStart(provider, stage)
+		err := provider.Start(stage)
 		if err != nil {
 			return E.Cause(err, stage, " ", name)
 		}
@@ -95,29 +94,6 @@ func (m *Manager) Get(tag string) (adapter.CertificateProviderService, bool) {
 	return provider, found
 }
 
-func (m *Manager) Remove(tag string) error {
-	m.access.Lock()
-	provider, found := m.providerByTag[tag]
-	if !found {
-		m.access.Unlock()
-		return os.ErrInvalid
-	}
-	delete(m.providerByTag, tag)
-	index := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
-		return it == provider
-	})
-	if index == -1 {
-		panic("invalid certificate provider index")
-	}
-	m.providers = append(m.providers[:index], m.providers[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return provider.Close()
-	}
-	return nil
-}
-
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
 	// Reject a duplicate BEFORE constructing anything.
 	//
@@ -136,18 +112,6 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	if m.started {
-		name := "certificate-provider/" + provider.Type() + "[" + provider.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
-			m.logger.Trace(stage, " ", name)
-			startTime := time.Now()
-			err = adapter.LegacyStart(provider, stage)
-			if err != nil {
-				return E.Cause(err, stage, " ", name)
-			}
-			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
-		}
-	}
 	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
 	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
 	if _, loaded := m.providerByTag[tag]; loaded {

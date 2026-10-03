@@ -133,14 +133,11 @@ func randomVersion() string {
 }
 
 func (s *Outbound) connect(ctx context.Context) (client *ssh.Client, err error) {
-	if s.client != nil {
-		return s.client, nil
-	}
-
 	s.clientAccess.Lock()
 	defer s.clientAccess.Unlock()
 
 	if s.client != nil {
+		s.streams++
 		return s.client, nil
 	}
 
@@ -199,14 +196,16 @@ func (s *Outbound) connect(ctx context.Context) (client *ssh.Client, err error) 
 
 	s.clientConn = conn
 	s.client = client
-	s.streams = 0
+	s.streams = 1
 
 	go func() {
 		client.Wait()
 		conn.Close()
 		s.clientAccess.Lock()
-		s.client = nil
-		s.clientConn = nil
+		if s.client == client {
+			s.client = nil
+			s.clientConn = nil
+		}
 		s.clientAccess.Unlock()
 	}()
 
@@ -237,6 +236,8 @@ func (s *Outbound) CloseIdleConnections() {
 		return
 	}
 	clientConn := s.clientConn
+	s.client = nil
+	s.clientConn = nil
 	s.clientAccess.Unlock()
 	common.Close(clientConn)
 }
@@ -253,6 +254,8 @@ func (s *Outbound) releaseStream(client *ssh.Client, keepSession bool) {
 		return
 	}
 	clientConn := s.clientConn
+	s.client = nil
+	s.clientConn = nil
 	s.clientAccess.Unlock()
 	common.Close(clientConn)
 }

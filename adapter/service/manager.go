@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"os"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,7 +44,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	for _, service := range services {
 		name := "service/" + service.Type() + "[" + service.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, stage, " ", name)
-		err := adapter.LegacyStart(service, stage)
+		err := service.Start(stage)
 		done()
 		if err != nil {
 			return E.Cause(err, stage, " ", name)
@@ -91,29 +90,6 @@ func (m *Manager) Get(tag string) (adapter.Service, bool) {
 	return service, found
 }
 
-func (m *Manager) Remove(tag string) error {
-	m.access.Lock()
-	service, found := m.serviceByTag[tag]
-	if !found {
-		m.access.Unlock()
-		return os.ErrInvalid
-	}
-	delete(m.serviceByTag, tag)
-	index := common.Index(m.services, func(it adapter.Service) bool {
-		return it == service
-	})
-	if index == -1 {
-		panic("invalid service index")
-	}
-	m.services = append(m.services[:index], m.services[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return service.Close()
-	}
-	return nil
-}
-
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
 	// Reject a duplicate BEFORE constructing anything.
 	//
@@ -133,17 +109,6 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	if m.started {
-		name := "service/" + service.Type() + "[" + service.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
-			done := adapter.LogElapsed(m.logger, stage, " ", name)
-			err = adapter.LegacyStart(service, stage)
-			done()
-			if err != nil {
-				return E.Cause(err, stage, " ", name)
-			}
-		}
-	}
 	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
 	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
 	if _, loaded := m.serviceByTag[tag]; loaded {

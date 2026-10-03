@@ -189,8 +189,9 @@ func TestFakeIPTypeWithoutTheCapabilityIsRefused(t *testing.T) {
 	require.Nil(t, manager.fakeIPTransport)
 	require.Nil(t, manager.defaultTransport,
 		"a failed install must not leave itself as the default")
-	require.Empty(t, manager.dependByTag,
-		"and it must not leave dependency entries pointing at a transport that was discarded")
+	// dependByTag is gone: upstream removed the unreferenced field with the dead hot-reload
+	// path, so there is no dependency bookkeeping left to leave dirty. The registry maps
+	// above are what a discarded transport could still be reachable through.
 }
 
 // TestFakeIPInvalidTransportIsClosedExactlyOnce is Part G's leak half.

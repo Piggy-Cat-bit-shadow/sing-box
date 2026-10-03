@@ -94,60 +94,68 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return outbound, nil
 }
 
-func (s *URLTest) Start() error {
-	// Dispose of any group from an earlier Start before replacing it.
-	//
-	// Assigning a new group over the old one stranded everything the old group owned: its ticker,
-	// its pause callback and its background context, none of which anything referenced afterwards.
-	// A health check already running kept running, for a group nothing could reach.
-	//
-	// Start is called once in the normal lifecycle, so this is about not leaking when it is not.
-	// Detach the previous group, then close it OUTSIDE any lock.
-	//
-	// Close runs an arbitrary lifecycle callback - the group unregisters pause callbacks and stops a
-	// ticker - so holding a lock across it would risk a deadlock. The lock is held only to decide and
-	// to detach.
-	s.lifecycleAccess.Lock()
-	if s.closed {
-		s.lifecycleAccess.Unlock()
-		return os.ErrClosed
-	}
-	previous := s.group.Swap(nil)
-	s.lifecycleAccess.Unlock()
-
-	if previous != nil {
-		_ = previous.Close()
-	}
-
-	outbounds := make([]adapter.Outbound, 0, len(s.tags))
-	for i, tag := range s.tags {
-		detour, loaded := s.outbound.Outbound(tag)
-		if !loaded {
-			return E.New("outbound ", i, " not found: ", tag)
+func (s *URLTest) Start(stage adapter.StartStage) error {
+	switch stage {
+	case adapter.StartStateStart:
+		// Dispose of any group from an earlier Start before replacing it.
+		//
+		// Assigning a new group over the old one stranded everything the old group owned: its
+		// ticker, its pause callback and its background context, none of which anything referenced
+		// afterwards. A health check already running kept running, for a group nothing could reach.
+		//
+		// Start is called once in the normal lifecycle, so this is about not leaking when it is not.
+		// Detach the previous group, then close it OUTSIDE any lock.
+		//
+		// Close runs an arbitrary lifecycle callback - the group unregisters pause callbacks and
+		// stops a ticker - so holding a lock across it would risk a deadlock. The lock is held only
+		// to decide and to detach.
+		s.lifecycleAccess.Lock()
+		if s.closed {
+			s.lifecycleAccess.Unlock()
+			return os.ErrClosed
 		}
-		outbounds = append(outbounds, detour)
-	}
-	group, err := NewURLTestGroupWithExpected(s.ctx, s.outbound, s.logger, outbounds, s.link, s.expectedStatus, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
-	if err != nil {
-		return err
-	}
-
-	// Publish ONLY if the wrapper is still live.
-	//
-	// Construction runs outside the lock, so a Close can complete while it is in progress. Without
-	// this re-check, Close returned success and was then undone by this store: the wrapper owned a
-	// live group, with its own ticker and background context, after it had been closed - and nothing
-	// would ever close that group.
-	//
-	// A loser disposes of what it built rather than leaving it to run unreferenced.
-	s.lifecycleAccess.Lock()
-	if s.closed {
+		previous := s.group.Swap(nil)
 		s.lifecycleAccess.Unlock()
-		_ = group.Close()
-		return os.ErrClosed
+
+		if previous != nil {
+			_ = previous.Close()
+		}
+
+		outbounds := make([]adapter.Outbound, 0, len(s.tags))
+		for i, tag := range s.tags {
+			detour, loaded := s.outbound.Outbound(tag)
+			if !loaded {
+				return E.New("outbound ", i, " not found: ", tag)
+			}
+			outbounds = append(outbounds, detour)
+		}
+		group, err := NewURLTestGroupWithExpected(s.ctx, s.outbound, s.logger, outbounds, s.link, s.expectedStatus, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+		if err != nil {
+			return err
+		}
+
+		// Publish ONLY if the wrapper is still live.
+		//
+		// Construction runs outside the lock, so a Close can complete while it is in progress.
+		// Without this re-check, Close returned success and was then undone by this store: the
+		// wrapper owned a live group, with its own ticker and background context, after it had been
+		// closed - and nothing would ever close that group.
+		//
+		// A loser disposes of what it built rather than leaving it to run unreferenced.
+		s.lifecycleAccess.Lock()
+		if s.closed {
+			s.lifecycleAccess.Unlock()
+			_ = group.Close()
+			return os.ErrClosed
+		}
+		s.group.Store(group)
+		s.lifecycleAccess.Unlock()
+	case adapter.StartStateStarted:
+		// The staged lifecycle calls this once the object is live. The wrapper's PostStart is the
+		// guarded form: no group means closed or never started, which is reported rather than
+		// silently treated as success.
+		return s.PostStart()
 	}
-	s.group.Store(group)
-	s.lifecycleAccess.Unlock()
 	return nil
 }
 

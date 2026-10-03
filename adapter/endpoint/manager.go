@@ -2,7 +2,6 @@ package endpoint
 
 import (
 	"context"
-	"os"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -48,7 +47,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	for _, endpoint := range m.endpoints {
 		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
 		done := adapter.LogElapsed(m.logger, stage, " ", name)
-		err := adapter.LegacyStart(endpoint, stage)
+		err := endpoint.Start(stage)
 		done()
 		if err != nil {
 			return E.Cause(err, stage, " ", name)
@@ -94,29 +93,6 @@ func (m *Manager) Get(tag string) (adapter.Endpoint, bool) {
 	return endpoint, found
 }
 
-func (m *Manager) Remove(tag string) error {
-	m.access.Lock()
-	endpoint, found := m.endpointByTag[tag]
-	if !found {
-		m.access.Unlock()
-		return os.ErrInvalid
-	}
-	delete(m.endpointByTag, tag)
-	index := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
-		return it == endpoint
-	})
-	if index == -1 {
-		panic("invalid endpoint index")
-	}
-	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return endpoint.Close()
-	}
-	return nil
-}
-
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
 	// Reject a duplicate BEFORE constructing anything.
 	//
@@ -136,17 +112,6 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	if m.started {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
-			done := adapter.LogElapsed(m.logger, stage, " ", name)
-			err = adapter.LegacyStart(endpoint, stage)
-			done()
-			if err != nil {
-				return E.Cause(err, stage, " ", name)
-			}
-		}
-	}
 	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
 	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
 	if _, loaded := m.endpointByTag[tag]; loaded {

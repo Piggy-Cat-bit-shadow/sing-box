@@ -337,7 +337,7 @@ func TestStartCloseInterfaceUpdatedGroupPointerIsRaceFree(t *testing.T) {
 
 	urlTest := constructed.(*URLTest)
 
-	require.NoError(t, urlTest.Start())
+	require.NoError(t, urlTest.Start(adapter.StartStateStart))
 
 	var waitGroup sync.WaitGroup
 	stop := make(chan struct{})
@@ -369,7 +369,7 @@ func TestStartCloseInterfaceUpdatedGroupPointerIsRaceFree(t *testing.T) {
 
 	// The writer: repeated Start, each of which replaces the pointer.
 	for attempt := 0; attempt < 50; attempt++ {
-		_ = urlTest.Start()
+		_ = urlTest.Start(adapter.StartStateStart)
 	}
 
 	close(stop)
@@ -430,7 +430,7 @@ func TestWrapperCloseWinsAgainstConcurrentStart(t *testing.T) {
 	// Start, parked inside construction.
 	startDone := make(chan error, 1)
 	go func() {
-		startDone <- urlTest.Start()
+		startDone <- urlTest.Start(adapter.StartStateStart)
 	}()
 
 	select {
@@ -503,7 +503,7 @@ func TestWrapperMethodsDoNotPanicAfterClose(t *testing.T) {
 		})
 	require.NoError(t, err)
 	urlTest := constructed.(*URLTest)
-	require.NoError(t, urlTest.Start())
+	require.NoError(t, urlTest.Start(adapter.StartStateStart))
 	require.NoError(t, urlTest.Close())
 
 	require.NotPanics(t, func() {
@@ -535,7 +535,7 @@ func TestWrapperFailedStartLeavesNoGroup(t *testing.T) {
 	require.NoError(t, err)
 	urlTest := constructed.(*URLTest)
 
-	require.Error(t, urlTest.Start(), "an unresolvable member fails the start")
+	require.Error(t, urlTest.Start(adapter.StartStateStart), "an unresolvable member fails the start")
 	require.Nil(t, urlTest.currentGroup(),
 		"a failed Start must leave no group: a partially constructed wrapper would report itself "+
 			"usable while nothing owns the members")
@@ -561,11 +561,11 @@ func TestWrapperRepeatedStartDoesNotLeakPreviousGroup(t *testing.T) {
 	require.NoError(t, err)
 	urlTest := constructed.(*URLTest)
 
-	require.NoError(t, urlTest.Start())
+	require.NoError(t, urlTest.Start(adapter.StartStateStart))
 	first := urlTest.currentGroup()
 	require.NotNil(t, first)
 
-	require.NoError(t, urlTest.Start())
+	require.NoError(t, urlTest.Start(adapter.StartStateStart))
 	second := urlTest.currentGroup()
 	require.NotNil(t, second)
 	require.NotSame(t, first, second, "the second Start installs a new group")

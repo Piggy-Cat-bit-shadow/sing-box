@@ -35,6 +35,9 @@ type queryMultiplexer struct {
 	queryId     uint16
 	queries     map[uint16]*pendingQuery
 
+	// keepIdle is a POOL state, not a one-off action: the serial pool owns the retention
+	// decision so a later query cannot release its connection back into a pool the caller
+	// asked to drain.
 	keepIdle atomic.Bool
 }
 

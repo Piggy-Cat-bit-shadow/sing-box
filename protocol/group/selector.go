@@ -27,6 +27,8 @@ func RegisterSelector(registry *outbound.Registry) {
 var (
 	_ adapter.OutboundGroup = (*Selector)(nil)
 	_ adapter.Referrer      = (*Selector)(nil)
+	_ adapter.OutboundGroup = (*Selector)(nil)
+	_ adapter.Referrer      = (*Selector)(nil)
 )
 
 type Selector struct {
