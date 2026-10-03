@@ -290,3 +290,60 @@ func TestContinuousLateArrivalsDoNotStarveTheTimerPath(t *testing.T) {
 			"regardless of how many unrelated candidates arrive meanwhile",
 		times[1], fallbackDelay)
 }
+
+// TestBurstOfLateCandidatesRespectsTheCadence is §2.3.
+//
+// Three addresses published together with the first blackholed. The remaining two must not be
+// dialled simultaneously just because they arrived late: the cadence applies to them exactly as it
+// would to a plan known at the start.
+//
+// The dials block, so no failure can advance the schedule - the timer is the only mechanism that
+// can start them, which is what makes the spacing assertion meaningful.
+func TestBurstOfLateCandidatesRespectsTheCadence(t *testing.T) {
+	const fallbackDelay = 100 * time.Millisecond
+
+	inner := &blockingDialer{start: time.Now(), launched: make(chan struct{}, 8)}
+	dialer := &resolveDialer{dialer: inner, parallel: true, fallbackDelay: fallbackDelay}
+
+	// An empty initial plan, so every candidate arrives through the late stream.
+	plan := planCandidates(nil, netip.Addr{}, 0)
+
+	late := make(chan dualStackCandidate, 4)
+	addresses := []netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("192.0.2.2"),
+		netip.MustParseAddr("192.0.2.3"),
+	}
+	for _, address := range addresses {
+		late <- dualStackCandidate{address: address, family: classifyAddress(address)}
+	}
+	close(late)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	scheduler := dialer.newScheduler()
+	_, _, _ = scheduler.dialWithLateCandidates(ctx, plan, late,
+		func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
+			return inner.DialContext(attemptCtx, "tcp", M.SocksaddrFrom(address, 443))
+		})
+
+	inner.access.Lock()
+	times := append([]time.Duration(nil), inner.times...)
+	inner.access.Unlock()
+
+	require.GreaterOrEqual(t, len(times), 3,
+		"the burst must be attempted; %d of %d candidates launched in 500ms with a %v cadence",
+		len(times), len(addresses), fallbackDelay)
+
+	// The first candidate starts at once; each subsequent one waits for the cadence.
+	require.Less(t, times[0], fallbackDelay,
+		"the first candidate of a burst starts immediately")
+
+	for index := 1; index < len(times); index++ {
+		gap := times[index] - times[index-1]
+		require.GreaterOrEqual(t, gap, fallbackDelay/2,
+			"candidate %d launched %v after candidate %d; a burst must be staggered by the "+
+				"fallback cadence rather than dialled simultaneously", index, gap, index-1)
+	}
+}
