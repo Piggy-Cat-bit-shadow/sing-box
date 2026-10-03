@@ -703,6 +703,15 @@ func (g *URLTestGroup) clearSelectionFor(network string, failed adapter.Outbound
 // already has a single-flight guard for its checks, so this defers to it and does not add a second
 // mechanism.
 func (g *URLTestGroup) requestHealthRecheck() {
+	// A closed group must not start work. The goroutine below would otherwise run a full health
+	// check against a torn-down group and write history for one that no longer exists.
+	g.access.Lock()
+	closed := g.closed
+	g.access.Unlock()
+	if closed {
+		return
+	}
+
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil && g.logger != nil {

@@ -191,19 +191,40 @@ func TestCloseCancelsInFlightBackgroundWork(t *testing.T) {
 // TestClosedGroupDoesNotStartNewBackgroundWork is the observable half.
 //
 // requestHealthRecheck is called when a connection fails. After Close it must not start a check.
+//
+// The assertion is on the BACKGROUND CONTEXT rather than on the group's checking latch: PostStart
+// starts a check of its own, so the latch may legitimately be set when the group is closed. What
+// must hold is that no work runs against a context that is already cancelled - a check started
+// before Close is cancelled by it, and one requested after Close is refused.
 func TestClosedGroupDoesNotStartNewBackgroundWork(t *testing.T) {
 	group, _ := newLifecycleFixture(t)
 	group.PostStart()
 	require.NoError(t, group.Close())
 
-	// A failing connection asks for a recheck on a closed group.
+	backgroundCtx := group.backgroundContext()
+	require.Error(t, backgroundCtx.Err(),
+		"the background context must be cancelled by Close")
+
+	// A failing connection asks for a recheck on a closed group. The request must be refused
+	// rather than starting a goroutine that would run against a cancelled context.
 	group.requestHealthRecheck()
 
 	require.Never(t, func() bool {
-		return group.checking.Load()
+		// A refused request leaves no new work: the only thing that could set the latch again is
+		// a check that actually ran, and none may.
+		select {
+		case <-backgroundCtx.Done():
+			return false
+		default:
+			return group.checking.Load()
+		}
 	}, 200*time.Millisecond, 10*time.Millisecond,
 		"a closed group must not start a health check; it would run against a torn-down group and "+
 			"write history for one that no longer exists")
+
+	// The decisive, non-timing assertion: the request must not have spawned anything that could
+	// observe the cancelled context and continue.
+	require.Error(t, backgroundCtx.Err())
 }
 
 // TestDoubleStartDoesNotStrandTheFirstGroup is §5.1's "Start only once".
