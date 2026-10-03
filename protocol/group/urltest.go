@@ -274,15 +274,33 @@ type URLTestGroup struct {
 	tolerance   uint16
 	idleTimeout time.Duration
 	history     *urltest.HistoryStorage
-	checking    atomic.Bool
-	// recheckPending collapses a burst of failing connections into ONE recheck worker.
+	// checking serialises health ROUNDS. It is what stops a periodic check and a forced recheck
+	// from measuring the same members at the same time.
+	checking atomic.Bool
+	// recheckAccess guards the two fields below.
 	//
-	// checking alone is not enough: it makes the redundant work inside the health function return
-	// early, but every failure still starts its own goroutine. A burst of failing connections on a
-	// phone would create a burst of short-lived goroutines.
-	recheckPending atomic.Bool
-	// recheckRuns counts how many recheck workers actually started. It exists so a test can assert
-	// the single-flight guarantee as a fact rather than inferring it from timing.
+	// This is not a traffic hot path - it is touched at most once per failing connection - so a
+	// mutex is the right tool. Two independent atomics could each be correct alone while the pair
+	// still lost a request, which is exactly the bug being fixed here.
+	recheckAccess sync.Mutex
+	// recheckQueued records that a forced round is owed.
+	//
+	// # Why a queued flag rather than a pending worker
+	//
+	// The previous design used one flag to mean "a recheck worker exists". A request arriving while
+	// a periodic round was already running found `checking` set, so the worker returned immediately
+	// and cleared the flag - and the forced probe the failure asked for was LOST. The node that had
+	// just failed to carry traffic was then never re-measured at all.
+	//
+	// The flag now means "a forced round is owed", which is independent of whether a round is
+	// running. A request can therefore be coalesced (many failures, one round) without ever being
+	// dropped.
+	recheckQueued bool
+	// recheckWorker records that a worker is draining recheckQueued, so a burst does not start a
+	// goroutine per failure.
+	recheckWorker bool
+	// recheckRuns counts forced rounds actually executed. It exists so a test can assert the
+	// guarantee as a fact rather than inferring it from timing.
 	recheckRuns atomic.Int32
 	// selected holds the TCP and UDP choices as ONE immutable generation.
 	//
@@ -549,12 +567,44 @@ func (g *URLTestGroup) URLTest(ctx context.Context) (map[string]uint16, error) {
 
 func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
 	if g.checking.Swap(true) {
+		// A round is already running, so this one cannot proceed.
+		//
+		// # Why a FORCED round must not simply return here
+		//
+		// Returning silently is correct for a periodic check - the running round measures the same
+		// members against the same target, so the work is genuinely redundant. It is NOT correct
+		// for a forced round: the caller asked because a traffic failure contradicted the current
+		// measurement, and the running round is a periodic one that will SKIP members whose history
+		// is still fresh. Dropping it means the contradiction is never re-examined, which is the
+		// defect this handoff exists to remove.
+		//
+		// The request is therefore queued. The worker that owns this round will run it afterwards.
+		if force {
+			g.queueForcedRecheck()
+		}
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
 	result := URLTestOutboundsWithTarget(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, TestHistoryHealth)
 	g.performUpdateCheck()
 	return result, nil
+}
+
+// queueForcedRecheck records that a forced round is owed and ensures a worker will run it.
+//
+// It is used when a round is already in flight, so the request cannot be served now.
+func (g *URLTestGroup) queueForcedRecheck() {
+	g.recheckAccess.Lock()
+	g.recheckQueued = true
+	startWorker := !g.recheckWorker
+	if startWorker {
+		g.recheckWorker = true
+	}
+	g.recheckAccess.Unlock()
+
+	if startWorker {
+		go g.drainHealthRechecks()
+	}
 }
 
 type urlTestBatch struct {
@@ -816,8 +866,8 @@ func (g *URLTestGroup) clearSelectionFor(network string, failed adapter.Outbound
 // already has a single-flight guard for its checks, so this defers to it and does not add a second
 // mechanism.
 func (g *URLTestGroup) requestHealthRecheck() {
-	// A closed group must not start work. The worker below would otherwise run a full health check
-	// against a torn-down group and write history for one that no longer exists.
+	// A closed group must not start work. A check against a torn-down group would measure nothing
+	// and write history for a group that no longer exists.
 	g.access.Lock()
 	closed := g.closed
 	g.access.Unlock()
@@ -825,33 +875,103 @@ func (g *URLTestGroup) requestHealthRecheck() {
 		return
 	}
 
-	// ONE worker per burst. CompareAndSwap is what makes that a guarantee rather than a hope: a
-	// failing connection arriving while a recheck is already pending is dropped, not queued.
-	if !g.recheckPending.CompareAndSwap(false, true) {
+	g.recheckAccess.Lock()
+	// Record the debt. This is the whole point of the redesign: whether or not a round is running,
+	// the request is remembered, because a forced probe that never happens leaves the node that
+	// just failed to carry traffic eligible for selection on the strength of the measurement the
+	// failure already contradicted.
+	g.recheckQueued = true
+	if g.recheckWorker {
+		// A worker already exists and will observe the flag. Starting another would make a burst of
+		// failing connections a burst of goroutines.
+		g.recheckAccess.Unlock()
 		return
 	}
+	g.recheckWorker = true
+	g.recheckAccess.Unlock()
 
-	go func() {
-		defer g.recheckPending.Store(false)
-		defer func() {
-			if recovered := recover(); recovered != nil && g.logger != nil {
-				g.logger.Error("health recheck panicked: ", recovered)
-			}
-		}()
+	go g.drainHealthRechecks()
+}
+
+// drainHealthRechecks runs forced rounds until no request is owed.
+//
+// # The handoff this exists to guarantee
+//
+// A request arriving while a round is running is QUEUED, not dropped:
+//
+//	request   -> recheckQueued = true
+//	worker    -> runs a forced round
+//	             (a request arriving during it leaves recheckQueued = true)
+//	worker    -> sees recheckQueued still set, runs ONE more forced round
+//	worker    -> clears recheckQueued, and only then gives up the worker slot
+//
+// The order of the last two steps is what makes it race-free. Clearing the flag first would leave
+// a window in which a request is recorded after the worker's final read but before the worker
+// stops - and that request would wait for a worker that has already decided to exit. Clearing it
+// while still holding the worker slot means a request either sets the flag in time for the final
+// read, or finds no worker and starts one.
+//
+// Many failures therefore coalesce into at most one extra round, and none are lost.
+func (g *URLTestGroup) drainHealthRechecks() {
+	defer func() {
+		if recovered := recover(); recovered != nil && g.logger != nil {
+			g.logger.Error("health recheck panicked: ", recovered)
+		}
+	}()
+
+	for {
+		g.recheckAccess.Lock()
+		g.recheckQueued = false
+		g.recheckAccess.Unlock()
 
 		if g.ctx.Err() != nil {
-			return
+			break
 		}
-		g.recheckRuns.Add(1)
 
+		// Run the round DIRECTLY, through the same path a periodic check uses.
+		//
+		// The worker must not call CheckOutbounds here. CheckOutbounds routes through the
+		// re-queuing guard, and this worker is itself the drain of that queue: if the guard were
+		// still held - by the round this worker was queued behind, whose deferred release has not
+		// run yet - the call would re-queue the very request being served, and the loop would
+		// re-trigger itself without bound. Running the round directly removes that coupling.
+		if !g.checking.CompareAndSwap(false, true) {
+			// Another round is still finishing. Wait for it rather than spin, then serve the debt.
+			//
+			// This is a bounded wait on a mutex-guarded handoff, not a traffic path.
+			time.Sleep(time.Millisecond)
+			g.recheckAccess.Lock()
+			g.recheckQueued = true
+			g.recheckAccess.Unlock()
+			continue
+		}
+
+		g.recheckRuns.Add(1)
 		// force = true. A recheck must actually PROBE.
 		//
 		// With force = false the batch skips any member whose measurement is younger than the
 		// interval - which is exactly the state a traffic failure leaves behind. Nothing would be
 		// re-measured, and the selection that follows would re-read the very measurement the
-		// failure just contradicted, so the node that could not carry traffic stayed eligible.
-		g.CheckOutbounds(g.ctx, true)
-	}()
+		// failure just contradicted.
+		URLTestOutboundsWithTarget(g.ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, true, TestHistoryHealth)
+		g.performUpdateCheck()
+		g.checking.Store(false)
+
+		// Decide whether to go round again, still holding the worker slot.
+		g.recheckAccess.Lock()
+		more := g.recheckQueued && g.ctx.Err() == nil
+		if !more {
+			g.recheckWorker = false
+		}
+		g.recheckAccess.Unlock()
+		if !more {
+			return
+		}
+	}
+
+	g.recheckAccess.Lock()
+	g.recheckWorker = false
+	g.recheckAccess.Unlock()
 }
 
 // clearSelected is invalidateSelected without the re-selection, so the cleared generation can be
