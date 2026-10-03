@@ -2,6 +2,7 @@ package urltest
 
 import (
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -123,15 +124,13 @@ func ParseExpectedStatus(value string) (ExpectedStatus, error) {
 		return nil, nil
 	}
 
-	// Mihomo accepts both separators, and a caller may mix them.
-	//
-	// strings.Split rather than FieldsFunc: FieldsFunc DROPS empty elements, so "204," and
-	// "204//200" would silently parse as a valid shorter list. A trailing or doubled separator is
-	// a malformed expression, and accepting it would make two different spellings share a scope.
-	var fields []string
-	for _, group := range strings.Split(trimmed, "/") {
-		fields = append(fields, strings.Split(group, ",")...)
-	}
+	// Both separators are accepted, and a caller may mix them. The comma is normalised to a slash
+	// first, exactly as Mihomo does, so the two spellings cannot diverge.
+	normalised := strings.ReplaceAll(trimmed, ",", "/")
+	fields := strings.Split(normalised, "/")
+
+	// The cap is applied to the RAW field count, before empty tokens are skipped, which is how
+	// Mihomo counts it.
 	if len(fields) > maxExpectedStatusRanges {
 		return nil, E.New("expected status has more than ", maxExpectedStatusRanges, " ranges: ", value)
 	}
@@ -140,7 +139,9 @@ func ParseExpectedStatus(value string) (ExpectedStatus, error) {
 	for _, field := range fields {
 		token := strings.TrimSpace(field)
 		if token == "" {
-			return nil, E.New("invalid expected status: empty element in ", value)
+			// Skipped, not refused: Mihomo accepts "204," and its equivalents, so a configuration
+			// using a trailing separator must keep working.
+			continue
 		}
 
 		startText, endText, isRange := strings.Cut(token, "-")
@@ -164,18 +165,20 @@ func ParseExpectedStatus(value string) (ExpectedStatus, error) {
 	return expected, nil
 }
 
-// parseStatusCode parses one status code, rejecting zero and anything beyond uint16.
+// parseStatusCode parses one status code.
+//
+// Brackets and surrounding whitespace are trimmed, matching Mihomo's own parser, so "[200-299]" is
+// accepted. A bound beyond uint16 is refused rather than truncated: Mihomo converts through uint64,
+// which silently turns 65536 into 0 and would give two different expressions the same scope.
 func parseStatusCode(text string) (uint16, error) {
-	trimmed := strings.TrimSpace(text)
+	trimmed := strings.Trim(strings.TrimSpace(text), "[]")
+	trimmed = strings.TrimSpace(trimmed)
 	if trimmed == "" {
 		return 0, E.New("empty status code")
 	}
 	number, err := strconv.ParseUint(trimmed, 10, 16)
 	if err != nil {
 		return 0, E.Cause(err, "status code ", trimmed)
-	}
-	if number == 0 {
-		return 0, E.New("status code 0 is not valid")
 	}
 	return uint16(number), nil
 }
@@ -201,15 +204,58 @@ func (e ExpectedStatus) Match(status int) bool {
 
 // Canonical renders the set as a stable string suitable for use as a scope key.
 //
-// The rendering is deliberately independent of the caller's spelling: "200,204" and "200/204"
-// describe the same accepted set and must therefore produce the same key, or the same target
-// measured through two syntaxes would be stored twice.
+// # Why this is a semantic canonical form and not a re-spelling
+//
+// The same accepted set can be written many ways: "200/204", "204/200", "200,204", "200-204",
+// "200/201/202-204". The scope key is built from this string, so any two spellings that produce
+// different output would become two scopes for one target - splitting a node's history and letting
+// a group see only part of its own evidence.
+//
+// The ranges are therefore sorted, merged where they overlap or touch, and deduplicated, so the
+// output depends only on the SET of accepted statuses. "200/201/202-204" and "200-204" both render
+// as "200-204"; "204/200" and "200/204" both render as "200/204".
+//
+// Merging is stronger than Mihomo's own String(), which joins the input ranges as written. That is
+// deliberate: Mihomo's output is a display string, while this one is an identity, and an identity
+// has to be canonical or it is not an identity.
 func (e ExpectedStatus) Canonical() string {
 	if len(e) == 0 {
 		return "*"
 	}
+
+	// Copy before sorting: Canonical must not reorder the caller's slice.
+	ranges := make([]StatusRange, len(e))
+	copy(ranges, e)
+
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Start != ranges[j].Start {
+			return ranges[i].Start < ranges[j].Start
+		}
+		return ranges[i].End < ranges[j].End
+	})
+
+	merged := make([]StatusRange, 0, len(ranges))
+	for _, current := range ranges {
+		if len(merged) == 0 {
+			merged = append(merged, current)
+			continue
+		}
+		last := &merged[len(merged)-1]
+		// Merge when the ranges overlap or are adjacent.
+		//
+		// The comparison is widened to uint32 so an End of 65535 does not overflow when the
+		// adjacency check adds one.
+		if uint32(current.Start) <= uint32(last.End)+1 {
+			if current.End > last.End {
+				last.End = current.End
+			}
+			continue
+		}
+		merged = append(merged, current)
+	}
+
 	var builder strings.Builder
-	for index, statusRange := range e {
+	for index, statusRange := range merged {
 		if index > 0 {
 			builder.WriteByte('/')
 		}
