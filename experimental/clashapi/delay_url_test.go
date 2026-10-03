@@ -2,6 +2,7 @@ package clashapi
 
 import (
 	"context"
+	"crypto/x509"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service"
 
 	"github.com/stretchr/testify/require"
 )
@@ -244,4 +246,127 @@ func TestClashDelayAcceptsValidExpected(t *testing.T) {
 				"a valid expected expression must be accepted")
 		})
 	}
+}
+
+// TestClashDelayInheritsTheServerContext is §64(J).
+//
+// Measure reads the Box's certificate roots and NTP clock out of the context it is given. The
+// handler used to start from context.Background(), which discarded both - so an HTTPS probe through
+// a private root failed in Clash while the identical native or group measurement succeeded. Same
+// engine, same node, different answer purely because of which context reached it.
+//
+// The fixture proves the mechanism: the target's certificate is trusted ONLY by the root pool in
+// the server's context, so the measurement succeeds if and only if that context is inherited.
+func TestClashDelayInheritsTheServerContext(t *testing.T) {
+	target := newTLSDelayTargetServer(t)
+	outbound := &recordingOutbound{}
+
+	// The server context carries the trust anchor; the request context does not.
+	server := &Server{
+		ctx:            service.ContextWith[adapter.CertificateStore](context.Background(), target.store),
+		outbound:       stubOutboundManager{},
+		urlTestHistory: urltest.NewHistoryStorage(),
+	}
+
+	request := httptest.NewRequest(http.MethodGet,
+		"/proxies/node/delay?timeout=5000&url="+target.server.URL+"/generate_204", nil)
+	request = request.WithContext(context.WithValue(request.Context(), CtxKeyProxy, outbound))
+
+	recorder := httptest.NewRecorder()
+	getProxyDelay(server)(recorder, request)
+
+	require.Equal(t, http.StatusOK, recorder.Code,
+		"an HTTPS probe must trust the root the Box context carries; starting from Background "+
+			"discards it, so a private-root endpoint fails here while the same measurement succeeds "+
+			"through the native API")
+	require.NotZero(t, target.count.Load())
+}
+
+// TestClashDelayIsCancelledWithTheRequest is §64(K).
+//
+// A client that disconnects must cancel the measurement rather than leaving it to run on.
+func TestClashDelayIsCancelledWithTheRequest(t *testing.T) {
+	target := newHangingDelayTargetServer(t)
+	outbound := &recordingOutbound{}
+
+	server := &Server{
+		ctx:            context.Background(),
+		outbound:       stubOutboundManager{},
+		urlTestHistory: urltest.NewHistoryStorage(),
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodGet,
+		"/proxies/node/delay?timeout=30000&url="+target.server.URL+"/generate_204", nil)
+	request = request.WithContext(context.WithValue(requestCtx, CtxKeyProxy, outbound))
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		getProxyDelay(server)(recorder, request)
+	}()
+
+	// Withdraw the request while the target is holding the connection open.
+	time.Sleep(100 * time.Millisecond)
+	cancelRequest()
+
+	select {
+	case <-done:
+		// The handler returned, which means the measurement observed the cancellation.
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not return after the request context was cancelled; the " +
+			"measurement is running on a context that does not observe the client")
+	}
+}
+
+// tlsDelayTarget is an HTTPS target whose certificate is trusted only by its own pool.
+type tlsDelayTarget struct {
+	server *httptest.Server
+	store  adapter.CertificateStore
+	count  atomic.Int32
+}
+
+// certificateStore carries one trust anchor.
+type certificateStore struct {
+	pool *x509.CertPool
+}
+
+func (s *certificateStore) Name() string                         { return "test-certificate-store" }
+func (s *certificateStore) Start(stage adapter.StartStage) error { return nil }
+func (s *certificateStore) Close() error                         { return nil }
+func (s *certificateStore) Pool() *x509.CertPool                 { return s.pool }
+func (s *certificateStore) ExclusiveAnchors() bool               { return true }
+
+// newTLSDelayTargetServer starts an HTTPS server whose certificate is trusted ONLY by the store it
+// returns, so a measurement succeeds if and only if that store reaches Measure's context.
+func newTLSDelayTargetServer(t *testing.T) *tlsDelayTarget {
+	t.Helper()
+	target := &tlsDelayTarget{store: &certificateStore{pool: x509.NewCertPool()}}
+	target.server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		target.count.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(target.server.Close)
+
+	// Trust exactly this server's certificate, and nothing else.
+	certificate := target.server.Certificate()
+	require.NotNil(t, certificate)
+	target.store.(*certificateStore).pool.AddCert(certificate)
+	return target
+}
+
+// hangingDelayTarget is an HTTP server that accepts and never answers.
+type hangingDelayTarget struct {
+	server *httptest.Server
+}
+
+func newHangingDelayTargetServer(t *testing.T) *hangingDelayTarget {
+	t.Helper()
+	target := &hangingDelayTarget{}
+	target.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	t.Cleanup(target.server.Close)
+	return target
 }
