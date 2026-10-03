@@ -103,6 +103,9 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 			}
 			return cacheFile
 		},
+		// The SAME generation the reverse mapping uses. One network reset advances one counter, so
+		// the two caches cannot disagree about which epoch an answer belongs to.
+		NetworkGeneration: router.dnsGeneration,
 		DNSCache: func() adapter.DNSCacheStore {
 			cacheFile := service.FromContext[adapter.CacheFile](ctx)
 			if cacheFile == nil {
@@ -1067,6 +1070,8 @@ type dnsExchangeContext struct {
 	rules         []adapter.DNSRule
 	legacyDNSMode bool
 	metadata      *adapter.InboundContext
+	// generation is the network generation this request was issued on.
+	generation uint64
 }
 
 func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsExchangeContext, *mDNS.Msg, error) {
@@ -1134,6 +1139,13 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 		rules:         rules,
 		legacyDNSMode: legacyDNSMode,
 		metadata:      metadata,
+		// The generation is captured HERE, when the request is issued.
+		//
+		// Reading it when the response arrives is not a guard at all: a request in flight across a
+		// network change would capture the post-change value, compare it against itself, match, and
+		// write into the cache the change had just purged. The comparison has to be against the
+		// network the question was asked on.
+		generation: r.dnsGeneration(),
 	}, nil, nil
 }
 
@@ -1166,10 +1178,6 @@ type reverseMappingAnswer struct {
 	address  netip.Addr
 	domain   string
 	lifetime time.Duration
-}
-
-func (r *Router) recordReverseMapping(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
-	r.recordReverseMappingFrom(message, response, transport, r.dnsGeneration())
 }
 
 // recordReverseMappingFrom records a mapping only if the response belongs to the given network
@@ -1272,7 +1280,7 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 	if err != nil {
 		return nil, err
 	}
-	r.recordReverseMapping(message, response, transport)
+	r.recordReverseMappingFrom(message, response, transport, exchangeCtx.generation)
 	return response, nil
 }
 
@@ -1286,26 +1294,26 @@ func (r *Router) ExchangeAsync(ctx context.Context, message *mDNS.Msg, options a
 	if options.Transport != nil {
 		transport := options.Transport
 		r.client.ExchangeAsync(ctx, transport, message, r.finalizeExchangeOptions(options), nil, func(response *mDNS.Msg, exchangeErr error) {
-			r.finishExchangeAsync(message, transport, response, exchangeErr, callback)
+			r.finishExchangeAsync(message, transport, response, exchangeErr, exchangeCtx.generation, callback)
 		})
 	} else if !exchangeCtx.legacyDNSMode {
 		r.exchangeWithRulesAsync(ctx, exchangeCtx.rules, message, options, true, func(result exchangeWithRulesResult) {
-			r.finishExchangeAsync(message, result.transport, result.response, result.err, callback)
+			r.finishExchangeAsync(message, result.transport, result.response, result.err, exchangeCtx.generation, callback)
 		})
 	} else {
 		go func() {
 			response, transport, exchangeErr := r.exchangeLegacy(ctx, exchangeCtx, message, options)
-			r.finishExchangeAsync(message, transport, response, exchangeErr, callback)
+			r.finishExchangeAsync(message, transport, response, exchangeErr, exchangeCtx.generation, callback)
 		}()
 	}
 }
 
-func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTransport, response *mDNS.Msg, err error, callback func(response *mDNS.Msg, err error)) {
+func (r *Router) finishExchangeAsync(message *mDNS.Msg, transport adapter.DNSTransport, response *mDNS.Msg, err error, generation uint64, callback func(response *mDNS.Msg, err error)) {
 	if err != nil {
 		callback(nil, err)
 		return
 	}
-	r.recordReverseMapping(message, response, transport)
+	r.recordReverseMappingFrom(message, response, transport, generation)
 	callback(response, nil)
 }
 
@@ -1453,9 +1461,23 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
 }
 
 func (r *Router) ResetNetwork() {
+	// The generation advances FIRST, making this a barrier from its very first instruction.
+	//
+	// It used to advance last, after the transports were reset and the reverse mapping purged. That
+	// left the window this ordering exists to close: a request issued before the reset still carried
+	// the pre-reset generation, still compared equal to the still-current pre-reset value, and was
+	// therefore accepted - refilling the cache the purge had just cleared with a name learned on the
+	// network being left.
+	//
+	// Advancing first means every capture taken before the reset is stale the moment it begins, and
+	// the purge below then removes whatever those captures had already written. The two steps are one
+	// barrier rather than two independent operations.
+	r.networkGeneration.Add(1)
+
 	for _, transport := range r.transport.Transports() {
 		transport.Reset()
 	}
+
 	// The reverse mapping is a cache of what previous answers said an address meant, and a network
 	// change is exactly when that may no longer hold: with split-horizon or captive-portal DNS the
 	// same address can mean a different name on the new network. Leaving entries behind lets a
@@ -1467,11 +1489,6 @@ func (r *Router) ResetNetwork() {
 	if r.dnsReverseMapping != nil {
 		r.dnsReverseMapping.Purge()
 	}
-	// The purge removes what is already recorded; advancing the generation stops a response that
-	// was issued before the change from re-adding it. Without this, a request in flight across the
-	// change would refill the cache it was just cleared of, and the new network would inherit a
-	// name learned on the old one.
-	r.networkGeneration.Add(1)
 }
 
 func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
