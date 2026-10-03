@@ -159,14 +159,32 @@ func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey)
 	}
 
 	environment := c.environmentHash(transport)
-	if key.environment == 0 {
-		// The query was sent before the environment was known, so the response cannot be
-		// attributed to any network. Storing it under whatever is current now would present an
-		// answer from one network as an answer about another.
-		return key, false
-	}
 	if environment != key.environment {
-		// The network changed while the query was in flight.
+		// The environment the query was issued under is not the one that holds now.
+		//
+		// # The two shapes this covers
+		//
+		//	key == 0, environment != 0   the environment became KNOWN after the query was sent
+		//	key != 0, environment != key the network changed while the query was in flight
+		//
+		// Both are the same mistake: storing the answer would attribute it to an environment it was
+		// not measured on. The first is the relabelling defect - a zero captured value overwritten
+		// with whatever number is current - and it is why this comparison is on the VALUE rather
+		// than on `key == 0`.
+		//
+		// # Why a zero fingerprint is not automatically "unknown"
+		//
+		// A transport that participates in environments, advertises none, and runs on a platform
+		// reporting NetworkEnvironment() == 0 has 0 as its real and permanent identity. Refusing it
+		// disabled caching for the whole process lifetime - every query went upstream - which is a
+		// silent behaviour change rather than a safety property. When the captured value and the
+		// current value are both zero they ARE the same environment, so the answer is correctly
+		// attributed and belongs in the cache.
+		//
+		// Residual hole, stated rather than implied: an environment that goes 0 -> B -> 0 would let
+		// a response issued at the first 0 be stored at the second. NetworkEnvironment does not
+		// return to "unknown" once it has reported a value within a process lifetime, so this needs
+		// a generation counter to close properly; the environment fingerprint is not one.
 		return key, false
 	}
 	return key, true
