@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/service"
@@ -25,7 +26,7 @@ import (
 
 // TestURLTestServicesBothAbsent is §23.
 func TestURLTestServicesBothAbsent(t *testing.T) {
-	ctx := ensureURLTestServices(context.Background())
+	ctx, _ := ensureURLTestServices(context.Background())
 
 	history := service.PtrFromContext[urltest.HistoryStorage](ctx)
 	require.NotNil(t, history, "a Box must supply a history storage when the caller has none")
@@ -43,7 +44,7 @@ func TestURLTestServicesHistoryOnly(t *testing.T) {
 	provided := urltest.NewHistoryStorage()
 	ctx := service.ContextWithPtr(context.Background(), provided)
 
-	ctx = ensureURLTestServices(ctx)
+	ctx, _ = ensureURLTestServices(ctx)
 
 	require.Same(t, provided, service.PtrFromContext[urltest.HistoryStorage](ctx),
 		"a caller's history storage must be kept, not replaced")
@@ -63,7 +64,7 @@ func TestURLTestServicesCoordinatorOnly(t *testing.T) {
 	provided := urltest.NewCoordinator(customLimit)
 	ctx := urltest.ContextWithCoordinator(context.Background(), provided)
 
-	ctx = ensureURLTestServices(ctx)
+	ctx, _ = ensureURLTestServices(ctx)
 
 	require.Same(t, provided, urltest.CoordinatorFromContext(ctx),
 		"a caller's coordinator must be kept, not replaced by the default")
@@ -82,7 +83,7 @@ func TestURLTestServicesBothPresent(t *testing.T) {
 	ctx := service.ContextWithPtr(context.Background(), providedHistory)
 	ctx = urltest.ContextWithCoordinator(ctx, providedCoordinator)
 
-	ctx = ensureURLTestServices(ctx)
+	ctx, _ = ensureURLTestServices(ctx)
 
 	require.Same(t, providedHistory, service.PtrFromContext[urltest.HistoryStorage](ctx))
 	require.Same(t, providedCoordinator, urltest.CoordinatorFromContext(ctx))
@@ -94,8 +95,8 @@ func TestURLTestServicesBothPresent(t *testing.T) {
 // Two Box contexts must not share a limiter, which is what makes a configuration-check Box unable
 // to starve the running one.
 func TestURLTestServicesAreIndependentAcrossBoxes(t *testing.T) {
-	ctxA := ensureURLTestServices(context.Background())
-	ctxB := ensureURLTestServices(context.Background())
+	ctxA, _ := ensureURLTestServices(context.Background())
+	ctxB, _ := ensureURLTestServices(context.Background())
 
 	coordinatorA := urltest.CoordinatorFromContext(ctxA)
 	coordinatorB := urltest.CoordinatorFromContext(ctxB)
@@ -122,4 +123,67 @@ func TestURLTestServicesAreIndependentAcrossBoxes(t *testing.T) {
 		"Box B must not be blocked by Box A exhausting its budget; a shared limiter would let a "+
 			"temporary configuration-check Box stall the running one")
 	releaseB()
+}
+
+// Tests for the ownership of the URL-test history storage.
+//
+// # Why ownership has to be explicit
+//
+// Putting a storage on the context does not make it part of the Box lifecycle. When the Box creates
+// one, only the Box knows and only the Box can close it; the daemon closes the instance it creates.
+// A standalone Box that created one and never closed it left the storage live after Close - closed
+// flag unset, maps retained, late writers still accepted - so a measurement finishing after
+// teardown could write into a Box that no longer existed.
+//
+// The rule is one-directional and easy to get wrong in the other direction too: closing a storage
+// the caller owns would break the daemon, which closes its own after the Box is gone.
+
+// TestBoxOwnedHistoryStorageIsReported tests the creation half.
+func TestBoxOwnedHistoryStorageIsReported(t *testing.T) {
+	ctx, owned := ensureURLTestServices(context.Background())
+
+	require.NotNil(t, owned,
+		"a storage the helper creates must be reported, or nothing can ever close it")
+	require.Same(t, owned, service.PtrFromContext[urltest.HistoryStorage](ctx),
+		"and it is the one installed on the context")
+
+	// A second call must not create a second storage, and must not claim ownership of the existing
+	// one.
+	secondCtx, secondOwned := ensureURLTestServices(ctx)
+	require.Nil(t, secondOwned,
+		"the storage already exists, so this call created nothing and owns nothing")
+	require.Same(t, owned, service.PtrFromContext[urltest.HistoryStorage](secondCtx))
+}
+
+// TestCallerHistoryStorageIsNotOwned tests the other half.
+func TestCallerHistoryStorageIsNotOwned(t *testing.T) {
+	provided := urltest.NewHistoryStorage()
+	ctx := service.ContextWithPtr(context.Background(), provided)
+
+	_, owned := ensureURLTestServices(ctx)
+
+	require.Nil(t, owned,
+		"a caller-supplied storage must not be reported as owned. Closing it would break a caller "+
+			"that keeps using it - the daemon closes its own instance after the Box is gone")
+}
+
+// TestOwnedHistoryStorageCloseIsTerminal states the contract the Box relies on.
+func TestOwnedHistoryStorageCloseIsTerminal(t *testing.T) {
+	_, owned := ensureURLTestServices(context.Background())
+	require.NotNil(t, owned)
+
+	scope, err := urltest.NewMeasurementScope("https://example.com/probe", nil)
+	require.NoError(t, err)
+
+	owned.StoreDisplayHistory("node-a", scope, &adapter.URLTestHistory{Delay: 10})
+	require.NoError(t, owned.Close())
+
+	require.Nil(t, owned.LoadURLTestHistory("node-a"),
+		"a closed storage holds nothing")
+
+	// A late writer must be refused, which is the property the Box depends on: a measurement that
+	// finishes after teardown must not repopulate a storage for a Box that no longer exists.
+	owned.StoreDisplayHistory("node-a", scope, &adapter.URLTestHistory{Delay: 99})
+	require.Nil(t, owned.LoadURLTestHistory("node-a"),
+		"a late write after Close must be discarded")
 }

@@ -44,7 +44,10 @@ import (
 var _ adapter.SimpleLifecycle = (*Box)(nil)
 
 type Box struct {
-	ctx                 context.Context
+	ctx context.Context
+	// ownedURLTestHistory is the storage this Box created, and therefore must close. It is nil when
+	// the caller supplied one, so a Box never closes state it does not own.
+	ownedURLTestHistory *urltest.HistoryStorage
 	createdAt           time.Time
 	debugOptions        option.DebugOptions
 	debugHTTPServer     *http.Server
@@ -127,14 +130,28 @@ func Context(
 //
 // Each service is now supplied only if absent, and neither is ever overwritten. A caller that has
 // already chosen a limit keeps it; one that has not gets the Box default.
-func ensureURLTestServices(ctx context.Context) context.Context {
+// It returns the storage it CREATED, or nil when the caller already supplied one.
+//
+// # Why ownership has to be reported
+//
+// Putting a storage on the context does not make it part of the Box lifecycle. When the Box created
+// it, only the Box knows it exists and only the Box can close it - and the daemon does exactly that
+// for the instance it creates. A standalone Box that created one and never closed it left the
+// storage live after Close: the closed flag stayed false, the maps were retained, and a late writer
+// was still accepted.
+//
+// The caller's storage is deliberately not reported, so a Box never closes something it does not
+// own.
+func ensureURLTestServices(ctx context.Context) (context.Context, *urltest.HistoryStorage) {
+	var ownedHistory *urltest.HistoryStorage
 	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
-		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
+		ownedHistory = urltest.NewHistoryStorage()
+		ctx = service.ContextWithPtr(ctx, ownedHistory)
 	}
 	if urltest.CoordinatorFromContext(ctx) == nil {
 		ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(C.URLTestConcurrencyLimit))
 	}
-	return ctx
+	return ctx, ownedHistory
 }
 
 func New(options Options) (*Box, error) {
@@ -193,7 +210,7 @@ func New(options Options) (*Box, error) {
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
-	ctx = ensureURLTestServices(ctx)
+	ctx, ownedURLTestHistory := ensureURLTestServices(ctx)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	var defaultLogWriter io.Writer
 	if platformInterface != nil {
@@ -524,6 +541,7 @@ func New(options Options) (*Box, error) {
 	}
 	return &Box{
 		ctx:                 ctx,
+		ownedURLTestHistory: ownedURLTestHistory,
 		network:             networkManager,
 		endpoint:            endpointManager,
 		inbound:             inboundManager,
@@ -708,6 +726,21 @@ func (s *Box) Close() error {
 			return E.Cause(err, "close ", lifecycleService.Name())
 		})
 		done()
+	}
+	// Close the URL-test storage THIS Box created, and only that one.
+	//
+	// Putting it on the context does not make it part of the lifecycle: without this a standalone
+	// Box left the storage live after Close, with its closed flag unset, its maps retained and late
+	// writers still accepted - so a measurement that finished after teardown could write into a
+	// Box that no longer existed. A storage the CALLER supplied is not touched, because the Box
+	// does not own it and the daemon closes its own.
+	if s.ownedURLTestHistory != nil {
+		done := adapter.LogElapsed(s.logger, "close url-test history")
+		err = E.Append(err, s.ownedURLTestHistory.Close(), func(err error) error {
+			return E.Cause(err, "close url-test history")
+		})
+		done()
+		s.ownedURLTestHistory = nil
 	}
 	done := adapter.LogElapsed(s.logger, "close logger")
 	err = E.Append(err, s.logFactory.Close(), func(err error) error {
