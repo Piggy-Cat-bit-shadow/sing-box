@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -215,10 +214,16 @@ func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapte
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
+		// The requested URL is used as given.
+		//
+		// This used to blank out any `http://` URL, which then fell through to the default
+		// `https://www.gstatic.com/generate_204`. A client explicitly asking to measure against
+		// a plain-HTTP endpoint therefore measured a TLS endpoint instead - a different
+		// destination, an extra TLS handshake, and a number that cannot be compared with another
+		// client's measurement of the same URL.
+		//
+		// An empty URL still means "use the default"; an explicit scheme is honoured.
 		url := query.Get("url")
-		if strings.HasPrefix(url, "http://") {
-			url = ""
-		}
 		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 16)
 		if err != nil {
 			render.Status(r, http.StatusBadRequest)

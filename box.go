@@ -194,6 +194,10 @@ func New(options Options) (*Box, error) {
 	}
 	service.MustRegister[log.Factory](ctx, logFactory)
 
+	// Let URLTest report the two phases of a measurement. This is diagnostics only and runs
+	// once per measurement, never on a packet path.
+	urltest.SetDebugLogger(logFactory.NewLogger("urltest"), logFactory.Level() <= log.LevelDebug)
+
 	var internalServices []adapter.LifecycleService
 	routeOptions := common.PtrValueOrDefault(options.Route)
 	certificateOptions := common.PtrValueOrDefault(options.Certificate)
