@@ -454,13 +454,20 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 		if result.err == nil {
 			return result.conn, nil
 		}
-		// The original failed. Fall back to recovery only if it has already produced
-		// something; waiting for a slow lookup here would reintroduce the blocking this
-		// function exists to remove, and the original error is a perfectly good answer.
+		// The original failed. Recovery still gets its chance.
+		//
+		// This used to read the recovery channel NON-BLOCKINGLY and, finding it empty, return the
+		// original's error immediately. A lookup that had not finished yet was therefore treated
+		// as "recovery found nothing", and a healthy recovered candidate was never tried - which
+		// discards the entire purpose of recovery, because a fast failure is exactly when a
+		// fallback is most useful.
+		//
+		// The wait is bounded by the caller's context and by the recovery lookup's own
+		// cancellation, so this cannot hang: recoverCandidates honours both.
 		select {
 		case addresses := <-recovered:
 			return d.dialRecoveredOrReport(ctx, network, destination, addresses, result.err)
-		default:
+		case <-ctx.Done():
 			return nil, result.err
 		}
 
@@ -524,7 +531,17 @@ func (d *resolveDialer) dialRecoveredOrReport(ctx context.Context, network strin
 }
 
 func (d *resolveDialer) raceCandidates(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, strategy C.DomainStrategy) (net.Conn, error) {
-	plan := planCandidates(addresses, destination.Addr, strategy)
+	return d.raceCandidatesExcluding(ctx, network, destination, addresses, destination.Addr, strategy)
+}
+
+// raceCandidatesExcluding races candidates without treating the given address as the original.
+//
+// planCandidates normally puts the original first, which is right when this is the only attempt.
+// When the original is already running as its own owned attempt, passing it here would dial it a
+// second time; passing an invalid address excludes it while keeping the planner's ordering for
+// everything else.
+func (d *resolveDialer) raceCandidatesExcluding(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, original netip.Addr, strategy C.DomainStrategy) (net.Conn, error) {
+	plan := planCandidates(addresses, original, strategy)
 	if len(plan.candidates) == 0 {
 		return nil, E.New("no dial candidates for ", destination)
 	}
@@ -721,14 +738,21 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 	var workers sync.WaitGroup
 
 	// --- attempt 1: the recovered candidates ---
+	//
+	// The original is deliberately NOT merged into this list. It is already running as its own
+	// attempt, owned by the caller, so including it here dialled the same address twice: once as
+	// the caller's attempt and once as this plan's first candidate. That wasted an attempt and,
+	// because the plan is staggered, pushed the healthy recovered family behind a duplicate of the
+	// address that was already failing - roughly doubling how long recovery took.
+	//
+	// planCandidates still puts the original first when one is supplied, and the literal path
+	// relies on that order for the single-attempt case; this race is the one place where the
+	// original must be excluded, because here it has its own owner.
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
 		strategy := d.queryOptions.Strategy
-		candidates := MergeOriginalDestination(destination.Addr, addresses, strategy)
-		// raceCtx, not ctx: this attempt must stop the moment the race is decided. Using the
-		// connection's context was the leak - it outlives the race by minutes.
-		conn, err := d.raceCandidates(raceCtx, network, destination, candidates, strategy)
+		conn, err := d.raceCandidatesExcluding(raceCtx, network, destination, addresses, netip.Addr{}, strategy)
 		recoveredResult <- literalDialResult{conn: conn, err: err}
 	}()
 
