@@ -576,6 +576,23 @@ func (c *Client) collectFamiliesComplete(
 		}
 		return nil, nil, E.New("no address for ", dnsName)
 	}
+
+	// At least one family answered. Before returning it, honour the caller's own lifecycle.
+	//
+	// Lookup's contract is the COMPLETE set - that is why it waits for both families rather than
+	// taking the fastest answer. If the caller cancelled or its deadline expired while the other
+	// family was still outstanding, returning the partial result with a nil error reports a
+	// completed operation that the caller had already withdrawn. The caller is then entitled to
+	// treat the partial set as the whole answer.
+	//
+	// This is deliberately narrower than "any family error fails the lookup". An upstream family
+	// failure with a live context is NOT a cancellation: one family answering while the other
+	// SERVFAILs is an ordinary partial result, and it stays usable. Only the caller withdrawing
+	// the operation changes the outcome here.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, nil, ctxErr
+	}
+
 	return response4, response6, nil
 }
 

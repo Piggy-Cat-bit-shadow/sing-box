@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 
 	mDNS "github.com/miekg/dns"
@@ -39,6 +40,11 @@ type familySchedulingTransport struct {
 	// failure and must not be treated as one.
 	noDataA    bool
 	noDataAAAA bool
+
+	// servfailA / servfailAAAA answer SERVFAIL, which is an upstream failure of ONE family
+	// rather than a failure of the whole lookup.
+	servfailA    bool
+	servfailAAAA bool
 
 	// observed records the QTYPE of every question the transport was asked, so a test can prove
 	// that a forbidden family was never EMITTED rather than merely filtered out of the result.
@@ -71,10 +77,12 @@ func (t *familySchedulingTransport) Exchange(ctx context.Context, message *mDNS.
 	delay := t.delayA
 	address := t.addressA
 	noData := t.noDataA
+	servfail := t.servfailA
 	if qType == mDNS.TypeAAAA {
 		delay = t.delayAAAA
 		address = t.addressAAAA
 		noData = t.noDataAAAA
+		servfail = t.servfailAAAA
 	}
 
 	if delay < 0 {
@@ -91,6 +99,11 @@ func (t *familySchedulingTransport) Exchange(ctx context.Context, message *mDNS.
 
 	response := new(mDNS.Msg)
 	response.SetReply(message)
+	if servfail {
+		response.Rcode = mDNS.RcodeServerFailure
+		response.Id = message.Id
+		return response, nil
+	}
 	if !noData && address != "" {
 		record := &mDNS.A{Hdr: mDNS.RR_Header{
 			Name:   message.Question[0].Name,
@@ -267,4 +280,103 @@ func TestLookupCancellationUnwindsBothFamilies(t *testing.T) {
 	}
 	t.Fatalf("goroutines before=%d after=%d; a family query outlived Lookup",
 		before, runtime.NumGoroutine())
+}
+
+// TestLookupHonoursCallerCancellationOverPartialSuccess is §45.
+//
+// A succeeds while AAAA is still blocked, and the caller then cancels. Lookup must report the
+// cancellation rather than returning the partial answer with a nil error: the caller asked for the
+// COMPLETE set, said so by using Lookup rather than the streaming path, and then withdrew the
+// request. Returning [A], nil tells it the operation completed normally.
+//
+// This is distinct from an upstream family failure, where the caller's context is still live and a
+// usable partial family is the correct answer - that case is covered separately below.
+func TestLookupHonoursCallerCancellationOverPartialSuccess(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		fastIsAAAA  bool
+		blockedType uint16
+	}{
+		{"A succeeds, AAAA blocked", false, mDNS.TypeAAAA},
+		{"AAAA succeeds, A blocked", true, mDNS.TypeA},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			transport := &familySchedulingTransport{
+				addressA:    "192.0.2.1",
+				addressAAAA: "2001:db8::1",
+			}
+			if testCase.fastIsAAAA {
+				// A blocks forever; AAAA answers at once.
+				transport.delayA = -1
+			} else {
+				transport.delayAAAA = -1
+			}
+
+			client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+			client.Start()
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			// Cancel once the fast family has had time to answer, so the lookup is genuinely
+			// waiting on the blocked one when the caller withdraws.
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				cancel()
+			}()
+
+			_, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{
+				Strategy: C.DomainStrategyPreferIPv4,
+			}, func(response *mDNS.Msg) bool { return response.Rcode == mDNS.RcodeSuccess })
+
+			require.Error(t, err,
+				"the caller cancelled while the lookup was still waiting; returning a partial "+
+					"answer with a nil error reports a completed operation")
+			require.ErrorIs(t, err, context.Canceled,
+				"the cancellation must be reported as such, got %v", err)
+		})
+	}
+}
+
+// TestLookupKeepsUsableFamilyWhenOtherFamilyFailsUpstream is §46.
+//
+// One family answers and the other returns SERVFAIL, with the caller's context still live. That is
+// an ordinary partial result: the caller did not withdraw anything, and the usable family must
+// still be returned. This is the compatibility boundary of the cancellation fix - the fix must
+// react to the CALLER's lifecycle, not to any family-level error.
+func TestLookupKeepsUsableFamilyWhenOtherFamilyFailsUpstream(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		failingV6 bool
+	}{
+		{"A succeeds, AAAA SERVFAIL", true},
+		{"AAAA succeeds, A SERVFAIL", false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			transport := &familySchedulingTransport{
+				addressA:    "192.0.2.1",
+				addressAAAA: "2001:db8::1",
+			}
+			if testCase.failingV6 {
+				transport.servfailAAAA = true
+			} else {
+				transport.servfailA = true
+			}
+
+			client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+			client.Start()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			addresses, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{
+				Strategy: C.DomainStrategyPreferIPv4,
+			}, func(response *mDNS.Msg) bool { return response.Rcode == mDNS.RcodeSuccess })
+
+			require.NoError(t, err,
+				"a SERVFAIL in one family with a live caller context is a partial result, not a "+
+					"failed lookup")
+			require.NotEmpty(t, addresses,
+				"the family that answered must still be returned")
+		})
+	}
 }
