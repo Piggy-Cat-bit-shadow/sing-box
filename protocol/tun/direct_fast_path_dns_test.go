@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"strings"
+
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	tun "github.com/sagernet/sing-tun"
@@ -285,6 +287,235 @@ func TestDNSQueryDoesNotEnterTheUserspacePath(t *testing.T) {
 
 // Protocol numbers, named so the tests read as protocols rather than magic bytes.
 const (
-	headerTCP = 6
-	headerUDP = 17
+	headerTCP  = 6
+	headerUDP  = 17
+	headerICMP = 1
 )
+
+// --- DNS-by-port precedence over the route address sets -------------------------------
+//
+// # The bug these pin
+//
+// JudgeFlow checked the route address sets BEFORE dnsHijackByPort. A destination that the
+// exclude set covered, or that the include set did not, therefore returned ActionBypass and the
+// function never reached the DNS-by-port check at all. A query to 8.8.8.8:53 left sing-box
+// entirely instead of reaching the DNS router, so DNS rules, ad filtering and Fake-IP policy
+// were bypassed for the most ordinary DNS destination there is.
+//
+// These tests build REAL *netipx.IPSet values and drive the real JudgeFlow, because the defect
+// is in the ordering inside that function. A fake that returned "bypass" for a test flag would
+// reproduce nothing.
+
+// ipSetFrom builds a real IPSet from addresses or CIDR prefixes.
+//
+// The caller supplies whichever form reads more naturally for the set being modelled - a single
+// DNS server address, or the private range an include list would carry.
+func ipSetFrom(t *testing.T, entries ...string) *netipx.IPSet {
+	t.Helper()
+	var builder netipx.IPSetBuilder
+	for _, entry := range entries {
+		if strings.Contains(entry, "/") {
+			builder.AddPrefix(netip.MustParsePrefix(entry))
+			continue
+		}
+		builder.Add(netip.MustParseAddr(entry))
+	}
+	ipSet, err := builder.IPSet()
+	require.NoError(t, err)
+	return ipSet
+}
+
+// hijackByPortInbound builds a TUN inbound with only the by-port hijack enabled, so the address
+// check cannot mask the ordering under test.
+func hijackByPortInbound(t *testing.T) (*Inbound, *bypassPreferringRouter) {
+	t.Helper()
+	router := newBypassPreferringRouter()
+	inbound := &Inbound{
+		tag:             "tun-in",
+		ctx:             context.Background(),
+		router:          router,
+		logger:          log.NewNOPFactory().Logger(),
+		dnsHijackByPort: true,
+	}
+	return inbound, router
+}
+
+func TestDNSHijackByPortBeatsRouteExclude(t *testing.T) {
+	// The exclusion case: 8.8.8.8 is in the exclude set, so ordinary traffic bypasses.
+	inbound, router := hijackByPortInbound(t)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "8.8.8.8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionHijackDNS, verdict.Action,
+		"UDP/53 in the route-exclude set must still be hijacked; the exclude bypass ran first "+
+			"and the query never reached the DNS router")
+	require.EqualValues(t, 0, router.preMatchCalls.Load(),
+		"the router must not see the query")
+}
+
+func TestDNSHijackByPortTCPBeatsRouteExclude(t *testing.T) {
+	// TCP/53 must be accepted for the stream DNS path - NOT bypassed, and NOT hijacked here.
+	inbound, router := hijackByPortInbound(t)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "8.8.8.8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionAccept, verdict.Action,
+		"TCP/53 must be accepted so the existing stream DNS hijack can take over")
+	require.NotEqual(t, tun.ActionBypass, verdict.Action,
+		"TCP/53 must not be bypassed")
+	require.NotEqual(t, tun.ActionHijackDNS, verdict.Action,
+		"TCP/53 keeps its existing ActionAccept semantics; changing it would alter the stream "+
+			"DNS architecture")
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+}
+
+func TestDNSHijackByPortBeatsRouteAddressSetMiss(t *testing.T) {
+	// The include case: the set is non-empty and does not contain 8.8.8.8, so ordinary traffic
+	// bypasses.
+	inbound, router := hijackByPortInbound(t)
+	inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "10.0.0.0/8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionHijackDNS, verdict.Action,
+		"UDP/53 outside the route include set must still be hijacked")
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+}
+
+func TestDNSHijackByPortTCPBeatsRouteAddressSetMiss(t *testing.T) {
+	inbound, router := hijackByPortInbound(t)
+	inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "10.0.0.0/8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionAccept, verdict.Action)
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+}
+
+// TestDNSHijackAddressBeatsRouteAddressSetMiss covers the address check against the include set.
+func TestDNSHijackAddressBeatsRouteAddressSetMiss(t *testing.T) {
+	dnsAddress := netip.MustParseAddr("10.0.0.53")
+	inbound, _ := hijackTestInbound(t, []netip.Addr{dnsAddress}, false)
+	inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "192.168.0.0/16")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.AddrPortFrom(dnsAddress, 53),
+		nil,
+	)
+	require.Equal(t, tun.ActionHijackDNS, verdict.Action,
+		"the configured DNS address must be hijacked even when it falls outside the route "+
+			"include set")
+
+	// TCP keeps its existing semantics on the address path too.
+	verdict = inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.AddrPortFrom(dnsAddress, 53),
+		nil,
+	)
+	require.Equal(t, tun.ActionAccept, verdict.Action)
+}
+
+// --- the non-DNS bypasses must keep working (§21, §22, §29, §30) -----------------------
+
+func TestNonDNSRouteExcludeStillBypasses(t *testing.T) {
+	// The fastest native path must not be collateral damage of moving the DNS check earlier.
+	inbound, _ := hijackByPortInbound(t)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "8.8.8.8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:443"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action,
+		"a non-DNS destination in the exclude set must still bypass natively")
+}
+
+func TestNonDNSRouteAddressSetMissStillBypasses(t *testing.T) {
+	inbound, _ := hijackByPortInbound(t)
+	inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "10.0.0.0/8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("1.2.3.4:443"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action,
+		"a non-DNS destination outside the include set must still bypass")
+}
+
+func TestDNSHijackByPortDisabledDoesNotHijack(t *testing.T) {
+	// With the by-port rule off, port 53 is ordinary traffic and the route sets decide.
+	inbound, _ := hijackTestInbound(t, nil, false)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "8.8.8.8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action,
+		"port 53 must not be hijacked when dnsHijackByPort is disabled; the bypass applies")
+}
+
+func TestDNSHijackByPortIgnoresNonTCPAndNonUDP(t *testing.T) {
+	// ICMP carries no port, but the guard is on the network number and must stay.
+	inbound, _ := hijackByPortInbound(t)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "8.8.8.8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerICMP),
+		netip.MustParseAddrPort("192.168.1.2:0"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		nil,
+	)
+	require.NotEqual(t, tun.ActionHijackDNS, verdict.Action,
+		"only TCP and UDP are DNS-by-port candidates")
+}
+
+func TestDNSHijackByPortWorksForIPv6(t *testing.T) {
+	inbound, _ := hijackByPortInbound(t)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "2001:4860:4860::8888")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("[2001:db8::1]:40000"),
+		netip.MustParseAddrPort("[2001:4860:4860::8888]:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionHijackDNS, verdict.Action,
+		"the precedence must hold for IPv6 destinations too")
+
+	verdict = inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("[2001:db8::1]:40000"),
+		netip.MustParseAddrPort("[2001:4860:4860::8888]:53"),
+		nil,
+	)
+	require.Equal(t, tun.ActionAccept, verdict.Action)
+}

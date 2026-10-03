@@ -565,13 +565,45 @@ func (t *Inbound) Close() error {
 	)
 }
 
+// JudgeFlow decides what happens to a new flow at the TUN boundary.
+//
+// # Ordering: DNS first, bypass second
+//
+// The DNS hijack checks run BEFORE the route address sets and before anything that can bypass
+// userspace. That order is load-bearing, not stylistic:
+//
+//	routeAddressSet / routeExcludeAddressSet return ActionBypass directly
+//
+// so any DNS check placed after them is unreachable for exactly the destinations those sets
+// cover. When the by-port check sat below them, a query to an excluded address (or to an address
+// outside an include set) was handed straight to the operating system: it never reached the DNS
+// router, and DNS rules, ad filtering and Fake-IP policy were silently skipped for the most
+// ordinary DNS destination there is.
+//
+// The hijack checks are cheap - a slice scan and a port/network comparison - so hoisting them
+// also makes the DNS path marginally shorter, and a non-DNS flow pays only those two comparisons.
 func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	// A configured DNS address is hijacked on every port.
 	if slices.Contains(t.dnsHijackAddress, destination.Addr()) {
 		if network == uint8(header.UDPProtocolNumber) {
 			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
 		}
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
+	// The by-port rule, which must also precede the bypasses below.
+	//
+	// UDP is hijacked here; TCP is ACCEPTED so the existing stream DNS path takes over. TCP is
+	// deliberately not hijacked at the flow level - changing that would alter the stream DNS
+	// architecture - but it must be accepted rather than bypassed, because a bypassed TCP/53
+	// leaves sing-box entirely.
+	if t.dnsHijackByPort && destination.Port() == 53 &&
+		(network == uint8(header.TCPProtocolNumber) || network == uint8(header.UDPProtocolNumber)) {
+		if network == uint8(header.UDPProtocolNumber) {
+			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
+		}
+		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
+
 	t.routeAddressSetAccess.RLock()
 	routeAddressSet := t.routeAddressSet
 	routeExcludeAddressSet := t.routeExcludeAddressSet
@@ -586,13 +618,6 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 		return it.Contains(destinationAddress)
 	}) {
 		return tun.FlowVerdict{Action: tun.ActionBypass}
-	}
-	if t.dnsHijackByPort && destination.Port() == 53 &&
-		(network == uint8(header.TCPProtocolNumber) || network == uint8(header.UDPProtocolNumber)) {
-		if network == uint8(header.UDPProtocolNumber) {
-			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
-		}
-		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
 	return adapter.JudgeFlow(t.router, adapter.InboundContext{Inbound: t.tag, InboundType: C.TypeTun}, network, source, destination, firstPacket)
 }
