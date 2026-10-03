@@ -1183,7 +1183,29 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 	if err != nil {
 		return err
 	}
-	metadata.DestinationAddresses = mergeOriginalDestination(metadata.Destination, addresses, action.Strategy)
+	// Plan with the EFFECTIVE strategy, not the raw one.
+	//
+	// The lookup above honours AsIS by applying the router's configured default, and returns
+	// addresses ordered accordingly. The planner has its own rule for AsIS - "keep the
+	// application's own family first, because a recovery is a fallback rather than an override" -
+	// and it cannot tell "the caller expressed no preference" from "the literal value AsIS
+	// arrived". Handing it the raw value therefore discarded the preference the resolver had just
+	// applied: a router configured for prefer_ipv6 with an IPv4 original produced an IPv4-first
+	// plan.
+	//
+	// A router that cannot report its strategy (a third-party implementation of the optional
+	// interface) keeps the previous behaviour, which is the safe default: the original's family
+	// leads.
+	strategy := action.Strategy
+	if strategy == C.DomainStrategyAsIS {
+		if resolver, isResolver := r.dns.(adapter.DNSStrategyResolver); isResolver {
+			strategy = resolver.ResolveStrategy(adapter.DNSQueryOptions{
+				Transport: transport,
+				Strategy:  action.Strategy,
+			})
+		}
+	}
+	metadata.DestinationAddresses = mergeOriginalDestination(metadata.Destination, addresses, strategy)
 	r.logger.DebugContext(ctx, "resolved [", strings.Join(F.MapToString(metadata.DestinationAddresses), " "), "]")
 	return nil
 }

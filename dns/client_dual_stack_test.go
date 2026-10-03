@@ -39,6 +39,18 @@ type familySchedulingTransport struct {
 	// failure and must not be treated as one.
 	noDataA    bool
 	noDataAAAA bool
+
+	// observed records the QTYPE of every question the transport was asked, so a test can prove
+	// that a forbidden family was never EMITTED rather than merely filtered out of the result.
+	observedAccess sync.Mutex
+	observed       []uint16
+}
+
+// observedTypes returns the QTYPE of every question this transport has received.
+func (t *familySchedulingTransport) observedTypes() []uint16 {
+	t.observedAccess.Lock()
+	defer t.observedAccess.Unlock()
+	return append([]uint16(nil), t.observed...)
 }
 
 func (t *familySchedulingTransport) Start(adapter.StartStage) error { return nil }
@@ -51,6 +63,10 @@ func (t *familySchedulingTransport) Reset()                         {}
 func (t *familySchedulingTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	t.queryCount.Add(1)
 	qType := message.Question[0].Qtype
+
+	t.observedAccess.Lock()
+	t.observed = append(t.observed, qType)
+	t.observedAccess.Unlock()
 
 	delay := t.delayA
 	address := t.addressA

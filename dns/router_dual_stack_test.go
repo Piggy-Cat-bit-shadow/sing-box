@@ -10,6 +10,8 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 
+	mDNS "github.com/miekg/dns"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -114,5 +116,94 @@ func TestLookupFamiliesStrictStrategyIssuesOneQuery(t *testing.T) {
 			require.EqualValues(t, 1, transport.queryCount.Load(),
 				"a strict strategy must issue only its own family's query")
 		})
+	}
+}
+
+// TestStrictRouterDefaultIssuesOneFamily is Group A §15.
+//
+// The caller passes AsIS. The router's configured default is a strict single-family strategy. The
+// effective policy is therefore that strict strategy, and the forbidden family's query must never
+// be emitted - not merely filtered out afterwards.
+//
+// # The defect this pins
+//
+// LookupFamilies resolved the effective strategy and used it to CHOOSE the strict branch, but then
+// called r.Lookup with the caller's RAW options. Client.Lookup reads options.Strategy to decide
+// which family to query, and the raw value was still AsIS, so the branch that was supposed to
+// issue one family issued... whichever family Client.Lookup defaults to. The policy that selected
+// the branch never reached the code that acts on it.
+func TestStrictRouterDefaultIssuesOneFamily(t *testing.T) {
+	for _, testCase := range []struct {
+		name             string
+		routerDefault    C.DomainStrategy
+		forbidden        uint16
+		expectedStrategy C.DomainStrategy
+	}{
+		{"router default ipv4_only", C.DomainStrategyIPv4Only, mDNS.TypeAAAA, C.DomainStrategyIPv4Only},
+		{"router default ipv6_only", C.DomainStrategyIPv6Only, mDNS.TypeA, C.DomainStrategyIPv6Only},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			transport := &familySchedulingTransport{
+				addressA:    "192.0.2.1",
+				addressAAAA: "2001:db8::1",
+			}
+			client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+			client.Start()
+			router := &Router{
+				ctx:                   context.Background(),
+				logger:                log.NewNOPFactory().Logger(),
+				client:                client,
+				defaultDomainStrategy: testCase.routerDefault,
+			}
+
+			var published []adapter.DNSFamilyResult
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			// AsIS: the caller expresses no preference, so the router's default decides.
+			err := router.LookupFamilies(ctx, "example.test.", adapter.DNSQueryOptions{
+				Transport: transport,
+				Strategy:  C.DomainStrategyAsIS,
+			}, func(result adapter.DNSFamilyResult) {
+				published = append(published, result)
+			})
+			require.NoError(t, err)
+
+			for _, questionType := range transport.observedTypes() {
+				require.NotEqual(t, testCase.forbidden, questionType,
+					"the router default is a strict single-family strategy, so the forbidden "+
+						"family's query must never be issued; it was")
+			}
+
+			require.Len(t, published, 1, "a strict strategy reports exactly one family result")
+			require.Equal(t, testCase.expectedStrategy, published[0].EffectiveStrategy,
+				"the reported effective strategy must be the router default that actually applied, "+
+					"not the caller's AsIS")
+		})
+	}
+}
+
+// TestStrictRouterDefaultDoesNotEmitForbiddenFamilyThroughLookup is the Client.Lookup half of the
+// same contract, driven directly.
+func TestStrictRouterDefaultDoesNotEmitForbiddenFamilyThroughLookup(t *testing.T) {
+	transport := &familySchedulingTransport{
+		addressA:    "192.0.2.1",
+		addressAAAA: "2001:db8::1",
+	}
+	client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// AsIS with the router default applied, exactly as finalizeExchangeOptions would.
+	_, err := client.Lookup(ctx, transport, "example.test.", adapter.DNSQueryOptions{
+		Strategy: C.DomainStrategyIPv4Only,
+	}, func(response *mDNS.Msg) bool { return response.Rcode == mDNS.RcodeSuccess })
+	require.NoError(t, err)
+
+	for _, questionType := range transport.observedTypes() {
+		require.NotEqual(t, mDNS.TypeAAAA, questionType,
+			"ipv4_only must not emit an AAAA query")
 	}
 }

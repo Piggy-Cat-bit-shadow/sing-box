@@ -950,6 +950,16 @@ func (r *Router) exchangeWithRulesAsync(ctx context.Context, rules []adapter.DNS
 	}()
 }
 
+// ResolveStrategy reports the strategy that will actually be applied for the given options.
+//
+// AsIS means "use this router's default", and only the router knows what that is. A caller that
+// must plan or order work with the SAME policy the lookup will use - rather than re-deriving it
+// from the raw options - reads it here. Without this, a caller passing AsIS sees only the literal
+// value and cannot tell "no preference expressed" from "the default is about to be applied".
+func (r *Router) ResolveStrategy(options adapter.DNSQueryOptions) C.DomainStrategy {
+	return r.resolveLookupStrategy(options)
+}
+
 func (r *Router) resolveLookupStrategy(options adapter.DNSQueryOptions) C.DomainStrategy {
 	if options.LookupStrategy != C.DomainStrategyAsIS {
 		return options.LookupStrategy

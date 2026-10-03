@@ -75,6 +75,16 @@ type DNSRouter interface {
 	ResetNetwork()
 }
 
+// DNSStrategyResolver is implemented by DNS routers that can report the strategy they will
+// actually apply for a set of query options.
+//
+// AsIS means "use the router's default", so a caller that needs to plan with the same policy the
+// lookup will use must ask. This is a separate, optional interface rather than a method on
+// DNSRouter so existing implementations keep compiling.
+type DNSStrategyResolver interface {
+	ResolveStrategy(options DNSQueryOptions) C.DomainStrategy
+}
+
 type DNSClient interface {
 	Start()
 	Exchange(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error)
