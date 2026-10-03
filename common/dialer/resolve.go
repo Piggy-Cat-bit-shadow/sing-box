@@ -98,22 +98,20 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		return nil, err
 	}
 	if !destination.IsDomain() {
-		// A literal destination. It may still be worth recovering the other address family:
-		// the application has usually already resolved the name, so a connection to one
-		// address has nothing to fall back to if that address's family is broken. Sniffing
-		// recovered the domain; this turns it back into candidates.
+		// A literal destination is the PRIMARY endpoint and dials immediately.
 		//
-		// Recovery is refused when it does not apply, so an unusual situation degrades to the
-		// previous single-candidate dial rather than to a surprising one.
-		recovered := d.recoverCandidates(ctx, destination)
-		if len(recovered) == 0 {
-			return d.dialer.DialContext(ctx, network, destination)
-		}
-		// The original destination stays a candidate, ordered by the shared planner so the
-		// configured family preference survives the recovery.
-		strategy := d.queryOptions.Strategy
-		candidates := MergeOriginalDestination(destination.Addr, recovered, strategy)
-		return d.raceCandidates(ctx, network, destination, candidates, strategy)
+		// Recovery may add candidates from the sniffed domain, but it must never be a
+		// prerequisite for reaching the address the application already chose. An earlier
+		// version looked the domain up synchronously first, so a literal IP - which used to
+		// connect at once - waited on a full DNS resolution, and a slow or hanging resolver
+		// delayed or broke a connection that needed no DNS at all.
+		//
+		// The application's address wins for a concrete reason: it may come from the
+		// application's own DNS cache, a hosts file, split-horizon or enterprise DNS, a CDN
+		// selection, or an earlier legitimate answer. Re-resolving the sniffed name can return
+		// a DIFFERENT address for the same name, and that must never displace the endpoint the
+		// application actually selected.
+		return d.dialLiteralWithRecovery(ctx, network, destination)
 	}
 	if !d.parallel {
 		// parallel=false is an explicit request for serial behaviour, used by callers that
@@ -161,9 +159,35 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 		return d.raceCandidates(ctx, network, destination, addresses, strategy)
 	}
 
+	// resolutionCtx owns everything that exists only to feed THIS connection's race.
+	//
+	// The caller's ctx is the connection's lifetime, which can outlive the race by a long way -
+	// the connection is returned and used for minutes. Without a narrower context, a late DNS
+	// answer would still be trying to hand a candidate to a scheduler that has already returned:
+	// the send blocks, and the feeder and lookup goroutines stay parked on it until the
+	// connection eventually closes.
+	//
+	// Cancelling on the way out means the whole producer set stops the moment the winner is
+	// known, whether the sender is blocked on a channel, holding a grace timer, or still inside
+	// the resolver.
+	resolutionCtx, cancelResolution := context.WithCancel(ctx)
+	defer cancelResolution()
+
 	// The channel is unbuffered and owned here: the publisher blocks until the scheduler takes
 	// a candidate, so no goroutine outlives the race holding a result nobody will read.
 	candidates := make(chan dualStackCandidate)
+
+	// lookupDone carries the resolver's own error exactly once, so a DNS failure can be
+	// surfaced instead of being replaced by a generic "no candidates".
+	//
+	// Buffered, and never closed: the resolver always sends exactly one value, and closing it
+	// would make the failure-path read indistinguishable from a nil error.
+	lookupDone := make(chan error, 1)
+
+	// producers tracks the two producer goroutines so the winner path can prove they have
+	// exited rather than merely assuming it. A test can then assert termination deterministically
+	// instead of counting goroutines and hoping.
+	var producers sync.WaitGroup
 
 	// The preferred family leads. A family is only fed to the scheduler as it arrives, so
 	// without this the first family to ANSWER would take the first launch slot and "prefer
@@ -177,39 +201,60 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 	firstReady := make(chan struct{})
 	var readyOnce sync.Once
 
-	// Arrivals are handed to one feeding goroutine over a channel, so the held buffer has a
-	// single owner and needs no lock. The callback only deposits.
-	type arrival struct {
-		result adapter.DNSFamilyResult
-	}
 	arrivals := make(chan adapter.DNSFamilyResult, 4)
 
+	// --- producer 1: the resolver ---
+	producers.Add(1)
 	go func() {
+		defer producers.Done()
+		defer close(arrivals)
+
+		err := dualStackRouter.LookupFamilies(resolutionCtx, destination.Fqdn, d.queryOptions,
+			func(result adapter.DNSFamilyResult) {
+				readyOnce.Do(func() { close(firstReady) })
+				select {
+				case arrivals <- result:
+				case <-resolutionCtx.Done():
+				}
+			})
+		// The error is published, not discarded. Without it a resolution failure would be
+		// reported as "no dial candidates", which describes a symptom and hides the cause.
+		lookupDone <- err
+	}()
+
+	// --- producer 2: the feeder ---
+	producers.Add(1)
+	go func() {
+		defer producers.Done()
 		defer close(candidates)
 
 		// graceTimer releases a held non-preferred family if the preferred one is slow. It is
-		// the ONLY timer for this grace period; the resolution path no longer holds results on
-		// its own, so the maximum delay from this mechanism is exactly preferredFamilyGrace.
+		// the ONLY timer for this grace period. It is stopped on every exit path so no callback
+		// outlives the feeder.
 		graceTimer := time.NewTimer(preferredFamilyGrace)
 		defer graceTimer.Stop()
 
 		var (
 			held        []dualStackCandidate
 			graceActive bool
-			closed      bool
 		)
 
 		feed := func(candidate dualStackCandidate) bool {
 			select {
 			case candidates <- candidate:
 				return true
-			case <-ctx.Done():
+			case <-resolutionCtx.Done():
+				// The only exit condition is the resolution context, NOT the connection
+				// context: once the race is decided this feeder must stop immediately rather
+				// than waiting for a connection that may live for minutes.
 				return false
 			}
 		}
 		release := func() {
 			for _, candidate := range held {
 				if !feed(candidate) {
+					held = nil
+					graceActive = false
 					return
 				}
 			}
@@ -227,7 +272,7 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 				graceSignal = graceTimer.C
 			}
 			select {
-			case <-ctx.Done():
+			case <-resolutionCtx.Done():
 				return
 			case arrivalValue, haveArrival = <-arrivals:
 				if !haveArrival {
@@ -273,19 +318,7 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 				graceTimer.Reset(preferredFamilyGrace)
 			}
 			held = append(held, batch...)
-			_ = closed
 		}
-	}()
-
-	go func() {
-		defer close(arrivals)
-		_ = dualStackRouter.LookupFamilies(lookupCtx, destination.Fqdn, d.queryOptions, func(result adapter.DNSFamilyResult) {
-			readyOnce.Do(func() { close(firstReady) })
-			select {
-			case arrivals <- result:
-			case <-ctx.Done():
-			}
-		})
 	}()
 
 	// Wait for the first result so a completely failing lookup is reported as a lookup error
@@ -293,6 +326,8 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 	select {
 	case <-firstReady:
 	case <-ctx.Done():
+		cancelResolution()
+		producers.Wait()
 		return nil, ctx.Err()
 	}
 
@@ -302,7 +337,26 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 		func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
 			return d.dialer.DialContext(attemptCtx, network, M.SocksaddrFrom(address, destination.Port))
 		})
+
+	// Stop the producers before returning, whatever the outcome. A winner must not leave a
+	// lookup running, and the wait makes that a guarantee rather than an expectation.
+	cancelResolution()
+	producers.Wait()
+
 	if err != nil {
+		// Now that both producers have exited, lookupDone holds the resolver's verdict (or is
+		// empty if it had not finished sending). A resolution failure is the more informative
+		// error: "no dial candidates" describes the symptom and hides that DNS itself failed.
+		//
+		// It is consulted ONLY on the failure path. If a candidate won, a late DNS error must
+		// not turn a working connection into a failed one.
+		select {
+		case lookupErr := <-lookupDone:
+			if lookupErr != nil {
+				return nil, E.Cause(lookupErr, "resolve ", destination.Fqdn)
+			}
+		default:
+		}
 		return nil, err
 	}
 	return conn, nil
@@ -312,6 +366,136 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 //
 // Every racing path in this file goes through here, so candidate ordering, scheduling, family
 // health and loser cleanup cannot differ between a hostname and a recovered literal.
+// dialLiteralWithRecovery dials a literal destination immediately, with domain recovery as a
+// parallel fallback rather than a precondition.
+//
+// # The shape
+//
+//	original address ──── dial immediately ────────────────────┐
+//	                                                           ├── first success wins
+//	sniffed-domain lookup ──── recovered candidates ───────────┘
+//
+// The original attempt is not deferred by even one syscall of DNS work. Recovery runs
+// concurrently and its candidates are dialled only if it produces them in time.
+//
+// # Failure handling, deliberately simple
+//
+// If the original address fails and recovery has produced candidates, those are tried. If
+// recovery produced nothing, the original error is returned. There is no dynamic racing of the
+// two streams: an earlier design attempt in this area grew a second scheduler, and the
+// complexity was not worth it. Correctness and "the original dial is never blocked" come first.
+//
+// # Bounded
+//
+// One goroutine for the lookup, cancelled when the original succeeds. The recovered dial uses
+// the same bounded scheduler as every other racing path, so its losers are closed and its
+// winner is unique.
+func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	originalCtx, cancelOriginal := context.WithCancel(ctx)
+	defer cancelOriginal()
+
+	original := make(chan literalDialResult, 1)
+
+	// A hard single-family strategy applies to the ORIGINAL address too.
+	//
+	// planCandidates enforces "only means only" by dropping the other family, but the original
+	// attempt is dialled directly rather than through the planner - so without this check a
+	// literal IPv6 address would be dialled under ipv4_only, silently turning a strict policy
+	// into a suggestion. The original is preferred, not exempt.
+	originalAllowed := addressAllowedByStrategy(destination.Addr, d.queryOptions.Strategy)
+	if originalAllowed {
+		go func() {
+			conn, err := d.dialer.DialContext(originalCtx, network, destination)
+			original <- literalDialResult{conn: conn, err: err}
+		}()
+	} else {
+		// Nothing to dial for the original. Report the exclusion rather than hanging on a
+		// channel that will never receive.
+		original <- literalDialResult{err: E.New("destination ", destination.Addr, " excluded by strategy ", strategyName(d.queryOptions.Strategy))}
+	}
+
+	// Recovery runs concurrently. Its result channel is buffered and it always sends exactly
+	// once, so the goroutine cannot outlive this function blocked on an unread channel.
+	recovered := make(chan []netip.Addr, 1)
+	go func() {
+		addresses := d.recoverCandidates(ctx, destination)
+		recovered <- addresses
+	}()
+
+	select {
+	case result := <-original:
+		if result.err == nil {
+			return result.conn, nil
+		}
+		// The original failed. Fall back to recovery only if it has already produced
+		// something; waiting for a slow lookup here would reintroduce the blocking this
+		// function exists to remove, and the original error is a perfectly good answer.
+		select {
+		case addresses := <-recovered:
+			return d.dialRecoveredOrReport(ctx, network, destination, addresses, result.err)
+		default:
+			return nil, result.err
+		}
+
+	case addresses := <-recovered:
+		if len(addresses) == 0 {
+			// Recovery found nothing; the original attempt is the only candidate, so wait for
+			// it rather than returning early.
+			result := <-original
+			if result.err != nil {
+				return nil, result.err
+			}
+			return result.conn, nil
+		}
+
+		// Recovery produced candidates while the original is STILL in flight. The original
+		// remains preferred, so give it a bounded head start rather than waiting for it
+		// indefinitely.
+		//
+		// Waiting unconditionally was a starvation bug: against a blackholed original the wait
+		// consumed the whole context, so by the time the fallback was reached there was no
+		// budget left to dial with. The recovered candidates - the entire point of doing
+		// recovery - could never actually be used.
+		//
+		// The head start is the connection fallback delay, the same interval that staggers
+		// candidates elsewhere in this package, so a healthy original still wins outright and a
+		// hanging one does not hold the fallback hostage.
+		fallbackTimer := time.NewTimer(d.fallbackDelayOrDefault())
+		defer fallbackTimer.Stop()
+
+		select {
+		case result := <-original:
+			if result.err == nil {
+				return result.conn, nil
+			}
+			return d.dialRecoveredOrReport(ctx, network, destination, addresses, result.err)
+
+		case <-fallbackTimer.C:
+			// The original has had its head start and is still pending. Dial the recovered
+			// candidates in parallel with it; the first success wins and the other attempt is
+			// cancelled by the deferred cancelOriginal.
+			return d.raceWithPendingOriginal(ctx, network, destination, addresses, original, cancelOriginal)
+		}
+	}
+}
+
+// dialRecoveredOrReport dials recovered candidates, or reports the original error when there
+// are none.
+func (d *resolveDialer) dialRecoveredOrReport(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, originalErr error) (net.Conn, error) {
+	if len(addresses) == 0 {
+		return nil, originalErr
+	}
+	strategy := d.queryOptions.Strategy
+	candidates := MergeOriginalDestination(destination.Addr, addresses, strategy)
+	conn, err := d.raceCandidates(ctx, network, destination, candidates, strategy)
+	if err != nil {
+		// Both the original endpoint and every recovered candidate failed. The original error
+		// is the more useful one to surface: it is the endpoint the application asked for.
+		return nil, originalErr
+	}
+	return conn, nil
+}
+
 func (d *resolveDialer) raceCandidates(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, strategy C.DomainStrategy) (net.Conn, error) {
 	plan := planCandidates(addresses, destination.Addr, strategy)
 	if len(plan.candidates) == 0 {
@@ -432,3 +616,119 @@ func (d *resolveParallelNetworkDialer) Upstream() any {
 // in the hope that the preferred family is about to arrive. The maximum delay this mechanism
 // can add is exactly this value, because it has a single owner.
 const preferredFamilyGrace = 50 * time.Millisecond
+
+// addressAllowedByStrategy reports whether a hard single-family strategy admits this address.
+//
+// Only the strict strategies exclude. AsIS, PreferIPv4 and PreferIPv6 all admit both families,
+// so the original address is always dialled under them.
+func addressAllowedByStrategy(address netip.Addr, strategy C.DomainStrategy) bool {
+	if !address.IsValid() {
+		return true
+	}
+	is4 := address.Is4() || address.Is4In6()
+	switch strategy {
+	case C.DomainStrategyIPv4Only:
+		return is4
+	case C.DomainStrategyIPv6Only:
+		return !is4
+	default:
+		return true
+	}
+}
+
+func strategyName(strategy C.DomainStrategy) string {
+	switch strategy {
+	case C.DomainStrategyIPv4Only:
+		return "ipv4_only"
+	case C.DomainStrategyIPv6Only:
+		return "ipv6_only"
+	case C.DomainStrategyPreferIPv4:
+		return "prefer_ipv4"
+	case C.DomainStrategyPreferIPv6:
+		return "prefer_ipv6"
+	default:
+		return "as_is"
+	}
+}
+
+// raceWithPendingOriginal dials recovered candidates while the original attempt is still in
+// flight, and returns whichever succeeds first.
+//
+// # Why both run at once
+//
+// The original has already had a full fallback delay and has not answered. Continuing to wait
+// for it - the previous behaviour - meant a blackholed original consumed the caller's entire
+// context and the fallback could never connect. Racing them gives the preferred endpoint every
+// chance to win while guaranteeing the recovered candidates get to try.
+//
+// # Ownership
+//
+// Exactly one connection is returned. The loser is closed, and the losing attempt is cancelled
+// through cancelOriginal, so nothing is left running when this returns.
+func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr, original <-chan literalDialResult, cancelOriginal context.CancelFunc) (net.Conn, error) {
+	recoveredResult := make(chan literalDialResult, 1)
+
+	go func() {
+		strategy := d.queryOptions.Strategy
+		candidates := MergeOriginalDestination(destination.Addr, addresses, strategy)
+		conn, err := d.raceCandidates(ctx, network, destination, candidates, strategy)
+		recoveredResult <- literalDialResult{conn: conn, err: err}
+	}()
+
+	var (
+		winner     net.Conn
+		firstErr   error
+		haveErr    bool
+		originalOK bool
+	)
+	for completed := 0; completed < 2 && winner == nil; completed++ {
+		select {
+		case result := <-original:
+			originalOK = true
+			if result.err == nil {
+				winner = result.conn
+			} else if !haveErr {
+				firstErr = result.err
+				haveErr = true
+			}
+		case result := <-recoveredResult:
+			if result.err == nil {
+				winner = result.conn
+			} else if !haveErr {
+				firstErr = result.err
+				haveErr = true
+			}
+		case <-ctx.Done():
+			cancelOriginal()
+			return nil, ctx.Err()
+		}
+	}
+
+	// Stop the attempt that did not win.
+	cancelOriginal()
+
+	if winner != nil {
+		return winner, nil
+	}
+	if haveErr {
+		return nil, firstErr
+	}
+	if !originalOK {
+		// Neither reported, which can only happen if the context ended.
+		return nil, ctx.Err()
+	}
+	return nil, ctx.Err()
+}
+
+// literalDialResult is one attempt's outcome on the literal-recovery path.
+type literalDialResult struct {
+	conn net.Conn
+	err  error
+}
+
+func (d *resolveDialer) fallbackDelayOrDefault() time.Duration {
+	if d.fallbackDelay > 0 {
+		return d.fallbackDelay
+	}
+	return preferredFamilyGrace
+}

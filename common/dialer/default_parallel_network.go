@@ -59,14 +59,53 @@ func DialSerialNetwork(ctx context.Context, dialer N.Dialer, network string, des
 // to be no.
 //
 // The interface and strategy arguments are unchanged; they select the per-attempt dialer.
+// The signature is unchanged so existing callers keep working. What changed is that the
+// function now finds the long-lived family health owner itself rather than being handed one.
 func DialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
-	return dialParallelNetwork(ctx, dialer, network, destination, destinationAddresses, preferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, nil, 0)
+	// Bind the scheduler to the dialer's own family health, when the chain leads to an owner.
+	//
+	// This path - the direct outbound's DialParallelNetwork, reached by the actionResolve
+	// candidate list and by flow-route candidates - previously passed health: nil, so it never
+	// shared the verdict the hostname path accumulates. The two paths learned about a broken
+	// family independently, and a literal destination never benefited from what a hostname
+	// connection had already discovered.
+	//
+	// The owner is DISCOVERED rather than passed, so no caller has to know about it and the
+	// public signature is untouched.
+	if owner, found := findFamilyHealthOwner(dialer); found {
+		return dialParallelNetwork(ctx, dialer, network, destination, destinationAddresses, preferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, owner.newDualStackScheduler(fallbackDelay))
+	}
+	// No owner in the chain: a caller-supplied dialer. Racing still works; there is simply no
+	// history to consult. It must not panic, and it must not invent a per-call health that
+	// could never accumulate anything.
+	return dialParallelNetwork(ctx, dialer, network, destination, destinationAddresses, preferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, &candidateScheduler{fallbackDelay: fallbackDelay})
 }
 
-// dialParallelNetwork is the health-aware form. The exported function keeps its signature so
-// existing callers are unaffected, and passes no health; callers that own family state use
-// this one.
-func dialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration, health *familyHealth, networkEnvironment uint64) (net.Conn, error) {
+// findFamilyHealthOwner walks the dialer chain looking for a long-lived health owner.
+//
+// The chain is short and its wrappers are known: a resolveDialer (or its parallel variant)
+// wraps the real dialer, which for the direct outbound is a *DefaultDialer. Each step is
+// unwrapped explicitly rather than by reflection, so adding a wrapper is a deliberate act and
+// cannot silently break the lookup.
+func findFamilyHealthOwner(dialer N.Dialer) (familyHealthOwner, bool) {
+	for depth := 0; depth < 8 && dialer != nil; depth++ {
+		if owner, ok := dialer.(familyHealthOwner); ok {
+			return owner, true
+		}
+		switch wrapper := dialer.(type) {
+		case *resolveDialer:
+			dialer = wrapper.dialer
+		case *resolveParallelNetworkDialer:
+			dialer = wrapper.dialer
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// dialParallelNetwork is the explicit form, used by callers that already hold a scheduler.
+func dialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration, scheduler *candidateScheduler) (net.Conn, error) {
 	if len(destinationAddresses) == 0 {
 		if !destination.IsIP() {
 			panic("invalid usage")
@@ -80,14 +119,8 @@ func dialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, ne
 	}
 	plan := planCandidates(destinationAddresses, netip.Addr{}, domainStrategy)
 
-	// Health comes from the dialer that owns the underlay, so the verdict survives across
-	// connections instead of being relearned every time. The parameter carries it because
-	// this is a free function; the alternative - a package-level variable - would share one
-	// network's verdict with every dialer in the process.
-	scheduler := &candidateScheduler{
-		fallbackDelay:      fallbackDelay,
-		health:             health,
-		networkEnvironment: networkEnvironment,
+	if scheduler == nil {
+		scheduler = &candidateScheduler{fallbackDelay: fallbackDelay}
 	}
 	conn, _, err := scheduler.dial(ctx, plan, func(attemptCtx context.Context, address netip.Addr) (net.Conn, error) {
 		// Each attempt keeps the full configuration the caller supplied: the network

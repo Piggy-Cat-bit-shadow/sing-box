@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -46,6 +47,28 @@ import (
 // Returning a non-nil conn AFTER an error is not allowed; callers must close anything they
 // create before returning an error.
 type dialAttemptFunc func(ctx context.Context, address netip.Addr) (net.Conn, error)
+
+// pendingAttempt records an attempt that has started and not yet reported.
+//
+// # Why the scheduler needs this at all
+//
+// A family that silently blackholes never reports an error: the attempt is still blocked when
+// the other family wins, and it unwinds with context.Canceled - which must NOT be recorded as a
+// family failure, because a cancelled loser says nothing about the network. So without some
+// record of what was still outstanding, the scheduler had no way to notice that a family had
+// demonstrably failed to answer, and the next connection paid the fallback delay again.
+//
+// The record is deliberately tiny and lives in the scheduler: the candidate count is small, a
+// slice is cheaper than a map, and nothing here outlives one race.
+type pendingAttempt struct {
+	address   netip.Addr
+	family    addressFamily
+	startedAt time.Time
+	// completed is written by the attempt goroutine and read by the winner path, so it must be
+	// synchronized. A plain bool here is a data race: the winner decides which families stalled
+	// while attempts are still finishing on their own goroutines.
+	completed atomic.Bool
+}
 
 // dialAttemptResult is one attempt's outcome.
 type dialAttemptResult struct {
@@ -138,12 +161,33 @@ func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan ca
 		workerGroup sync.WaitGroup
 		started     int
 	)
+	// attempts tracks every started candidate so a winner can tell which families were still
+	// outstanding when it won.
+	var attempts []*pendingAttempt
+
 	startAttempt := func(candidate dualStackCandidate) {
 		started++
 		workerGroup.Add(1)
+		record := &pendingAttempt{
+			address:   candidate.address,
+			family:    candidate.family,
+			startedAt: time.Now(),
+		}
+		attempts = append(attempts, record)
 		go func() {
 			defer workerGroup.Done()
 			conn, err := attempt(raceCtx, candidate.address)
+			record.completed.Store(true)
+
+			// Health is updated ONLY while the parent operation is still running.
+			//
+			// When the parent context ends, every attempt is cancelled at once and returns a
+			// context error. Recording that as a family verdict would blame the network for the
+			// caller's own deadline and would poison the next connection for the full window.
+			// The clock is checked here rather than the error string, because the same error
+			// value is produced by a candidate's own dial timeout - which IS a valid path
+			// signal - and only the parent's state distinguishes them.
+			parentAlive := ctx.Err() == nil
 
 			// Record a PATH failure here, where the attempt completes, rather than only on
 			// the winner path.
@@ -156,8 +200,8 @@ func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan ca
 			//
 			// The classification is conservative: caller cancellation and closed connections
 			// - which is how a loser is torn down - record nothing.
-			if err != nil && s.health != nil {
-				s.health.recordFailure(s.networkEnvironment, classifyAddress(candidate.address), err)
+			if err != nil && s.health != nil && parentAlive {
+				s.health.recordFailure(s.networkEnvironment, record.family, err)
 			}
 
 			select {
@@ -280,10 +324,22 @@ func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan ca
 
 		case candidate, stillOpen := <-lateCandidates:
 			if !stillOpen {
-				// Resolution finished: no more candidates can arrive.
+				// Resolution finished: no more candidates can arrive, ever.
 				lateCandidates = nil
 				resolutionFinished = true
-				if nextIndex >= len(launch) && started == len(failures) && started > 0 {
+
+				// Nothing was ever launched and nothing more can arrive. Returning here is the
+				// whole point: the previous version required `started > 0` to conclude, so a
+				// provider that closed its stream without producing a single candidate left the
+				// race waiting for the PARENT TIMEOUT even though it already knew the answer.
+				//
+				// That is not a theoretical case - a name where both A and AAAA return NODATA
+				// produces exactly this, and the caller would sit for the whole connect timeout
+				// before being told there was no address.
+				if started == 0 {
+					return nil, netip.Addr{}, E.New("no dial candidates")
+				}
+				if nextIndex >= len(launch) && started == len(failures) {
 					if len(failures) == 0 {
 						return nil, netip.Addr{}, E.Cause(lastErr, "dial failed")
 					}
@@ -321,8 +377,22 @@ func (s *candidateScheduler) dialWithLateCandidates(ctx context.Context, plan ca
 					// works, so any penalty it carries is cleared here rather than by a
 					// caller remembering to do it. Without this a family penalised once
 					// would stay penalised for the full window even after it recovered.
-					if s.health != nil {
-						s.health.recordSuccess(s.networkEnvironment, classifyAddress(result.address))
+					winnerFamily := classifyAddress(result.address)
+					if s.health != nil && ctx.Err() == nil {
+						s.health.recordSuccess(s.networkEnvironment, winnerFamily)
+
+						// A family that was still outstanding when another family connected has
+						// demonstrably failed to answer. Without this the scheduler learned
+						// nothing from the most common bad-family case: a silently blackholed
+						// IPv6 attempt loses the race, unwinds with context.Canceled, and
+						// context.Canceled must never be recorded as a failure. The next
+						// connection then paid the fallback delay all over again.
+						//
+						// The verdict is SOFT: it does not disable the family, reorder it
+						// permanently, or blacklist it. It only lets the next connection start
+						// both families' first candidates together, which is a bounded,
+						// expiring nudge - preference is not lock-in.
+						s.recordStalledOppositeFamily(attempts, winnerFamily, result.address)
 					}
 					cancelRace()
 					stopTimer()
@@ -434,6 +504,88 @@ func (h *familyHealth) fallbackImmediately(environment uint64, preferred address
 	// Only promote when the family that recently failed is the one that would otherwise
 	// have been preferred, and the other family is the alternative being offered.
 	return entry.failedFamily == preferred
+}
+
+// recordStalledOppositeFamily records a SOFT verdict for a family that was still unresolved
+// when another family established a connection.
+//
+// # What qualifies
+//
+// Three conditions, all required:
+//
+//   - the pending attempt is in a DIFFERENT family from the winner. Two addresses in one family
+//     are ordinary racing, not evidence that the family is degraded, so a slow same-family
+//     candidate proves nothing about the family as a whole.
+//   - it started BEFORE the winner completed, so it had its chance.
+//   - it has been pending for at least the effective fallback delay. A candidate that started a
+//     millisecond ago has not stalled; it simply has not finished. This is what keeps a fast
+//     healthy race - where both families start within a millisecond and one wins in five - from
+//     manufacturing a penalty out of nothing.
+//
+// # What this is not
+//
+// It is not a path failure. A path failure means the kernel reported the network unreachable; a
+// stall means the opposite family connected first while this one stayed silent. The two are
+// recorded through different entry points and mean different things, and fabricating a
+// DeadlineExceeded error to reuse the failure path would have conflated them.
+func (s *candidateScheduler) recordStalledOppositeFamily(attempts []*pendingAttempt, winnerFamily addressFamily, winnerAddress netip.Addr) {
+	now := time.Now()
+	minimumPending := s.fallbackDelayOrDefault()
+
+	var stalled addressFamily
+	for _, attempt := range attempts {
+		if attempt.completed.Load() {
+			continue
+		}
+		if attempt.address == winnerAddress {
+			continue
+		}
+		if attempt.family == winnerFamily || attempt.family == familyInvalid {
+			continue
+		}
+		if now.Sub(attempt.startedAt) < minimumPending {
+			continue
+		}
+		stalled = attempt.family
+		break
+	}
+
+	if stalled != familyInvalid {
+		s.health.recordStalledFamily(s.networkEnvironment, stalled)
+	}
+}
+
+// recordStalledFamily records a SOFT verdict: another family established a connection while this
+// one remained unresolved.
+//
+// # How this differs from recordFailure
+//
+// recordFailure means the kernel reported the path as broken - unreachable network, unreachable
+// host, address unavailable. recordStalledFamily means something weaker and more common: this
+// family did not answer in time, while the other family demonstrably could. The distinction is
+// kept because they are genuinely different observations, and collapsing them would mean
+// inventing an error the network never produced.
+//
+// # What it does NOT do
+//
+// It does not disable the family, order it permanently last, or blacklist it. The only effect is
+// the same one a hard verdict has: the NEXT connection starts both families' first candidates
+// together instead of making the suspect family wait out a fallback delay. Every other candidate
+// still follows the normal schedule.
+//
+// It expires on the same C.TCPTimeout window and clears on the first successful connection in
+// that family, so a transient stall costs one connection's worth of caution rather than
+// changing the user's configuration.
+func (h *familyHealth) recordStalledFamily(environment uint64, family addressFamily) {
+	if family == familyInvalid {
+		return
+	}
+	h.access.Lock()
+	defer h.access.Unlock()
+	h.state[environment] = familyHealthState{
+		failedFamily: family,
+		failedAt:     time.Now(),
+	}
 }
 
 // recordFailure notes a path failure for the family an address belongs to.
