@@ -264,7 +264,13 @@ type URLTestGroup struct {
 	pauseCallback    *list.Element[pause.Callback]
 	logger           log.Logger
 	outbounds        []adapter.Outbound
-	link             string
+	// link is target.RequestURL: the spelling the operator configured, which is what is fetched.
+	//
+	// It is deliberately NOT the canonical identity. Storing the canonical form here is what let a
+	// scope canonicalisation rewrite the request on the automatic group path.
+	link string
+	// target carries the three separate uses of the configured URL.
+	target urltest.MeasurementTarget
 	// expected is the parsed status set its health checks accept, and is part of the scope.
 	expected urltest.ExpectedStatus
 	// scope identifies the target this group measures against, so selection and skipping only
@@ -362,16 +368,27 @@ func NewURLTestGroupWithExpected(ctx context.Context, outboundManager adapter.Ou
 	//
 	// Deferring this would let a group start, look healthy, and only discover after the first
 	// interval that every measurement fails - by which time the operator has been told nothing.
-	// The canonical URL is kept so the scope and what is actually requested are the same string.
+	// The request target and health identity are kept separate: RequestURL controls what is
+	// fetched, ScopeURL controls which health evidence the result belongs to.
+	//
 	// The expected status is parsed HERE, with the target, so an unusable expression fails
 	// configuration rather than only surfacing when the first background check runs.
 	expected, err := urltest.ParseExpectedStatus(expectedStatus)
 	if err != nil {
 		return nil, E.Cause(err, "invalid expected_status")
 	}
-	scope, err := urltest.NewMeasurementScope(link, expected)
+	// The request target and the health identity are intentionally kept SEPARATE:
+	// RequestURL controls what is fetched, and ScopeURL controls which health evidence the result
+	// belongs to. Collapsing them into one string means a canonicalisation chosen for identity
+	// silently rewrites what is requested - which is what this group used to do, by storing the
+	// canonical form as its link and measuring with it.
+	target, err := urltest.ParseMeasurementTarget(link)
 	if err != nil {
 		return nil, E.Cause(err, "invalid URL test target")
+	}
+	scope := urltest.MeasurementScope{
+		URL:      target.ScopeURL,
+		Expected: expected.Canonical(),
 	}
 	// The group owns its background lifetime. Storing the caller's context alone meant Close could
 	// not stop a check that was already running: it could only stop the loop that schedules them,
@@ -384,7 +401,8 @@ func NewURLTestGroupWithExpected(ctx context.Context, outboundManager adapter.Ou
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
-		link:                         scope.URL,
+		link:                         target.RequestURL,
+		target:                       target,
 		expected:                     expected,
 		scope:                        scope,
 		interval:                     interval,
@@ -670,12 +688,21 @@ func URLTestOutboundsWithMode(ctx context.Context, outboundManager adapter.Outbo
 // measure, so the batch reports no results rather than failing every node individually.
 func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool, mode TestHistoryMode) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-	scope, scopeErr := urltest.NewMeasurementScope(link, expected)
-	if scopeErr != nil {
-		logger.Error("invalid URL test target: ", scopeErr)
+
+	// Parse the target ONCE and keep all three uses distinct.
+	//
+	// This used to do `link = scope.URL`, which replaced the request target with the canonical
+	// identity - so everything measured through this batch fetched a rewritten URL. The batch now
+	// carries the request spelling for the measurement and the scope for storage.
+	target, targetErr := urltest.ParseMeasurementTarget(link)
+	if targetErr != nil {
+		logger.Error("invalid URL test target: ", targetErr)
 		return map[string]uint16{}
 	}
-	link = scope.URL
+	scope := urltest.MeasurementScope{
+		URL:      target.ScopeURL,
+		Expected: expected.Canonical(),
+	}
 	testBatch := &urlTestBatch{
 		ctx:      ctx,
 		outbound: outboundManager,
@@ -688,7 +715,7 @@ func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.Out
 		mode:     mode,
 		expected: expected,
 	}
-	testBatch.test(outbounds, link, interval, force)
+	testBatch.test(outbounds, target.RequestURL, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistoryFor(RealTag(outboundGroup, N.NetworkTCP), scope)
