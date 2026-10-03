@@ -613,6 +613,27 @@ func TestSerialReuseSetKeepIdleConnectionsFalseReleases(t *testing.T) {
 	if err := testExchange(transport, "example.com."); err != nil {
 		t.Fatal("a query after disabling keep-alive failed: ", err)
 	}
+
+	// # And the connection that query just used must not be retained either
+	//
+	// This is the half the test used to miss. The call dropped what was idle at that instant,
+	// but Release did not consult the flag, so the very next query - the one above - put its
+	// connection straight back into the pool. The setting then applied only to the moment it was
+	// made, which is not what "keep idle connections: false" means.
+	pool.access.Lock()
+	afterQuery := pool.state.idle.Len()
+	trackedAfterQuery := len(pool.state.all)
+	pool.access.Unlock()
+
+	if afterQuery != 0 {
+		t.Errorf("keep-alive is disabled but the query after disabling it left %d idle "+
+			"connection(s); the setting must apply to every later release, not only to the "+
+			"connections that were idle when it was made", afterQuery)
+	}
+	if trackedAfterQuery != 0 {
+		t.Errorf("keep-alive is disabled but %d connection(s) are still tracked after a query",
+			trackedAfterQuery)
+	}
 }
 
 var _ = M.Socksaddr{}

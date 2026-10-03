@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/sing/common/x/list"
 
@@ -33,6 +34,13 @@ type ConnPool[T comparable] struct {
 	access sync.Mutex
 	closed bool
 	state  *connPoolState[T]
+
+	// keepIdle is the pool's own authority on whether a released connection may be retained.
+	//
+	// It lives here rather than being consulted by each caller because retention is decided in
+	// Release, and a caller that forgot to check would silently keep a socket the transport had
+	// asked to stop keeping. Defaults to true, matching the historical behaviour.
+	keepIdle atomic.Bool
 }
 
 type connPoolState[T comparable] struct {
@@ -68,6 +76,7 @@ func NewConnPool[T comparable](options ConnPoolOptions[T]) *ConnPool[T] {
 		p.sem = semaphore.NewWeighted(int64(options.MaxInflight))
 	}
 	p.state = newConnPoolState[T](options.Mode)
+	p.keepIdle.Store(true)
 	return p
 }
 
@@ -118,7 +127,10 @@ func (p *ConnPool[T]) Release(conn T, reuse bool) {
 		p.options.Close(conn, net.ErrClosed)
 		return
 	}
-	if !reuse || !p.options.IsAlive(conn) {
+	if !reuse || !p.keepIdle.Load() || !p.options.IsAlive(conn) {
+		// keepIdle is checked here, not at the call sites: a transport that disabled keep-idle
+		// must not retain a connection even when the caller asked for reuse, and Release is the
+		// only place that decides retention.
 		p.removeConn(state, conn, net.ErrClosed)
 		p.access.Unlock()
 		p.options.Close(conn, net.ErrClosed)
@@ -133,6 +145,18 @@ func (p *ConnPool[T]) Release(conn T, reuse bool) {
 		}
 	}
 	p.access.Unlock()
+}
+
+// SetKeepIdle reports whether released connections may be retained.
+//
+// Disabling it also drops what is already idle, because the two halves of the request are the
+// same request: from now on, nothing may be kept. Without the flag, Release would put the next
+// connection straight back and the setting would apply only to the instant it was made.
+func (p *ConnPool[T]) SetKeepIdle(keep bool) {
+	p.keepIdle.Store(keep)
+	if !keep {
+		p.CloseIdle()
+	}
 }
 
 func (p *ConnPool[T]) Invalidate(conn T, cause error) {

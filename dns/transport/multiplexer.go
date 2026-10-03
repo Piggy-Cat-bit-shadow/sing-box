@@ -134,6 +134,11 @@ func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 
 func (m *queryMultiplexer) SetKeepIdleConnections(keep bool) {
 	m.keepIdle.Store(keep)
+	// The serial pool owns its own retention decision, so the flag is pushed down rather than
+	// being re-checked at each Release site. Without this, disabling keep-idle dropped the
+	// connections that were idle AT THAT MOMENT while the next query released its connection
+	// straight back into the pool.
+	m.serial.SetKeepIdle(keep)
 	m.closeIdleConnection()
 }
 
