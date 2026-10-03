@@ -170,6 +170,9 @@ func New(options Options) (*Box, error) {
 	})
 	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
 		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
+		// Its own coordinator: a configuration check measures against its own budget and cannot
+		// starve the running Box.
+		ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(C.URLTestConcurrencyLimit))
 	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	var defaultLogWriter io.Writer

@@ -13,10 +13,16 @@ const (
 	ICMPTimeout               = 10 * time.Second
 	DefaultURLTestInterval    = 3 * time.Minute
 	DefaultURLTestIdleTimeout = 30 * time.Minute
-	StartTimeout              = 10 * time.Second
-	StopTimeout               = 5 * time.Second
-	FatalStopTimeout          = 10 * time.Second
-	TLSFragmentFallbackDelay  = 500 * time.Millisecond
+	// URLTestConcurrencyLimit bounds URL-test measurements across one whole Box.
+	//
+	// It matches the per-batch limit, so a configuration with several groups cannot exceed what a
+	// single group was already allowed. The budget matters on a phone: each measurement holds a
+	// socket, a TLS session and buffers, inside a NetworkExtension with roughly 50 MiB to work in.
+	URLTestConcurrencyLimit  = 10
+	StartTimeout             = 10 * time.Second
+	StopTimeout              = 5 * time.Second
+	FatalStopTimeout         = 10 * time.Second
+	TLSFragmentFallbackDelay = 500 * time.Millisecond
 )
 
 var PortProtocols = map[uint16]string{

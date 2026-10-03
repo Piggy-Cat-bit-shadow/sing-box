@@ -168,6 +168,24 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 	ctx, cancelMeasurement = withMeasurementTimeout(ctx, C.TCPTimeout)
 	defer cancelMeasurement()
 
+	// ONE slot per measurement, taken from the Box's coordinator.
+	//
+	// It is acquired HERE rather than by each caller, so every path is bounded by construction:
+	// automatic group checks, Clash delay probes, native single-node tests, generic group tests and
+	// endpoint tests all reach the network through Measure. A caller that had to remember to Acquire
+	// would eventually forget, and the bound would be advisory rather than real.
+	//
+	// The release is deferred before anything else can fail, so a slot cannot leak on an error path.
+	// A context with no coordinator means unbounded, which is what an isolated unit test or a
+	// library caller gets.
+	if coordinator := CoordinatorFromContext(ctx); coordinator != nil {
+		release, acquireErr := coordinator.Acquire(ctx)
+		if acquireErr != nil {
+			return Measurement{}, acquireErr
+		}
+		defer release()
+	}
+
 	normalized, err := NormalizeURLTestURL(options.Link)
 	if err != nil {
 		return Measurement{}, err

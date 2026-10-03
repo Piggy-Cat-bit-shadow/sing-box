@@ -119,6 +119,11 @@ func (s *StartedService) newInstance(ctx context.Context, profileContent string,
 	}
 	urlTestHistoryStorage := urltest.NewHistoryStorage()
 	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
+	// ONE measurement budget for this Box.
+	//
+	// A separate coordinator per Box is what keeps a temporary configuration-check Box from
+	// competing with the running one for slots.
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(C.URLTestConcurrencyLimit))
 	i := &Instance{
 		ctx:                   ctx,
 		cancel:                cancel,
