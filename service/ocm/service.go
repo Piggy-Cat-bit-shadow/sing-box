@@ -234,7 +234,11 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if s.usageTracker != nil {
 		err = s.usageTracker.Load()
 		if err != nil {
-			s.logger.Warn("load usage statistics: ", err)
+			// See service/ccm for why this disables the tracker rather than only warning: Load
+			// empties the in-memory state first, so a failed read followed by a save on close
+			// overwrites the file that could not be read.
+			s.logger.Error("load usage statistics: ", err, ", usage tracking and saving disabled")
+			s.usageTracker = nil
 		}
 	}
 

@@ -210,12 +210,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	}
 	s.credentials = credentials
 
-	if s.usageTracker != nil {
-		err = s.usageTracker.Load()
-		if err != nil {
-			s.logger.Warn("load usage statistics: ", err)
-		}
-	}
+	s.loadUsageTracker()
 
 	router := chi.NewRouter()
 	router.Mount("/", s)
@@ -576,6 +571,28 @@ func (s *Service) handleResponseWithTracking(writer http.ResponseWriter, respons
 			}
 			return
 		}
+	}
+}
+
+// loadUsageTracker loads persisted usage statistics, disabling tracking if the load fails.
+//
+// # Why a failed load disables the tracker rather than only warning
+//
+// Load clears the in-memory combinations BEFORE reading the file, so a failed read leaves the
+// tracker holding empty state. Close then saves that empty state over the file it just failed to
+// read, turning a transient failure - a permission problem, a partially written file, a decode
+// error - into permanent data loss.
+//
+// A service that could not understand the existing contents must not become their new source. The
+// file is left exactly as it was, so it can be inspected or repaired.
+func (s *Service) loadUsageTracker() {
+	if s.usageTracker == nil {
+		return
+	}
+	err := s.usageTracker.Load()
+	if err != nil {
+		s.logger.Error("load usage statistics: ", err, ", usage tracking and saving disabled")
+		s.usageTracker = nil
 	}
 }
 

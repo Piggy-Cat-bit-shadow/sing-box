@@ -99,12 +99,19 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Only start the save loop when the existing cache was understood.
+	//
+	// loadCache removes a cache file it cannot decode, so a failed load leaves nothing to preserve
+	// on disk - but starting the save loop anyway immediately writes a fresh cache built from
+	// zeroed counters, replacing traffic totals the service never managed to read. Disabling
+	// saving keeps the failure visible instead of silently discarding the history.
 	err := s.loadCache()
 	if err != nil {
-		s.logger.Error(E.Cause(err, "load cache"))
+		s.logger.Error("load cache: ", err, ", saving disabled")
+	} else {
+		s.saveTicker = time.NewTicker(1 * time.Minute)
+		go s.loopSaveCache()
 	}
-	s.saveTicker = time.NewTicker(1 * time.Minute)
-	go s.loopSaveCache()
 	if s.tlsConfig != nil {
 		err = s.tlsConfig.Start()
 		if err != nil {
