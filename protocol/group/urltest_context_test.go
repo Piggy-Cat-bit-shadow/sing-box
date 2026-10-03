@@ -397,3 +397,186 @@ func (m *singleOutboundManager) Outbounds() []adapter.Outbound {
 	}
 	return []adapter.Outbound{m.outbound}
 }
+
+// TestWrapperCloseWinsAgainstConcurrentStart is §22/§23.
+//
+// Start constructs a group and then publishes it, with nothing checking whether Close already ran.
+// A Close landing during construction therefore returns success and is then undone: the wrapper owns
+// a live group again, with background work, after it has been closed.
+//
+// The window is widened deterministically by holding the outbound manager's lookup, which Start
+// calls during construction, so Close completes while Start is provably between its detach and its
+// publish.
+func TestWrapperCloseWinsAgainstConcurrentStart(t *testing.T) {
+	node := &observingOutbound{tag: "node-a"}
+	manager := &blockingOutboundManager{
+		outbound: node,
+		entered:  make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(10))
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
+
+	constructed, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("group"), "auto",
+		option.URLTestOutboundOptions{
+			Outbounds: []string{"node-a"},
+			URL:       "https://probe.example/generate_204",
+		})
+	require.NoError(t, err)
+	urlTest := constructed.(*URLTest)
+
+	// Start, parked inside construction.
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- urlTest.Start()
+	}()
+
+	select {
+	case <-manager.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start never reached construction")
+	}
+
+	// Close while Start is provably mid-construction.
+	require.NoError(t, urlTest.Close())
+
+	// Let Start finish publishing.
+	close(manager.release)
+
+	select {
+	case <-startDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start never returned")
+	}
+
+	require.Nil(t, urlTest.currentGroup(),
+		"Close returned and was then undone by a late Start publication: the wrapper owns a live "+
+			"group, with its own ticker and background context, after it has been closed. A closed "+
+			"wrapper must stay closed")
+}
+
+// blockingOutboundManager parks its first lookup so a test can hold Start mid-construction.
+type blockingOutboundManager struct {
+	adapter.OutboundManager
+	outbound adapter.Outbound
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (m *blockingOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	m.once.Do(func() {
+		close(m.entered)
+		<-m.release
+	})
+	if m.outbound != nil && m.outbound.Tag() == tag {
+		return m.outbound, true
+	}
+	return nil, false
+}
+
+func (m *blockingOutboundManager) Outbounds() []adapter.Outbound {
+	if m.outbound == nil {
+		return nil
+	}
+	return []adapter.Outbound{m.outbound}
+}
+
+// TestWrapperMethodsDoNotPanicAfterClose is §26/§27.
+//
+// A closed wrapper has no group, and every entry point dereferenced it. These are API calls a
+// control plane can make at any time, so a panic here is a crash of the management surface.
+func TestWrapperMethodsDoNotPanicAfterClose(t *testing.T) {
+	node := &observingOutbound{tag: "node-a"}
+	manager := &singleOutboundManager{outbound: node}
+
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(10))
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
+
+	constructed, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("group"), "auto",
+		option.URLTestOutboundOptions{
+			Outbounds: []string{"node-a"},
+			URL:       "https://probe.example/generate_204",
+		})
+	require.NoError(t, err)
+	urlTest := constructed.(*URLTest)
+	require.NoError(t, urlTest.Start())
+	require.NoError(t, urlTest.Close())
+
+	require.NotPanics(t, func() {
+		_ = urlTest.PostStart()
+		_, _ = urlTest.URLTest(context.Background())
+		urlTest.CheckOutbounds()
+		urlTest.PerformUpdateCheck()
+		_ = urlTest.MeasurementScope()
+		_ = urlTest.Selected(N.NetworkTCP)
+		_, _ = urlTest.DialContext(context.Background(), N.NetworkTCP, M.Socksaddr{})
+		_, _ = urlTest.ListenPacket(context.Background(), M.Socksaddr{})
+		urlTest.InterfaceUpdated(context.Background())
+	}, "a closed wrapper must be safe to call from a control plane")
+}
+
+// TestWrapperFailedStartLeavesNoGroup is §28.
+func TestWrapperFailedStartLeavesNoGroup(t *testing.T) {
+	manager := &singleOutboundManager{} // resolves nothing
+
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(10))
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
+
+	constructed, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("group"), "auto",
+		option.URLTestOutboundOptions{
+			Outbounds: []string{"missing"},
+			URL:       "https://probe.example/generate_204",
+		})
+	require.NoError(t, err)
+	urlTest := constructed.(*URLTest)
+
+	require.Error(t, urlTest.Start(), "an unresolvable member fails the start")
+	require.Nil(t, urlTest.currentGroup(),
+		"a failed Start must leave no group: a partially constructed wrapper would report itself "+
+			"usable while nothing owns the members")
+}
+
+// TestWrapperRepeatedStartDoesNotLeakPreviousGroup is §28.
+//
+// A second Start must dispose of the first group rather than stranding its ticker and background
+// context, which nothing could then reach.
+func TestWrapperRepeatedStartDoesNotLeakPreviousGroup(t *testing.T) {
+	node := &observingOutbound{tag: "node-a"}
+	manager := &singleOutboundManager{outbound: node}
+
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(10))
+	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
+
+	constructed, err := NewURLTest(ctx, nil, log.NewNOPFactory().NewLogger("group"), "auto",
+		option.URLTestOutboundOptions{
+			Outbounds: []string{"node-a"},
+			URL:       "https://probe.example/generate_204",
+		})
+	require.NoError(t, err)
+	urlTest := constructed.(*URLTest)
+
+	require.NoError(t, urlTest.Start())
+	first := urlTest.currentGroup()
+	require.NotNil(t, first)
+
+	require.NoError(t, urlTest.Start())
+	second := urlTest.currentGroup()
+	require.NotNil(t, second)
+	require.NotSame(t, first, second, "the second Start installs a new group")
+
+	// The first group must have been disposed: its background context is cancelled.
+	select {
+	case <-first.backgroundContext().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replaced group's background context was never cancelled, so its ticker and " +
+			"health work keep running for a group nothing can reach")
+	}
+
+	require.NoError(t, urlTest.Close())
+}

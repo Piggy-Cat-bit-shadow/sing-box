@@ -60,7 +60,16 @@ type URLTest struct {
 	//
 	// An atomic pointer makes every read race-free without putting a lock on the traffic path, which
 	// is the same reasoning already applied to selectedState.
-	group                        atomic.Pointer[URLTestGroup]
+	group atomic.Pointer[URLTestGroup]
+	// lifecycleAccess serialises Start against Close and guards closed.
+	//
+	// It is a separate, short-lived lock: it is held while deciding and publishing, and NEVER while
+	// a group is being constructed or closed. Those run lifecycle callbacks - a group unregisters
+	// pause callbacks and stops a ticker - and holding a lock across one would risk a deadlock if a
+	// callback touched the wrapper.
+	lifecycleAccess sync.Mutex
+	// closed makes the wrapper terminal. A closed wrapper stays closed.
+	closed                       bool
 	checkAccess                  sync.Mutex
 	interruptExternalConnections bool
 }
@@ -96,8 +105,17 @@ func (s *URLTest) Start() error {
 	// Detach the previous group, then close it OUTSIDE any lock.
 	//
 	// Close runs an arbitrary lifecycle callback - the group unregisters pause callbacks and stops a
-	// ticker - so holding a lock across it would risk a deadlock.
-	if previous := s.group.Swap(nil); previous != nil {
+	// ticker - so holding a lock across it would risk a deadlock. The lock is held only to decide and
+	// to detach.
+	s.lifecycleAccess.Lock()
+	if s.closed {
+		s.lifecycleAccess.Unlock()
+		return os.ErrClosed
+	}
+	previous := s.group.Swap(nil)
+	s.lifecycleAccess.Unlock()
+
+	if previous != nil {
 		_ = previous.Close()
 	}
 
@@ -113,19 +131,53 @@ func (s *URLTest) Start() error {
 	if err != nil {
 		return err
 	}
+
+	// Publish ONLY if the wrapper is still live.
+	//
+	// Construction runs outside the lock, so a Close can complete while it is in progress. Without
+	// this re-check, Close returned success and was then undone by this store: the wrapper owned a
+	// live group, with its own ticker and background context, after it had been closed - and nothing
+	// would ever close that group.
+	//
+	// A loser disposes of what it built rather than leaving it to run unreferenced.
+	s.lifecycleAccess.Lock()
+	if s.closed {
+		s.lifecycleAccess.Unlock()
+		_ = group.Close()
+		return os.ErrClosed
+	}
 	s.group.Store(group)
+	s.lifecycleAccess.Unlock()
 	return nil
 }
 
 func (s *URLTest) PostStart() error {
-	s.currentGroup().PostStart()
+	// No group means the wrapper is closed or was never started. Reporting that as an error rather
+	// than returning nil keeps "PostStart succeeded" meaningful: a caller that ignores this would
+	// otherwise believe background work had been started.
+	group := s.currentGroup()
+	if group == nil {
+		return os.ErrClosed
+	}
+	group.PostStart()
 	return nil
 }
 
 func (s *URLTest) Close() error {
-	// Detach atomically, so a concurrent Start cannot publish a group this Close then closes.
+	// Terminal BEFORE detaching, so a Start that is mid-construction cannot publish afterwards.
+	s.lifecycleAccess.Lock()
+	if s.closed {
+		s.lifecycleAccess.Unlock()
+		return nil
+	}
+	s.closed = true
+	detached := s.group.Swap(nil)
+	s.lifecycleAccess.Unlock()
+
+	// Close OUTSIDE the lock: the group runs lifecycle callbacks, and holding the lock across them
+	// would deadlock if a callback touched the wrapper.
 	return common.Close(
-		common.PtrOrNil(s.group.Swap(nil)),
+		common.PtrOrNil(detached),
 	)
 }
 
@@ -189,15 +241,32 @@ func (s *URLTest) References() []string {
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
-	return s.currentGroup().URLTest(ctx)
+	group := s.currentGroup()
+	if group == nil {
+		// A closed wrapper has no measurement to run. Reporting success with no results would tell
+		// the caller the test ran and found nothing, which is a different statement.
+		return nil, os.ErrClosed
+	}
+	return group.URLTest(ctx)
 }
 
 func (s *URLTest) CheckOutbounds() {
-	s.currentGroup().CheckOutbounds(s.ctx, true)
+	// No group means there is nothing to check. A no-op rather than an error: this is called from
+	// lifecycle and refresh paths that ignore the result, and there is no failure a caller could act
+	// on.
+	group := s.currentGroup()
+	if group == nil {
+		return
+	}
+	group.CheckOutbounds(s.ctx, true)
 }
 
 func (s *URLTest) PerformUpdateCheck() {
-	s.currentGroup().performUpdateCheck()
+	group := s.currentGroup()
+	if group == nil {
+		return
+	}
+	group.performUpdateCheck()
 }
 
 func (s *URLTest) InterfaceUpdated(ctx context.Context) {
@@ -482,7 +551,14 @@ func (g *URLTestGroup) PostStart() {
 // than the process-wide display history. Selecting a member from one measurement and showing
 // another's delay is how a UI ends up contradicting the selection it is describing.
 func (s *URLTest) MeasurementScope() urltest.MeasurementScope {
-	return s.currentGroup().scope
+	// A closed wrapper has no scope. Returning the zero value rather than panicking keeps this a
+	// safe read for a display layer, which asks for it to label a group and can legitimately race a
+	// teardown.
+	group := s.currentGroup()
+	if group == nil {
+		return urltest.MeasurementScope{}
+	}
+	return group.scope
 }
 
 // backgroundContext reports the context this group's background work runs on.
@@ -700,7 +776,13 @@ func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]u
 	// services are gone and any result would be written for a group that no longer exists.
 	ctx, cancelOperation, contextErr := g.operationContext(caller)
 	if contextErr != nil {
-		return make(map[string]uint16), nil
+		// A terminal group ran no measurement, so it has no result to report.
+		//
+		// Returning an empty map with a nil error says "the probe completed and every node was
+		// unreachable", which the Clash API serialises as a 200 response body. The background path
+		// discards this value, so only a SYNCHRONOUS caller is affected - and it is exactly the
+		// caller that cannot distinguish an empty result from a failed one.
+		return nil, contextErr
 	}
 	defer cancelOperation()
 

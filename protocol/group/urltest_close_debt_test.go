@@ -205,3 +205,40 @@ func TestRecheckRequestRacingCloseCannotCreateTerminalDebt(t *testing.T) {
 			"attempt %d left a worker responsible for a closed group", attempt)
 	}
 }
+
+// TestClosedGroupSynchronousProbeReportsError is §29/§31.
+//
+// A closed group ran no measurement, so a synchronous caller must not be told the probe succeeded
+// with no results. The Clash API serialises the returned map as the response body, so an empty map
+// with a nil error is a 200 saying "every node is unreachable" for a group that was never measured.
+func TestClosedGroupSynchronousProbeReportsError(t *testing.T) {
+	node := &debtTrackingOutbound{tag: "node-a"}
+	group, _ := newGroupFixture(t, "https://probe.example/generate_204", node)
+
+	require.NoError(t, group.Close())
+
+	result, err := group.URLTest(context.Background())
+
+	require.Error(t, err,
+		"a closed group reported success with an empty result. No measurement ran, so there is no "+
+			"result to report - and a caller cannot distinguish an empty result from a failed one")
+	require.Nil(t, result, "and no result may be presented as a completed measurement")
+
+	require.EqualValues(t, 0, node.dials.Load(),
+		"and nothing may be dialled for a closed group")
+}
+
+// TestClosedGroupBackgroundCheckIsStillSilent keeps the background path unchanged.
+//
+// CheckOutbounds discards its result, so a closed group is simply a no-op there. Only a synchronous
+// caller - the one that can act on the value - is told.
+func TestClosedGroupBackgroundCheckIsStillSilent(t *testing.T) {
+	node := &debtTrackingOutbound{tag: "node-a"}
+	group, _ := newGroupFixture(t, "https://probe.example/generate_204", node)
+	require.NoError(t, group.Close())
+
+	require.NotPanics(t, func() {
+		group.CheckOutbounds(context.Background(), true)
+	})
+	require.EqualValues(t, 0, node.dials.Load())
+}
