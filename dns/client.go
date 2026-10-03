@@ -133,13 +133,43 @@ func (c *Client) newCacheKey(transport adapter.DNSTransport, question dns.Questi
 	}
 }
 
+// finishCacheKey decides whether a response may be stored, and under which environment.
+//
+// # Why an unknown captured environment is not "adopt the current one"
+//
+// A query records its environment when it is SENT. If nothing is known yet the value is 0, and the
+// response is stored later - after a network change, possibly. The previous rule accepted any key
+// whose captured value was 0 and rewrote it with the CURRENT environment:
+//
+//	if environment == key.environment || key.environment == 0 {
+//
+// That relabels an answer produced elsewhere with the identity of the network that is current now,
+// so a query on the new network is answered from a cache entry that was never true there. It is the
+// same class of defect the reverse-mapping path guards against with a generation check.
+//
+// An unknown environment therefore means "cannot be attributed", and the response is not stored.
+// The cost is one uncached answer while the environment is still unknown, which is the safe
+// direction: a cache MISS costs a lookup, a wrong HIT returns an answer about a different network.
 func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey) (dnsCacheKey, bool) {
-	environment := c.environmentHash(transport)
-	if environment == key.environment || key.environment == 0 {
-		key.environment = environment
+	// A transport that does not participate in environments has 0 as its REAL, stable identity.
+	// Distinguishing this from "participates, but nothing is known yet" is what keeps caching
+	// enabled for such transports while refusing to guess for the others.
+	if _, withEnvironment := transport.(adapter.DNSTransportWithEnvironment); !withEnvironment {
 		return key, true
 	}
-	return key, false
+
+	environment := c.environmentHash(transport)
+	if key.environment == 0 {
+		// The query was sent before the environment was known, so the response cannot be
+		// attributed to any network. Storing it under whatever is current now would present an
+		// answer from one network as an answer about another.
+		return key, false
+	}
+	if environment != key.environment {
+		// The network changed while the query was in flight.
+		return key, false
+	}
+	return key, true
 }
 
 func (c *Client) environmentHash(transport adapter.DNSTransport) uint64 {
