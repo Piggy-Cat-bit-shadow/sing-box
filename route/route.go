@@ -1232,6 +1232,30 @@ func resolveLookupName(metadata *adapter.InboundContext) string {
 	if !metadata.Destination.IsIP() {
 		return ""
 	}
+	// A protocol sentinel is not an application domain and must never be resolved.
+	//
+	// # How one gets here
+	//
+	// common/uot.Router recognises the UoT magic address, reads the session header, and then rewrites
+	// the metadata: Domain keeps the magic address to record the flow's provenance, and Destination
+	// becomes the real target. That target is usually a literal IP, which is the shape that makes
+	// this function fall back to metadata.Domain - so without this check the resolver is asked for
+	// "sp.v2.udp-over-tcp.arpa".
+	//
+	// The lookup cannot succeed: it is not a real name, so the query runs to its timeout and the flow
+	// is abandoned before the per-datagram target policy it exists to exercise is ever consulted.
+	//
+	// # Why only the sentinels are excluded
+	//
+	// An IP destination WITH a genuine sniffed domain is a deliberate shape - 4ca74d69f added the
+	// recovery so dual-stack planning can work against the real name - and excluding everything would
+	// revert that fix. Only a value that is a protocol marker rather than a name learned from the
+	// traffic is filtered, which is why the comparison is against the canonical constants and not
+	// against a string pattern.
+	switch metadata.Domain {
+	case uot.MagicAddress, uot.LegacyMagicAddress:
+		return ""
+	}
 	return validSniffedDomain(metadata.Domain)
 }
 

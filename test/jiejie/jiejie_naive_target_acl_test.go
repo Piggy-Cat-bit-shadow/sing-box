@@ -37,10 +37,26 @@ import (
 // ---------------------------------------------------------------------------
 
 type scriptedDNS struct {
-	conn      *net.UDPConn
-	sequence  map[string][]net.IP // name -> answers, last entry repeats
-	queries   atomic.Int64
+	conn     *net.UDPConn
+	sequence map[string][]net.IP // name -> answers, last entry repeats
+	queries  atomic.Int64
+	// names records every question the server was actually asked, in order.
+	//
+	// The count alone cannot distinguish "the flow was abandoned on a DNS timeout" from "the flow
+	// never needed a lookup at all", and that distinction is the whole point of the UoT sentinel
+	// assertions: a magic address reaching the resolver is a bug that a query count reports as
+	// ordinary activity.
+	names     sync.Map // name -> *atomic.Int64
 	answersOf sync.Map // name -> *atomic.Int64 (index consumed)
+}
+
+// queried reports whether the server was ever asked for the given name.
+func (s *scriptedDNS) queried(name string) bool {
+	value, loaded := s.names.Load(name)
+	if !loaded {
+		return false
+	}
+	return value.(*atomic.Int64).Load() > 0
 }
 
 func startScriptedDNS(t *testing.T, script map[string][]net.IP) (*scriptedDNS, string) {
@@ -68,6 +84,10 @@ func (s *scriptedDNS) serve() {
 			return
 		}
 		s.queries.Add(1)
+		if name, _, ok := parseDNSName(buffer[:n], 12); ok {
+			value, _ := s.names.LoadOrStore(name, &atomic.Int64{})
+			value.(*atomic.Int64).Add(1)
+		}
 		response := s.buildResponse(buffer[:n])
 		if response != nil {
 			_, _ = s.conn.WriteToUDP(response, addr)
@@ -759,6 +779,18 @@ func TestJiejieTargetACLUoTV1MultiTargetChecksEachDatagram(t *testing.T) {
 	require.EqualValues(t, 0, forbiddenOrigin.packets.Load(),
 		"a datagram addressed to a different loopback port must not be delivered "+
 			"even after an allowed datagram on the same UoT session")
+
+	// The UoT protocol sentinel must never reach the resolver.
+	//
+	// This is the assertion these ACL tests were missing. They passed whenever the flow was abandoned
+	// on a DNS timeout for the magic address, which from the outside looks identical to "the policy
+	// rejected the target": no packet is delivered either way. Naming the sentinel turns a silent
+	// timeout into a failure instead of a green test.
+	require.False(t, env.dnsServer.queried(uot.MagicAddress),
+		"the UoT magic address was sent to the resolver. It is a protocol marker, not a name: the "+
+			"lookup cannot succeed, and the flow is abandoned before the policy is ever consulted")
+	require.False(t, env.dnsServer.queried(uot.LegacyMagicAddress),
+		"the legacy UoT sentinel was sent to the resolver")
 }
 
 // TestJiejieTargetACLUoTV2ConnectTargetIsChecked covers the v2 Connect form, where
@@ -798,6 +830,64 @@ func TestJiejieTargetACLUoTV2ConnectTargetIsChecked(t *testing.T) {
 		forbiddenOrigin.packets.Load())
 	require.EqualValues(t, 0, forbiddenOrigin.packets.Load(),
 		"a v2 connect session to loopback must not deliver UDP")
+}
+
+// TestJiejieTargetACLUoTDomainTargetStillResolves is the boundary case.
+//
+// Excluding the UoT sentinels must not become "UoT does not resolve". A genuine target domain is a
+// real name, and the resolve rule exists to turn it into an address the policy can be applied to.
+//
+// The two assertions are what make the distinction real:
+//
+//	the sentinel      must NEVER be queried
+//	the target domain must be queried, and then policed by its resolved address
+//
+// Without the second half, a fix that simply disabled resolution for every UoT flow would pass.
+func TestJiejieTargetACLUoTDomainTargetStillResolves(t *testing.T) {
+	env := startACLInstance(t, defaultRejectCIDRs(), true)
+	forbiddenOrigin := startCountingUDPOrigin(t)
+
+	conn := naiveTLSConn(t, env.port)
+	magic := uot.RequestDestination(uot.Version).String()
+	response := naiveWriteConnectOK(t, conn, magic, map[string]string{
+		"Proxy-Authorization": naiveBasicAuth(),
+		"Padding":             "~~~~~~~~",
+	})
+	defer response.Body.Close()
+
+	// The target is a NAME, not an address: forbidden.test is scripted to resolve to loopback, which
+	// the reject rule covers. So the flow must resolve it, and then refuse it.
+	target := metadata.ParseSocksaddr("forbidden.test:" + strconv.Itoa(int(forbiddenOrigin.port())))
+	writer := &sliceWriter{}
+	require.NoError(t, metadata.SocksaddrSerializer.WriteAddrPort(writer, target))
+	_, err := conn.Write(append([]byte{1}, writer.data...))
+	require.NoError(t, err)
+
+	length := make([]byte, 2)
+	binary.BigEndian.PutUint16(length, 4)
+	_, err = conn.Write(append(length, []byte("ping")...))
+	require.NoError(t, err)
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, _ = conn.Read(make([]byte, 64))
+	time.Sleep(300 * time.Millisecond)
+
+	// The target domain WAS resolved - that is the resolve rule doing its job for a real name.
+	require.True(t, env.dnsServer.queried("forbidden.test"),
+		"the UoT target domain was never resolved. Excluding the protocol sentinels must not "+
+			"disable resolution for genuine target names; the resolve rule exists to apply the "+
+			"policy to the address a name maps to")
+
+	// And the sentinel still was not.
+	require.False(t, env.dnsServer.queried(uot.MagicAddress),
+		"the UoT magic address was sent to the resolver")
+	require.False(t, env.dnsServer.queried(uot.LegacyMagicAddress),
+		"the legacy UoT sentinel was sent to the resolver")
+
+	// The resolved address was then policed: forbidden.test maps to loopback, which is rejected.
+	require.EqualValues(t, 0, forbiddenOrigin.packets.Load(),
+		"a UoT target domain that resolves into the rejected CIDR must not deliver. This is the "+
+			"negative half: resolving the name did not bypass the target policy")
 }
 
 // TestJiejieTargetACLUoTV2NonConnectMultiTarget covers v2 without connect, where the
@@ -846,6 +936,18 @@ func TestJiejieTargetACLUoTV2NonConnectMultiTarget(t *testing.T) {
 		forbiddenBefore, forbiddenOrigin.packets.Load())
 	require.EqualValues(t, 0, forbiddenOrigin.packets.Load(),
 		"a v2 non-connect datagram to a different loopback port must not be delivered")
+
+	// The UoT protocol sentinel must never reach the resolver.
+	//
+	// This is the assertion these ACL tests were missing. They passed whenever the flow was abandoned
+	// on a DNS timeout for the magic address, which from the outside looks identical to "the policy
+	// rejected the target": no packet is delivered either way. Naming the sentinel turns a silent
+	// timeout into a failure instead of a green test.
+	require.False(t, env.dnsServer.queried(uot.MagicAddress),
+		"the UoT magic address was sent to the resolver. It is a protocol marker, not a name: the "+
+			"lookup cannot succeed, and the flow is abandoned before the policy is ever consulted")
+	require.False(t, env.dnsServer.queried(uot.LegacyMagicAddress),
+		"the legacy UoT sentinel was sent to the resolver")
 }
 
 // writeUoTDatagramToLoopback frames one v1-style datagram: address, length,
@@ -1107,6 +1209,18 @@ func TestJiejieTargetACLLoopbackIPv6UDPIsRejected(t *testing.T) {
 
 	require.EqualValues(t, 0, received.Load(),
 		"a datagram addressed to IPv6 loopback must not be delivered")
+
+	// The UoT protocol sentinel must never reach the resolver.
+	//
+	// This is the assertion these ACL tests were missing. They passed whenever the flow was abandoned
+	// on a DNS timeout for the magic address, which from the outside looks identical to "the policy
+	// rejected the target": no packet is delivered either way. Naming the sentinel turns a silent
+	// timeout into a failure instead of a green test.
+	require.False(t, env.dnsServer.queried(uot.MagicAddress),
+		"the UoT magic address was sent to the resolver. It is a protocol marker, not a name: the "+
+			"lookup cannot succeed, and the flow is abandoned before the policy is ever consulted")
+	require.False(t, env.dnsServer.queried(uot.LegacyMagicAddress),
+		"the legacy UoT sentinel was sent to the resolver")
 }
 
 // ---------------------------------------------------------------------------
