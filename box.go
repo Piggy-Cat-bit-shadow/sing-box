@@ -112,6 +112,31 @@ func Context(
 	return ctx
 }
 
+// ensureURLTestServices supplies the URL-test services a Box needs, if the caller has not.
+//
+// # The two decisions are INDEPENDENT
+//
+// They were previously nested: the coordinator was created only inside the branch that created a
+// missing HistoryStorage. That coupling failed in both directions.
+//
+//   - HistoryStorage provided, coordinator missing - the common case for a caller that builds its
+//     own Box context - skipped the coordinator entirely, so every measurement in that Box ran
+//     unbounded: several groups, each with ten concurrent probes, with no ceiling.
+//   - Coordinator provided, HistoryStorage missing - the caller's carefully sized limiter was
+//     replaced by a default one, silently discarding the configuration.
+//
+// Each service is now supplied only if absent, and neither is ever overwritten. A caller that has
+// already chosen a limit keeps it; one that has not gets the Box default.
+func ensureURLTestServices(ctx context.Context) context.Context {
+	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
+		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
+	}
+	if urltest.CoordinatorFromContext(ctx) == nil {
+		ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(C.URLTestConcurrencyLimit))
+	}
+	return ctx
+}
+
 func New(options Options) (*Box, error) {
 	createdAt := time.Now()
 	ctx := options.Context
@@ -168,12 +193,7 @@ func New(options Options) (*Box, error) {
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
-	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
-		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
-		// Its own coordinator: a configuration check measures against its own budget and cannot
-		// starve the running Box.
-		ctx = urltest.ContextWithCoordinator(ctx, urltest.NewCoordinator(C.URLTestConcurrencyLimit))
-	}
+	ctx = ensureURLTestServices(ctx)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	var defaultLogWriter io.Writer
 	if platformInterface != nil {
