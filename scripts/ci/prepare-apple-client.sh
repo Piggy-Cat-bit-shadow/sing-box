@@ -216,6 +216,27 @@ if ! python3 "$root/scripts/ci/check-apple-links.py" "$submodule_path"; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 1e. [updater] The upstream update channel is not followed.
+# ---------------------------------------------------------------------------
+# Settings > Update in the pinned client is not informational: it checks
+# api.github.com/repos/SagerNet/sing-box/releases and, on confirmation, downloads that
+# project's macOS package and installs it over this app. A fork build must never replace
+# itself with a different project's binary.
+#
+# The API URL is deliberately NOT repointed at the fork. This fork has no signed,
+# notarised .pkg release for the updater to consume - the Apple workflows produce unsigned
+# IPA/DMG artifacts - so pointing it here would produce a channel that finds nothing while
+# keeping the code path that installs a package. The path is disabled instead, and restored
+# once the fork has a release channel worth following.
+echo "overlay [updater]: upstream update channel disabled"
+python3 "$root/scripts/ci/apply-apple-updater-overlay.py" "$submodule_path"
+
+if ! python3 "$root/scripts/ci/check-apple-updater.py" "$submodule_path"; then
+  echo "prepare-apple-client.sh: the updater overlay did not produce the expected source" >&2
+  exit 1
+fi
+
 # Provenance, so the GitHub Actions log records which client was prepared and where its
 # two product links point. The checker above already proved these values; printing them
 # makes the run auditable without reading the source out of the artifact.
