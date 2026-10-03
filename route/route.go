@@ -453,12 +453,14 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol)
 			}
 		case *R.RuleActionRouteOptions:
-			applyRouteOptionsOverride(&metadata, action)
+			applyRouteOptionsMetadata(&metadata, action)
 		case *R.RuleActionRoute:
-			applyRouteOptionsOverride(&metadata, &action.RuleActionRouteOptions)
+			// Applied before the flow decision, so the metadata canFastBypass inspects matches
+			// what the slow path would have seen.
+			applyRouteOptionsMetadata(&metadata, &action.RuleActionRouteOptions)
 			return r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
 		case *R.RuleActionBypass:
-			applyRouteOptionsOverride(&metadata, &action.RuleActionRouteOptions)
+			applyRouteOptionsMetadata(&metadata, &action.RuleActionRouteOptions)
 			if action.Outbound == "" {
 				if metadata.Destination.IsDomain() || metadata.Destination != packetDestination {
 					return continueResult
@@ -501,7 +503,33 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 	return r.preMatchFlow(ctx, &metadata, packetDestination, nil, "")
 }
 
-func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R.RuleActionRouteOptions) {
+// applyRouteOptionsMetadata applies a route action's options to the connection metadata.
+//
+// # Why this is one function
+//
+// The pre-match path and the full match path both have to apply these options, and they used to do
+// it separately: pre-match applied address, port and UDP timeout, while the full path applied
+// eleven fields. The difference was invisible until the Direct Fast Path started making decisions
+// in pre-match, and then it became a correctness bug - the fast path judged a connection eligible
+// before options such as tls_fragment, udp_connect or a network strategy had been recorded, so a
+// connection the user had explicitly configured took the native path and those options were
+// silently discarded.
+//
+// One implementation means the two paths cannot drift again: a field added here is added for both,
+// and a field that pre-match needs in order to decide correctly cannot be forgotten.
+//
+// It must be called BEFORE any verdict is produced, because its whole purpose is to make the
+// metadata the fast path inspects identical to the metadata the slow path would have seen.
+func applyRouteOptionsMetadata(metadata *adapter.InboundContext, routeOptions *R.RuleActionRouteOptions) {
+	// The original destination is captured before any rewrite, and only the first time: it records
+	// what the application asked for, which later rules must not overwrite.
+	if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
+		metadata.RouteOriginalDestination = metadata.Destination
+	}
+	if routeOptions.OverrideAddress.IsValid() {
+		// A resolved address list belongs to the pre-rewrite destination.
+		metadata.DestinationAddresses = nil
+	}
 	if routeOptions.OverrideAddress.IsValid() {
 		metadata.Destination = M.Socksaddr{
 			Addr: routeOptions.OverrideAddress.Addr,
@@ -518,6 +546,35 @@ func applyRouteOptionsOverride(metadata *adapter.InboundContext, routeOptions *R
 	}
 	if routeOptions.UDPTimeout > 0 {
 		metadata.UDPTimeout = routeOptions.UDPTimeout
+	}
+	if routeOptions.NetworkStrategy != nil {
+		metadata.NetworkStrategy = routeOptions.NetworkStrategy
+	}
+	if len(routeOptions.NetworkType) > 0 {
+		metadata.NetworkType = routeOptions.NetworkType
+	}
+	if len(routeOptions.FallbackNetworkType) > 0 {
+		metadata.FallbackNetworkType = routeOptions.FallbackNetworkType
+	}
+	if routeOptions.FallbackDelay != 0 {
+		metadata.FallbackDelay = routeOptions.FallbackDelay
+	}
+	if routeOptions.UDPDisableDomainUnmapping {
+		metadata.UDPDisableDomainUnmapping = true
+	}
+	if routeOptions.UDPConnect {
+		metadata.UDPConnect = true
+	}
+	if routeOptions.TLSFragment {
+		metadata.TLSFragment = true
+		metadata.TLSFragmentFallbackDelay = routeOptions.TLSFragmentFallbackDelay
+	}
+	if routeOptions.TLSRecordFragment {
+		metadata.TLSRecordFragment = true
+	}
+	if routeOptions.TLSSpoof != "" {
+		metadata.TLSSpoof = routeOptions.TLSSpoof
+		metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
 	}
 }
 
@@ -602,6 +659,13 @@ func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestinati
 	// Connected UDP has its own socket and NAT semantics that this optimisation does not
 	// reproduce. Left on the existing path deliberately.
 	if metadata.UDPConnect {
+		return false
+	}
+
+	// Domain unmapping is performed by the userspace NAT path (splice and conn decide
+	// unidirectional NAT from it). A native bypass never reaches that code, so the option would
+	// be silently ignored for a connection that is not already an IP destination.
+	if metadata.UDPDisableDomainUnmapping {
 		return false
 	}
 
@@ -844,45 +908,7 @@ match:
 		}
 		if routeOptions != nil {
 			// TODO: add nat
-			if (routeOptions.OverrideAddress.IsValid() || routeOptions.OverridePort > 0) && !metadata.RouteOriginalDestination.IsValid() {
-				metadata.RouteOriginalDestination = metadata.Destination
-			}
-			if routeOptions.OverrideAddress.IsValid() {
-				metadata.DestinationAddresses = nil
-			}
-			applyRouteOptionsOverride(metadata, routeOptions)
-			if routeOptions.NetworkStrategy != nil {
-				metadata.NetworkStrategy = routeOptions.NetworkStrategy
-			}
-			if len(routeOptions.NetworkType) > 0 {
-				metadata.NetworkType = routeOptions.NetworkType
-			}
-			if len(routeOptions.FallbackNetworkType) > 0 {
-				metadata.FallbackNetworkType = routeOptions.FallbackNetworkType
-			}
-			if routeOptions.FallbackDelay != 0 {
-				metadata.FallbackDelay = routeOptions.FallbackDelay
-			}
-			if routeOptions.UDPDisableDomainUnmapping {
-				metadata.UDPDisableDomainUnmapping = true
-			}
-			if routeOptions.UDPConnect {
-				metadata.UDPConnect = true
-			}
-			if routeOptions.UDPTimeout > 0 {
-				metadata.UDPTimeout = routeOptions.UDPTimeout
-			}
-			if routeOptions.TLSFragment {
-				metadata.TLSFragment = true
-				metadata.TLSFragmentFallbackDelay = routeOptions.TLSFragmentFallbackDelay
-			}
-			if routeOptions.TLSRecordFragment {
-				metadata.TLSRecordFragment = true
-			}
-			if routeOptions.TLSSpoof != "" {
-				metadata.TLSSpoof = routeOptions.TLSSpoof
-				metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
-			}
+			applyRouteOptionsMetadata(metadata, routeOptions)
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
