@@ -308,5 +308,35 @@ func (h *Outbound) CanBypass(network string, destination netip.Addr) bool {
 	if destination.Zone() != "" {
 		return false
 	}
+	// Global network policy applies to this dialer even when the outbound itself is plain.
+	//
+	// isEmpty only describes the outbound's own options. The DefaultDialer additionally inherits
+	// from the NetworkManager: a default bind interface adds a socket bind, a routing mark adds a
+	// mark wrapper, and a default network strategy/type/fallback adds interface selection. A
+	// native bypass performs none of those - it is the platform's own connect - so a connection
+	// that would have been bound, marked or steered would silently lose that policy.
+	//
+	// isMyLoopbackAddress is checked last because it consults the live address list, making it the
+	// only part of this method that touches state beyond the outbound.
+	if h.hasGlobalNetworkPolicy() {
+		return false
+	}
 	return !h.isMyLoopbackAddress(destination)
+}
+
+// hasGlobalNetworkPolicy reports whether the network manager imposes policy this dialer inherits.
+//
+// A nil manager means no global policy exists to lose, which is the case in tests and in builds
+// without one. Anything set means the userspace dialer would have applied it.
+func (h *Outbound) hasGlobalNetworkPolicy() bool {
+	if h.network == nil {
+		return false
+	}
+	defaults := h.network.DefaultOptions()
+	return defaults.BindInterface != "" ||
+		defaults.RoutingMark != 0 ||
+		defaults.NetworkStrategy != nil ||
+		len(defaults.NetworkType) > 0 ||
+		len(defaults.FallbackNetworkType) > 0 ||
+		defaults.FallbackDelay != 0
 }
