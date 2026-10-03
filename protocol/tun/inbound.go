@@ -558,11 +558,51 @@ func (t *Inbound) InterfaceUpdated(ctx context.Context) {
 }
 
 func (t *Inbound) Close() error {
+	// Release the route-set callbacks BEFORE tearing anything down.
+	//
+	// Start registers t.updateRouteAddressSet on every route and exclude rule-set and stores the
+	// returned elements, but nothing used to release them. The callback closes over this *Inbound,
+	// so a rule-set kept a reference to a closed inbound and would call into it on the next
+	// update - reading fields the Close below has already invalidated. The stored element slice
+	// made the omission look handled: the bookkeeping existed, only the release was missing.
+	//
+	// Releasing first also means the rule-set can never fire between the teardown and the release.
+	t.releaseRouteSetCallbacks()
+
 	return common.Close(
 		t.tunStack,
 		t.tunIf,
 		t.autoRedirect,
 	)
+}
+
+// releaseRouteSetCallbacks unregisters everything Start registered and clears the stored elements.
+//
+// Clearing them is what makes Close idempotent: a second call finds nothing to release and cannot
+// hand the same element to UnregisterCallback twice, which would corrupt the rule-set's list.
+func (t *Inbound) releaseRouteSetCallbacks() {
+	// Take the elements under the lock, then release them OUTSIDE it.
+	//
+	// UnregisterCallback takes the rule-set's own lock. Holding this inbound's lock across that
+	// call would order the two locks for no benefit, and a rule-set that ever grew a reason to
+	// read back from the inbound would deadlock.
+	t.routeAddressSetAccess.Lock()
+	routeCallbacks := t.routeRuleSetCallback
+	excludeCallbacks := t.routeExcludeRuleSetCallback
+	t.routeRuleSetCallback = nil
+	t.routeExcludeRuleSetCallback = nil
+	t.routeAddressSetAccess.Unlock()
+
+	for index, ruleSet := range t.routeRuleSet {
+		if index < len(routeCallbacks) && routeCallbacks[index] != nil {
+			ruleSet.UnregisterCallback(routeCallbacks[index])
+		}
+	}
+	for index, ruleSet := range t.routeExcludeRuleSet {
+		if index < len(excludeCallbacks) && excludeCallbacks[index] != nil {
+			ruleSet.UnregisterCallback(excludeCallbacks[index])
+		}
+	}
 }
 
 // JudgeFlow decides what happens to a new flow at the TUN boundary.
