@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/logger"
 
 	"github.com/stretchr/testify/require"
 )
@@ -67,6 +68,7 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 
 	// Seed a stable environment, as a device that has been up for a while would have.
 	manager.networkEnvironment = 0x1111
@@ -118,6 +120,7 @@ func TestUnchangedEnvironmentDoesNotResetOnEveryUpdate(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 
 	// First call settles the environment to whatever this host reports.
 	manager.updateNetworkEnvironment()
@@ -151,6 +154,7 @@ func TestEnvironmentTransitionDoesNotDeadlockTheLockHoldingPath(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 
 	done := make(chan struct{})
 	go func() {
@@ -188,6 +192,7 @@ func TestConcurrentEnvironmentTransitionsAreSerialised(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 	manager.networkEnvironment = 0x2222
 
 	var waitGroup sync.WaitGroup
@@ -242,17 +247,11 @@ func TestEnvironmentRecomputeDoesNotHoldItsLockAcrossTheReset(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 
 	// Stand in for Close: hold the reset lock so the boundary cannot proceed.
 	manager.resetRunAccess.Lock()
 	defer manager.resetRunAccess.Unlock()
-	defer func() {
-		manager.environmentUpdateAccess.Lock()
-		if manager.environmentUpdateTimer != nil {
-			manager.environmentUpdateTimer.Stop()
-		}
-		manager.environmentUpdateAccess.Unlock()
-	}()
 
 	// The recompute phase must finish and let go of its lock.
 	recomputed := make(chan struct{})
@@ -316,6 +315,7 @@ func TestInterfacePathTakesTheInnerResetForATransition(t *testing.T) {
 	startedCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager.startedCtx = startedCtx
+	manager.logger = logger.NOP()
 
 	// The interface path's critical section, exactly as updateInterface takes it.
 	manager.resetRunAccess.Lock()

@@ -61,7 +61,6 @@ type NetworkManager struct {
 	networkEnvironment      uint64
 	stateAccess             sync.RWMutex
 	environmentUpdateAccess sync.Mutex
-	environmentUpdateTimer  *time.Timer
 	startedCtx              context.Context
 	interfaceUpdateAccess   sync.Mutex
 	interfaceUpdateCancel   context.CancelFunc
@@ -159,14 +158,8 @@ func (r *NetworkManager) Start(stage adapter.StartStage, scope *adapter.Scope) e
 	switch stage {
 	case adapter.StartStateInitialize:
 		r.router = service.FromContext[adapter.Router](r.ctx)
-		scope.Add(func() error {
-			r.environmentUpdateAccess.Lock()
-			if r.environmentUpdateTimer != nil {
-				r.environmentUpdateTimer.Stop()
-			}
-			r.environmentUpdateAccess.Unlock()
-			return nil
-		})
+		// Nothing to cancel for the environment boundary: it is established synchronously by the
+		// event that causes it, so there is no pending timer that could fire after teardown.
 		if r.networkMonitor != nil {
 			monitor.Start("initialize network monitor")
 			err := r.networkMonitor.Start()
@@ -448,33 +441,79 @@ func (r *NetworkManager) WIFIState() adapter.WIFIState {
 	return r.wifiState
 }
 
-func (r *NetworkManager) onWIFIStateChanged(state adapter.WIFIState) {
+// publishWIFIState stores the new Wi-Fi state and reports whether it actually changed.
+//
+// It deliberately does NOT establish the environment boundary. A Wi-Fi change moves the environment
+// fingerprint, so a boundary is owed - but the boundary is a reset, and one of this function's callers
+// (updateInterface) already holds resetRunAccess while another (the monitor callback) does not.
+// Splitting "publish" from "establish the boundary" is what lets each caller use the form its lock
+// context allows, instead of one of them having to guess.
+func (r *NetworkManager) publishWIFIState(state adapter.WIFIState) bool {
 	state.BSSID = adapter.NormalizeWIFIBSSID(state.BSSID)
 	r.stateAccess.Lock()
-	if state != r.wifiState {
-		r.wifiState = state
-		r.stateAccess.Unlock()
-		r.postUpdateNetworkEnvironment()
-		if state.SSID != "" {
-			r.logger.Info("WIFI state changed: SSID=", state.SSID, ", BSSID=", state.BSSID)
-		} else {
-			r.logger.Info("WIFI disconnected")
-		}
+	defer r.stateAccess.Unlock()
+	if state == r.wifiState {
+		return false
+	}
+	r.wifiState = state
+	return true
+}
+
+// onWIFIStateChanged is the entry for callers that do NOT hold resetRunAccess - the Wi-Fi monitor
+// callback. It establishes the boundary itself, through the exported self-locking reset.
+func (r *NetworkManager) onWIFIStateChanged(state adapter.WIFIState) {
+	if !r.publishWIFIState(state) {
+		return
+	}
+	r.logWIFIState(state)
+	r.postUpdateNetworkEnvironment()
+}
+
+// logWIFIState reports the change at the same level the previous implementation used.
+func (r *NetworkManager) logWIFIState(state adapter.WIFIState) {
+	if state.SSID != "" {
+		r.logger.Info("WIFI state changed: SSID=", state.SSID, ", BSSID=", state.BSSID)
 	} else {
-		r.stateAccess.Unlock()
+		r.logger.Info("WIFI disconnected")
 	}
 }
 
+// UpdateWIFIState is the entry for callers that do NOT hold resetRunAccess.
 func (r *NetworkManager) UpdateWIFIState(ctx context.Context) {
-	var state adapter.WIFIState
-	if r.wifiMonitor != nil {
-		state = r.wifiMonitor.ReadWIFIState(ctx)
-	} else if r.platformInterface != nil && r.platformInterface.UsePlatformWIFIMonitor() {
-		state = r.platformInterface.ReadWIFIState(ctx)
-	} else {
+	state, loaded := r.readWIFIState(ctx)
+	if !loaded {
 		return
 	}
 	r.onWIFIStateChanged(state)
+}
+
+// updateWIFIStateLocked is the entry for a caller that DOES hold resetRunAccess.
+//
+// It publishes the state without taking a boundary: the caller is responsible for establishing one,
+// because it holds the reset lock and must not ask for it again. Reading the state and publishing it
+// are both done here so the caller's ordering is unchanged.
+func (r *NetworkManager) updateWIFIStateLocked(ctx context.Context) {
+	state, loaded := r.readWIFIState(ctx)
+	if !loaded {
+		return
+	}
+	if !r.publishWIFIState(state) {
+		return
+	}
+	r.logWIFIState(state)
+	// No boundary here. updateInterface recomputes the environment after this call and establishes a
+	// single boundary covering both the Wi-Fi move and any pending interface reset.
+}
+
+// readWIFIState reads the current Wi-Fi state from whichever monitor is configured.
+func (r *NetworkManager) readWIFIState(ctx context.Context) (adapter.WIFIState, bool) {
+	if r.wifiMonitor != nil {
+		return r.wifiMonitor.ReadWIFIState(ctx), true
+	}
+	if r.platformInterface != nil && r.platformInterface.UsePlatformWIFIMonitor() {
+		return r.platformInterface.ReadWIFIState(ctx), true
+	}
+	return adapter.WIFIState{}, false
 }
 
 // ResetNetwork runs a network reset, serialised against every other one.
@@ -611,21 +650,49 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 		}
 	}
 	r.logger.Info("updated default interface ", defaultInterface.Name, ", ", strings.Join(options, ", "))
-	r.UpdateWIFIState(ctx)
+	// The Wi-Fi state is read through the monitor. A CHANGE in it moves the environment fingerprint,
+	// but this function must NOT let that take its own boundary: updateInterface already holds
+	// resetRunAccess, and the boundary is a reset. Establishing it from inside here would ask for the
+	// lock this goroutine is holding - a self-deadlock, since sync.Mutex is not reentrant - and it
+	// would also reset before this function has decided about the pending interface reset.
+	//
+	// So the state is published without a boundary, and the single decision below takes one reset
+	// covering both reasons.
+	r.updateWIFIStateLocked(ctx)
 	if ctx.Err() != nil {
 		return
 	}
-	// The locked form: this function holds resetRunAccess (taken above), and the boundary it may
-	// establish resets the network. Calling the exported, self-locking entry from here would
-	// self-deadlock, because sync.Mutex is not reentrant.
-	r.updateNetworkEnvironmentLocked(ctx)
-	r.interfaceUpdateAccess.Lock()
-	resetNetwork := ctx.Err() == nil && r.networkResetPending
-	if resetNetwork {
-		r.networkResetPending = false
+	// One decision, one reset.
+	//
+	// Two independent reasons can call for a reset here, and they describe the SAME physical
+	// transition: an interface change sets networkResetPending AND usually moves the environment
+	// fingerprint with it. Deciding them separately reset the network twice for one event, tearing
+	// down pooled connections a second time with no second event behind it.
+	//
+	// The recompute runs first because it is what answers "did the environment move", and it must
+	// NOT take the reset itself - the boundary is taken once, below, under this function's lock.
+	//
+	// The locked form throughout: this function holds resetRunAccess (taken above), and the boundary
+	// resets the network. Calling the exported, self-locking entry from here would self-deadlock,
+	// because sync.Mutex is not reentrant.
+	environmentChanged := r.recomputeNetworkEnvironment()
+
+	// Consume the pending flag only if THIS update is the one that will act on it.
+	//
+	// A newer interface notification cancels this update's context and arms the flag for itself. If a
+	// cancelled update cleared the flag anyway, that newer transition would be dropped: its own update
+	// would find nothing pending and skip the reset it exists to perform.
+	resetNetwork := false
+	if ctx.Err() == nil {
+		r.interfaceUpdateAccess.Lock()
+		if r.networkResetPending {
+			r.networkResetPending = false
+			resetNetwork = true
+		}
+		r.interfaceUpdateAccess.Unlock()
 	}
-	r.interfaceUpdateAccess.Unlock()
-	if resetNetwork {
+
+	if environmentChanged || resetNetwork {
 		r.resetNetworkLocked(ctx)
 	}
 }

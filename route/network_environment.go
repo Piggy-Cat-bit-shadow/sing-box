@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common"
@@ -18,37 +17,48 @@ func (r *NetworkManager) NetworkEnvironment() uint64 {
 	return r.networkEnvironment
 }
 
+// postUpdateNetworkEnvironment recomputes the environment and establishes the boundary NOW.
+//
+// # Why there is no debounce
+//
+// It used to defer both by a second, coalescing bursts of notifications. That made the boundary a
+// latency detail, and it is not one: the boundary is what re-pins each transport's cache namespace to
+// the network it is actually on. During the delay the pin still named the old network while the
+// transports were already free to re-dial on the new one - they acquire from a pool and dial through
+// the dialer when a connection is invalidated - so a new network's answer could be filed under the
+// old network's namespace with no timer ever becoming involved.
+//
+// # What absorbs the bursts instead
+//
+// The recompute is what decides whether anything happened: it compares the fingerprint and does
+// nothing when it is unchanged. A burst of repeated notifications therefore costs a hash comparison
+// and no teardown, which is the same protection the timer provided, without a window in which the
+// boundary is owed but not yet taken.
+//
+// # Locking
+//
+// None of this function's callers holds resetRunAccess - the network monitor callback, the interface
+// list refresh, and the Wi-Fi state change all arrive without it - so the exported, self-locking
+// reset is the correct form here. updateInterface, which DOES hold the lock, does not come through
+// this function: it recomputes and establishes the boundary itself, inline, under the lock it
+// already has.
 func (r *NetworkManager) postUpdateNetworkEnvironment() {
-	r.environmentUpdateAccess.Lock()
-	defer r.environmentUpdateAccess.Unlock()
-	if r.environmentUpdateTimer == nil {
-		r.environmentUpdateTimer = time.AfterFunc(time.Second, r.updateNetworkEnvironment)
-	} else {
-		r.environmentUpdateTimer.Reset(time.Second)
-	}
+	r.updateNetworkEnvironment()
 }
 
 // updateNetworkEnvironment refreshes the fingerprint and, on a real transition, establishes the
 // transport/generation boundary.
 //
-// It is the ENTRY POINT FOR CALLERS THAT DO NOT HOLD resetRunAccess - the debounced timer, which
-// runs from an AfterFunc goroutine with no reset lock at all. updateInterface, which holds
-// resetRunAccess for a wider critical section, calls updateNetworkEnvironmentLocked instead: taking
-// the exported form here would self-deadlock, because sync.Mutex is not reentrant.
+// It is the ENTRY POINT FOR CALLERS THAT DO NOT HOLD resetRunAccess - the network monitor callback,
+// the interface list refresh, and the Wi-Fi state change all arrive without it. updateInterface, which
+// holds resetRunAccess for a wider critical section, does not come through here: it recomputes and
+// establishes its boundary inline, so that one interface update produces one reset. Taking the
+// exported form from a lock holder would self-deadlock, because sync.Mutex is not reentrant.
 func (r *NetworkManager) updateNetworkEnvironment() {
 	if !r.recomputeNetworkEnvironment() {
 		return
 	}
 	r.boundEnvironmentTransitionExported()
-}
-
-// updateNetworkEnvironmentLocked is the same operation for a caller that already holds
-// resetRunAccess. It must use the inner reset, for the reason above.
-func (r *NetworkManager) updateNetworkEnvironmentLocked(ctx context.Context) {
-	if !r.recomputeNetworkEnvironment() {
-		return
-	}
-	r.boundEnvironmentTransitionLocked(ctx)
 }
 
 // recomputeNetworkEnvironment refreshes the fingerprint and reports whether it changed.
@@ -62,9 +72,6 @@ func (r *NetworkManager) updateNetworkEnvironmentLocked(ctx context.Context) {
 func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	r.environmentUpdateAccess.Lock()
 	defer r.environmentUpdateAccess.Unlock()
-	if r.environmentUpdateTimer != nil {
-		r.environmentUpdateTimer.Stop()
-	}
 	var defaultInterface *adapter.NetworkInterface
 	if r.interfaceMonitor != nil {
 		defaultInterface = r.DefaultNetworkInterface()
@@ -118,10 +125,25 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	changed := environmentHash != r.networkEnvironment
 	r.networkEnvironment = environmentHash
 	r.stateAccess.Unlock()
-	if !changed || len(options) == 0 {
+	if !changed {
 		return false
 	}
-	r.logger.Info("updated network environment: ", strings.Join(options, ", "))
+	// A zero fingerprint is a real environment, not a missing reading.
+	//
+	// The hash is built from the default interface's gateways, the Wi-Fi SSID, or the gateway
+	// hardware addresses, so it is zero exactly when the device has no default interface, no gateways
+	// and no SSID - a disconnected network, or one whose link is down. The value is PUBLISHED as the
+	// environment either way, which is what makes skipping the boundary here an inconsistency: the
+	// manager would report "not the previous network" while the transports stayed pinned to it, so a
+	// transport re-dialling as the device comes back up on the next network would file that network's
+	// answers under the old namespace. Returning early for an empty fingerprint meant exactly that
+	// transition - the one where the old network is definitively gone - was the only one without a
+	// boundary.
+	if len(options) > 0 {
+		r.logger.Info("updated network environment: ", strings.Join(options, ", "))
+	} else {
+		r.logger.Info("updated network environment: no default interface, gateways or SSID")
+	}
 
 	return true
 }
