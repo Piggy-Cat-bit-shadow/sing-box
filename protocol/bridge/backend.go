@@ -48,29 +48,72 @@ type backendBase struct {
 	session       adapter.BridgeSession
 	currentEgress string
 
+	// indexAccess guards indexAcquired and index, so claiming and releasing a global slot is
+	// idempotent rather than dependent on how many times Start and Close are called.
+	indexAccess   sync.Mutex
+	indexAcquired bool
+
 	closeOnce sync.Once
 	closed    chan struct{}
 	readDone  chan struct{}
 }
 
+// init records the configuration. It deliberately acquires NOTHING.
+//
+// # Why the index is not claimed here
+//
+// A constructor does not own a running resource, and nothing ever closes an object that failed to
+// be built: when a later part of startup fails, the object is discarded and Close is never called.
+// Claiming a process-global slot in the constructor therefore leaked it permanently on every
+// startup failure, and enough failures made bridge creation fail with a limit error the
+// configuration had never reached.
+//
+// The index is claimed by acquireIndex, which Start calls and whose failure path releases it.
 func (b *backendBase) init(ctx context.Context, logger logger.ContextLogger, networkManager adapter.NetworkManager, tag string, options option.BridgeOutboundOptions) error {
-	index, err := allocateBridgeIndex()
-	if err != nil {
-		return err
-	}
 	b.ctx = ctx
 	b.logger = logger
 	b.networkManager = networkManager
 	b.tag = tag
-	b.index = index
 	b.bridgeName = options.BridgeName
 	if b.bridgeName == "" {
 		b.bridgeName = "bridge"
 	}
 	b.boundInterface = options.Interface
+	return nil
+}
+
+// acquireIndex claims this bridge's global slot and the addresses derived from it.
+//
+// It is safe to call more than once: only the first call allocates, so a repeated Start cannot
+// consume a second slot. It runs under indexAccess so the "already acquired" test and the claim are
+// one operation.
+func (b *backendBase) acquireIndex() error {
+	b.indexAccess.Lock()
+	defer b.indexAccess.Unlock()
+	if b.indexAcquired {
+		return nil
+	}
+	index, err := allocateBridgeIndex()
+	if err != nil {
+		return err
+	}
+	b.index = index
+	b.indexAcquired = true
 	b.inet4Port = addressAt(bridgeInet4Base, index)
 	b.inet6Port = addressAt(bridgeInet6Base, index)
 	return nil
+}
+
+// releaseIndex returns the slot. It is safe to call more than once, so a failed Start followed by
+// Close cannot release a slot twice - which would free a slot another bridge may have taken.
+func (b *backendBase) releaseIndex() {
+	b.indexAccess.Lock()
+	defer b.indexAccess.Unlock()
+	if !b.indexAcquired {
+		return
+	}
+	b.indexAcquired = false
+	releaseBridgeIndex(b.index)
 }
 
 func (b *backendBase) PortAddresses() (netip.Addr, netip.Addr) {

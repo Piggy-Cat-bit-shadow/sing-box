@@ -65,6 +65,14 @@ func (b *backendLinux) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	// Claim the global slot HERE, not in the constructor.
+	//
+	// This is the first point at which the object owns a running resource, and it is the point the
+	// failure path below can undo: a constructor has no such path, so a slot claimed there was lost
+	// whenever startup failed afterwards.
+	if err := b.acquireIndex(); err != nil {
+		return err
+	}
 	err := b.start()
 	if err != nil {
 		b.Close()
@@ -240,7 +248,7 @@ func (b *backendLinux) Close() error {
 			restoreBridgeForwarding(b.forwardingRestore)
 			b.forwardingRestore = nil
 		}
-		releaseBridgeIndex(b.index)
+		b.releaseIndex()
 	})
 	return nil
 }
