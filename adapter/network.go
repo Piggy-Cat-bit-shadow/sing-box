@@ -40,6 +40,28 @@ type NetworkManager interface {
 	ReleaseMemory(ctx context.Context)
 }
 
+// NetworkResetCounter is implemented by a network manager that can report how many network resets
+// have run.
+//
+// # Why this is a counter and not a timestamp
+//
+// A pre-reset network operation - a dial, a listen - can succeed after the network has changed. The
+// only way to tell whether the connection it produced still belongs to the current network is to
+// compare the epoch it STARTED in against the epoch that is current when ownership is handed over.
+// A timestamp cannot do that: two resets in quick succession, or a reset that happens to fall in the
+// same clock tick, would be indistinguishable.
+//
+// # Why it is optional
+//
+// It is a capability rather than a method on NetworkManager. Every implementation and every test mock
+// would otherwise have to grow a counter it does not care about, and a manager that cannot report an
+// epoch is one where the ownership check simply does not apply - which is the correct degradation,
+// not a compile error.
+type NetworkResetCounter interface {
+	// NetworkResetGeneration returns a value that increases on every completed network reset.
+	NetworkResetGeneration() uint64
+}
+
 type NetworkOptions struct {
 	BindInterface        string
 	RoutingMark          uint32

@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,8 +70,14 @@ type NetworkManager struct {
 	interfaceUpdateCancel   context.CancelFunc
 	networkResetPending     bool
 	resetRunAccess          sync.Mutex
-	powerUpdateAccess       sync.Mutex
-	powerUpdateCancel       context.CancelFunc
+	// networkResetGeneration increases on every completed network reset.
+	//
+	// It is the epoch a pre-reset network operation is compared against: an operation that began
+	// before a reset must not hand a connection to a caller after it, because that connection
+	// belongs to the network that has been left.
+	networkResetGeneration atomic.Uint64
+	powerUpdateAccess      sync.Mutex
+	powerUpdateCancel      context.CancelFunc
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -525,8 +532,24 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 	r.resetNetworkLocked(ctx)
 }
 
+// NetworkResetGeneration reports how many network resets have completed.
+//
+// Read by the dialer to decide whether a connection it just produced still belongs to the network it
+// was dialled for. See adapter.NetworkResetCounter.
+func (r *NetworkManager) NetworkResetGeneration() uint64 {
+	return r.networkResetGeneration.Load()
+}
+
 // resetNetworkLocked performs the reset. Callers must hold resetRunAccess.
 func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
+	// The epoch advances FIRST, making the reset a boundary from its first instruction.
+	//
+	// A network operation that began before this point is stale the moment the reset starts, rather
+	// than only once it finishes. Advancing at the end would leave an interval in which a dial that
+	// began on the old network completes, is compared against the still-current old epoch, and is
+	// accepted - the same window the DNS generation barrier exists to close.
+	r.networkResetGeneration.Add(1)
+
 	if r.connectionManager != nil {
 		r.connectionManager.CloseAll()
 	}

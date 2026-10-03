@@ -31,17 +31,23 @@ var (
 )
 
 type DefaultDialer struct {
-	dialer4                tfo.Dialer
-	dialer6                tfo.Dialer
-	udpDialer4             net.Dialer
-	udpDialer6             net.Dialer
-	udpListener            net.ListenConfig
-	udpAddr4               string
-	udpAddr6               string
-	netns                  string
-	autoDetectBindFunc     control.Func
-	connectionManager      adapter.ConnectionManager
-	networkManager         adapter.NetworkManager
+	dialer4            tfo.Dialer
+	dialer6            tfo.Dialer
+	udpDialer4         net.Dialer
+	udpDialer6         net.Dialer
+	udpListener        net.ListenConfig
+	udpAddr4           string
+	udpAddr6           string
+	netns              string
+	autoDetectBindFunc control.Func
+	connectionManager  adapter.ConnectionManager
+	networkManager     adapter.NetworkManager
+	// networkEpoch reports the completed network reset count, when the manager can provide one.
+	//
+	// A dial that begins before a reset can succeed after it. That connection belongs to the network
+	// which has been left, and the only way to notice is to compare the epoch it started in against
+	// the epoch that is current when ownership is handed to the caller.
+	networkEpoch           func() uint64
 	powerManager           *powerreport.Manager
 	outboundManager        adapter.OutboundManager
 	dnsTransportManager    adapter.DNSTransportManager
@@ -66,6 +72,14 @@ type DefaultDialer struct {
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
 	connectionManager := service.FromContext[adapter.ConnectionManager](ctx)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+
+	// An optional capability rather than a method on NetworkManager: a manager that cannot report an
+	// epoch is one where this check does not apply, and every mock would otherwise have to grow a
+	// counter it has no use for.
+	var networkEpoch func() uint64
+	if counter, isCounter := networkManager.(adapter.NetworkResetCounter); isCounter {
+		networkEpoch = counter.NetworkResetGeneration
+	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 
 	var (
@@ -253,6 +267,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		autoDetectBindFunc:     autoDetectBindFunc,
 		connectionManager:      connectionManager,
 		networkManager:         networkManager,
+		networkEpoch:           networkEpoch,
 		familyHealth:           newFamilyHealth(),
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		outboundManager:        service.FromContext[adapter.OutboundManager](ctx),
@@ -287,6 +302,10 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 	} else if address.IsDomain() {
 		return nil, E.New("domain not resolved")
 	}
+	// Captured before any raw work, so a reset landing anywhere between here and the ownership
+	// handover is detected. Capturing after the dial would let a reset slip in before the capture and
+	// make a connection from the previous network look current.
+	epochCurrent := d.captureEpoch()
 	if d.networkStrategy == nil {
 		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
@@ -303,13 +322,26 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 				return DialSlowContext(&d.dialer6, ctx, network, address)
 			}
 		})
-		return d.trackConn(ctx, address, conn, err)
+		tracked, trackErr := d.trackConn(ctx, address, conn, err)
+		if trackErr != nil {
+			return nil, trackErr
+		}
+		return d.stillCurrentEpoch(epochCurrent, tracked)
 	} else {
-		return d.DialParallelInterface(ctx, network, address, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
+		return d.dialParallelInterfaceEpoch(ctx, network, address, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay, epochCurrent)
 	}
 }
 
+// DialParallelInterface dials across the configured interfaces, racing them.
+//
+// The epoch is captured here rather than by the caller because this is a public entry point: a
+// production dial through a network strategy arrives directly, and a connection it produced belongs
+// to the network it was dialled for just as much as one from DialContext.
 func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network string, address M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+	return d.dialParallelInterfaceEpoch(ctx, network, address, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, d.captureEpoch())
+}
+
+func (d *DefaultDialer) dialParallelInterfaceEpoch(ctx context.Context, network string, address M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration, epochCurrent func() bool) (net.Conn, error) {
 	if strategy == nil {
 		strategy = d.networkStrategy
 	}
@@ -354,10 +386,16 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	if !fastFallback && !isPrimary {
 		d.networkLastFallback.Store(time.Now())
 	}
-	return d.trackConn(ctx, address, conn, nil)
+	tracked, trackErr := d.trackConn(ctx, address, conn, nil)
+	if trackErr != nil {
+		return nil, trackErr
+	}
+	return d.stillCurrentEpoch(epochCurrent, tracked)
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	// Captured before the socket is created, for the same reason as a dial.
+	epochCurrent := d.captureEpoch()
 	if d.networkStrategy == nil {
 		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
@@ -377,9 +415,13 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 				return listenConfig.ListenPacket(ctx, N.NetworkUDP, d.udpAddr4)
 			}
 		})
-		return d.trackPacketConn(ctx, destination, packetConn, err)
+		tracked, trackErr := d.trackPacketConn(ctx, destination, packetConn, err)
+		if trackErr != nil {
+			return nil, trackErr
+		}
+		return d.stillCurrentEpochPacketConn(epochCurrent, tracked)
 	} else {
-		return d.ListenSerialInterfacePacket(ctx, destination, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
+		return d.listenSerialInterfacePacketEpoch(ctx, destination, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay, epochCurrent)
 	}
 }
 
@@ -391,7 +433,16 @@ func (d *DefaultDialer) DialerForICMPDestination(destination netip.Addr) net.Dia
 	}
 }
 
+// ListenSerialInterfacePacket binds a socket to a chosen interface.
+//
+// Like DialParallelInterface this is a public entry point, so it captures its own epoch: a caller
+// that arrives here directly gets the same ownership guarantee as one that arrived through
+// ListenPacket.
 func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, error) {
+	return d.listenSerialInterfacePacketEpoch(ctx, destination, strategy, interfaceType, fallbackInterfaceType, fallbackDelay, d.captureEpoch())
+}
+
+func (d *DefaultDialer) listenSerialInterfacePacketEpoch(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration, epochCurrent func() bool) (net.PacketConn, error) {
 	if strategy == nil {
 		strategy = d.networkStrategy
 	}
@@ -421,7 +472,11 @@ func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destina
 			return nil, err
 		}
 	}
-	return d.trackPacketConn(ctx, destination, packetConn, nil)
+	tracked, trackErr := d.trackPacketConn(ctx, destination, packetConn, nil)
+	if trackErr != nil {
+		return nil, trackErr
+	}
+	return d.stillCurrentEpochPacketConn(epochCurrent, tracked)
 }
 
 func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
@@ -431,6 +486,51 @@ func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
 		listenerControl = control.Append(listenerControl, d.autoDetectBindFunc)
 	}
 	return listenerControl, egressEnabled
+}
+
+// captureEpoch records the network epoch a raw operation is about to begin in.
+//
+// It returns a predicate that reports whether that epoch is still current, so the caller does not
+// have to carry a possibly-nil function around.
+func (d *DefaultDialer) captureEpoch() func() bool {
+	if d.networkEpoch == nil {
+		return func() bool { return true }
+	}
+	captured := d.networkEpoch()
+	return func() bool { return d.networkEpoch() == captured }
+}
+
+// errNetworkChanged reports that a network operation completed across a network reset.
+//
+// It is deliberately not a new public error type: the operation did not fail for a reason the
+// caller can act on differently from any other transient network failure, and the dial is retryable
+// in exactly the way a failed one is.
+var errNetworkChanged = E.New("network changed while dialling")
+
+// stillCurrentEpoch closes the connection and reports an error when the network changed while the
+// operation was in flight.
+//
+// # Why this runs AFTER the connection is tracked
+//
+// The obvious order - verify the epoch, then hand the connection to the manager - has a window the
+// check cannot see:
+//
+//	verify epoch            (still current)
+//	                        <- a reset runs here: CloseAll sees nothing to close
+//	track
+//
+// and the connection escapes. Tracking FIRST closes that window in both directions:
+//
+//	reset before the track   -> the epoch check below rejects it, and the connection is closed here
+//	reset after the track    -> CloseAll can see it and closes it
+//
+// There is no ordering in which the connection is neither rejected nor reachable by CloseAll.
+func (d *DefaultDialer) stillCurrentEpoch(epochCurrent func() bool, conn net.Conn) (net.Conn, error) {
+	if epochCurrent() {
+		return conn, nil
+	}
+	_ = conn.Close()
+	return nil, errNetworkChanged
 }
 
 func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, conn net.Conn, err error) (net.Conn, error) {
@@ -470,6 +570,19 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 		}
 	}
 	return conn, nil
+}
+
+// stillCurrentEpochPacketConn is stillCurrentEpoch for a packet connection.
+//
+// A listening socket has the same ownership question as a dialled one: it was bound to the previous
+// network's interface, so handing it to a caller after a reset gives them a socket on a network that
+// has been left.
+func (d *DefaultDialer) stillCurrentEpochPacketConn(epochCurrent func() bool, conn net.PacketConn) (net.PacketConn, error) {
+	if epochCurrent() {
+		return conn, nil
+	}
+	_ = conn.Close()
+	return nil, errNetworkChanged
 }
 
 func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socksaddr, conn net.PacketConn, err error) (net.PacketConn, error) {
