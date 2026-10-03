@@ -41,9 +41,7 @@ func TestMmapMatchesSource(t *testing.T) {
 					Type: C.RuleTypeDefault,
 					DefaultOptions: option.DefaultHeadlessRule{
 						AdGuardDomain: badoption.Listable[string]{"||ads.example.net^"},
-						SourceIPCIDR: badoption.Listable[*badoption.Prefixable]{
-							common.Ptr(badoption.Prefixable(netip.MustParsePrefix("172.16.0.0/12"))),
-						},
+						SourceIPCIDR:  badoption.Listable[*badoption.Prefixable]{common.Ptr(badoption.Prefixable(netip.MustParsePrefix("172.16.0.0/12")))},
 					},
 				}},
 			},

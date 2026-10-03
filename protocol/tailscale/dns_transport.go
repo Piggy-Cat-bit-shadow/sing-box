@@ -103,6 +103,7 @@ func (t *DNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) err
 		t.routes = nil
 		t.hosts = nil
 		t.magicHosts = nil
+		t.serverAddresses = nil
 		t.defaultResolvers = nil
 		t.resolverScope = nil
 		t.access.Unlock()

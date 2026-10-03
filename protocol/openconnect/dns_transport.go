@@ -87,6 +87,7 @@ func (t *DNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) err
 		t.closed = true
 		t.routes = nil
 		t.searchDomains = nil
+		t.serverAddresses = nil
 		t.defaultResolvers = nil
 		t.resolverScope = nil
 		t.access.Unlock()

@@ -520,6 +520,103 @@ func blackholeBridgeDefault(routeTable int, family int) {
 	})
 }
 
+func applyBridgeRoutes(routeTable int, routes []netlink.Route, fallbackType int) error {
+	flushBridgeRouteTable(routeTable)
+	var applyErr error
+	for index := range routes {
+		err := netlink.RouteReplace(&routes[index])
+		if err != nil && routes[index].Type == unix.RTN_UNICAST && isDefaultDestination(routes[index].Dst) {
+			unroutableBridgeDefault(routeTable, routes[index].Family, fallbackType)
+			applyErr = E.Errors(applyErr, err)
+		}
+	}
+	return applyErr
+}
+
+// The kernel drops routes through a link that goes down and routes whose
+// preferred source is removed, so the table is compared against what the kernel
+// holds rather than against what was last written.
+func bridgeRoutesEqual(current []netlink.Route, desired []netlink.Route) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+	matched := make([]bool, len(current))
+	for _, route := range desired {
+		found := false
+		for index := range current {
+			if matched[index] || !bridgeRouteEqual(current[index], route) {
+				continue
+			}
+			matched[index] = true
+			found = true
+			break
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func bridgeRouteEqual(left netlink.Route, right netlink.Route) bool {
+	if left.Family != right.Family || left.Type != right.Type {
+		return false
+	}
+	if left.Type == unix.RTN_UNICAST && left.LinkIndex != right.LinkIndex {
+		return false
+	}
+	return left.Dst.String() == right.Dst.String() && left.Gw.Equal(right.Gw)
+}
+
+// The connected routes are collected from every table because netd stores them
+// in the network's own table instead of main.
+func egressRoutes(routeTable int, family int, link netlink.Link, fallbackType int) []netlink.Route {
+	var routes []netlink.Route
+	linkRoutes, err := netlink.RouteListFiltered(family, &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Table:     unix.RT_TABLE_UNSPEC,
+	}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+	if err == nil {
+		for _, route := range linkRoutes {
+			if route.Table == unix.RT_TABLE_LOCAL || route.Table == routeTable ||
+				route.Type != unix.RTN_UNICAST || route.Gw != nil || isDefaultDestination(route.Dst) {
+				continue
+			}
+			connected := netlink.Route{
+				LinkIndex: link.Attrs().Index,
+				Table:     routeTable,
+				Family:    family,
+				Type:      unix.RTN_UNICAST,
+				Scope:     route.Scope,
+				Dst:       route.Dst,
+				Priority:  route.Priority,
+			}
+			if slices.ContainsFunc(routes, func(existing netlink.Route) bool {
+				return existing.Dst.String() == connected.Dst.String() && existing.Priority == connected.Priority
+			}) {
+				continue
+			}
+			routes = append(routes, connected)
+		}
+	}
+	resolved, err := netlink.RouteGetWithOptions(probeAddress(family), &netlink.RouteGetOptions{Oif: link.Attrs().Name})
+	if err != nil || len(resolved) == 0 {
+		return append(routes, unroutableBridgeRoute(routeTable, family, fallbackType))
+	}
+	defaultRoute := netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Table:     routeTable,
+		Family:    family,
+		Type:      unix.RTN_UNICAST,
+		Dst:       defaultDestination(family),
+	}
+	if len(resolved[0].Gw) > 0 {
+		defaultRoute.Gw = resolved[0].Gw
+		defaultRoute.Flags = int(unix.RTNH_F_ONLINK)
+	}
+	return append(routes, defaultRoute)
+}
+
 func activeBridgeFamilies(inet6Port netip.Addr) []int {
 	families := []int{unix.AF_INET}
 	if inet6Port.IsValid() {

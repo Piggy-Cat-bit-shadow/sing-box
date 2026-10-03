@@ -671,15 +671,16 @@ func (s *ServerEndpoint) WritePackets(packets [][]byte) error {
 	if !s.started.Load() {
 		return E.New("endpoint is not ready yet")
 	}
-	packetBuffers := make([]*buf.Buffer, len(packets))
-	for i, packet := range packets {
-		packetBuffers[i] = buf.As(packet)
-	}
-	routeMisses, err := s.server.WriteDataPacketBuffersByDestination(packetBuffers)
+	routeMisses, err := s.server.WriteDataPacketsByDestination(packets)
 	if len(routeMisses) > 0 {
 		s.writeRouteMisses(routeMisses)
 	}
 	return err
+}
+
+func (s *ServerEndpoint) routeOutbound(packet []byte) *tun.OutboundQueue {
+	outboundQueue, _ := s.server.RouteOutbound(packet).(*tun.OutboundQueue)
+	return outboundQueue
 }
 
 func (s *ServerEndpoint) writePacketBuffersByDestination(packetBuffers []*buf.Buffer) error {
