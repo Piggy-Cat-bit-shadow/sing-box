@@ -21,9 +21,9 @@ import (
 // # The behaviour under test
 //
 // A resolver that refuses concurrent outstanding queries is not a resolver that cannot
-// be reused. Before this change, reuseStateUnsupported meant every query dialed, wrote,
-// read and closed a socket, paying a full TCP handshake per lookup. The transport now
-// keeps one connection for sequential queries.
+// be reused: the transport keeps one connection for sequential queries, so a lookup does
+// not pay a TCP handshake each time. (This used to be reached by demoting after a failed
+// pipelining probe; the probe is gone, and this is now simply how the transport works.)
 //
 // The distinction matters most on a phone: a TCP handshake per DNS lookup is radio work
 // and latency, and it happens on the connection-setup path of every new flow.
@@ -108,12 +108,8 @@ func TestTCPTransportReusesSequentially(t *testing.T) {
 	transport := newTestTCPTransport(t, listener)
 	defer transport.Close()
 
-	// Force the serial state rather than relying on the probe to reach it. The probe's
-	// timeout is five seconds, so no server-side delay short of that would make it
-	// conclude "unsupported", and waiting five seconds would make this test slow without
-	// testing anything extra. What is under test here is the serial reuse path itself;
-	// that the transport DEMOTES to it is covered by TestTCPTransportDemotesBrokenReuse.
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
+	// The serial path is the only path: the pipelining capability probe was removed because it
+	// generated DNS queries the caller never authorised. Nothing needs to be forced here.
 
 	if err := testExchange(transport, "example.com."); err != nil {
 		t.Fatal("first query: ", err)
@@ -143,7 +139,6 @@ func TestTCPTransportSerialReuseSurvivesRepeatedQueries(t *testing.T) {
 	transport := newTestTCPTransport(t, listener)
 	defer transport.Close()
 	// Serial path under test; see TestTCPTransportReusesSequentially.
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
 
 	const total = 30
 	for i := range total {
@@ -171,7 +166,6 @@ func TestTCPTransportSerialReuseConcurrentQueriesStayCorrect(t *testing.T) {
 	transport := newTestTCPTransport(t, listener)
 	defer transport.Close()
 	// Serial path under test; see TestTCPTransportReusesSequentially.
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
 
 	const concurrency = 8
 	results := make(chan error, concurrency)
@@ -198,7 +192,6 @@ func TestTCPTransportSerialReuseCancellationDoesNotCorruptThePool(t *testing.T) 
 	listener, _ := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
 	defer transport.Close()
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
 
 	// A query with an already-expired context must fail, not hang.
 	expired, cancel := context.WithCancel(context.Background())
@@ -221,7 +214,6 @@ func TestTCPTransportSerialReuseCloseAndReset(t *testing.T) {
 	t.Parallel()
 	listener, _ := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
 
 	if err := testExchange(transport, "example.com."); err != nil {
 		t.Fatal("query: ", err)
@@ -284,10 +276,9 @@ func BenchmarkTCPDNSSerialReuse(b *testing.B) {
 	}()
 
 	for _, variant := range []struct {
-		name  string
-		state int32
+		name string
 	}{
-		{"serial-reuse", reuseStateUnsupported},
+		{"serial-reuse"},
 	} {
 		b.Run(variant.name, func(b *testing.B) {
 			transportDialer, dialErr := dialer.NewDefault(context.Background(), option.DialerOptions{})
@@ -300,7 +291,6 @@ func BenchmarkTCPDNSSerialReuse(b *testing.B) {
 				M.SocksaddrFromNet(listener.Addr()),
 			)
 			defer transport.Close()
-			transport.multiplexer.reuseState.Store(variant.state)
 
 			message := new(mDNS.Msg)
 			message.SetQuestion("example.com.", mDNS.TypeA)

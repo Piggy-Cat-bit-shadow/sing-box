@@ -6,27 +6,10 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
 
 	mDNS "github.com/miekg/dns"
-)
-
-const (
-	reuseStateUnknown int32 = iota
-	reuseStateProbing
-	reuseStateSupported
-	reuseStateUnsupported
-)
-
-const (
-	reuseProbeTimeout       = 5 * time.Second
-	reuseProbeRetryInterval = time.Minute
-	reuseDemoteFailureLimit = 3
-
-	reuseProbeQueryIdA uint16 = 1
-	reuseProbeQueryIdB uint16 = 2
 )
 
 type queryMultiplexerOptions struct {
@@ -34,7 +17,6 @@ type queryMultiplexerOptions struct {
 	write          func(conn net.Conn, message *mDNS.Msg, queryId uint16) error
 	readNext       func(conn net.Conn) (*mDNS.Msg, error)
 	retryReadError bool
-	probeReuse     bool
 }
 
 type queryMultiplexer struct {
@@ -53,13 +35,7 @@ type queryMultiplexer struct {
 	queryId     uint16
 	queries     map[uint16]*pendingQuery
 
-	reuseState     atomic.Int32
-	demoteFailures atomic.Int32
-	keepIdle       atomic.Bool
-
-	probeAccess   sync.Mutex
-	probeEpoch    uint32
-	lastProbeTime time.Time
+	keepIdle atomic.Bool
 }
 
 type multiplexConn struct {
@@ -171,14 +147,6 @@ func (m *queryMultiplexer) Close() error {
 }
 
 func (m *queryMultiplexer) Reset() {
-	if m.options.probeReuse {
-		m.probeAccess.Lock()
-		m.probeEpoch++
-		m.reuseState.Store(reuseStateUnknown)
-		m.lastProbeTime = time.Time{}
-		m.probeAccess.Unlock()
-		m.demoteFailures.Store(0)
-	}
 	m.connection.Reset()
 	// A Reset drops cached connections so the next query re-dials - used when the network
 	// has changed. The serial pool must follow, or a query after Reset would keep using a
@@ -206,12 +174,19 @@ func (m *queryMultiplexer) ExchangeAsync(ctx context.Context, message *mDNS.Msg,
 }
 
 func (m *queryMultiplexer) dispatch(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error), retryReadError bool) {
-	if m.options.probeReuse && m.reuseState.Load() != reuseStateSupported {
-		m.maybeStartProbe(ctx, message)
-		go m.exchangeSingle(ctx, message, callback)
-		return
-	}
-	m.exchangeAsync(ctx, message, callback, retryReadError)
+	// # Why there is no pipelining capability probe
+	//
+	// Deciding whether a resolver tolerates several outstanding queries requires sending several
+	// queries. The probe did that with its OWN raw connection and the caller's QNAME, so the
+	// resolver received A and AAAA questions the DNS Router had never authorised: query_type
+	// routing was bypassed, a strict single-family strategy still emitted the forbidden family,
+	// and the traffic used context.WithoutCancel so cancelling the real query did not stop it.
+	//
+	// There is no way to learn this without generating traffic the user did not ask for, so the
+	// probe is gone and the serial path is unconditional: one connection at a time, held across
+	// sequential queries by the serial pool. Only intra-connection pipelining is given up.
+	_ = retryReadError
+	m.exchangeSingle(ctx, message, callback)
 }
 
 // exchangeSingle answers one query on a connection that is NOT used concurrently.
@@ -453,118 +428,18 @@ func (m *queryMultiplexer) dialSerialConn(ctx context.Context) (*multiplexConn, 
 	return &multiplexConn{Conn: conn}, nil
 }
 
-func (m *queryMultiplexer) maybeStartProbe(ctx context.Context, message *mDNS.Msg) {
-	if len(message.Question) == 0 {
-		return
-	}
-	m.probeAccess.Lock()
-	if m.reuseState.Load() == reuseStateProbing {
-		m.probeAccess.Unlock()
-		return
-	}
-	if !m.lastProbeTime.IsZero() && time.Since(m.lastProbeTime) < reuseProbeRetryInterval {
-		m.probeAccess.Unlock()
-		return
-	}
-	m.reuseState.Store(reuseStateProbing)
-	m.lastProbeTime = time.Now()
-	epoch := m.probeEpoch
-	m.probeAccess.Unlock()
-	go m.runReuseProbe(context.WithoutCancel(ctx), message.Question[0].Name, epoch)
-}
-
-func (m *queryMultiplexer) runReuseProbe(ctx context.Context, questionName string, epoch uint32) {
-	supported, dialFailed := m.executeReuseProbe(ctx, questionName)
-	m.probeAccess.Lock()
-	defer m.probeAccess.Unlock()
-	if m.probeEpoch != epoch {
-		return
-	}
-	switch {
-	case supported:
-		m.reuseState.Store(reuseStateSupported)
-		m.demoteFailures.Store(0)
-	case dialFailed:
-		m.reuseState.Store(reuseStateUnknown)
-	default:
-		m.reuseState.Store(reuseStateUnsupported)
-	}
-}
-
-func (m *queryMultiplexer) executeReuseProbe(ctx context.Context, questionName string) (supported bool, dialFailed bool) {
-	probeCtx, cancel := context.WithTimeout(ctx, reuseProbeTimeout)
-	defer cancel()
-	conn, err := m.options.dial(probeCtx)
-	if err != nil {
-		return false, true
-	}
-	defer conn.Close()
-	stop := context.AfterFunc(probeCtx, func() {
-		conn.Close()
-	})
-	defer stop()
-	queryA := new(mDNS.Msg)
-	queryA.SetQuestion(questionName, mDNS.TypeA)
-	queryAAAA := new(mDNS.Msg)
-	queryAAAA.SetQuestion(questionName, mDNS.TypeAAAA)
-	err = m.options.write(conn, queryA, reuseProbeQueryIdA)
-	if err == nil {
-		err = m.options.write(conn, queryAAAA, reuseProbeQueryIdB)
-	}
-	if err != nil {
-		return false, false
-	}
-	var seenA, seenAAAA bool
-	for !seenA || !seenAAAA {
-		var response *mDNS.Msg
-		response, err = m.options.readNext(conn)
-		if err != nil {
-			return false, false
-		}
-		if response == nil {
-			continue
-		}
-		switch response.Id {
-		case reuseProbeQueryIdA:
-			seenA = true
-		case reuseProbeQueryIdB:
-			seenAAAA = true
-		}
-	}
-	return true, false
-}
-
-func (m *queryMultiplexer) recordConnDeath(conn *multiplexConn) {
-	if !m.options.probeReuse || m.reuseState.Load() != reuseStateSupported {
-		return
-	}
-	if conn.readEpoch.Load() == 0 {
-		return
-	}
-	m.queryAccess.Lock()
-	var pendingOnConn int
-	for _, pending := range m.queries {
-		if pending.conn == conn {
-			pendingOnConn++
-		}
-	}
-	m.queryAccess.Unlock()
-	if pendingOnConn == 0 {
-		m.demoteFailures.Store(0)
-		return
-	}
-	if m.demoteFailures.Add(1) < reuseDemoteFailureLimit {
-		return
-	}
-	m.probeAccess.Lock()
-	if m.reuseState.Load() == reuseStateSupported {
-		m.reuseState.Store(reuseStateUnsupported)
-		m.lastProbeTime = time.Now()
-	}
-	m.probeAccess.Unlock()
-	m.demoteFailures.Store(0)
-}
-
+// exchangeAsync answers a query on the SHARED (concurrent) connection.
+//
+// # Currently unreachable
+//
+// This path belonged to the pipelining design: the transport used it only once a capability probe
+// had established that the resolver tolerated several outstanding queries. That probe is gone
+// because it generated DNS traffic the caller never authorised, so dispatch now always takes the
+// serial path above and nothing calls this.
+//
+// It is left in place rather than deleted because removing the shared pool is a larger change
+// than this fix, and dead-but-correct code is not a release blocker. If pipelining is ever
+// reinstated, it must be decided without extra DNS queries - which is the reason it was removed.
 func (m *queryMultiplexer) exchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error), retryReadError bool) {
 	for firstAttempt := true; ; firstAttempt = false {
 		conn, connCtx, created, err := m.connection.AcquireShared(ctx, m.dialConn)
@@ -702,7 +577,6 @@ func (m *queryMultiplexer) recvLoop(conn *multiplexConn) {
 	for {
 		message, err := m.options.readNext(conn)
 		if err != nil {
-			m.recordConnDeath(conn)
 			m.connection.Invalidate(conn, &queryMultiplexerReadError{cause: err})
 			return
 		}

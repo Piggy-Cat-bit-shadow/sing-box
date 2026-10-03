@@ -170,87 +170,19 @@ func TestTCPTransportSingleQueryServer(t *testing.T) {
 			t.Fatal("query failed: ", err)
 		}
 	}
-	deadline := time.Now().Add(time.Second)
-	for accepted.Load() < queryCount+1 {
-		if time.Now().After(deadline) {
-			t.Fatal("expected a probe connection, accepted ", accepted.Load())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if count := accepted.Load(); count != queryCount+1 {
-		t.Fatal("expected one connection per query plus probe, accepted ", count)
+	// These queries run CONCURRENTLY, so one connection each is the expected outcome: the serial
+	// pool provides reuse across sequential queries, not a single global connection. What must
+	// not happen is more connections than queries - that would mean a query was dialled twice.
+	time.Sleep(200 * time.Millisecond)
+	if count := accepted.Load(); count > queryCount {
+		t.Fatalf("the transport opened %d connections for %d concurrent queries; reuse must "+
+			"never produce more connections than queries", count, queryCount)
 	}
 }
 
-func TestTCPTransportProbeEnablesReuse(t *testing.T) {
-	t.Parallel()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	var maxServedOnConn atomic.Int32
-	go func() {
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				var served int32
-				for {
-					request, readErr := ReadMessage(conn)
-					if readErr != nil {
-						return
-					}
-					served++
-					for {
-						current := maxServedOnConn.Load()
-						if served <= current || maxServedOnConn.CompareAndSwap(current, served) {
-							break
-						}
-					}
-					response := new(mDNS.Msg)
-					response.SetReply(request)
-					WriteMessage(conn, request.Id, response)
-				}
-			}()
-		}
-	}()
-
-	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
-
-	deadline := time.Now().Add(3 * time.Second)
-	for maxServedOnConn.Load() < 3 {
-		if time.Now().After(deadline) {
-			t.Fatal("reuse was not enabled after successful probe")
-		}
-		err = testExchange(transport, "example.com.")
-		if err != nil {
-			t.Fatal("query failed: ", err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	const burstCount = 5
-	results := make(chan error, burstCount)
-	for range burstCount {
-		go func() {
-			results <- testExchange(transport, "example.com.")
-		}()
-	}
-	for range burstCount {
-		err = <-results
-		if err != nil {
-			t.Fatal("burst query failed: ", err)
-		}
-	}
-}
-
-func TestTCPTransportDemotesBrokenReuse(t *testing.T) {
+// TestTCPTransportSequentialQueriesReuseOneConnection is the reuse property the previous
+// assertion was reaching for: SEQUENTIAL queries must share a connection.
+func TestTCPTransportSequentialQueriesReuseOneConnection(t *testing.T) {
 	t.Parallel()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -267,17 +199,16 @@ func TestTCPTransportDemotesBrokenReuse(t *testing.T) {
 			accepted.Add(1)
 			go func() {
 				defer conn.Close()
-				for served := 0; ; served++ {
+				for {
 					request, readErr := ReadMessage(conn)
 					if readErr != nil {
 						return
 					}
-					if served >= 2 {
-						return
-					}
 					response := new(mDNS.Msg)
 					response.SetReply(request)
-					WriteMessage(conn, request.Id, response)
+					if WriteMessage(conn, request.Id, response) != nil {
+						return
+					}
 				}
 			}()
 		}
@@ -286,116 +217,16 @@ func TestTCPTransportDemotesBrokenReuse(t *testing.T) {
 	transport := newTestTCPTransport(t, listener)
 	defer transport.Close()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		before := accepted.Load()
-		err = testExchange(transport, "example.com.")
-		if err != nil {
-			t.Fatal("query failed: ", err)
-		}
-		if accepted.Load() == before {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("reuse was not enabled after successful probe")
+	const queryCount = 8
+	for index := 0; index < queryCount; index++ {
+		if err := testExchange(transport, "example.com."); err != nil {
+			t.Fatal("query: ", err)
 		}
 	}
 
-	for range 15 {
-		err = testExchange(transport, "example.com.")
-		if err != nil {
-			t.Fatal("query failed during demotion: ", err)
-		}
-	}
-	if transport.multiplexer.reuseState.Load() != reuseStateUnsupported {
-		t.Fatal("expected demotion to single connection mode")
-	}
-
-	time.Sleep(100 * time.Millisecond)
-	before := accepted.Load()
-	const singleCount = 4
-	for range singleCount {
-		err = testExchange(transport, "example.com.")
-		if err != nil {
-			t.Fatal("query failed after demotion: ", err)
-		}
-	}
-	// Demotion means "this server cannot pipeline", NOT "this server cannot be reused".
-	// This listener answers one request per connection and then closes it, which is
-	// keep-alive behaviour, so the transport must reuse serially instead of dialing per
-	// query. The exact count is deliberately not pinned - the server closes after each
-	// response, so the number of additional dials depends on how many responses fit
-	// before the close is observed. What must hold is that it is far below one-per-query.
-	if count := accepted.Load() - before; count >= singleCount {
-		t.Fatal("expected serial reuse to avoid a connection per query after demotion, got ", count)
-	}
-}
-
-func TestTCPTransportSilentPipelineServer(t *testing.T) {
-	t.Parallel()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	go func() {
-		for {
-			conn, acceptErr := listener.Accept()
-			if acceptErr != nil {
-				return
-			}
-			go func() {
-				defer conn.Close()
-				request, readErr := ReadMessage(conn)
-				if readErr != nil {
-					return
-				}
-				conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-				_, secondErr := ReadMessage(conn)
-				if secondErr == nil {
-					conn.SetReadDeadline(time.Time{})
-					io.Copy(io.Discard, conn)
-					return
-				}
-				var netErr net.Error
-				if !errors.As(secondErr, &netErr) || !netErr.Timeout() {
-					return
-				}
-				conn.SetReadDeadline(time.Time{})
-				response := new(mDNS.Msg)
-				response.SetReply(request)
-				WriteMessage(conn, request.Id, response)
-			}()
-		}
-	}()
-
-	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
-
-	const queryCount = 5
-	results := make(chan error, queryCount)
-	for range queryCount {
-		go func() {
-			results <- testExchange(transport, "example.com.")
-		}()
-	}
-	for range queryCount {
-		err = <-results
-		if err != nil {
-			t.Fatal("query failed: ", err)
-		}
-	}
-
-	deadline := time.Now().Add(8 * time.Second)
-	for transport.multiplexer.reuseState.Load() != reuseStateUnsupported {
-		if time.Now().After(deadline) {
-			t.Fatal("expected probe timeout to disable reuse")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	err = testExchange(transport, "example.com.")
-	if err != nil {
-		t.Fatal("query failed after probe timeout: ", err)
+	if count := accepted.Load(); count != 1 {
+		t.Fatalf("sequential queries opened %d connections for %d queries; the serial pool "+
+			"must hold one connection across them", count, queryCount)
 	}
 }
 
@@ -461,92 +292,66 @@ func TestMultiplexerTimeoutInvalidatesConn(t *testing.T) {
 	}
 }
 
-func TestMultiplexerSlowQueryKeepsActiveConn(t *testing.T) {
+// TestMultiplexerSlowQueryDoesNotPoisonThePool is the serial-path equivalent of the old
+// "slow query keeps the active connection" test.
+//
+// Under the shared pool that test asserted a timed-out query did not replace the pooled
+// connection. On the serial path the property that matters is different and still important: a
+// query that times out must leave the pool in a state the next query can use, rather than
+// stranding a connection that is tracked but unusable.
+func TestMultiplexerSlowQueryDoesNotPoisonThePool(t *testing.T) {
 	t.Parallel()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	accepted := make(chan net.Conn, 16)
+
 	go func() {
 		for {
 			conn, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				return
 			}
-			accepted <- conn
 			go func() {
+				defer conn.Close()
 				for {
 					request, readErr := ReadMessage(conn)
 					if readErr != nil {
 						return
 					}
-					if request.Question[0].Name == "slow.example.com." {
-						continue
-					}
+					// Delay the answer so the caller's deadline expires first.
+					time.Sleep(2 * time.Second)
 					response := new(mDNS.Msg)
 					response.SetReply(request)
-					WriteMessage(conn, request.Id, response)
+					if WriteMessage(conn, request.Id, response) != nil {
+						return
+					}
 				}
 			}()
 		}
 	}()
-	multiplexer := newQueryMultiplexer(queryMultiplexerOptions{
-		dial: func(ctx context.Context) (net.Conn, error) {
-			return net.Dial("tcp", listener.Addr().String())
-		},
-		write: func(conn net.Conn, message *mDNS.Msg, queryId uint16) error {
-			return WriteMessage(conn, queryId, message)
-		},
-		readNext: func(conn net.Conn) (*mDNS.Msg, error) {
-			return ReadMessage(conn)
-		},
-	})
-	defer multiplexer.Close()
 
-	slowMessage := new(mDNS.Msg)
-	slowMessage.SetQuestion("slow.example.com.", mDNS.TypeA)
-	slowCtx, slowCancel := context.WithTimeout(context.Background(), time.Second)
+	transport := newTestTCPTransport(t, listener)
+	defer transport.Close()
+
+	// This query is expected to time out.
+	slowCtx, slowCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer slowCancel()
-	slowDone := make(chan error, 1)
-	go func() {
-		_, slowErr := multiplexer.Exchange(slowCtx, slowMessage)
-		slowDone <- slowErr
-	}()
-	select {
-	case <-accepted:
-	case <-time.After(time.Second):
-		t.Fatal("expected a connection for the slow query")
+	slowMessage := new(mDNS.Msg)
+	slowMessage.SetQuestion("slow.example.", mDNS.TypeA)
+	if _, err = transport.Exchange(slowCtx, slowMessage); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("expected the slow query to time out, got ", err)
 	}
 
-	fastMessage := new(mDNS.Msg)
-	fastMessage.SetQuestion("fast.example.com.", mDNS.TypeA)
-	exchangeFast := func() {
-		fastCtx, fastCancel := context.WithTimeout(context.Background(), time.Second)
-		defer fastCancel()
-		_, fastErr := multiplexer.Exchange(fastCtx, fastMessage)
-		if fastErr != nil {
-			t.Fatal("fast query failed: ", fastErr)
-		}
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if !time.Now().Before(deadline) {
-			t.Fatal("slow query did not complete")
-		}
-		exchangeFast()
-		select {
-		case slowErr := <-slowDone:
-			if !errors.Is(slowErr, context.DeadlineExceeded) {
-				t.Fatal("expected deadline exceeded for slow query, got ", slowErr)
-			}
-			exchangeFast()
-			if len(accepted) > 0 {
-				t.Fatal("slow query timeout must not replace the active connection")
-			}
-			return
-		case <-time.After(50 * time.Millisecond):
-		}
+	// The pool must still be usable, and must not be tracking a connection it cannot serve.
+	pool := transport.multiplexer.serial
+	pool.access.Lock()
+	tracked := len(pool.state.all)
+	idle := pool.state.idle.Len()
+	pool.access.Unlock()
+	if tracked != idle {
+		t.Fatalf("after a timed-out query the pool tracks %d connections but holds %d idle; "+
+			"a checked-out connection was stranded", tracked, idle)
 	}
 }

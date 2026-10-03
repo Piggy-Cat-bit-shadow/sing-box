@@ -55,6 +55,22 @@ type scriptedDNSServer struct {
 
 	mu      sync.Mutex
 	handled int
+	// observed records every question the server was asked, so a test can prove that only the
+	// queries the caller authorised actually reached the resolver.
+	observed []observedQuestion
+}
+
+// observedQuestion is one question the server received.
+type observedQuestion struct {
+	name  string
+	qType uint16
+}
+
+// questions returns every question the server has seen.
+func (s *scriptedDNSServer) questions() []observedQuestion {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]observedQuestion(nil), s.observed...)
 }
 
 // releaseQueries lets every held query proceed. Safe to call more than once.
@@ -111,6 +127,12 @@ func (s *scriptedDNSServer) handle(conn net.Conn) {
 
 		s.mu.Lock()
 		s.handled++
+		if len(request.Question) > 0 {
+			s.observed = append(s.observed, observedQuestion{
+				name:  request.Question[0].Name,
+				qType: request.Question[0].Qtype,
+			})
+		}
 		s.mu.Unlock()
 
 		response := new(mDNS.Msg)
@@ -134,9 +156,13 @@ func (s *scriptedDNSServer) queriesHandled() int {
 	return s.handled
 }
 
-// forceSerial puts the transport on the serial path without waiting for the five-second probe.
+// forceSerial is retained as a named no-op.
+//
+// It used to force the transport off the pipelining fast path by overriding the reuse probe's
+// verdict. The probe is gone: the conservative path is now the only path, so every transport is
+// already serial and the call sites below document that the tests target the serial mechanism.
 func forceSerial(transport *TCPTransport) {
-	transport.multiplexer.reuseState.Store(reuseStateUnsupported)
+	_ = transport
 }
 
 // TestSerialPoolCloseIdleClosesIdleConnections is the §BUG A regression.
@@ -566,28 +592,16 @@ func TestSerialReuseKeepsOneOutstandingQueryPerConnection(t *testing.T) {
 		t.Fatalf("%d concurrent queries failed", failures.Load())
 	}
 
-	// Every query must have been ANSWERED exactly once.
+	// Every query must have been ANSWERED exactly once, and nothing else may have been sent.
 	//
-	// The server also receives the transport's pipelining PROBE, which sends two queries of its
-	// own on its own connection to discover whether the resolver supports concurrent queries.
-	// That is separate traffic and is counted separately here - folding it into the total would
-	// make this assertion fail for a reason unrelated to what it is checking, and, worse, would
-	// hide a genuinely duplicated user query inside a fudge factor.
-	//
-	// forceSerial sets reuseStateUnsupported, so the probe does not re-run: exactly one probe
-	// connection exists for the test's duration.
-	const probeQueries = 2
-	if probeConnections := int32(1); server.connections() < probeConnections {
-		t.Fatalf("expected at least the probe connection, got %d connections", server.connections())
-	}
-
-	// Any query beyond the user's own must be attributable to the probe, which runs once.
-	excess := server.queriesHandled() - workers*queriesPerWorker
-	if excess != probeQueries {
-		t.Fatalf("server handled %d queries; %d were issued, so %d are unaccounted for "+
-			"(the one-time probe accounts for exactly %d). An excess means a user query was "+
-			"sent more than once",
-			server.queriesHandled(), workers*queriesPerWorker, excess, probeQueries)
+	// This is now an exact equality rather than a budget: the pipelining probe used to add two
+	// queries of its own, and the assertion had to allow for them. The probe is gone, so the
+	// server must have seen precisely the queries the test issued - which makes this a much
+	// stronger statement than it was, and one that would catch any newly introduced extra traffic.
+	if handled := server.queriesHandled(); handled != workers*queriesPerWorker {
+		t.Fatalf("server handled %d queries but %d were issued; a difference means either a "+
+			"user query was sent more than once or the transport generated traffic the caller "+
+			"never authorised", handled, workers*queriesPerWorker)
 	}
 
 	pool.access.Lock()
@@ -793,4 +807,85 @@ func TestSerialBurstLeavesBoundedIdleConnections(t *testing.T) {
 	server.holdQueries.Store(false)
 	require.NoError(t, testExchange(transport, "example.com."),
 		"the retained connection must still serve queries")
+}
+
+// TestReuseProbeDoesNotLeakUnauthorisedQueries is §5.
+//
+// The reuse probe opened its own raw connection to the resolver and sent A and AAAA queries for
+// the caller's QNAME. Those queries never passed through the DNS Router, so they bypassed
+// query_type routing, strict family strategies and any per-server policy the user configured -
+// and they used context.WithoutCancel, so cancelling the real query did not stop them.
+//
+// The contract is: the resolver sees exactly the questions the caller authorised. Nothing else.
+func TestReuseProbeDoesNotLeakUnauthorisedQueries(t *testing.T) {
+	server := newScriptedDNSServer(t)
+	transport := newTestTCPTransport(t, server.listener)
+	defer transport.Close()
+
+	// A TXT query. The resolver must see only that.
+	message := new(mDNS.Msg)
+	message.SetQuestion("example.test.", mDNS.TypeTXT)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	if _, err := transport.Exchange(ctx, message); err != nil {
+		t.Fatal("query: ", err)
+	}
+
+	// Give any detached probe the chance to reach the resolver, so its absence is meaningful
+	// rather than a race the test happens to win.
+	time.Sleep(300 * time.Millisecond)
+
+	for _, question := range server.questions() {
+		if question.qType == mDNS.TypeA || question.qType == mDNS.TypeAAAA {
+			t.Errorf("the resolver was asked %s %s, which the caller never requested; a "+
+				"capability probe must not generate DNS traffic that bypasses the DNS Router",
+				question.name, mDNS.TypeToString[question.qType])
+		}
+	}
+
+	// The authorised query must still have been served.
+	require.GreaterOrEqual(t, len(server.questions()), 1)
+}
+
+// TestStrictFamilyStrategyIsNotBypassedByProbe is §5.2 Case C.
+//
+// Under a single-family policy the forbidden family's query must never be emitted, not even by an
+// internal capability probe.
+func TestStrictFamilyStrategyIsNotBypassedByProbe(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		question  uint16
+		forbidden uint16
+	}{
+		{"A only", mDNS.TypeA, mDNS.TypeAAAA},
+		{"AAAA only", mDNS.TypeAAAA, mDNS.TypeA},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			server := newScriptedDNSServer(t)
+			transport := newTestTCPTransport(t, server.listener)
+			defer transport.Close()
+
+			message := new(mDNS.Msg)
+			message.SetQuestion("example.test.", scenario.question)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			if _, err := transport.Exchange(ctx, message); err != nil {
+				t.Fatal("query: ", err)
+			}
+
+			time.Sleep(300 * time.Millisecond)
+
+			for _, question := range server.questions() {
+				if question.qType == scenario.forbidden {
+					t.Fatalf("a %s query reached the resolver although the caller asked %s; "+
+						"a forbidden family must never be emitted, not even by a probe",
+						mDNS.TypeToString[scenario.forbidden], mDNS.TypeToString[scenario.question])
+				}
+			}
+		})
+	}
 }
