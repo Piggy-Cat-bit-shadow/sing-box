@@ -1,11 +1,7 @@
 package clashapi
 
 import (
-	"context"
 	"net/http"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/protocol/group"
@@ -53,6 +49,19 @@ func getGroup(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// getGroupDelay measures every member of a group.
+//
+// # What this endpoint is
+//
+// It is a MANUAL DIAGNOSTIC: a user asking "how fast are this group's members right now, against the
+// URL I named". That makes two things mandatory, and both were missing here.
+//
+// It must not write health evidence. A measurement taken against an arbitrary URL is not evidence
+// about any group's configured target, so it must not become selection input - and writing it would
+// let a user grow the health map without bound by testing arbitrary URLs.
+//
+// It must run under the Box's context. Measure reads the certificate roots, the time service and the
+// per-Box Coordinator out of the context, and the HTTP request's context carries none of them.
 func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
@@ -63,35 +72,69 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		query := r.URL.Query()
-		url := query.Get("url")
-		if strings.HasPrefix(url, "http://") {
-			url = ""
-		}
-		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 32)
-		if err != nil {
+		query, valid := parseClashDelayQuery(r.URL.Query())
+		if !valid {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, ErrBadRequest)
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), time.Millisecond*time.Duration(timeout))
+		ctx, cancel := clashMeasurementContext(server.ctx, r.Context(), query.Timeout)
 		defer cancel()
 
-		var result map[string]uint16
-		if urlTestGroup, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
-			result, err = urlTestGroup.URLTest(ctx)
-		} else {
-			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
-				itOutbound, _ := server.outbound.Outbound(it)
-				return itOutbound
-			}))
-			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, 0, true)
+		// A URLTest group is measured through its own entry point, because it OWNS a configured
+		// target and a measurement scope that this endpoint cannot reconstruct. What it does not own
+		// is a caller-supplied override: passing `url` or `expected` to this endpoint cannot be
+		// honoured for such a group without measuring something other than what its health check
+		// means, and silently measuring its configured target instead would report a result the
+		// client did not ask for.
+		//
+		// Refusing the override explicitly is the honest answer. The response says so, rather than
+		// returning 200 with a measurement of a target the client never named.
+		if _, isURLTestGroup := outboundGroup.(adapter.URLTestGroup); isURLTestGroup {
+			if r.URL.Query().Get("url") != "" || r.URL.Query().Get("expected") != "" {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, newError("a URLTest group measures its configured target; url and expected cannot be overridden"))
+				return
+			}
+			result, err := outboundGroup.(adapter.URLTestGroup).URLTest(ctx)
+			if err != nil {
+				render.Status(r, http.StatusGatewayTimeout)
+				render.JSON(w, r, newError(err.Error()))
+				return
+			}
+			render.JSON(w, r, result)
+			return
 		}
 
-		if err != nil {
-			render.Status(r, http.StatusGatewayTimeout)
-			render.JSON(w, r, newError(err.Error()))
+		outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
+			itOutbound, _ := server.outbound.Outbound(it)
+			return itOutbound
+		}))
+
+		// DISPLAY ONLY.
+		//
+		// The legacy wrapper defaulted to writing health evidence, which is wrong for a manual
+		// probe: a diagnostic would silently change which member the group selects, and an arbitrary
+		// URL would accumulate in the health map. Each member's own automatic check is the only
+		// thing that should move selection.
+		result := group.URLTestOutboundsWithTarget(ctx, server.outbound, server.urlTestHistory,
+			server.logger, outbounds, query.URL, query.Expected, 0, true, group.TestHistoryDisplayOnly)
+
+		// A request that produced no measurement at all is a failure, not an empty success.
+		//
+		// The node-level endpoint already answers this way: it reports 503 when the measurement
+		// failed, which includes the target not satisfying `expected`. The group endpoint used to
+		// answer 200 with an empty map for the same situation, so a client could not tell "no member
+		// satisfied the rule I asked for" from "here are the members, all without a delay".
+		if len(result) == 0 {
+			if ctx.Err() != nil {
+				render.Status(r, http.StatusGatewayTimeout)
+				render.JSON(w, r, ErrRequestTimeout)
+				return
+			}
+			render.Status(r, http.StatusServiceUnavailable)
+			render.JSON(w, r, newError("An error occurred in the delay test"))
 			return
 		}
 
