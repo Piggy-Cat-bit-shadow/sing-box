@@ -4,44 +4,35 @@ package oomkiller
 
 // notifyPressure handles a memory-pressure event from the dispatch source.
 //
-// # Why the active check comes first
+// # The two-part guarantee
 //
-// This is called from a dispatch callback. The registry hands each service a snapshot of the
-// registered services, so a callback can be in flight while the service is being closed - the
-// snapshot was taken before the Close and the callback runs after it.
+// A callback must not do destructive work on a stopped timer, AND Close must not return while
+// a callback that legitimately started can still write MemoryPressureCritical. Those are
+// different requirements and the first does not imply the second:
 //
-// The previous order was:
+//	active check   -> bounds WHEN the work may start
+//	in-flight group -> bounds when it has FINISHED, so Close can wait for it
 //
-//	releaseMemory()          <- Flush cache, Store(Critical), badCleanup, FreeOSMemory
-//	if t.timer == nil { return }
+// The previous implementation had only the first. It released the lock before doing the work -
+// correctly, so a slow FreeOSMemory does not stall Close - but nothing joined on that work, so
+// this sequence was possible:
 //
-// so a callback that arrived after Close performed the whole destructive sequence and only
-// then discovered the timer was stopped. The consequences are not merely wasted work:
+//	notifyPressure: active check passes, unlock
+//	Close:          timer = nil, pressure.Store(None), Close RETURNS
+//	notifyPressure: releaseMemory() -> Store(Critical), cache flush, badCleanup, FreeOSMemory
 //
-//   - an OOM-killer service that has been shut down flushes caches and calls FreeOSMemory,
-//     which is exactly the behaviour the user stopped;
-//   - pressure is rewritten from None back to Critical, so a torn-down service re-arms a
-//     pressure report that other components read;
-//   - badCleanup() runs on a service nobody owns any more.
+// A torn-down service was left reporting Critical with cleanup still running, which is exactly
+// what the earlier ordering fix was supposed to prevent.
 //
-// # Why a bare `if t.timer != nil` is not enough
+// # Ordering
 //
-// Checking the timer outside the lock and then doing the work would be a time-of-check /
-// time-of-use race: Close can stop the timer between the check and the work. The state is
-// therefore read and the decision acted on under one hold of the lifecycle lock.
+// Add(1) happens under t.access, after the active check. stop() sets timer = nil under the same
+// lock and only then waits. So a callback that started before stop() is always counted, and one
+// that arrives after sees timer == nil and never Adds - there is no window in which Add can
+// land after the wait has already concluded.
 //
-// # Ordering guarantee
-//
-// notifyPressure and stop() are mutually exclusive through t.access:
-//
-//   - If stop() wins the lock first, the timer is nil by the time notifyPressure runs, so it
-//     returns without touching anything. Close does not wait.
-//   - If notifyPressure wins first, it completes its work and releases the lock; stop() then
-//     proceeds. Close waits for the in-flight callback, which is the correct behaviour: the
-//     service was genuinely active when the pressure arrived.
-//
-// Either way a callback never performs destructive work on a stopped timer, and Close never
-// races the work.
+// Release-and-poll still run outside the lock: they are the slow part, and holding t.access
+// across FreeOSMemory would stall every other reader of the timer state for its whole duration.
 func (t *adaptiveTimer) notifyPressure() {
 	t.access.Lock()
 
@@ -52,17 +43,31 @@ func (t *adaptiveTimer) notifyPressure() {
 		return
 	}
 
-	// The service is genuinely active. Record the pressure intent while still holding the
-	// lock, so the state Close observes is consistent.
+	// Join the in-flight group WHILE STILL HOLDING the lock.
+	//
+	// This is the ordering that makes the barrier sound. stop() sets timer = nil under this
+	// same lock before it waits, so a callback either:
+	//
+	//   - Added here before stop() took the lock, in which case stop()'s Wait observes it; or
+	//   - arrives after timer became nil, fails the check above, and never Adds.
+	//
+	// Adding after unlocking would leave a window where stop() could see a zero count and
+	// return while this callback was already committed to running - the exact race the barrier
+	// exists to close.
+	t.pressureCallbacks.Add(1)
+
+	// Record the pressure intent while still holding the lock, so the state Close observes is
+	// consistent.
 	t.forceMinInterval = true
 	t.pendingPressureBaseline = true
 	t.access.Unlock()
 
+	// Every path below must decrement, including a panic in the cleanup, or stop() would wait
+	// forever.
+	defer t.pressureCallbacks.Done()
+
 	// The destructive cleanup runs OUTSIDE the lock so a long FreeOSMemory does not block
-	// Close for its whole duration. The check above already established that this service was
-	// active at the moment the pressure arrived; a Close that lands during the cleanup is
-	// handled by the normal stop path, and the cleanup completing afterwards is correct
-	// because it was legitimately started while the service was live.
+	// Close for its whole duration. stop() does not return until this has finished.
 	t.releaseMemory()
 
 	t.poll()

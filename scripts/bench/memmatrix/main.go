@@ -41,6 +41,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -122,7 +123,33 @@ type runResult struct {
 	ContinuousTicks uint64 `json:"continuous_ticks"`
 	HeapLiveBytes   uint64 `json:"heap_live_bytes"`
 
-	Valid      bool   `json:"valid"`
+	// SampleValid says this individual run produced a complete, structurally sound
+	// measurement: timing and throughput above zero, runtime metrics captured, the runtime
+	// configured as the setting requested.
+	//
+	// # Why this is separate from the merged-row verdict
+	//
+	// An earlier schema had a single `valid` field that was only ever computed for MERGED rows.
+	// Raw samples therefore serialised with the Go zero value, so every raw run in the
+	// committed evidence appeared as `valid: false` - which reads as "this run was judged and
+	// rejected" when it actually meant "nobody set this field".
+	//
+	// Three different questions now have three different fields:
+	//
+	//	SampleValid    was this run a complete measurement?            (per run)
+	//	LimitEngaged   did the configured limit actually constrain it? (per merged row)
+	//	Valid          is the merged row usable for a comparison?      (per merged row)
+	SampleValid bool `json:"sample_valid"`
+
+	// LimitEngaged reports whether the configured limit measurably constrained the runtime.
+	// Only meaningful on merged rows; false on raw samples rather than absent, so a reader
+	// cannot mistake an unset field for a negative verdict.
+	LimitEngaged bool `json:"limit_engaged"`
+
+	// Valid is the MERGED-row usability verdict. It is false on raw samples by construction:
+	// a single run cannot answer a question about the setting as a whole.
+	Valid bool `json:"valid"`
+
 	InvalidWhy string `json:"invalid_why,omitempty"`
 	MetricsSaw bool   `json:"metrics_seen"`
 }
@@ -186,11 +213,32 @@ func main() {
 			for _, s := range order {
 				one, err := runOnce(s, b, *benchTime, tags)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "  %s / %s run %d failed: %v\n", s.name, b.name, run+1, err)
-					continue
+					// FAIL CLOSED. A run that did not produce a complete measurement ends the
+					// whole command with a non-zero exit.
+					//
+					// The previous behaviour skipped the sample and carried on, so `-runs 10`
+					// could finish with nine or fewer samples per setting and still report a
+					// median. A median over an unknown number of samples is not the measurement
+					// the operator asked for, and quietly dropping the failures makes the
+					// evidence look more complete than it is.
+					//
+					// Retrying would hide the same problem differently: it would keep re-running
+					// until enough numbers appeared, with no record of how many attempts failed.
+					// The operator reruns, and the reason is printed.
+					fmt.Fprintf(os.Stderr,
+						"FATAL: run %d/%d of %s / %s did not produce a valid measurement.\n"+
+							"  Refusing to continue with fewer samples than requested, because a "+
+							"median over an unknown sample count is not the measurement asked for.\n"+
+							"  Cause: %v\n",
+						run+1, *runs, s.name, b.name, err)
+					os.Exit(1)
 				}
 				one.Setting = s.name
 				one.Benchmark = b.name
+				// runOnce only returns a sample that passed validateSample, so reaching here
+				// means the measurement is complete. Recording that explicitly is what stops
+				// the raw evidence from implying every run failed.
+				one.SampleValid = true
 				samplesBySetting[s.name] = append(samplesBySetting[s.name], one)
 				rawSamples = append(rawSamples, one)
 			}
@@ -239,9 +287,19 @@ func main() {
 		document := struct {
 			Merged []runResult `json:"merged"`
 			Runs   []runResult `json:"runs"`
+			// RequestedRuns records how many samples per setting were asked for, so the
+			// summarizer can verify the evidence is complete instead of trusting that it is.
+			// Without it, a file containing nine samples is indistinguishable from a file
+			// where nine was the intended count.
+			RequestedRuns int `json:"requested_runs"`
+			// Pairing records whether the run order alternated, which is what cancels thermal
+			// drift between the settings being compared.
+			Paired bool `json:"paired"`
 		}{
-			Merged: results,
-			Runs:   rawSamples,
+			Merged:        results,
+			Runs:          rawSamples,
+			RequestedRuns: *runs,
+			Paired:        *paired,
 		}
 		data, _ := json.MarshalIndent(document, "", "  ")
 		if err := os.WriteFile(*outPath, data, 0o644); err != nil {
@@ -305,28 +363,46 @@ func runOnce(s setting, b benchmark, benchTime string, tags string) (runResult, 
 	if err != nil {
 		return runResult{}, fmt.Errorf("%v\n%s", err, tail(string(out), 10))
 	}
-	return parseOutput(string(out), b)
+	result, err := parseOutput(string(out), b)
+	if err != nil {
+		return runResult{}, err
+	}
+	if err := validateSample(result, s, b); err != nil {
+		return runResult{}, fmt.Errorf("incomplete measurement for %s / %s: %w", s.name, b.name, err)
+	}
+	return result, nil
 }
 
 func parseOutput(out string, b benchmark) (runResult, error) {
 	var result runResult
-	foundBenchmark := false
 
-	for _, line := range strings.Split(out, "\n") {
+	// # Why the output is reassembled before parsing
+	//
+	// `go test -json` does not emit one event per printed line. A long line - and a benchmark
+	// result is long - arrives split across events at arbitrary boundaries:
+	//
+	//	event 1: "BenchmarkShadowMemoryPressureMeasured-8   \t"
+	//	event 2: "       6\t  48854389 ns/op\t5494.60 MB/s\t..."
+	//
+	// Parsing each event in isolation therefore never sees a complete result. The previous
+	// implementation worked around that by treating the mere presence of "ns/op" as proof a
+	// benchmark had run, and recorded a successful sample with ns/op and MB/s left at zero.
+	// Two such samples reached the committed GOGC evidence and sat inside a throughput median.
+	//
+	// The fix is to reconstruct what the test binary actually wrote - the concatenation of its
+	// output events - and parse THAT. The parser then only reports success when it genuinely
+	// recognises a result, so a real failure to parse stays a failure instead of becoming a
+	// fabricated zero.
+	var logicalOutput strings.Builder
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// The metrics line is printed directly to stdout by the benchmark, and may also
-		// arrive inside a test2json envelope.
-		metricsLine := ""
+		// The metrics line may arrive directly or inside a test2json envelope.
 		if strings.HasPrefix(trimmed, metricsPrefix) {
-			metricsLine = trimmed
-		} else if strings.Contains(trimmed, metricsPrefix) {
-			if index := strings.Index(trimmed, metricsPrefix); index >= 0 {
-				metricsLine = trimmed[index:]
-			}
-		}
-		if metricsLine != "" {
-			parseMetricsLine(metricsLine, &result)
+			parseMetricsLine(trimmed, &result)
+		} else if index := strings.Index(trimmed, metricsPrefix); index >= 0 {
+			parseMetricsLine(trimmed[index:], &result)
 		}
 
 		var event struct {
@@ -337,21 +413,108 @@ func parseOutput(out string, b benchmark) (runResult, error) {
 			if index := strings.Index(event.Output, metricsPrefix); index >= 0 {
 				parseMetricsLine(strings.TrimSpace(event.Output[index:]), &result)
 			}
-			if strings.Contains(event.Output, "ns/op") {
-				parseBenchLine(event.Output, &result)
-				foundBenchmark = true
-			}
+			// Reassemble the logical stream. This is the text the test binary printed, before
+			// JSON framing split it.
+			logicalOutput.WriteString(event.Output)
+			continue
+		}
+		if strings.HasPrefix(trimmed, metricsPrefix) {
+			continue
+		}
+		// A plain (non-JSON) line still contributes, so `go test` without -json also works.
+		logicalOutput.WriteString(line)
+		logicalOutput.WriteString("\n")
+	}
+
+	// Parse the reassembled stream line by line. foundBenchmark is set ONLY by a successful
+	// parse - never by a substring test.
+	foundBenchmark := false
+	for _, line := range strings.Split(logicalOutput.String(), "\n") {
+		if parseBenchLine(line, &result) {
+			foundBenchmark = true
 		}
 	}
 
 	if !foundBenchmark {
 		return runResult{}, fmt.Errorf("no benchmark result in output:\n%s", tail(out, 15))
 	}
-	if b.pressure && !result.MetricsSaw {
-		// A pressure benchmark that emitted no metrics measured nothing about memory.
-		return runResult{}, fmt.Errorf("the pressure benchmark emitted no %s line", strings.TrimSpace(metricsPrefix))
-	}
 	return result, nil
+}
+
+// validateSample rejects a run that did not produce a complete, meaningful measurement.
+//
+// # Why every field is checked
+//
+// A partially parsed run is far more dangerous than a failed one. A failure is visible and the
+// operator reruns; a sample that reports 0 MB/s but is marked as measured goes straight into a
+// median and silently drags it down. Two such samples already reached the committed evidence
+// for the GOGC comparison, which is exactly the outcome this prevents.
+//
+// The checks fall into three groups:
+//
+//   - the benchmark actually produced numbers (timing and throughput above zero);
+//   - the runtime metrics were captured, including at least one continuous sample, or the
+//     memory figures describe an unobserved workload;
+//   - the runtime was configured the way the setting asked, so the row is attributable to the
+//     configuration it is labelled with rather than to whatever the environment happened to be.
+//
+// # Why the runtime configuration is verified
+//
+// GOMEMLIMIT and GOGC are read by the runtime at start-up. If the environment did not apply
+// them - a typo, an operator override, an inherited value - the measured row is not the row it
+// claims to be, and comparing it against another setting is meaningless. Reading the values
+// back from runtime/metrics is the only way to know what was actually in force.
+func validateSample(result runResult, s setting, b benchmark) error {
+	if result.NsPerOp <= 0 {
+		return fmt.Errorf("ns/op is %v, so no timing was measured", result.NsPerOp)
+	}
+	if result.MBPerSec <= 0 {
+		return fmt.Errorf("throughput is %v MB/s, so no payload was measured", result.MBPerSec)
+	}
+	if !result.MetricsSaw {
+		return fmt.Errorf("the benchmark emitted no %s line", strings.TrimSpace(metricsPrefix))
+	}
+	if b.pressure {
+		// A pressure benchmark exists to describe memory. Without continuous samples the peak
+		// is an endpoint reading, and without a peak there is nothing to report.
+		if result.ContinuousTicks == 0 {
+			return fmt.Errorf("the continuous sampler completed no observations, so the peak " +
+				"describes an unobserved workload")
+		}
+		if result.ContinuousPeakBytes == 0 {
+			return fmt.Errorf("the continuous runtime-managed peak is zero")
+		}
+	}
+
+	// The runtime must be running the configuration this row is labelled with.
+	wantGC, err := strconv.ParseUint(s.gcPercent, 10, 64)
+	if err != nil {
+		return fmt.Errorf("setting %s has an unparsable GOGC value %q: %w", s.name, s.gcPercent, err)
+	}
+	if result.GOGCPercent != wantGC {
+		return fmt.Errorf("GOGC is %d but the setting requested %d; the runtime is not running "+
+			"the configuration this row claims", result.GOGCPercent, wantGC)
+	}
+
+	if s.memLimit == "off" {
+		// "unlimited" is expressed by the runtime as the maximum int64, not as zero. Requiring
+		// zero here would fail every unlimited row for the wrong reason.
+		const unlimited = uint64(math.MaxInt64)
+		if result.GOMEMLIMITBytes != unlimited && result.GOMEMLIMITBytes != 0 {
+			return fmt.Errorf("the unlimited setting reported a GOMEMLIMIT of %d bytes",
+				result.GOMEMLIMITBytes)
+		}
+	} else {
+		wantLimit, err := strconv.ParseUint(s.memLimit, 10, 64)
+		if err != nil {
+			return fmt.Errorf("setting %s has an unparsable limit %q: %w", s.name, s.memLimit, err)
+		}
+		if result.GOMEMLIMITBytes != wantLimit {
+			return fmt.Errorf("GOMEMLIMIT is %d but the setting requested %d; the runtime is not "+
+				"running the configuration this row claims", result.GOMEMLIMITBytes, wantLimit)
+		}
+	}
+	return nil
 }
 
 func parseMetricsLine(line string, result *runResult) {
@@ -399,11 +562,25 @@ func parseMetricsLine(line string, result *runResult) {
 	}
 }
 
-func parseBenchLine(line string, result *runResult) {
+// parseBenchLine extracts a benchmark result and reports whether it recognised one.
+//
+// # Why the return value matters
+//
+// The caller used to decide "did a benchmark run?" with strings.Contains(output, "ns/op"),
+// which is true when the unit merely APPEARS anywhere in the output - a log line echoing it, a
+// truncated write, a test2json envelope split across a boundary. The result was a run recorded
+// as successful with NsPerOp and MBPerSec left at zero: a fabricated 0 MB/s sample that then
+// went into the median.
+//
+// The only trustworthy evidence that a benchmark produced a number is that this function
+// parsed a line beginning with "Benchmark" and found a usable ns/op on it. Nothing else sets
+// the flag.
+func parseBenchLine(line string, result *runResult) bool {
 	fields := strings.Fields(line)
 	if len(fields) == 0 || !strings.HasPrefix(fields[0], "Benchmark") {
-		return
+		return false
 	}
+	recognised := false
 	for i := 0; i+1 < len(fields); i++ {
 		value, err := strconv.ParseFloat(fields[i], 64)
 		if err != nil {
@@ -411,7 +588,10 @@ func parseBenchLine(line string, result *runResult) {
 		}
 		switch fields[i+1] {
 		case "ns/op":
+			// A benchmark line without ns/op is not a measurement. Parsing must not report
+			// success for a line that carries no timing.
 			result.NsPerOp += value
+			recognised = true
 		case "MB/s":
 			result.MBPerSec += value
 		case "B/op":
@@ -420,6 +600,7 @@ func parseBenchLine(line string, result *runResult) {
 			result.AllocsPerOp += value
 		}
 	}
+	return recognised
 }
 
 // evaluateValidity decides whether a row measured what it claims to.
@@ -459,7 +640,13 @@ func evaluateValidity(merged *runResult, s setting, previous []runResult, b benc
 		merged.InvalidWhy = fmt.Sprintf(
 			"peak runtime-managed memory %.1f MiB matches the unlimited %.1f MiB, so the limit did not engage",
 			float64(merged.ManagedPeakBytes)/(1024*1024), float64(unlimitedPeak)/(1024*1024))
+		return
 	}
+	// The limit measurably constrained the runtime. Recorded separately from Valid, because
+	// "the limit engaged" and "this row is usable" are different questions: a row can be
+	// perfectly usable while the limit did nothing, and a reader comparing configurations
+	// needs to see that distinction rather than infer it from a single boolean.
+	merged.LimitEngaged = true
 }
 
 var unlimitedManagedPeak = map[string]uint64{}

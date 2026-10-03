@@ -5,6 +5,7 @@ package oomkiller
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	tun "github.com/sagernet/sing-tun"
 )
@@ -174,5 +175,162 @@ func TestLatePressureCallbackRacingClose(t *testing.T) {
 		if baselineSet || forced {
 			t.Fatalf("iteration %d: a callback delivered after stop acted on a stopped timer", iteration)
 		}
+	}
+}
+
+// TestCloseWaitsForInFlightPressureCallback is the §1 regression.
+//
+// # The interleaving it forces
+//
+//	notifyPressure: active check passes, Add(1), unlock
+//	callback:       enters cleanup, BLOCKS on the hook
+//	stopTimer:      stop() sets timer = nil, then must WAIT
+//	...
+//	hook released:  callback finishes
+//	stopTimer:      returns
+//
+// The assertion is that stopTimer/Close has NOT returned while the callback is inside its
+// cleanup. An earlier implementation released the lock and returned immediately, so Close
+// completed while releaseMemory was still going to store MemoryPressureCritical - leaving a
+// closed service reporting critical pressure, with cache flush and FreeOSMemory still to run.
+//
+// The hook makes this deterministic. The previous test raced goroutines and asserted the
+// outcome, which could pass by luck on a machine where the callback never won the race.
+func TestCloseWaitsForInFlightPressureCallback(t *testing.T) {
+	pressure := &atomic.Uint32{}
+	pressure.Store(uint32(tun.MemoryPressureNone))
+	timer := newPressureTestTimer(pressure)
+
+	callbackEntered := make(chan struct{})
+	callbackRelease := make(chan struct{})
+	timer.cleanupHook = func() {
+		close(callbackEntered)
+		<-callbackRelease
+	}
+
+	timer.start(nil)
+
+	// Run the callback on its own goroutine: it is about to block inside the barrier.
+	callbackDone := make(chan struct{})
+	go func() {
+		defer close(callbackDone)
+		timer.notifyPressure()
+	}()
+
+	// Wait until the callback is provably inside the cleanup.
+	select {
+	case <-callbackEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the callback never entered its cleanup")
+	}
+
+	// Close concurrently. It must WAIT, not return.
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		timer.stop()
+	}()
+
+	select {
+	case <-closeDone:
+		t.Fatal("stop returned while a pressure callback was still inside its cleanup; " +
+			"the destructive work can still rewrite pressure to Critical after Close")
+	case <-time.After(150 * time.Millisecond):
+		// Correct: stop is blocked on the in-flight barrier.
+	}
+
+	// Release the callback and let everything settle.
+	close(callbackRelease)
+
+	select {
+	case <-callbackDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the callback did not finish after being released")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not return after the callback finished")
+	}
+
+	// Final state: timer stopped, in-flight count zero.
+	timer.access.Lock()
+	running := timer.timer != nil
+	timer.access.Unlock()
+	if running {
+		t.Fatal("the timer must be stopped")
+	}
+
+	// The callback ran legitimately - it was active when the pressure arrived - so pressure is
+	// Critical at this instant. What matters is that it can no longer CHANGE after Close.
+	pressureAfterClose := pressure.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := pressure.Load(); got != pressureAfterClose {
+		t.Fatalf("pressure changed from %d to %d after Close returned", pressureAfterClose, got)
+	}
+}
+
+// TestLateCallbackAfterCloseHasNoEffect is the other half: a callback delivered AFTER Close
+// must do nothing at all.
+//
+// It must not set the pressure baseline, must not force the minimum interval, and must not
+// touch the reported pressure.
+func TestLateCallbackAfterCloseHasNoEffect(t *testing.T) {
+	pressure := &atomic.Uint32{}
+
+	var hookCalls atomic.Int32
+	timer := newPressureTestTimer(pressure)
+	timer.cleanupHook = func() { hookCalls.Add(1) }
+
+	timer.start(nil)
+	timer.stop()
+
+	// Normalise the state so any change is visible.
+	pressure.Store(uint32(tun.MemoryPressureNone))
+	timer.access.Lock()
+	timer.forceMinInterval = false
+	timer.pendingPressureBaseline = false
+	timer.pressureBaselineTime = time.Time{}
+	timer.access.Unlock()
+
+	// A definitively late callback.
+	timer.notifyPressure()
+
+	if got := pressure.Load(); got != uint32(tun.MemoryPressureNone) {
+		t.Fatalf("a callback after Close rewrote pressure to %d", got)
+	}
+	if calls := hookCalls.Load(); calls != 0 {
+		t.Fatalf("a callback after Close executed the cleanup %d time(s)", calls)
+	}
+
+	timer.access.Lock()
+	forced := timer.forceMinInterval
+	baseline := timer.pendingPressureBaseline
+	baselineTime := timer.pressureBaselineTime
+	timer.access.Unlock()
+
+	if forced || baseline || !baselineTime.IsZero() {
+		t.Fatalf("a callback after Close modified timer state: forced=%v baseline=%v at=%v",
+			forced, baseline, baselineTime)
+	}
+}
+
+// TestStopIsNotBlockedWhenNoCallbackIsInFlight guards against the barrier turning into a
+// permanent stall: with nothing in flight, stop must return promptly.
+func TestStopIsNotBlockedWhenNoCallbackIsInFlight(t *testing.T) {
+	pressure := &atomic.Uint32{}
+	timer := newPressureTestTimer(pressure)
+	timer.start(nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer.stop()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop blocked with no callback in flight")
 	}
 }

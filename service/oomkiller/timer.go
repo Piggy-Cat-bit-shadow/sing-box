@@ -143,8 +143,44 @@ type adaptiveTimer struct {
 	pressure        *atomic.Uint32
 	limitThresholds pressureThresholds
 
-	access          sync.Mutex
-	timer           *time.Timer
+	access sync.Mutex
+	timer  *time.Timer
+
+	// pressureCallbacks tracks memory-pressure callbacks that have passed the active check
+	// and are still running their destructive cleanup.
+	//
+	// # Why a WaitGroup is needed at all
+	//
+	// Checking `t.timer != nil` under the lock is necessary but NOT sufficient. The callback
+	// releases the lock before doing its work, precisely so a long FreeOSMemory does not stall
+	// Close. Without something to join on, this sequence is possible:
+	//
+	//	notifyPressure: active check passes, unlock
+	//	Close:          stop() sets timer = nil, stopTimer() stores None, Close RETURNS
+	//	notifyPressure: releaseMemory() stores Critical, flushes the cache, calls FreeOSMemory
+	//
+	// So Close has returned and the pressure flag a torn-down service reports is Critical
+	// again, with destructive cleanup still to come. The active check bounds WHEN the work
+	// starts; the barrier bounds when it has FINISHED.
+	//
+	// # Why this ordering cannot race
+	//
+	// Add(1) happens while t.access is held and only after the active check has passed, and
+	// stop() sets timer = nil while holding the same lock before it Waits. So:
+	//
+	//   - a callback that entered before stop() took the lock has already Added, and Wait
+	//     observes it;
+	//   - a callback that enters after stop() set timer = nil fails the active check and never
+	//     Adds, so it cannot be missed.
+	//
+	// There is no window in which Add can happen after Wait has decided the count is zero.
+	pressureCallbacks sync.WaitGroup
+
+	// cleanupHook, when set, runs at the start of the destructive cleanup. Tests use it to
+	// hold a callback inside the barrier deterministically instead of racing goroutines and
+	// hoping to hit the interleaving.
+	cleanupHook func()
+
 	lastGoroutines  int
 	lastConnections int
 	lastGCCycles    uint64
@@ -191,14 +227,36 @@ func (t *adaptiveTimer) startLocked() {
 	t.timer = time.AfterFunc(t.minInterval, t.poll)
 }
 
+// stop halts the timer and WAITS for in-flight pressure callbacks to finish.
+//
+// # Why the wait is the point
+//
+// Setting timer = nil under the lock stops new callbacks from starting, but a callback that
+// already passed its active check is still running its destructive cleanup - and if stop
+// returned immediately, Service.Close could return while that cleanup is still going to store
+// Critical. Callers treat the return of stop as "nothing further will touch this service", and
+// the barrier is what makes that true rather than merely likely.
+//
+// # Why the lock is released before Wait
+//
+// The callback must be able to finish, and it does not need t.access to do so. Waiting while
+// holding the lock would deadlock the moment a callback tried to acquire it, and would also
+// turn a slow FreeOSMemory into a stall for every other reader of the timer state.
 func (t *adaptiveTimer) stop() timerState {
 	t.access.Lock()
-	defer t.access.Unlock()
 	if t.timer != nil {
 		t.timer.Stop()
 		t.timer = nil
 	}
-	return t.timerState
+	state := t.timerState
+	t.access.Unlock()
+
+	// Everything that legitimately started before timer was set to nil finishes here. Nothing
+	// can join the group after this point: a later callback sees timer == nil and returns
+	// without Add.
+	t.pressureCallbacks.Wait()
+
+	return state
 }
 
 func (t *adaptiveTimer) poll() {
@@ -348,6 +406,16 @@ func (t *adaptiveTimer) belowTrigger(sample memorySample) bool {
 }
 
 func (t *adaptiveTimer) releaseMemory() {
+	// The hook runs BEFORE the destructive work, so a test can hold a callback inside the
+	// in-flight barrier and observe whether stop() waits for it. Placed after the work it would
+	// only prove the work had already happened.
+	//
+	// It is read without the lock: tests install it before starting anything, and reading it
+	// under t.access would deadlock against stop(), which holds that lock while a callback is
+	// meant to be finishing.
+	if hook := t.cleanupHook; hook != nil {
+		hook()
+	}
 	if t.cacheFile != nil {
 		t.cacheFile.Flush()
 	}
