@@ -289,21 +289,25 @@ type URLTestGroup struct {
 	// mutex is the right tool. Two independent atomics could each be correct alone while the pair
 	// still lost a request, which is exactly the bug being fixed here.
 	recheckAccess sync.Mutex
-	// recheckQueued records that a forced round is owed.
+	// recheckRequested counts recheck requests; recheckServed counts those a completed round has
+	// accounted for. Debt exists while requested > served.
 	//
-	// # Why a queued flag rather than a pending worker
+	// # Why a sequence and not a flag
 	//
-	// The previous design used one flag to mean "a recheck worker exists". A request arriving while
-	// a periodic round was already running found `checking` set, so the worker returned immediately
-	// and cleared the flag - and the forced probe the failure asked for was LOST. The node that had
-	// just failed to carry traffic was then never re-measured at all.
+	// A flag says only "something is owed". That is not enough to recover from a panic, because the
+	// recovery has to tell apart two debts that look identical to a boolean:
 	//
-	// The flag now means "a forced round is owed", which is independent of whether a round is
-	// running. A request can therefore be coalesced (many failures, one round) without ever being
-	// dropped.
-	recheckQueued bool
-	// recheckWorker records that a worker is draining recheckQueued, so a burst does not start a
-	// goroutine per failure.
+	//	the debt the PANICKING round was already serving  -> must NOT be retried
+	//	debt created WHILE it ran, by a genuine failure    -> must NOT be lost
+	//
+	// Retrying the first turns a reproducible panic into an unbounded retry loop. Dropping the
+	// second leaves debt with no worker to serve it. A sequence distinguishes them by value: a
+	// round records the sequence it is serving, so anything above that number arrived during the
+	// round and needs a replacement worker.
+	recheckRequested uint64
+	recheckServed    uint64
+	// recheckWorker records that a worker exists to serve the outstanding sequence, so a burst does
+	// not start a goroutine per failure.
 	recheckWorker bool
 	// recheckRuns counts forced rounds actually executed. It exists so a test can assert the
 	// guarantee as a fact rather than inferring it from timing.
@@ -619,7 +623,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 // It is used when a round is already in flight, so the request cannot be served now.
 func (g *URLTestGroup) queueForcedRecheck() {
 	g.recheckAccess.Lock()
-	g.recheckQueued = true
+	g.recheckRequested++
 	startWorker := !g.recheckWorker
 	if startWorker {
 		g.recheckWorker = true
@@ -933,10 +937,10 @@ func (g *URLTestGroup) requestHealthRecheck() {
 	// the request is remembered, because a forced probe that never happens leaves the node that
 	// just failed to carry traffic eligible for selection on the strength of the measurement the
 	// failure already contradicted.
-	g.recheckQueued = true
+	g.recheckRequested++
 	if g.recheckWorker {
-		// A worker already exists and will observe the flag. Starting another would make a burst of
-		// failing connections a burst of goroutines.
+		// A worker already exists and will observe the new sequence. Starting another would make a
+		// burst of failing connections a burst of goroutines.
 		g.recheckAccess.Unlock()
 		return
 	}
@@ -950,33 +954,51 @@ func (g *URLTestGroup) requestHealthRecheck() {
 //
 // # The handoff this exists to guarantee
 //
-// A request arriving while a round is running is QUEUED, not dropped:
+// A request arriving while a round is running is recorded, not dropped:
 //
-//	request   -> recheckQueued = true
-//	worker    -> runs a forced round
-//	             (a request arriving during it leaves recheckQueued = true)
-//	worker    -> sees recheckQueued still set, runs ONE more forced round
-//	worker    -> clears recheckQueued, and only then gives up the worker slot
+//	request   -> recheckRequested++
+//	worker    -> records the sequence it is serving, runs a forced round
+//	             (a request arriving during it raises recheckRequested further)
+//	worker    -> marks that sequence served, and if more was requested runs ONE more round
+//	worker    -> only then gives up the worker slot
 //
-// The order of the last two steps is what makes it race-free. Clearing the flag first would leave
-// a window in which a request is recorded after the worker's final read but before the worker
-// stops - and that request would wait for a worker that has already decided to exit. Clearing it
-// while still holding the worker slot means a request either sets the flag in time for the final
-// read, or finds no worker and starts one.
+// Ordering the last two steps under the lock is what makes it race-free: a request either raises the
+// sequence in time for the final comparison, or finds no worker and starts one.
 //
-// Many failures therefore coalesce into at most one extra round, and none are lost.
+// Many failures therefore coalesce into at most one extra round, and none are lost. The same
+// sequence is what lets the panic path tell apart debt this round already owned - which must not be
+// retried - from debt that arrived while it ran, which must not be dropped.
 func (g *URLTestGroup) drainHealthRechecks() {
-	// The worker gives up its slot on EVERY exit, including a panic.
+	// The worker gives up its slot on EVERY exit, including a panic, and decides there whether a
+	// replacement is owed.
 	//
-	// Releasing `checking` and `recheckWorker` on the normal path only was a permanent stall
-	// waiting to happen: a panic left both set, so every later periodic check saw a round
-	// "already running" and returned, and no later traffic failure could start a worker. The
-	// group's health subsystem was then dead for the rest of the process's life, with selection
-	// quietly reusing whatever evidence existed when the panic happened.
+	// # What a panic must and must not do
 	//
-	// A panicking round is NOT automatically retried. A reproducible panic would otherwise become
-	// an unbounded retry loop that pins a CPU and floods the log; the next failure or periodic
-	// tick can start a fresh worker instead.
+	// MUST NOT retry the round that panicked. A reproducible panic would then become an unbounded
+	// retry loop that pins a CPU and floods the log.
+	//
+	// MUST NOT drop debt created WHILE that round ran. A genuine traffic failure arriving during
+	// the round is a real request nobody else will serve: the previous design released `checking`
+	// and the worker while leaving the queued flag set, which is debt with no worker to serve it.
+	//
+	// `retired` is the sequence this worker has accounted for, either by completing a round or by
+	// ABANDONING the one that panicked.
+	//
+	// It starts at the sequence the worker was created to serve, NOT at recheckServed. The
+	// difference is the whole point: a round that panics abandons the debt it was serving, so that
+	// debt must be marked retired rather than left outstanding - leaving it outstanding is what
+	// would make the replacement worker retry the panicking round forever.
+	//
+	// Anything ABOVE the round's own serving mark arrived while it ran, so it is genuinely new debt
+	// and the tail starts a replacement worker to serve exactly that.
+	g.recheckAccess.Lock()
+	retired := g.recheckRequested
+	g.recheckAccess.Unlock()
+
+	// servingMark is the sequence the CURRENT round is serving. A panic retires exactly this, so the
+	// panicking round's own debt is abandoned while anything newer survives.
+	var servingMark uint64
+
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if g.logger != nil {
@@ -984,14 +1006,37 @@ func (g *URLTestGroup) drainHealthRechecks() {
 			}
 		}
 		g.checking.Store(false)
+
 		g.recheckAccess.Lock()
 		g.recheckWorker = false
+		if servingMark > g.recheckServed {
+			// The round was abandoned rather than completed, so its debt is retired rather than
+			// served. Writing it back to recheckServed is what keeps the counter pair meaningful:
+			// "requested > served" must mean "somebody still owes a round", and an abandoned round
+			// is nobody's debt any more. Leaving it outstanding would also make a replacement
+			// worker replay the same panicking round without bound.
+			g.recheckServed = servingMark
+		}
+		retired = g.recheckServed
+		replacement := g.recheckRequested > retired
+		if replacement {
+			// Claim the worker slot while still holding the lock, so a request arriving now either
+			// observes a worker or starts one itself. There is no window in which it waits for a
+			// worker that has already decided to exit.
+			g.recheckWorker = true
+		}
 		g.recheckAccess.Unlock()
+
+		if replacement {
+			go g.drainHealthRechecks()
+		}
 	}()
 
 	for {
 		g.recheckAccess.Lock()
-		g.recheckQueued = false
+		// This round serves every request made up to now. Many failures therefore still coalesce
+		// into ONE round: the sequence is not one-round-per-request.
+		serving := g.recheckRequested
 		g.recheckAccess.Unlock()
 
 		if g.ctx.Err() != nil {
@@ -1010,19 +1055,26 @@ func (g *URLTestGroup) drainHealthRechecks() {
 			//
 			// This is a bounded wait on a mutex-guarded handoff, not a traffic path.
 			time.Sleep(time.Millisecond)
-			g.recheckAccess.Lock()
-			g.recheckQueued = true
-			g.recheckAccess.Unlock()
 			continue
 		}
 
 		g.recheckRuns.Add(1)
+		// Record the mark BEFORE running, so the panic path can retire exactly this round's debt
+		// rather than re-deriving it from state the panic may have left inconsistent.
+		g.recheckAccess.Lock()
+		servingMark = serving
+		g.recheckAccess.Unlock()
+
 		g.runForcedRound()
 		g.checking.Store(false)
 
-		// Decide whether to go round again, still holding the worker slot.
+		// The round completed, so everything up to `serving` is now accounted for.
 		g.recheckAccess.Lock()
-		more := g.recheckQueued && g.ctx.Err() == nil
+		if serving > g.recheckServed {
+			g.recheckServed = serving
+		}
+		retired = g.recheckServed
+		more := g.recheckRequested > g.recheckServed && g.ctx.Err() == nil
 		if !more {
 			g.recheckWorker = false
 		}
@@ -1041,7 +1093,7 @@ func (g *URLTestGroup) drainHealthRechecks() {
 // measurement the failure just contradicted.
 //
 // It is a separate function so the worker's ownership of the `checking` guard is visible at the
-// call site, and so the guard's release can be deferred around exactly this work.
+// call site.
 func (g *URLTestGroup) runForcedRound() {
 	if g.forcedRoundOverride != nil {
 		g.forcedRoundOverride()

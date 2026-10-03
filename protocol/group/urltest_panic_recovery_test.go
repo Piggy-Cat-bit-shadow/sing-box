@@ -243,3 +243,155 @@ func TestMemberPanicDoesNotKillTheProcess(t *testing.T) {
 	require.Nil(t, storage.LoadURLTestHistoryFor("node-bad", group.scope),
 		"the panicking member is treated as unavailable, like a failed dial")
 }
+
+// TestQueuedRecheckSurvivesConcurrentPanickingRound is the release blocker for orphaned debt.
+//
+// # The state that must not exist
+//
+// A forced round is running. Another traffic failure arrives, which records new debt but does not
+// start a worker (one already exists). The running round then panics. The recovery released
+// `checking` and `recheckWorker` but never considered `recheckQueued`, so it could leave:
+//
+//	checking = false
+//	recheckWorker = false
+//	recheckQueued = true
+//
+// That is debt with nobody to serve it. Nothing would probe again until some unrelated future
+// failure happened to arrive, so a node that failed to carry traffic stays eligible on the strength
+// of the very measurement the failure contradicted.
+//
+// The test deliberately stops requesting anything after step 7. If it did, a later request would
+// start a worker by itself and the test would pass without proving anything about the recovery.
+
+// barrierRound lets a test hold a forced round open and then decide how it ends.
+type barrierRound struct {
+	entered chan struct{}
+	release chan struct{}
+	panicIt bool
+}
+
+func (b *barrierRound) run() {
+	close(b.entered)
+	<-b.release
+	if b.panicIt {
+		panic("injected failure inside the forced round body")
+	}
+}
+
+// TestQueuedRecheckSurvivesConcurrentPanickingRound is problem 1 of this round.
+func TestQueuedRecheckSurvivesConcurrentPanickingRound(t *testing.T) {
+	server := newRecordingServer(t)
+	link := "http://127.0.0.1:" + portOf(t, server.address) + "/a"
+
+	node := &observingOutbound{tag: "node-a"}
+	group, storage := newGroupFixture(t, link, node)
+	group.selected.Store(&selectedState{tcp: node, udp: node})
+
+	// The FIRST round blocks and then panics; later rounds run normally.
+	barrier := &barrierRound{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		panicIt: true,
+	}
+	var rounds atomic.Int32
+	group.forcedRoundOverride = func() {
+		if rounds.Add(1) == 1 {
+			barrier.run()
+			return
+		}
+		// Replacement rounds do the real work.
+		URLTestOutboundsWithTarget(group.ctx, group.outbound, group.history, group.logger,
+			group.outbounds, group.link, group.expected, group.interval, true, TestHistoryHealth)
+		group.performUpdateCheck()
+	}
+
+	// 1-3. Start round #1 and wait until it is genuinely in flight.
+	group.requestHealthRecheck()
+	select {
+	case <-barrier.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("round #1 never started")
+	}
+
+	// 4-5. A real traffic failure arrives while that round is running.
+	group.recheckAccess.Lock()
+	outstandingBefore := group.recheckRequested
+	group.recheckAccess.Unlock()
+
+	group.requestHealthRecheck()
+
+	group.recheckAccess.Lock()
+	outstandingAfter := group.recheckRequested
+	group.recheckAccess.Unlock()
+	require.Greater(t, outstandingAfter, outstandingBefore,
+		"the new request must be recorded while the round is running")
+
+	// 6. The running round panics.
+	close(barrier.release)
+
+	// 7-8. From here on NOTHING requests a recheck. Any round that runs is the recovery working.
+	require.Eventually(t, func() bool {
+		return storage.LoadURLTestHistoryFor("node-a", group.scope) != nil
+	}, 5*time.Second, 5*time.Millisecond,
+		"the debt recorded during the panicking round was ORPHANED: recovery released checking "+
+			"and the worker but left recheckQueued set, so nobody served it. The node that failed "+
+			"to carry traffic is never re-measured. No further request is made by this test, so "+
+			"nothing else could have woken the worker")
+
+	// 9-11. The state machine must settle with no debt and no worker.
+	waitForIdleWorker(t, group)
+
+	require.False(t, group.checking.Load(), "checking must be released")
+
+	group.recheckAccess.Lock()
+	outstanding := group.recheckRequested > group.recheckServed
+	group.recheckAccess.Unlock()
+	require.False(t, outstanding,
+		"the debt was served, so it must not still be outstanding; `requested > served` with no "+
+			"worker is exactly the orphaned state this test rules out")
+
+	require.GreaterOrEqual(t, rounds.Load(), int32(2),
+		"the replacement round actually ran")
+}
+
+// TestPanickingRoundDoesNotRetryItsOwnDebt is the converse (§11).
+//
+// The panicking round's OWN debt must not be retried. Otherwise a reproducible panic becomes an
+// unbounded self-retry loop.
+func TestPanickingRoundDoesNotRetryItsOwnDebt(t *testing.T) {
+	server := newRecordingServer(t)
+	link := "http://127.0.0.1:" + portOf(t, server.address) + "/a"
+
+	node := &observingOutbound{tag: "node-a"}
+	group, _ := newGroupFixture(t, link, node)
+	group.selected.Store(&selectedState{tcp: node, udp: node})
+
+	var rounds atomic.Int32
+	group.forcedRoundOverride = func() {
+		rounds.Add(1)
+		panic("injected failure inside the forced round body")
+	}
+
+	group.requestHealthRecheck()
+	waitForIdleWorker(t, group)
+
+	// No new request is made. The panicking round's own debt must NOT be retried.
+	time.Sleep(400 * time.Millisecond)
+
+	require.Equal(t, int32(1), rounds.Load(),
+		"the panicking round's own debt must not be retried; a reproducible panic would "+
+			"otherwise become an unbounded retry loop that pins a CPU and floods the log. Got %d "+
+			"rounds from a single request", rounds.Load())
+
+	require.False(t, group.checking.Load(), "checking must be released")
+
+	group.recheckAccess.Lock()
+	worker := group.recheckWorker
+	orphan := group.recheckRequested > group.recheckServed
+	group.recheckAccess.Unlock()
+
+	require.False(t, worker)
+	require.False(t, orphan,
+		"the panicking round's own debt is abandoned, not left outstanding: it was already the "+
+			"round that failed, so re-queueing it would be the retry loop")
+}

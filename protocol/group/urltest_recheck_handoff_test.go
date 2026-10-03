@@ -227,7 +227,7 @@ func TestForcedRecheckIsQueuedRatherThanDroppedWhenBusy(t *testing.T) {
 	group.queueForcedRecheck()
 
 	group.recheckAccess.Lock()
-	queued := group.recheckQueued
+	queued := group.recheckRequested > group.recheckServed
 	worker := group.recheckWorker
 	group.recheckAccess.Unlock()
 
@@ -247,7 +247,7 @@ func TestClosedGroupDoesNotQueueWork(t *testing.T) {
 	group.requestHealthRecheck()
 
 	group.recheckAccess.Lock()
-	queued := group.recheckQueued
+	queued := group.recheckRequested > group.recheckServed
 	worker := group.recheckWorker
 	group.recheckAccess.Unlock()
 
