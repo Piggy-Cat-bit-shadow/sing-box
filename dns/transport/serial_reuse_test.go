@@ -106,7 +106,6 @@ func TestTCPTransportReusesSequentially(t *testing.T) {
 	t.Parallel()
 	listener, accepted := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
 
 	// The serial path is the only path: the pipelining capability probe was removed because it
 	// generated DNS queries the caller never authorised. Nothing needs to be forced here.
@@ -137,7 +136,6 @@ func TestTCPTransportSerialReuseSurvivesRepeatedQueries(t *testing.T) {
 	t.Parallel()
 	listener, accepted := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
 	// Serial path under test; see TestTCPTransportReusesSequentially.
 
 	const total = 30
@@ -164,7 +162,6 @@ func TestTCPTransportSerialReuseConcurrentQueriesStayCorrect(t *testing.T) {
 	t.Parallel()
 	listener, _ := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
 	// Serial path under test; see TestTCPTransportReusesSequentially.
 
 	const concurrency = 8
@@ -191,7 +188,6 @@ func TestTCPTransportSerialReuseCancellationDoesNotCorruptThePool(t *testing.T) 
 	t.Parallel()
 	listener, _ := newSequentialDNSServer(t)
 	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
 
 	// A query with an already-expired context must fail, not hang.
 	expired, cancel := context.WithCancel(context.Background())
@@ -223,7 +219,8 @@ func TestTCPTransportSerialReuseCloseAndReset(t *testing.T) {
 	if err := testExchange(transport, "example.com."); err != nil {
 		t.Fatal("query after Reset: ", err)
 	}
-	if err := transport.Close(); err != nil {
+	// Teardown is scope-owned; closing the scope is what releases the pooled connections.
+	if err := testScopeOf(t, transport).Close(); err != nil {
 		t.Fatal("Close: ", err)
 	}
 	// A query after Close must fail rather than block.
@@ -290,7 +287,6 @@ func BenchmarkTCPDNSSerialReuse(b *testing.B) {
 				transportDialer,
 				M.SocksaddrFromNet(listener.Addr()),
 			)
-			defer transport.Close()
 
 			message := new(mDNS.Msg)
 			message.SetQuestion("example.com.", mDNS.TypeA)

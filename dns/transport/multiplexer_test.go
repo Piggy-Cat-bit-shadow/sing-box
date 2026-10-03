@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -111,6 +112,19 @@ func TestTCPTransportRetriesReadErrorOnReusedConn(t *testing.T) {
 	}
 }
 
+// testScopes records the scope each test transport was started with, so a test can close it.
+var testScopes sync.Map
+
+// testScopeOf returns the scope a test transport was started with.
+func testScopeOf(t *testing.T, transport *TCPTransport) *adapter.Scope {
+	t.Helper()
+	scope, loaded := testScopes.Load(transport)
+	if !loaded {
+		t.Fatal("no scope recorded for this test transport")
+	}
+	return scope.(*adapter.Scope)
+}
+
 func newTestTCPTransport(t *testing.T, listener net.Listener) *TCPTransport {
 	transportDialer, err := dialer.NewDefault(context.Background(), option.DialerOptions{})
 	if err != nil {
@@ -122,9 +136,13 @@ func newTestTCPTransport(t *testing.T, listener net.Listener) *TCPTransport {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Teardown is scope-owned now, so a test that wants to assert post-close behaviour must close
+	// the scope: DNSTransport no longer has a Close. The scope is recorded here rather than on the
+	// production struct, which must not grow a field for a test's benefit.
 	t.Cleanup(func() {
-		scope.Close()
+		_ = scope.Close()
 	})
+	testScopes.Store(transport, scope)
 	return transport
 }
 
@@ -342,7 +360,8 @@ func TestMultiplexerSlowQueryDoesNotPoisonThePool(t *testing.T) {
 	}()
 
 	transport := newTestTCPTransport(t, listener)
-	defer transport.Close()
+	// Teardown is scope-owned: newTestTCPTransport registers scope.Close with t.Cleanup, so there
+	// is no per-transport Close to call.
 
 	// This query is expected to time out.
 	slowCtx, slowCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)

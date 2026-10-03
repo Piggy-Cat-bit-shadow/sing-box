@@ -173,7 +173,6 @@ func forceSerial(transport *TCPTransport) {
 func TestSerialPoolCloseIdleClosesIdleConnections(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	if err := testExchange(transport, "example.com."); err != nil {
@@ -230,7 +229,6 @@ func TestSerialPoolCloseIdleClosesIdleConnections(t *testing.T) {
 func TestSerialPoolCloseIdleDoesNotCloseCheckedOutConnections(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	pool := transport.multiplexer.serial
@@ -276,7 +274,6 @@ func TestSerialPoolCloseIdleDoesNotCloseCheckedOutConnections(t *testing.T) {
 func TestSerialPoolDoesNotRetainClosedConnections(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	pool := transport.multiplexer.serial
@@ -326,7 +323,6 @@ func TestSerialPoolDoesNotRetainClosedConnections(t *testing.T) {
 func TestStaleReusedConnectionRetriesOnWrite(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	// First query establishes a pooled connection.
@@ -366,7 +362,6 @@ func TestStaleReusedConnectionRetriesOnWrite(t *testing.T) {
 func TestStaleReusedConnectionRetriesOnRead(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	// A server that answers one query per connection and then hangs up. The first query pools
@@ -395,7 +390,6 @@ func TestStaleReusedConnectionRetriesOnRead(t *testing.T) {
 func TestFreshConnectionFailureIsNotRetried(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	// Every connection is closed before it can be read. The pool has nothing to reuse, so
@@ -429,7 +423,6 @@ func TestFreshConnectionFailureIsNotRetried(t *testing.T) {
 func TestCancelledQueryDoesNotReturnConnectionToIdle(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	pool := transport.multiplexer.serial
@@ -487,7 +480,6 @@ func TestCancelledQueryDoesNotReturnConnectionToIdle(t *testing.T) {
 func TestSerialPoolResetDropsConnections(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	if err := testExchange(transport, "example.com."); err != nil {
@@ -528,7 +520,9 @@ func TestSerialPoolCloseClosesEverything(t *testing.T) {
 		t.Fatal("query: ", err)
 	}
 
-	if err := transport.Close(); err != nil {
+	// Close is scope-owned under the new lifecycle: closing the scope tears down the pooled
+	// connections the same way, and the assertion below is about the transport's behaviour after.
+	if err := testScopeOf(t, transport).Close(); err != nil {
 		t.Fatal("close: ", err)
 	}
 
@@ -550,7 +544,6 @@ func TestSerialPoolCloseClosesEverything(t *testing.T) {
 func TestSerialReuseKeepsOneOutstandingQueryPerConnection(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	pool := transport.multiplexer.serial
@@ -618,7 +611,6 @@ func TestSerialReuseKeepsOneOutstandingQueryPerConnection(t *testing.T) {
 func TestSerialReuseSetKeepIdleConnectionsFalseReleases(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	if err := testExchange(transport, "example.com."); err != nil {
@@ -691,10 +683,15 @@ func TestSerialFreshRetryAfterCloseDoesNotDial(t *testing.T) {
 		t.Fatal("query: ", err)
 	}
 
+	// Close the transport before the acquisition: teardown is scope-owned, so the scope is what
+	// puts the pool into its closed state.
+	if err := testScopeOf(t, transport).Close(); err != nil {
+		t.Fatal("close: ", err)
+	}
+
 	pool := transport.multiplexer.serial
 
 	dialsBefore := server.connections()
-	require.NoError(t, transport.Close())
 
 	// A fresh acquisition after Close must be refused rather than dialling.
 	conn, err := pool.AcquireFresh(context.Background(), transport.multiplexer.dialSerialConn)
@@ -751,7 +748,6 @@ func TestSerialBurstLeavesBoundedIdleConnections(t *testing.T) {
 	defer server.releaseQueries()
 
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 	forceSerial(transport)
 
 	pool := transport.multiplexer.serial
@@ -820,7 +816,6 @@ func TestSerialBurstLeavesBoundedIdleConnections(t *testing.T) {
 func TestReuseProbeDoesNotLeakUnauthorisedQueries(t *testing.T) {
 	server := newScriptedDNSServer(t)
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 
 	// A TXT query. The resolver must see only that.
 	message := new(mDNS.Msg)
@@ -865,7 +860,6 @@ func TestStrictFamilyStrategyIsNotBypassedByProbe(t *testing.T) {
 		t.Run(scenario.name, func(t *testing.T) {
 			server := newScriptedDNSServer(t)
 			transport := newTestTCPTransport(t, server.listener)
-			defer transport.Close()
 
 			message := new(mDNS.Msg)
 			message.SetQuestion("example.test.", scenario.question)
@@ -902,7 +896,6 @@ func TestSerialPoolConcurrencyContract(t *testing.T) {
 	defer server.releaseQueries()
 
 	transport := newTestTCPTransport(t, server.listener)
-	defer transport.Close()
 
 	const concurrency = 4
 	var waitGroup sync.WaitGroup
