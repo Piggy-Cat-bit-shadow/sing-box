@@ -37,12 +37,18 @@ var (
 )
 
 type Router struct {
-	ctx                   context.Context
-	logger                logger.ContextLogger
-	transport             adapter.DNSTransportManager
-	outbound              adapter.OutboundManager
-	powerManager          *powerreport.Manager
-	client                adapter.DNSClient
+	ctx          context.Context
+	logger       logger.ContextLogger
+	transport    adapter.DNSTransportManager
+	outbound     adapter.OutboundManager
+	powerManager *powerreport.Manager
+	client       adapter.DNSClient
+	// concreteClient is the same client, typed.
+	//
+	// The network reset needs one internal operation on it - re-pinning each transport's environment
+	// - and widening adapter.DNSClient for a single caller inside this package would put a
+	// fork-specific method on a shared interface. Holding the concrete type keeps that seam local.
+	concreteClient        *Client
 	rawRules              []option.DNSRule
 	rules                 []adapter.DNSRule
 	defaultDomainStrategy C.DomainStrategy
@@ -85,7 +91,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 			optimisticTimeout = 3 * 24 * time.Hour
 		}
 	}
-	router.client = NewClient(ClientOptions{
+	router.concreteClient = NewClient(ClientOptions{
 		Context:           ctx,
 		Timeout:           time.Duration(options.DNSClientOptions.Timeout),
 		DisableCache:      options.DNSClientOptions.DisableCache,
@@ -120,6 +126,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		},
 		Logger: router.logger,
 	})
+	router.client = router.concreteClient
 	if options.ReverseMapping {
 		router.dnsReverseMapping = common.Must1(freelru.New[netip.Addr, string](1024, maphash.NewHasher[netip.Addr]().Hash32, true))
 	}
@@ -1502,6 +1509,20 @@ func (r *Router) ResetNetwork() {
 
 	for _, transport := range r.transport.Transports() {
 		transport.Reset()
+	}
+
+	// Re-pin every transport's network environment.
+	//
+	// NetworkManager publishes the new environment BEFORE it calls this, so a query issued in
+	// between would otherwise be stamped with the new fingerprint while travelling over a connection
+	// belonging to the previous network - and because the stamp matched, the answer would be served
+	// to every later query on the new network for the rest of its TTL.
+	//
+	// The transports have just been reset, which is what makes this the correct moment: a transport
+	// now serves the new network, so stamping it with the new environment is accurate rather than
+	// premature.
+	if r.concreteClient != nil {
+		r.concreteClient.refreshTransportEnvironments()
 	}
 
 	// The reverse mapping is a cache of what previous answers said an address meant, and a network

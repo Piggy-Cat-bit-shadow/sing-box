@@ -47,8 +47,28 @@ type Client struct {
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	networkManager    adapter.NetworkManager
 	networkGeneration func() uint64
-	logger            logger.ContextLogger
-	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
+	// environmentPins holds the network environment each transport was LAST reset in.
+	//
+	// # Why the environment is pinned rather than read live
+	//
+	// A DNS cache key records which network an answer belongs to, and the transport that carried the
+	// query is what actually defines that network. But NetworkManager publishes the new environment
+	// BEFORE it resets the DNS router:
+	//
+	//	updateNetworkEnvironment()   <- the fingerprint becomes B
+	//	ResetNetwork()               <- transports are reset here
+	//
+	// A query issued in between travels over a connection belonging to network A while a live read
+	// of NetworkEnvironment() already reports B, so its answer was stamped B and served to every
+	// later query on the new network for the rest of its TTL. The answer described A; the stamp said
+	// B; and because the stamp matched, nothing downstream could tell.
+	//
+	// Pinning the environment to the transport makes the stamp mean "the network this transport
+	// serves". Router.ResetNetwork refreshes the pin when it resets the transports, which is exactly
+	// the moment a transport stops belonging to the old network.
+	environmentPins compatible.Map[string, uint64]
+	logger          logger.ContextLogger
+	cache           *freelru.Cache[dnsCacheKey, *dns.Msg]
 	// QNAME-wide negative verdicts for NXDOMAIN, keyed without Qtype. See
 	// client_negative.go: one name costs one upstream query, not one per record type.
 	nxdomainCache     *freelru.Cache[nxdomainCacheKey, *nxdomainCacheEntry]
@@ -234,15 +254,56 @@ func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey)
 	return key, true
 }
 
+// transportEnvironment returns the network environment the given transport belongs to.
+//
+// The first observation pins it, and Router.ResetNetwork refreshes the pin when it resets the
+// transports. Until then the pinned value is used, so a query cannot be stamped with a network its
+// transport does not serve - see the environmentPins field for the ordering this exists to close.
+func (c *Client) transportEnvironment(transport adapter.DNSTransport) uint64 {
+	var current uint64
+	if c.networkManager != nil {
+		current = c.networkManager.NetworkEnvironment()
+	}
+	pinned, loaded := c.environmentPins.Load(transport.Tag())
+	if loaded {
+		return pinned
+	}
+	// LoadOrStore, so two concurrent first observations cannot pin different values.
+	actual, _ := c.environmentPins.LoadOrStore(transport.Tag(), current)
+	return actual
+}
+
+// refreshTransportEnvironments re-pins every transport to the environment that is current now.
+//
+// Called from the network reset, which is the moment a transport stops belonging to the previous
+// network. Everything observed afterwards is stamped with the new environment, and everything
+// observed before it keeps the environment its transport actually served.
+func (c *Client) refreshTransportEnvironments() {
+	for _, transport := range c.knownTransports() {
+		var current uint64
+		if c.networkManager != nil {
+			current = c.networkManager.NetworkEnvironment()
+		}
+		c.environmentPins.Store(transport, current)
+	}
+}
+
+// knownTransports lists the transport tags this client has observed.
+func (c *Client) knownTransports() []string {
+	var tags []string
+	c.environmentPins.Range(func(tag string, _ uint64) bool {
+		tags = append(tags, tag)
+		return true
+	})
+	return tags
+}
+
 func (c *Client) environmentHash(transport adapter.DNSTransport) uint64 {
 	environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
 	if !withEnvironment {
 		return 0
 	}
-	var networkEnvironment uint64
-	if c.networkManager != nil {
-		networkEnvironment = c.networkManager.NetworkEnvironment()
-	}
+	networkEnvironment := c.transportEnvironment(transport)
 	environment := environmentTransport.Environment()
 	if len(environment) == 0 {
 		return networkEnvironment
