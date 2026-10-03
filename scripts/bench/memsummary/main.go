@@ -28,6 +28,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+
+	"github.com/sagernet/sing-box/scripts/bench/benchstat"
 )
 
 // sample is one raw benchmark run, mirroring the harness's runResult for the fields this
@@ -76,14 +78,14 @@ func summarise(values []float64) stats {
 
 // median returns the median of an already-sorted non-empty slice.
 //
+// It delegates to benchstat, which memmatrix also uses. The two tools derive the same statistic
+// from the same raw samples, so they must agree byte for byte; keeping one implementation is
+// what makes that a property of the code rather than of two authors remembering the same rule.
+//
 // For an even count it averages the two central values, which is why a median can be a value
 // that no individual sample took - the raw file must be consulted for the actual observations.
 func median(sorted []float64) float64 {
-	middle := len(sorted) / 2
-	if len(sorted)%2 == 1 {
-		return sorted[middle]
-	}
-	return (sorted[middle-1] + sorted[middle]) / 2
+	return benchstat.MedianOfSorted(sorted)
 }
 
 // settingReport is everything the report claims about one configuration.

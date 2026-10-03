@@ -1,10 +1,10 @@
 {
   "benchmark": "SS2022-memory-pressure",
   "comparison": {
-    "exact_pause_total_reduction_pct": 55.18962758678765,
+    "exact_pause_total_reduction_pct": 51.7616799216309,
     "from": "40MiB/50",
-    "gc_cycles_reduction_pct": 56.14035087719298,
-    "throughput_change_pct": 1.7184823300819867,
+    "gc_cycles_reduction_pct": 53.44827586206896,
+    "throughput_change_pct": 1.22827216506408,
     "to": "40MiB/100"
   },
   "description": "Derived entirely from the raw samples beside this file. Every figure here can be recomputed from them; none was transcribed by hand.",
@@ -24,41 +24,41 @@
       "gomemlimit_bytes": 41943040,
       "throughput_mb_per_sec": {
         "samples": 10,
-        "median": 5750.6900000000005,
-        "min": 5435.25,
-        "max": 5839.79
+        "median": 5776.48,
+        "min": 5646.22,
+        "max": 5833.31
       },
       "ns_per_op": {
         "samples": 10,
-        "median": 46678840,
-        "min": 45966646,
-        "max": 49387902
+        "median": 46470566,
+        "min": 46017695,
+        "max": 47542507
       },
       "gc_cycles": {
         "samples": 10,
-        "median": 12.5,
+        "median": 13.5,
         "min": 12,
-        "max": 15
+        "max": 16
       },
       "pause_total_ns_exact": {
         "samples": 10,
-        "median": 425707.5,
-        "min": 332331,
-        "max": 649250
+        "median": 415604,
+        "min": 399625,
+        "max": 671877
       },
       "pause_max_upper_bound_ns": {
         "samples": 10,
         "median": 45056,
         "min": 24576,
-        "max": 163840
+        "max": 196608
       },
       "continuous_runtime_managed_peak_bytes": {
         "samples": 10,
-        "median": 40802568,
-        "min": 40618248,
-        "max": 41019656
+        "median": 40745224,
+        "min": 40036616,
+        "max": 41117960
       },
-      "max_headroom_below_gomemlimit_bytes": -923384
+      "max_headroom_below_gomemlimit_bytes": -825080
     },
     "40MiB/50": {
       "setting": "40MiB/50",
@@ -67,41 +67,41 @@
       "gomemlimit_bytes": 41943040,
       "throughput_mb_per_sec": {
         "samples": 10,
-        "median": 5653.535,
-        "min": 5509.11,
-        "max": 5784.56
+        "median": 5706.389999999999,
+        "min": 5608.25,
+        "max": 5761.42
       },
       "ns_per_op": {
         "samples": 10,
-        "median": 47481222.5,
-        "min": 46405479,
-        "max": 48725715
+        "median": 47041295,
+        "min": 46591875,
+        "max": 47864430
       },
       "gc_cycles": {
         "samples": 10,
-        "median": 28.5,
-        "min": 23,
-        "max": 32
+        "median": 29,
+        "min": 22,
+        "max": 36
       },
       "pause_total_ns_exact": {
         "samples": 10,
-        "median": 950020,
-        "min": 666336,
-        "max": 1118047
+        "median": 861564,
+        "min": 631326,
+        "max": 1258498
       },
       "pause_max_upper_bound_ns": {
         "samples": 10,
-        "median": 40960,
+        "median": 53248,
         "min": 20480,
-        "max": 163840
+        "max": 196608
       },
       "continuous_runtime_managed_peak_bytes": {
         "samples": 10,
-        "median": 39827720,
-        "min": 37669128,
-        "max": 40495368
+        "median": 39323912,
+        "min": 34957576,
+        "max": 39831816
       },
-      "max_headroom_below_gomemlimit_bytes": -1447672
+      "max_headroom_below_gomemlimit_bytes": -2111224
     }
   }
 }

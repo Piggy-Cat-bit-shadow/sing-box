@@ -89,7 +89,7 @@ func TestParseOutputAcceptsACompleteResult(t *testing.T) {
 		t.Fatalf("parsed ns/op=%v MB/s=%v, want 1000 and 500.5", result.NsPerOp, result.MBPerSec)
 	}
 	if !result.MetricsSaw || result.ContinuousTicks != 10 {
-		t.Fatalf("metrics were not captured: seen=%v ticks=%d", result.MetricsSaw, result.ContinuousTicks)
+		t.Fatalf("metrics were not captured: seen=%v ticks=%v", result.MetricsSaw, result.ContinuousTicks)
 	}
 }
 

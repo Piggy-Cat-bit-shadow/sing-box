@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Tests for the derived summary.
@@ -213,4 +216,50 @@ func TestPercentChange(t *testing.T) {
 	if got := percentChange(0, 100); got != 0 {
 		t.Fatalf("percentChange(0,100) = %v, want 0 rather than a division by zero", got)
 	}
+}
+
+// TestSummaryMedianMatchesTheStandardDefinition is the cross-tool regression.
+//
+// memmatrix writes a `merged` median into the raw file; memsummary recomputes a median from the
+// same raw `runs`. Both call it "median", so they must agree exactly. They previously did not:
+// memmatrix took the upper median for an even count while memsummary averaged the two central
+// values, so ten samples produced 5665.92 in the raw file and 5653.5 in the report - two files
+// in the same commit disagreeing about the same evidence.
+//
+// The two tools now share benchstat. This test uses the ten real throughput values from that
+// comparison so the previously-divergent figure is the one being checked.
+func TestSummaryMedianMatchesTheStandardDefinition(t *testing.T) {
+	// The actual samples, in the order the raw file carries them.
+	samples := []float64{
+		5665.9, 5784.6, 5509.1, 5689.9, 5622.4,
+		5631.1, 5677.9, 5641.1, 5632.2, 5669.7,
+	}
+
+	sorted := append([]float64(nil), samples...)
+	sort.Float64s(sorted)
+
+	got := median(sorted)
+
+	// The standard median of these ten values is the mean of the 5th and 6th smallest.
+	expected := (5641.1 + 5665.9) / 2
+	require.InDelta(t, expected, got, 1e-9,
+		"the summary must use the standard median; the upper median (5665.9) is the value "+
+			"this replaces")
+
+	require.NotEqual(t, 5665.9, got,
+		"taking the upper median is precisely the divergence being fixed")
+}
+
+// TestSummariseAgreesWithIndependentRecomputation recomputes every reported statistic straight
+// from the samples and requires the report to match, so the report cannot drift from the raw.
+func TestSummariseAgreesWithIndependentRecomputation(t *testing.T) {
+	samples := []float64{10, 20, 30, 40, 50, 60, 70, 80, 90, 100}
+
+	summary := summarise(samples)
+
+	require.Equal(t, 10, summary.Samples)
+	require.InDelta(t, 55, summary.Median, 1e-9,
+		"the median of 10..100 must be the mean of 50 and 60")
+	require.InDelta(t, 10, summary.Min, 1e-9)
+	require.InDelta(t, 100, summary.Max, 1e-9)
 }

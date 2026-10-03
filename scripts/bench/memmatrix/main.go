@@ -45,9 +45,10 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/sagernet/sing-box/scripts/bench/benchstat"
 )
 
 const metricsPrefix = "MEMMETRICS "
@@ -85,6 +86,16 @@ var benchmarks = []benchmark{
 }
 
 // runResult is one (setting, benchmark) measurement.
+//
+// # Integer fields versus float64 fields
+//
+// The throughput and timing figures were always float64. The derived memory and GC statistics
+// are float64 for the same reason: for an even sample count the standard median of integers is
+// a half-integer, so a uint64 field could only hold a truncated value while still being called
+// a median.
+//
+// A zero-throughput or otherwise failed run is discarded by SampleValid before it reaches the
+// merge, so a fractional value here is always a real statistic and never a sentinel.
 type runResult struct {
 	Setting     string  `json:"setting"`
 	Benchmark   string  `json:"benchmark"`
@@ -95,33 +106,41 @@ type runResult struct {
 
 	// Runtime figures, from runtime/metrics inside the benchmark process. These are the
 	// only memory and GC numbers reported; nothing here comes from log parsing.
-	GOGCPercent       uint64 `json:"gogc_percent"`
-	GOMEMLIMITBytes   uint64 `json:"gomemlimit_bytes"`
-	ManagedStartBytes uint64 `json:"managed_start_bytes"`
-	ManagedPeakBytes  uint64 `json:"managed_peak_bytes"`
-	ManagedEndBytes   uint64 `json:"managed_end_bytes"`
-	GCCycles          uint64 `json:"gc_cycles"`
+	GOGCPercent       uint64  `json:"gogc_percent"`
+	GOMEMLIMITBytes   uint64  `json:"gomemlimit_bytes"`
+	ManagedStartBytes float64 `json:"managed_start_bytes"`
+	ManagedPeakBytes  float64 `json:"managed_peak_bytes"`
+	ManagedEndBytes   float64 `json:"managed_end_bytes"`
+	GCCycles          float64 `json:"gc_cycles"`
 	// PauseTotalNs is the exact cumulative STW pause for the run, from the runtime's own
 	// nanosecond counter.
-	PauseTotalNs uint64 `json:"pause_total_ns"`
-	PauseCount   uint64 `json:"pause_count"`
+	PauseTotalNs float64 `json:"pause_total_ns"`
+	PauseCount   float64 `json:"pause_count"`
 	// PauseMaxUpperBoundNs is the largest histogram bucket UPPER BOUND among this run's
 	// pauses. It is a bound, not a measured maximum - the runtime does not expose one - and the
 	// field name keeps that visible in the JSON so a report cannot quietly treat it as exact.
-	PauseMaxUpperBoundNs uint64 `json:"pause_max_upper_bound_ns"`
+	PauseMaxUpperBoundNs float64 `json:"pause_max_upper_bound_ns"`
 	// PauseUpperBoundTotalNs is the histogram estimate, advisory only.
-	PauseUpperBoundTotalNs uint64 `json:"pause_upper_bound_total_ns"`
+	PauseUpperBoundTotalNs float64 `json:"pause_upper_bound_total_ns"`
 	// ContinuousPeakBytes is the runtime-managed peak observed by a sampler running for the
 	// whole workload, rather than only at workload boundaries.
 	//
 	// ManagedPeakBytes comes from a Recorder that is sampled at copy boundaries, so it
-	// understates a transient that rises and falls within one copy. ContinuousPeakBytes is the
-	// figure to trust for "how close did this get to the limit".
-	ContinuousPeakBytes uint64 `json:"continuous_peak_bytes"`
+	// understates a transient that rises and falls within one copy.
+	//
+	// These two answer DIFFERENT questions and must not be substituted for each other:
+	//
+	//	ManagedPeakBytes    = the boundary observation, kept as a diagnostic
+	//	ContinuousPeakBytes = the whole-workload sampled peak
+	//
+	// Limiter engagement is judged from ContinuousPeakBytes only. Comparing one row's boundary
+	// peak against another's made an engaged limit look inert, because the boundary sampler
+	// misses the transient that the limit actually caps.
+	ContinuousPeakBytes float64 `json:"continuous_peak_bytes"`
 	// ContinuousTicks is how many observations the sampler completed. It distinguishes
 	// "the workload never rose" from "the sampler never ran", which look identical otherwise.
-	ContinuousTicks uint64 `json:"continuous_ticks"`
-	HeapLiveBytes   uint64 `json:"heap_live_bytes"`
+	ContinuousTicks float64 `json:"continuous_ticks"`
+	HeapLiveBytes   float64 `json:"heap_live_bytes"`
 
 	// SampleValid says this individual run produced a complete, structurally sound
 	// measurement: timing and throughput above zero, runtime metrics captured, the runtime
@@ -256,7 +275,11 @@ func main() {
 			// against, so it must be recorded first. Evaluating in slice order would make
 			// the result depend on where "unlimited" sits in the settings list.
 			if s.memLimit == "off" && merged.MetricsSaw {
-				unlimitedManagedPeak[b.name] = merged.ManagedPeakBytes
+				// The reference is the CONTINUOUS peak, which samples runtime-managed memory
+				// for the whole workload. The boundary peak is sampled at copy boundaries and
+				// therefore understates a transient that rises and falls inside one copy, so
+				// using it here made a genuinely engaged limiter look ineffective.
+				unlimitedContinuousPeak[b.name] = merged.ContinuousPeakBytes
 			}
 			evaluateValidity(&merged, s, results, b)
 			results = append(results, merged)
@@ -271,9 +294,9 @@ func main() {
 			}
 			memory := ""
 			if merged.MetricsSaw {
-				memory = fmt.Sprintf(" peak=%5.1f MiB gc=%5d pause=%8.1f ms",
-					float64(merged.ManagedPeakBytes)/(1024*1024), merged.GCCycles,
-					float64(merged.PauseTotalNs)/1e6)
+				memory = fmt.Sprintf(" peak=%5.1f MiB gc=%5.1f pause=%8.1f ms",
+					merged.ManagedPeakBytes/(1024*1024), merged.GCCycles,
+					merged.PauseTotalNs/1e6)
 			}
 			fmt.Printf("  %-16s %-26s %s%s  %s\n", s.name, b.name, throughput, memory, status)
 		}
@@ -537,27 +560,27 @@ func parseMetricsLine(line string, result *runResult) {
 		case "gomemlimit":
 			result.GOMEMLIMITBytes = value
 		case "managed_start":
-			result.ManagedStartBytes = value
+			result.ManagedStartBytes = float64(value)
 		case "managed_peak":
-			result.ManagedPeakBytes = value
+			result.ManagedPeakBytes = float64(value)
 		case "managed_end":
-			result.ManagedEndBytes = value
+			result.ManagedEndBytes = float64(value)
 		case "gc_cycles":
-			result.GCCycles = value
+			result.GCCycles = float64(value)
 		case "pause_total_ns":
-			result.PauseTotalNs = value
+			result.PauseTotalNs = float64(value)
 		case "pause_count":
-			result.PauseCount = value
+			result.PauseCount = float64(value)
 		case "pause_max_upper_bound_ns":
-			result.PauseMaxUpperBoundNs = value
+			result.PauseMaxUpperBoundNs = float64(value)
 		case "pause_upper_bound_total_ns":
-			result.PauseUpperBoundTotalNs = value
+			result.PauseUpperBoundTotalNs = float64(value)
 		case "continuous_peak":
-			result.ContinuousPeakBytes = value
+			result.ContinuousPeakBytes = float64(value)
 		case "continuous_ticks":
-			result.ContinuousTicks = value
+			result.ContinuousTicks = float64(value)
 		case "heap_live":
-			result.HeapLiveBytes = value
+			result.HeapLiveBytes = float64(value)
 		}
 	}
 }
@@ -626,7 +649,7 @@ func evaluateValidity(merged *runResult, s setting, previous []runResult, b benc
 		return
 	}
 
-	unlimitedPeak := unlimitedManagedPeak[b.name]
+	unlimitedPeak := unlimitedContinuousPeak[b.name]
 	if unlimitedPeak == 0 {
 		merged.Valid = false
 		merged.InvalidWhy = "the unlimited reference did not run, so there is nothing to compare against"
@@ -635,11 +658,25 @@ func evaluateValidity(merged *runResult, s setting, previous []runResult, b benc
 
 	// A soft limit holds the runtime near its target, so a limited run's peak should be
 	// BELOW the unlimited peak. If it matches, the limit did not constrain anything.
-	if merged.ManagedPeakBytes >= unlimitedPeak*95/100 {
+	//
+	// Both sides of this comparison are the CONTINUOUS whole-workload peak. The question being
+	// asked is "did the limit hold the runtime down during the workload", and only the
+	// continuous sampler observes that; the boundary peak answers a different question and
+	// answered it in a way that contradicted the sampling data.
+	//
+	// Judging the limited row by its boundary peak against the unlimited row's boundary peak
+	// produced exactly that contradiction in committed evidence: the continuous sampler showed
+	// the limited peak at ~40.8 MiB against an unlimited ~48.5 MiB (clearly constrained), while
+	// the boundary peaks read ~38.2 MiB against ~33.7 MiB and made the limiter look like it had
+	// done nothing. The limited row was then marked invalid - not because the limit failed, but
+	// because two different instruments were being compared.
+	//
+	// The 95% threshold is unchanged; only the instrument is.
+	if merged.ContinuousPeakBytes >= unlimitedPeak*95/100 {
 		merged.Valid = false
 		merged.InvalidWhy = fmt.Sprintf(
-			"peak runtime-managed memory %.1f MiB matches the unlimited %.1f MiB, so the limit did not engage",
-			float64(merged.ManagedPeakBytes)/(1024*1024), float64(unlimitedPeak)/(1024*1024))
+			"continuous runtime-managed peak %.1f MiB matches the unlimited %.1f MiB, so the limit did not engage",
+			float64(merged.ContinuousPeakBytes)/(1024*1024), float64(unlimitedPeak)/(1024*1024))
 		return
 	}
 	// The limit measurably constrained the runtime. Recorded separately from Valid, because
@@ -649,45 +686,73 @@ func evaluateValidity(merged *runResult, s setting, previous []runResult, b benc
 	merged.LimitEngaged = true
 }
 
-var unlimitedManagedPeak = map[string]uint64{}
+// unlimitedContinuousPeak holds the reference the limited rows are judged against, keyed by
+// benchmark. It is the continuous whole-workload peak of the unlimited setting.
+var unlimitedContinuousPeak = map[string]float64{}
 
+// medianOf reduces a setting's samples to one row, using the standard median.
+//
+// # Why the merged statistics are float64
+//
+// For an even sample count the standard median of integers is a half-integer - ten samples can
+// genuinely have a median of 12.5. Storing that in a uint64 would either truncate it or round
+// it, and the result would still be labelled "median" while no longer being one. The merged
+// statistics that need a median are therefore float64.
+//
+// Raw samples keep their integer types: those are real measurements, and a GC cycle count is
+// not a fractional quantity. Only the derived statistic changes type.
+//
+// Every value here comes from benchstat, which memsummary also uses, so the raw file's merged
+// row and the generated report cannot disagree about what the median of the same samples is.
 func medianOf(samples []runResult) runResult {
 	pick := func(get func(runResult) float64) float64 {
 		values := make([]float64, len(samples))
 		for i, s := range samples {
 			values[i] = get(s)
 		}
-		sort.Float64s(values)
-		return values[len(values)/2]
+		return benchstat.Median(values)
 	}
-	pickU := func(get func(runResult) uint64) uint64 {
+	pickInt := func(get func(runResult) uint64) uint64 {
 		values := make([]uint64, len(samples))
 		for i, s := range samples {
 			values[i] = get(s)
 		}
-		sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
-		return values[len(values)/2]
+		return uint64(benchstat.MedianUint(values))
 	}
+	pickU := func(get func(runResult) float64) float64 {
+		values := make([]float64, len(samples))
+		for i, s := range samples {
+			values[i] = get(s)
+		}
+		return benchstat.Median(values)
+	}
+
 	return runResult{
-		NsPerOp:                pick(func(r runResult) float64 { return r.NsPerOp }),
-		MBPerSec:               pick(func(r runResult) float64 { return r.MBPerSec }),
-		BytesPerOp:             pick(func(r runResult) float64 { return r.BytesPerOp }),
-		AllocsPerOp:            pick(func(r runResult) float64 { return r.AllocsPerOp }),
-		GOGCPercent:            pickU(func(r runResult) uint64 { return r.GOGCPercent }),
-		GOMEMLIMITBytes:        pickU(func(r runResult) uint64 { return r.GOMEMLIMITBytes }),
-		ManagedStartBytes:      pickU(func(r runResult) uint64 { return r.ManagedStartBytes }),
-		ManagedPeakBytes:       pickU(func(r runResult) uint64 { return r.ManagedPeakBytes }),
-		ManagedEndBytes:        pickU(func(r runResult) uint64 { return r.ManagedEndBytes }),
-		GCCycles:               pickU(func(r runResult) uint64 { return r.GCCycles }),
-		PauseTotalNs:           pickU(func(r runResult) uint64 { return r.PauseTotalNs }),
-		PauseCount:             pickU(func(r runResult) uint64 { return r.PauseCount }),
-		PauseMaxUpperBoundNs:   pickU(func(r runResult) uint64 { return r.PauseMaxUpperBoundNs }),
-		PauseUpperBoundTotalNs: pickU(func(r runResult) uint64 { return r.PauseUpperBoundTotalNs }),
-		ContinuousPeakBytes:    pickU(func(r runResult) uint64 { return r.ContinuousPeakBytes }),
-		ContinuousTicks:        pickU(func(r runResult) uint64 { return r.ContinuousTicks }),
-		HeapLiveBytes:          pickU(func(r runResult) uint64 { return r.HeapLiveBytes }),
-		MetricsSaw:             true,
-		Valid:                  true,
+		NsPerOp:     pick(func(r runResult) float64 { return r.NsPerOp }),
+		MBPerSec:    pick(func(r runResult) float64 { return r.MBPerSec }),
+		BytesPerOp:  pick(func(r runResult) float64 { return r.BytesPerOp }),
+		AllocsPerOp: pick(func(r runResult) float64 { return r.AllocsPerOp }),
+
+		// Integer-valued configuration echoes, not statistics: a median GOGC is meaningless
+		// because every sample shares one value. They stay uint64.
+		GOGCPercent:     pickInt(func(r runResult) uint64 { return r.GOGCPercent }),
+		GOMEMLIMITBytes: pickInt(func(r runResult) uint64 { return r.GOMEMLIMITBytes }),
+
+		// Derived memory and GC statistics. float64 so an even-count median is exact.
+		ManagedStartBytes:      pickU(func(r runResult) float64 { return r.ManagedStartBytes }),
+		ManagedPeakBytes:       pickU(func(r runResult) float64 { return r.ManagedPeakBytes }),
+		ManagedEndBytes:        pickU(func(r runResult) float64 { return r.ManagedEndBytes }),
+		GCCycles:               pickU(func(r runResult) float64 { return r.GCCycles }),
+		PauseTotalNs:           pickU(func(r runResult) float64 { return r.PauseTotalNs }),
+		PauseCount:             pickU(func(r runResult) float64 { return r.PauseCount }),
+		PauseMaxUpperBoundNs:   pickU(func(r runResult) float64 { return r.PauseMaxUpperBoundNs }),
+		PauseUpperBoundTotalNs: pickU(func(r runResult) float64 { return r.PauseUpperBoundTotalNs }),
+		ContinuousPeakBytes:    pickU(func(r runResult) float64 { return r.ContinuousPeakBytes }),
+		ContinuousTicks:        pickU(func(r runResult) float64 { return r.ContinuousTicks }),
+		HeapLiveBytes:          pickU(func(r runResult) float64 { return r.HeapLiveBytes }),
+
+		MetricsSaw: true,
+		Valid:      true,
 	}
 }
 
@@ -718,9 +783,9 @@ func printReport(results []runResult, selected []benchmark) {
 				if r.GOMEMLIMITBytes > 0 && r.GOMEMLIMITBytes < 1<<62 {
 					limit = fmt.Sprintf("%.1f", float64(r.GOMEMLIMITBytes)/(1024*1024))
 				}
-				fmt.Printf("%-16s %12.1f %12s %8d %12.1f %8.0f MB/s\n",
-					s.name, float64(r.ManagedPeakBytes)/(1024*1024), limit,
-					r.GCCycles, float64(r.PauseTotalNs)/1e6, r.MBPerSec)
+				fmt.Printf("%-16s %12.1f %12s %8.1f %12.1f %8.0f MB/s\n",
+					s.name, r.ManagedPeakBytes/(1024*1024), limit,
+					r.GCCycles, r.PauseTotalNs/1e6, r.MBPerSec)
 			}
 		}
 		fmt.Printf("\npeak = peak Go runtime-managed memory (total minus released), the quantity\n")
