@@ -46,6 +46,7 @@ type Client struct {
 	dnsCache          adapter.DNSCacheStore
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	networkManager    adapter.NetworkManager
+	networkGeneration func() uint64
 	logger            logger.ContextLogger
 	cache             *freelru.Cache[dnsCacheKey, *dns.Msg]
 	// QNAME-wide negative verdicts for NXDOMAIN, keyed without Qtype. See
@@ -66,6 +67,23 @@ type ClientOptions struct {
 	RDRC              func() adapter.RDRCStore
 	DNSCache          func() adapter.DNSCacheStore
 	Logger            logger.ContextLogger
+	// NetworkGeneration reports the current network generation.
+	//
+	// # Why a generation is needed on top of the environment fingerprint
+	//
+	// The fingerprint namespaces the cache by WHICH network an answer belongs to. It cannot express
+	// "same network identity, different epoch": a reset that leaves the fingerprint unchanged - the
+	// same SSID reconnected, the same interface re-addressed to the same values - produces an
+	// identical fingerprint, so a response issued before the reset and captured after it looks like
+	// it belongs. Comparing only fingerprints therefore accepts it.
+	//
+	// This is the OWNERSHIP guard for an in-flight response: it says whether the answer still belongs
+	// to the network its request was issued on. It is deliberately separate from the fingerprint,
+	// which is a NAMESPACE, and it is never part of a persistent key - a process-local counter would
+	// make persisted entries meaningless to the next process.
+	//
+	// nil means the caller has no generation concept, and only the fingerprint applies.
+	NetworkGeneration func() uint64
 }
 
 func NewClient(options ClientOptions) *Client {
@@ -81,6 +99,7 @@ func NewClient(options ClientOptions) *Client {
 		initRDRCFunc:      options.RDRC,
 		initDNSCacheFunc:  options.DNSCache,
 		logger:            options.Logger,
+		networkGeneration: options.NetworkGeneration,
 	}
 	if client.timeout == 0 {
 		client.timeout = C.DNSTimeout
@@ -131,6 +150,31 @@ func (c *Client) newCacheKey(transport adapter.DNSTransport, question dns.Questi
 		clientSubnet: clientSubnet,
 		environment:  c.environmentHash(transport),
 	}
+}
+
+// captureGeneration records the network generation a query is being issued on.
+//
+// It is called where the cache key is built - before the round trip - so the value describes the
+// network the question was asked on rather than the one that happens to be current when the answer
+// arrives. Reading it at store time would compare the current value against itself and therefore
+// never reject anything.
+func (c *Client) captureGeneration(operation *exchangeOperation) {
+	if c.networkGeneration == nil {
+		return
+	}
+	operation.generation = c.networkGeneration()
+	operation.hasGenerationGuard = true
+}
+
+// generationStillCurrent reports whether a captured generation still describes the live network.
+//
+// A caller with no generation concept is always current, so this degrades to fingerprint-only
+// behaviour rather than rejecting everything.
+func (c *Client) generationStillCurrent(operation *exchangeOperation) bool {
+	if !operation.hasGenerationGuard || c.networkGeneration == nil {
+		return true
+	}
+	return operation.generation == c.networkGeneration()
 }
 
 // finishCacheKey decides whether a response may be stored, and under which environment.
@@ -303,6 +347,10 @@ type exchangeOperation struct {
 	disableCache    bool
 	cacheKey        dnsCacheKey
 	releaseCond     func()
+	// generation is the network generation this query was issued on. Captured when the operation is
+	// built, which is BEFORE the round trip, and compared before anything is stored.
+	generation         uint64
+	hasGenerationGuard bool
 }
 
 func (o *exchangeOperation) release() {
@@ -352,6 +400,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 	if !disableCache {
 		cacheKey := c.newCacheKey(transport, question, message, options)
 		operation.cacheKey = cacheKey
+		c.captureGeneration(operation)
 		exchangeKey := dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
 		for {
 			cond, loaded := c.cacheLock.LoadOrStore(exchangeKey, make(chan struct{}))
@@ -404,6 +453,7 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 			}
 			cacheKey = c.newCacheKey(transport, question, message, options)
 			operation.cacheKey = cacheKey
+			c.captureGeneration(operation)
 			exchangeKey = dnsExchangeKey{dnsCacheKey: cacheKey, timeout: options.Timeout}
 		}
 	}
@@ -444,7 +494,7 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 		}
 	}
 	timeToLive := applyResponseOptions(question, response, operation.options)
-	if !disableCache {
+	if !disableCache && c.generationStillCurrent(operation) {
 		cacheKey, storable := c.finishCacheKey(transport, operation.cacheKey)
 		if storable {
 			c.storeCache(cacheKey, response, timeToLive)
@@ -840,6 +890,16 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		ctx := adapter.ContextWithDNSTransportTag(c.ctx, transport.Tag())
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+
+		// The refresh makes its OWN round trip, so it captures the generation at ITS issue point
+		// rather than inheriting the one from the stale read that scheduled it. A refresh started
+		// before a reset and completing after it must not repopulate the cache the reset cleared.
+		refreshOperation := &exchangeOperation{}
+		if c.networkGeneration != nil {
+			refreshOperation.generation = c.networkGeneration()
+			refreshOperation.hasGenerationGuard = true
+		}
+
 		response, err := c.exchangeToTransport(ctx, transport, message)
 		if err != nil {
 			if c.logger != nil {
@@ -864,6 +924,9 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 				return
 			}
 		} else if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
+			return
+		}
+		if !c.generationStillCurrent(refreshOperation) {
 			return
 		}
 		storeKey, storable := c.finishCacheKey(transport, key)
