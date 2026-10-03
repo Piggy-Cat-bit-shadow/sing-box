@@ -889,3 +889,47 @@ func TestStrictFamilyStrategyIsNotBypassedByProbe(t *testing.T) {
 		})
 	}
 }
+
+// TestSerialPoolConcurrencyContract is §8.
+//
+// The documented contract is one outstanding query PER CONNECTION, not one per pool. Concurrent
+// callers are not serialised: with no inflight cap configured, N simultaneous queries open up to N
+// connections. This test records that, so a comment claiming a global single-connection guarantee
+// cannot quietly reappear.
+func TestSerialPoolConcurrencyContract(t *testing.T) {
+	server := newScriptedDNSServer(t)
+	server.holdQueries.Store(true)
+	defer server.releaseQueries()
+
+	transport := newTestTCPTransport(t, server.listener)
+	defer transport.Close()
+
+	const concurrency = 4
+	var waitGroup sync.WaitGroup
+	errs := make(chan error, concurrency)
+	for index := 0; index < concurrency; index++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			errs <- testExchange(transport, "example.com.")
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	server.releaseQueries()
+	waitGroup.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	// Concurrent queries are not queued behind one socket.
+	require.GreaterOrEqual(t, server.connections(), int32(2),
+		"concurrent queries must be able to proceed in parallel; serialising them behind a "+
+			"single connection would turn a burst into a queue")
+
+	// The idle cap still bounds what is retained afterwards.
+	pool := transport.multiplexer.serial
+	require.Equal(t, 1, pool.maxIdle)
+}
