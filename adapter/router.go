@@ -89,11 +89,24 @@ func JudgeFlow(router Router, metadata InboundContext, network uint8, source net
 	case PreMatchDrop:
 		return tun.FlowVerdict{Action: tun.ActionDrop}
 	case PreMatchBypass:
-		port, isPort := result.Outbound.(tun.Port)
-		if !isPort {
-			return tun.FlowVerdict{Action: tun.ActionBypass}
-		}
-		return tun.FlowVerdict{Action: tun.ActionBypass, Port: port, UDPTimeout: result.UDPTimeout, NewTracker: result.NewTracker}
+		// A bypass verdict carries NO Port, deliberately.
+		//
+		// The direct outbound implements tun.Port because it serves ICMP through a ping Port, so
+		// attaching that Port here made a bypass arrive at sing-tun as ActionBypass + Port. The
+		// pinned sing-tun rewrites exactly that combination (flow_dispatch.go, judgeAndInstall):
+		//
+		//	if verdict.Action == ActionBypass && verdict.Port != nil {
+		//	    verdict.Action = ActionFlow
+		//	}
+		//
+		// so the bypass was silently converted into a userspace flow carrying the ICMP ping Port -
+		// the fast path did not happen, and the flow was built with a Port describing a ping
+		// rather than the TCP or UDP connection being judged.
+		//
+		// A bypass means "let the platform route this itself"; there is no flow, so there is
+		// nothing for a Port to describe. ICMP keeps its Port through the PreMatchFlow branch
+		// above, which is the only verdict that builds a flow here.
+		return tun.FlowVerdict{Action: tun.ActionBypass}
 	case PreMatchHijackDNS:
 		return tun.FlowVerdict{Action: tun.ActionHijackDNS}
 	default:
