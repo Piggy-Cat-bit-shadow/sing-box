@@ -52,6 +52,13 @@ type displayRecord struct {
 // an arbitrary URL land in the health map.
 type HistoryStorage struct {
 	access sync.RWMutex
+	// notifyAccess serialises notification against teardown.
+	//
+	// Copying the hook list removes the data race, but not the lifecycle boundary: without this, a
+	// notification could take its snapshot, Close could return, and the sends would then happen
+	// after the caller had already released whatever consumes them. Holding this across Close makes
+	// "Close has returned" mean "no further event can be produced".
+	notifyAccess sync.Mutex
 
 	// displayHistory is the most recent successful measurement per tag, for display.
 	//
@@ -90,12 +97,6 @@ func (s *HistoryStorage) AddUpdateHook(hook *observable.Subscriber[struct{}]) {
 }
 
 func (s *HistoryStorage) NotifyUpdated() {
-	s.access.RLock()
-	closed := s.closed
-	s.access.RUnlock()
-	if closed {
-		return
-	}
 	s.notifyUpdated()
 }
 
@@ -276,10 +277,34 @@ func (s *HistoryStorage) DisplayEntryCount() int {
 	return len(s.displayHistory)
 }
 
-// notifyUpdated must be called WITHOUT the lock held, so a hook that reads the storage cannot
-// deadlock against the write that triggered it.
+// notifyUpdated delivers one event to every registered hook.
+//
+// # Synchronisation
+//
+// The hook list is COPIED while holding the storage lock, and the sends happen after releasing it.
+// Both halves are required:
+//
+//   - Copying is what removes the race. The list is appended to by AddUpdateHook and dropped by
+//     Close, so walking it unlocked reads a slice header and backing array that another goroutine
+//     writes.
+//   - Sending outside the storage lock is what keeps this callable from a context that already
+//     holds it, and keeps a slow consumer from blocking every other storage operation.
+//
+// notifyAccess is held across both, so Close cannot return while an event is still being delivered.
 func (s *HistoryStorage) notifyUpdated() {
-	for _, updateHook := range s.updateHooks {
+	s.notifyAccess.Lock()
+	defer s.notifyAccess.Unlock()
+
+	s.access.RLock()
+	if s.closed {
+		s.access.RUnlock()
+		return
+	}
+	hooks := make([]*observable.Subscriber[struct{}], len(s.updateHooks))
+	copy(hooks, s.updateHooks)
+	s.access.RUnlock()
+
+	for _, updateHook := range hooks {
 		updateHook.Emit(struct{}{})
 	}
 }
@@ -289,6 +314,11 @@ func (s *HistoryStorage) notifyUpdated() {
 // Every later operation becomes a no-op, including a measurement that was already in flight when
 // Close ran: its result is discarded rather than written into a storage that no longer exists.
 func (s *HistoryStorage) Close() error {
+	// Take the notification lock first, so Close blocks until any in-flight delivery finishes and
+	// no new one can start afterwards.
+	s.notifyAccess.Lock()
+	defer s.notifyAccess.Unlock()
+
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.closed {
