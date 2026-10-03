@@ -164,3 +164,93 @@ func TestTransportHeaderCapIsSet(t *testing.T) {
 }
 
 var _ = time.Second
+
+// TestMeasurementSharesOneTotalDeadline is §64(I).
+//
+// The dial, the warm-up and the timed request all run under one deadline. Previously the context
+// had no deadline of its own and the client carried a per-request timeout, so a measurement whose
+// phases each took just under the limit could take a multiple of it in total.
+//
+// The test does not wait out the real C.TCPTimeout; it sets its own deadline and asserts the
+// measurement respects it, which is the same contract.
+func TestMeasurementSharesOneTotalDeadline(t *testing.T) {
+	// A server that accepts and then never answers, so both requests block.
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := &countingDialer{}
+
+	const deadline = 300 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	start := time.Now()
+	_, err := Measure(ctx, MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "a server that never answers must fail the measurement")
+	require.Less(t, elapsed, deadline+2*time.Second,
+		"the measurement took %v against a %v deadline; the phases must share one budget rather "+
+			"than each getting the full timeout", elapsed, deadline)
+
+	require.EqualValues(t, 1, dialer.dials.Load(),
+		"and it must still dial exactly once")
+}
+
+// TestCallerDeadlineIsHonouredNotExtended is the other half of the contract.
+//
+// A caller that set an earlier deadline must keep it: the measurement may not extend it.
+func TestCallerDeadlineIsHonouredNotExtended(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := &countingDialer{}
+
+	const shortDeadline = 150 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), shortDeadline)
+	defer cancel()
+
+	start := time.Now()
+	_, err := Measure(ctx, MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	require.Less(t, elapsed, shortDeadline+2*time.Second,
+		"the caller's own deadline must be respected, not replaced by a longer internal one")
+}
+
+// TestDebugCallbackIsPerMeasurement is §30.
+//
+// The diagnostic is delivered to the caller's callback, so no process-wide state is involved and
+// nothing is computed when the caller does not ask for it.
+func TestDebugCallbackIsPerMeasurement(t *testing.T) {
+	server := newStatusServer(t, http.StatusNoContent)
+	dialer := &countingDialer{}
+
+	var reported []MeasureDebug
+	_, err := Measure(context.Background(), MeasureOptions{
+		Link: server.URL + "/generate_204",
+		Debug: func(debug MeasureDebug) {
+			reported = append(reported, debug)
+		},
+	}, dialer)
+	require.NoError(t, err)
+
+	require.Len(t, reported, 1, "one successful measurement reports exactly one debug record")
+	require.False(t, reported[0].UsedFallback)
+	require.NotZero(t, reported[0].Warmup, "the warm-up phase is reported")
+	require.NotZero(t, reported[0].Warm)
+}
+
+// TestNoDebugCallbackComputesNothing is the disabled path.
+func TestNoDebugCallbackComputesNothing(t *testing.T) {
+	server := newStatusServer(t, http.StatusNoContent)
+	dialer := &countingDialer{}
+
+	_, err := Measure(context.Background(), MeasureOptions{Link: server.URL + "/generate_204"}, dialer)
+	require.NoError(t, err, "a measurement without a debug callback must still succeed")
+}

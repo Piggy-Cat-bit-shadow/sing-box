@@ -66,6 +66,35 @@ type MeasureOptions struct {
 	Link string
 	// ExpectedStatus is the accepted HTTP status set. Empty accepts any status.
 	ExpectedStatus ExpectedStatus
+	// Debug, when set, receives the phase timings of this measurement.
+	//
+	// # Why a callback rather than a package-level logger
+	//
+	// A global logger made the measurement engine depend on process-wide state that any Box could
+	// replace. A temporary Box built by a configuration check would install its own logger over
+	// the one belonging to the running Box, and after the temporary Box was closed the running Box
+	// kept logging through a dead factory. The atomics made that race-free but not correct: the
+	// ownership was wrong.
+	//
+	// A callback belongs to the caller, so the caller's lifecycle is the only one that matters.
+	// When it is nil no phase timing is computed at all.
+	Debug func(MeasureDebug)
+}
+
+// MeasureDebug carries the phase timings of one measurement.
+//
+// It is produced only when MeasureOptions.Debug is set, so the timings cost nothing on the normal
+// path.
+type MeasureDebug struct {
+	// Dial is the outbound dial that opens the connection both requests share.
+	Dial time.Duration
+	// Warmup is the first request, which sets up the proxy path, TLS and the connection pool.
+	Warmup time.Duration
+	// Warm is the timed second request.
+	Warm time.Duration
+	// UsedFallback reports that the second request failed in a way that kept the node usable, so
+	// the reported delay is the whole attempt rather than the timed request.
+	UsedFallback bool
 }
 
 // Measurement is the outcome of one successful measurement.
@@ -120,18 +149,25 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (uint16, error) 
 // produced a "successful" history entry for a request the Clash layer had already reported as a
 // timeout, and inside the URLTest group it raced against the batch's own context.
 func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Measurement, error) {
+	// ONE deadline for the whole measurement.
+	//
+	// The dial, the warm-up request and the timed request all run under this context, so the total
+	// cost is bounded by C.TCPTimeout rather than by that much per phase. A caller that already set
+	// an earlier deadline keeps it: the measurement must never extend the caller's own limit.
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, C.TCPTimeout)
+		defer cancel()
+	}
+
 	normalized, err := NormalizeURLTestURL(options.Link)
 	if err != nil {
 		return Measurement{}, err
 	}
 	scope := MeasurementScope{URL: normalized, Expected: options.ExpectedStatus.Canonical()}
 
-	// One debug snapshot for the whole measurement, so a concurrent SetDebugLogger cannot make
-	// the first request log through one logger and the second through another.
-	// Loaded once for the whole measurement, so the first and second requests cannot log through
-	// different loggers if SetDebugLogger runs concurrently.
-	debug := currentDebugConfig.Load()
-	debugEnabled := debug != nil && debug.enabled && debug.logger != nil
+	debugEnabled := options.Debug != nil
+	var debugReport MeasureDebug
 
 	parsed, err := url.Parse(normalized)
 	if err != nil {
@@ -153,12 +189,14 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 
 	transport := newMeasurementTransport(instance, ctx)
 
+	// No client-level timeout. The measurement context already carries the deadline above, and a
+	// second policy here would bound each request separately - so a measurement could take up to
+	// twice the intended total while looking like it respected one.
 	client := http.Client{
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
-		Timeout: C.TCPTimeout,
 	}
 	defer client.CloseIdleConnections()
 
@@ -206,8 +244,10 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 		}
 		warmElapsed := time.Since(secondStart)
 		if debugEnabled {
-			debug.logger.Debug("urltest dial=", dialElapsed, " first_request=", firstElapsed,
-				" warm_request=", warmElapsed, " warm_reused=assumed")
+			debugReport.Dial = dialElapsed
+			debugReport.Warmup = firstElapsed
+			debugReport.Warm = warmElapsed
+			options.Debug(debugReport)
 		}
 		return Measurement{
 			Delay:      durationToDelay(warmElapsed),
@@ -226,8 +266,15 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 		return Measurement{}, statusMismatch(options.ExpectedStatus, firstStatus, scope)
 	}
 	if debugEnabled {
-		debug.logger.Debug("urltest dial=", dialElapsed, " first_request=", firstElapsed,
-			" warm_request=failed", " fallback=first_path")
+		debugReport.Dial = dialElapsed
+		debugReport.Warmup = firstElapsed
+		debugReport.UsedFallback = true
+		// The reported delay is the WHOLE ATTEMPT, not the first request.
+		//
+		// The name used to say "first_path", which described a delay that was in fact
+		// dial + warm-up + the wait for the second request to fail. Anyone reading a log to work
+		// out where the time went would have been told the wrong thing.
+		options.Debug(debugReport)
 	}
 	return Measurement{
 		Delay:      durationToDelay(time.Since(measurementStart)),
