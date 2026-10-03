@@ -873,15 +873,22 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			}
 			b.checked[tag] = true
 			b.batch.Go(tag, func() (any, error) {
-				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
-				defer cancel()
-
+				// NO per-member timeout here.
+				//
+				// Measure establishes the active probe budget itself, starting from the moment it
+				// holds a coordinator slot. Wrapping it again here would charge the queue wait
+				// against that budget from the outside, so the inner ordering fix would not help:
+				// a member could still time out while waiting for a slot and be reported as
+				// unhealthy without ever being dialled.
+				//
+				// b.ctx still governs the round as a whole, so the batch remains cancellable.
+				//
 				// Called directly. batch.Go is already running this on its own goroutine, and
 				// Measure honours the context, so the previous goroutine-plus-channel-plus-select
 				// added nothing but a second race: when the context expired while the result was
 				// also ready, Go picked between the two cases at random and the measurement's
 				// outcome became non-deterministic.
-				measurement, testErr := b.measure(testCtx, link, detour)
+				measurement, testErr := b.measure(b.ctx, link, detour)
 				if testErr != nil {
 					if b.ctx.Err() != nil {
 						return nil, nil

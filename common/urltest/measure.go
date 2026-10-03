@@ -161,10 +161,27 @@ func withMeasurementTimeout(ctx context.Context, timeout time.Duration) (context
 }
 
 func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Measurement, error) {
-	// ONE deadline for the whole measurement, and it is the EARLIER of the caller's and ours.
-	var cancelMeasurement context.CancelFunc
-	ctx, cancelMeasurement = withMeasurementTimeout(ctx, C.TCPTimeout)
-	defer cancelMeasurement()
+	return measureWithTimeout(ctx, options, detour, C.TCPTimeout)
+}
+
+// measureWithTimeout is Measure with an explicit active-probe budget.
+//
+// It exists so a test can exercise the queue-versus-probe boundary in milliseconds instead of
+// waiting out C.TCPTimeout. The budget applies only from the moment a coordinator slot is held;
+// the caller's own deadline bounds the whole operation including the wait.
+func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Dialer, probeTimeout time.Duration) (Measurement, error) {
+	// ONE parse, three results, BEFORE any budget is spent.
+	//
+	// The request, the identity and the dial target are decided together and then used as decided.
+	// Deriving them separately - the previous code re-parsed the normalised string to find the host
+	// and port - is how a canonicalisation chosen for identity can end up changing what is fetched.
+	//
+	// It also runs before the slot is taken, so an unusable target fails without consuming a
+	// measurement slot at all.
+	target, err := ParseMeasurementTarget(options.Link)
+	if err != nil {
+		return Measurement{}, err
+	}
 
 	// ONE slot per measurement, taken from the Box's coordinator.
 	//
@@ -176,6 +193,8 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 	// The release is deferred before anything else can fail, so a slot cannot leak on an error path.
 	// A context with no coordinator means unbounded, which is what an isolated unit test or a
 	// library caller gets.
+	//
+	// It waits on the CALLER's context, so a caller deadline still bounds the wait.
 	if coordinator := CoordinatorFromContext(ctx); coordinator != nil {
 		release, acquireErr := coordinator.Acquire(ctx)
 		if acquireErr != nil {
@@ -184,15 +203,24 @@ func Measure(ctx context.Context, options MeasureOptions, detour N.Dialer) (Meas
 		defer release()
 	}
 
-	// ONE parse, three results.
+	// The ACTIVE PROBE budget starts here, once the slot is held.
 	//
-	// The request, the identity and the dial target are decided together and then used as decided.
-	// Deriving them separately - the previous code re-parsed the normalised string to find the host
-	// and port - is how a canonicalisation chosen for identity can end up changing what is fetched.
-	target, err := ParseMeasurementTarget(options.Link)
-	if err != nil {
-		return Measurement{}, err
-	}
+	// # Why the order matters
+	//
+	// The deadline used to be established before Acquire, so the time spent waiting for a slot was
+	// charged against the probe budget. Under saturation - several groups checking at once, all
+	// sharing one Box budget - a member could exhaust its budget while queued, never dial at all,
+	// and still be reported as a measurement failure. The group then DELETED that node's health
+	// evidence: a node that was never tested was recorded as unhealthy, which is evidence being
+	// changed without a measurement.
+	//
+	// C.TCPTimeout bounds the network probe. The caller's deadline bounds the whole operation,
+	// queue included, and is applied by layering on top of whatever the caller already supplied.
+	//
+	// It remains the EARLIER of the caller's deadline and ours, because WithTimeout only tightens.
+	var cancelMeasurement context.CancelFunc
+	ctx, cancelMeasurement = withMeasurementTimeout(ctx, probeTimeout)
+	defer cancelMeasurement()
 	scope := MeasurementScope{URL: target.ScopeURL, Expected: options.ExpectedStatus.Canonical()}
 
 	debugEnabled := options.Debug != nil

@@ -227,3 +227,58 @@ func TestInterfaceUpdatedAfterCloseStartsNothing(t *testing.T) {
 		200*time.Millisecond, 20*time.Millisecond,
 		"a closed group must not dial")
 }
+
+// TestCoordinatorWaitDoesNotDeleteHealthWithoutDial is §8.5.
+//
+// A node that never got a measurement slot must not lose its health evidence. Deleting it would
+// record a node as unhealthy on the strength of a queue wait, which is evidence changed without a
+// measurement.
+//
+// # What this test does and does not prove
+//
+// It is a CONTRACT GUARD, not a discriminator. The reordering inside Measure is what makes the
+// queue safe, and that is discriminated by TestCoordinatorWaitDoesNotConsumeProbeTimeout. The
+// group's own outer per-member timeout was a second, compounding cause: with the old ordering the
+// two charged the same wait twice. Demonstrating that in isolation would require holding a slot
+// longer than C.TCPTimeout, i.e. a real 15-second wait, which is not an acceptable unit test and
+// would rely on timing rather than a barrier.
+//
+// So this asserts the invariant that must hold end to end - no dial means no health deletion -
+// rather than claiming to reproduce the timeout interaction.
+func TestCoordinatorWaitDoesNotDeleteHealthWithoutDial(t *testing.T) {
+	coordinator := urltest.NewCoordinator(1)
+
+	// One node, with valid health evidence already recorded.
+	node := &observingOutbound{tag: "node-a"}
+
+	baseCtx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
+	baseCtx = urltest.ContextWithCoordinator(baseCtx, coordinator)
+
+	group, err := NewURLTestGroup(
+		baseCtx, &stubOutboundManager{}, log.NewNOPFactory().NewLogger("group"),
+		[]adapter.Outbound{node}, "https://probe.example/generate_204", 0, 0, 0, false)
+	require.NoError(t, err)
+	group.selected.Store(&selectedState{tcp: node, udp: node})
+
+	storage := service.PtrFromContext[urltest.HistoryStorage](baseCtx)
+	storage.StoreHealthHistory("node-a", group.scope,
+		&adapter.URLTestHistory{Time: time.Now(), Delay: 25})
+
+	// Hold the Box's only slot so the group cannot measure.
+	releaseSlot, err := coordinator.Acquire(baseCtx)
+	require.NoError(t, err)
+
+	// Ask for a forced round: it will queue for the slot.
+	group.requestHealthRecheck()
+
+	// Give it time to attempt measurement and be refused admission.
+	time.Sleep(150 * time.Millisecond)
+
+	releaseSlot()
+
+	// The evidence must still be there, whether or not the round has completed by now.
+	require.NotNil(t, storage.LoadURLTestHistoryFor("node-a", group.scope),
+		"the node's health evidence was deleted while it was waiting for a measurement slot. The "+
+			"node was never tested, so nothing was learned about it - and a queue wait is not "+
+			"health evidence")
+}
