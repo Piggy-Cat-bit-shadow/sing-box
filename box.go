@@ -398,6 +398,18 @@ func New(options Options) (*Box, error) {
 		} else {
 			tag = F.ToString(i)
 		}
+		// Refuse a tag already used by an ENDPOINT.
+		//
+		// Endpoints and outbounds are separate namespaces, but a lookup resolves an outbound first
+		// and only falls back to an endpoint when no outbound matches, and the API lists both
+		// collections. A tag used in both therefore creates two objects, shows the tag twice to a
+		// client, and makes the endpoint permanently unreachable and unmeasurable - the
+		// configuration appears to have an endpoint that silently does not exist.
+		//
+		// Endpoints are created before outbounds above, so the collision is detectable here.
+		if _, endpointCollision := endpointManager.Get(tag); endpointCollision {
+			return nil, E.New("outbound ", tag, " conflicts with an endpoint of the same tag")
+		}
 		outboundCtx := ctx
 		if tag != "" {
 			// TODO: remove this
