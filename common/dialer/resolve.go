@@ -347,10 +347,29 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 			}
 
 			if result.IPv6 == preferIPv6 {
-				// The preferred family is the reason to wait, so once it arrives nothing is
-				// held back: this is what keeps a preferred-first answer at zero added delay.
-				release()
+				// The preferred family arrived, so the held family is no longer waiting on it.
+				//
+				// The PREFERRED candidates go first. Holding the non-preferred family is only
+				// half the contract: the other half is that the family it was held FOR does not
+				// end up behind it. Feeding the held family first put IPv4 ahead of IPv6 in the
+				// stream, and the scheduler - which launches the first candidate it sees - then
+				// started IPv4 and made the preferred IPv6 wait out a fallback interval. The
+				// preference was held correctly and then given away at the moment of release.
+				//
+				// The preferred family leads on every path, so this also keeps a preferred-first
+				// answer at zero added delay: nothing is released ahead of it.
+				// Take the held batch and clear the hold BEFORE feeding, so a concurrent
+				// arrival cannot append to a slice that is already being drained.
+				pending := held
+				held = nil
+				graceActive = false
+
 				for _, candidate := range batch {
+					if !feed(candidate) {
+						return
+					}
+				}
+				for _, candidate := range pending {
 					if !feed(candidate) {
 						return
 					}
@@ -499,9 +518,17 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 
 	// Recovery runs concurrently. Its result channel is buffered and it always sends exactly
 	// once, so the goroutine cannot outlive this function blocked on an unread channel.
+	//
+	// recoveryCtx is cancelled when this function returns, so a recovery lookup does not keep
+	// running DNS after the race is decided. Deriving it from ctx alone left the lookup running
+	// until the caller's deadline - which for a connection is minutes - so an original that
+	// connected in a millisecond still had a resolver query in flight long afterwards.
+	recoveryCtx, cancelRecovery := context.WithCancel(ctx)
+	defer cancelRecovery()
+
 	recovered := make(chan []netip.Addr, 1)
 	go func() {
-		addresses := d.recoverCandidates(ctx, destination)
+		addresses := d.recoverCandidates(recoveryCtx, destination)
 		recovered <- addresses
 	}()
 
