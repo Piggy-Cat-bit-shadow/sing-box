@@ -118,6 +118,18 @@ func (m *Manager) Remove(tag string) error {
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
+	// Reject a duplicate BEFORE constructing anything.
+	//
+	// Constructing first and replacing afterwards discards an object whose constructor side effects
+	// cannot be undone - a bridge outbound claims a process-global slot at construction, for example
+	// - and it silently runs a configuration the user did not write.
+	m.access.Lock()
+	if _, loaded := m.endpointByTag[tag]; loaded {
+		m.access.Unlock()
+		return E.New("endpoint ", tag, " already exists")
+	}
+	m.access.Unlock()
+
 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 	if err != nil {
 		return err
@@ -135,20 +147,11 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 			}
 		}
 	}
-	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
-		if m.started {
-			err = existsEndpoint.Close()
-			if err != nil {
-				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
-			return it == existsEndpoint
-		})
-		if existsIndex == -1 {
-			panic("invalid endpoint index")
-		}
-		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
+	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
+	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
+	if _, loaded := m.endpointByTag[tag]; loaded {
+		_ = common.Close(endpoint)
+		return E.New("endpoint ", tag, " already exists")
 	}
 	m.endpoints = append(m.endpoints, endpoint)
 	m.endpointByTag[tag] = endpoint

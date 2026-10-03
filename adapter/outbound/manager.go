@@ -261,6 +261,19 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if tag == "" {
 		return os.ErrInvalid
 	}
+
+	// Reject a duplicate BEFORE constructing anything.
+	//
+	// Constructing first and replacing afterwards discards an object whose constructor side effects
+	// cannot be undone - a bridge outbound claims a process-global slot at construction, for example
+	// - and it silently runs a configuration the user did not write.
+	m.access.Lock()
+	if _, loaded := m.outboundByTag[tag]; loaded {
+		m.access.Unlock()
+		return E.New("outbound ", tag, " already exists")
+	}
+	m.access.Unlock()
+
 	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
 	if err != nil {
 		return err
@@ -278,20 +291,11 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	if existsOutbound, loaded := m.outboundByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsOutbound)
-			if err != nil {
-				return E.Cause(err, "close outbound/", existsOutbound.Type(), "[", existsOutbound.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.outbounds, func(it adapter.Outbound) bool {
-			return it == existsOutbound
-		})
-		if existsIndex == -1 {
-			panic("invalid inbound index")
-		}
-		m.outbounds = append(m.outbounds[:existsIndex], m.outbounds[existsIndex+1:]...)
+	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
+	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
+	if _, loaded := m.outboundByTag[tag]; loaded {
+		_ = common.Close(outbound)
+		return E.New("outbound ", tag, " already exists")
 	}
 	m.outbounds = append(m.outbounds, outbound)
 	m.outboundByTag[tag] = outbound

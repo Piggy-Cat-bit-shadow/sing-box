@@ -119,6 +119,17 @@ func (m *Manager) Remove(tag string) error {
 }
 
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, providerType string, options any) error {
+	// Reject a duplicate BEFORE constructing anything.
+	//
+	// Constructing first and replacing afterwards discards an object whose constructor side effects
+	// cannot be undone, and it silently runs a configuration the user did not write.
+	m.access.Lock()
+	if _, loaded := m.providerByTag[tag]; loaded {
+		m.access.Unlock()
+		return E.New("certificate provider ", tag, " already exists")
+	}
+	m.access.Unlock()
+
 	provider, err := m.registry.Create(ctx, logger, tag, providerType, options)
 	if err != nil {
 		return err
@@ -137,20 +148,11 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
-	if existsProvider, loaded := m.providerByTag[tag]; loaded {
-		if m.started {
-			err = existsProvider.Close()
-			if err != nil {
-				return E.Cause(err, "close certificate-provider/", existsProvider.Type(), "[", existsProvider.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.providers, func(it adapter.CertificateProviderService) bool {
-			return it == existsProvider
-		})
-		if existsIndex == -1 {
-			panic("invalid certificate provider index")
-		}
-		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
+	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
+	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
+	if _, loaded := m.providerByTag[tag]; loaded {
+		_ = common.Close(provider)
+		return E.New("certificate provider ", tag, " already exists")
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider

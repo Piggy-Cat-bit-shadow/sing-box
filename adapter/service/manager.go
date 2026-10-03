@@ -115,6 +115,18 @@ func (m *Manager) Remove(tag string) error {
 }
 
 func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag string, serviceType string, options any) error {
+	// Reject a duplicate BEFORE constructing anything.
+	//
+	// Constructing first and replacing afterwards discards an object whose constructor side effects
+	// cannot be undone - a bridge outbound claims a process-global slot at construction, for example
+	// - and it silently runs a configuration the user did not write.
+	m.access.Lock()
+	if _, loaded := m.serviceByTag[tag]; loaded {
+		m.access.Unlock()
+		return E.New("service ", tag, " already exists")
+	}
+	m.access.Unlock()
+
 	service, err := m.registry.Create(ctx, logger, tag, serviceType, options)
 	if err != nil {
 		return err
@@ -132,20 +144,11 @@ func (m *Manager) Create(ctx context.Context, logger log.ContextLogger, tag stri
 			}
 		}
 	}
-	if existsService, loaded := m.serviceByTag[tag]; loaded {
-		if m.started {
-			err = existsService.Close()
-			if err != nil {
-				return E.Cause(err, "close service/", existsService.Type(), "[", existsService.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.services, func(it adapter.Service) bool {
-			return it == existsService
-		})
-		if existsIndex == -1 {
-			panic("invalid service index")
-		}
-		m.services = append(m.services[:existsIndex], m.services[existsIndex+1:]...)
+	// Re-check under the lock: the constructor runs outside it, so another goroutine may have
+	// installed this tag meanwhile. The loser releases what it built rather than leaking it.
+	if _, loaded := m.serviceByTag[tag]; loaded {
+		_ = common.Close(service)
+		return E.New("service ", tag, " already exists")
 	}
 	m.services = append(m.services, service)
 	m.serviceByTag[tag] = service
