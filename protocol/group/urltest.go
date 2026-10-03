@@ -308,6 +308,12 @@ type URLTestGroup struct {
 	// recheckRuns counts forced rounds actually executed. It exists so a test can assert the
 	// guarantee as a fact rather than inferring it from timing.
 	recheckRuns atomic.Int32
+	// forcedRoundOverride replaces the body of one forced round in tests.
+	//
+	// It exists because the worker's panic recovery guards work that runs on the worker's OWN
+	// goroutine, and nothing in the production code path can be made to panic on demand from a
+	// test. Nil in production, where runForcedRound is used directly.
+	forcedRoundOverride func()
 	// selected holds the TCP and UDP choices as ONE immutable generation.
 	//
 	// They were two bare interface fields, written by the background health check and read by
@@ -726,6 +732,29 @@ func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.Out
 	return testBatch.result
 }
 
+// measure runs one member's probe, converting a panic into an error.
+//
+// # Why a member panic must not escape
+//
+// batch.Go runs each member on its own goroutine and does NOT recover. A panic there therefore
+// reaches the runtime, which terminates the whole process - a single misbehaving outbound would
+// take down sing-box rather than being reported as one unusable node.
+//
+// Converting it to an error also keeps the round's own bookkeeping correct: the member is treated
+// as unavailable, exactly like a failed dial, so the batch still completes and the other members are
+// still measured.
+func (b *urlTestBatch) measure(ctx context.Context, link string, detour adapter.Outbound) (measurement urltest.Measurement, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = E.New("measurement panicked: ", recovered)
+		}
+	}()
+	return urltest.Measure(ctx, urltest.MeasureOptions{
+		Link:           link,
+		ExpectedStatus: b.expected,
+	}, detour)
+}
+
 func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
 	for _, detour := range outbounds {
 		tag := detour.Tag()
@@ -773,10 +802,7 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				// added nothing but a second race: when the context expired while the result was
 				// also ready, Go picked between the two cases at random and the measurement's
 				// outcome became non-deterministic.
-				measurement, testErr := urltest.Measure(testCtx, urltest.MeasureOptions{
-					Link:           link,
-					ExpectedStatus: b.expected,
-				}, detour)
+				measurement, testErr := b.measure(testCtx, link, detour)
 				if testErr != nil {
 					if b.ctx.Err() != nil {
 						return nil, nil
@@ -940,10 +966,27 @@ func (g *URLTestGroup) requestHealthRecheck() {
 //
 // Many failures therefore coalesce into at most one extra round, and none are lost.
 func (g *URLTestGroup) drainHealthRechecks() {
+	// The worker gives up its slot on EVERY exit, including a panic.
+	//
+	// Releasing `checking` and `recheckWorker` on the normal path only was a permanent stall
+	// waiting to happen: a panic left both set, so every later periodic check saw a round
+	// "already running" and returned, and no later traffic failure could start a worker. The
+	// group's health subsystem was then dead for the rest of the process's life, with selection
+	// quietly reusing whatever evidence existed when the panic happened.
+	//
+	// A panicking round is NOT automatically retried. A reproducible panic would otherwise become
+	// an unbounded retry loop that pins a CPU and floods the log; the next failure or periodic
+	// tick can start a fresh worker instead.
 	defer func() {
-		if recovered := recover(); recovered != nil && g.logger != nil {
-			g.logger.Error("health recheck panicked: ", recovered)
+		if recovered := recover(); recovered != nil {
+			if g.logger != nil {
+				g.logger.Error("health recheck panicked: ", recovered)
+			}
 		}
+		g.checking.Store(false)
+		g.recheckAccess.Lock()
+		g.recheckWorker = false
+		g.recheckAccess.Unlock()
 	}()
 
 	for {
@@ -974,14 +1017,7 @@ func (g *URLTestGroup) drainHealthRechecks() {
 		}
 
 		g.recheckRuns.Add(1)
-		// force = true. A recheck must actually PROBE.
-		//
-		// With force = false the batch skips any member whose measurement is younger than the
-		// interval - which is exactly the state a traffic failure leaves behind. Nothing would be
-		// re-measured, and the selection that follows would re-read the very measurement the
-		// failure just contradicted.
-		URLTestOutboundsWithTarget(g.ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, true, TestHistoryHealth)
-		g.performUpdateCheck()
+		g.runForcedRound()
 		g.checking.Store(false)
 
 		// Decide whether to go round again, still holding the worker slot.
@@ -995,10 +1031,24 @@ func (g *URLTestGroup) drainHealthRechecks() {
 			return
 		}
 	}
+}
 
-	g.recheckAccess.Lock()
-	g.recheckWorker = false
-	g.recheckAccess.Unlock()
+// runForcedRound performs one forced health measurement and re-evaluates the selection.
+//
+// force = true. A recheck must actually PROBE: with force = false the batch skips any member whose
+// measurement is younger than the interval, which is exactly the state a traffic failure leaves
+// behind - nothing would be re-measured, and the selection that follows would re-read the very
+// measurement the failure just contradicted.
+//
+// It is a separate function so the worker's ownership of the `checking` guard is visible at the
+// call site, and so the guard's release can be deferred around exactly this work.
+func (g *URLTestGroup) runForcedRound() {
+	if g.forcedRoundOverride != nil {
+		g.forcedRoundOverride()
+		return
+	}
+	URLTestOutboundsWithTarget(g.ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, true, TestHistoryHealth)
+	g.performUpdateCheck()
 }
 
 // clearSelected is invalidateSelected without the re-selection, so the cleared generation can be
