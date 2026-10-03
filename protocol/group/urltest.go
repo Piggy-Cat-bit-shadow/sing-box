@@ -688,7 +688,40 @@ func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]u
 		return make(map[string]uint16), nil
 	}
 	defer g.checking.Store(false)
-	result := URLTestOutboundsWithTarget(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, TestHistoryHealth)
+	return g.runHealthRound(ctx, force)
+}
+
+// runHealthRound performs one complete health round under a panic boundary.
+//
+// # Why a round-level boundary is needed
+//
+// A member's own probe is already contained: a panic inside DialContext becomes that member's
+// error, so one bad node cannot take the process down. But substantial work runs OUTSIDE that
+// boundary, on a goroutine that recovers nothing - batch.Go runs its closure on a fresh goroutine,
+// and the traversal recurses inside it. Nested All(), Selected(), RealTag, the history reads and
+// performUpdateCheck are all outside the member boundary.
+//
+// A panic in any of them reaches the runtime and terminates the whole process. A configuration
+// describing a cycle, or a group whose traversal misbehaves, was therefore enough to kill sing-box
+// rather than failing one round - and the round is the unit that can be abandoned safely.
+//
+// The three boundaries are separate and all three are required: member (one node fails), round (one
+// round fails), worker (the forced-round state machine stays consistent).
+//
+// A contained panic is an ERROR, never a silent success: the round reports no results, and the
+// caller sees a failed round rather than an empty but successful one.
+func (g *URLTestGroup) runHealthRound(ctx context.Context, force bool) (result map[string]uint16, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if g.logger != nil {
+				g.logger.Error("health round panicked: ", recovered)
+			}
+			result = make(map[string]uint16)
+			err = E.New("health round panicked: ", recovered)
+		}
+	}()
+
+	result = URLTestOutboundsWithTarget(ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, force, TestHistoryHealth)
 	g.performUpdateCheck()
 	return result, nil
 }
@@ -1204,8 +1237,12 @@ func (g *URLTestGroup) runForcedRound() {
 		g.forcedRoundOverride()
 		return
 	}
-	URLTestOutboundsWithTarget(g.ctx, g.outbound, g.history, g.logger, g.outbounds, g.link, g.expected, g.interval, true, TestHistoryHealth)
-	g.performUpdateCheck()
+	// The SAME round implementation the periodic path uses.
+	//
+	// Maintaining two copies is how the two paths drift: a fix applied to one silently does not
+	// reach the other. Sharing the call also means the round-level panic boundary covers the forced
+	// path without a second recover.
+	_, _ = g.runHealthRound(g.ctx, true)
 }
 
 // clearSelected is invalidateSelected without the re-selection, so the cleared generation can be

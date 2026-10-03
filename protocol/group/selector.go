@@ -184,7 +184,27 @@ func (s *Selector) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 // A configuration can describe a cycle, and the traversal must not recurse into it. Each visited
 // outbound is recorded by identity, so a cycle is detected on the second visit rather than followed
 // forever. The previous implementation was a bare loop with no record, so a cycle hung.
-func ResolveURLTestLeaf(detour adapter.Outbound, network string) (adapter.Outbound, error) {
+func ResolveURLTestLeaf(detour adapter.Outbound, network string) (leaf adapter.Outbound, err error) {
+	// Contain a panic from the traversal itself.
+	//
+	// # Why the resolver and not each caller
+	//
+	// This walks user-configured objects: Selected() and Tag() are implemented by every group type,
+	// including ones this package does not own. A panic there would otherwise reach the runtime and
+	// terminate the process, and the callers are on display paths - the Clash API's node list and
+	// the native UI both resolve a leaf to label a measurement - where a crash is far worse than an
+	// unlabelled node.
+	//
+	// Recovering here covers every caller at once, including ones added later. The traversal cannot
+	// return a partial answer either: either a leaf is resolved or the caller is told it could not
+	// be, so no caller can act on half a chain.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			leaf = nil
+			err = E.New("resolve outbound leaf panicked: ", recovered)
+		}
+	}()
+
 	if detour == nil {
 		return nil, E.New("nil detour")
 	}
