@@ -474,3 +474,70 @@ func TestLiteralRecoveryUsesOneReadyFamilyWithoutWaiting(t *testing.T) {
 	require.Equal(t, 1, inner.dialCount(recoveredFast),
 		"the family that answered first is the one the policy admits, so it must be used")
 }
+
+// TestLiteralStrictMismatchWaitsForTheAdmittedFamily is §24.
+//
+// The effective policy excludes the original address, and the recovered family is available but
+// arrives after a short delay. The dial must WAIT for the admitted family and succeed - it must not
+// treat "the original cannot be dialled" as "this connection has failed".
+func TestLiteralStrictMismatchWaitsForTheAdmittedFamily(t *testing.T) {
+	originalV6 := netip.MustParseAddr("2001:db8::1")
+	recoveredV4 := netip.MustParseAddr("192.0.2.9")
+
+	for _, testCase := range []struct {
+		name          string
+		original      netip.Addr
+		policy        C.DomainStrategy
+		recovered     netip.Addr
+		recoveredIsV6 bool
+	}{
+		{
+			name:          "ipv4_only excludes an IPv6 original",
+			original:      originalV6,
+			policy:        C.DomainStrategyIPv4Only,
+			recovered:     recoveredV4,
+			recoveredIsV6: false,
+		},
+		{
+			name:          "ipv6_only excludes an IPv4 original",
+			original:      netip.MustParseAddr("192.0.2.1"),
+			policy:        C.DomainStrategyIPv6Only,
+			recovered:     netip.MustParseAddr("2001:db8::9"),
+			recoveredIsV6: true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			inner := &lifecycleDialer{answers: map[netip.Addr]lifecycleAnswer{
+				testCase.original:  {delay: 5 * time.Millisecond, success: true},
+				testCase.recovered: {delay: 5 * time.Millisecond, success: true},
+			}}
+			dialer := &resolveDialer{
+				router: &slowSecondFamilyRouter{
+					fast:     testCase.recovered,
+					slow:     testCase.recovered,
+					fastIsV6: testCase.recoveredIsV6,
+					// A real delay, so the dial must actually wait rather than win immediately.
+					slowWait: 80 * time.Millisecond,
+				},
+				dialer:        inner,
+				parallel:      true,
+				fallbackDelay: 5 * time.Millisecond,
+				queryOptions:  adapter.DNSQueryOptions{Strategy: testCase.policy},
+			}
+
+			ctx, cancel := context.WithTimeout(sniffedContext(t, context.Background()), 5*time.Second)
+			defer cancel()
+
+			conn, err := dialer.DialContext(ctx, "tcp", M.SocksaddrFrom(testCase.original, 443))
+			require.NoError(t, err,
+				"the original is excluded by policy but an admitted recovered address exists; "+
+					"that must succeed, not be reported as a failed connection")
+			require.NotNil(t, conn)
+
+			require.Equal(t, 0, inner.dialCount(testCase.original),
+				"the excluded family must not be dialled at all")
+			require.GreaterOrEqual(t, inner.dialCount(testCase.recovered), 1,
+				"the admitted family must carry the connection")
+		})
+	}
+}
