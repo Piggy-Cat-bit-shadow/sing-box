@@ -58,7 +58,11 @@ type NetworkManager interface {
 // epoch is one where the ownership check simply does not apply - which is the correct degradation,
 // not a compile error.
 type NetworkResetCounter interface {
-	// NetworkResetGeneration returns a value that increases on every completed network reset.
+	// NetworkResetGeneration returns a value that increases every time a network reset BEGINS.
+	//
+	// It is advanced as the reset's first statement, not on completion, so that a network operation
+	// running while a reset starts is already stale rather than being compared against the epoch it
+	// was started under. It is therefore a reset epoch, not a count of finished resets.
 	NetworkResetGeneration() uint64
 }
 

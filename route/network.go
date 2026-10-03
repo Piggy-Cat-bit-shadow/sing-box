@@ -70,7 +70,9 @@ type NetworkManager struct {
 	interfaceUpdateCancel   context.CancelFunc
 	networkResetPending     bool
 	resetRunAccess          sync.Mutex
-	// networkResetGeneration increases on every completed network reset.
+	// networkResetGeneration increases every time a network reset BEGINS - it is advanced as the
+	// reset's first statement, so an operation in flight when the reset starts is already stale.
+	// Read it as a reset epoch, not as a count of finished resets.
 	//
 	// It is the epoch a pre-reset network operation is compared against: an operation that began
 	// before a reset must not hand a connection to a caller after it, because that connection
@@ -532,7 +534,8 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 	r.resetNetworkLocked(ctx)
 }
 
-// NetworkResetGeneration reports how many network resets have completed.
+// NetworkResetGeneration reports the current reset epoch: it increases every time a network
+// reset BEGINS, advanced as the reset's first statement rather than on completion.
 //
 // Read by the dialer to decide whether a connection it just produced still belongs to the network it
 // was dialled for. See adapter.NetworkResetCounter.
@@ -650,7 +653,10 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	if ctx.Err() != nil {
 		return
 	}
-	r.updateNetworkEnvironment()
+	// The locked form: this function holds resetRunAccess (taken above), and the boundary it may
+	// establish resets the network. Calling the exported, self-locking entry from here would
+	// self-deadlock, because sync.Mutex is not reentrant.
+	r.updateNetworkEnvironmentLocked(ctx)
 	r.interfaceUpdateAccess.Lock()
 	resetNetwork := ctx.Err() == nil && r.networkResetPending
 	if resetNetwork {

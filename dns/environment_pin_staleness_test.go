@@ -32,6 +32,23 @@ import (
 //
 // A Wi-Fi SSID change on the same interface, or an interface list refresh, therefore moves the
 // fingerprint without touching the DNS router's transports.
+//
+// # What the fixtures in this file can and cannot show
+//
+// windowTransport answers from a FIXED address for the whole test. A transport like that cannot go
+// stale, because it never acquires a new underlay - so these tests show the pin holding while the
+// transport is unchanged, and nothing more. They do NOT show that the pin still describes the network
+// after the transport has moved.
+//
+// That case is real: TCP, TLS and HTTPS re-dial through their dialer when a pooled connection is
+// invalidated, and the dial resolves the device's routes then. It is covered by
+// TestTransportRedialedOnANewNetworkDoesNotKeepTheOldEnvironment in environment_rebind_test.go, and
+// the transition that closes it is route's boundEnvironmentTransition.
+//
+// The boundary is now established on a real environment change, so the scenario these two tests
+// describe - "the environment moved but nothing reset" - is no longer reachable through production
+// paths. They are kept because they pin the ordering the pin exists for: an operation still running
+// on the old network must not be stamped with the new one.
 
 // movingEnvironmentManager is a NetworkEnvironment the test drives.
 type movingEnvironmentManager struct {
@@ -70,8 +87,9 @@ func TestEnvironmentChangeWithoutAResetRestampsTheTransport(t *testing.T) {
 	require.EqualValues(t, 0xA, pinned,
 		"the transport keeps the environment it was established in, which is the intended pin")
 
-	// A query now travels over the SAME transport, whose socket belongs to the interface that was
-	// never rebound. Its answer therefore describes network A, and stamping it A is accurate.
+	// In THIS fixture the transport answers from a fixed address and never re-dials, so its answer
+	// describes network A and stamping it A is accurate. That is a property of the fixture, not a
+	// general guarantee - see the file comment.
 	message := new(mDNS.Msg)
 	message.SetQuestion("wifi-switch.example.", mDNS.TypeA)
 	question := message.Question[0]

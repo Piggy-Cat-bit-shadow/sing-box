@@ -42,7 +42,9 @@ type DefaultDialer struct {
 	autoDetectBindFunc control.Func
 	connectionManager  adapter.ConnectionManager
 	networkManager     adapter.NetworkManager
-	// networkEpoch reports the completed network reset count, when the manager can provide one.
+	// networkEpoch reports the manager's reset epoch, when it can provide one. The counter is
+	// advanced when a reset BEGINS, not when it completes, so a dial that started before the reset
+	// is recognised as stale even if it finishes while the reset is still running.
 	//
 	// A dial that begins before a reset can succeed after it. That connection belongs to the network
 	// which has been left, and the only way to notice is to compare the epoch it started in against
