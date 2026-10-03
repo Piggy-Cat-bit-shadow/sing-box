@@ -94,6 +94,7 @@ func (m *stubNetworkManager) DefaultOptions() adapter.NetworkOptions {
 	return adapter.NetworkOptions{}
 }
 func (m *stubNetworkManager) RegisterAutoRedirectOutputMark(mark uint32) error { return nil }
+func (m *stubNetworkManager) UnregisterAutoRedirectOutputMark()                {}
 func (m *stubNetworkManager) AutoRedirectOutputMark() uint32                   { return 0 }
 func (m *stubNetworkManager) AutoRedirectOutputMarkFunc() control.Func         { return nil }
 func (m *stubNetworkManager) RegisterBridgeInterface(interfaceName string)     {}
