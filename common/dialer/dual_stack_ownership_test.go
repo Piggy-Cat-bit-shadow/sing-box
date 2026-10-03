@@ -167,14 +167,22 @@ func (d *owningDialer) waitForConnection(t *testing.T, address string, timeout t
 	return nil
 }
 
-// waitForSettledConnection waits for an address to produce a connection and then gives any
-// pending cleanup a moment to run, so close counters can be read reliably.
-func (d *owningDialer) waitForSettledConnection(t *testing.T, address string, timeout time.Duration) *closeCountingConn {
+// waitForClosedConnection waits for an address to produce a connection AND for that connection
+// to be closed, up to the timeout.
+//
+// A fixed settle sleep would be a guess about how long cleanup takes, and on a loaded machine
+// that guess can be wrong - the counter is then read before the race has closed the loser and
+// the test reports a leak that did not happen. Polling the actual condition removes the guess.
+func (d *owningDialer) waitForClosedConnection(t *testing.T, address string, timeout time.Duration) *closeCountingConn {
 	t.Helper()
 	conn := d.waitForConnection(t, address, timeout)
-	// The race closes a loser after its worker returns; a short settle avoids reading the
-	// counter in the window between the dial returning and the cleanup running.
-	time.Sleep(50 * time.Millisecond)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if conn.closes.Load() > 0 {
+			return conn
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 	return conn
 }
 
@@ -300,9 +308,23 @@ func TestOriginalWinnerLeavesNoUnownedRecoveredConnection(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, conn)
 
-	// The race promises synchronous cleanup, so by the time the call returns the recovered side
-	// is already settled. A settle delay here would be masking the very leak being tested.
-	time.Sleep(250 * time.Millisecond)
+	// Wait for the recovered attempt's fate to be observable.
+	//
+	// The fixed implementation cancels and waits for that attempt, so it either never produces a
+	// connection or produces one the race has already closed. The previous implementation did
+	// neither: it left the attempt running on the connection's context, so the connection
+	// appeared LATE - after this function had already returned - and was never closed.
+	//
+	// Waiting for it to appear is therefore what makes this test discriminating. Checking
+	// immediately would read the map before a leaked connection exists and skip the assertion.
+	var recoveredConn *closeCountingConn
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if recoveredConn = inner.connectionFor(recovered); recoveredConn != nil {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 
 	originalConn := inner.connectionFor(original)
 	require.NotNil(t, originalConn, "the original won and must have produced the returned connection")
@@ -310,7 +332,8 @@ func TestOriginalWinnerLeavesNoUnownedRecoveredConnection(t *testing.T) {
 	require.EqualValues(t, 0, originalConn.closes.Load(),
 		"the winner must still be open; the caller owns it")
 
-	if recoveredConn := inner.connectionFor(recovered); recoveredConn != nil {
+	if recoveredConn != nil {
+		inner.waitForClosedConnection(t, recovered, 5*time.Second)
 		require.EqualValues(t, 1, recoveredConn.closes.Load(),
 			"a recovered connection that completed after losing the race must be closed exactly "+
 				"once; leaving it open leaks a connection nobody owns")
@@ -463,8 +486,6 @@ func TestRaceReturnsExactlyOneConnection(t *testing.T) {
 	conn, err := dialer.DialContext(ctx, "tcp", M.ParseSocksaddr(original+":443"))
 	require.NoError(t, err)
 	require.NotNil(t, conn)
-
-	time.Sleep(250 * time.Millisecond)
 
 	// Whatever the outcome, the caller must hold exactly one OPEN connection and nothing may be
 	// left dangling. This is the property the leak violated: a second successful connection
