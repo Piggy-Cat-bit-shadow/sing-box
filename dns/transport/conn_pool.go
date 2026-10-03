@@ -22,8 +22,16 @@ type ConnPoolOptions[T comparable] struct {
 	Mode ConnPoolMode
 	// MaxInflight caps concurrent in-progress dials. Only honored in ConnPoolOrdered mode.
 	MaxInflight int
-	IsAlive     func(T) bool
-	Close       func(T, error)
+	// MaxIdle caps how many connections may be retained as idle. Zero means one for
+	// ConnPoolOrdered, which is the pool that keeps a reusable serial socket.
+	//
+	// Concurrency above the cap is still allowed: several queries may be in flight at once, and
+	// they each get their own connection. The cap governs what is KEPT once they finish. Without
+	// it a burst leaves every connection from that burst idle forever, so a 100-query burst would
+	// park 100 sockets - which is not a keep-alive pool but a leak that happens to be reachable.
+	MaxIdle int
+	IsAlive func(T) bool
+	Close   func(T, error)
 }
 
 type ConnPool[T comparable] struct {
@@ -34,6 +42,9 @@ type ConnPool[T comparable] struct {
 	access sync.Mutex
 	closed bool
 	state  *connPoolState[T]
+
+	// maxIdle caps retained connections. See ConnPoolOptions.MaxIdle.
+	maxIdle int
 
 	// keepIdle is the pool's own authority on whether a released connection may be retained.
 	//
@@ -77,6 +88,11 @@ func NewConnPool[T comparable](options ConnPoolOptions[T]) *ConnPool[T] {
 	}
 	p.state = newConnPoolState[T](options.Mode)
 	p.keepIdle.Store(true)
+	p.maxIdle = options.MaxIdle
+	if p.maxIdle == 0 && options.Mode == ConnPoolOrdered {
+		// Serial reuse exists to reuse ONE healthy socket, not to cache peak concurrency.
+		p.maxIdle = 1
+	}
 	return p
 }
 
@@ -142,6 +158,20 @@ func (p *ConnPool[T]) Release(conn T, reuse bool) {
 	if p.options.Mode == ConnPoolOrdered {
 		if _, idle := state.idleElements[conn]; !idle {
 			state.idleElements[conn] = state.idle.PushBack(conn)
+		}
+		// Trim after inserting, so the cap applies to retention rather than to admission.
+		//
+		// The newest connection is kept and older ones are closed: a connection that has just
+		// completed a query is the one most likely to still be alive and warm.
+		for p.maxIdle > 0 && state.idle.Len() > p.maxIdle {
+			oldest := state.idle.Front()
+			if oldest == nil {
+				break
+			}
+			evicted := state.idle.Remove(oldest)
+			delete(state.idleElements, evicted)
+			delete(state.all, evicted)
+			go p.options.Close(evicted, net.ErrClosed)
 		}
 	}
 	p.access.Unlock()

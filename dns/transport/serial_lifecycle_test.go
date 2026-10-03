@@ -47,8 +47,27 @@ type scriptedDNSServer struct {
 	// write fails on a reused connection.
 	closeBeforeReading atomic.Bool
 
+	// holdQueries makes each connection wait before replying, so a burst of queries genuinely
+	// overlaps instead of being serialised by fast replies.
+	holdQueries    atomic.Bool
+	queriesRelease chan struct{}
+	releaseOnce    sync.Once
+
 	mu      sync.Mutex
 	handled int
+}
+
+// releaseQueries lets every held query proceed. Safe to call more than once.
+func (s *scriptedDNSServer) releaseQueries() {
+	s.releaseOnce.Do(func() { close(s.queriesRelease) })
+}
+
+// waitWhileHeld blocks until the test releases the held queries.
+func (s *scriptedDNSServer) waitWhileHeld() {
+	if !s.holdQueries.Load() {
+		return
+	}
+	<-s.queriesRelease
 }
 
 func newScriptedDNSServer(t *testing.T) *scriptedDNSServer {
@@ -57,7 +76,7 @@ func newScriptedDNSServer(t *testing.T) *scriptedDNSServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &scriptedDNSServer{listener: listener}
+	server := &scriptedDNSServer{listener: listener, queriesRelease: make(chan struct{})}
 	go server.serve()
 	t.Cleanup(func() { listener.Close() })
 	return server
@@ -88,6 +107,8 @@ func (s *scriptedDNSServer) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		s.waitWhileHeld()
+
 		s.mu.Lock()
 		s.handled++
 		s.mu.Unlock()
@@ -701,4 +722,75 @@ func TestSerialFreshRetryAfterCloseDoesNotDial(t *testing.T) {
 
 	require.True(t, closed, "the pool must report itself closed")
 	require.Nil(t, state, "a closed pool must have released its state, tracking nothing and keeping nothing")
+}
+
+// TestSerialBurstLeavesBoundedIdleConnections is §53.
+//
+// Concurrency above the idle cap is allowed - several queries may be in flight at once and each
+// gets its own connection - but the pool must not retain every connection from the burst
+// afterwards. Without a cap, a 32-query burst parks 32 sockets, which on a mobile device is a leak
+// that happens to be reachable rather than a keep-alive pool.
+func TestSerialBurstLeavesBoundedIdleConnections(t *testing.T) {
+	server := newScriptedDNSServer(t)
+	// Hold each query so the burst really overlaps rather than being served serially.
+	server.holdQueries.Store(true)
+	defer server.releaseQueries()
+
+	transport := newTestTCPTransport(t, server.listener)
+	defer transport.Close()
+	forceSerial(transport)
+
+	pool := transport.multiplexer.serial
+	require.Equal(t, 1, pool.maxIdle, "the serial pool must default to a single retained connection")
+
+	const burst = 32
+	var waitGroup sync.WaitGroup
+	errs := make(chan error, burst)
+	for i := 0; i < burst; i++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			errs <- testExchange(transport, "example.com.")
+		}()
+	}
+
+	// Let the queries overlap before releasing them.
+	time.Sleep(50 * time.Millisecond)
+	server.releaseQueries()
+	waitGroup.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err, "every query in the burst must succeed")
+	}
+
+	// Give the eviction closes a moment to complete. This is a timing allowance for an
+	// asynchronous Close, not an assumption that cleanup "should" have finished.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pool.access.Lock()
+		idle := pool.state.idle.Len()
+		tracked := len(pool.state.all)
+		pool.access.Unlock()
+		if idle <= pool.maxIdle && tracked <= pool.maxIdle {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	pool.access.Lock()
+	idle := pool.state.idle.Len()
+	tracked := len(pool.state.all)
+	pool.access.Unlock()
+
+	require.LessOrEqual(t, idle, pool.maxIdle,
+		"a %d-query burst must not leave %d idle connections; the cap is %d",
+		burst, idle, pool.maxIdle)
+	require.Equal(t, idle, tracked,
+		"every tracked connection must be an idle one: %d tracked, %d idle", tracked, idle)
+
+	// The retained connection must still be usable, which is the point of keeping one.
+	server.holdQueries.Store(false)
+	require.NoError(t, testExchange(transport, "example.com."),
+		"the retained connection must still serve queries")
 }
