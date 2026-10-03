@@ -532,7 +532,35 @@ func (r *NetworkManager) readWIFIState(ctx context.Context) (adapter.WIFIState, 
 func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 	r.resetRunAccess.Lock()
 	defer r.resetRunAccess.Unlock()
+	// Claimed here because this entry point IS the transition: it has no earlier moment at which a
+	// caller could observe a half-published state.
+	r.beginTransition()
 	r.resetNetworkLocked(ctx)
+}
+
+// beginTransition claims the epoch for a transition that is about to perform a reset.
+//
+// # Why the epoch is claimed separately from the reset body
+//
+// The epoch is the ownership token every other subsystem compares against: the DNS generation
+// barrier rejects a response whose captured epoch has moved, and the dialer refuses to hand a
+// connection to a caller whose epoch is stale. Both read the SAME counter this advances.
+//
+// Advancing it only inside resetNetworkLocked, which runs after resetRunAccess is acquired, left a
+// window in which the transition was already half-published: recomputeNetworkEnvironment had
+// written the new fingerprint, so NetworkEnvironment() reported the new network, while the epoch
+// still reported the old one and every DNS transport pin still named the old network. An operation
+// completing inside that window is compared against the OLD epoch, is judged current, and its
+// answer is cached under the old namespace although the connection that carried it now reaches the
+// new network. Holding the lock for a long time - a slow CloseAll, a contended mutex - only makes
+// the window wider; it does not make it safe.
+//
+// Claiming the epoch BEFORE waiting turns the publish and the epoch into one observation: there is
+// no instant at which a reader can see the new fingerprint with the old ownership. The reset body
+// then runs without advancing the epoch a second time, so one logical transition still costs
+// exactly one epoch.
+func (r *NetworkManager) beginTransition() {
+	r.networkResetGeneration.Add(1)
 }
 
 // NetworkResetGeneration reports the current reset epoch: it increases every time a network
@@ -544,16 +572,21 @@ func (r *NetworkManager) NetworkResetGeneration() uint64 {
 	return r.networkResetGeneration.Load()
 }
 
-// resetNetworkLocked performs the reset. Callers must hold resetRunAccess.
-func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
-	// The epoch advances FIRST, making the reset a boundary from its first instruction.
-	//
-	// A network operation that began before this point is stale the moment the reset starts, rather
-	// than only once it finishes. Advancing at the end would leave an interval in which a dial that
-	// began on the old network completes, is compared against the still-current old epoch, and is
-	// accepted - the same window the DNS generation barrier exists to close.
-	r.networkResetGeneration.Add(1)
+// interfaceUpdateDecisionHook, when set, runs between updateInterface's context check and its
+// consumption of networkResetPending.
+//
+// Those two steps are the window a superseding notification can slip into, and the window is one
+// instruction wide. A test that wants to prove the ordering cannot widen it by racing, so it parks
+// the update here instead. It is nil in production, where the check is a single predictable branch.
+var interfaceUpdateDecisionHook func()
 
+// resetNetworkLocked performs the reset. Callers must hold resetRunAccess.
+//
+// The epoch must already have been claimed, by beginTransition or by one of the entry points that
+// claims it as part of taking the lock. It is NOT advanced here: a transition claims its epoch
+// before it waits for the lock, so that the epoch moves with the published environment rather than
+// a lock acquisition later.
+func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 	if r.connectionManager != nil {
 		r.connectionManager.CloseAll()
 	}
@@ -682,17 +715,58 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	// A newer interface notification cancels this update's context and arms the flag for itself. If a
 	// cancelled update cleared the flag anyway, that newer transition would be dropped: its own update
 	// would find nothing pending and skip the reset it exists to perform.
-	resetNetwork := false
-	if ctx.Err() == nil {
-		r.interfaceUpdateAccess.Lock()
-		if r.networkResetPending {
-			r.networkResetPending = false
-			resetNetwork = true
+	// ONE ownership decision.
+	//
+	// Everything that decides whether this update still owns its event happens under
+	// interfaceUpdateAccess, and it happens as a single step:
+	//
+	//	- whether this update is still current, and
+	//	- whether networkResetPending belongs to it.
+	//
+	// Checking the context OUTSIDE the lock and consuming the flag INSIDE it made those two facts
+	// separately readable, and a superseding notification - which arms the flag and cancels this
+	// update's context under that same lock - could land between them. The check passed, the flag it
+	// then consumed belonged to the newer event, and that event's own update found nothing to do.
+	// The interface change was silently dropped.
+	//
+	// The two must therefore be observed together: the lock that the notifier takes is the lock in
+	// which "am I still current" is answered. A context cancelled before this critical section is
+	// seen as cancelled here; one cancelled after it has already lost, because this update has
+	// claimed its epoch and committed to the transition.
+	ownedByThisUpdate := false
+	superseded := false
+	r.interfaceUpdateAccess.Lock()
+	if ctx.Err() != nil {
+		superseded = true
+	} else {
+		if interfaceUpdateDecisionHook != nil {
+			interfaceUpdateDecisionHook()
 		}
-		r.interfaceUpdateAccess.Unlock()
+		// Re-check inside the lock: the hook above explicitly widens the window, and a notification
+		// that arrived while it ran must still win.
+		if ctx.Err() != nil {
+			superseded = true
+		} else if r.networkResetPending {
+			r.networkResetPending = false
+			ownedByThisUpdate = true
+		}
+	}
+	r.interfaceUpdateAccess.Unlock()
+
+	// The environment half is governed by the same decision. A superseded update does not run a
+	// reset for a state it no longer owns: the notification that superseded it will establish that
+	// boundary itself, and running it here as well would be a second reset for one transition - with
+	// the epoch already claimed by the newer event.
+	if superseded && !ownedByThisUpdate {
+		// The flag may still have been armed by the superseding notification, which is exactly what
+		// must survive for its own update to consume.
+		return
 	}
 
-	if environmentChanged || resetNetwork {
+	if environmentChanged || ownedByThisUpdate {
+		// One transition, one epoch: the two reasons above describe the same physical event, so
+		// claiming the epoch once here costs exactly one advance whichever of them fired.
+		r.beginTransition()
 		r.resetNetworkLocked(ctx)
 	}
 }
@@ -724,6 +798,7 @@ func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 			if updateContext.Err() != nil {
 				return
 			}
+			r.beginTransition()
 			r.resetNetworkLocked(updateContext)
 		}()
 	}

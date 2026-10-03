@@ -40,7 +40,7 @@ import (
 func newPowerHarness(t *testing.T) *NetworkManager {
 	t.Helper()
 	manager := &NetworkManager{
-		router:   &countingRouter{},
+		router:   newCountingRouter(),
 		endpoint: &emptyEndpointManager{},
 		inbound:  &emptyInboundManager{},
 		outbound: &emptyOutboundManager{},
@@ -186,18 +186,15 @@ func TestAllResetEntriesShareOneSerialisation(t *testing.T) {
 
 // waitForResets blocks until the router has observed at least n resets, or fails.
 //
-// The power resume path dispatches a goroutine, so the test has to join on the work rather than
-// sleep on a guess about how long it takes.
+// The power resume path dispatches a goroutine, so the test has to join on the work. It joins on the
+// router's own signal - published by the reset as it runs - rather than polling the count, so the
+// wait is ordered by the reset instead of by how long the test guessed it would take. The timeout is
+// a watchdog against a hang, not the synchroniser.
 func waitForResets(t *testing.T, router *countingRouter, n int) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if dnsResetCount(router) >= n {
-			return
-		}
-		time.Sleep(time.Millisecond)
+	if !router.waitForCount(n, 10*time.Second) {
+		t.Fatalf("expected at least %d reset(s), saw %d", n, router.count())
 	}
-	t.Fatalf("expected at least %d reset(s), saw %d", n, dnsResetCount(router))
 }
 
 // setWIFIStateForTest publishes a Wi-Fi SSID so the environment fingerprint moves.

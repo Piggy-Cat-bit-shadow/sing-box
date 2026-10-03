@@ -69,6 +69,15 @@ func (r *NetworkManager) updateNetworkEnvironment() {
 // startedCancel - so holding environmentUpdateAccess across it would stop every later
 // postUpdateNetworkEnvironment behind a Close that is itself waiting. That is a three-way cycle, and
 // it hung the jiejie reference suite for the full 40-minute test timeout.
+// environmentPublishedHook, when set, runs immediately after a recompute publishes a new
+// fingerprint and before the transition's boundary is taken.
+//
+// It is the test-visible form of "the environment has been published", which is otherwise only
+// observable by reading the field and hoping to catch the instant. A test that needs to assert what
+// the rest of the system can see at that instant would otherwise have to poll for it. It is nil in
+// production, where this is one predictable branch.
+var environmentPublishedHook func()
+
 func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	r.environmentUpdateAccess.Lock()
 	defer r.environmentUpdateAccess.Unlock()
@@ -145,6 +154,10 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 		r.logger.Info("updated network environment: no default interface, gateways or SSID")
 	}
 
+	if environmentPublishedHook != nil {
+		environmentPublishedHook()
+	}
+
 	return true
 }
 
@@ -190,6 +203,17 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 // representable fingerprint, so "old == 0" cannot distinguish a first observation from a genuine
 // transition. startedCtx is nil until Start, which is the lifecycle fact that actually
 // distinguishes them.
+// THE LINEARIZATION POINT of an environment transition is r.beginTransition() below: the instant the
+// epoch advances. Everything before it belongs to the previous network; everything after it - the
+// reset body, the transport re-pinning, the re-dialled connections - belongs to the new one. The
+// fingerprint is published immediately before it, under the same call, so no reader can observe the
+// new environment with the old ownership.
+//
+// The epoch is claimed BEFORE resetRunAccess is taken. That ordering is the whole point of this
+// function's shape: waiting for the lock is exactly the interval in which the transition is
+// half-published, and claiming afterwards would leave that interval observable. Claiming first makes
+// the wait harmless - a long wait only delays the reset body, and by then the epoch has already told
+// every other subsystem to treat the previous network's operations as stale.
 func (r *NetworkManager) boundEnvironmentTransitionExported() {
 	if !r.environmentTransitionApplies() {
 		return
@@ -197,7 +221,12 @@ func (r *NetworkManager) boundEnvironmentTransitionExported() {
 	if r.logger != nil {
 		r.logger.Info("network environment changed, resetting network transports")
 	}
-	r.ResetNetwork(r.startedCtx)
+	// Claim the epoch, then take the lock and run the body WITHOUT claiming again - one logical
+	// transition must cost exactly one epoch, however long the lock is contended.
+	r.beginTransition()
+	r.resetRunAccess.Lock()
+	defer r.resetRunAccess.Unlock()
+	r.resetNetworkLocked(r.startedCtx)
 }
 
 // boundEnvironmentTransitionLocked is the inner form for a caller holding resetRunAccess.

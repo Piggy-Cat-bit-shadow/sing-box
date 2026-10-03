@@ -31,7 +31,7 @@ import (
 //
 // Serialisation must not drop work, and neither form may deadlock against the other.
 func TestAllResetEntryPointsCoexist(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -93,7 +93,7 @@ func TestAllResetEntryPointsCoexist(t *testing.T) {
 // It calls the exported entry and then releases idle connections, so the exported path must return
 // with the lock free - otherwise the CloseIdleConnections loop runs while holding it, or deadlocks.
 func TestReleaseMemoryResetsThenClosesIdle(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	keeper := &recordingIdleKeeper{}
 	manager := &NetworkManager{
 		router:   router,

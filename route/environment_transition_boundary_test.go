@@ -55,7 +55,7 @@ func (m *environmentTransitionManager) NetworkEnvironment() uint64 {
 
 // TestEnvironmentTransitionTakesTheResetBoundary is the positive direction.
 func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -92,7 +92,7 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 	// and the environment is a hash for which 0 is a real value, so the gate is the lifecycle rather
 	// than the old value.
 	unstarted := &NetworkManager{
-		router:   &countingRouter{},
+		router:   newCountingRouter(),
 		endpoint: &emptyEndpointManager{},
 		inbound:  &emptyInboundManager{},
 		outbound: &emptyOutboundManager{},
@@ -110,7 +110,7 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 // boundary only when the fingerprint actually changes; resetting on every tick would tear down every
 // pooled DNS connection repeatedly on a stable network and fracture the cache for no reason.
 func TestUnchangedEnvironmentDoesNotResetOnEveryUpdate(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -144,7 +144,7 @@ func TestUnchangedEnvironmentDoesNotResetOnEveryUpdate(t *testing.T) {
 // one. If the timer path ever took the lock as well - or the interface path called the exported
 // form - one of these would hang rather than fail, so the test bounds it in time.
 func TestEnvironmentTransitionDoesNotDeadlockTheLockHoldingPath(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -182,7 +182,7 @@ func TestEnvironmentTransitionDoesNotDeadlockTheLockHoldingPath(t *testing.T) {
 // TestConcurrentEnvironmentTransitionsAreSerialised checks that overlapping transitions neither
 // drop work nor interleave two resets.
 func TestConcurrentEnvironmentTransitionsAreSerialised(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -239,7 +239,7 @@ var _ adapter.NetworkManager = (*environmentTransitionManager)(nil)
 // to proceed while the boundary is still blocked on a reset.
 func TestEnvironmentRecomputeDoesNotHoldItsLockAcrossTheReset(t *testing.T) {
 	manager := &NetworkManager{
-		router:   &countingRouter{},
+		router:   newCountingRouter(),
 		endpoint: &emptyEndpointManager{},
 		inbound:  &emptyInboundManager{},
 		outbound: &emptyOutboundManager{},
@@ -305,7 +305,7 @@ func TestEnvironmentRecomputeDoesNotHoldItsLockAcrossTheReset(t *testing.T) {
 // The inner form completes while resetRunAccess is already held. A version that reached for the
 // exported entry would block here rather than fail, so the assertion is bounded in time.
 func TestInterfacePathTakesTheInnerResetForATransition(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -320,6 +320,9 @@ func TestInterfacePathTakesTheInnerResetForATransition(t *testing.T) {
 	// The interface path's critical section, exactly as updateInterface takes it.
 	manager.resetRunAccess.Lock()
 	generationBefore := manager.NetworkResetGeneration()
+	// updateInterface claims the epoch for its single transition before running the body; the inner
+	// form performs the reset and does not advance the epoch itself.
+	manager.beginTransition()
 
 	done := make(chan struct{})
 	go func() {

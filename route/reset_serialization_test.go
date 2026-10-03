@@ -52,6 +52,59 @@ type countingRouter struct {
 	// the interleaving under test.
 	inFlight atomic.Int32
 	maxSeen  atomic.Int32
+
+	// signal is closed and replaced on every reset, and waiters select on the value they read. It
+	// lets a test join on the reset actually happening instead of polling the count, which is what a
+	// sleep-based wait would do: a poll both slows the test down and can only ever observe the count
+	// by accident of timing.
+	signal atomic.Pointer[chan struct{}]
+}
+
+// noteReset publishes a new signal channel and closes the previous one, so every waiter blocked on
+// the old value wakes exactly once.
+func (r *countingRouter) noteReset() {
+	next := make(chan struct{})
+	previous := r.signal.Swap(&next)
+	if previous != nil {
+		close(*previous)
+	}
+}
+
+// waitForCount blocks until at least n resets have been observed, or the timeout elapses.
+//
+// It never samples: the count is compared once, and if it is short the caller waits on the channel
+// the next reset will close. There is always a channel to wait on because newCountingRouter
+// publishes one at construction.
+func (r *countingRouter) waitForCount(n int, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for r.count() < n {
+		signal := r.signal.Load()
+		if signal == nil {
+			return false
+		}
+		select {
+		case <-*signal:
+		case <-deadline:
+			return r.count() >= n
+		}
+	}
+	return true
+}
+
+// newCountingRouter builds a countingRouter with its signal channel already published, so a waiter
+// never has to poll for the first reset.
+func newCountingRouter() *countingRouter {
+	router := &countingRouter{}
+	signal := make(chan struct{})
+	router.signal.Store(&signal)
+	return router
+}
+
+// count reports how many resets have been entered.
+func (r *countingRouter) count() int {
+	r.access.Lock()
+	defer r.access.Unlock()
+	return r.entered
 }
 
 func (r *countingRouter) ResetNetwork() {
@@ -66,6 +119,7 @@ func (r *countingRouter) ResetNetwork() {
 	r.access.Lock()
 	r.entered++
 	r.access.Unlock()
+	r.noteReset()
 
 	// Hold long enough that an unserialised second reset would certainly overlap.
 	for index := 0; index < 1000; index++ {
@@ -79,7 +133,7 @@ func (r *countingRouter) ResetNetwork() {
 // Two resets dispatched from different goroutines, as a control-plane call and an interface event
 // would be, must not overlap.
 func TestConcurrentResetNetworkIsSerialized(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
@@ -121,7 +175,7 @@ func TestConcurrentResetNetworkIsSerialized(t *testing.T) {
 // manager would deadlock on the first interface change - a far worse outcome than the race this
 // serialisation removes.
 func TestResetNetworkIsReentrantFromTheInterfacePath(t *testing.T) {
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},

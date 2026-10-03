@@ -47,7 +47,7 @@ type interfaceTransitionHarness struct {
 // exact transition onWIFIStateChanged exists for.
 func newInterfaceTransitionHarness(t *testing.T) *interfaceTransitionHarness {
 	t.Helper()
-	router := &countingRouter{}
+	router := newCountingRouter()
 	manager := &NetworkManager{
 		router:   router,
 		endpoint: &emptyEndpointManager{},
