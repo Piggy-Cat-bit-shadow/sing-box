@@ -1408,6 +1408,17 @@ func (r *Router) ResetNetwork() {
 	for _, transport := range r.transport.Transports() {
 		transport.Reset()
 	}
+	// The reverse mapping is a cache of what previous answers said an address meant, and a network
+	// change is exactly when that may no longer hold: with split-horizon or captive-portal DNS the
+	// same address can mean a different name on the new network. Leaving entries behind lets a
+	// stale name participate in route rule matching until its DNS TTL expires.
+	//
+	// Nothing depends on the mapping surviving a network change - it is a cache, and every entry
+	// is re-learned from the next answer - so purging it here is strictly a reduction in stale
+	// state rather than a behaviour change for any correct configuration.
+	if r.dnsReverseMapping != nil {
+		r.dnsReverseMapping.Purge()
+	}
 }
 
 func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
