@@ -73,6 +73,20 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 }
 
 func (s *URLTest) Start() error {
+	// Dispose of any group from an earlier Start before replacing it.
+	//
+	// Assigning a new group over the old one stranded everything the old group owned: its ticker,
+	// its pause callback and its background context, none of which anything referenced afterwards.
+	// A health check already running kept running, for a group nothing could reach.
+	//
+	// Start is called once in the normal lifecycle, so this is about not leaking when it is not.
+	s.checkAccess.Lock()
+	if s.group != nil {
+		_ = s.group.Close()
+		s.group = nil
+	}
+	s.checkAccess.Unlock()
+
 	outbounds := make([]adapter.Outbound, 0, len(s.tags))
 	for i, tag := range s.tags {
 		detour, loaded := s.outbound.Outbound(tag)
@@ -237,13 +251,17 @@ type selectedState struct {
 }
 
 type URLTestGroup struct {
-	ctx           context.Context
-	outbound      adapter.OutboundManager
-	pause         pause.Manager
-	pauseCallback *list.Element[pause.Callback]
-	logger        log.Logger
-	outbounds     []adapter.Outbound
-	link          string
+	ctx context.Context
+	// cancelBackground cancels ctx, which is a child of the caller's context created by
+	// NewURLTestGroup. Every background check runs on it, so Close stops work that is already
+	// running rather than only preventing new work from starting.
+	cancelBackground context.CancelFunc
+	outbound         adapter.OutboundManager
+	pause            pause.Manager
+	pauseCallback    *list.Element[pause.Callback]
+	logger           log.Logger
+	outbounds        []adapter.Outbound
+	link             string
 	// scope identifies the target this group measures against, so selection and skipping only
 	// ever read measurements made against that same target.
 	scope       urltest.MeasurementScope
@@ -298,8 +316,14 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if err != nil {
 		return nil, E.Cause(err, "invalid URL test target")
 	}
+	// The group owns its background lifetime. Storing the caller's context alone meant Close could
+	// not stop a check that was already running: it could only stop the loop that schedules them,
+	// and a recheck requested by a failing connection started a goroutine nothing could cancel.
+	groupCtx, cancelBackground := context.WithCancel(ctx)
+
 	return &URLTestGroup{
-		ctx:                          ctx,
+		ctx:                          groupCtx,
+		cancelBackground:             cancelBackground,
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
@@ -322,6 +346,14 @@ func (g *URLTestGroup) PostStart() {
 	g.started = true
 	g.lastActive.Store(time.Now())
 	go g.CheckOutbounds(g.ctx, false)
+}
+
+// backgroundContext reports the context this group's background work runs on.
+//
+// It exists so a test can assert that Close cancels in-flight work, rather than inferring it from
+// the absence of some other effect.
+func (g *URLTestGroup) backgroundContext() context.Context {
+	return g.ctx
 }
 
 func (g *URLTestGroup) Touch() {
@@ -373,6 +405,12 @@ func (g *URLTestGroup) Close() error {
 		g.pauseCallback = nil
 	}
 	close(g.close)
+
+	// Stop work that is already running. Stopping the ticker only stops future scheduling.
+	if g.cancelBackground != nil {
+		g.cancelBackground()
+		g.cancelBackground = nil
+	}
 	return nil
 }
 

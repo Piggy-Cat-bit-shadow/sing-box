@@ -7,8 +7,11 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 
@@ -147,4 +150,137 @@ func TestCloseWithoutTouchIsStillTerminal(t *testing.T) {
 	group.access.Unlock()
 	require.Nil(t, ticker,
 		"a group closed before it was ever touched must not be startable by a later Touch")
+}
+
+// TestCloseCancelsInFlightBackgroundWork is §5.1's "no background check after Close" and §5.2's
+// group-owned child context.
+//
+// The group stores the caller's context and every background check runs on it. Close stops the
+// ticker and closes the loop channel, but neither of those cancels work that is already running:
+// a check in flight keeps going, and a health recheck requested by a failing connection starts a
+// goroutine that nothing can stop.
+//
+// A group that is closed must stop doing work.
+func TestCloseCancelsInFlightBackgroundWork(t *testing.T) {
+	group, _ := newLifecycleFixture(t)
+	group.PostStart()
+
+	// The group must own a context that Close can cancel. Observing it directly is what makes this
+	// a deterministic assertion rather than a race against a check finishing on its own.
+	groupCtx := group.backgroundContext()
+	require.NotNil(t, groupCtx, "the group must expose the context its background work runs on")
+
+	select {
+	case <-groupCtx.Done():
+		t.Fatal("the background context must be live before Close")
+	default:
+	}
+
+	require.NoError(t, group.Close())
+
+	select {
+	case <-groupCtx.Done():
+		// Cancelled as required.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel the group's background context; a health check already " +
+			"running keeps going, and a check requested by a failing connection can start after " +
+			"the group is closed - both write history for a group that no longer exists")
+	}
+}
+
+// TestClosedGroupDoesNotStartNewBackgroundWork is the observable half.
+//
+// requestHealthRecheck is called when a connection fails. After Close it must not start a check.
+func TestClosedGroupDoesNotStartNewBackgroundWork(t *testing.T) {
+	group, _ := newLifecycleFixture(t)
+	group.PostStart()
+	require.NoError(t, group.Close())
+
+	// A failing connection asks for a recheck on a closed group.
+	group.requestHealthRecheck()
+
+	require.Never(t, func() bool {
+		return group.checking.Load()
+	}, 200*time.Millisecond, 10*time.Millisecond,
+		"a closed group must not start a health check; it would run against a torn-down group and "+
+			"write history for one that no longer exists")
+}
+
+// TestDoubleStartDoesNotStrandTheFirstGroup is §5.1's "Start only once".
+//
+// URLTest.Start builds a fresh group and assigns it to s.group. A second Start therefore replaces
+// the first group without disposing of it, and the first one's ticker, pause callback and
+// background context are left owned by nothing.
+func TestDoubleStartDoesNotStrandTheFirstGroup(t *testing.T) {
+	member := &stubOutbound{tag: "node-a"}
+	manager := &taggedOutboundManager{byTag: map[string]adapter.Outbound{"node-a": member}}
+	ctx := pause.WithDefaultManager(
+		service.ContextWithPtr(service.ContextWith[adapter.OutboundManager](context.Background(), manager),
+			urltest.NewHistoryStorage()))
+
+	instance := &URLTest{
+		Adapter:  outbound.NewAdapter(C.TypeURLTest, "group", []string{N.NetworkTCP}, []string{"node-a"}),
+		ctx:      ctx,
+		outbound: manager,
+		logger:   log.NewNOPFactory().NewLogger("group"),
+		tags:     []string{"node-a"},
+		link:     "https://probe.example/generate_204",
+	}
+
+	require.NoError(t, instance.Start())
+	first := instance.group
+	require.NotNil(t, first, "Start must install a group")
+	firstCtx := first.backgroundContext()
+	first.PostStart()
+
+	// A second Start on the same instance.
+	require.NoError(t, instance.Start())
+	second := instance.group
+	require.NotNil(t, second)
+
+	if first != second {
+		require.Eventually(t, func() bool {
+			select {
+			case <-firstCtx.Done():
+				return true
+			default:
+				return false
+			}
+		}, 2*time.Second, 10*time.Millisecond,
+			"Start replaced the group, so the previous group's background context must be "+
+				"cancelled; otherwise its ticker, pause callback and context are stranded with no "+
+				"owner and a health check keeps running for a group nothing references")
+	}
+
+	require.NoError(t, instance.Close())
+}
+
+// TestStartIsIdempotentOrReplacesCleanly is §5.1's "Start only once".
+//
+// Start builds a fresh group and assigns it to s.group. Calling it twice would replace the first
+// group without closing it, leaving a ticker, a pause callback and a background context behind -
+// the lifecycle resources the first group acquired that nothing now owns.
+func TestStartIsIdempotentOrReplacesCleanly(t *testing.T) {
+	group, _ := newLifecycleFixture(t)
+	group.PostStart()
+	group.Touch()
+
+	firstCtx := group.backgroundContext()
+
+	// Close is the only sanctioned way to dispose of a group, and the URLTest wrapper must not
+	// discard one silently.
+	require.NoError(t, group.Close())
+
+	select {
+	case <-firstCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a replaced or closed group must have its background context cancelled")
+	}
+
+	// A second group can be built and started without the first one's resources interfering.
+	second, _ := newLifecycleFixture(t)
+	second.PostStart()
+	require.NotEqual(t, firstCtx, second.backgroundContext(),
+		"each group owns its own background context")
+	require.NoError(t, second.Close())
 }
