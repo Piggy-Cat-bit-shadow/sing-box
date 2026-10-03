@@ -852,7 +852,30 @@ func URLTestOutboundsWithMode(ctx context.Context, outboundManager adapter.Outbo
 // The target is resolved once for the whole batch. An unusable one means there is nothing to
 // measure, so the batch reports no results rather than failing every node individually.
 func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, expected urltest.ExpectedStatus, interval time.Duration, force bool, mode TestHistoryMode) map[string]uint16 {
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	// The round owns a child context, so an abort can stop the members it already started.
+	//
+	// # Why the join is deferred rather than inlined
+	//
+	// The traversal recurses and can panic - a nested group's All() or Selected(), a cycle,
+	// anything outside the per-member boundary. On that path `b.Wait()` used to be skipped: the
+	// round unwound and reported failure to its caller while probes started earlier were still
+	// running, and they went on to write health and display history for a round that was over.
+	//
+	// Cancelling and joining in a defer makes the guarantee independent of how the function exits.
+	// A panic still propagates; what changes is that it propagates with nothing left behind.
+	roundCtx, cancelRound := context.WithCancel(ctx)
+	b, _ := batch.New(roundCtx, batch.WithConcurrencyNum[any](10))
+
+	// The defer is the ABORT guarantee, not the normal path.
+	//
+	// It runs on every exit, including a panic that unwinds past the join below, and it is what
+	// makes "the round has returned" mean "nothing this round started is still running". On the
+	// normal path the join below has already happened, so this is a no-op there - which is why it
+	// can be unconditional.
+	defer func() {
+		cancelRound()
+		b.Wait()
+	}()
 
 	// Parse the target ONCE and keep all three uses distinct.
 	//
@@ -869,7 +892,7 @@ func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.Out
 		Expected: expected.Canonical(),
 	}
 	testBatch := &urlTestBatch{
-		ctx:      ctx,
+		ctx:      roundCtx,
 		outbound: outboundManager,
 		history:  history,
 		logger:   logger,
@@ -881,7 +904,14 @@ func URLTestOutboundsWithTarget(ctx context.Context, outboundManager adapter.Out
 		expected: expected,
 	}
 	testBatch.test(outbounds, target.RequestURL, interval, force)
+
+	// Join BEFORE post-processing on the normal path.
+	//
+	// The deferred join alone is not enough here: it runs after this function body, so reading the
+	// results first would race the members that produce them - a nested group's result is assembled
+	// from what its members recorded.
 	b.Wait()
+
 	for _, outboundGroup := range testBatch.groups {
 		groupHistory := history.LoadURLTestHistoryFor(RealTag(outboundGroup, N.NetworkTCP), scope)
 		if groupHistory != nil {
