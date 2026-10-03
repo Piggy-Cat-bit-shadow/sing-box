@@ -506,7 +506,27 @@ func (r *NetworkManager) UpdateWIFIState(ctx context.Context) {
 	r.onWIFIStateChanged(state)
 }
 
+// ResetNetwork runs a network reset, serialised against every other one.
+//
+// # Why it takes the lock itself
+//
+// The interface-driven path and the power paths already hold resetRunAccess when they call the inner
+// function, because they need it for a wider critical section that also decides WHETHER to reset.
+// The control plane does not: experimental/clashapi and the libbox command server call ResetNetwork
+// directly, with no lock at all.
+//
+// Two resets running concurrently interleave CloseAll, the InterfaceUpdated callbacks and the DNS
+// reset. The generation then advances more than once while the transports and callbacks are reset in
+// an order belonging to neither run, so a transport can be reset after the generation it was pinned
+// to - and a caller observes a state that no single reset produced.
 func (r *NetworkManager) ResetNetwork(ctx context.Context) {
+	r.resetRunAccess.Lock()
+	defer r.resetRunAccess.Unlock()
+	r.resetNetworkLocked(ctx)
+}
+
+// resetNetworkLocked performs the reset. Callers must hold resetRunAccess.
+func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 	if r.connectionManager != nil {
 		r.connectionManager.CloseAll()
 	}
@@ -615,7 +635,7 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	}
 	r.interfaceUpdateAccess.Unlock()
 	if resetNetwork {
-		r.ResetNetwork(ctx)
+		r.resetNetworkLocked(ctx)
 	}
 }
 
@@ -646,7 +666,7 @@ func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 			if updateContext.Err() != nil {
 				return
 			}
-			r.ResetNetwork(updateContext)
+			r.resetNetworkLocked(updateContext)
 		}()
 	}
 }
