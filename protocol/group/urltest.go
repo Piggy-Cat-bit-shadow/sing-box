@@ -38,11 +38,14 @@ var (
 
 type URLTest struct {
 	outbound.Adapter
-	ctx                          context.Context
-	outbound                     adapter.OutboundManager
-	logger                       log.ContextLogger
-	tags                         []string
-	link                         string
+	ctx      context.Context
+	outbound adapter.OutboundManager
+	logger   log.ContextLogger
+	tags     []string
+	link     string
+	// scope identifies the target this group measures against. Selection, skipping and health
+	// checks must only read measurements for THIS target.
+	scope                        urltest.MeasurementScope
 	interval                     time.Duration
 	tolerance                    uint16
 	idleTimeout                  time.Duration
@@ -104,10 +107,12 @@ func (s *URLTest) All() []string {
 
 func (s *URLTest) Selected(network string) adapter.Outbound {
 	var outbound adapter.Outbound
-	if network == N.NetworkUDP {
-		outbound = s.group.selectedOutboundUDP
-	} else {
-		outbound = s.group.selectedOutboundTCP
+	if state := s.group.selected.Load(); state != nil {
+		if network == N.NetworkUDP {
+			outbound = state.udp
+		} else {
+			outbound = state.tcp
+		}
 	}
 	if outbound == nil {
 		outbound, _ = s.group.Select(network)
@@ -125,12 +130,16 @@ func (s *URLTest) References() []string {
 	if group == nil {
 		return nil
 	}
-	var references []string
-	if group.selectedOutboundTCP != nil {
-		references = append(references, group.selectedOutboundTCP.Tag())
+	state := group.selected.Load()
+	if state == nil {
+		return nil
 	}
-	if group.selectedOutboundUDP != nil && group.selectedOutboundUDP != group.selectedOutboundTCP {
-		references = append(references, group.selectedOutboundUDP.Tag())
+	var references []string
+	if state.tcp != nil {
+		references = append(references, state.tcp.Tag())
+	}
+	if state.udp != nil && state.udp != state.tcp {
+		references = append(references, state.udp.Tag())
 	}
 	return references
 }
@@ -168,12 +177,16 @@ func (s *URLTest) InterfaceUpdated(ctx context.Context) {
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
 	var outbound adapter.Outbound
-	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP
-	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP
-	default:
+	if state := s.group.selected.Load(); state != nil {
+		switch N.NetworkName(network) {
+		case N.NetworkTCP:
+			outbound = state.tcp
+		case N.NetworkUDP:
+			outbound = state.udp
+		default:
+			return nil, E.Extend(N.ErrUnknownNetwork, network)
+		}
+	} else if N.NetworkName(network) != N.NetworkTCP && N.NetworkName(network) != N.NetworkUDP {
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if outbound == nil {
@@ -187,13 +200,19 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	// A real connection failed, so the node is not usable now regardless of what an earlier
+	// measurement said. Only this target's result is invalidated, and only if this outbound is
+	// still the selected one - a concurrent update may already have moved on.
+	s.group.invalidateSelected(network, outbound)
 	return nil, err
 }
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP
+	var outbound adapter.Outbound
+	if state := s.group.selected.Load(); state != nil {
+		outbound = state.udp
+	}
 	if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
@@ -205,25 +224,42 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
+	s.group.invalidateSelected(N.NetworkUDP, outbound)
 	return nil, err
 }
 
+// selectedState is one immutable generation of the group's selection.
+//
+// It is replaced wholesale, never mutated, so a reader that has loaded a pointer can use both
+// fields without them changing underneath it.
+type selectedState struct {
+	tcp adapter.Outbound
+	udp adapter.Outbound
+}
+
 type URLTestGroup struct {
-	ctx                          context.Context
-	outbound                     adapter.OutboundManager
-	pause                        pause.Manager
-	pauseCallback                *list.Element[pause.Callback]
-	logger                       log.Logger
-	outbounds                    []adapter.Outbound
-	link                         string
-	interval                     time.Duration
-	tolerance                    uint16
-	idleTimeout                  time.Duration
-	history                      *urltest.HistoryStorage
-	checking                     atomic.Bool
-	selectedOutboundTCP          adapter.Outbound
-	selectedOutboundUDP          adapter.Outbound
+	ctx           context.Context
+	outbound      adapter.OutboundManager
+	pause         pause.Manager
+	pauseCallback *list.Element[pause.Callback]
+	logger        log.Logger
+	outbounds     []adapter.Outbound
+	link          string
+	// scope identifies the target this group measures against, so selection and skipping only
+	// ever read measurements made against that same target.
+	scope       urltest.MeasurementScope
+	interval    time.Duration
+	tolerance   uint16
+	idleTimeout time.Duration
+	history     *urltest.HistoryStorage
+	checking    atomic.Bool
+	// selected holds the TCP and UDP choices as ONE immutable generation.
+	//
+	// They were two bare interface fields, written by the background health check and read by
+	// real traffic. That is a data race, and reading them separately could yield two different
+	// generations within one operation. Publishing them together means a reader loads once and
+	// sees a consistent pair.
+	selected                     atomic.Pointer[selectedState]
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 	access                       sync.Mutex
@@ -251,12 +287,22 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 	if history == nil {
 		return nil, E.New("missing URL test history storage")
 	}
+	// Resolve the target once, here, and refuse an unusable one now.
+	//
+	// Deferring this would let a group start, look healthy, and only discover after the first
+	// interval that every measurement fails - by which time the operator has been told nothing.
+	// The canonical URL is kept so the scope and what is actually requested are the same string.
+	scope, err := urltest.NewMeasurementScope(link, nil)
+	if err != nil {
+		return nil, E.Cause(err, "invalid URL test target")
+	}
 	return &URLTestGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
 		logger:                       logger,
 		outbounds:                    outbounds,
-		link:                         link,
+		link:                         scope.URL,
+		scope:                        scope,
 		interval:                     interval,
 		tolerance:                    tolerance,
 		idleTimeout:                  idleTimeout,
@@ -311,16 +357,16 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 	var minOutbound adapter.Outbound
 	switch network {
 	case N.NetworkTCP:
-		if g.selectedOutboundTCP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP)); history != nil {
-				minOutbound = g.selectedOutboundTCP
+		if state := g.selected.Load(); state != nil && state.tcp != nil {
+			if history := g.history.LoadURLTestHistoryFor(RealTag(state.tcp, N.NetworkTCP), g.scope); history != nil {
+				minOutbound = state.tcp
 				minDelay = history.Delay
 			}
 		}
 	case N.NetworkUDP:
-		if g.selectedOutboundUDP != nil {
-			if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP)); history != nil {
-				minOutbound = g.selectedOutboundUDP
+		if state := g.selected.Load(); state != nil && state.udp != nil {
+			if history := g.history.LoadURLTestHistoryFor(RealTag(state.udp, N.NetworkUDP), g.scope); history != nil {
+				minOutbound = state.udp
 				minDelay = history.Delay
 			}
 		}
@@ -329,7 +375,7 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
-		history := g.history.LoadURLTestHistory(RealTag(detour, network))
+		history := g.history.LoadURLTestHistoryFor(RealTag(detour, network), g.scope)
 		if history == nil {
 			continue
 		}
@@ -394,30 +440,37 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 	return result, nil
 }
 
-type urlTestResult struct {
-	delay uint16
-	err   error
-}
-
 type urlTestBatch struct {
 	ctx      context.Context
 	outbound adapter.OutboundManager
 	history  *urltest.HistoryStorage
 	logger   log.Logger
-	batch    *batch.Batch[any]
-	checked  map[string]bool
-	groups   []adapter.OutboundGroup
-	access   sync.Mutex
-	result   map[string]uint16
+	// scope is the target every measurement in this batch shares, so results are stored and
+	// freshness is judged against the right key.
+	scope   urltest.MeasurementScope
+	batch   *batch.Batch[any]
+	checked map[string]bool
+	groups  []adapter.OutboundGroup
+	access  sync.Mutex
+	result  map[string]uint16
 }
 
 func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history *urltest.HistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+	// The target is resolved once for the whole batch. An unusable one means there is nothing to
+	// measure, so the batch reports no results rather than failing every node individually.
+	scope, scopeErr := urltest.NewMeasurementScope(link, nil)
+	if scopeErr != nil {
+		logger.Error("invalid URL test target: ", scopeErr)
+		return map[string]uint16{}
+	}
+	link = scope.URL
 	testBatch := &urlTestBatch{
 		ctx:      ctx,
 		outbound: outboundManager,
 		history:  history,
 		logger:   logger,
+		scope:    scope,
 		batch:    b,
 		checked:  make(map[string]bool),
 		result:   make(map[string]uint16),
@@ -425,7 +478,7 @@ func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManag
 	testBatch.test(outbounds, link, interval, force)
 	b.Wait()
 	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
+		groupHistory := history.LoadURLTestHistoryFor(RealTag(outboundGroup, N.NetworkTCP), scope)
 		if groupHistory != nil {
 			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
 		}
@@ -458,7 +511,9 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				return member
 			})), link, interval, force)
 		default:
-			history := b.history.LoadURLTestHistory(tag)
+			// The freshness check is scoped: a result against a DIFFERENT target says nothing
+			// about this one, so it must not cause this test to be skipped.
+			history := b.history.LoadURLTestHistoryFor(tag, b.scope)
 			if !force && history != nil && time.Since(history.Time) < interval {
 				continue
 			}
@@ -466,37 +521,138 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 			b.batch.Go(tag, func() (any, error) {
 				testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
 				defer cancel()
-				testChan := make(chan urlTestResult, 1)
-				go func() {
-					delay, testErr := urltest.URLTest(testCtx, link, detour)
-					testChan <- urlTestResult{delay, testErr}
-				}()
-				var testResult urlTestResult
-				select {
-				case testResult = <-testChan:
-				case <-testCtx.Done():
-					testResult.err = testCtx.Err()
-				}
-				if testResult.err != nil {
+
+				// Called directly. batch.Go is already running this on its own goroutine, and
+				// Measure honours the context, so the previous goroutine-plus-channel-plus-select
+				// added nothing but a second race: when the context expired while the result was
+				// also ready, Go picked between the two cases at random and the measurement's
+				// outcome became non-deterministic.
+				measurement, testErr := urltest.Measure(testCtx, urltest.MeasureOptions{Link: link}, detour)
+				if testErr != nil {
 					if b.ctx.Err() != nil {
 						return nil, nil
 					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
+					b.logger.Debug("outbound ", tag, " unavailable: ", testErr)
+					// Only this target's result is removed.
+					b.history.DeleteURLTestHistoryFor(tag, b.scope)
 				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+					b.logger.Debug("outbound ", tag, " available: ", measurement.Delay, "ms")
+					// The scope comes from the measurement itself, so the key cannot disagree
+					// with what was actually requested.
+					b.history.StoreURLTestHistoryFor(tag, measurement.Scope, &adapter.URLTestHistory{
 						Time:  time.Now(),
-						Delay: testResult.delay,
+						Delay: measurement.Delay,
 					})
 					b.access.Lock()
-					b.result[tag] = testResult.delay
+					b.result[tag] = measurement.Delay
 					b.access.Unlock()
 				}
 				return nil, nil
 			})
 		}
 	}
+}
+
+// invalidateSelected drops a node that just failed a real connection.
+//
+// # Why a measurement is not enough on its own
+//
+// History records how a node behaved when tested. A node can pass every test and still fail to
+// carry traffic - the endpoint moved, the credentials were revoked, a middlebox started dropping
+// the flow - and a selection that keeps pointing at it makes every subsequent connection fail
+// until the next interval.
+//
+// # Why the comparison
+//
+// The current selection is re-read under the lock and compared: a concurrent update may already
+// have replaced this outbound, and clearing the newer choice would undo that work.
+//
+// # Why only a TCP failure discards the measurement
+//
+// A delay measurement dials over TCP - URLTest establishes a TCP path through the outbound and
+// speaks HTTP over it. The stored value is therefore a statement about the TCP path, and it
+// remains true after a UDP failure. Discarding it because UDP failed would throw away correct
+// information and, because TCP and UDP selection read the same entry, would move the TCP
+// selection as a side effect of a UDP problem.
+//
+// So a UDP failure clears only the UDP selection: the group picks another node for UDP traffic
+// immediately, while the TCP-path measurement stays available for the next selection round. A TCP
+// failure is evidence about the path the measurement describes, so it discards the measurement.
+//
+// The result is published as one generation and the normal update check runs, which re-selects
+// from whatever scoped history remains.
+func (g *URLTestGroup) invalidateSelected(network string, failed adapter.Outbound) {
+	if failed == nil {
+		return
+	}
+	realTag := RealTag(failed, network)
+
+	g.updateAccess.Lock()
+	previous := g.selected.Load()
+	next := &selectedState{}
+	if previous != nil {
+		next.tcp = previous.tcp
+		next.udp = previous.udp
+	}
+
+	cleared := false
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		if next.tcp == failed {
+			next.tcp = nil
+			cleared = true
+		}
+	case N.NetworkUDP:
+		if next.udp == failed {
+			next.udp = nil
+			cleared = true
+		}
+	}
+	if cleared {
+		g.selected.Store(next)
+	}
+	g.updateAccess.Unlock()
+
+	// Only this target's result is invalidated, and only when the failure is evidence about the
+	// path the measurement describes. Another target's measurement of the same node is a
+	// different observation and remains valid either way.
+	if N.NetworkName(network) == N.NetworkTCP {
+		g.history.DeleteURLTestHistoryFor(realTag, g.scope)
+	}
+
+	if cleared {
+		// Try to pick a replacement immediately rather than leaving the group without a selection
+		// until the next interval.
+		g.performUpdateCheck()
+	}
+}
+
+// clearSelected is invalidateSelected without the re-selection, so the cleared generation can be
+// observed on its own. It exists because the two effects are separate concerns: which fields the
+// invalidation clears is a rule, and which node selection then settles on is a policy.
+func (g *URLTestGroup) clearSelected(network string, failed adapter.Outbound) {
+	if failed == nil {
+		return
+	}
+	g.updateAccess.Lock()
+	defer g.updateAccess.Unlock()
+
+	previous := g.selected.Load()
+	if previous == nil {
+		return
+	}
+	next := &selectedState{tcp: previous.tcp, udp: previous.udp}
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		if next.tcp == failed {
+			next.tcp = nil
+		}
+	case N.NetworkUDP:
+		if next.udp == failed {
+			next.udp = nil
+		}
+	}
+	g.selected.Store(next)
 }
 
 func (g *URLTestGroup) performUpdateCheck() {
@@ -506,20 +662,33 @@ func (g *URLTestGroup) performUpdateCheck() {
 		updated  bool
 		selected bool
 	)
-	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (g.selectedOutboundTCP == nil || (exists && outbound != g.selectedOutboundTCP)) {
-		if g.selectedOutboundTCP != nil {
+
+	// The previous generation is read once and the next is built from it, so TCP and UDP are
+	// published together. Assigning each field separately would let a reader observe one updated
+	// network and one stale one.
+	previous := g.selected.Load()
+	next := &selectedState{}
+	if previous != nil {
+		next.tcp = previous.tcp
+		next.udp = previous.udp
+	}
+
+	if outbound, exists := g.Select(N.NetworkTCP); outbound != nil && (next.tcp == nil || (exists && outbound != next.tcp)) {
+		if next.tcp != nil {
 			updated = true
 		}
-		g.selectedOutboundTCP = outbound
+		next.tcp = outbound
 		selected = true
 	}
-	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (g.selectedOutboundUDP == nil || (exists && outbound != g.selectedOutboundUDP)) {
-		if g.selectedOutboundUDP != nil {
+	if outbound, exists := g.Select(N.NetworkUDP); outbound != nil && (next.udp == nil || (exists && outbound != next.udp)) {
+		if next.udp != nil {
 			updated = true
 		}
-		g.selectedOutboundUDP = outbound
+		next.udp = outbound
 		selected = true
 	}
+
+	g.selected.Store(next)
 	if updated {
 		g.interruptGroup.Interrupt(g.interruptExternalConnections)
 	}

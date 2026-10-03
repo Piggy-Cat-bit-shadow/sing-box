@@ -187,30 +187,6 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	render.NoContent(w, r)
 }
 
-func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapter.OutboundGroup, tag string, visited map[string]bool) bool {
-	for _, memberTag := range outboundGroup.All() {
-		if memberTag == tag {
-			return true
-		}
-		member, loaded := outboundManager.Outbound(memberTag)
-		if !loaded {
-			continue
-		}
-		if group.RealTag(member, N.NetworkTCP) == tag {
-			return true
-		}
-		memberGroup, isGroup := member.(adapter.OutboundGroup)
-		if !isGroup || visited[memberTag] {
-			continue
-		}
-		visited[memberTag] = true
-		if groupContains(outboundManager, memberGroup, tag, visited) {
-			return true
-		}
-	}
-	return false
-}
-
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -231,32 +207,45 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
+		// `expected` restricts which HTTP status counts as a successful measurement, using the
+		// Mihomo syntax (204, 200-299, 200/204/301-399, *, or empty for no constraint).
+		// A malformed expression is the caller's error, so it is refused here rather than being
+		// silently ignored and producing a measurement against the wrong acceptance rule.
+		expected, err := urltest.ParseExpectedStatus(query.Get("expected"))
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
+
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
 		defer cancel()
 
-		delay, err := urltest.URLTest(ctx, url, proxy)
-		defer func() {
-			realTag := group.RealTag(proxy, N.NetworkTCP)
-			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistory(realTag)
-			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: delay,
-				})
-			}
-			for _, detour := range server.outbound.Outbounds() {
-				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
-				if !isURLTestGroup {
-					continue
-				}
-				if !groupContains(server.outbound, urlTestGroup, realTag, map[string]bool{detour.Tag(): true}) {
-					continue
-				}
-				urlTestGroup.PerformUpdateCheck()
-			}
-		}()
+		measurement, measureErr := urltest.Measure(ctx, urltest.MeasureOptions{
+			Link:           url,
+			ExpectedStatus: expected,
+		}, proxy)
+
+		// This records the outcome of THIS request and nothing else.
+		//
+		// It previously walked every URLTest group containing this node and forced an immediate
+		// re-selection. That coupled a manual probe of one node against one target to the
+		// selection of unrelated groups: a measurement taken for a diagnostic could move live
+		// traffic, and a group measuring a different target would re-select from a result that
+		// was never about its target. A group maintains its own selection from its own periodic
+		// checks, and when this probe happens to use the same target, the scoped result is simply
+		// available to the group's next check.
+		realTag := group.RealTag(proxy, N.NetworkTCP)
+		if measureErr != nil {
+			server.urlTestHistory.DeleteURLTestHistoryFor(realTag, measurement.Scope)
+		} else {
+			server.urlTestHistory.StoreURLTestHistoryFor(realTag, measurement.Scope, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: measurement.Delay,
+			})
+		}
+		delay, err := measurement.Delay, measureErr
 
 		if ctx.Err() != nil {
 			render.Status(r, http.StatusGatewayTimeout)

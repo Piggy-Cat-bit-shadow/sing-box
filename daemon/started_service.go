@@ -750,13 +750,15 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 		go group.URLTestOutbounds(boxService.ctx, boxService.outboundManager, historyStorage, boxService.logFactory.Logger(), outbounds, "", 0, true)
 	} else {
 		go func() {
-			t, err := urltest.URLTest(boxService.ctx, "", outbound)
+			// The measurement reports its own scope, so the history key cannot disagree with the
+			// target that was actually requested.
+			measurement, err := urltest.Measure(boxService.ctx, urltest.MeasureOptions{}, outbound)
 			if err != nil {
-				historyStorage.DeleteURLTestHistory(outboundTag)
+				historyStorage.DeleteURLTestHistoryFor(outboundTag, measurement.Scope)
 			} else {
-				historyStorage.StoreURLTestHistory(outboundTag, &adapter.URLTestHistory{
+				historyStorage.StoreURLTestHistoryFor(outboundTag, measurement.Scope, &adapter.URLTestHistory{
 					Time:  time.Now(),
-					Delay: t,
+					Delay: measurement.Delay,
 				})
 			}
 		}()
