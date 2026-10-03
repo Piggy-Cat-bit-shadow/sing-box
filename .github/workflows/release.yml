@@ -23,10 +23,9 @@ name: Release
 # fails if either is not a success, which keeps "released" and "green" the same
 # statement.
 
+# Tag creation does not publish automatically.
+# Release is explicitly dispatched by the maintainer.
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:

@@ -19,7 +19,7 @@ name: macOS arm64
 #
 # # Quick path vs deep checks
 #
-# A push to `testing` runs the fast path above plus the core unit tests under the
+# A manual dispatch runs the fast path above plus the core unit tests under the
 # canonical tags.
 #
 # Behind the manual `deep_checks` input:
@@ -53,20 +53,15 @@ name: macOS arm64
 #
 # # Triggers
 #
-# push to testing, plus manual dispatch. Documentation-only changes are ignored so
-# a README edit does not rebuild a kernel. `paths-ignore` is used rather than a
-# `paths` allowlist so a new source directory added later still triggers the build.
+# Manual dispatch only. A normal commit or push does not run this workflow, so no
+# path filter is needed and none is applied: when this is dispatched, it runs.
 
+# Manual only.
+#
+# Normal development commits and pushes intentionally do not consume GitHub
+# Actions runner time. Run this workflow explicitly after a batch of development
+# changes is ready for validation.
 on:
-  push:
-    branches:
-      - testing
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.editorconfig'
   workflow_dispatch:
     inputs:
       deep_checks:

@@ -4,7 +4,7 @@ name: Linux amd64
 #
 # # What this workflow is for
 #
-# One job, one build, one artifact: `sing-box-linux-amd64`. A push to `testing` must
+# One job, one build, one artifact: `sing-box-linux-amd64`. A manual dispatch must
 # mean "build the Linux kernel", not "run a protocol laboratory for a quarter of an
 # hour and build a kernel at the end of it".
 #
@@ -67,20 +67,15 @@ name: Linux amd64
 #
 # # Triggers
 #
-# push to testing, plus manual dispatch. Documentation-only changes are ignored.
-# `paths-ignore` is used rather than a `paths` allowlist so a new source directory
-# still triggers a build.
+# Manual dispatch only. A normal commit or push does not run this workflow, so no
+# path filter is needed and none is applied: when this is dispatched, it runs.
 
+# Manual only.
+#
+# Normal development commits and pushes intentionally do not consume GitHub
+# Actions runner time. Run this workflow explicitly after a batch of development
+# changes is ready for validation.
 on:
-  push:
-    branches:
-      - testing
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.gitignore'
-      - '.editorconfig'
   workflow_dispatch:
     inputs:
       deep_checks:
