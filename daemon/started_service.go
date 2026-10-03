@@ -611,8 +611,20 @@ func (s *StartedService) readGroups() *Groups {
 			}
 		}
 
+		// A URLTest group's members are shown with the delay the GROUP measured.
+		//
+		// The group selects from its own URL-and-status scope, so showing a member's process-wide
+		// display value would describe the node with a number the selection never used - a UI
+		// reporting 30ms while the group chose on 80ms, or the reverse. Every other group has no
+		// scope of its own and keeps reading the display layer.
+		var groupScope *urltest.MeasurementScope
+		if urlTestGroup, isURLTestGroup := iGroup.(*group.URLTest); isURLTestGroup {
+			scope := urlTestGroup.MeasurementScope()
+			groupScope = &scope
+		}
+
 		for _, itemTag := range iGroup.All() {
-			itemOutbound, isLoaded := boxService.outboundManager.Outbound(itemTag)
+			itemOutbound, isLoaded := resolveURLTestTarget(boxService, itemTag)
 			if !isLoaded {
 				continue
 			}
@@ -620,7 +632,15 @@ func (s *StartedService) readGroups() *Groups {
 			var item GroupItem
 			item.Tag = itemTag
 			item.Type = itemOutbound.Type()
-			if history := historyStorage.LoadURLTestHistory(group.RealTag(itemOutbound, N.NetworkTCP)); history != nil {
+
+			var history *adapter.URLTestHistory
+			realTag := group.RealTag(itemOutbound, N.NetworkTCP)
+			if groupScope != nil {
+				history = historyStorage.LoadURLTestHistoryFor(realTag, *groupScope)
+			} else {
+				history = historyStorage.LoadURLTestHistory(realTag)
+			}
+			if history != nil {
 				item.UrlTestTime = history.Time.Unix()
 				item.UrlTestDelay = int32(history.Delay)
 			}
@@ -733,7 +753,13 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	boxService := s.instance
 	s.serviceAccess.RUnlock()
 	outboundTag := request.OutboundTag
-	outbound, isLoaded := boxService.outboundManager.Outbound(outboundTag)
+
+	// A URLTest target may be an outbound OR an endpoint.
+	//
+	// Endpoints are listed alongside outbounds in the UI, so a node the user can see must be one
+	// they can measure. This resolver is deliberately local to URLTest: other APIs keep their
+	// outbound-only meaning, which is a separate question from what may be measured.
+	outbound, isLoaded := resolveURLTestTarget(boxService, outboundTag)
 	if !isLoaded {
 		return nil, status.Error(codes.NotFound, "outbound not found: "+outboundTag)
 	}
@@ -772,6 +798,25 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 		}()
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// resolveURLTestTarget finds a node that can be measured, by outbound tag or endpoint tag.
+//
+// Outbounds win a tag collision, so every name that resolved before still resolves to the same
+// node.
+func resolveURLTestTarget(instance *Instance, tag string) (adapter.Outbound, bool) {
+	if instance == nil {
+		return nil, false
+	}
+	if outbound, loaded := instance.outboundManager.Outbound(tag); loaded {
+		return outbound, true
+	}
+	if instance.endpointManager != nil {
+		if endpoint, loaded := instance.endpointManager.Get(tag); loaded {
+			return endpoint, true
+		}
+	}
+	return nil, false
 }
 
 func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutboundRequest) (*emptypb.Empty, error) {

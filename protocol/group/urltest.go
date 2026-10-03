@@ -388,6 +388,15 @@ func (g *URLTestGroup) PostStart() {
 	go g.CheckOutbounds(g.ctx, false)
 }
 
+// MeasurementScope reports the target and status set this group measures against.
+//
+// It is read-only and exists so a display layer can read the group's OWN health evidence rather
+// than the process-wide display history. Selecting a member from one measurement and showing
+// another's delay is how a UI ends up contradicting the selection it is describing.
+func (s *URLTest) MeasurementScope() urltest.MeasurementScope {
+	return s.group.scope
+}
+
 // backgroundContext reports the context this group's background work runs on.
 //
 // It exists so a test can assert that Close cancels in-flight work, rather than inferring it from

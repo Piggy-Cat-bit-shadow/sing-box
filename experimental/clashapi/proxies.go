@@ -45,7 +45,25 @@ func findProxyByName(server *Server) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			name := r.Context().Value(CtxKeyProxyName).(string)
+
+			// Outbounds first, then endpoints.
+			//
+			// Endpoints are listed alongside outbounds in /proxies, so a client that sees one
+			// there must be able to measure it. Looking only at the outbound manager made every
+			// endpoint visible but unmeasurable: the delay request answered 404 for a node the
+			// same API had just advertised.
+			//
+			// An endpoint satisfies adapter.Outbound, so it can be measured directly. An outbound
+			// wins a tag collision, which keeps the existing resolution order for every name that
+			// resolved before.
 			proxy, exist := server.outbound.Outbound(name)
+			if !exist {
+				if server.endpoint != nil {
+					if endpoint, endpointExists := server.endpoint.Get(name); endpointExists {
+						proxy, exist = endpoint, true
+					}
+				}
+			}
 			if !exist {
 				render.Status(r, http.StatusNotFound)
 				render.JSON(w, r, ErrNotFound)
