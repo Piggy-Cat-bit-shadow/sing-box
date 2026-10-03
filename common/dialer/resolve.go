@@ -42,6 +42,18 @@ type resolveDialer struct {
 	initErr       error
 	queryOptions  adapter.DNSQueryOptions
 	fallbackDelay time.Duration
+
+	// effectiveStrategy is the family policy that actually applies, resolved ONCE from the router.
+	//
+	// queryOptions.Strategy is what the CALLER said, and AsIS means "use the resolver's default" -
+	// which only the router knows. Every decision in this package that depends on family policy
+	// must use this value, not the raw one, or a strict policy can be walked around by whichever
+	// layer happens to read the caller's literal AsIS.
+	//
+	// It is resolved lazily by effectiveFamilyStrategy so a nil or non-reporting router degrades to
+	// the caller's value rather than to an arbitrary one.
+	effectiveStrategy     C.DomainStrategy
+	effectiveStrategyOnce sync.Once
 }
 
 func NewResolveDialer(ctx context.Context, dialer N.Dialer, parallel bool, server string, queryOptions adapter.DNSQueryOptions, fallbackDelay time.Duration) ResolveDialer {
@@ -148,7 +160,9 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 // working rather than requiring them to implement a new interface.
 func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	lookupCtx := log.ContextWithOverrideLevel(ctx, log.LevelDebug)
-	strategy := d.queryOptions.Strategy
+	// The EFFECTIVE strategy: AsIS means "the resolver's default", and planning with the raw
+	// value would discard the preference the resolver applied.
+	strategy := d.effectiveFamilyStrategy()
 
 	dualStackRouter, supportsStreaming := d.router.(adapter.DNSDualStackRouter)
 	if !supportsStreaming {
@@ -437,6 +451,27 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 // One goroutine for the lookup, cancelled when the original succeeds. The recovered dial uses
 // the same bounded scheduler as every other racing path, so its losers are closed and its
 // winner is unique.
+// effectiveFamilyStrategy reports the family policy that actually applies to this dialer.
+//
+// AsIS means "the resolver's default". A router that can report it is asked once; anything else
+// keeps the caller's value, which is the safe degradation - a caller that said ipv4_only still
+// gets ipv4_only, and a caller that said AsIS with a router that cannot answer is treated as
+// having no family restriction rather than an invented one.
+func (d *resolveDialer) effectiveFamilyStrategy() C.DomainStrategy {
+	d.effectiveStrategyOnce.Do(func() {
+		strategy := d.queryOptions.Strategy
+		if strategy != C.DomainStrategyAsIS {
+			d.effectiveStrategy = strategy
+			return
+		}
+		if resolver, isResolver := d.router.(adapter.DNSStrategyResolver); isResolver && d.router != nil {
+			strategy = resolver.ResolveStrategy(d.queryOptions)
+		}
+		d.effectiveStrategy = strategy
+	})
+	return d.effectiveStrategy
+}
+
 func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	originalCtx, cancelOriginal := context.WithCancel(ctx)
 	defer cancelOriginal()
@@ -449,7 +484,8 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 	// attempt is dialled directly rather than through the planner - so without this check a
 	// literal IPv6 address would be dialled under ipv4_only, silently turning a strict policy
 	// into a suggestion. The original is preferred, not exempt.
-	originalAllowed := addressAllowedByStrategy(destination.Addr, d.queryOptions.Strategy)
+	// The EFFECTIVE strategy, not the caller's raw value. See effectiveFamilyStrategy.
+	originalAllowed := addressAllowedByStrategy(destination.Addr, d.effectiveFamilyStrategy())
 	if originalAllowed {
 		go func() {
 			conn, err := d.dialer.DialContext(originalCtx, network, destination)
@@ -458,7 +494,7 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 	} else {
 		// Nothing to dial for the original. Report the exclusion rather than hanging on a
 		// channel that will never receive.
-		original <- literalDialResult{err: E.New("destination ", destination.Addr, " excluded by strategy ", strategyName(d.queryOptions.Strategy))}
+		original <- literalDialResult{err: E.New("destination ", destination.Addr, " excluded by strategy ", strategyName(d.effectiveFamilyStrategy()))}
 	}
 
 	// Recovery runs concurrently. Its result channel is buffered and it always sends exactly
@@ -539,9 +575,19 @@ func (d *resolveDialer) dialRecoveredOrReport(ctx context.Context, network strin
 	if len(addresses) == 0 {
 		return nil, originalErr
 	}
-	strategy := d.queryOptions.Strategy
-	candidates := MergeOriginalDestination(destination.Addr, addresses, strategy)
-	conn, err := d.raceCandidates(ctx, network, destination, candidates, strategy)
+	// The EFFECTIVE strategy, and the original is merged only if that strategy admits it.
+	//
+	// Merging unconditionally re-introduced an address the policy had just excluded: with
+	// ipv4_only and an IPv6 original, MergeOriginalDestination put the IPv6 address back into the
+	// plan because it has its own rule for AsIS ("keep the caller's family first") and cannot tell
+	// that the effective policy already answered the question.
+	strategy := d.effectiveFamilyStrategy()
+	original := destination.Addr
+	if !addressAllowedByStrategy(original, strategy) {
+		original = netip.Addr{}
+	}
+	candidates := MergeOriginalDestination(original, addresses, strategy)
+	conn, err := d.raceCandidatesExcluding(ctx, network, destination, candidates, original, strategy)
 	if err != nil {
 		// Both the original endpoint and every recovered candidate failed. The original error
 		// is the more useful one to surface: it is the endpoint the application asked for.
@@ -635,7 +681,11 @@ func (d *resolveParallelNetworkDialer) DialParallelInterface(ctx context.Context
 		fallbackDelay = d.fallbackDelay
 	}
 	if d.parallel {
-		return DialParallelNetwork(ctx, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		// preferIPv6 comes from the EFFECTIVE strategy. Deriving it from the raw value made a
+		// router default of prefer_ipv6 invisible here, so the parallel dialler started with the
+		// IPv4 interface.
+		preferIPv6 := d.effectiveFamilyStrategy() == C.DomainStrategyPreferIPv6
+		return DialParallelNetwork(ctx, d.dialer, network, destination, addresses, preferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	} else {
 		return DialSerialNetwork(ctx, d.dialer, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	}
@@ -771,7 +821,7 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		strategy := d.queryOptions.Strategy
+		strategy := d.effectiveFamilyStrategy()
 		conn, err := d.raceCandidatesExcluding(raceCtx, network, destination, addresses, netip.Addr{}, strategy)
 		recoveredResult <- literalDialResult{conn: conn, err: err}
 	}()
