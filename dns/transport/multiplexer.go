@@ -388,7 +388,11 @@ func (m *queryMultiplexer) retrySerialOnce(ctx context.Context, message *mDNS.Ms
 // It reports created=true semantics for the retry: the connection cannot have come from the
 // idle pool, because the pool's idle list was cleared and the acquire below dials directly.
 func (m *queryMultiplexer) exchangeSingleFresh(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
-	conn, err := m.dialSerialConn(ctx)
+	// AcquireFresh rather than dialSerialConn: the retry must not be able to create a socket
+	// after the transport has been closed. A bare dial bypassed the pool's lifecycle, so a retry
+	// that started before Close could install a connection afterwards - leaving a socket alive
+	// inside a transport that was supposed to be shut.
+	conn, err := m.serial.AcquireFresh(ctx, m.dialSerialConn)
 	if err != nil {
 		callback(nil, err)
 		return

@@ -147,6 +147,49 @@ func (p *ConnPool[T]) Release(conn T, reuse bool) {
 	p.access.Unlock()
 }
 
+// AcquireFresh returns a connection that did NOT come from the pool and is owned outright by the
+// caller, who must close it.
+//
+// # Why this exists rather than a bare dial
+//
+// A stale-connection retry needs a genuinely new socket, so it cannot go through Acquire - but
+// dialling directly would bypass the pool's lifecycle entirely, and a retry that began before
+// Close could create a socket AFTER the transport was closed. Close is supposed to make the
+// transport unusable, so that socket would outlive the thing that owned it.
+//
+// The dial is performed under the pool's lock with the closed flag checked first, so a retry
+// racing Close either gets its connection before Close and is tracked, or is refused.
+func (p *ConnPool[T]) AcquireFresh(ctx context.Context, dial func(context.Context) (T, error)) (T, error) {
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		var zero T
+		return zero, net.ErrClosed
+	}
+	p.access.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		var zero T
+		return zero, err
+	}
+
+	// Dialed outside the lock so a slow dial does not block other queries, then re-checked: if
+	// Close ran while dialling, the new connection is closed here rather than being leaked.
+	conn, err := dial(ctx)
+	if err != nil {
+		return conn, err
+	}
+	p.access.Lock()
+	closed := p.closed
+	p.access.Unlock()
+	if closed {
+		p.options.Close(conn, net.ErrClosed)
+		var zero T
+		return zero, net.ErrClosed
+	}
+	return conn, nil
+}
+
 // SetKeepIdle reports whether released connections may be retained.
 //
 // Disabling it also drops what is already idle, because the two halves of the request are the

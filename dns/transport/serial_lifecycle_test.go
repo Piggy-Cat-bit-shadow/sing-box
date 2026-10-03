@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
+
+	"github.com/stretchr/testify/require"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -637,3 +640,65 @@ func TestSerialReuseSetKeepIdleConnectionsFalseReleases(t *testing.T) {
 }
 
 var _ = M.Socksaddr{}
+
+// TestSerialFreshRetryAfterCloseDoesNotDial is §49.
+//
+// A stale-connection retry dials a NEW socket. If it dialled directly it would bypass the pool's
+// lifecycle, so a retry that began before Close could install a connection after it - leaving a
+// live socket inside a transport that was supposed to be shut. AcquireFresh refuses once closed.
+func TestSerialFreshRetryAfterCloseDoesNotDial(t *testing.T) {
+	server := newScriptedDNSServer(t)
+	transport := newTestTCPTransport(t, server.listener)
+	forceSerial(transport)
+
+	// Establish the pool so a Close has something to close.
+	if err := testExchange(transport, "example.com."); err != nil {
+		t.Fatal("query: ", err)
+	}
+
+	pool := transport.multiplexer.serial
+
+	dialsBefore := server.connections()
+	require.NoError(t, transport.Close())
+
+	// A fresh acquisition after Close must be refused rather than dialling.
+	conn, err := pool.AcquireFresh(context.Background(), transport.multiplexer.dialSerialConn)
+	if err == nil {
+		conn.Close()
+		t.Fatal("AcquireFresh succeeded after Close; the transport is supposed to be unusable")
+	}
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected a closed error, got %v", err)
+	}
+
+	require.Equal(t, dialsBefore, server.connections(),
+		"no new socket may be dialled after Close")
+
+	// And the retry path itself must be guarded, not merely the accessor it happens to use: this
+	// is the call a stale-connection retry makes, and it must not dial once the pool is closed.
+	dialsBeforeRetry := server.connections()
+	callbackDone := make(chan struct{})
+	queryMessage := new(mDNS.Msg)
+	queryMessage.SetQuestion("example.com.", mDNS.TypeA)
+	transport.multiplexer.exchangeSingleFresh(context.Background(), queryMessage,
+		func(response *mDNS.Msg, err error) { close(callbackDone) })
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the retry never completed")
+	}
+
+	require.Equal(t, dialsBeforeRetry, server.connections(),
+		"a stale-connection retry must not dial a new socket after the transport was closed; "+
+			"the socket would outlive the transport that owned it")
+
+	// Close replaces the pool state with nil, so there is nothing left to track or keep; a
+	// non-nil state here would mean Close had not finished tearing the pool down.
+	pool.access.Lock()
+	state := pool.state
+	closed := pool.closed
+	pool.access.Unlock()
+
+	require.True(t, closed, "the pool must report itself closed")
+	require.Nil(t, state, "a closed pool must have released its state, tracking nothing and keeping nothing")
+}
