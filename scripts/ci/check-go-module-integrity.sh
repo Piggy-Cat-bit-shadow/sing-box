@@ -72,8 +72,16 @@ PARITY_MODULES=(test)
 # Fork modules that must be pinned identically wherever they are replaced.
 PARITY_REPLACES=(
     github.com/sagernet/sing
-    github.com/sagernet/cronet-go
     github.com/sagernet/quic-go
+)
+# Module path PREFIXES whose every replaced path must be pinned identically.
+#
+# cronet-go is a tree of modules rather than one: the repository publishes `all` and each
+# `lib/<os>_<arch>` separately, and a nested module does not inherit the root module's replace. A list
+# would have to name thirty-one paths and would drift the first time upstream adds a platform, so the
+# rule is the prefix.
+PARITY_REPLACE_PREFIXES=(
+    github.com/sagernet/cronet-go
 )
 EXCLUDES=()
 REQUIRE_CHECKED=()
@@ -283,7 +291,16 @@ for module in "${PARITY_MODULES[@]}"; do
         fail "parity module '$module' has no go.mod"
         continue
     fi
-    for replaced in "${PARITY_REPLACES[@]}"; do
+    # Every replace under a prefix, discovered from the root module rather than listed here.
+    prefix_replaces=()
+    for prefix in "${PARITY_REPLACE_PREFIXES[@]}"; do
+        while read -r replaced; do
+            [ -n "$replaced" ] && prefix_replaces+=("$replaced")
+        done < <(awk -v prefix="$prefix" '$1 == "replace" && index($2, prefix) == 1 { print $2 }' "$REPO_ROOT/go.mod")
+    done
+
+    for replaced in "${PARITY_REPLACES[@]}" "${prefix_replaces[@]:-}"; do
+        [ -n "$replaced" ] || continue
         root_target="$(replace_target "$REPO_ROOT/go.mod" "$replaced" || true)"
         sub_target="$(replace_target "$REPO_ROOT/$module/go.mod" "$replaced" || true)"
 
