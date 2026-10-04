@@ -3,6 +3,7 @@ package trafficsched
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -258,6 +259,11 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 		"blocked", "HIGH p95")
 
 	var phaseOneSamples []time.Duration
+	// phaseEstimates is the controller's own estimate at the end of each phase. The direction of a
+	// capacity change is the one property this prototype does have, so it is asserted on the phase
+	// that measures it rather than on the last phase, whose value depends on what the resumed bulk
+	// traffic did to the controller afterwards.
+	phaseEstimates := make([]float64, 0, len(phases))
 	paused := false
 	for index, phase := range phases {
 		if phase.idle && !paused {
@@ -277,7 +283,40 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 		bulkAtStart := acceptedTotal(bulkConns)
 		deliveredAtStart, _, _ := shared.snapshot()
 
+		// Sample the controller's estimate ACROSS the phase rather than reading it once at the end.
+		//
+		// A single end-of-phase reading is wherever the AIMD sawtooth happened to be. Across four
+		// consecutive runs of this test, the end-of-phase estimate during the 1.0 MB/s phase ranged
+		// from 0.88 to 1.80 MB/s and the value after the capacity doubled ranged from 1.17 to 3.09 -
+		// which is the same sawtooth, sampled at a different point. The mean is the statistic that
+		// describes where the controller SAT, and the direction claim is about that.
+		estimateSamples := make([]float64, 0, 64)
+		sampleStop := make(chan struct{})
+		sampleDone := make(chan struct{})
+		go func() {
+			defer close(sampleDone)
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-sampleStop:
+					return
+				case <-ticker.C:
+					estimateSamples = append(estimateSamples, float64(rate.Rate()))
+				}
+			}
+		}()
 		time.Sleep(phase.length)
+		close(sampleStop)
+		<-sampleDone
+		meanEstimate := 0.0
+		for _, sample := range estimateSamples {
+			meanEstimate += sample
+		}
+		if len(estimateSamples) > 0 {
+			meanEstimate /= float64(len(estimateSamples))
+		}
+		phaseEstimates = append(phaseEstimates, meanEstimate)
 
 		bulkBytes := acceptedTotal(bulkConns) - bulkAtStart
 		delivered, _, _ := shared.snapshot()
@@ -285,18 +324,17 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 		if index == 0 {
 			phaseOneSamples = highConn.snapshot()
 		}
+
 		t.Logf("%-32s %10.2f %10.2f %10.2f %10.2f %8.0f%% %9s",
 			phase.label,
 			phase.capacity/1_000_000,
-			float64(rate.Rate())/1_000_000,
+			meanEstimate/1_000_000,
 			float64(bulkBytes)/phase.length.Seconds()/1_000_000,
 			float64(delivered-deliveredAtStart)/phase.length.Seconds()/1_000_000,
 			100*rate.blockedFraction(),
 			p95(highConn.snapshot()).Round(100*time.Microsecond),
 		)
 	}
-
-	afterRise := float64(rate.Rate())
 
 	// The oracle comparison. A fixed rate that already knows the capacity is the bar a learned one
 	// has to clear, and running it on the same scheduler through the same seam is also the proof
@@ -345,9 +383,25 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 
 	// Direction following is the least a controller must do: after the capacity dropped it came
 	// down, and after the capacity rose it went back up. That part works.
-	require.Greater(t, afterRise, 1_000_000.0,
+	//
+	// The comparison is against the DROPPED phase's own estimate rather than against a fixed number,
+	// because the claim is "it climbed back" and not "it ended above one particular value". A fixed
+	// threshold also sits within a few percent of where the controller settles when the capacity is
+	// low, which made this assertion depend on how loaded the host was: it passed at 1.09 against a
+	// threshold of 1.00 and failed at 0.99 in a busier run, for a property that held in both.
+	require.Greater(t, phaseEstimates[2], phaseEstimates[1]*1.3,
 		"the learned rate must climb back after the capacity rises rather than staying at the "+
-			"dropped capacity")
+			"dropped capacity (dropped phase ended at %.2f MB/s, risen phase at %.2f MB/s)",
+		phaseEstimates[1]/1_000_000, phaseEstimates[2]/1_000_000)
+	require.Greater(t, phaseEstimates[1], phaseEstimates[0]*0.4,
+		"and the drop must not be an artefact of the controller collapsing to nothing "+
+			"(%.2f MB/s against %.2f MB/s before the drop)",
+		phaseEstimates[1]/1_000_000, phaseEstimates[0]/1_000_000)
+	for index, estimate := range phaseEstimates {
+		require.Positive(t, estimate, "phase %d produced a non-positive rate estimate", index)
+		require.False(t, math.IsNaN(estimate) || math.IsInf(estimate, 0),
+			"phase %d produced a rate estimate that is not a number", index)
+	}
 
 	// What does NOT work, recorded rather than hidden. The prototype follows the DIRECTION of a
 	// capacity change, which is the part that works. It does not deliver the latency, because the
