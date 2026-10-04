@@ -18,14 +18,18 @@ publish="./scripts/publish-apple-beta.sh"
 pass=0
 fail=0
 
+# Output is captured rather than discarded, so a failure in CI reports WHY. A suite that prints
+# only "FAIL" forces the next reader to reproduce the whole run to learn anything.
 check() {
   local name="$1"
   shift
-  if "$@" >/dev/null 2>&1; then
+  local output
+  if output="$("$@" 2>&1)"; then
     echo "  PASS: $name"
     pass=$((pass + 1))
   else
     echo "  FAIL: $name" >&2
+    [ -n "$output" ] && echo "$output" | sed 's/^/        /' >&2
     fail=$((fail + 1))
   fi
 }
