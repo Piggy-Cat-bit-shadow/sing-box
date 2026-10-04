@@ -161,6 +161,11 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 	if testing.Short() {
 		t.Skip("adaptive prototype evaluation runs for tens of seconds")
 	}
+	if raceEnabled {
+		t.Skip("the oracle comparison is a ratio of two SHORT timing windows; under -race the host " +
+			"is not representative and the ratio is not evidence. The rate-source seam itself is " +
+			"covered under race by TestRateSourceObservationSeam")
+	}
 
 	const (
 		window    = 64 * 1024

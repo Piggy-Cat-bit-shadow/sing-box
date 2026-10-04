@@ -711,3 +711,57 @@ func TestReleaseAllDoesNotShutTheSchedulerDown(t *testing.T) {
 	require.NoError(t, parked.Close())
 	require.NoError(t, fresh.Close())
 }
+
+// TestRateSourceObservationSeam covers the seam a learning controller uses, without any timing.
+//
+// It always runs, including under the race detector, because the properties it checks are exactly
+// the ones the detector can break: the observer is read from the same holder the rate came from, it
+// is only consulted when one is installed, and replacing the source stops the old one being
+// consulted. What it deliberately does NOT check is whether any particular control law is a good
+// idea - see adaptive_research_test.go for that, and for why it is not shipped.
+func TestRateSourceObservationSeam(t *testing.T) {
+	observer := &countingRateSource{rate: 1 << 30}
+	scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: observer})
+	defer scheduler.Close()
+	require.True(t, scheduler.observing.Load())
+
+	flow := scheduler.NewFlow(trafficclass.ClassDefault)
+	for index := 0; index < 16; index++ {
+		start := flow.observeWriteStart()
+		require.False(t, start.IsZero(), "an installed observer must be timed")
+		flow.observeWrite(start, 4096)
+	}
+	require.EqualValues(t, 16, observer.count.Load())
+	require.EqualValues(t, 16*4096, observer.bytes.Load())
+
+	// Replacing the source must stop the old one from being consulted: a controller that is being
+	// replaced cannot be observed and consulted as two different objects.
+	plain := NewFixedRate(1 << 20)
+	scheduler.SetRateSource(plain)
+	require.False(t, scheduler.observing.Load())
+	require.Zero(t, flow.observeWriteStart().Nanosecond(), "no observer, no clock read")
+	flow.observeWrite(time.Now(), 4096)
+	require.EqualValues(t, 16, observer.count.Load(), "the replaced observer must not be called")
+	require.EqualValues(t, 1<<20, scheduler.Rate())
+
+	// And with the shaping switched off altogether, a write is admitted without touching the queue.
+	scheduler.SetRateSource(nil)
+	require.True(t, scheduler.inert())
+	require.NoError(t, flow.wait(1<<20))
+	require.Zero(t, flow.Grants())
+	flow.done()
+}
+
+// countingRateSource is a rate source that also observes, which is the shape a learned rate has.
+type countingRateSource struct {
+	rate  int64
+	count atomic.Int64
+	bytes atomic.Int64
+}
+
+func (c *countingRateSource) Rate() int64 { return c.rate }
+
+func (c *countingRateSource) ObserveWrite(size int, _ time.Duration, _ bool) {
+	c.count.Add(1)
+	c.bytes.Add(int64(size))
+}

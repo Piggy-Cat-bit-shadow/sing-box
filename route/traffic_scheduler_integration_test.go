@@ -448,3 +448,27 @@ func TestNetworkTransitionReleasesAFlowParkedInTheShaper(t *testing.T) {
 
 	require.NoError(t, manager.Close())
 }
+
+// TestBoxWiresTheConfiguredRateIntoTheScheduler reads box.go, because the wiring cannot be exercised
+// behaviourally from here.
+//
+// The route package cannot import the root package (it would be a cycle), so the four lines in
+// box.New that read route.traffic_scheduler and call SetUploadRate have no behavioural test. A
+// source guard is weaker than a behavioural one, and it is stronger than leaving the one link in the
+// chain untested: the option decodes, the scheduler shapes, and this is what joins them.
+func TestBoxWiresTheConfiguredRateIntoTheScheduler(t *testing.T) {
+	source := readRouteSource(t, "../box.go")
+
+	require.Contains(t, source, "routeOptions.TrafficScheduler",
+		"box.New must read the scheduler options from the route section")
+	require.Contains(t, source, "connectionManager.SetUploadRate(",
+		"and must install the configured rate into the connection manager's scheduler")
+	require.Contains(t, source, ".UploadRate.Build()",
+		"passing the parsed rate rather than the options value, so the unit handling stays in one "+
+			"place")
+
+	// The option is a pointer, so absent and present-but-empty are both handled by the same branch;
+	// a caller that forgot to check for nil would panic on every configuration that omits it.
+	require.Contains(t, source, "trafficScheduler := routeOptions.TrafficScheduler; trafficScheduler != nil",
+		"and must not dereference an absent section")
+}
