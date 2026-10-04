@@ -94,11 +94,21 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		info.Put("history", []*adapter.URLTestHistory{})
 	}
 	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
-		var now string
-		if selected := group.Selected(N.NetworkTCP); selected != nil {
-			now = selected.Tag()
+		// A flow-aware group has no current member to report.
+		//
+		// Its member is a property of the flow, so Selected() answers "which member would
+		// the next flow take" - a question whose answer changes with every flow and is not
+		// the member any existing connection is using. Publishing that as `now` would tell
+		// the user every flow goes there, which is the opposite of what the group does. The
+		// field is omitted, as the reference implementation omits it for the same reason,
+		// while `all` and `type` still describe the group so a dashboard can list it.
+		if _, isFlowAware := group.(adapter.FlowAwareOutboundGroup); !isFlowAware {
+			var now string
+			if selected := group.Selected(N.NetworkTCP); selected != nil {
+				now = selected.Tag()
+			}
+			info.Put("now", now)
 		}
-		info.Put("now", now)
 		info.Put("all", group.All())
 	}
 	return &info

@@ -602,8 +602,14 @@ func (s *StartedService) readGroups() *Groups {
 		g.Tag = iGroup.Tag()
 		g.Type = iGroup.Type()
 		_, g.Selectable = iGroup.(*group.Selector)
-		if selected := iGroup.Selected(N.NetworkTCP); selected != nil {
-			g.Selected = selected.Tag()
+		// A flow-aware group has no selected member: each flow is given its own, so the
+		// honest value is none. The group's Type still identifies it, and its members are
+		// listed below, so a client can present it without being told a member it is not
+		// using.
+		if _, isFlowAware := iGroup.(adapter.FlowAwareOutboundGroup); !isFlowAware {
+			if selected := iGroup.Selected(N.NetworkTCP); selected != nil {
+				g.Selected = selected.Tag()
+			}
 		}
 		if boxService.cacheFile != nil {
 			if isExpand, loaded := boxService.cacheFile.LoadGroupExpand(g.Tag); loaded {
