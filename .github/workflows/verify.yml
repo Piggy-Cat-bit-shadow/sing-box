@@ -77,10 +77,16 @@ jobs:
         # decode a configuration, let the manager wire it, route through it and observe which
         # member served each flow. Scoped with -run so the test module's compile cost is the
         # only thing this adds to a push.
+        #
+        # The test module builds the whole box, so it is built with the SERVER profile here:
+        # that is the profile a Linux product ships, and the client profile would link the
+        # Naive outbound's cronet archive, which does not link on linux/amd64 at all - the
+        # limitation recorded in docs/RELEASE-CERTIFICATE.md, which this step would otherwise
+        # rediscover as a build failure every push. Nothing in this feature is tag-gated.
         run: |
           set -euo pipefail
           cd test
-          go test -tags "$(cat ../release/DEFAULT_BUILD_TAGS)" -count=1 -timeout 10m -run 'TestLoadBalance' .
+          go test -tags "$(cat ../release/DEFAULT_BUILD_TAGS_OTHERS)" -count=1 -timeout 10m -run 'TestLoadBalance' .
 
       - name: race on the fork's own data paths
         # Bounded to the packages the fork actually changed. The artifact workflows own the full race
