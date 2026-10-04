@@ -160,6 +160,12 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		metadata.RouteRule = selectedRule.String()
 	}
 	metadata.RouteOutbound = selectedOutbound.Tag()
+	// Resolve the class BEFORE the chain is published.
+	//
+	// Ordering is the contract: trackers and the connection manager are handed this metadata
+	// immediately below, so the class has to be final by then. Resolving afterwards would leave
+	// every consumer of OutboundChain looking at an unclassified flow.
+	metadata.TrafficClass = resolveTrafficClass(chain, r.trafficClassPolicies)
 	metadata.OutboundChain = chain
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -368,6 +374,12 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		metadata.RouteRule = selectedRule.String()
 	}
 	metadata.RouteOutbound = selectedOutbound.Tag()
+	// Resolve the class BEFORE the chain is published.
+	//
+	// Ordering is the contract: trackers and the connection manager are handed this metadata
+	// immediately below, so the class has to be final by then. Resolving afterwards would leave
+	// every consumer of OutboundChain looking at an unclassified flow.
+	metadata.TrafficClass = resolveTrafficClass(chain, r.trafficClassPolicies)
 	metadata.OutboundChain = chain
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedPacketConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
@@ -809,6 +821,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	} else if metadata.Destination != packetDestination {
 		result.Destination = metadata.Destination.AddrPort()
 	}
+	metadata.TrafficClass = resolveTrafficClass(chain, r.trafficClassPolicies)
 	metadata.OutboundChain = chain
 	metadataCopy := *metadata
 	result.NewTracker = func() tun.FlowTracker {

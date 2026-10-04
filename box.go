@@ -442,6 +442,30 @@ func New(options Options) (*Box, error) {
 			return nil, E.Cause(err, "initialize outbound[", i, "]")
 		}
 	}
+
+	// Collect the explicit traffic classes before any flow is routed.
+	//
+	// The class is declared on the outbound envelope, where every outbound type shares it, so it is
+	// gathered here into a tag-keyed map rather than pushed into each outbound object. See
+	// route.TrafficClassPolicies for why the object itself must not carry it.
+	//
+	// Only outbounds that explicitly state a class appear. A configuration that never uses the
+	// field produces an empty map, and classification then rests entirely on tag matching - which
+	// is the mode a stock configuration runs in.
+	trafficClassPolicies := make(route.TrafficClassPolicies)
+	for i, outboundOptions := range options.Outbounds {
+		if outboundOptions.TrafficClass == nil {
+			continue
+		}
+		tag := outboundOptions.Tag
+		if tag == "" {
+			// Mirrors the fallback used when the outbound was created above, so a tagless entry
+			// resolves to the same name the router will see.
+			tag = F.ToString(i)
+		}
+		trafficClassPolicies[tag] = *outboundOptions.TrafficClass
+	}
+	router.SetTrafficClassPolicies(trafficClassPolicies)
 	for i, certificateProviderOptions := range options.CertificateProviders {
 		var tag string
 		if certificateProviderOptions.Tag != "" {

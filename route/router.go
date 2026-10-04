@@ -47,6 +47,10 @@ type Router struct {
 	pauseManager      pause.Manager
 	trackers          []adapter.ConnectionTracker
 	platformInterface adapter.PlatformInterface
+
+	// trafficClassPolicies holds the per-outbound explicit traffic class from the configuration.
+	// It is set once during box setup and only read at flow setup.
+	trafficClassPolicies TrafficClassPolicies
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -238,6 +242,14 @@ func (r *Router) Rules() []adapter.Rule {
 
 func (r *Router) AppendTracker(tracker adapter.ConnectionTracker) {
 	r.trackers = append(r.trackers, tracker)
+}
+
+// SetTrafficClassPolicies installs the per-outbound explicit traffic class from the configuration.
+//
+// Called once during box setup, before any flow is routed. A router that was never given policies
+// still classifies by tag, because automatic detection needs no configuration.
+func (r *Router) SetTrafficClassPolicies(policies TrafficClassPolicies) {
+	r.trafficClassPolicies = policies
 }
 
 func (r *Router) NeedFindProcess() bool {

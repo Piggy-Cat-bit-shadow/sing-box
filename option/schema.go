@@ -61,6 +61,11 @@ func prependTypeTag(variant *schema.Node, typeName string, withTag bool) error {
 	newProperties.Put("type", schema.StringConst(typeName))
 	if withTag {
 		newProperties.Put("tag", schema.StringNode())
+		// TrafficClass rides the polymorphic base, exactly as type and tag do, because it is
+		// declared on the shared envelope and excluded from every concrete options type by the
+		// same compose step. Documenting it here keeps the generated schema matching what the
+		// decoder actually accepts.
+		newProperties.Put("traffic_class", schema.StringEnum("default", "interactive", "bulk", "realtime"))
 	}
 	for _, entry := range variant.Properties.Entries() {
 		newProperties.Put(entry.Key, entry.Value)

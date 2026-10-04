@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
+	"github.com/sagernet/sing-box/common/trafficclass"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -85,6 +86,29 @@ type InboundContext struct {
 	RouteRule     string
 	RouteOutbound string
 	OutboundChain []Outbound
+
+	// TrafficClass is the resolved per-flow traffic class.
+	//
+	// # What it is
+	//
+	// Policy about what the flow is FOR, resolved once at route time from the logical outbound
+	// chain. It is deliberately not a protocol property: no protocol reads this field, and the
+	// component that acts on it is the generic copy layer.
+	//
+	// # Why it lives on the flow and not on the outbound
+	//
+	// The same leaf outbound serves several logical groups - a residential node reached through
+	// the AI selector and through a general selector is one object - so storing a class on the
+	// outbound would let one group's policy leak into the other. The class belongs to the FLOW,
+	// and this struct is the per-flow metadata.
+	//
+	// # Multiplex
+	//
+	// This field is deliberately NOT copied by ContextForMultiplexSession. A shared multiplex
+	// session carries many logical flows with different classes, so the session-level context
+	// stays transport-scoped; inheriting the first flow's class would mark the underlying tunnel
+	// permanently. See the test for that boundary.
+	TrafficClass trafficclass.Class
 
 	// sniffer
 

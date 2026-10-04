@@ -20,9 +20,32 @@ type OutboundOptionsRegistry interface {
 }
 
 type _Outbound struct {
-	Type    string `json:"type"`
-	Tag     string `json:"tag,omitempty"`
-	Options any    `json:"-"`
+	Type string `json:"type"`
+	Tag  string `json:"tag,omitempty"`
+	// TrafficClass is a fork extension, carried on the shared envelope rather than on
+	// SelectorOutboundOptions.
+	//
+	// # Why the envelope
+	//
+	// TrafficClass is not a selector property. Any outbound - a selector, a urltest group, a leaf
+	// protocol - may be given one, and the resolution walks the whole logical chain looking for
+	// the first explicit value. Putting the field on one options type would make it unavailable
+	// everywhere else and would tie a routing policy to a single protocol.
+	//
+	// # Why a pointer
+	//
+	// nil is "unset" and a non-nil value is an explicit choice, including an explicit "default".
+	// That distinction is what lets an operator stop automatic classification for one outbound.
+	// See TrafficClassPolicy.
+	//
+	// # Compatibility
+	//
+	// The field is omitted when unset, so a configuration that does not use it serialises exactly
+	// as before. A configuration that DOES use it is fork-only: official sing-box does not know
+	// this key. Nothing in this fork rewrites or injects it, so a configuration relying only on
+	// automatic tag detection remains loadable by the official client.
+	TrafficClass *TrafficClassPolicy `json:"traffic_class,omitempty"`
+	Options      any                 `json:"-"`
 }
 
 type Outbound _Outbound
