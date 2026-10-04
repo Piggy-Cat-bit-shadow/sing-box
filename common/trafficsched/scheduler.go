@@ -1,6 +1,7 @@
 package trafficsched
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -271,6 +272,12 @@ func NewScheduler(options Options) *Scheduler {
 func (s *Scheduler) SetRateSource(source RateSource) {
 	s.mu.Lock()
 	s.installRateSourceLocked(source)
+	// A rate change can make a parked waiter admissible immediately - most obviously by turning
+	// shaping off altogether, which removes the credit rule entirely - and there is no guarantee a
+	// wake loop is running to notice. Running one grant pass here closes that window rather than
+	// leaving it to the next tick.
+	s.grantLocked()
+	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
@@ -407,9 +414,19 @@ func (f *Flow) done() {
 	s.mu.Lock()
 	if f.holdsSlot {
 		s.releaseGrantLocked(f)
-		s.grantLocked()
+		// The grant pass is skipped when nothing is waiting, which is the common case: it would
+		// otherwise re-walk both lanes and read the clock again for every single write, and it can
+		// only ever produce a permit for a waiter that does not exist.
+		if s.hasWaitersLocked() {
+			s.grantLocked()
+		}
 	}
 	s.mu.Unlock()
+}
+
+// hasWaitersLocked reports whether either lane has a parked flow.
+func (s *Scheduler) hasWaitersLocked() bool {
+	return !s.lanes[laneHigh].empty() || !s.lanes[laneNormal].empty()
 }
 
 // observeWriteStart reports whether the flow's writes are being timed, so the gate can skip reading
@@ -441,6 +458,19 @@ func (f *Flow) AdmittedBytes() int64 {
 		return 0
 	}
 	return f.admitted.Load()
+}
+
+// HighPriority reports which lane this flow was placed in.
+//
+// The lane is decided once, from the resolved traffic class, and it is the only thing about a flow
+// that its class changes. Exposed so that "the class reached the scheduler" can be asserted rather
+// than inferred from timing, which is the difference between a test that pins the mapping and one
+// that pins whatever the host happened to do.
+func (f *Flow) HighPriority() bool {
+	if f == nil {
+		return false
+	}
+	return f.high
 }
 
 // Grants reports how many writes the scheduler arbitrated for this flow.
@@ -527,6 +557,12 @@ func (s *Scheduler) waitSlow(f *Flow, n int) error {
 // grant, from done() on the normal path and from waitSlow/Close when a grant is abandoned.
 func (s *Scheduler) releaseGrantLocked(f *Flow) {
 	f.holdsSlot = false
+	if s.closed {
+		// Shutdown already zeroed the counters and dropped every queue. Decrementing them again
+		// would drive them negative, and a negative count is the kind of state that reads as a
+		// leak the next time someone inspects it.
+		return
+	}
 	switch s.options.Mode {
 	case ModeAdmission:
 		if f.high {
@@ -608,7 +644,28 @@ func (s *Scheduler) chargeLocked(f *Flow) {
 	if base.Before(now) {
 		base = now
 	}
-	f.owedUntil = base.Add(time.Duration(float64(f.pending) / float64(rate) * float64(time.Second)))
+	f.owedUntil = base.Add(writePeriod(f.pending, rate))
+}
+
+// writePeriod is how long one write of size bytes is worth at rate bytes per second.
+//
+// The arithmetic is done in float64 seconds and then saturated, because the alternative is a
+// conversion the language does not define: a write whose period exceeds what a time.Duration can
+// represent would become an arbitrary value, and an arbitrary value in the past is an over-admitted
+// rate while one in the far future is a stalled connection. Neither is reachable from a copy loop
+// whose buffers are bounded, and a helper that cannot produce either is worth the three lines.
+func writePeriod(size int, rate int64) time.Duration {
+	if size <= 0 {
+		return 0
+	}
+	if rate <= 0 {
+		return 0
+	}
+	nanoseconds := float64(size) / float64(rate) * float64(time.Second)
+	if nanoseconds >= float64(math.MaxInt64) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(nanoseconds)
 }
 
 // flowTimeReadyLocked reports whether a flow has finished paying for its last write.

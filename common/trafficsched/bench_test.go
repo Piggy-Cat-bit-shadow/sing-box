@@ -75,6 +75,24 @@ func BenchmarkStreamWriteTax(b *testing.B) {
 				flow.done()
 			}
 		})
+
+		// The shaped path with a rate far above what the writes need, so every write is admitted on
+		// the spot and only the SHAPING MACHINERY is being measured - the queue push, the credit
+		// check, the per-flow period. This is the case a configured-but-generous rate runs, and the
+		// allocation count is the property that matters: a shaped write that allocated would turn a
+		// rate limit into a garbage source.
+		b.Run(sizeName("gate-paced-generous", size), func(b *testing.B) {
+			scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(1 << 40)})
+			flow := scheduler.NewFlow(trafficclass.ClassDefault)
+			gate := NewGate(&benchSink{}, flow)
+			b.Cleanup(func() { _ = scheduler.Close() })
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			for b.Loop() {
+				_, _ = gate.Write(payload)
+				flow.done()
+			}
+		})
 	}
 }
 
