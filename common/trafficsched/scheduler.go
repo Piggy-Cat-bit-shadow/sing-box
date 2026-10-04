@@ -163,13 +163,24 @@ func (o Options) withDefaults() Options {
 // So when a rate is configured, shaping runs continuously for as long as the scheduler exists. That
 // is also why the configured number has to be a rate the path actually sustains: it is not a
 // ceiling that only applies under contention, it is the rate.
+// rateSourceHolder bundles the shaping input with its optional learning half, so replacing the
+// source is one atomic store rather than two fields that could be seen half-updated.
+type rateSourceHolder struct {
+	source   RateSource
+	observer WriteObserver
+}
+
 type Scheduler struct {
 	options Options
-	// source is the shaping input. It is read on every refill rather than captured, so a controller
-	// can be installed or replaced while flows are running.
-	source RateSource
-	// observer is the optional learning half of the rate source, resolved once.
-	observer  WriteObserver
+	// source is the shaping input. It is read on every refill and on the fast path rather than
+	// captured, so a controller can be installed or replaced while flows are running, without the
+	// gate, the lane policy or the flow holding a copy of it.
+	//
+	// It is an atomic pointer rather than a field under the mutex because Flow.wait reads it with
+	// no lock held: an uncontended NORMAL write must not have to take one.
+	source atomic.Pointer[rateSourceHolder]
+	// observing is the cheap half of "is anything learning": the gate reads it once per write to
+	// decide whether to read the clock at all.
 	observing atomic.Bool
 
 	// armed is the ordering modes' predicate.
@@ -243,13 +254,9 @@ func NewScheduler(options Options) *Scheduler {
 	options = options.withDefaults()
 	scheduler := &Scheduler{
 		options: options,
-		source:  options.RateSource,
 		closeCh: make(chan struct{}),
 	}
-	if observer, isObserver := options.RateSource.(WriteObserver); isObserver {
-		scheduler.observer = observer
-		scheduler.observing.Store(true)
-	}
+	scheduler.installRateSourceLocked(options.RateSource)
 	scheduler.cond = sync.NewCond(&scheduler.mu)
 	scheduler.tokens = float64(options.Burst)
 	scheduler.lastRefill = time.Now()
@@ -263,14 +270,19 @@ func NewScheduler(options Options) *Scheduler {
 // holds a copy of it.
 func (s *Scheduler) SetRateSource(source RateSource) {
 	s.mu.Lock()
-	s.source = source
-	s.observer = nil
-	s.observing.Store(false)
-	if observer, isObserver := source.(WriteObserver); isObserver {
-		s.observer = observer
-		s.observing.Store(true)
-	}
+	s.installRateSourceLocked(source)
 	s.mu.Unlock()
+}
+
+// installRateSourceLocked publishes a rate source. The callers hold s.mu, but the store is atomic
+// because the readers do not.
+func (s *Scheduler) installRateSourceLocked(source RateSource) {
+	holder := &rateSourceHolder{source: source}
+	if observer, isObserver := source.(WriteObserver); isObserver {
+		holder.observer = observer
+	}
+	s.source.Store(holder)
+	s.observing.Store(holder.observer != nil)
 }
 
 // NewFlow returns a scheduler handle for one logical flow.
@@ -297,10 +309,14 @@ func (s *Scheduler) Rate() int64 {
 }
 
 func (s *Scheduler) rateLocked() int64 {
-	if !s.options.Mode.paced() || s.source == nil {
+	if !s.options.Mode.paced() {
 		return 0
 	}
-	rate := s.source.Rate()
+	holder := s.source.Load()
+	if holder == nil || holder.source == nil {
+		return 0
+	}
+	rate := holder.source.Rate()
 	if rate <= 0 {
 		return 0
 	}
@@ -371,10 +387,11 @@ func (s *Scheduler) inert() bool {
 	if !s.options.Mode.paced() {
 		return false
 	}
-	if s.source == nil {
+	holder := s.source.Load()
+	if holder == nil || holder.source == nil {
 		return true
 	}
-	return s.source.Rate() <= 0
+	return holder.source.Rate() <= 0
 }
 
 // done releases the credit or slot the flow holds, if any.
@@ -409,12 +426,13 @@ func (f *Flow) observeWrite(start time.Time, n int) {
 	if f == nil || start.IsZero() {
 		return
 	}
-	s := f.sched
-	observer := s.observer
-	if observer == nil {
+	holder := f.sched.source.Load()
+	if holder == nil || holder.observer == nil {
 		return
 	}
-	observer.ObserveWrite(n, time.Since(start), f.high)
+	// The observer is read from the same holder the rate came from, so a controller that is being
+	// replaced cannot be observed and consulted as two different objects.
+	holder.observer.ObserveWrite(n, time.Since(start), f.high)
 }
 
 // AdmittedBytes reports how many bytes have passed through the gate for this flow.

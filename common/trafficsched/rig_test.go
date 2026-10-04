@@ -92,9 +92,12 @@ func (w *wire) run() {
 			return
 		}
 		chunk := w.queue[0]
+		// The rate is read under the lock: the adaptive experiment changes it while the drain is
+		// running, which is the whole point of that experiment.
+		rate := w.rate
 		w.mu.Unlock()
 
-		time.Sleep(time.Duration(float64(time.Second) * float64(chunk.size) / w.rate))
+		time.Sleep(time.Duration(float64(time.Second) * float64(chunk.size) / rate))
 
 		w.mu.Lock()
 		// Only this goroutine pops, so the head is still the chunk that was slept on.
