@@ -233,8 +233,36 @@ func (c *Client) generationStillCurrent(operation *exchangeOperation) bool {
 // and a later commit does not repair either fact - the commit advances neither the generation nor the
 // pin. Delivering it would present an unresolved-network result as a stable answer about the current
 // network, which nothing downstream can detect.
-func (c *Client) responseAcceptable(operation *exchangeOperation) bool {
+func (c *Client) responseDeliverable(operation *exchangeOperation) bool {
 	return !operation.hasOwnershipGuard || operation.startedStable
+}
+
+// stateMutationAllowed reports whether a completed exchange may MODIFY network state.
+//
+// # Why this is separate from responseDeliverable
+//
+// The product contract allows a dated observation to be delivered: a query that started in a settled
+// state and whose answer arrives after the network moved is still returned, because a DNS answer is a
+// statement about a name at a moment, the generation guard keeps it out of the cache, and cancelling
+// every in-flight resolution on a transient interface event would turn a wifi blip into a failed
+// lookup. That is deliberate.
+//
+// It says nothing about whether that answer may be RECORDED as describing the current network. The
+// two questions have different answers, and conflating them is how a dated answer from the network
+// being left ends up renewing a cache entry, an NXDOMAIN verdict, an RDRC verdict or a refresh
+// deposit for the network that has replaced it.
+//
+// Delivering needs only "started settled". Mutating needs that AND that the network it was measured
+// on is still the network that holds: the generation must be current and the transition must have
+// settled.
+func (c *Client) stateMutationAllowed(operation *exchangeOperation) bool {
+	if !c.responseDeliverable(operation) {
+		return false
+	}
+	if operation.hasOwnershipGuard && !c.networkTransitionStable() {
+		return false
+	}
+	return c.generationStillCurrent(operation)
 }
 
 // networkTransitionStable reports whether the network is settled, from the manager when it can say.
@@ -246,6 +274,22 @@ func (c *Client) responseAcceptable(operation *exchangeOperation) bool {
 // a settled state, succeeds normally.
 var errNetworkTransitioning = E.New("network is transitioning")
 
+// networkTransitionStable reports whether the network is settled.
+//
+// # Why the plain read is sufficient here
+//
+// beginTransition publishes instability BEFORE it publishes the new token, so a reader that does not
+// take the manager's ownership lock can only observe:
+//
+//	old token + settled      the claim has not started
+//	old token + unsettled    the claim is in progress
+//	new token + unsettled    the claim is complete
+//
+// The combination that would matter - a new token with the network still reported settled - is never
+// observable. Reading the settled flag alone is therefore safe, and it avoids putting a manager lock
+// on the DNS hot path where every query would serialise behind every transition.
+//
+// A manager without the capability is one where the distinction does not arise.
 func (c *Client) networkTransitionStable() bool {
 	if c.networkManager == nil {
 		return true
@@ -632,7 +676,11 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 			rejected = !operation.responseChecker(response)
 		}
 		if rejected {
-			if !disableCache && c.rdrc != nil {
+			// An RDRC verdict is a claim about how this network answers this name, so it may only be
+			// recorded while the network the query was measured on still holds. The rejection path
+			// runs before the delivery and mutation gates below, which is how a stale response used to
+			// persist a verdict for the network that replaced it.
+			if !disableCache && c.rdrc != nil && c.stateMutationAllowed(operation) {
 				c.rdrc.SaveRDRCAsync(transport.Tag(), question.Name, question.Qtype, c.logger)
 			}
 			logRejectedResponse(c.logger, ctx, response)
@@ -655,12 +703,15 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 	// A query that began DURING a transition fails the first even if the transition later committed,
 	// which is what stops a commit from laundering it. DisableCache is deliberately not consulted:
 	// whether a response may be cached and whether it may be trusted are different questions.
-	if !c.responseAcceptable(operation) {
+	if !c.responseDeliverable(operation) {
 		logRejectedResponse(c.logger, ctx, response)
 		return nil, errNetworkTransitioning
 	}
 	timeToLive := applyResponseOptions(question, response, operation.options)
-	if !disableCache && c.generationStillCurrent(operation) {
+	// Storing an exact entry or an NXDOMAIN verdict is a state mutation, so it takes the stricter
+	// predicate: a dated answer may be delivered, but it may not be recorded as describing the
+	// network that is current now.
+	if !disableCache && c.stateMutationAllowed(operation) {
 		cacheKey, storable := c.finishCacheKey(transport, operation.cacheKey)
 		if storable {
 			c.storeCache(cacheKey, response, timeToLive)
@@ -952,6 +1003,18 @@ func (c *Client) lookupToExchange(ctx context.Context, transport adapter.DNSTran
 		},
 		Question: []dns.Question{question},
 	}
+	// Lookup reaches the cache BEFORE it reaches Exchange, so the ownership gate that lives in
+	// beginExchange cannot cover a cache hit here. Without this, a lookup issued during a transition
+	// was answered from the old network's entry - exact or optimistic-stale - with no ownership
+	// question asked at all.
+	//
+	// The gate is applied at the public operation level rather than inside loadResponse, because
+	// loadResponse is also used by internal maintenance paths whose contract differs: refusing there
+	// would change behaviour those callers depend on.
+	if !c.networkTransitionStable() {
+		return nil, errNetworkTransitioning
+	}
+
 	disableCache := c.disableCache || options.DisableCache
 	if !disableCache {
 		cachedAddresses, err := c.questionCache(ctx, transport, &message, options, responseChecker)
@@ -1092,13 +1155,32 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		// The refresh makes its OWN round trip, so it captures the generation at ITS issue point
-		// rather than inheriting the one from the stale read that scheduled it. A refresh started
-		// before a reset and completing after it must not repopulate the cache the reset cleared.
+		// The refresh makes its OWN round trip, so it captures its OWN start state rather than
+		// inheriting anything from the stale read that scheduled it.
+		//
+		// Both halves are required. The generation alone is not enough: a refresh that STARTS while a
+		// transition is pending captures the transition's own epoch, and a commit advances neither the
+		// generation nor the pin, so the generation comparison finds no change and the deposit is
+		// allowed. Recording startedStable is what refuses it.
+		//
+		// Without hasOwnershipGuard the ownership predicates short-circuit to "allowed", which is
+		// exactly the hole this closes: the refresh previously set only the generation guard, so
+		// responseAcceptable returned true unconditionally.
 		refreshOperation := &exchangeOperation{}
 		if c.networkGeneration != nil {
 			refreshOperation.generation = c.networkGeneration()
 			refreshOperation.hasGenerationGuard = true
+		}
+		refreshOperation.startedStable = c.networkTransitionStable()
+		refreshOperation.hasOwnershipGuard = true
+		if !refreshOperation.startedStable {
+			// Issued during a transition. There is no settled network for this answer to describe, so
+			// the round trip is not even made: its result could neither be delivered nor recorded.
+			if c.logger != nil {
+				c.logger.DebugContext(ctx, "optimistic refresh skipped for ", FqdnToDomain(key.Name),
+					": network is transitioning")
+			}
+			return
 		}
 
 		response, err := c.exchangeToTransport(ctx, transport, message)
@@ -1119,7 +1201,7 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 				if c.logger != nil {
 					c.logger.DebugContext(ctx, "optimistic refresh rejected for ", FqdnToDomain(key.Name))
 				}
-				if c.rdrc != nil {
+				if c.rdrc != nil && c.stateMutationAllowed(refreshOperation) {
 					c.rdrc.SaveRDRCAsync(transport.Tag(), key.Name, key.Qtype, c.logger)
 				}
 				return
@@ -1127,11 +1209,11 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		} else if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
 			return
 		}
-		// The same ownership contract as the foreground path: the refresh may only deposit a result
-		// if the network it was issued on is still the network that holds. A refresh started while a
-		// transition was pending would otherwise seed the old namespace with an answer from the new
-		// network, which is the mislabelling this exists to prevent.
-		if !c.responseAcceptable(refreshOperation) {
+		// Depositing into the cache is a STATE MUTATION, so it takes the stricter predicate: the
+		// refresh may only record a result if the network it was issued on is still the network that
+		// holds. A refresh that started settled and whose network moved underneath it must not seed a
+		// namespace that now belongs to a different network.
+		if !c.stateMutationAllowed(refreshOperation) {
 			return
 		}
 		storeKey, storable := c.finishCacheKey(transport, key)

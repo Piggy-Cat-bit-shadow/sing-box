@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -36,6 +37,8 @@ import (
 type interfaceTransitionHarness struct {
 	manager *NetworkManager
 	router  *countingRouter
+	// release hands back a resetRunAccess taken by holdResetLock.
+	release chan struct{}
 }
 
 // newInterfaceTransitionHarness builds a started manager whose environment fingerprint the test
@@ -72,7 +75,15 @@ func newInterfaceTransitionHarness(t *testing.T) *interfaceTransitionHarness {
 		Type:      C.InterfaceTypeWIFI,
 		Gateways:  []netip.Addr{netip.MustParseAddr("192.0.2.1")},
 	}})
-	return &interfaceTransitionHarness{manager: manager, router: router}
+	h := &interfaceTransitionHarness{manager: manager, router: router, release: make(chan struct{})}
+	t.Cleanup(func() {
+		select {
+		case <-h.release:
+		default:
+			close(h.release)
+		}
+	})
+	return h
 }
 
 // setSSID publishes a Wi-Fi SSID, which is the environment transition the test drives.
@@ -92,6 +103,24 @@ func (h *interfaceTransitionHarness) markInterfaceResetPending() {
 }
 
 func (h *interfaceTransitionHarness) resetCount() int { return dnsResetCount(h.router) }
+
+// holdResetLock takes resetRunAccess so a dispatched update blocks instead of racing the assertions.
+// release (closed by the test, or by cleanup) hands it back.
+func (h *interfaceTransitionHarness) holdResetLock(t *testing.T) {
+	t.Helper()
+	held := make(chan struct{})
+	go func() {
+		h.manager.resetRunAccess.Lock()
+		close(held)
+		<-h.release
+		h.manager.resetRunAccess.Unlock()
+	}()
+	select {
+	case <-held:
+	case <-time.After(10 * time.Second):
+		t.Fatal("could not take resetRunAccess")
+	}
+}
 
 // staticInterfaceMonitor is a DefaultInterfaceMonitor whose answer the test controls.
 type staticInterfaceMonitor struct {
@@ -203,13 +232,21 @@ func TestCancelledInterfaceUpdateDoesNotConsumeNewPendingReset(t *testing.T) {
 	harness := newInterfaceTransitionHarness(t)
 	harness.setSSID("A")
 
+	// Arm the event by hand rather than through the notifier.
+	//
+	// The notifier is exercised by TestSupersedeUsesRealNotifyInterfaceUpdate; here the subject is the
+	// CANCELLED update's decision, and driving the notifier would dispatch a second update that
+	// performs the reset concurrently - making the counts race the very thing under test. What is
+	// being asserted is that a cancelled update neither resets nor consumes the flag.
+	harness.manager.interfaceUpdateAccess.Lock()
+	harness.manager.networkResetPending = true
+	harness.manager.networkResetPendingToken = harness.manager.beginTransition()
+	harness.manager.interfaceUpdateAccess.Unlock()
+
 	// The old update's context is already cancelled when it reaches the decision, as it would be
 	// after a newer notification cancelled it.
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-
-	// A new event arrives and arms the pending flag.
-	harness.markInterfaceResetPending()
 
 	before := harness.resetCount()
 	harness.manager.updateInterface(cancelledCtx, &control.Interface{Index: 1, Name: "en0"})
@@ -225,7 +262,7 @@ func TestCancelledInterfaceUpdateDoesNotConsumeNewPendingReset(t *testing.T) {
 		"the cancelled update consumed the pending reset that belongs to the newer event; that "+
 			"transition is then lost, because the newer update sees nothing to do")
 
-	// And the newer update does perform it.
+	// And the newer update performs it, exactly once.
 	harness.manager.updateInterface(harness.manager.startedCtx, &control.Interface{Index: 1, Name: "en0"})
 	require.Equal(t, before+1, harness.resetCount(),
 		"the newer update must still perform the pending reset")

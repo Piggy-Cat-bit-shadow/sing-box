@@ -124,8 +124,21 @@ type NetworkManager struct {
 	interfaceUpdateDecision func()
 	// environmentPublished, when set, runs immediately after a recompute publishes a new fingerprint.
 	environmentPublished func()
-	powerUpdateAccess    sync.Mutex
-	powerUpdateCancel    context.CancelFunc
+	// beginTransitionHook, when set, runs BETWEEN the two ownership writes in beginTransition.
+	//
+	// It exists so a test can park the claim midway and observe what a reader that does not hold
+	// transitionAccess sees there. Nil in production, where it costs one predictable branch.
+	beginTransitionHook func()
+	// transitionClaimed, when set, runs AFTER both ownership writes, so a test can join on the claim
+	// having happened rather than on an earlier signal that merely precedes it.
+	//
+	// The distinction is not cosmetic. environmentPublished fires BEFORE the claim - the fingerprint
+	// must be written before the transition becomes unstable, or a reader could see the new
+	// environment with the old ownership - so a test that waits for it and then reads the epoch is
+	// reading a value the claim has not necessarily produced yet.
+	transitionClaimed func(transitionToken)
+	powerUpdateAccess sync.Mutex
+	powerUpdateCancel context.CancelFunc
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -648,8 +661,32 @@ func (r *NetworkManager) beginTransition() transitionToken {
 	// settled, which is the observation the transition exists to prevent.
 	r.transitionAccess.Lock()
 	defer r.transitionAccess.Unlock()
-	r.transitionOwner = transitionToken(r.networkResetGeneration.Add(1))
+	// Unstable FIRST, then the token.
+	//
+	// The reverse order left a window that a reader NOT holding transitionAccess could observe: the
+	// new token was already published while the settled flag still read true. NetworkTransitionStable
+	// deliberately does not take the lock - it is read on hot paths and a lock there would serialise
+	// every DNS query against every transition - so it can land squarely in that window and report a
+	// claimed transition as settled.
+	//
+	// Publishing instability first makes every non-snapshot reader see only safe combinations:
+	//
+	//	old token + settled      the transition has not claimed yet
+	//	old token + unstable     claiming, not yet claimed
+	//	new token + unstable     claimed
+	//
+	// The dangerous combination - a new token with the network still reported settled - is never
+	// observable, which is the direction that matters: a reader that sees "unsettled" is never wrong
+	// to refuse, whereas one that sees "settled" during a claim would accept an operation the
+	// transition exists to reject.
 	r.transitionStable.Store(false)
+	if r.beginTransitionHook != nil {
+		r.beginTransitionHook()
+	}
+	r.transitionOwner = transitionToken(r.networkResetGeneration.Add(1))
+	if r.transitionClaimed != nil {
+		r.transitionClaimed(r.transitionOwner)
+	}
 	return r.transitionOwner
 }
 

@@ -295,27 +295,31 @@ func TestConsecutiveTransitionsEachGetTheirOwnBoundary(t *testing.T) {
 	baseResets := dnsResetCount(h.router)
 
 	// B transitions, with the reset lock held so its body cannot run yet.
+	//
+	// The waits join on the CLAIM, not on the publish. The publish hook fires before beginTransition
+	// runs, so awaiting it and then reading the epoch reads a value the claim may not have produced
+	// yet - which is precisely the intermittent base+1-instead-of-base+2 this test used to show.
+	claimed, stopClaim := claimWatch(t, h)
+	defer stopClaim()
+
 	h.holdResetLock(t)
-	publishedB, stopB := publishWatch(t, h)
-	defer stopB()
 	h.setSSID("B")
 	bDone := make(chan struct{})
 	go func() {
 		defer close(bDone)
 		h.manager.updateNetworkEnvironment()
 	}()
-	awaitPublish(t, publishedB)
+	tokenB := awaitClaim(t, claimed)
 
 	// C transitions while B waits. C is the newest claimant.
-	publishedC, stopC := publishWatch(t, h)
-	defer stopC()
 	h.setSSID("C")
 	cDone := make(chan struct{})
 	go func() {
 		defer close(cDone)
 		h.manager.updateNetworkEnvironment()
 	}()
-	awaitPublish(t, publishedC)
+	tokenC := awaitClaim(t, claimed)
+	require.Greater(t, tokenC, tokenB, "C claims a later token than B")
 
 	// Two claims, two tokens, and neither body has run: the lock is still held.
 	require.EqualValues(t, base+2, h.manager.NetworkResetGeneration(),
@@ -359,15 +363,16 @@ func TestTransitionToTheSameEnvironmentWhileWaitingIsNotASecondBoundary(t *testi
 	base := h.manager.NetworkResetGeneration()
 
 	h.holdResetLock(t)
-	publishedB, stopB := publishWatch(t, h)
-	defer stopB()
+	// Joins on the claim, because the assertion below reads the epoch.
+	claimed, stopClaim := claimWatch(t, h)
+	defer stopClaim()
 	h.setSSID("B")
 	bDone := make(chan struct{})
 	go func() {
 		defer close(bDone)
 		h.manager.updateNetworkEnvironment()
 	}()
-	awaitPublish(t, publishedB)
+	awaitClaim(t, claimed)
 
 	// The same environment reported again while B waits: not a transition.
 	h.manager.updateNetworkEnvironment()
@@ -382,6 +387,36 @@ func TestTransitionToTheSameEnvironmentWhileWaitingIsNotASecondBoundary(t *testi
 		t.Fatal("the transition did not complete")
 	}
 	require.Equal(t, int(base+1), dnsResetCount(h.router), "one transition, one reset")
+}
+
+// claimWatch installs the claimed signal and returns a channel that receives the claimed token.
+//
+// Tests that READ THE EPOCH must join on this, not on the publish signal. publishWatch fires before
+// beginTransition runs, so waiting for it and then reading the epoch reads a value the claim may not
+// have produced yet - which is exactly the flake it caused.
+func claimWatch(t *testing.T, h *transitionWindowHarness) (claimed chan transitionToken, stop func()) {
+	t.Helper()
+	claimed = make(chan transitionToken, 8)
+	h.manager.transitionClaimed = func(token transitionToken) {
+		select {
+		case claimed <- token:
+		default:
+		}
+	}
+	t.Cleanup(func() { h.manager.transitionClaimed = nil })
+	return claimed, func() { h.manager.transitionClaimed = nil }
+}
+
+// awaitClaim joins on a transition having claimed, and returns the token it claimed.
+func awaitClaim(t *testing.T, claimed chan transitionToken) transitionToken {
+	t.Helper()
+	select {
+	case token := <-claimed:
+		return token
+	case <-time.After(10 * time.Second):
+		t.Fatal("no transition claimed")
+		return 0
+	}
 }
 
 // awaitPublish joins on a transition publishing its fingerprint, then reports the epoch that is
@@ -538,6 +573,9 @@ func TestPublishedEnvironmentCannotBeObservedAsStableBeforeTransitionClaim(t *te
 		defer close(readerReturned)
 		h.manager.networkEnvironmentAndStability()
 	}()
+	// This is the one place a timeout IS the assertion: the property is that the reader does NOT
+	// return. A signal cannot express "nothing happened", so a bounded wait is the only way to state
+	// it - and the wait is against the writer's own held lock, not against a state change.
 	select {
 	case <-readerReturned:
 		require.Fail(t, "a reader observed the pair while the transition was parked between the "+
@@ -830,36 +868,47 @@ func TestInterfacePendingResetMarksNetworkUnstableBeforeResetLock(t *testing.T) 
 	// claims via recompute.
 	h.manager.notifyInterfaceUpdate(testDefaultInterface(), 0)
 
-	// The notification has been delivered. The update goroutine is dispatched but blocked on the lock.
-	awaitOutcome(t, func() bool {
-		h.manager.interfaceUpdateAccess.Lock()
-		defer h.manager.interfaceUpdateAccess.Unlock()
-		return h.manager.networkResetPending
-	}, "the notification never armed the pending reset")
+	// notifyInterfaceUpdate arms the flag and claims before it returns, so this is a plain
+	// post-condition rather than something to wait for. Waiting would only hide a regression in that
+	// ordering behind a timeout.
+	h.manager.interfaceUpdateAccess.Lock()
+	pendingArmed := h.manager.networkResetPending
+	h.manager.interfaceUpdateAccess.Unlock()
+	require.True(t, pendingArmed, "the notification must arm the pending reset before it returns")
 
 	require.False(t, h.manager.NetworkTransitionStable(),
 		"a reset has been requested and its update is waiting for the reset lock, but the network "+
 			"still reports settled. A dial or a DNS query in this interval is accepted as a stable "+
 			"operation against transports that are about to be reset")
 
+	resetsBefore := dnsResetCount(h.router)
 	close(h.release)
-	awaitOutcome(t, func() bool { return h.manager.NetworkTransitionStable() },
-		"the network never settled after the pending reset completed")
+	require.True(t, h.router.waitForCount(resetsBefore+1, 10*time.Second),
+		"the pending reset never reached the router")
+	require.True(t, h.manager.NetworkTransitionStable(),
+		"the network must be settled once the pending reset has run")
 }
 
-// awaitOutcome blocks until the predicate holds, or fails.
+// awaitSignal blocks until the channel fires, then asserts the predicate once.
 //
-// The predicate is evaluated against state the code under test publishes; the timeout is a watchdog
-// against a hang rather than the synchroniser.
-func awaitOutcome(t *testing.T, predicate func() bool, message string) {
+// # Why this is not a poll
+//
+// The caller supplies a channel that the code under test closes when it reaches the state in
+// question. The wait is therefore ordered by the code's own progress: it cannot observe the state
+// before it exists, and it cannot spin. The predicate is checked once, on wake, as a post-condition.
+//
+// A timer would make the test's cadence the scheduler's problem and would let a slow machine see a
+// state that has not been reached yet, which is how a polling assertion turns into a flake. The
+// timeout below is only a watchdog against a hang.
+func awaitSignal(t *testing.T, signal <-chan struct{}, predicate func() bool, message string) {
 	t.Helper()
-	deadline := time.After(10 * time.Second)
-	for !predicate() {
-		select {
-		case <-deadline:
-			t.Fatal(message)
-		case <-time.After(time.Millisecond):
-		}
+	select {
+	case <-signal:
+	case <-time.After(10 * time.Second):
+		t.Fatal(message)
+	}
+	if predicate != nil {
+		require.True(t, predicate(), message)
 	}
 }
 
@@ -907,10 +956,83 @@ func TestRepeatedInterfaceNotificationsCoalesceOwnership(t *testing.T) {
 	// One update consumes the event and performs exactly one boundary.
 	baseResets := dnsResetCount(h.router)
 	close(h.release)
-	awaitOutcome(t, func() bool { return h.manager.NetworkTransitionStable() },
-		"the coalesced event never completed")
+	require.True(t, h.router.waitForCount(baseResets+1, 10*time.Second),
+		"the coalesced event never reached the router")
 	require.Equal(t, baseResets+1, dnsResetCount(h.router),
 		"the whole burst must produce exactly one reset")
 	require.EqualValues(t, base+1, h.manager.NetworkResetGeneration(),
 		"and exactly one epoch beyond the one settling on A used")
+}
+
+// A reader that does not hold transitionAccess must never see a claimed transition as settled.
+//
+// # The window
+//
+// beginTransition performs two writes. In the original order the token moved first and the settled
+// flag second, so a reader landing between them saw the NEW token alongside a network that still
+// reported settled. NetworkTransitionStable deliberately does not take transitionAccess - it is read
+// on the DNS hot path and a lock there would put every query behind every transition - so it can
+// land exactly in that window.
+//
+// # Why the direction matters
+//
+// The dangerous combination is "new token + settled", because a consumer that believes the network is
+// settled will accept an operation the transition exists to reject. Publishing instability first
+// means a reader sees only old-token-settled, old-token-unsettled or new-token-unsettled, and the
+// only wrong answer available to it is a refusal - which is safe.
+//
+// The hook parks the claim between the two writes so the observation is exact rather than raced.
+func TestDNSStartCannotObserveClaimedTransitionAsStable(t *testing.T) {
+	h := newTransitionWindowHarness(t)
+	h.settle(t, "A")
+	require.True(t, h.manager.NetworkTransitionStable())
+
+	between := make(chan struct{})
+	leave := make(chan struct{})
+	var once sync.Once
+	h.manager.beginTransitionHook = func() {
+		once.Do(func() {
+			close(between)
+			<-leave
+		})
+	}
+	t.Cleanup(func() { h.manager.beginTransitionHook = nil })
+
+	claimed := make(chan transitionToken, 1)
+	go func() { claimed <- h.manager.beginTransition() }()
+
+	select {
+	case <-between:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the claim never reached the point between its two writes")
+	}
+
+	// This is what a DNS query reads at its start when it does not hold transitionAccess.
+	observedStable := h.manager.NetworkTransitionStable()
+	observedEpoch := h.manager.NetworkResetGeneration()
+
+	require.False(t, observedStable,
+		"a reader observed the network as SETTLED while a transition was mid-claim (epoch %d). A "+
+			"DNS query taking its start state here records startedStable=true and is then accepted, "+
+			"which is the laundering the start state exists to prevent", observedEpoch)
+
+	close(leave)
+	token := <-claimed
+	require.EqualValues(t, observedEpoch+1, token,
+		"the epoch is published after the instability, so the reader saw the OLD epoch with the "+
+			"network already reported unsettled")
+}
+
+// The snapshot reader must see a consistent pair throughout the claim.
+func TestTransitionSnapshotIsConsistentDuringClaim(t *testing.T) {
+	h := newTransitionWindowHarness(t)
+	h.settle(t, "A")
+	beforeEpoch, beforeStable := h.manager.NetworkTransitionSnapshot()
+	require.True(t, beforeStable)
+
+	token := h.manager.beginTransition()
+	afterEpoch, afterStable := h.manager.NetworkTransitionSnapshot()
+	require.False(t, afterStable, "the snapshot must report the claim as unsettled")
+	require.Equal(t, uint64(token), afterEpoch)
+	require.Greater(t, afterEpoch, beforeEpoch)
 }
