@@ -25,8 +25,12 @@ import (
 var _ adapter.Router = (*Router)(nil)
 
 type Router struct {
-	ctx               context.Context
-	logger            log.ContextLogger
+	ctx    context.Context
+	logger log.ContextLogger
+	// logFactory is kept for its level alone, so a hot-path diagnostic can be skipped rather than
+	// built and discarded. It is nil in tests that construct a Router directly, which is why every
+	// use of it goes through debugLogging.
+	logFactory        log.Factory
 	inbound           adapter.InboundManager
 	outbound          adapter.OutboundManager
 	dns               adapter.DNSRouter
@@ -57,6 +61,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 	return &Router{
 		ctx:               ctx,
 		logger:            logFactory.NewLogger("router"),
+		logFactory:        logFactory,
 		inbound:           service.FromContext[adapter.InboundManager](ctx),
 		outbound:          service.FromContext[adapter.OutboundManager](ctx),
 		dns:               service.FromContext[adapter.DNSRouter](ctx),
@@ -273,4 +278,14 @@ func (r *Router) ResetNetwork() {
 	if r.processSearcher != nil {
 		r.processSearcher.ResetCache()
 	}
+}
+
+// debugLogging reports whether a debug-level message would actually be emitted.
+//
+// It exists so that the arguments of a hot-path debug message can be left unbuilt. A nil factory -
+// which is what a Router built directly in a test has - reports false, so the message is skipped
+// rather than causing a nil dereference; no test loses an assertion it was making about logging,
+// because none of them asserted on this.
+func (r *Router) debugLogging() bool {
+	return r.logFactory != nil && r.logFactory.Level() >= log.LevelDebug
 }

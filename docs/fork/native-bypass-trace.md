@@ -93,6 +93,26 @@ Tracking works precisely because the flow did not bypass. The datagram still goe
 
 ---
 
+## What the verdict costs, and what it does not
+
+The first version of this document claimed an eligible flow "pays one extra rule evaluation". That was
+wrong, and the measurement is in `route/bypass_capability_cost_test.go`: the pre-match verdict is
+discarded for a direct TCP or UDP flow whichever verdict it is, because the direct outbound answers
+`PreMatchContinue` for both networks and there is no `tun.Port` for them. The stack terminates the
+connection in userspace and the router routes it from scratch in every case.
+
+Measured per flow through the public entry point:
+
+| Configuration | Cost |
+| --- | --- |
+| eligible (a bypass verdict is produced) | 224 ns, 240 B, 7 allocs |
+| ordinary (the decision declines) | 129 ns, 48 B, 2 allocs |
+
+The difference was entirely one debug line whose arguments were built before the logger decided the
+level was off. With that gated, both configurations are 135 ns, 48 B, 2 allocs — which is also the
+answer to whether the decision should be gated on the caller's ability to honour it: there is nothing
+left to save, and no observable difference to preserve.
+
 ## What this means for tracked native bypass
 
 The round's premise was that a native path exists and only its observability is missing. The premise

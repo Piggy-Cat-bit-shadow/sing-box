@@ -104,9 +104,20 @@ userspace and calls the Handler back. The header of
 it.
 
 So for a TUN client the eligibility decision in this document has **no data-plane effect**: a flow it
-marks as bypassable is still proxied in userspace, and pays one extra rule evaluation for the
-privilege, because the pre-match verdict is discarded and the userspace connection is routed from
-scratch. What it does have is a real effect in Linux redirect mode.
+marks as bypassable is still proxied in userspace. What it does have is a real effect in Linux
+redirect mode.
+
+It is worth being precise about what it does *not* cost, because the first version of this document
+claimed one extra rule evaluation and that was wrong. The pre-match verdict is discarded for a direct
+TCP or UDP flow whichever verdict it is: the direct outbound answers `PreMatchContinue` for both
+networks, there is no `tun.Port` for them, so the stack terminates the connection in userspace and the
+router routes it from scratch — the same for a flow the decision allowed, a flow it refused, and a
+flow it never considered. The decision's own cost is 15–17 ns and zero allocations either way.
+
+The one cost it *did* have is fixed: the eligible path logged a debug line whose arguments were built
+before the logger decided the level was off, which measured at five allocations and about 95 ns per
+eligible flow — more than the decision itself, on exactly the flows the feature targets. The message
+is now built only when it will be emitted.
 
 **L0 is not "the router, then a bypass".** It runs *before* the router, so it decides with an address
 and nothing else. It cannot express a domain, a process or a protocol condition, and it must not be
