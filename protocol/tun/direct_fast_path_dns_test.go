@@ -39,6 +39,10 @@ type bypassPreferringRouter struct {
 	adapter.Router
 	preMatchCalls atomic.Int32
 	bypassable    atomic.Bool
+	// lastDestination records what the router was told the connection's destination is. The TUN
+	// boundary is the last place that can canonicalise it, so this is where a test can see whether
+	// it did.
+	lastDestination atomic.Pointer[netip.AddrPort]
 }
 
 func newBypassPreferringRouter() *bypassPreferringRouter {
@@ -49,6 +53,8 @@ func newBypassPreferringRouter() *bypassPreferringRouter {
 
 func (r *bypassPreferringRouter) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
 	r.preMatchCalls.Add(1)
+	destination := metadata.Destination.AddrPort()
+	r.lastDestination.Store(&destination)
 	if r.bypassable.Load() {
 		return adapter.PreMatchResult{Action: adapter.PreMatchBypass}
 	}

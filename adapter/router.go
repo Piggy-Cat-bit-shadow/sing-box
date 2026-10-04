@@ -49,6 +49,18 @@ type PreMatchResult struct {
 	NewTracker  func() tun.FlowTracker
 }
 
+// canonicalAddrPort rewrites a v4-mapped IPv6 address to its four-byte form, and is a no-op for
+// every other address. It is duplicated from protocol/tun rather than shared because the adapter
+// package is a leaf: the alternative would be a dependency between two packages that both describe
+// the boundary rather than one implementing it.
+func canonicalAddrPort(address netip.AddrPort) netip.AddrPort {
+	addr := address.Addr()
+	if !addr.Is4In6() {
+		return address
+	}
+	return netip.AddrPortFrom(addr.Unmap(), address.Port())
+}
+
 func JudgeFlow(router Router, metadata InboundContext, network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
 	var networkName string
 	switch network {
@@ -62,6 +74,12 @@ func JudgeFlow(router Router, metadata InboundContext, network uint8, source net
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
 	metadata.Network = networkName
+	// Canonicalised here because this is the boundary EVERY JudgeFlow caller goes through, including
+	// the Linux nfqueue one, whose packets are parsed from the wire just like a TUN's. A v4-mapped
+	// destination is an IPv4 address in sixteen bytes, and every policy comparison downstream -
+	// route rules by CIDR, FakeIP ranges, DNS addresses - is written against the four-byte form.
+	source = canonicalAddrPort(source)
+	destination = canonicalAddrPort(destination)
 	metadata.Source = M.SocksaddrFromNetIP(source)
 	metadata.Destination = M.SocksaddrFromNetIP(destination)
 	if networkName == N.NetworkICMP {

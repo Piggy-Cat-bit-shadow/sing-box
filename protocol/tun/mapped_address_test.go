@@ -1,0 +1,261 @@
+package tun
+
+import (
+	"context"
+	"net/netip"
+	"testing"
+	"time"
+
+	"github.com/sagernet/sing-box/log"
+	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun/gtcpip/header"
+	M "github.com/sagernet/sing/common/metadata"
+
+	"github.com/stretchr/testify/require"
+	"go4.org/netipx"
+)
+
+// A v4-mapped IPv6 destination is an IPv4 address written in sixteen bytes, and every policy
+// comparison in this file is written against the four-byte form.
+//
+// # Why this needs its own tests rather than one
+//
+// The bug reported a different symptom in each layer, and all three symptoms are "policy silently did
+// not apply":
+//
+//	DNS address hijack   the query was not hijacked, so it left the DNS policy path entirely
+//	FakeIP L0 guard      the guard did not fire, so a placeholder was handed to the platform
+//	route address sets   a route set did not contain its own address, so the wrong verdict was reached
+//
+// They share one cause - the address was never canonicalised at the boundary - so they are fixed in
+// one place, and each is asserted separately because a fix that covered only one of them would look
+// correct from the other two.
+//
+// # Reachability
+//
+// These are wire forms, not constructed ones: the packets below are built with the sixteen-byte
+// destination in the IPv6 header and pushed through the real stack harness in
+// native_bypass_trace_test.go, which parses them exactly as sing-tun does. A dual-stack application
+// reaching 10.0.0.53 as ::ffff:10.0.0.53 is the ordinary case this protects.
+
+func mappedAddr(address netip.Addr) netip.Addr { return netip.AddrFrom16(address.As16()) }
+
+func mappedAddrPort(address netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(mappedAddr(address.Addr()), address.Port())
+}
+
+// hijackTestInboundFor returns an inbound wired to a router that records what it is asked and that
+// never bypasses, so "the router was consulted" and "the flow was bypassed" cannot be confused.
+func hijackTestInboundFor(t *testing.T, dnsAddress []netip.Addr, byPort bool) (*Inbound, *bypassPreferringRouter) {
+	t.Helper()
+	router := newBypassPreferringRouter()
+	router.bypassable.Store(false)
+	return &Inbound{
+		tag:              "tun-in",
+		ctx:              context.Background(),
+		router:           router,
+		logger:           log.NewNOPFactory().Logger(),
+		dnsHijackAddress: dnsAddress,
+		dnsHijackByPort:  byPort,
+	}, router
+}
+
+// TestMappedDnsAddressIsHijacked pins the DNS half.
+func TestMappedDnsAddressIsHijacked(t *testing.T) {
+	dnsAddress := netip.MustParseAddr("10.0.0.53")
+	inbound, _ := hijackTestInboundFor(t, []netip.Addr{dnsAddress}, false)
+
+	for _, testCase := range []struct {
+		name        string
+		destination netip.AddrPort
+		packet      []byte
+	}{
+		{
+			name:        "four-byte",
+			destination: netip.AddrPortFrom(dnsAddress, 53),
+			packet: func() []byte {
+				return udpDatagram(netip.MustParseAddrPort("198.18.0.2:40000"),
+					netip.AddrPortFrom(dnsAddress, 53), []byte("query"))
+			}(),
+		},
+		{
+			name:        "v4-mapped",
+			destination: mappedAddrPort(netip.AddrPortFrom(dnsAddress, 53)),
+			packet: func() []byte {
+				return udpDatagramV6(netip.MustParseAddrPort("[fd73:ab91:1::2]:40000"),
+					mappedAddrPort(netip.AddrPortFrom(dnsAddress, 53)), []byte("query"))
+			}(),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Through the real parser and the real stack: the packet's own header decides the
+			// destination, so the test cannot pass by constructing the address it wants to see.
+			handler := handlerFor(inbound)
+			harness := newMemoryTunHarness(t, handler)
+			harness.inject(t, testCase.packet)
+
+			verdicts := awaitVerdicts(t, handler, 1)
+			require.Equal(t, tun.ActionHijackDNS, verdicts[0].Action,
+				"a query to the configured DNS address must be hijacked in every form it can arrive "+
+					"in, and this is the verdict the stack received for the packet that was injected")
+
+			// The same input judged directly, so a failure says whether the decision or the delivery
+			// is at fault.
+			verdict := inbound.JudgeFlow(uint8(header.UDPProtocolNumber), netip.MustParseAddrPort("198.18.0.2:40000"), testCase.destination, nil)
+			require.Equal(t, tun.ActionHijackDNS, verdict.Action)
+		})
+	}
+
+	// And the TCP half, which is ACCEPTED at the flow level so the stream DNS path takes over. The
+	// same comparison decides it, so the same input must not be bypassed there either.
+	tcpInbound, _ := hijackTestInboundFor(t, []netip.Addr{dnsAddress}, false)
+	for _, destination := range []netip.AddrPort{
+		netip.AddrPortFrom(dnsAddress, 53),
+		mappedAddrPort(netip.AddrPortFrom(dnsAddress, 53)),
+	} {
+		verdict := tcpInbound.JudgeFlow(uint8(header.TCPProtocolNumber), netip.MustParseAddrPort("198.18.0.2:40000"), destination, nil)
+		require.Equal(t, tun.ActionAccept, verdict.Action,
+			"TCP to a configured DNS address is accepted so the stream path can hijack it, never bypassed")
+	}
+
+	// The userspace entry point makes the same decision, and it is the one that actually carries a
+	// real connection.
+	for _, destination := range []netip.AddrPort{
+		netip.AddrPortFrom(dnsAddress, 53),
+		mappedAddrPort(netip.AddrPortFrom(dnsAddress, 53)),
+	} {
+		require.True(t, tcpInbound.isDNSHijackDestination(M.SocksaddrFromNetIP(destination)),
+			"the connection path must recognise the DNS address in both forms")
+	}
+}
+
+// TestMappedFakeIPIsStillGuardedFromTheRouteSets pins the FakeIP half.
+//
+// The include-set configuration is the one where the missing canonicalisation fails OPEN: an address
+// outside an include set is bypassed, and a mapped address is outside every set written in four-byte
+// form - so without the fix a FakeIP placeholder reaches the platform's routing table.
+func TestMappedFakeIPIsStillGuardedFromTheRouteSets(t *testing.T) {
+	fakeIP := netip.MustParseAddr("198.18.0.5")
+	mapped := mappedAddr(fakeIP)
+
+	for _, testCase := range []struct {
+		name        string
+		destination netip.Addr
+		packet      []byte
+	}{
+		{
+			name:        "four-byte",
+			destination: fakeIP,
+			packet: udpDatagram(netip.MustParseAddrPort("198.18.0.2:40000"),
+				netip.AddrPortFrom(fakeIP, 443), []byte("x")),
+		},
+		{
+			name:        "v4-mapped",
+			destination: mapped,
+			packet: udpDatagramV6(netip.MustParseAddrPort("[fd73:ab91:1::2]:40000"),
+				netip.AddrPortFrom(mapped, 443), []byte("x")),
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			inbound, router := hijackTestInboundFor(t, nil, false)
+			inbound.fakeIPStore = &fakeIPStoreStub{inet4: netip.MustParsePrefix("198.18.0.0/15")}
+			// An include set that cannot contain the placeholder in either spelling: without the
+			// guard, "outside the set" means bypass.
+			inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "10.0.0.0/8")}
+
+			harness := newTraceHandler(func(network uint8, source, destination netip.AddrPort) tun.FlowVerdict {
+				return inbound.JudgeFlow(network, source, destination, nil)
+			})
+			memoryHarness := newMemoryTunHarness(t, harness)
+			memoryHarness.inject(t, testCase.packet)
+			verdicts := awaitVerdicts(t, harness, 1)
+			require.NotEqual(t, tun.ActionBypass, verdicts[0].Action,
+				"a FakeIP placeholder must reach the router so the domain can be recovered, in every "+
+					"form it can arrive in")
+			require.EqualValues(t, 1, router.preMatchCalls.Load(),
+				"and the router is where the FakeIP policy lives")
+		})
+	}
+}
+
+// TestMappedDestinationReachesTheRouteSets pins the third symptom, which is the widest one: a route
+// set that does not contain its own address makes every address-based decision wrong in whichever
+// direction the set was written.
+func TestMappedDestinationReachesTheRouteSets(t *testing.T) {
+	inbound, router := hijackTestInboundFor(t, nil, false)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "198.16.0.0/12")}
+
+	excluded := netip.MustParseAddr("198.20.0.5")
+	for _, testCase := range []struct {
+		name        string
+		destination netip.AddrPort
+	}{
+		{"four-byte", netip.AddrPortFrom(excluded, 443)},
+		{"v4-mapped", netip.AddrPortFrom(mappedAddr(excluded), 443)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			router.preMatchCalls.Store(0)
+			verdict := inbound.JudgeFlow(uint8(header.TCPProtocolNumber),
+				netip.MustParseAddrPort("198.18.0.2:40000"), testCase.destination, nil)
+			require.Equal(t, tun.ActionBypass, verdict.Action,
+				"an address in the exclude set is bypassed by the route sets in every form")
+			require.EqualValues(t, 0, router.preMatchCalls.Load(),
+				"without consulting the router, which is the point of the layer")
+		})
+	}
+}
+
+// TestMappedDestinationReachesTheRouterCanonical is the fourth symptom, and the one no single
+// comparison owns: the metadata the ROUTER sees must be canonical, or every rule matching an
+// address against a CIDR set fails silently.
+func TestMappedDestinationReachesTheRouterCanonical(t *testing.T) {
+	inbound, router := hijackTestInboundFor(t, nil, false)
+	unmapped := netip.MustParseAddrPort("93.184.216.34:443")
+	mapped := netip.AddrPortFrom(mappedAddr(unmapped.Addr()), unmapped.Port())
+
+	// Two paths reach the router and both are asserted, because they are separate call sites: the
+	// flow-level verdict and the userspace connection the TUN stack creates for a direct flow.
+	verdict := inbound.JudgeFlow(uint8(header.UDPProtocolNumber),
+		netip.MustParseAddrPort("198.18.0.2:40000"), mapped, nil)
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+	recorded := router.lastDestination.Load()
+	require.NotNil(t, recorded)
+	require.Equal(t, unmapped, *recorded,
+		"the flow path must hand the router the four-byte form, or a route rule written as a CIDR set "+
+			"matches nothing")
+
+	router.lastDestination.Store(nil)
+	harness := newMemoryTunHarness(t, handlerFor(inbound))
+	harness.inject(t, udpDatagramV6(netip.MustParseAddrPort("[fd73:ab91:1::2]:40000"), mapped, []byte("x")))
+	harness.waitForAccepted(t)
+	recorded = router.lastDestination.Load()
+	require.NotNil(t, recorded)
+	require.Equal(t, unmapped, *recorded,
+		"and so must the userspace connection path, which is the one that actually carries a real flow")
+}
+
+// awaitVerdicts waits until the handler has produced at least `count` verdicts.
+//
+// A hijacked or rejected packet is CONSUMED by the dispatcher, so "a userspace connection appeared"
+// is not a signal that can be waited on for those verdicts; the verdict itself is.
+func awaitVerdicts(t *testing.T, handler *traceHandler, count int) []tun.FlowVerdict {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if verdicts := handler.verdictsSeen(); len(verdicts) >= count {
+			return verdicts
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	verdicts := handler.verdictsSeen()
+	t.Fatalf("the packet never reached a verdict: got %d, want %d", len(verdicts), count)
+	return nil
+}
+
+// handlerFor runs the real TUN inbound behind the stack, so the packet's own bytes decide what the
+// inbound is asked about.
+func handlerFor(inbound *Inbound) *traceHandler {
+	return newTraceHandler(func(network uint8, source, destination netip.AddrPort) tun.FlowVerdict {
+		return inbound.JudgeFlow(network, source, destination, nil)
+	})
+}

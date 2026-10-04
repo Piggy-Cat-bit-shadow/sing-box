@@ -645,6 +645,26 @@ func (t *Inbound) releaseRouteSetCallbacks() {
 // The hijack checks are cheap - a slice scan and a port/network comparison - so hoisting them
 // also makes the DNS path marginally shorter, and a non-DNS flow pays only those two comparisons.
 func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	// The destination is canonicalised BEFORE any policy comparison, and that order is part of the
+	// contract rather than tidiness.
+	//
+	// A v4-mapped address (::ffff:a.b.c.d) is an IPv4 address written in sixteen bytes: a dual-stack
+	// application reaches 10.0.0.53 exactly as ::ffff:10.0.0.53, and sing-tun's parser carries the
+	// sixteen-byte form through unchanged. Every comparison below is written against the four-byte
+	// form, and each of them fails open on the mapped one:
+	//
+	//	netip.Addr equality      a configured DNS address is not recognised, so the query is not
+	//	                         hijacked and DNS policy - including Fake-IP - is skipped entirely
+	//	netip.Prefix.Contains    a FakeIP range does not contain its own address, so the L0 guard
+	//	                         does not fire and the placeholder is handed to the platform
+	//	netipx.IPSet.Contains    a route set does not contain its own address either, so an address
+	//	                         the include set was supposed to match is bypassed, and one an
+	//	                         exclude set was supposed to bypass is routed
+	//
+	// Failing open is the dangerous direction in all four cases, and they share one cause, so the
+	// fix belongs here rather than in each comparison.
+	destination = canonicalAddrPort(destination)
+
 	// A configured DNS address is hijacked on every port.
 	if slices.Contains(t.dnsHijackAddress, destination.Addr()) {
 		if network == uint8(header.UDPProtocolNumber) {
@@ -701,7 +721,33 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 	return adapter.JudgeFlow(t.router, adapter.InboundContext{Inbound: t.tag, InboundType: C.TypeTun}, network, source, destination, firstPacket)
 }
 
+// canonicalAddrPort rewrites a v4-mapped IPv6 address to its four-byte form.
+//
+// A no-op for every other address. It exists so the reason above is written once: an address that
+// arrives in sixteen bytes and is compared against four-byte policy is the shape of every bug in this
+// family.
+func canonicalAddrPort(destination netip.AddrPort) netip.AddrPort {
+	address := destination.Addr()
+	if !address.Is4In6() {
+		return destination
+	}
+	return netip.AddrPortFrom(address.Unmap(), destination.Port())
+}
+
+// canonicalSocksaddr is canonicalAddrPort for the userspace entry points.
+func canonicalSocksaddr(destination M.Socksaddr) M.Socksaddr {
+	address := destination.Addr
+	if !address.Is4In6() {
+		return destination
+	}
+	return M.Socksaddr{
+		Addr: address.Unmap(),
+		Port: destination.Port,
+	}
+}
+
 func (t *Inbound) isDNSHijackDestination(destination M.Socksaddr) bool {
+	destination = canonicalSocksaddr(destination)
 	return slices.Contains(t.dnsHijackAddress, destination.Addr) || t.dnsHijackByPort && destination.Port == 53
 }
 
@@ -720,6 +766,10 @@ func (t *Inbound) NewDNSPacket(payload []byte, source M.Socksaddr, destination M
 
 func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
+	// The router sees the canonical form for the same reason JudgeFlow does: rule matching compares
+	// addresses against CIDR sets, and a sixteen-byte spelling of a four-byte address fails every one
+	// of those comparisons - so the connection would be routed by whichever rules match nothing.
+	destination = canonicalSocksaddr(destination)
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
@@ -739,6 +789,7 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 
 func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
+	destination = canonicalSocksaddr(destination)
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
@@ -764,6 +815,7 @@ func (t *autoRedirectHandler) JudgeFlow(network uint8, source netip.AddrPort, de
 
 func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
+	destination = canonicalSocksaddr(destination)
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun

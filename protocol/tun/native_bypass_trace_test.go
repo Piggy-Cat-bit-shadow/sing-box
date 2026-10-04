@@ -46,6 +46,7 @@ type traceHandler struct {
 
 	access         sync.Mutex
 	judged         []netip.AddrPort
+	verdicts       []tun.FlowVerdict
 	tcpAccepted    []netip.AddrPort
 	udpAccepted    []netip.AddrPort
 	trackedFlows   []*traceFlow
@@ -106,10 +107,19 @@ func newTraceHandler(verdict func(uint8, netip.AddrPort, netip.AddrPort) tun.Flo
 }
 
 func (h *traceHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	verdict := h.verdict(network, source, destination)
 	h.access.Lock()
 	h.judged = append(h.judged, destination)
+	h.verdicts = append(h.verdicts, verdict)
 	h.access.Unlock()
-	return h.verdict(network, source, destination)
+	return verdict
+}
+
+// verdictsSeen returns the verdicts this handler produced, in order.
+func (h *traceHandler) verdictsSeen() []tun.FlowVerdict {
+	h.access.Lock()
+	defer h.access.Unlock()
+	return append([]tun.FlowVerdict(nil), h.verdicts...)
 }
 
 func (h *traceHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
@@ -239,6 +249,53 @@ func tcpSYN(source, destination netip.AddrPort, sequence uint32) []byte {
 	binary.BigEndian.PutUint16(tcpHeader[14:], 65535)
 	binary.BigEndian.PutUint16(tcpHeader[16:], transportChecksum(6, source.Addr(), destination.Addr(), tcpHeader))
 	return packet
+}
+
+// udpDatagramV6 builds a checksummed IPv6 UDP datagram, which is how a v4-mapped destination
+// reaches the stack: the IPv6 header carries ::ffff:a.b.c.d.
+func udpDatagramV6(source, destination netip.AddrPort, payload []byte) []byte {
+	packet := make([]byte, 40+8+len(payload))
+	ipHeader := packet[:40]
+	udpHeader := packet[40 : 40+8]
+
+	ipHeader[0] = 0x60
+	binary.BigEndian.PutUint16(ipHeader[4:], uint16(8+len(payload)))
+	ipHeader[6] = 17
+	ipHeader[7] = 64
+	sourceBytes := source.Addr().As16()
+	destinationBytes := destination.Addr().As16()
+	copy(ipHeader[8:], sourceBytes[:])
+	copy(ipHeader[24:], destinationBytes[:])
+
+	binary.BigEndian.PutUint16(udpHeader[0:], source.Port())
+	binary.BigEndian.PutUint16(udpHeader[2:], destination.Port())
+	binary.BigEndian.PutUint16(udpHeader[4:], uint16(8+len(payload)))
+	copy(packet[48:], payload)
+	binary.BigEndian.PutUint16(udpHeader[6:], transportChecksumV6(source.Addr(), destination.Addr(), udpHeader[:8+len(payload)]))
+	return packet
+}
+
+// transportChecksumV6 is the IPv6 pseudo-header, which is NOT the IPv4 one.
+//
+// The IPv4 pseudo-header is 12 bytes (addresses, zero, protocol, length); the IPv6 one is 40
+// (addresses, a four-byte upper-layer length, three zero bytes, next header). Using the IPv4 layout
+// for an IPv6 packet produces a datagram the stack validates, rejects and drops - and a dropped
+// packet looks exactly like a packet the code under test ignored, which is how a vacuous assertion
+// gets written.
+func transportChecksumV6(source, destination netip.Addr, transport []byte) uint16 {
+	pseudo := make([]byte, 40+len(transport))
+	sourceBytes := source.As16()
+	destinationBytes := destination.As16()
+	copy(pseudo[0:], sourceBytes[:])
+	copy(pseudo[16:], destinationBytes[:])
+	binary.BigEndian.PutUint32(pseudo[32:], uint32(len(transport)))
+	pseudo[39] = 17
+	copy(pseudo[40:], transport)
+	sum := checksum(pseudo)
+	if sum == 0 {
+		return 0xffff
+	}
+	return sum
 }
 
 // udpDatagram builds a checksummed IPv4 UDP datagram.
