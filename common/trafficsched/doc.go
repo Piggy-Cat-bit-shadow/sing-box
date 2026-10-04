@@ -98,6 +98,10 @@
 //
 // # Cost when nothing contends
 //
-// A write costs about 4.5 ns more than writing to the bare writer, with no allocation on the
-// uncontended path. See bench_test.go.
+// A write costs about 9 ns more than writing to the bare writer, with no allocation on the
+// uncontended path. About 2.5 ns of that is the wrapper itself and the rest is the two atomic loads
+// that let a rate be installed, replaced or absent without the gate, the lane policy or the flow
+// holding a copy of it. A real write is measured in microseconds, so this is a fraction of a
+// percent; it is recorded because "the fast path is cheap" should be a number and not a claim. See
+// bench_test.go.
 package trafficsched
