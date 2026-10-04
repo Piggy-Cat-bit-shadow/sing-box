@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/common/trafficclass"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -630,4 +631,93 @@ func TestPacketGatePassesAZeroLengthDatagramOverARealSocket(t *testing.T) {
 	n, _, err := server.ReadFromUDP(payload)
 	require.NoError(t, err, "the empty datagram must reach the socket")
 	require.Zero(t, n)
+}
+
+// --- ownership ------------------------------------------------------------------------------
+
+// TestGateReleasesBuffersItNeverDelegated is the cancel-before-delegate ownership case.
+//
+// The copy loop's contract is that the WRITER owns a buffer once it is handed over, on both the
+// nil and the non-nil return: copyPacketBatchWaitWithPool does not release anything when the batch
+// write fails, because the writer is expected to have done it. A gate that fails BEFORE reaching
+// the upstream therefore owns every buffer itself and must release them, or the pool leaks one
+// buffer per abandoned batch under exactly the conditions that produce them.
+func TestGateReleasesBuffersItNeverDelegated(t *testing.T) {
+	t.Run("stream buffer", func(t *testing.T) {
+		scheduler := NewScheduler(Options{Mode: ModeService, HighIdleWindow: time.Minute})
+		holder := scheduler.NewFlow(trafficclass.ClassInteractive)
+		require.NoError(t, holder.wait(1), "the holder takes the single service slot")
+
+		target := scheduler.NewFlow(trafficclass.ClassInteractive)
+		gate := NewGate(&extendedSink{}, target)
+
+		buffer := newTestBuffer("payload")
+		require.Equal(t, len("payload"), buffer.Len())
+
+		result := make(chan error, 1)
+		go func() { result <- gate.(N.ExtendedWriter).WriteBuffer(buffer) }()
+		time.Sleep(25 * time.Millisecond)
+
+		require.NoError(t, target.Close())
+		require.ErrorIs(t, awaitResult(t, result, "the abandoned buffer write"), ErrClosed)
+		require.Zero(t, buffer.Len(),
+			"a buffer the upstream never saw must be released by the gate, not dropped")
+
+		holder.done()
+	})
+
+	t.Run("packet batch", func(t *testing.T) {
+		scheduler := NewScheduler(Options{Mode: ModeService, HighIdleWindow: time.Minute})
+		holder := scheduler.NewFlow(trafficclass.ClassInteractive)
+		require.NoError(t, holder.wait(1))
+
+		target := scheduler.NewFlow(trafficclass.ClassInteractive)
+		gate := NewPacketGate(&packetSink{}, target)
+		batchWriter, _ := bufio.CreatePacketBatchWriter(gate)
+
+		buffers := []*buf.Buffer{newTestBuffer("aaa"), newTestBuffer("bb"), newTestBuffer("c")}
+		result := make(chan error, 1)
+		go func() {
+			result <- batchWriter.WritePacketBatch(buffers, []M.Socksaddr{{}, {}, {}})
+		}()
+		time.Sleep(25 * time.Millisecond)
+
+		require.NoError(t, target.Close())
+		require.ErrorIs(t, awaitResult(t, result, "the abandoned batch"), ErrClosed)
+		for index, buffer := range buffers {
+			require.Zero(t, buffer.Len(),
+				"every buffer of a batch the upstream never saw must be released: index %d", index)
+		}
+
+		holder.done()
+	})
+}
+
+// TestGateDelegatesOwnershipOnAnUpstreamError is the other half: once the write reaches the
+// upstream, the upstream owns the buffer and the gate must not touch it again. Double-releasing is
+// a no-op in the current buffer implementation, which is exactly why a caller must not depend on
+// being able to do it.
+func TestGateDelegatesOwnershipOnAnUpstreamError(t *testing.T) {
+	upstreamErr := E.New("upstream refused")
+	sink := &failingExtendedSink{err: upstreamErr}
+	gate := NewGate(sink, nil)
+
+	buffer := newTestBuffer("payload")
+	require.ErrorIs(t, gate.(N.ExtendedWriter).WriteBuffer(buffer), upstreamErr)
+	require.Zero(t, buffer.Len(), "the upstream released it, which is the ExtendedWriter contract")
+	require.EqualValues(t, 1, sink.releases.Load(),
+		"and the gate must not have released it a second time")
+}
+
+type failingExtendedSink struct {
+	err      error
+	releases atomic.Int64
+}
+
+func (s *failingExtendedSink) Write([]byte) (int, error) { return 0, s.err }
+
+func (s *failingExtendedSink) WriteBuffer(buffer *buf.Buffer) error {
+	s.releases.Add(1)
+	buffer.Release()
+	return s.err
 }
