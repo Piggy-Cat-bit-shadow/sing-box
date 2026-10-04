@@ -361,14 +361,24 @@ func TestOversizedWriteCannotEscapeShaping(t *testing.T) {
 	}
 
 	shapedResult := shaped.result(results)
-	budget := shaped.rate * 1.10
+	unshapedResult := unshaped.result(results)
+
+	// The budget check is loose on purpose. The measurement window holds about a dozen writes at
+	// this rate and size, so one write landing on either side of the boundary is worth several
+	// percent; the exact accounting is pinned by unit tests instead, which can count bytes rather
+	// than divide totals.
+	budget := shaped.rate * 1.15
 	if shapedResult.bulkThroughput > budget {
 		t.Errorf("an oversized write escaped the shaping budget: admitted %.2f MB/s against a "+
 			"configured %.2f MB/s", shapedResult.bulkThroughput/1_000_000, shaped.rate/1_000_000)
 	}
-	if !(shapedResult.bulkThroughput < unshaped.result(results).bulkThroughput*0.9) {
-		t.Errorf("the control must show the oversized write reaching the wire unshaped; the "+
-			"comparison is meaningless otherwise (control %.2f MB/s, shaped %.2f MB/s)",
-			unshaped.result(results).bulkThroughput/1_000_000, shapedResult.bulkThroughput/1_000_000)
+
+	// What the rig can show reliably is the QUEUE, because that is what the two runs differ by an
+	// order of magnitude on: the control lets a megabyte of oversized writes stand in front of the
+	// wire and the shaper does not.
+	if shapedResult.queueMean >= unshapedResult.queueMean/2 {
+		t.Errorf("the control must show the oversized write reaching the wire unshaped, or the "+
+			"comparison means nothing: control queue mean %d KiB, shaped %d KiB",
+			unshapedResult.queueMean/1024, shapedResult.queueMean/1024)
 	}
 }

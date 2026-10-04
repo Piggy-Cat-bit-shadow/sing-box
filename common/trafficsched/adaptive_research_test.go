@@ -3,6 +3,8 @@ package trafficsched
 import (
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,13 +18,17 @@ import (
 // uploadWriter is the io.Writer half of a gate, named so the flooder goroutines can be shared.
 type uploadWriter = io.Writer
 
-// The adaptive rate prototype.
+// RESEARCH CODE. Not in the build, not reachable from any configuration, not a default.
 //
-// It is deliberately NOT in a non-test file. Round 1 ships a configured rate, and the question this
-// prototype exists to answer is whether a learned one is even viable - so it is evaluated here,
-// against the same scheduler and the same gate, through the same two-method seam a production
-// controller would use. Promoting it later is moving this type into a file that ships; nothing in
-// the scheduler, the gate or the lane policy changes either way.
+// Round 1 ships a configured rate. A learned one is not viable yet, and the measurements below are
+// what says so rather than an opinion: the observable a controller would have to use measures the
+// wait produced by contention instead of the rate of the path, and a controller built on it settles
+// at exactly the rate where the queue is built - which is the thing the feature exists to remove.
+//
+// It lives in a _test.go file on purpose. Nothing here is compiled into the binary, the scheduler
+// exposes no way to select it, and `TestAdaptiveControllerIsNotInProduction` fails if any of that
+// stops being true. It is kept because the measurement is the argument, and an argument that cannot
+// be re-run is a story.
 
 // adaptiveRate learns a shaping rate from the writes it shaped.
 //
@@ -500,4 +506,48 @@ func percentileFloat(values []float64, fraction float64) float64 {
 		}
 	}
 	return sorted[int(float64(len(sorted)-1)*fraction)]
+}
+
+// TestAdaptiveControllerIsNotInProduction is the guard that keeps research out of the product.
+//
+// "It is only in a test file" is a property of the file layout, and file layouts drift. This asserts
+// it against the source, so promoting the prototype - deliberately or by accident - fails here
+// first, with the reason attached.
+func TestAdaptiveControllerIsNotInProduction(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+
+	productionFiles := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		productionFiles++
+		content, readErr := os.ReadFile(name)
+		require.NoError(t, readErr)
+		require.NotContains(t, string(content), "adaptiveRate",
+			"%s is a production file and must not contain the adaptive controller: it is research, "+
+				"and a wrong controller that is reachable from configuration is worse than none", name)
+	}
+	require.Positive(t, productionFiles, "the guard must be reading the package, not an empty directory")
+
+	// Positive control: the identifier the guard looks for must exist somewhere, or a rename would
+	// turn the loop above into a check that passes by finding nothing.
+	research, readErr := os.ReadFile("adaptive_research_test.go")
+	require.NoError(t, readErr)
+	require.Contains(t, string(research), "adaptiveRate",
+		"the guard must be looking for an identifier that exists")
+
+	// The seam the research uses is production, and that is deliberate: FixedRate and a future
+	// learned rate must be able to share one scheduler. Only the controller is research.
+	rateSource, readErr := os.ReadFile("scheduler.go")
+	require.NoError(t, readErr)
+	require.Contains(t, string(rateSource), "type RateSource interface",
+		"the rate-source seam must stay in production code, or promoting a controller would mean "+
+			"changing the scheduler rather than adding to it")
 }

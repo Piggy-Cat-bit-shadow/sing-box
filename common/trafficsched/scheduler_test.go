@@ -1,11 +1,16 @@
 package trafficsched
 
 import (
+	"fmt"
+	"io"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/common/trafficclass"
+	"github.com/sagernet/sing/common/bufio"
 
 	"github.com/stretchr/testify/require"
 )
@@ -533,4 +538,77 @@ func TestAggregateShapingCoversTheHighPriorityLane(t *testing.T) {
 			"the hole the aggregate mode exists to close")
 	require.Greater(t, aggregate, time.Duration(3)*time.Second*burst/rate/2,
 		"aggregate shaping must charge the high-priority lane for what it sends")
+}
+
+// TestAdmittedRateMatchesTheConfiguredRate is the precision half of the shaping contract.
+//
+// A shaper that is approximately right is not right: a rate the path sustains is only safe to
+// configure if the admitted rate does not exceed it, because the excess is exactly the queue the
+// feature exists to prevent. The measurement runs through the REAL copy engine and a real socket, so
+// it also covers the buffer sizes the engine chooses rather than only the scheduler's arithmetic.
+func TestAdmittedRateMatchesTheConfiguredRate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("rate precision measurement runs for several seconds")
+	}
+	const configured = 2 << 20
+	for _, chunk := range []int{16 * 1024, 64 * 1024} {
+		t.Run(fmt.Sprintf("%dKiB-writes", chunk/1024), func(t *testing.T) {
+			scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(configured)})
+			defer scheduler.Close()
+			flow := scheduler.NewFlow(trafficclass.ClassDefault)
+
+			sink, sinkPeer := net.Pipe()
+			defer sink.Close()
+			defer sinkPeer.Close()
+			go func() { _, _ = io.Copy(io.Discard, sinkPeer) }()
+			source, sourcePeer := net.Pipe()
+			defer source.Close()
+			defer sourcePeer.Close()
+
+			gate := NewGate(sink, flow)
+			var accepted atomic.Int64
+			stop := make(chan struct{})
+			writerDone := make(chan struct{})
+			go func() {
+				defer close(writerDone)
+				payload := make([]byte, chunk)
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					written, err := sourcePeer.Write(payload)
+					accepted.Add(int64(written))
+					if err != nil {
+						return
+					}
+				}
+			}()
+
+			start := time.Now()
+			copyDone := make(chan struct{})
+			go func() {
+				defer close(copyDone)
+				_, _ = bufio.CopyWithIncreateBuffer(gate, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+			}()
+
+			time.Sleep(2 * time.Second)
+			elapsed := time.Since(start)
+			close(stop)
+			<-writerDone
+
+			admitted := float64(flow.AdmittedBytes()) / elapsed.Seconds()
+			require.LessOrEqual(t, admitted, float64(configured)*1.02,
+				"the admitted rate must never exceed the configured one by more than the rounding of "+
+					"a single write: an excess is the queue this exists to remove")
+			require.Greater(t, admitted, float64(configured)*0.90,
+				"and it must be within a tenth of it, or the configuration is a promise the shaper "+
+					"does not keep")
+
+			_ = source.Close()
+			_ = sink.Close()
+			<-copyDone
+		})
+	}
 }
