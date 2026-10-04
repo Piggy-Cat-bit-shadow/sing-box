@@ -84,6 +84,21 @@ fi
 
 eval "$(./scripts/ci/apple-signing-config.sh)"
 
+
+# One build number for the whole run.
+#
+# Both TestFlight scripts default APPLE_BUILD_NUMBER to their own `date -u +%Y%m%d%H%M`. Run
+# separately that is harmless, but `testflight` uploads iOS and macOS into ONE App Store Connect
+# record, and letting each derive its own value means a run spanning a minute boundary publishes two
+# build numbers for a single release. Deriving it once here and exporting it keeps the pair together;
+# an explicit APPLE_BUILD_NUMBER from the caller still wins.
+case "$target" in
+  testflight|testflight-ios|testflight-macos)
+    if [ -z "${APPLE_BUILD_NUMBER:-}" ]; then
+      export APPLE_BUILD_NUMBER="$(date -u +%Y%m%d%H%M)"
+    fi
+    ;;
+esac
 mkdir -p dist/apple
 
 step() {

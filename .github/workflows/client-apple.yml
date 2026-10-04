@@ -93,12 +93,14 @@ jobs:
           go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Apple signing regression tests
-        # Cheap invariant checks for the failures that are otherwise silent: a
-        # signed build falling back to unsigned, upstream identifiers left in
-        # place, or entitlements cleared while signing.
-        run: ./scripts/ci/test-apple-signing.sh
-
+      - name: Apple regression tests
+        # Cheap invariant checks for the failures that are otherwise silent: a signed build falling
+        # back to unsigned, upstream identifiers left in place, entitlements cleared while signing,
+        # or a published artifact that does not belong to the commit being released.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/test-apple-signing.sh
+          ./scripts/ci/test-apple-beta-publish.sh
       - name: verify the Apple submodule revision
         run: |
           set -euo pipefail
@@ -403,12 +405,6 @@ jobs:
           # create-dmg makes a Finder-friendly image. The script falls back to
           # hdiutil if this fails, so a brew hiccup cannot break the build.
           brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"
-
-      - name: Apple signing regression tests
-        # Cheap invariant checks for the failures that are otherwise silent: a
-        # signed build falling back to unsigned, upstream identifiers left in
-        # place, or entitlements cleared while signing.
-        run: ./scripts/ci/test-apple-signing.sh
 
       - name: verify the Apple submodule revision
         run: |
