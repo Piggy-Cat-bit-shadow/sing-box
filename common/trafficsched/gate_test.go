@@ -449,7 +449,7 @@ func TestGateKeepsTheVectorisedPathAndStaysInIt(t *testing.T) {
 			"silently fell back")
 	require.EqualValues(t, len("firstsecondthird"), flowAdmitted(flow),
 		"every byte must still pass through the gate, including the ones on the vectorised path")
-	require.EqualValues(t, 2, flow.grants.Load(),
+	require.EqualValues(t, 2, flow.Grants(),
 		"and the batch must have been admitted as ONE unit: one grant for the single buffer "+
 			"(5 bytes, through WriteBuffer) and one for the whole batch (11 bytes, through "+
 			"WriteVectorised). A gate that re-entered WriteBuffer per packet would show three.")
@@ -565,7 +565,7 @@ func TestPacketGateAdmitsOneBatchAsOneUnitAndKeepsTheBatch(t *testing.T) {
 	require.Zero(t, sink.packets.Load(), "and must not be split into single packets")
 	require.EqualValues(t, 6, sink.bytes.Load())
 	require.EqualValues(t, 6, flowAdmitted(flow), "accounted as the SUM of its packet sizes")
-	require.EqualValues(t, 1, flow.grants.Load(), "and as ONE scheduling unit")
+	require.EqualValues(t, 1, flow.Grants(), "and as ONE scheduling unit")
 }
 
 // TestPacketGateKeepsTheConnectedBatchShape is the same rule for the connected variant, whose

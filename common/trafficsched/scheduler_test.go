@@ -30,7 +30,7 @@ func TestUncontendedNormalFlowIsPassThrough(t *testing.T) {
 	flow := scheduler.NewFlow(trafficclass.ClassDefault)
 
 	require.NoError(t, flow.wait(4096))
-	require.Zero(t, flow.grants.Load(),
+	require.Zero(t, flow.Grants(),
 		"an uncontended NORMAL write must not reach the scheduler body")
 	require.EqualValues(t, 4096, flow.admitted.Load(),
 		"but it is still accounted, which is how a scheduler that quietly left the path is "+
@@ -62,7 +62,7 @@ func TestHighPriorityWriteArmsTheScheduler(t *testing.T) {
 	// The high-priority write completes, then the same NORMAL flow takes the scheduled path.
 	high.done()
 	require.NoError(t, normal.wait(1))
-	require.Positive(t, normal.grants.Load(),
+	require.Positive(t, normal.Grants(),
 		"once armed, NORMAL writes must go through the scheduler")
 	normal.done()
 }
@@ -125,10 +125,10 @@ func TestPickLockedServesHighFirstWithANormalFloor(t *testing.T) {
 		scheduler.lanes[laneHigh].push(high)
 		scheduler.lanes[laneNormal].push(normal)
 		scheduler.inflightService = 0
-		chosen := scheduler.pickLocked()
-		require.GreaterOrEqual(t, chosen, 0, "a lane must be servable when both have waiters")
-		picks = append(picks, chosen)
-		scheduler.lanes[lane(chosen)].pop()
+		chosen, flow := scheduler.pickLocked()
+		require.NotNil(t, flow, "a lane must be servable when both have waiters")
+		picks = append(picks, int(chosen))
+		scheduler.lanes[chosen].pop()
 	}
 
 	require.Equal(t, []int{0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, picks,
@@ -145,12 +145,16 @@ func TestPickLockedServesTheOnlyLaneThatHasWorkers(t *testing.T) {
 
 	scheduler.inflightService = 0
 	scheduler.lanes[laneNormal].push(normal)
-	require.Equal(t, int(laneNormal), scheduler.pickLocked())
+	chosen, flow := scheduler.pickLocked()
+	require.Equal(t, laneNormal, chosen)
+	require.Same(t, normal, flow)
 	scheduler.lanes[laneNormal].pop()
 
 	scheduler.inflightService = 0
 	scheduler.lanes[laneHigh].push(high)
-	require.Equal(t, int(laneHigh), scheduler.pickLocked())
+	chosen, flow = scheduler.pickLocked()
+	require.Equal(t, laneHigh, chosen)
+	require.Same(t, high, flow)
 	scheduler.lanes[laneHigh].pop()
 }
 
@@ -316,7 +320,7 @@ func TestDisarmRestoresPassThrough(t *testing.T) {
 
 	require.NoError(t, normal.wait(1))
 	normal.done()
-	require.Zero(t, normal.grants.Load(),
+	require.Zero(t, normal.Grants(),
 		"and NORMAL writes must be back on the immediate path")
 }
 
@@ -366,22 +370,167 @@ func TestTheInstalledDefaultIsInert(t *testing.T) {
 	require.NoError(t, normal.wait(1))
 	require.False(t, scheduler.Armed(),
 		"an inert scheduler must not even start the arm/disarm machinery")
-	require.Zero(t, high.grants.Load())
-	require.Zero(t, normal.grants.Load())
+	require.Zero(t, high.Grants())
+	require.Zero(t, normal.Grants())
 	require.EqualValues(t, 1, high.AdmittedBytes(),
 		"but the gate still observes the bytes, which is what makes the choice reversible")
 	require.EqualValues(t, 1, normal.AdmittedBytes())
 
 	// Granting a rate is what turns it on, and then the same flow is really scheduled.
-	active := NewScheduler(Options{Mode: ModePaced, NormalRate: 1 << 20, HighIdleWindow: time.Minute})
+	active := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(1 << 20), HighIdleWindow: time.Minute})
 	activeHigh := active.NewFlow(trafficclass.ClassInteractive)
 	activeNormal := active.NewFlow(trafficclass.ClassDefault)
 	require.False(t, active.inert())
 	require.NoError(t, activeHigh.wait(1))
-	require.True(t, active.Armed())
+	require.False(t, active.Armed(),
+		"the paced modes must NOT arm: shaping that starts when interactive traffic arrives is "+
+			"shaping that protects the second request, not the first")
 	require.NoError(t, activeNormal.wait(64))
-	require.Positive(t, activeNormal.grants.Load())
+	require.Positive(t, activeNormal.Grants())
 	activeNormal.done()
 	activeHigh.done()
 	require.NoError(t, active.Close())
+}
+
+// TestPacedModeShapesFromTheFirstWrite pins the change that question A forced.
+//
+// The ordering modes arm on high-priority activity. The paced modes must not: shaping that begins
+// when an interactive request arrives cannot protect that request, because the queue it would have
+// prevented is already full. This test asserts the mechanism directly - a single flow writing with
+// no high-priority traffic anywhere is still shaped to the configured rate.
+func TestPacedModeShapesFromTheFirstWrite(t *testing.T) {
+	const (
+		rate  = 100_000
+		burst = 1024
+	)
+	scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(rate), Burst: burst})
+	defer scheduler.Close()
+	flow := scheduler.NewFlow(trafficclass.ClassDefault)
+
+	require.False(t, scheduler.Armed(), "the paced modes must never depend on arming")
+
+	start := time.Now()
+	const writes = 5
+	for index := 0; index < writes; index++ {
+		require.NoError(t, flow.wait(burst))
+		flow.done()
+	}
+	elapsed := time.Since(start)
+
+	// Four of the five writes have to wait a full bucket's worth of time.
+	require.Greater(t, elapsed, time.Duration(writes-1)*time.Second*burst/rate*3/4,
+		"a NORMAL flow must be shaped from its first write, with no interactive traffic in sight")
+	require.Less(t, elapsed, time.Duration(writes)*time.Second*burst/rate*2)
+	require.Zero(t, scheduler.Armed())
+}
+
+// TestOversizedWriteIsChargedNotExempted is question B, as an exact accounting property.
+//
+// The rule this replaced admitted any write larger than the bucket without charging it, because
+// such a write can never be covered and the alternative looked like a deadlock. The consequence
+// was that the largest writes were the only ones exempt from shaping.
+//
+// The charge is now split. The shared bucket pays what the write had to see, which is at most one
+// burst and can therefore never hold another flow hostage. The flow that sent it pays the rest, in
+// its own future, which is the only place that cost belongs.
+func TestOversizedWriteIsChargedNotExempted(t *testing.T) {
+	const (
+		rate  = 2_000_000
+		burst = 16 * 1024
+	)
+	scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(rate), Burst: burst})
+	defer scheduler.Close()
+
+	offender := scheduler.NewFlow(trafficclass.ClassDefault)
+	bystander := scheduler.NewFlow(trafficclass.ClassDefault)
+
+	const oversized = 256 * 1024
+	require.NoError(t, offender.wait(oversized), "the oversized write is admitted once")
+	offender.done()
+
+	scheduler.mu.Lock()
+	tokensAfter := scheduler.tokens
+	scheduler.mu.Unlock()
+	require.GreaterOrEqual(t, tokensAfter, 0.0,
+		"the shared bucket must never go negative: a negative balance is a bill every other flow "+
+			"has to pay")
+
+	// The rest of the cost lands on the flow that incurred it.
+	expected := time.Duration(float64(oversized) / rate * float64(time.Second))
+	start := time.Now()
+	require.NoError(t, offender.wait(1024))
+	offenderElapsed := time.Since(start)
+	offender.done()
+	require.Greater(t, offenderElapsed, expected/2,
+		"an oversized write must not be free: the next write from that flow must pay for most of it")
+	require.Less(t, offenderElapsed, expected*2)
+
+	// And it must not have become everyone else's problem.
+	start = time.Now()
+	require.NoError(t, bystander.wait(1024))
+	bystanderElapsed := time.Since(start)
+	bystander.done()
+	require.Less(t, bystanderElapsed, time.Duration(3)*time.Second*burst/rate,
+		"a bystander must wait at most for the shared bucket, not for another flow's debt")
+}
+
+// TestOversizedWriteCannotBlockItsOwnLane pins the release valve: a flow paying off a large write
+// must not stop the rest of its lane, or one large upload would stall every other interactive flow.
+func TestOversizedWriteCannotBlockItsOwnLane(t *testing.T) {
+	const (
+		rate  = 2_000_000
+		burst = 16 * 1024
+	)
+	scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(rate), Burst: burst})
+	defer scheduler.Close()
+
+	bulk := scheduler.NewFlow(trafficclass.ClassInteractive)
+	small := scheduler.NewFlow(trafficclass.ClassInteractive)
+
+	require.NoError(t, bulk.wait(256*1024), "the bulk flow runs up a debt")
+	bulk.done()
+
+	start := time.Now()
+	result := make(chan error, 1)
+	go func() { result <- small.wait(256) }()
+	require.NoError(t, awaitResult(t, result, "the small write"), 2*time.Second)
+	elapsed := time.Since(start)
+	small.done()
+	require.Less(t, elapsed, 20*time.Millisecond,
+		"a small write must not wait for another flow's debt; the debt is that flow's alone")
+}
+
+// TestAggregateShapingCoversTheHighPriorityLane pins the difference the HIGH-versus-HIGH
+// experiment measured, at the level of the policy.
+//
+// Shaping only the NORMAL lane leaves a high-priority flow free to fill the acceptance windows,
+// and a small high-priority write then waits behind exactly the queue the NORMAL lane was prevented
+// from creating. The aggregate mode closes that by charging the same bucket for both lanes, while
+// the lane policy still decides who spends it first.
+func TestAggregateShapingCoversTheHighPriorityLane(t *testing.T) {
+	const (
+		rate  = 100_000
+		burst = 1024
+	)
+	measure := func(mode Mode) time.Duration {
+		scheduler := NewScheduler(Options{Mode: mode, RateSource: NewFixedRate(rate), Burst: burst})
+		defer scheduler.Close()
+		flow := scheduler.NewFlow(trafficclass.ClassInteractive)
+		start := time.Now()
+		const writes = 4
+		for index := 0; index < writes; index++ {
+			require.NoError(t, flow.wait(burst))
+			flow.done()
+		}
+		return time.Since(start)
+	}
+
+	normalOnly := measure(ModePacedNormalOnly)
+	aggregate := measure(ModePaced)
+
+	require.Less(t, normalOnly, 10*time.Millisecond,
+		"the NORMAL-lane-only shaper must leave high-priority writes entirely unshaped, which is "+
+			"the hole the aggregate mode exists to close")
+	require.Greater(t, aggregate, time.Duration(3)*time.Second*burst/rate/2,
+		"aggregate shaping must charge the high-priority lane for what it sends")
 }
