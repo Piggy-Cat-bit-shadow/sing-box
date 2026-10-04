@@ -194,6 +194,29 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 - **cronet-go 的 replace 只覆盖了仓库根模块，native archive 一直是 upstream 的。** `replace` 只改写一个模块路径，而 cronet-go 是**模块树**：`all` 与每个 `lib/<os>_<arch>` 都是独立模块，嵌套模块不继承根模块的 replace。所以实际构建是"fork 的 Go 代码 + upstream 的 .a"。实测：fork 的 `lib/darwin_arm64/libcronet.a` 是 48110296 字节 / sha256 `f680ff96…`，upstream 的是 48112080 字节 / sha256 `9e2d603e…`，而出货客户端链接的是后者。fork 自己的 `ASYNC_BUFFER_LIFETIME.md` 明确写着它的分析基于"本仓库 vendored 的 C 头与 cgo bridge"——也就是说 Go 侧按 fork 的契约写，native 侧不是 fork 的。唯一一次响亮失败是在 linux/amd64 的 race 构建上（`skipping incompatible ... cannot find -l:libcronet.a`），因为那是本仓库第一次在 Linux 上链接 cronet（server profile 不带 naive，Apple workflow 只建 darwin）。
   现在 30 个模块路径全部 pin，`go.sum` 带上全部 hash；parity 检查从**列表**改为**前缀规则**，upstream 将来新增平台时会要求 pin 而不是被漏掉。
 
+## Load balance：不能被误重构的不变量（Round 6）
+
+这几条是这套功能成立的全部依据，任何"顺手重构"都会让其中一条静默失效：
+
+- **一个已提交的 flow 只能消费一次选择。** round-robin cursor 只在 `commit=true` 时推进；PreMatch 预览
+  （commit=false）必须给出"下一次提交会选谁"的答案而不动任何状态。预览与提交结果不一致 = policy 违规。
+- **提交型 PreMatch 必须自己提交。** `PreMatchFlow` 的 verdict 会被安装成 flow 的 Port 并且不再回到 route
+  路径，所以 preMatchFlow 在确认可提交后要再做一次 commit=true 的解析；否则这类 flow 永远用同一个预览成员，
+  从不轮转（这是本轮 audit 抓到的真实缺口）。
+- **UDP 一个 session 一个成员。** 选择发生在 `routePacketConnection` 的会话级解析（每次会话一次），
+  之后 group 完全退出数据面：它返回的是成员自己的 packet conn。per-datagram 选择在结构上不可能出现，
+  除非有人把解析挪进 copy loop。
+- **group 不是数据面 wrapper。** 链里必须保持具体类型（`outbound.(adapter.OutboundGroup)` 依赖它），
+  而且 group 不包装 conn/packet conn，因此 splice / batch / counters / syscall unwrap 全部保持。
+- **实际 leaf 必须与 chain/tracker 一致。** chain 的最后一个元素就是被 dial 的成员；tracker 记录这条 chain。
+- **hash 的桶空间是成员列表，不是健康子集。** 否则一次健康变化会重映射所有 key，affinity 失去意义。
+- **health 优先于 affinity。** 指到已死成员的 pin 必须被替换，而不是被遵守到 TTL 结束。
+- **health 未知 ≠ dead。** 只有"存在证据且证据为阴性"才排除；完全无证据时不能把整个 group 退化成第一个成员。
+- **控制面不得伪造 now。** LoadBalance 没有单一当前成员：Clash API 对 flow-aware group 省略 `now`，
+  原生 API 报空 `selected`，两者仍然列出全部成员。
+- **探测不等于用户 flow。** `ResolveURLTestLeaf`/`RealTag` 这类标注遍历走 commit=false：健康检查不能移动
+  真实 flow 的成员。
+
 ## 发布边界与验证缺口（Round 4）
 
 - **本轮最重要的发现是环境性的而非代码性的**：开发机是 macOS 非特权用户（`sudo` 需要密码），没有 Linux、没有可配置地址/路由的 TUN、没有签名的 NetworkExtension。所以 **L0 route exclusion、L2 splice、flow table、真机 DNS hijack、真机 FakeIP、网络切换这几项没有任何执行证据**，只有代码论证。完整程序见 [real-tun-validation.md](fork/real-tun-validation.md)，证据状态与 blocker 见 [RELEASE-CERTIFICATE.md](RELEASE-CERTIFICATE.md)。

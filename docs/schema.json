@@ -13208,6 +13208,57 @@
           "type": "object",
           "properties": {
             "type": {
+              "const": "loadbalance"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
+            "outbounds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "outbound"
+              }
+            },
+            "strategy": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "expected_status": {
+              "type": "string"
+            },
+            "interval": {
+              "$ref": "#/$defs/Duration"
+            },
+            "tolerance": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "idle_timeout": {
+              "$ref": "#/$defs/Duration"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
               "const": "naive"
             },
             "tag": {

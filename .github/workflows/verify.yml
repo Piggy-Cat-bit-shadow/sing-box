@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           tags="$(cat release/DEFAULT_BUILD_TAGS)"
-          packages="./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./route/... ./option/..."
+          packages="./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./protocol/group/... ./route/... ./option/..."
           for target in linux/amd64 windows/amd64 freebsd/amd64; do
             goos="${target%%/*}"
             goarch="${target##*/}"
