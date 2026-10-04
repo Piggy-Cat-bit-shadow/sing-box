@@ -69,7 +69,11 @@ pack() {
   eval "$(./scripts/ci/version.sh)"
   version="$JJ_ARTIFACT_VERSION"
   go_version="$JJ_GO_VERSION"
-  xcode_version="$(xcodebuild -version 2>/dev/null | head -1 || echo unknown)"
+  # Collapse to a single printable line. `xcodebuild -version` on a runner can emit a control
+  # character that is legal in a shell variable and illegal in JSON; sanitising here keeps the
+  # value readable in BUILD-INFO-LIBBOX.txt as well.
+  xcode_version="$(xcodebuild -version 2>/dev/null | head -1 | tr -d '\000-\037\177' || true)"
+  [ -n "$xcode_version" ] || xcode_version="unknown"
 
   local artifact_sha
   artifact_sha="$(sha256_of "$tarball")"
@@ -91,18 +95,36 @@ EOF
 
   # manifest.json is the authoritative record. The workflow job that uploads this also names the
   # artifact after the commit, but nothing downstream trusts the name.
-  cat > "$output/manifest.json" <<EOF
-{
-  "parent_sha": "$parent_sha",
-  "apple_submodule_sha": "$submodule_sha",
-  "version": "$version",
-  "build_time_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "xcode_version": "$xcode_version",
-  "go_version": "$go_version",
-  "artifact": "$(basename "$tarball")",
-  "artifact_sha256": "$artifact_sha"
-}
-EOF
+  # manifest.json is the authoritative record. The workflow job that uploads this also names the
+  # artifact after the commit, but nothing downstream trusts the name.
+  #
+  # Written with a real JSON encoder rather than by interpolating into a heredoc. Hand-built JSON
+  # cannot escape what it interpolates, and a single control character in the Xcode version string
+  # was enough to make the manifest unparseable on a runner while it parsed fine on a workstation.
+  python3 - "$output/manifest.json" "$parent_sha" "$submodule_sha" "$version" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$xcode_version" "$go_version" \
+    "$(basename "$tarball")" "$artifact_sha" <<'PY'
+import json
+import sys
+
+path, parent, submodule, version, built, xcode, goversion, artifact, digest = sys.argv[1:10]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "parent_sha": parent,
+            "apple_submodule_sha": submodule,
+            "version": version,
+            "build_time_utc": built,
+            "xcode_version": xcode,
+            "go_version": goversion,
+            "artifact": artifact,
+            "artifact_sha256": digest,
+        },
+        handle,
+        indent=2,
+    )
+    handle.write("\n")
+PY
 
   echo "packed:   $tarball"
   echo "sha256:   $artifact_sha"

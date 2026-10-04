@@ -109,6 +109,28 @@ mv "$tmp/a_renamed" "$tmp/anything-at-all"
 check "validation does not depend on the directory name" \
   "$artifact_tool" validate "$tmp/anything-at-all" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
 
+echo "== manifest is valid JSON whatever the build environment prints =="
+
+# The manifest is parsed by the publish path, so it must be valid JSON and not merely well-formed for
+# the values a workstation happens to produce. A control character in the Xcode version string made
+# it unparseable on a runner while it parsed locally, which is a failure only CI could surface.
+check "the manifest parses as JSON" \
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp/a1/manifest.json"
+
+check "the manifest carries no control characters" \
+  python3 -c '
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+sys.exit(1 if any(b < 0x20 and b not in (0x09, 0x0a, 0x0d) for b in raw) else 0)
+' "$tmp/a1/manifest.json"
+
+# And the packer must sanitise whatever the toolchain emits rather than trusting it to be printable.
+check "the packer sanitises the Xcode version string" \
+  grep -q "tr -d" scripts/ci/apple-libbox-artifact.sh
+
+check "the packer writes the manifest with a JSON encoder" \
+  grep -q "json.dump" scripts/ci/apple-libbox-artifact.sh
+
 echo "== manifest content =="
 
 check "the manifest records the parent commit" \
