@@ -359,3 +359,54 @@ var (
 	_ N.RearHeadroom   = (*framingSink)(nil)
 	_ N.WriterWithMTU  = (*framingSink)(nil)
 )
+
+// replaceableRewriter is a destination-side wrapper that is replaceable for unwrapping purposes
+// AND rewrites every write. It is the shape a NAT packet connection has, and the reason the gate
+// must not be placed below an unexamined unwrap.
+type replaceableRewriter struct {
+	upstream io.Writer
+	marker   string
+}
+
+func (w *replaceableRewriter) Write(p []byte) (int, error) {
+	_, _ = w.upstream.Write([]byte(w.marker))
+	return w.upstream.Write(p)
+}
+
+func (w *replaceableRewriter) WriteBuffer(buffer *buf.Buffer) error {
+	_, _ = w.upstream.Write([]byte(w.marker))
+	_, err := w.upstream.Write(buffer.Bytes())
+	buffer.Release()
+	return err
+}
+
+func (w *replaceableRewriter) WriterReplaceable() bool { return true }
+
+func (w *replaceableRewriter) UpstreamWriter() any { return w.upstream }
+
+func (w *replaceableRewriter) Upstream() any { return w.upstream }
+
+var _ N.WriterWithUpstream = (*replaceableRewriter)(nil)
+
+// TestUploadGateNeverSkipsADestinationSideRewrite pins that the gate wraps the DESTINATION when
+// there is no counter to carry.
+//
+// N.UnwrapCountWriter unwraps through every replaceable wrapper, not only counters, so a gate
+// installed on the unwrapped base would sit BELOW a wrapper that remaps each write - and that
+// wrapper's behaviour would silently disappear. bufio's NAT packet connections are exactly this
+// shape for UDP.
+func TestUploadGateNeverSkipsADestinationSideRewrite(t *testing.T) {
+	sink := &trackingSink{}
+	rewriter := &replaceableRewriter{upstream: sink, marker: "marker:"}
+
+	manager := NewConnectionManager(log.NewNOPFactory().Logger())
+	copyWriter, flow := manager.gateWriter(rewriter, trafficclass.ClassDefault)
+	defer flow.Close()
+
+	_, err := bufio.CopyWithIncreateBuffer(copyWriter, strings.NewReader("payload"), bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	require.NoError(t, err)
+	require.Equal(t, "marker:payload", string(sink.seen),
+		"the destination-side rewrite must still happen; a gate placed below the rewriter would "+
+			"have dropped it")
+	require.Positive(t, flow.AdmittedBytes())
+}

@@ -268,11 +268,14 @@ func (m *ConnectionManager) uploadStreamGate(source net.Conn, destination net.Co
 func (m *ConnectionManager) gateWriter(destination io.Writer, class trafficclass.Class) (io.Writer, *trafficsched.Flow) {
 	flow := m.scheduler.NewFlow(class)
 	upstream, counters := N.UnwrapCountWriter(destination, nil)
-	gate := trafficsched.NewGate(upstream, flow)
 	if len(counters) == 0 {
-		return gate, flow
+		// Nothing to preserve, so there is no reason to move the gate below whatever the
+		// destination is. Wrapping it directly also keeps any behaviour the destination itself
+		// has: N.UnwrapCountWriter unwraps through every replaceable wrapper, not only counters,
+		// and a wrapper that rewrites a write would be silently skipped if the gate sat under it.
+		return trafficsched.NewGate(destination, flow), flow
 	}
-	return &counterPreservingWriter{gate: gate, counters: counters}, flow
+	return &counterPreservingWriter{gate: trafficsched.NewGate(upstream, flow), counters: counters}, flow
 }
 
 // connectionIncreaseBufferAfter reports after how many copied bytes the copy loop that
@@ -489,11 +492,14 @@ func (m *ConnectionManager) uploadPacketGate(destination N.PacketWriter, class t
 	}
 	flow := m.scheduler.NewFlow(class)
 	upstream, counters := N.UnwrapCountPacketWriter(destination, nil)
-	gate := trafficsched.NewPacketGate(upstream, flow)
 	if len(counters) == 0 {
-		return gate, flow
+		// See gateWriter: with no counters to carry, wrapping the destination itself is the only
+		// choice that cannot skip a destination-side rewrite. bufio's NAT packet conns are
+		// exactly that kind of wrapper - they remap the per-packet destination - and they are not
+		// replaceable today, which is a property to depend on rather than to assume.
+		return trafficsched.NewPacketGate(destination, flow), flow
 	}
-	return &counterPreservingPacketWriter{gate: gate, counters: counters}, flow
+	return &counterPreservingPacketWriter{gate: trafficsched.NewPacketGate(upstream, flow), counters: counters}, flow
 }
 
 // counterPreservingWriter keeps a destination's write counters visible across a non-replaceable
