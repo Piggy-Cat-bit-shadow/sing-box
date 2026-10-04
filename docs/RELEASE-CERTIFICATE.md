@@ -66,6 +66,23 @@ rather than of the pin. **No product is affected**: the Linux product ships
 The Verify workflow therefore runs the configuration surface under the server profile, which is what
 Linux ships. A Linux *client* with the Naive outbound would need this resolved first.
 
+## Found while adding load balancing: a pre-existing Linux goroutine leak
+
+`dns/transport/local.(*DBusResolvedResolver).loopUpdateStatus` never returns. It ranges over a
+channel registered with `t.systemBus.Signal(signalChan)` (`local_resolved_linux.go:347-349`), and
+nothing closes that channel: `Close()` cancels the update context, unregisters the callbacks and
+closes the system bus (`:216`), but the range stays blocked for the life of the process.
+
+It is unconditional on that path - not a race, not load-dependent - and it is in the DNS transport
+rather than in anything this feature touches. It was found by running the `test/` module on a
+Linux runner for the first time; the module's `TestMain` fails the run on it, so the loadbalance
+box-level tests stay out of push CI until it is fixed, with the reproduction and the reasoning
+recorded in `.github/workflows/verify.yml`.
+
+The fix is a close of the signal channel in `Close()` (and a `sync.Once` around the loop's
+teardown). It is not made here because this machine cannot execute that path: the D-Bus resolver
+only exists on Linux with systemd-resolved present, so the fix would ship unverified.
+
 ## Release blockers, exactly
 
 1. **A real-TUN run of §1, §2, §4, §6 and §7**, on Linux with root, with the results recorded here.
