@@ -148,7 +148,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if selectedRule == nil {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP)
+	chain, err := resolveOutbound(selectedOutbound, &metadata, N.NetworkTCP, true)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
@@ -181,14 +181,32 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	return nil
 }
 
-func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbound, error) {
+// resolveOutbound walks the matched outbound down to the leaf that will carry the flow.
+//
+// # commit
+//
+// A group whose choice depends on the flow - a load balancing group - has to know whether
+// the caller will own the connection this chain is for. The pre-match preview runs this
+// same walk for a verdict that may be discarded when the connection is created, and a
+// balancing group that consumed its rotation or wrote an affinity pin for a preview would
+// spend a slot on nothing: the two walks for one flow would disagree, and one of them would
+// be wrong about which member carried it.
+//
+// Callers that own the connection pass true; the speculative preview passes false. Groups
+// without the flow-aware capability ignore the question entirely, so an existing
+// configuration routes through exactly the code it did before.
+func resolveOutbound(outbound adapter.Outbound, metadata *adapter.InboundContext, network string, commit bool) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
 		group, isGroup := outbound.(adapter.OutboundGroup)
 		if !isGroup {
 			break
 		}
-		outbound = group.Selected(network)
+		if flowAware, isFlowAware := group.(adapter.FlowAwareOutboundGroup); isFlowAware {
+			outbound = flowAware.SelectForFlow(metadata, network, commit)
+		} else {
+			outbound = group.Selected(network)
+		}
 		if outbound == nil {
 			return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", group.Tag())
 		}
@@ -350,7 +368,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if selectedRule == nil || selectReturn {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP)
+	chain, err := resolveOutbound(selectedOutbound, &metadata, N.NetworkUDP, true)
 	if err != nil {
 		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
@@ -762,7 +780,11 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 			return continueResult
 		}
 	}
-	chain, err := resolveOutbound(outbound, metadata.Network)
+	// A preview, not a commitment: this chain decides whether the pre-match verdict can
+	// bypass, and for a direct flow the verdict is discarded when the connection is
+	// created and the full route resolves again. Passing false is what keeps that second
+	// walk from being a second selection of the same flow.
+	chain, err := resolveOutbound(outbound, metadata, metadata.Network, false)
 	if err != nil {
 		return continueResult
 	}
@@ -802,6 +824,36 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	flowAction := flowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr)
 	if flowAction != adapter.PreMatchFlow {
 		return adapter.PreMatchResult{Action: flowAction, Outbound: outbound}
+	}
+
+	// This verdict COMMITS the flow, so the choice is committed here.
+	//
+	// A flow port receives this result and builds the connection from it; the flow does not
+	// return to this function, and for a flow-capable port it does not reach the route path
+	// again either. The walk above therefore decided only that the flow CAN be given a port,
+	// and this walk decides which member owns it - the only one allowed to consume a
+	// balancing decision. Without it, a balancing group whose members can own a port would
+	// answer every such flow with the same previewed member, because nothing ever committed.
+	//
+	// A committed member that cannot own a port sends the flow back to the route path, which
+	// resolves once more with the same commit flag. That costs that flow one extra balancing
+	// decision, and it can only happen for a group mixing port-capable and port-less members;
+	// the alternative - never committing here - would leave every port-capable flow on one
+	// member for the life of the group, which is the silent failure this feature exists to
+	// avoid.
+	committedChain, committedErr := resolveOutbound(outbound, metadata, metadata.Network, true)
+	if committedErr != nil {
+		return continueResult
+	}
+	committedOutbound := committedChain[len(committedChain)-1]
+	if committedOutbound != outbound {
+		committedFlowOutbound, isCommittedFlowOutbound := committedOutbound.(adapter.FlowOutbound)
+		if !isCommittedFlowOutbound || committedFlowOutbound.PreMatchFlow(metadata.Network, metadata.Destination.Addr) != adapter.PreMatchFlow {
+			return continueResult
+		}
+		outbound = committedOutbound
+		flowOutbound = committedFlowOutbound
+		chain = committedChain
 	}
 	result := adapter.PreMatchResult{Action: adapter.PreMatchFlow, Outbound: outbound}
 	if metadata.Network == N.NetworkUDP {

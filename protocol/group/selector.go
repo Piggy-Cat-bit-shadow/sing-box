@@ -224,7 +224,17 @@ func ResolveURLTestLeaf(detour adapter.Outbound, network string) (leaf adapter.O
 		}
 		visited[detour] = struct{}{}
 
-		next := group.Selected(network)
+		var next adapter.Outbound
+		if flowAware, isFlowAware := group.(adapter.FlowAwareOutboundGroup); isFlowAware {
+			// A preview. This traversal labels a measurement, and a measurement is not a
+			// user flow: it has no metadata to balance on and it does not own the
+			// connection it is about to make. Letting it consume a rotation or write an
+			// affinity pin would let a health check move the member a real flow is then
+			// given.
+			next = flowAware.SelectForFlow(nil, network, false)
+		} else {
+			next = group.Selected(network)
+		}
 		if next == nil {
 			return nil, E.New("outbound group ", group.Tag(), " has no selected member for ", network)
 		}
