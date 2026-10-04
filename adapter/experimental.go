@@ -161,3 +161,35 @@ type URLTestGroup interface {
 	URLTest(ctx context.Context) (map[string]uint16, error)
 	PerformUpdateCheck()
 }
+
+// FlowAwareOutboundGroup is an OPTIONAL capability of a group whose member choice
+// depends on which flow is being routed rather than only on the network.
+//
+// # Why it is a separate interface
+//
+// Selected(network) is the contract every group already implements, and it is the right
+// contract for the groups whose choice does not depend on the flow: a selector has one
+// answer, a urltest has one best node. Load balancing does not: its answer is a property
+// of the flow, so it needs the flow, which Selected does not receive.
+//
+// Adding the parameter to Selected would have changed every implementation and every
+// caller at once. This capability is asked for where the flow exists and is absent
+// everywhere else, so an existing group is untouched and only a balancing group pays
+// for the fewer than one interface assertion per routing decision.
+type FlowAwareOutboundGroup interface {
+	OutboundGroup
+
+	// SelectForFlow chooses the member that serves this flow.
+	//
+	// commit reports whether the caller will own the connection this choice is for. A
+	// speculative caller - the pre-match preview, a leaf-labeling traversal, a
+	// control-plane read - passes false, and the implementation MUST then answer
+	// purely: no balanced cursor advance, no affinity write, no accounting side effect.
+	// Its answer may be used to make a decision about a connection that is never
+	// created, so consuming state for it would spend a slot on nothing and let two
+	// callers for one flow disagree about the member.
+	//
+	// It returns nil only when the group cannot serve the network at all, which the
+	// caller reports as an error rather than falling through to another outbound.
+	SelectForFlow(metadata *InboundContext, network string, commit bool) Outbound
+}

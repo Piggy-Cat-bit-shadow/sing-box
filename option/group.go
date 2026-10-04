@@ -22,3 +22,50 @@ type URLTestOutboundOptions struct {
 	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 }
+
+// LoadBalanceOutboundOptions configures the loadbalance outbound group.
+//
+// # What this group is
+//
+// It distributes NEW flows over its members and keeps each flow on the member it was
+// given. It does not bond, stripe or reassemble anything: one flow is one member for
+// the flow's whole life, which is what keeps NAT, TLS and application state intact.
+//
+// # Strategy
+//
+// The default is round_robin, not the consistent-hashing default that Clash-derived
+// clients use. Hashing on the destination sends every flow to the same site to the same
+// member, which for a client whose traffic is concentrated on a few sites is the
+// opposite of what the group is for. A configuration that wants the hashing behaviour
+// states it.
+type LoadBalanceOutboundOptions struct {
+	Outbounds []string `json:"outbounds" reference:"outbound"`
+	// Strategy selects how a member is chosen for a new flow:
+	//
+	//	round_robin        successive flows go to successive members (default)
+	//	consistent_hashing flows to the same destination key keep the same member
+	//	sticky_sessions    flows from the same source to the same destination keep the
+	//	                   same member for a bounded time
+	Strategy string `json:"strategy,omitempty"`
+	// URL enables health-aware candidate filtering, using the same measurement the
+	// urltest group uses. Empty disables it: with nothing measuring the members,
+	// "no health entry" cannot mean "dead", so every member stays a candidate.
+	URL string `json:"url,omitempty"`
+	// ExpectedStatus restricts which HTTP statuses count as reachable, as in urltest.
+	ExpectedStatus string `json:"expected_status,omitempty"`
+	// Interval is the health re-check interval. Defaults to three minutes.
+	Interval badoption.Duration `json:"interval,omitempty"`
+	// Tolerance is accepted but unused for selection: it is a urltest notion of how much
+	// slower a node may be and still be preferred, and a balancing group does not rank.
+	Tolerance uint16 `json:"tolerance,omitempty"`
+	// IdleTimeout stops the health checker after the group has been idle this long.
+	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	//
+	// There is deliberately no failover option. Retrying another member is only safe
+	// before any application byte has been delivered to a destination, and the route path
+	// hands the flow to the chosen leaf's own DialContext - this group never sees that
+	// dial, so it cannot know whether the connection was established when it failed. A
+	// retry implemented here would be reachable on the detour path and silently absent on
+	// the route path, which is worse than no retry: the option would appear to work and
+	// would not, and on the path where it did work it could replay a request.
+}
