@@ -1,3 +1,5 @@
+//go:build linux || netbsd || darwin
+
 package trafficsched
 
 import (
@@ -85,21 +87,4 @@ func TestPacketGatePreservesTheDestinationSyscallBatch(t *testing.T) {
 
 	received := []string{string(readDatagram(t, server)), string(readDatagram(t, server))}
 	require.ElementsMatch(t, []string{"one", "two"}, received)
-}
-
-// TestPacketGatePassesAZeroLengthDatagramOverARealSocket closes the item the gate's unit test can
-// only cover behaviourally: an empty datagram is a legal packet, and a gate must not treat
-// "nothing to admit" as "nothing to send".
-func TestPacketGatePassesAZeroLengthDatagramOverARealSocket(t *testing.T) {
-	// An unconnected socket, because that is the shape whose WritePacket carries a destination.
-	server, client := newUDPPair(t, false)
-	gate := NewPacketGate(bufio.NewPacketConn(client), nil)
-
-	destination := M.SocksaddrFromNet(server.LocalAddr()).Unwrap()
-	require.NoError(t, gate.WritePacket(buf.NewSize(16), destination))
-	require.NoError(t, server.SetReadDeadline(time.Now().Add(2*time.Second)))
-	payload := make([]byte, 64)
-	n, _, err := server.ReadFromUDP(payload)
-	require.NoError(t, err, "the empty datagram must reach the socket")
-	require.Zero(t, n)
 }

@@ -2,9 +2,11 @@ package trafficsched
 
 import (
 	"io"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/common/trafficclass"
 	"github.com/sagernet/sing/common/buf"
@@ -603,4 +605,29 @@ func TestPacketGateMTUIsAbsentWhenTheChainHasNone(t *testing.T) {
 	_, hasMTU := gate.(N.WriterWithMTU)
 	require.False(t, hasMTU)
 	require.Zero(t, N.CalculateMTU(nil, gate))
+}
+
+// TestPacketGatePassesAZeroLengthDatagramOverARealSocket closes the item the gate's unit test can
+// only cover behaviourally: an empty datagram is a legal packet, and a gate must not treat
+// "nothing to admit" as "nothing to send".
+func TestPacketGatePassesAZeroLengthDatagramOverARealSocket(t *testing.T) {
+	// An unconnected socket, because that is the shape whose WritePacket carries a destination.
+	// The socket pair is built here rather than shared with the syscall batch tests so this one
+	// runs on every platform.
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	gate := NewPacketGate(bufio.NewPacketConn(client), nil)
+
+	destination := M.SocksaddrFromNet(server.LocalAddr()).Unwrap()
+	require.NoError(t, gate.WritePacket(buf.NewSize(16), destination))
+	require.NoError(t, server.SetReadDeadline(time.Now().Add(2*time.Second)))
+	payload := make([]byte, 64)
+	n, _, err := server.ReadFromUDP(payload)
+	require.NoError(t, err, "the empty datagram must reach the socket")
+	require.Zero(t, n)
 }
