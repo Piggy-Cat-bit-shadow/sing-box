@@ -25,6 +25,14 @@ var (
 type ResolveDialer interface {
 	N.Dialer
 	QueryOptions() adapter.DNSQueryOptions
+	// EffectiveFamilyStrategy reports the family policy that actually applies, which is the
+	// caller's value unless the resolver has its own and the caller left it unset.
+	//
+	// Exported because the native-bypass profile has to ask the same question the dial path asks. A
+	// strict policy also filters the LITERAL destination of a flow - not just resolved candidates -
+	// so a profile that assumed "a literal needs no resolver" would bypass a connection the
+	// userspace path would have refused to dial.
+	EffectiveFamilyStrategy() C.DomainStrategy
 }
 
 type ParallelInterfaceResolveDialer interface {
@@ -476,6 +484,10 @@ func (d *resolveDialer) raceResolvedName(ctx context.Context, network string, de
 // keeps the caller's value, which is the safe degradation - a caller that said ipv4_only still
 // gets ipv4_only, and a caller that said AsIS with a router that cannot answer is treated as
 // having no family restriction rather than an invented one.
+func (d *resolveDialer) EffectiveFamilyStrategy() C.DomainStrategy {
+	return d.effectiveFamilyStrategy()
+}
+
 func (d *resolveDialer) effectiveFamilyStrategy() C.DomainStrategy {
 	d.effectiveStrategyOnce.Do(func() {
 		strategy := d.queryOptions.Strategy
@@ -535,7 +547,7 @@ func (d *resolveDialer) dialLiteralWithRecovery(ctx context.Context, network str
 	// literal IPv6 address would be dialled under ipv4_only, silently turning a strict policy
 	// into a suggestion. The original is preferred, not exempt.
 	// The EFFECTIVE strategy, not the caller's raw value. See effectiveFamilyStrategy.
-	originalAllowed := addressAllowedByStrategy(destination.Addr, d.effectiveFamilyStrategy())
+	originalAllowed := AddressAllowedByStrategy(destination.Addr, d.effectiveFamilyStrategy())
 	if originalAllowed {
 		originalWorkers.Add(1)
 		go func() {
@@ -646,7 +658,7 @@ func (d *resolveDialer) dialRecoveredOrReport(ctx context.Context, network strin
 	// that the effective policy already answered the question.
 	strategy := d.effectiveFamilyStrategy()
 	original := destination.Addr
-	if !addressAllowedByStrategy(original, strategy) {
+	if !AddressAllowedByStrategy(original, strategy) {
 		original = netip.Addr{}
 	}
 	candidates := MergeOriginalDestination(original, addresses, strategy)
@@ -798,7 +810,7 @@ const preferredFamilyGrace = 50 * time.Millisecond
 //
 // Only the strict strategies exclude. AsIS, PreferIPv4 and PreferIPv6 all admit both families,
 // so the original address is always dialled under them.
-func addressAllowedByStrategy(address netip.Addr, strategy C.DomainStrategy) bool {
+func AddressAllowedByStrategy(address netip.Addr, strategy C.DomainStrategy) bool {
 	if !address.IsValid() {
 		return true
 	}
