@@ -36,6 +36,7 @@ Everything else below is either verified here or named as outstanding.
 | Scheduler | Aggregate shaping, no over-admission, high-priority coverage, goroutine lifecycle, transition release | `common/trafficsched` |
 | Traffic class | Per-flow classification, whole-token matching, lane mapping | `common/trafficclass`, `route` |
 | MASQUE, Naive, protocols | Their packages' suites, in the affected-package run and in CI | CI |
+| Platform-independent eligibility tests | The self-address guard differs by platform on purpose (upstream's "Fix routing loop to exact TUN address on darwin"), and the tests now assert the invariant rather than one platform's answer; verified by forcing the non-Darwin branch locally | `protocol/direct` |
 | Config and schema | `route.traffic_scheduler` round-trips, absent stays byte-identical, `docs/schema.json` regenerated | `option` |
 | Pinned dependency tree | Every module path cronet-go publishes is pinned to the fork, and the parity rule is a prefix rule so a new platform cannot be missed | `scripts/ci/check-go-module-integrity.sh` |
 | v4-mapped policy comparisons | Four symptoms (DNS hijack, FakeIP guard, route sets, router metadata) asserted end to end through the real stack, with two mutations proving they bite | `protocol/tun/mapped_address_test.go`, `adapter/judge_flow_mapped_test.go` |
@@ -53,6 +54,17 @@ Everything else below is either verified here or named as outstanding.
 | Network transitions | needs interfaces you can take down | §7 |
 | Apple NetworkExtension | needs a signed build and a device | §8 |
 | Startup and idle memory under a TUN client | the TUN stack, route mirror and flow table are not in the SOCKS baseline | §8 |
+
+## Known limitation, recorded rather than hidden
+
+`github.com/sagernet/cronet-go/lib/linux_amd64` does not link under a `-race` build on ubuntu-latest
+(`skipping incompatible ... cannot find -l:libcronet.a`). The archive is a well-formed x86-64 static
+library - 2736 ELF64/EM_X86_64 relocatable members, verified by parsing every member's header - and the
+fork's copy is byte-identical to upstream's at this pin, so this is a property of what is published
+rather than of the pin. **No product is affected**: the Linux product ships
+`release/DEFAULT_BUILD_TAGS_OTHERS`, which has no `with_naive_outbound`, so no Linux build links cronet.
+The Verify workflow therefore runs the configuration surface under the server profile, which is what
+Linux ships. A Linux *client* with the Naive outbound would need this resolved first.
 
 ## Release blockers, exactly
 

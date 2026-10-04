@@ -75,7 +75,19 @@ jobs:
       - name: race on the fork's own data paths
         # Bounded to the packages the fork actually changed. The artifact workflows own the full race
         # suite; this is the subset where a fork-local regression would land first.
+        #
+        # The configuration surface is a separate step because the `option` package's TEST binary
+        # links cronet (through a naive-related test), and no Linux product links cronet: the server
+        # profile is release/DEFAULT_BUILD_TAGS_OTHERS, which has no with_naive_outbound. Running it
+        # under the server profile covers every decode, schema and round-trip test in the package,
+        # and it is what Linux actually ships.
         run: |
           set -euo pipefail
           tags="$(cat release/DEFAULT_BUILD_TAGS)"
-          go test -race -count=1 -timeout 30m -tags "$tags" ./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./route/... ./option/...
+          go test -race -count=1 -timeout 30m -tags "$tags" ./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./route/... ./adapter/...
+
+      - name: race on the configuration surface
+        run: |
+          set -euo pipefail
+          tags="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
+          go test -race -count=1 -timeout 30m -tags "$tags" ./option/...

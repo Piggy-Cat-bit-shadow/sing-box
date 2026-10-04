@@ -203,6 +203,12 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 - **内存基线（macOS arm64，真实二进制 + SOCKS 入站，无 TUN）**：idle RSS ~43 MiB；100 条连接持有期间每条约 20–40 KB；关闭后 active connection 列表回到 0；两轮之间的增长 1.6 MiB（低于 2 MiB 泄漏阈值）。RSS 在 macOS 上抖动明显，所以有意义的信号是**差值**与连接计数断言，而不是绝对值。TUN 客户端的 stack/路由镜像/flow table 不在这份基线里。
 - **半关闭不是泄漏**：客户端已关闭但对端仍未关闭的连接会继续留在 active list 里，直到 session 结束（或被 timeout 回收）。这是正确行为，harness 的断言只针对**两端都已结束**的情况，并且用了一个"两端都关"的对照实验先确立了这条契约。
 
+## 最终 Debug 轮的 CI / 平台发现（Round 5 续）
+
+- **`isMyLoopbackAddress` 的平台差异是上游有意为之，不是 bug。** `if !C.IsDarwin && prefix.Addr() == address { continue }` 来自上游提交 `7da573f18 direct: Fix routing loop to exact TUN address on darwin`：Darwin 上"目标恰好等于本机某个 prefix 的地址"会被判为自身地址（修 TUN 路由环），其他平台保留旧行为。Round 2 我写的测试硬编码了 Darwin 的答案，于是在 Linux runner 上红（并因 fixture 没有 logger 而 panic）。测试已改为断言**不变量**（bypass 判定与 dial 路径必须给同一答案），平台答案只记录不断言；用"强制走非 Darwin 分支"的变异在本地验证过它两边都过。
+- **Linux 上 cronet 无法在 `-race`(`-no-pie`) 下链接**：`lib/linux_amd64` 是格式良好的 x86-64 静态库（逐成员解析 ELF 头：2736 个 ELF64/EM_X86_64 可重定位成员），且 fork 的这份与 upstream 在此 pin 上**逐字节相同**——所以这是"发布出来的产物"的属性，不是 pin 的问题。**没有产品受影响**：Linux 产品用 `DEFAULT_BUILD_TAGS_OTHERS`（不含 `with_naive_outbound`），任何 Linux 构建都不链接 cronet。因此 Verify 的配置面用 server profile 跑。将来若要有带 Naive 的 Linux 客户端，必须先解决这一条。
+- **只有 `./option` 的测试二进制会链接 cronet**（3 个包，经一个 naive 相关测试传递引入）；其余 fork 数据面包在 client profile 下也不引入。
+
 ## 当前未闭环的验证边界
 
 - live IPv6 H3 Packet Too Big；现有 ICMPv6 形状测试与 IPv4 live H3 PTB 均不能代替它。

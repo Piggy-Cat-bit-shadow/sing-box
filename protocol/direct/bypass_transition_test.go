@@ -34,27 +34,53 @@ import (
 //
 // If CanBypass said yes where DialContext says no, the bypass would connect to an address the
 // userspace path deliberately refuses, which is how a TUN ends up routing a connection back into
-// itself.
+// itself. The invariant is that they agree, NOT that a particular address is refused, because the
+// platform decides that:
+//
+//	isMyLoopbackAddress skips an exact prefix-address match on every platform EXCEPT Darwin
+//	    if !C.IsDarwin && prefix.Addr() == address { continue }
+//
+// That condition is deliberate - upstream's "direct: Fix routing loop to exact TUN address on
+// darwin" - so the same /32 is refused on Darwin and allowed elsewhere. A test that hardcoded one of
+// the two answers was green on the development machine and red on the Linux CI runner, which is how
+// this was found. The agreement is asserted on both platforms; the platform's own answer is logged.
 func TestBypassAgreesWithTheDialPathOnSelfAddresses(t *testing.T) {
 	outbound := bypassable(option.DialerOptions{})
-	tunPrefix := netip.MustParsePrefix("10.0.0.1/32")
-	outbound.myAddresses.Store([]netip.Prefix{tunPrefix})
+	// A /24 whose network address is not the destination, so the platform-specific branch above does
+	// not apply and the assertion is about the guard rather than about which spelling of the address
+	// the platform compares.
+	outbound.myAddresses.Store([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")})
 
 	self := netip.MustParseAddr("10.0.0.1")
 	other := netip.MustParseAddr("93.184.216.34")
 
-	_, dialErr := outbound.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(self.String()+":443"))
-	require.Error(t, dialErr, "the userspace path refuses this host's own address")
+	require.True(t, outbound.isMyLoopbackAddress(self),
+		"an address inside one of this host's prefixes is this host's address on every platform")
 	require.False(t, outbound.CanBypass(N.NetworkTCP, self),
-		"and the bypass must refuse it too, or the two paths disagree about the same connection")
+		"so the bypass must refuse it too, or the two paths disagree about the same connection")
+
+	// The refusal itself, when the platform's guard applies: this is what the dial path returns.
+	_, dialErr := outbound.DialContext(context.Background(), N.NetworkTCP, M.ParseSocksaddr(self.String()+":443"))
+	require.Error(t, dialErr, "the userspace path refuses its own address")
+	require.ErrorContains(t, dialErr, "loopback")
 
 	require.True(t, outbound.CanBypass(N.NetworkTCP, other),
 		"an unrelated destination is unaffected")
+
+	// The exact prefix address, which is where the platforms differ. The invariant is asserted; the
+	// answer is not, and the log says which one this platform gave.
+	exact := netip.MustParsePrefix("10.0.0.2/32")
+	outbound.myAddresses.Store([]netip.Prefix{exact})
+	refused := outbound.isMyLoopbackAddress(exact.Addr())
+	t.Logf("this platform refuses the exact prefix address %s: %v", exact.Addr(), refused)
+	require.Equal(t, !refused, outbound.CanBypass(N.NetworkTCP, exact.Addr()),
+		"the bypass and the dial path must give the same answer to the same question, whichever it is")
 
 	// The guard is exactly as fresh as the dial path's, which is the property that matters: a stale
 	// or never-fetched address list makes both paths permissive together rather than one of them
 	// silently stricter.
 	outbound.myAddresses.Store(nil)
+	require.False(t, outbound.isMyLoopbackAddress(self))
 	require.True(t, outbound.CanBypass(N.NetworkTCP, self),
 		"with no address list both paths allow it; the bypass does not invent a stricter rule than "+
 			"the dial path applies")
@@ -155,7 +181,9 @@ func TestBypassFollowsAnInterfaceUpdate(t *testing.T) {
 
 	outbound.InterfaceUpdated(context.Background())
 	require.Equal(t, netip.MustParseAddr("192.168.1.20"), outbound.myAddresses.Load()[0].Addr())
-	require.False(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("192.168.1.20")),
+	// A destination inside the prefix but not its network address, so the platform-specific
+	// exact-address branch does not decide the assertion.
+	require.False(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("192.168.1.21")),
 		"an address this host owns is refused")
 
 	// The transition: the same interface, a different address, which is what a network change
@@ -166,10 +194,10 @@ func TestBypassFollowsAnInterfaceUpdate(t *testing.T) {
 	}
 	outbound.InterfaceUpdated(context.Background())
 
-	require.False(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("10.5.0.20")),
-		"the guard must follow the update: this is the current address and a bypass to it would "+
-			"loop back into the TUN")
-	require.True(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("192.168.1.20")),
+	require.False(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("10.5.0.21")),
+		"the guard must follow the update: this is an address on the current interface and a bypass "+
+			"to it would loop back into the TUN")
+	require.True(t, outbound.CanBypass(N.NetworkTCP, netip.MustParseAddr("192.168.1.21")),
 		"and the address from before the transition must stop being treated as this host's, or the "+
 			"guard would keep refusing connections the new network routes normally")
 }

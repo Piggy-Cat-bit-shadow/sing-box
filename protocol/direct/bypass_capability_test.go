@@ -108,12 +108,15 @@ func TestCanBypassPreservesTheLoopbackGuard(t *testing.T) {
 	// routing a connection back into itself. A bypass is a connect performed by the platform
 	// rather than by this dialer, so this guard is the only thing standing between the fast path
 	// and that loop.
-	selfPrefix := netip.MustParsePrefix("10.0.0.1/32")
+	// A /24 whose network address is not the destination. The exact-address spelling is refused on
+	// Darwin and allowed elsewhere, deliberately (see TestBypassAgreesWithTheDialPathOnSelfAddresses),
+	// so a test that wants to pin the guard uses this form.
+	selfPrefix := netip.MustParsePrefix("10.0.0.0/24")
 	plain := bypassable(option.DialerOptions{})
 	plain.myAddresses.Store([]netip.Prefix{selfPrefix})
 
 	require.False(t, plain.CanBypass(N.NetworkTCP, netip.MustParseAddr("10.0.0.1")),
-		"a destination matching this outbound's own address must not be bypassed")
+		"a destination inside this outbound's own prefix must not be bypassed")
 	require.Contains(t, plain.BypassBlockers(N.NetworkTCP, netip.MustParseAddr("10.0.0.1")).String(),
 		"this host's own address")
 
