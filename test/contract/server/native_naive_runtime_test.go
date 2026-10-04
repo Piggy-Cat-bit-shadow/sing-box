@@ -187,21 +187,44 @@ func buildFixtureInbound(t *testing.T, tag string) adapter.Inbound {
 // registry reports.
 func TestServerBuildsNativeNaiveInbound(t *testing.T) {
 	instance := buildFixtureInbound(t, "naive-in")
-	defer instance.Close()
 
 	require.Equal(t, "naive", instance.Type(),
 		"the constructed inbound must report the naive type")
 	require.Equal(t, "naive-in", instance.Tag())
 
-	// Start binds the real listener. A stub, or an inbound whose constructor
-	// half-succeeded, fails here rather than only under `run`.
-	require.NoError(t, instance.Start(adapter.StartStateStart),
-		"the Native Naive inbound must start; construction alone would not prove the "+
-			"listener path is intact")
+	// The lifecycle is scope-owned, exactly as production runs it.
+	//
+	// Under the scoped lifecycle an inbound has no Close of its own: it receives a child scope when
+	// it starts, registers its teardown with that scope, and is released when the scope is closed.
+	// Scope.Start is what allocates the child and what makes the parent own the child's lifetime, so
+	// driving it directly would test a lifecycle the product does not use.
+	//
+	// The stages are run in production's order (box.go): a component is started with Initialize,
+	// then Start, then PostStart, then Started, reusing the same child scope throughout.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	// Deferred AFTER the scope is created and BEFORE it is used, so a failure anywhere below still
+	// releases the listener. Closing the scope runs the inbound's registered teardown in reverse
+	// registration order, which is what a leaked listener on the production port would survive.
+	defer func() {
+		_ = scope.Close()
+	}()
 
-	// Close must release it cleanly. A leak at this point would be a leaked listener
-	// on the production port, which is exactly what a schema-only test cannot see.
-	require.NoError(t, instance.Close())
+	// Start binds the real listener. A stub, or an inbound whose constructor half-succeeded, fails
+	// here rather than only under `run`.
+	for _, stage := range []adapter.StartStage{
+		adapter.StartStateInitialize,
+		adapter.StartStateStart,
+		adapter.StartStatePostStart,
+		adapter.StartStateStarted,
+	} {
+		require.NoError(t, scope.Start("naive-in", instance, stage),
+			"the Native Naive inbound must start at stage ", stage,
+			"; construction alone would not prove the listener path is intact")
+	}
+
+	// Closing the scope is what releases the listener. A leak at this point would be a leaked
+	// listener on the production port, which is exactly what a schema-only test cannot see.
+	require.NoError(t, scope.Close())
 }
 
 // TestServerNativeNaiveInboundKeepsProductionShape pins the options that reach

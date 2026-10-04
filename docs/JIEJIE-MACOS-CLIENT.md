@@ -7,7 +7,7 @@ The macOS client is a headless-first sing-box CLI core for Apple Silicon (`darwi
 The canonical tag file is `release/DEFAULT_BUILD_TAGS`, which is upstream's Darwin profile:
 
 ```text
-with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
 ```
 
 Both products use `include/registry.go`, which is upstream's complete registry. There is no

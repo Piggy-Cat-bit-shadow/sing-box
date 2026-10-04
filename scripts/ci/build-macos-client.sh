@@ -53,9 +53,29 @@ tags="$(cat "$tags_file")"
 # working binary and nothing downstream would notice that the core had lost
 # capabilities. The list is upstream's own Darwin baseline; the point of the
 # check is that the file still names all of it.
-for required in with_gvisor with_quic with_utls with_naive_outbound with_wireguard with_tailscale; do
+#
+# with_gvisor is deliberately NOT in this list. Upstream removed the gVisor
+# dependency (f857f0814, "Remove dependency on gVisor") and drives the TUN stack
+# through the in-process Go stack instead, so the tag no longer exists in the
+# upstream Darwin baseline this check mirrors.
+for required in with_quic with_utls with_naive_outbound with_wireguard with_tailscale; do
   if ! grep -q "$required" <<<"$tags"; then
     echo "$tags_file is missing $required; the macOS core would lose part of the upstream feature profile" >&2
+    exit 2
+  fi
+done
+
+# And the converse: a tag whose feature has been removed must not come back.
+#
+# Narrowing the list above would otherwise be indistinguishable from simply
+# deleting the requirement, which is what this check exists to prevent. If one of
+# these reappears in the profile it means either a dependency was re-added without
+# the architecture decision behind it, or the file was merged from a stale branch -
+# both worth stopping for.
+for retired in with_gvisor; do
+  if grep -q "$retired" <<<"$tags"; then
+    echo "$tags_file names $retired, which upstream retired (the gVisor dependency was" >&2
+    echo "removed in favour of the Go TUN stack); the macOS core would link it back in" >&2
     exit 2
   fi
 done

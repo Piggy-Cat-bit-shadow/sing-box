@@ -32,8 +32,12 @@ difference, not a capability boundary this fork maintains:
 - The **server** profile omits `with_naive_outbound`, because the Cronet outbound
   is a client capability. The Naive **inbound** is present in both — the live
   production configuration declares one.
-- The **client** profile adds `with_gvisor`, `with_naive_outbound` and
-  `with_utls`, because upstream's `DEFAULT_BUILD_TAGS` carries them.
+- The **client** profile adds `with_naive_outbound` and `with_utls`, because
+  upstream's `DEFAULT_BUILD_TAGS` carries them. It does NOT add `with_gvisor`:
+  upstream retired that tag when it removed the gVisor dependency in favour of the
+  in-process Go TUN stack, and both profiles follow. `scripts/ci/build-macos-client.sh`
+  asserts this in both directions - the required tags must be present, and retired
+  tags must not reappear.
 
 Because the registry is upstream's, a protocol, endpoint, DNS transport, service or
 certificate provider that upstream adds is inherited automatically. There is no
