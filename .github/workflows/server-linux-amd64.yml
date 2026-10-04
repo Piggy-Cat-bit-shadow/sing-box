@@ -162,7 +162,7 @@ jobs:
           go test -tags "$TAGS" -count=1 -timeout 10m \
             ./option ./transport/http ./protocol/http ./protocol/naive \
             ./protocol/anytls ./protocol/shadowtls ./protocol/shadowsocks \
-            ./common/httpclient ./common/tls ./include ./route
+            ./common/httpclient ./common/tls ./include ./route ./common/trafficsched
           echo "PASS: focused unit tests under $TAGS"
 
       - name: low-memory data paths

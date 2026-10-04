@@ -131,6 +131,7 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=1 go test -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 25m \
             ./option ./transport/... ./protocol/... ./common/httpclient ./common/tls \
+            ./common/trafficclass ./common/trafficsched \
             ./include ./route ./adapter/... ./dns/... ./service/... ./experimental/clashmode
           echo "PASS: unit tests under the macOS tags"
 
@@ -319,7 +320,7 @@ jobs:
           # on another. The ordinary unit-test step covers the package too, but a race
           # in it would only be reported by this one.
           CGO_ENABLED=1 go test -race -tags "$(cat "$TAGS_FILE")" -count=1 -timeout 40m \
-            ./transport/masque/ ./protocol/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/
+            ./transport/masque/ ./protocol/masque/ ./transport/http/ ./protocol/naive/ ./route/ ./common/httpclient/ ./common/trafficsched/
           echo "PASS: race tests"
 
       - name: deep check - fuzz campaign
