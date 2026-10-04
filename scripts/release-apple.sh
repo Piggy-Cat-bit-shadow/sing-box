@@ -103,6 +103,7 @@ echo "  commit:   $(git rev-parse HEAD)"
 echo "  submodule: clients/apple @ $(git -C clients/apple rev-parse HEAD)"
 echo "  mode:     $APPLE_SIGNING_MODE"
 echo "  style:    $APPLE_SIGNING_STYLE"
+[ -n "${APPLE_BUILD_NUMBER:-}" ] && echo "  build:    $APPLE_BUILD_NUMBER"
 
 step "signing environment"
 # In unsigned mode this prints SKIP; otherwise it fails with an actionable message
@@ -111,12 +112,43 @@ step "signing environment"
 
 if [ "$APPLE_SIGNING_MODE" = "unsigned" ]; then
   step "signing regression tests"
-  ./scripts/ci/test-apple-signing.sh >/dev/null
-  echo "  14 checks passed"
+  # Run in a clean environment.
+  #
+  # The suite asserts that an unconfigured development/testflight build is REJECTED, and its checks
+  # read the ambient environment. This script has already sourced .env.apple.local and exported the
+  # resolved signing values, so running the suite as an ordinary child made those checks observe a
+  # configured environment and fail. Passing the values in explicitly is what the suite's own `env`
+  # invocations already do for the cases they care about.
+  env -u APPLE_TEAM_ID -u APPLE_BASE_BUNDLE_ID -u APPLE_APP_GROUP_ID \
+      -u APPLE_SIGNING_MODE -u APPLE_SIGNING_STYLE \
+      ./scripts/ci/test-apple-signing.sh >/dev/null
+  echo "  signing regression suite passed"
 fi
 
-step "build Libbox from this fork"
-./scripts/ci/build-apple-libbox.sh both
+  # Libbox is either built here or installed from a CI-verified artifact.
+  #
+  # The prebuilt path exists so the one-command publish can reuse the framework CI already compiled
+  # and validated for this commit, rather than compiling it a third time on the publishing Mac.
+  #
+  # The mode fails closed rather than falling back: if a caller asked for a prebuilt Libbox and none
+  # is installed, building one silently would make the published binary differ from the artifact the
+  # caller believed it was shipping.
+  if [ "${APPLE_USE_PREBUILT_LIBBOX:-0}" = "1" ]; then
+    step "use the prebuilt Libbox"
+    libbox="clients/apple/Libbox.xcframework"
+    if [ ! -d "$libbox" ]; then
+      echo "FAIL: APPLE_USE_PREBUILT_LIBBOX=1 but $libbox is not installed." >&2
+      echo "  Install a verified artifact first, then re-run with this variable set." >&2
+      echo "  Refusing to build one instead: that would publish a binary that does not match" >&2
+      echo "  the artifact you verified." >&2
+      exit 2
+    fi
+    echo "  using: $libbox"
+    echo "  slices: $(ls "$libbox" | grep -v Info.plist | tr '\n' ' ')"
+  else
+    step "build Libbox from this fork"
+    ./scripts/ci/build-apple-libbox.sh both
+  fi
 
 step "prepare the Apple client"
 ./scripts/ci/prepare-apple-client.sh

@@ -48,10 +48,18 @@ env:
   APPLE_SUBMODULE: clients/apple
 
 jobs:
-  ios:
-    if: ${{ inputs.build_ios }}
+  # Libbox is compiled ONCE per commit and shared by both GUI jobs and by the local publish.
+  #
+  # It is the most expensive step in the Apple pipeline and depends only on the source commit - no
+  # Apple secrets - so building it per platform was duplicated work. The artifact carries a manifest
+  # naming the commit and submodule it was built from, because the consumers must be able to prove
+  # the framework matches the tree they are about to sign, not merely trust an artifact name.
+  libbox:
+    if: ${{ inputs.build_ios || inputs.build_macos }}
     runs-on: macos-latest
     timeout-minutes: 120
+    outputs:
+      artifact: ${{ env.LIBBOX_ARTIFACT }}
     steps:
       - name: check out with submodules
         uses: actions/checkout@v4
@@ -131,6 +139,95 @@ jobs:
           set -euo pipefail
           export PATH="$(go env GOPATH)/bin:$PATH"
           ./scripts/ci/build-apple-libbox.sh both
+
+      - name: pack the Libbox artifact
+        # The manifest is what makes the artifact attributable to a commit. The artifact name is
+        # informative only; consumers validate against the manifest.
+        env:
+          LIBBOX_ARTIFACT: jiejiebox-libbox-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./scripts/ci/apple-libbox-artifact.sh pack \
+            clients/apple/Libbox.xcframework \
+            dist/apple/libbox
+          echo "Libbox artifact contents:"
+          ls -la dist/apple/libbox
+
+      - name: upload the Libbox artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejiebox-libbox-${{ github.sha }}
+          path: dist/apple/libbox
+          if-no-files-found: error
+          retention-days: 30
+
+  ios:
+    if: ${{ inputs.build_ios }}
+    needs: libbox
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - name: check out with submodules
+        uses: actions/checkout@v4
+        with:
+          # The Apple client is a git submodule pinned by this repository, and it has
+          # its own nested submodule (Frameworks/Runestone) that the Xcode project
+          # needs in order to resolve packages. `recursive` fetches both. The
+          # revision must be the one this repository pins - never a newer upstream tip.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: set up Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer" 2>/dev/null || true
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: verify the Apple submodule revision
+        run: |
+          set -euo pipefail
+          recorded="$(git ls-tree HEAD "$APPLE_SUBMODULE" | awk '{print $3}')"
+          actual="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+          echo "parent records: $recorded"
+          echo "checked out:    $actual"
+          if [ "$actual" != "$recorded" ]; then
+            echo "FAIL: the Apple submodule is not at the revision this repository pins." >&2
+            exit 1
+          fi
+          echo "PASS: submodule matches the parent gitlink"
+
+      - name: download the verified Libbox artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jiejiebox-libbox-${{ github.sha }}
+          path: build/apple-libbox
+
+      - name: validate and install the Libbox artifact
+        # Both GUI jobs install the SAME artifact, so the framework they sign is byte-identical by
+        # construction rather than by both having run the same compiler.
+        run: |
+          set -euo pipefail
+          submodule_sha="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+          ./scripts/ci/apple-libbox-artifact.sh validate build/apple-libbox \
+            --parent-sha "${{ github.sha }}" \
+            --submodule-sha "$submodule_sha"
+          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$PWD"
+
+      - name: warm the Go module cache
+        run: go mod download all
+
+      - name: Apple signing preflight
+        # In unsigned mode this prints SKIP. In development mode it fails with an
+        # actionable message rather than letting xcodebuild produce an artifact
+        # that installs and cannot connect.
+        run: ./scripts/ci/check-apple-signing-environment.sh
 
       - name: apply the personal-test overlay
         # Removes the multicast entitlement (not yet granted by Apple) and refuses to
@@ -275,6 +372,7 @@ jobs:
 
   macos:
     if: ${{ inputs.build_macos }}
+    needs: libbox
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -331,17 +429,22 @@ jobs:
       - name: Apple signing preflight
         run: ./scripts/ci/check-apple-signing-environment.sh
 
-      - name: build Libbox from this fork
-        # The macOS client links the same framework as the iOS one, built from this
-        # repository's experimental/libbox at the current commit.
-        #
-        # The script is used rather than `make lib_apple` for the same reason as the
-        # iOS job: that target builds upstream's full Apple matrix, whose amd64 iOS
-        # simulator slice cannot link against the pinned cronet-go.
+      - name: download the verified Libbox artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jiejiebox-libbox-${{ github.sha }}
+          path: build/apple-libbox
+
+      - name: validate and install the Libbox artifact
+        # The SAME artifact the iOS job installs. The two signed frameworks are therefore
+        # byte-identical by construction, rather than merely both produced from this commit.
         run: |
           set -euo pipefail
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          ./scripts/ci/build-apple-libbox.sh both
+          submodule_sha="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
+          ./scripts/ci/apple-libbox-artifact.sh validate build/apple-libbox \
+            --parent-sha "${{ github.sha }}" \
+            --submodule-sha "$submodule_sha"
+          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$PWD"
 
       - name: apply the build overlays
         # Compatibility shims for the pinned client's libbox API, plus the
