@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"reflect"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,7 +44,15 @@ type Outbound struct {
 	dialer         dialer.ParallelInterfaceDialer
 	domainStrategy C.DomainStrategy
 	fallbackDelay  time.Duration
-	isEmpty        bool
+	// semantics is the precomputed native-bypass profile of this outbound's dial options. It is
+	// built once, here, from the same options the dialer was built from, and it is the only thing
+	// that answers "would the userspace dial path do anything special for this flow?".
+	semantics dialer.SocketSemantics
+	// familyStrategy reports the effective address-family policy of the resolver this outbound was
+	// given, or nil when it has none. It is a function rather than a value because the effective
+	// policy can come from the resolver's own configuration and is only known once the router can
+	// be asked.
+	familyStrategy func() C.DomainStrategy
 	myAddresses    common.TypedValue[[]netip.Prefix]
 	icmpPort       *ping.Port
 }
@@ -73,9 +80,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		domainStrategy: C.DomainStrategy(options.DomainStrategy),
 		fallbackDelay:  time.Duration(options.FallbackDelay),
 		dialer:         outboundDialer.(dialer.ParallelInterfaceDialer),
-		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
-			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
-		}),
+		semantics:      dialer.NativeBypassSemantics(options.DialerOptions),
+	}
+	if reporter, isReporter := outboundDialer.(dialer.ResolveDialer); isReporter {
+		outbound.familyStrategy = reporter.EffectiveFamilyStrategy
 	}
 	//nolint:staticcheck
 	if options.ProxyProtocol != 0 {
@@ -259,81 +267,68 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 	return conn, newDestination, nil
 }
 
+// IsEmpty reports whether this outbound asks the socket layer for nothing at all.
+//
+// It is NOT the bypass question, and the difference is the point of the profile: a direct outbound
+// configured only with a domain_resolver is not empty, because it resolves names for the flows that
+// need it, while a literal-IP flow through the same outbound still needs no resolution and is
+// reproducible by the platform's own connect.
 func (h *Outbound) IsEmpty() bool {
-	return h.isEmpty
+	return h.semantics.IsPlain()
 }
 
-// CanBypass reports whether a connection over this network to this literal destination is
-// equivalent to a plain OS connect, so the userspace data path can be skipped.
+// CanBypass reports whether a connection over this network to this literal destination may skip the
+// userspace data path.
 //
-// # What it deliberately cannot see
+// # What it answers, and how
 //
-// This is an OUTBOUND-level answer. It has no view of FakeIP state, sniffed domains, destination
-// rewrites, trackers, or how the outbound was selected - all of which decide whether a specific
-// connection is safe to bypass. The router owns that decision; this method only establishes that
-// the outbound itself would do nothing special.
+// It is a conjunction of three things the userspace path would otherwise do:
 //
-// # Why isEmpty is the authoritative signal
+//	the dial options        the profile built once from the same options the dialer was built from
+//	the ambient policy      the network manager's default bind, mark, strategy and fallback
+//	the self-address guard  the check that keeps a TUN from routing a connection into itself
 //
-// isEmpty already means "this direct outbound carries no dial configuration beyond a plain
-// connect". Re-listing the individual options here would create a second, silently divergent
-// copy of that judgement: a newly added dialer option would have to be remembered in two places,
-// and forgetting one would turn a configured outbound into a bypassed one. Reusing the existing
-// signal means a new option automatically disables the fast path until someone deliberately
-// accounts for it.
+// # Why the options are no longer compared wholesale
 //
-// # Why the loopback check cannot be skipped
+// The previous implementation asked whether the outbound's options were literally empty. That is
+// safe but it answers the wrong question: a configured option only disqualifies a flow if it would
+// AFFECT that flow. The production topology is the case in point - its direct outbound carries
+// domain_resolver and nothing else - and a literal-IP flow through it never reaches the resolver.
+// Comparing the configuration refused the bypass; comparing the semantics does not.
 //
-// The direct outbound refuses to dial its own addresses, which is what prevents a TUN from
-// routing a connection back into itself. A bypass is a connect performed by the platform rather
-// than by this dialer, so this check is the only thing standing between the fast path and that
-// loop. It is evaluated against the live address list, not a snapshot.
+// The conservative direction is preserved where it matters. Every option that changes a socket, a
+// bind, a mark, a timeout, TCP behaviour, interface selection or the resolution of a name still
+// refuses, an option nobody has classified refuses, and the ambient-policy and self-address guards
+// are unchanged.
 func (h *Outbound) CanBypass(network string, destination netip.Addr) bool {
-	if !h.isEmpty {
-		return false
-	}
-	if network != N.NetworkTCP && network != N.NetworkUDP {
-		// ICMP keeps its existing Flow semantics; anything else is not this optimisation's
-		// business.
-		return false
-	}
-	if !destination.IsValid() {
-		return false
-	}
-	// A zone-carrying address cannot be handed to the platform's direct path through this
-	// interface, which is keyed by address alone.
-	if destination.Zone() != "" {
-		return false
-	}
-	// Global network policy applies to this dialer even when the outbound itself is plain.
-	//
-	// isEmpty only describes the outbound's own options. The DefaultDialer additionally inherits
-	// from the NetworkManager: a default bind interface adds a socket bind, a routing mark adds a
-	// mark wrapper, and a default network strategy/type/fallback adds interface selection. A
-	// native bypass performs none of those - it is the platform's own connect - so a connection
-	// that would have been bound, marked or steered would silently lose that policy.
-	//
-	// isMyLoopbackAddress is checked last because it consults the live address list, making it the
-	// only part of this method that touches state beyond the outbound.
-	if h.hasGlobalNetworkPolicy() {
-		return false
-	}
-	return !h.isMyLoopbackAddress(destination)
+	return h.BypassBlockers(network, destination) == dialer.BlockerNone
 }
 
-// hasGlobalNetworkPolicy reports whether the network manager imposes policy this dialer inherits.
+// BypassBlockers reports every reason this outbound cannot be reproduced by the platform's own
+// connect for this flow. The empty set means it can.
 //
-// A nil manager means no global policy exists to lose, which is the case in tests and in builds
-// without one. Anything set means the userspace dialer would have applied it.
-func (h *Outbound) hasGlobalNetworkPolicy() bool {
-	if h.network == nil {
-		return false
+// It exists beside CanBypass so a refusal can be attributed rather than merely observed: knowing
+// that the fast path is off is not actionable, and knowing it is off because of a routing mark is.
+// The cost is one profile lookup and two comparisons on a path that runs once per flow.
+func (h *Outbound) BypassBlockers(network string, destination netip.Addr) dialer.NativeBypassBlocker {
+	facts := dialer.NativeBypassFacts{
+		Network: network,
+		// Always true here, and not by assumption: the router only consults a bypassable outbound
+		// after establishing that the destination is a literal with no candidate list, no sniffed
+		// domain and no rewrite. A flow that needs a name resolved never reaches this method.
+		DestinationIsLiteral: true,
+		Destination:          destination,
 	}
-	defaults := h.network.DefaultOptions()
-	return defaults.BindInterface != "" ||
-		defaults.RoutingMark != 0 ||
-		defaults.NetworkStrategy != nil ||
-		len(defaults.NetworkType) > 0 ||
-		len(defaults.FallbackNetworkType) > 0 ||
-		defaults.FallbackDelay != 0
+	if h.familyStrategy != nil {
+		facts.FamilyStrategy = h.familyStrategy()
+	}
+	blockers := h.semantics.Blockers(facts)
+	blockers |= dialer.NetworkPolicyBlockers(h.network)
+	if h.isMyLoopbackAddress(destination) {
+		// The userspace path refuses to dial this host's own addresses so a TUN cannot route a
+		// connection back into itself. A bypass is a connect performed by the platform, which has no
+		// such guard, so this check is the only thing standing between the fast path and that loop.
+		blockers |= dialer.BlockerSelfAddress
+	}
+	return blockers
 }
