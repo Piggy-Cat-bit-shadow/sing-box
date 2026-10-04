@@ -1,6 +1,7 @@
 package route
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -11,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -275,6 +277,28 @@ func BenchmarkDirectCopyUserspace(b *testing.B) {
 	}
 }
 
+// singlePacketSource offers single packets only, so the copy engine takes the generic per-datagram
+// path this benchmark is about.
+//
+// The scheduler tests' packetSource also implements the batch read waiter, which is what they need
+// and what would make this measure a different path - and with no batch size configured, a source
+// that advertises batching makes the engine ask for zero packets forever.
+type singlePacketSource struct {
+	remaining int
+	payload   []byte
+}
+
+func (s *singlePacketSource) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	if s.remaining <= 0 {
+		return M.Socksaddr{}, io.EOF
+	}
+	s.remaining--
+	if _, err := buffer.Write(s.payload); err != nil {
+		return M.Socksaddr{}, err
+	}
+	return M.Socksaddr{}, nil
+}
+
 // BenchmarkDirectPacketCopyUserspace measures the UDP layer's per-datagram cost.
 //
 // There is no kernel-copy alternative here at all: bufio.CopyPacket reads a datagram, copies it and
@@ -283,6 +307,7 @@ func BenchmarkDirectCopyUserspace(b *testing.B) {
 // and a proxied flow, and it would swamp the difference this measures.
 func BenchmarkDirectPacketCopyUserspace(b *testing.B) {
 	const datagram = 1400
+	payload := make([]byte, datagram)
 
 	for _, packets := range []int{1024, 8192} {
 		b.Run(strconv.Itoa(packets)+"packets", func(b *testing.B) {
@@ -291,11 +316,13 @@ func BenchmarkDirectPacketCopyUserspace(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
-				source := &packetSource{remaining: packets, size: datagram}
+				source := &singlePacketSource{remaining: packets, payload: payload}
 				sink := &packetSink{}
 				b.StartTimer()
 
-				if _, err := bufio.CopyPacket(sink, source); err != nil {
+				// CopyPacket reports the source's EOF as its error, which is how the copy ends
+				// normally rather than a failure.
+				if _, err := bufio.CopyPacket(sink, source); err != nil && !errors.Is(err, io.EOF) {
 					b.Fatal(err)
 				}
 				if sink.packets.Load() != int64(packets) {
