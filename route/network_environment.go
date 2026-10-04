@@ -69,15 +69,6 @@ func (r *NetworkManager) updateNetworkEnvironment() {
 // startedCancel - so holding environmentUpdateAccess across it would stop every later
 // postUpdateNetworkEnvironment behind a Close that is itself waiting. That is a three-way cycle, and
 // it hung the jiejie reference suite for the full 40-minute test timeout.
-// environmentPublishedHook, when set, runs immediately after a recompute publishes a new
-// fingerprint and before the transition's boundary is taken.
-//
-// It is the test-visible form of "the environment has been published", which is otherwise only
-// observable by reading the field and hoping to catch the instant. A test that needs to assert what
-// the rest of the system can see at that instant would otherwise have to poll for it. It is nil in
-// production, where this is one predictable branch.
-var environmentPublishedHook func()
-
 func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	r.environmentUpdateAccess.Lock()
 	defer r.environmentUpdateAccess.Unlock()
@@ -132,11 +123,25 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	}
 	r.stateAccess.Lock()
 	changed := environmentHash != r.networkEnvironment
-	r.networkEnvironment = environmentHash
-	r.stateAccess.Unlock()
 	if !changed {
+		r.stateAccess.Unlock()
 		return false
 	}
+	r.networkEnvironment = environmentHash
+	// The test hook runs HERE: after the fingerprint is written, before the transition is claimed,
+	// while stateAccess is still held. That is precisely the instant the ordering is about, so a test
+	// parked here observes the window if the claim is not part of it.
+	if r.environmentPublished != nil {
+		r.environmentPublished()
+	}
+	// Claim the transition BEFORE releasing stateAccess.
+	//
+	// Readers of NetworkEnvironment take stateAccess.RLock, so holding it here is what makes "the
+	// new fingerprint is visible" and "the network is no longer settled" a single observation. Doing
+	// the claim after the unlock - which is what this replaced - left a window in which a reader saw
+	// the new environment while every ownership token still described the old one.
+	r.beginTransition()
+	r.stateAccess.Unlock()
 	// A zero fingerprint is a real environment, not a missing reading.
 	//
 	// The hash is built from the default interface's gateways, the Wi-Fi SSID, or the gateway
@@ -154,10 +159,9 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 		r.logger.Info("updated network environment: no default interface, gateways or SSID")
 	}
 
-	if environmentPublishedHook != nil {
-		environmentPublishedHook()
-	}
-
+	// The transition was claimed above, while stateAccess was still held, so the publish and the
+	// claim are one observation. The caller decides whether a reset body runs; what is settled here
+	// is only that the network is no longer stable.
 	return true
 }
 
@@ -221,9 +225,12 @@ func (r *NetworkManager) boundEnvironmentTransitionExported() {
 	if r.logger != nil {
 		r.logger.Info("network environment changed, resetting network transports")
 	}
-	// Claim the epoch, then take the lock and run the body WITHOUT claiming again - one logical
-	// transition must cost exactly one epoch, however long the lock is contended.
-	r.beginTransition()
+	// The epoch was claimed by recomputeNetworkEnvironment, in the same step that published the new
+	// fingerprint. Here the body runs and the transition commits, so the network is unstable for
+	// exactly the interval between publishing and finishing the reset - however long the lock is
+	// contended, and one epoch per logical transition.
+	token := r.networkResetGeneration.Load()
+	defer r.commitTransition(token)
 	r.resetRunAccess.Lock()
 	defer r.resetRunAccess.Unlock()
 	r.resetNetworkLocked(r.startedCtx)
@@ -237,6 +244,11 @@ func (r *NetworkManager) boundEnvironmentTransitionLocked(ctx context.Context) {
 	if r.logger != nil {
 		r.logger.Info("network environment changed, resetting network transports")
 	}
+	// The epoch was claimed by recomputeNetworkEnvironment, in the same step that published the new
+	// fingerprint - NOT here. Claiming again would advance the epoch twice for one logical
+	// transition, and the caller's token would then be the wrong one.
+	token := r.networkResetGeneration.Load()
+	defer r.commitTransition(token)
 	r.resetNetworkLocked(ctx)
 }
 

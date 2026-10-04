@@ -75,10 +75,13 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 	before := dnsResetCount(router)
 	generationBefore := manager.NetworkResetGeneration()
 
-	// Take the boundary exactly as the debounced production path does once it has decided the
-	// fingerprint moved. The decision itself is `changed && len(options) > 0` inside
-	// updateNetworkEnvironment; what this test pins is its consequence, because a test host has no
-	// interfaces to derive a real fingerprint from.
+	// Take the boundary exactly as production does once it has decided the fingerprint moved.
+	//
+	// The epoch is claimed by recomputeNetworkEnvironment, in the same step that publishes the new
+	// fingerprint - that is what makes the two one observable state - and the boundary here runs the
+	// reset body. A test host has no interfaces to derive a real fingerprint from, so the decision is
+	// driven directly and the claim is made where recompute makes it.
+	manager.beginTransition()
 	manager.boundEnvironmentTransitionExported()
 
 	require.Greater(t, dnsResetCount(router), before,

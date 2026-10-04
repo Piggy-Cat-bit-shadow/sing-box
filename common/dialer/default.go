@@ -49,7 +49,9 @@ type DefaultDialer struct {
 	// A dial that begins before a reset can succeed after it. That connection belongs to the network
 	// which has been left, and the only way to notice is to compare the epoch it started in against
 	// the epoch that is current when ownership is handed to the caller.
-	networkEpoch           func() uint64
+	networkEpoch func() uint64
+	// networkStable reports whether the network is settled; nil when the manager has no such concept.
+	networkStable          func() bool
 	powerManager           *powerreport.Manager
 	outboundManager        adapter.OutboundManager
 	dnsTransportManager    adapter.DNSTransportManager
@@ -81,6 +83,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	var networkEpoch func() uint64
 	if counter, isCounter := networkManager.(adapter.NetworkResetCounter); isCounter {
 		networkEpoch = counter.NetworkResetGeneration
+	}
+	// Also optional, and for the same reason. A manager that cannot report transition state keeps
+	// the previous behaviour exactly.
+	var networkStable func() bool
+	if state, isState := networkManager.(adapter.NetworkTransitionState); isState {
+		networkStable = state.NetworkTransitionStable
 	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 
@@ -270,6 +278,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		connectionManager:      connectionManager,
 		networkManager:         networkManager,
 		networkEpoch:           networkEpoch,
+		networkStable:          networkStable,
 		familyHealth:           newFamilyHealth(),
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		outboundManager:        service.FromContext[adapter.OutboundManager](ctx),
@@ -494,12 +503,37 @@ func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
 //
 // It returns a predicate that reports whether that epoch is still current, so the caller does not
 // have to carry a possibly-nil function around.
+// captureEpoch returns a predicate reporting whether the connection produced by this dial may still
+// be handed to the caller.
+//
+// # Two questions, not one
+//
+//	"has the epoch moved since I captured it?"   rejects a dial that began BEFORE a transition
+//	"is the network settled right now?"          rejects a dial taken DURING one
+//
+// The second is not implied by the first. A dial started while a transition is pending captures the
+// transition's OWN epoch, so the epoch comparison finds them equal and would hand the connection
+// over - even though the DNS generation has not advanced and the transport pins still name the
+// network being left. Everything such a connection observes belongs to the old network while the
+// caller believes it belongs to the new one.
+//
+// Requiring a settled network at hand-over time closes that: a connection dialled during a
+// transition is refused, and the caller retries - which is the correct transient failure, not a
+// permanent one, because the transition does complete.
 func (d *DefaultDialer) captureEpoch() func() bool {
 	if d.networkEpoch == nil {
-		return func() bool { return true }
+		if d.networkStable == nil {
+			return func() bool { return true }
+		}
+		return func() bool { return d.networkStable() }
 	}
 	captured := d.networkEpoch()
-	return func() bool { return d.networkEpoch() == captured }
+	return func() bool {
+		if d.networkStable != nil && !d.networkStable() {
+			return false
+		}
+		return d.networkEpoch() == captured
+	}
 }
 
 // errNetworkChanged reports that a network operation completed across a network reset.

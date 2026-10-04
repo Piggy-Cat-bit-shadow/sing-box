@@ -191,10 +191,43 @@ func (c *Client) captureGeneration(operation *exchangeOperation) {
 // A caller with no generation concept is always current, so this degrades to fingerprint-only
 // behaviour rather than rejecting everything.
 func (c *Client) generationStillCurrent(operation *exchangeOperation) bool {
+	if !c.networkTransitionStable() {
+		// A transition is pending: the network this answer describes is not settled.
+		//
+		// The generation check below cannot catch this. It compares the DNS generation, which
+		// Router.ResetNetwork advances - and that has not run yet. Neither can the environment pin:
+		// the pin is refreshed by the same reset, so it still names the network being left and
+		// matches the key exactly.
+		//
+		// The consequence of accepting here is not a stale answer but a MISLABELLED one. A query
+		// issued during the transition captures the transition's own epoch, so nothing else rejects
+		// it; its transport may already have re-dialled on the new network, so the answer describes
+		// the NEW network; and both guards agree it belongs to the OLD one. The entry is then served
+		// to every later query on the old namespace for the rest of its TTL.
+		//
+		// Refusing the cache write is the smallest behaviour change that closes it: the answer is
+		// still returned to the caller that asked, and only its storage is declined. The query is
+		// not failed, because the exchange itself was legitimate.
+		return false
+	}
 	if !operation.hasGenerationGuard || c.networkGeneration == nil {
 		return true
 	}
 	return operation.generation == c.networkGeneration()
+}
+
+// networkTransitionStable reports whether the network is settled, from the manager when it can say.
+//
+// A manager without the capability is one where the distinction does not arise, so the check
+// degrades to "settled" and the previous behaviour is preserved exactly.
+func (c *Client) networkTransitionStable() bool {
+	if c.networkManager == nil {
+		return true
+	}
+	if state, isState := c.networkManager.(adapter.NetworkTransitionState); isState {
+		return state.NetworkTransitionStable()
+	}
+	return true
 }
 
 // finishCacheKey decides whether a response may be stored, and under which environment.

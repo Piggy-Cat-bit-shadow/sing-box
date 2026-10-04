@@ -66,6 +66,37 @@ type NetworkResetCounter interface {
 	NetworkResetGeneration() uint64
 }
 
+// NetworkTransitionState reports whether the network is in the middle of a transition.
+//
+// # Why an epoch alone is not enough
+//
+// A monotonic epoch distinguishes "before" from "after". It cannot describe the state in between,
+// and that state is not the same as either. While a transition is pending - the new environment is
+// published, the ownership epoch has advanced, but the reset body has not yet run - the DNS
+// generation has not moved and the transport pins still name the old network. An operation started
+// there captures the NEW epoch, so an epoch comparison says it is current, while everything it can
+// observe about the network still belongs to the old one. Handing it over is how the new network's
+// answer ends up filed under the old network's namespace.
+//
+// The three states an operation must be able to tell apart are therefore:
+//
+//	stable A        the last transition committed; operations proceed normally
+//	transitioning   a transition is pending; operations must not be accepted as stable results
+//	stable B        the transition committed; operations proceed normally
+//
+// # Why it is a separate capability
+//
+// Like NetworkResetCounter, this is optional: a manager that cannot report it is one where the
+// distinction does not arise, and every test mock would otherwise have to grow state it has no use
+// for. A manager implementing only NetworkResetCounter keeps its previous behaviour exactly.
+type NetworkTransitionState interface {
+	// NetworkTransitionStable reports whether the network is currently in a settled state.
+	//
+	// It returns false from the moment a transition claims ownership until the reset body has
+	// completed, and true otherwise.
+	NetworkTransitionStable() bool
+}
+
 type NetworkOptions struct {
 	BindInterface        string
 	RoutingMark          uint32

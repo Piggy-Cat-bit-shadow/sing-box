@@ -81,6 +81,10 @@ func newTransitionWindowHarness(t *testing.T) *transitionWindowHarness {
 	t.Cleanup(cancel)
 	manager.startedCtx = startedCtx
 	manager.logger = logger.NOP()
+	// NewNetworkManager marks the network settled and supplies a pause manager; the harness builds the
+	// struct directly, so it establishes the same starting state.
+	manager.transitionStable.Store(true)
+	manager.pauseManager = &noopPauseManager{}
 	manager.interfaceMonitor = &staticInterfaceMonitor{
 		current: &control.Interface{Index: 1, Name: "en0"},
 	}
@@ -104,6 +108,17 @@ func newTransitionWindowHarness(t *testing.T) *transitionWindowHarness {
 		}
 	})
 	return h
+}
+
+// settle runs a transition to completion and returns the state it established, so a test can start
+// from a known stable environment rather than from the zero value.
+func (h *transitionWindowHarness) settle(t *testing.T, ssid string) uint64 {
+	t.Helper()
+	h.setSSID(ssid)
+	h.manager.updateNetworkEnvironment()
+	require.True(t, h.manager.NetworkTransitionStable(),
+		"a completed transition must leave the network settled")
+	return h.manager.NetworkEnvironment()
 }
 
 // setSSID publishes a Wi-Fi SSID without going through the event handler, so the test controls
@@ -137,17 +152,17 @@ func (h *transitionWindowHarness) holdResetLock(t *testing.T) {
 //
 // The test is then ordered by the transition's own progress rather than by a poll. The returned stop
 // restores the hook so no other test in the package inherits it.
-func publishWatch(t *testing.T) (published chan struct{}, stop func()) {
+func publishWatch(t *testing.T, h *transitionWindowHarness) (published chan struct{}, stop func()) {
 	t.Helper()
 	published = make(chan struct{})
 	var once sync.Once
-	environmentPublishedHook = func() {
+	h.manager.environmentPublished = func() {
 		once.Do(func() { close(published) })
 	}
 	// Registered with the test as well as returned, so a test that fails before its deferred stop
 	// (a require, or a t.Fatal) still cannot leave the hook installed for the next test.
-	t.Cleanup(func() { environmentPublishedHook = nil })
-	return published, func() { environmentPublishedHook = nil }
+	t.Cleanup(func() { h.manager.environmentPublished = nil })
+	return published, func() { h.manager.environmentPublished = nil }
 }
 
 // awaitGenerationNoPoll is intentionally absent: every wait in this file is driven by the publish
@@ -172,7 +187,7 @@ func TestEnvironmentTransitionPublishesItsEpochBeforeWaiting(t *testing.T) {
 
 	// The transition to B. It publishes the fingerprint and then blocks, either on the epoch claim or
 	// on the held lock - which of the two is exactly what this test distinguishes.
-	published, stopWatch := publishWatch(t)
+	published, stopWatch := publishWatch(t, h)
 	defer stopWatch()
 
 	h.setSSID("B")
@@ -278,7 +293,7 @@ func TestConsecutiveTransitionsEachGetTheirOwnBoundary(t *testing.T) {
 
 	// B transitions, with the reset lock held so its body cannot run yet.
 	h.holdResetLock(t)
-	publishedB, stopB := publishWatch(t)
+	publishedB, stopB := publishWatch(t, h)
 	defer stopB()
 	h.setSSID("B")
 	bDone := make(chan struct{})
@@ -291,7 +306,7 @@ func TestConsecutiveTransitionsEachGetTheirOwnBoundary(t *testing.T) {
 	awaitPublish(t, publishedB)
 
 	// C transitions while B's body is still blocked. This is a second, real transition.
-	publishedC, stopC := publishWatch(t)
+	publishedC, stopC := publishWatch(t, h)
 	defer stopC()
 	h.setSSID("C")
 	cDone := make(chan struct{})
@@ -340,7 +355,7 @@ func TestTransitionToTheSameEnvironmentWhileWaitingIsNotASecondBoundary(t *testi
 	base := h.manager.NetworkResetGeneration()
 
 	h.holdResetLock(t)
-	publishedB, stopB := publishWatch(t)
+	publishedB, stopB := publishWatch(t, h)
 	defer stopB()
 	h.setSSID("B")
 	bDone := make(chan struct{})
@@ -450,4 +465,157 @@ func TestGatewayAloneIsASufficientFingerprint(t *testing.T) {
 		"an SSID appearing on top of the gateway changes the fingerprint")
 	require.Equal(t, int(base+1), dnsResetCount(h.router),
 		"a fingerprint change is a transition and must establish exactly one boundary")
+}
+
+// The published environment and the transition's ownership must become one observation.
+//
+// # The window
+//
+// recomputeNetworkEnvironment writes networkEnvironment and then claims the transition. If those are
+// separate observations, a reader can see the new fingerprint while the epoch still describes the old
+// network - a state that contradicts itself, and the one in which a dial or a query is judged current
+// by the old ownership token while everything else already describes the new network.
+//
+// # What makes them one
+//
+// The claim happens while stateAccess is still held, and the fingerprint is read under that same lock.
+// A reader lands on one side or the other, never in between.
+//
+// # Why this is deterministic
+//
+// The publish hook runs between the write and the claim, while stateAccess is held. A lock-taking
+// reader started there must BLOCK rather than observe the pair, and the pre-fix ordering - which
+// released the lock before claiming - lets it through. The test therefore measures a lock discipline,
+// not a timing window.
+func TestPublishedEnvironmentCannotBeObservedAsStableBeforeTransitionClaim(t *testing.T) {
+	h := newTransitionWindowHarness(t)
+	h.settle(t, "A")
+	epochA := h.manager.NetworkResetGeneration()
+	fingerprintA := h.manager.NetworkEnvironment()
+
+	// Park the transition between the publish and the claim.
+	inWindow := make(chan struct{})
+	leaveWindow := make(chan struct{})
+	var once sync.Once
+	h.manager.environmentPublished = func() {
+		once.Do(func() {
+			close(inWindow)
+			<-leaveWindow
+		})
+	}
+	t.Cleanup(func() { h.manager.environmentPublished = nil })
+
+	h.setSSID("B")
+	transitionDone := make(chan struct{})
+	go func() {
+		defer close(transitionDone)
+		h.manager.updateNetworkEnvironment()
+	}()
+
+	select {
+	case <-inWindow:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the transition never reached the publish window")
+	}
+
+	// The writer is parked holding stateAccess. Read the fields directly - a locking reader would
+	// simply block, which is what the next step checks.
+	require.NotEqual(t, fingerprintA, h.manager.networkEnvironment,
+		"the environment must be published before this window means anything")
+	require.Equal(t, epochA, h.manager.NetworkResetGeneration(),
+		"the hook must run before the claim for this test to be about the ordering")
+	require.True(t, h.manager.transitionStable.Load(),
+		"and before the network is marked unstable")
+
+	// A locking reader must not get in. What it would see is the new fingerprint against the old
+	// ownership, which is the contradiction.
+	readerReturned := make(chan struct{})
+	go func() {
+		defer close(readerReturned)
+		h.manager.networkEnvironmentAndStability()
+	}()
+	select {
+	case <-readerReturned:
+		require.Fail(t, "a reader observed the pair while the transition was parked between the "+
+			"publish and the claim. It sees the new fingerprint with the old ownership, so an "+
+			"operation sampling both is judged current against the network being left")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(leaveWindow)
+	select {
+	case <-transitionDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the transition did not complete")
+	}
+
+	environment, settled := h.manager.networkEnvironmentAndStability()
+	require.NotEqual(t, fingerprintA, environment, "the transition published")
+	require.True(t, settled, "the transition committed, so the network is settled again")
+	require.Equal(t, epochA+1, h.manager.NetworkResetGeneration(),
+		"one logical transition advances the epoch exactly once")
+}
+
+// A later transition must not be reported as settled while an earlier transition's body is pending.
+//
+// # The sequence
+//
+//	B claims epoch R2, blocks on resetRunAccess
+//	C claims epoch R3, blocks behind B
+//	B's body runs, then B commits
+//	C's body runs, then C commits
+//
+// An unconditional commit would mark the network SETTLED when B finishes, while C's body has not
+// started. In that interval the network is neither B nor C: the environment says C, while the DNS
+// generation and the transport pins are whatever B's body produced. An operation issued there would be
+// accepted as a stable result against state no single transition produced.
+//
+// # Why the token
+//
+// commitTransition takes the epoch the transition claimed and commits only if it is still current, so
+// B's completion is ignored once C has claimed.
+func TestLaterTransitionCannotReportSettledBeforeItsBodyRuns(t *testing.T) {
+	h := newTransitionWindowHarness(t)
+	require.True(t, h.manager.NetworkTransitionStable())
+
+	tokenB := h.manager.beginTransition()
+	require.False(t, h.manager.NetworkTransitionStable())
+	require.EqualValues(t, tokenB, h.manager.NetworkResetGeneration())
+
+	tokenC := h.manager.beginTransition()
+	require.Greater(t, tokenC, tokenB)
+	require.False(t, h.manager.NetworkTransitionStable())
+
+	// B finishes, but C owns the settled state now.
+	h.manager.commitTransition(tokenB)
+	require.False(t, h.manager.NetworkTransitionStable(),
+		"B's completion marked the network settled while C's body had not run. An operation issued "+
+			"in C's era would then be accepted against state that is half B and half C")
+
+	h.manager.commitTransition(tokenC)
+	require.True(t, h.manager.NetworkTransitionStable(),
+		"once the owning transition finishes the network must be settled, or every later operation "+
+			"is refused forever")
+}
+
+// TestCommitWithAStaleTokenIsIgnoredButTheEpochStillCountsOnce is the companion: the token must not
+// cost the property it was built on.
+func TestCommitWithAStaleTokenIsIgnoredButTheEpochStillCountsOnce(t *testing.T) {
+	h := newTransitionWindowHarness(t)
+	base := h.manager.NetworkResetGeneration()
+
+	first := h.manager.beginTransition()
+	h.manager.commitTransition(first)
+	require.EqualValues(t, base+1, h.manager.NetworkResetGeneration(),
+		"one transition advances the epoch exactly once")
+	require.True(t, h.manager.NetworkTransitionStable())
+
+	second := h.manager.beginTransition()
+	h.manager.commitTransition(first) // stale
+	require.False(t, h.manager.NetworkTransitionStable(),
+		"a stale token must not settle the network")
+
+	h.manager.commitTransition(second)
+	require.True(t, h.manager.NetworkTransitionStable())
+	require.EqualValues(t, base+2, h.manager.NetworkResetGeneration(), "two transitions, two epochs")
 }
