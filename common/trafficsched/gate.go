@@ -70,13 +70,15 @@ func (c *gateCore) admit(n int) error {
 }
 
 // write performs the gated write and is shared by every shape, so the ordering rule
-// (admit -> write -> release the service slot) exists in exactly one place.
+// (admit -> write -> observe -> release the slot) exists in exactly one place.
 func (c *gateCore) write(p []byte) (int, error) {
 	err := c.admit(len(p))
 	if err != nil {
 		return 0, err
 	}
+	start := c.flow.observeWriteStart()
 	n, err := c.upstream.Write(p)
+	c.flow.observeWrite(start, len(p))
 	if c.flow != nil {
 		c.flow.done()
 	}
@@ -127,13 +129,16 @@ type gateVectorisedWriter struct {
 }
 
 func (w *gateVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
-	err := w.core.admit(buf.LenMulti(buffers))
+	dataLen := buf.LenMulti(buffers)
+	err := w.core.admit(dataLen)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
 	}
 	// The upstream vectorised writer owns the buffers from here, including on error.
+	start := w.core.flow.observeWriteStart()
 	err = w.upstream.WriteVectorised(buffers)
+	w.core.flow.observeWrite(start, dataLen)
 	if w.core.flow != nil {
 		w.core.flow.done()
 	}
@@ -175,13 +180,16 @@ type gateExtended struct {
 // WriteBuffer forwards ownership unchanged: the upstream's WriteBuffer releases the buffer on both
 // the nil and the non-nil return, so the gate must not release it and must not double-release it.
 func (g *gateExtended) WriteBuffer(buffer *buf.Buffer) error {
-	err := g.admit(buffer.Len())
+	bufferSize := buffer.Len()
+	err := g.admit(bufferSize)
 	if err != nil {
 		// The buffer never reached the upstream, so the gate owns it and must release it.
 		buffer.Release()
 		return err
 	}
+	start := g.flow.observeWriteStart()
 	err = g.extended.WriteBuffer(buffer)
+	g.flow.observeWrite(start, bufferSize)
 	if g.flow != nil {
 		g.flow.done()
 	}
@@ -282,13 +290,16 @@ type gatePacketWriter struct {
 }
 
 func (g *gatePacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	err := g.admit(buffer.Len())
+	packetSize := buffer.Len()
+	err := g.admit(packetSize)
 	if err != nil {
 		buffer.Release()
 		return err
 	}
 	// The upstream owns the buffer from here, including on error.
+	start := g.flow.observeWriteStart()
 	err = g.upstream.WritePacket(buffer, destination)
+	g.flow.observeWrite(start, packetSize)
 	if g.flow != nil {
 		g.flow.done()
 	}
@@ -335,13 +346,16 @@ type gatePacketBatchWriter struct {
 }
 
 func (w *gatePacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
-	err := w.core.admit(buf.LenMulti(buffers))
+	batchSize := buf.LenMulti(buffers)
+	err := w.core.admit(batchSize)
 	if err != nil {
 		// The batch never reached the upstream, so the gate owns every buffer in it.
 		buf.ReleaseMulti(buffers)
 		return err
 	}
+	start := w.core.flow.observeWriteStart()
 	err = w.upstream.WritePacketBatch(buffers, destinations)
+	w.core.flow.observeWrite(start, batchSize)
 	if w.core.flow != nil {
 		w.core.flow.done()
 	}
@@ -356,12 +370,15 @@ type gateConnectedPacketBatchWriter struct {
 }
 
 func (w *gateConnectedPacketBatchWriter) WriteConnectedPacketBatch(buffers []*buf.Buffer) error {
-	err := w.core.admit(buf.LenMulti(buffers))
+	batchSize := buf.LenMulti(buffers)
+	err := w.core.admit(batchSize)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
 	}
+	start := w.core.flow.observeWriteStart()
 	err = w.upstream.WriteConnectedPacketBatch(buffers)
+	w.core.flow.observeWrite(start, batchSize)
 	if w.core.flow != nil {
 		w.core.flow.done()
 	}

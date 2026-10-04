@@ -58,14 +58,12 @@ func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
 		// The contention experiment in common/trafficsched measured that the models which only
 		// change when a write starts - admission ordering and service slots - do not move the
 		// receiver-visible p99 at all, because the bytes that delay an interactive message are
-		// already inside the sender's acceptance window. Only admitting NORMAL data at no more
-		// than the rate the path actually sustains helps, and that needs a rate nobody can read
-		// out of a socket.
+		// already inside the sender's acceptance window. Only shaping the managed upload rate
+		// helps, and a rate has to come from somewhere.
 		//
-		// So the gate goes in the path, observes every byte, and admits everything immediately.
-		// Turning the feature on is setting NormalRate - one line here, or a configuration field
-		// when the rate can be learned rather than supplied. Until then a scheduler that appears
-		// to do something it cannot is worse than one that plainly does nothing.
+		// So the gate goes in the path, observes every byte, and admits all of them: shaping is
+		// switched on by installing a rate source, not by changing the shape of the data path.
+		// See trafficsched.Options.RateSource.
 		scheduler: trafficsched.NewScheduler(trafficsched.Options{Mode: trafficsched.ModePaced}),
 	}
 }
