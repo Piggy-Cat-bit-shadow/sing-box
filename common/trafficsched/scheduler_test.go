@@ -603,10 +603,30 @@ func TestAdmittedRateMatchesTheConfiguredRate(t *testing.T) {
 			admitted := float64(flow.AdmittedBytes()) / elapsed.Seconds()
 			require.LessOrEqual(t, admitted, float64(configured)*1.02,
 				"the admitted rate must never exceed the configured one by more than the rounding of "+
-					"a single write: an excess is the queue this exists to remove")
-			require.Greater(t, admitted, float64(configured)*0.90,
-				"and it must be within a tenth of it, or the configuration is a promise the shaper "+
-					"does not keep")
+					"a single write: an excess is the queue this exists to remove (measured %.3f MB/s "+
+					"against %.3f configured)", admitted/1e6, float64(configured)/1e6)
+			// The lower bound follows from the pacing granularity rather than from taste.
+			//
+			// A write of `chunk` bytes at the configured rate is worth `chunk/rate` of future, and the
+			// flow is woken no earlier than the next pace tick. So the achieved rate is short of the
+			// configured one by roughly `paceTick / (chunk/rate)`:
+			//
+			//	16 KiB at 2 MiB/s     7.8 ms of debt, one 1 ms tick      about 13% short
+			//	64 KiB at 2 MiB/s    31.3 ms of debt, one 1 ms tick      about  3% short
+			//
+			// Measured under four CPU hogs on an eight-core machine, the 16 KiB case sits at 1.859 of
+			// 2.097 MB/s, which is 88.7% - inside the derived figure, and outside the 0.90 this test
+			// asserted before, which is why it failed intermittently on a loaded machine and never on
+			// an idle one. The bound is 0.85 for both sizes: loose enough for the granularity, and
+			// still far above the halving a broken shaper would produce, which is what it is for.
+			//
+			// The UPPER bound above is the safety property and has no such allowance. An excess is the
+			// queue this feature exists to remove, and it holds exactly.
+			require.Greater(t, admitted, float64(configured)*0.85,
+				"the achieved rate must stay near the configured one, within the pacing granularity "+
+					"(measured %.3f MB/s against %.3f configured over %s, with %d-byte writes whose "+
+					"period is %s)", admitted/1e6, float64(configured)/1e6, elapsed, chunk,
+				time.Duration(float64(chunk)/float64(configured)*float64(time.Second)))
 
 			_ = source.Close()
 			_ = sink.Close()
