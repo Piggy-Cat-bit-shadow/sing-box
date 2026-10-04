@@ -142,6 +142,33 @@ type dnsExchangeKey struct {
 	timeout time.Duration
 }
 
+// rdrcNamespace is the persistent namespace an RDRC verdict belongs to.
+//
+// # Why a verdict needs a network namespace
+//
+// RDRC records "this network answers this name this way". Its persistent key was
+// (transportName, qName, qType) - no environment and no generation - and Router.ResetNetwork does not
+// clear it, so a verdict learned on one network stayed visible on every later network that used the
+// same transport tag. With the default 7-day timeout that is not a brief window: a rejection learned
+// on network A would suppress DNS on network B entirely, and B would never be queried.
+//
+// The environment fingerprint is the right key rather than a process-local generation, because the
+// generation restarts at zero with the process while the fingerprint is derived from the network
+// itself - and because the DNS persistent cache already namespaces on exactly this value.
+//
+// Namespacing closes the TOCTOU structurally: an operation that resolves A and deposits after B has
+// committed can still write, but it writes the A namespace, which no B lookup ever reads. That is why
+// this is a key change rather than a ClearRDRC() call on reset - clearing loses the race against an
+// already-authorised write, while a namespace cannot.
+func rdrcNamespace(transportTag string, environment uint64) string {
+	if environment == 0 {
+		// A transport with no environment fingerprint keeps the historical key. Synthesising a
+		// namespace here would invent a distinction the manager never published.
+		return transportTag
+	}
+	return transportTag + "\x01" + strconv.FormatUint(environment, 36)
+}
+
 func (k dnsCacheKey) persistentName() string {
 	name := k.transportTag
 	if k.clientSubnet.IsValid() {
@@ -655,7 +682,11 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 	}
 	operation.ctx = adapter.ContextWithDNSTransportTag(ctx, transport.Tag())
 	if !disableCache && responseChecker != nil && c.rdrc != nil {
-		rejected := c.rdrc.LoadRDRC(transport.Tag(), question.Name, question.Qtype)
+		// The namespace comes from THIS operation's captured environment, not from a fresh read of
+		// the current one: an operation that started on A must consult A's namespace even if the
+		// manager has since moved to B.
+		rejected := c.rdrc.LoadRDRC(rdrcNamespace(transport.Tag(), operation.cacheKey.environment),
+			question.Name, question.Qtype)
 		if rejected {
 			operation.release()
 			return nil, nil, exchangeDone, ErrResponseRejectedCached
@@ -681,7 +712,11 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 			// runs before the delivery and mutation gates below, which is how a stale response used to
 			// persist a verdict for the network that replaced it.
 			if !disableCache && c.rdrc != nil && c.stateMutationAllowed(operation) {
-				c.rdrc.SaveRDRCAsync(transport.Tag(), question.Name, question.Qtype, c.logger)
+				// The verdict is written to the namespace of the network it was OBSERVED on. Even if
+				// this write lands after a transition has committed, it can only ever be read back by
+				// a lookup that belongs to that same network.
+				c.rdrc.SaveRDRCAsync(rdrcNamespace(transport.Tag(), operation.cacheKey.environment),
+					question.Name, question.Qtype, c.logger)
 			}
 			logRejectedResponse(c.logger, ctx, response)
 			return response, ErrResponseRejected
@@ -1202,7 +1237,8 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 					c.logger.DebugContext(ctx, "optimistic refresh rejected for ", FqdnToDomain(key.Name))
 				}
 				if c.rdrc != nil && c.stateMutationAllowed(refreshOperation) {
-					c.rdrc.SaveRDRCAsync(transport.Tag(), key.Name, key.Qtype, c.logger)
+					c.rdrc.SaveRDRCAsync(rdrcNamespace(transport.Tag(), key.environment),
+						key.Name, key.Qtype, c.logger)
 				}
 				return
 			}

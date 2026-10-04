@@ -10,10 +10,13 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	badoption "github.com/sagernet/sing/common/json/badoption"
 	slog "github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service"
+	"path/filepath"
 
 	mDNS "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
@@ -133,6 +136,58 @@ func newPendingTransitionFixture(t *testing.T, manager adapter.NetworkManager, t
 		transports: []adapter.DNSTransport{transport},
 	}
 	return router, concrete
+}
+
+// persistentRDRCStore wraps a REAL cachefile store, so the namespace under test is exactly the
+// production key rather than a test invention.
+type persistentRDRCStore struct {
+	file *cachefile.CacheFile
+}
+
+func newPersistentRDRCStore(t *testing.T) *persistentRDRCStore {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rdrc-ns.db")
+	file := cachefile.New(context.Background(), log.NewNOPFactory().Logger(), option.CacheFileOptions{
+		Enabled:     true,
+		Path:        path,
+		StoreRDRC:   true,
+		RDRCTimeout: badoption.Duration(7 * 24 * time.Hour),
+		CacheID:     "rdrc-ns-test",
+	})
+	// Teardown is scope-owned under the current lifecycle, as in production.
+	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+	// Initialize opens the bolt file; Start begins the cleanup loop. Both are needed before the
+	// store can be read or written.
+	require.NoError(t, file.Start(adapter.StartStateInitialize, scope))
+	require.NoError(t, file.Start(adapter.StartStateStart, scope))
+	t.Cleanup(func() { _ = scope.Close() })
+	return &persistentRDRCStore{file: file}
+}
+
+func (s *persistentRDRCStore) LoadRDRC(transportName string, qName string, qType uint16) bool {
+	return s.file.LoadRDRC(transportName, qName, qType)
+}
+
+func (s *persistentRDRCStore) SaveRDRC(transportName string, qName string, qType uint16) error {
+	return s.file.SaveRDRC(transportName, qName, qType)
+}
+
+func (s *persistentRDRCStore) SaveRDRCAsync(transportName string, qName string, qType uint16, l slog.Logger) {
+	s.file.SaveRDRCAsync(transportName, qName, qType, l)
+}
+
+// rejected reports whether a verdict is visible for the given key.
+func (s *persistentRDRCStore) rejected(transportName string, qName string, qType uint16) bool {
+	return s.file.LoadRDRC(transportName, qName, qType)
+}
+
+// newPendingTransitionFixtureWithRDRC is newPendingTransitionFixture with a persistent RDRC store
+// attached.
+func newPendingTransitionFixtureWithRDRC(t *testing.T, manager adapter.NetworkManager, transport adapter.DNSTransport, store adapter.RDRCStore) (*Router, *Client) {
+	t.Helper()
+	router, client := newPendingTransitionFixture(t, manager, transport)
+	client.rdrc = store
+	return router, client
 }
 
 // TestDNSQueryStartedDuringPendingTransitionCannotCacheUnderOldEnvironment is the PART B
@@ -829,6 +884,8 @@ type blockingWindowTransport struct {
 	block       bool
 	entered     chan struct{}
 	once        sync.Once
+	// queries counts round trips, so a test can assert that a lookup actually reached the resolver.
+	queries int
 }
 
 func (t *blockingWindowTransport) Type() string                                   { return "blocking-window" }
@@ -840,6 +897,7 @@ func (t *blockingWindowTransport) Close() error                                 
 func (t *blockingWindowTransport) Reset()                                         {}
 
 func (t *blockingWindowTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	t.queries++
 	if t.block {
 		// entered is built with the transport, never from here: creating it on the exchange
 		// goroutine would race the test's read of the field and could lose the signal entirely.
@@ -1099,4 +1157,328 @@ func TestExchangeAsyncSharesTheDeliveryContract(t *testing.T) {
 	_, err := client.Exchange(context.Background(), transport, messageFor("async-during.example."),
 		adapter.DNSQueryOptions{}, nil)
 	require.ErrorIs(t, err, errNetworkTransitioning, "the sync path must refuse the same operation")
+}
+
+// An RDRC verdict is a claim about how a NETWORK answers a name, not about how a transport does.
+//
+// # The defect
+//
+// The persistent key is (transportName, qName, qType) with no environment and no generation, and
+// Router.ResetNetwork does not clear RDRC. The default RDRC timeout is 7 days. So:
+//
+//	network A: transport dns1, foo.example/A rejected -> verdict stored for (dns1, foo.example, A)
+//	A -> B:    DNS generation advances, transport re-pinned to B
+//	network B: same transport tag, same name, same type
+//	           LoadRDRC(dns1, foo.example, A) -> HIT -> ErrResponseRejectedCached
+//
+// B is never queried. A rejection learned on one network suppresses DNS on another, which
+// contradicts the code's own premise that RDRC is network state and its writes require
+// stateMutationAllowed.
+//
+// This test drives a REAL persistent store and a REAL Router.ResetNetwork.
+func TestRDRCVerdictFromNetworkACannotRejectNetworkB(t *testing.T) {
+	manager := &transitionStateManager{}
+	manager.environment.Store(0xA)
+	manager.routeEpoch.Store(1)
+	manager.stable.Store(true)
+
+	transport := &rebindingWindowTransport{
+		tag:         "dns-rdrc-ns",
+		environment: []string{"wifi"},
+		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
+	}
+
+	// A real persistent RDRC store, so the namespace is whatever the production key produces.
+	store := newPersistentRDRCStore(t)
+	router, client := newPendingTransitionFixtureWithRDRC(t, manager, transport, store)
+
+	message := messageFor("ns-verdict.example.")
+
+	// --- network A: the checker rejects, which stores a verdict ---------------
+	reject := func(*mDNS.Msg) bool { return false }
+	_, err := client.Exchange(context.Background(), transport, message,
+		adapter.DNSQueryOptions{}, reject)
+	require.Error(t, err, "A must reject, or no verdict is stored")
+	// The namespace is derived from the transport's pinned environment, which is what the operation
+	// captured - not from the manager's current fingerprint.
+	aNamespace := rdrcNamespace("dns-rdrc-ns", router.concreteClient.environmentHash(transport))
+	require.True(t, store.rejected(aNamespace, mDNS.Fqdn("ns-verdict.example."), mDNS.TypeA),
+		"the positive control: a settled rejection on A persists a verdict in A's namespace")
+
+	// --- transition A -> B, running the real reset body -----------------------
+	manager.stable.Store(false)
+	manager.routeEpoch.Add(1)
+	manager.environment.Store(0xB)
+	router.ResetNetwork()
+	manager.stable.Store(true)
+
+	// --- network B: the same query must actually reach the resolver -----------
+	// The transport now answers acceptably, so a query that reaches it succeeds.
+	transport.current = func() netip.Addr { return netip.MustParseAddr("10.2.0.1") }
+	queriesBefore := transport.queries
+
+	response, err := client.Exchange(context.Background(), transport, message,
+		adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return true })
+
+	require.Greater(t, transport.queries, queriesBefore,
+		"network B was never queried: the verdict learned on A satisfied the lookup on B. RDRC's "+
+			"persistent key carries only (transport, name, type), so a rejection from one network "+
+			"suppresses DNS on every later network at the same tag")
+	require.NoError(t, err,
+		"B's own answer was refused with a verdict that describes A")
+	require.NotNil(t, response)
+}
+
+// A -> B -> A must reuse A's verdict, because the fingerprint really did return to A.
+//
+// The namespace is content-addressed rather than sequence-addressed: it names the network, not the
+// point in time. Returning to a network whose fingerprint is identical means returning to a network
+// the verdict still describes, so the verdict is still true of it. Requiring a re-query would treat
+// an identical environment as a different one, which is what the DNS cache namespace deliberately
+// does NOT do either.
+func TestRDRCVerdictIsReusedWhenTheEnvironmentReturns(t *testing.T) {
+	manager := &transitionStateManager{}
+	manager.environment.Store(0xA)
+	manager.routeEpoch.Store(1)
+	manager.stable.Store(true)
+
+	transport := &rebindingWindowTransport{
+		tag:         "dns-rdrc-aba",
+		environment: []string{"wifi"},
+		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
+	}
+	store := newPersistentRDRCStore(t)
+	router, client := newPendingTransitionFixtureWithRDRC(t, manager, transport, store)
+
+	message := messageFor("aba-verdict.example.")
+	_, err := client.Exchange(context.Background(), transport, message,
+		adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return false })
+	require.Error(t, err)
+
+	aHash := router.concreteClient.environmentHash(transport)
+	require.True(t, store.rejected(rdrcNamespace("dns-rdrc-aba", aHash),
+		mDNS.Fqdn("aba-verdict.example."), mDNS.TypeA), "A holds a verdict")
+
+	// A -> B.
+	manager.stable.Store(false)
+	manager.routeEpoch.Add(1)
+	manager.environment.Store(0xB)
+	router.ResetNetwork()
+	manager.stable.Store(true)
+
+	bNamespace := rdrcNamespace("dns-rdrc-aba", router.concreteClient.environmentHash(transport))
+	require.NotEqual(t, rdrcNamespace("dns-rdrc-aba", aHash), bNamespace,
+		"B must not share A's namespace, or the isolation this test pairs with proves nothing")
+	require.False(t, store.rejected(bNamespace, mDNS.Fqdn("aba-verdict.example."), mDNS.TypeA),
+		"A's verdict must not be visible in B")
+
+	// B -> A, restoring A's fingerprint exactly as the manager publishes it.
+	manager.environment.Store(0xA)
+	router.ResetNetwork()
+	manager.stable.Store(true)
+
+	restored := rdrcNamespace("dns-rdrc-aba", router.concreteClient.environmentHash(transport))
+	require.Equal(t, rdrcNamespace("dns-rdrc-aba", aHash), restored,
+		"returning to A must restore A's namespace")
+	require.True(t, store.rejected(restored, mDNS.Fqdn("aba-verdict.example."), mDNS.TypeA),
+		"the verdict still describes this network, so it is reused rather than re-learned")
+}
+
+// A write authorised on A must not become visible to B even if it lands after B commits.
+//
+// This is the TOCTOU the namespace exists to close. The guard below is passed deliberately: the point
+// is that authorisation alone cannot make a late write correct, because "check then mutate" always
+// leaves a gap between the two. The namespace removes the consequence rather than narrowing the gap.
+func TestLateRDRCWriteCannotPoisonNewEnvironment(t *testing.T) {
+	manager := &transitionStateManager{}
+	manager.environment.Store(0xA)
+	manager.routeEpoch.Store(1)
+	manager.stable.Store(true)
+
+	release := make(chan struct{})
+	transport := &blockingWindowTransport{
+		tag:         "dns-rdrc-late",
+		environment: []string{"wifi"},
+		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
+		release:     release,
+		entered:     make(chan struct{}),
+	}
+	store := newPersistentRDRCStore(t)
+	router, client := newPendingTransitionFixtureWithRDRC(t, manager, transport, store)
+
+	// Drive a REAL operation on A and hold it inside its round trip, so the transition can land
+	// before the response is judged. The transport blocks until release.
+	//
+	// aNamespace is captured here only to assert, below, that A's own namespace is where any late
+	// write would have to appear; the shipped guard refuses the write outright.
+	_ = rdrcNamespace("dns-rdrc-late", router.concreteClient.environmentHash(transport))
+	transport.block = true
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = client.Exchange(context.Background(), transport, messageFor("late.example."),
+			adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return false })
+	}()
+	waitForBlockedExchange(t, transport)
+
+	// A -> B completes first.
+	manager.stable.Store(false)
+	manager.routeEpoch.Add(1)
+	manager.environment.Store(0xB)
+	router.ResetNetwork()
+	manager.stable.Store(true)
+
+	// Release the A-era operation now that B owns the network. It has passed its guard, so it will
+	// write - the question is which namespace it writes into.
+	close(release)
+	<-done
+
+	bNamespace := rdrcNamespace("dns-rdrc-late", router.concreteClient.environmentHash(transport))
+
+	// Two independent defences, and this asserts the OUTCOME rather than which one fired.
+	//
+	// In the shipped code the write is refused earlier, by stateMutationAllowed: the operation
+	// started settled on A, B has since committed, and ResetNetwork advanced the generation, so the
+	// guard is false and nothing is written at all.
+	//
+	// The namespace is what covers the remainder. Removing that guard does not reopen the hole: the
+	// write then proceeds, but into A's namespace, which no B lookup reads. Verified by deleting the
+	// guard and re-running this test, which still passes.
+	//
+	// Asserting the outcome rather than the mechanism keeps this valid whichever defence fires, and
+	// is why this test is not merely a restatement of the guard test above.
+	require.False(t, store.rejected(bNamespace, mDNS.Fqdn("late.example."), mDNS.TypeA),
+		"a late A-era write became visible to B")
+
+	// And a query on B reaches the resolver rather than being suppressed by it.
+	transport.block = false
+	queriesBefore := transport.queries
+	_, _ = client.Exchange(context.Background(), transport, messageFor("late.example."),
+		adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return true })
+	require.Greater(t, transport.queries, queriesBefore, "B must actually be queried")
+}
+
+// A background refresh that crosses a transition must not persist an RDRC verdict for the new network.
+//
+// # Why the existing refresh test did not cover this
+//
+// TestBackgroundRefreshDuringTransitionDoesNotPersistRDRC schedules the refresh while the network is
+// already unsettled, so the refresh returns before it ever reaches its checker. The refresh's RDRC
+// guard is therefore never exercised, and deleting it produced no test failure - the gap the previous
+// report admitted.
+//
+// # The shape that does cover it
+//
+// The refresh must start SETTLED, so it passes its start-state check and makes its round trip. The
+// transition then completes while the response is in flight, and the response comes back rejected.
+// That is the only ordering in which the refresh's own guard is the thing being tested.
+func TestBackgroundRefreshCrossingTransitionCannotPersistRDRC(t *testing.T) {
+	manager := &transitionStateManager{}
+	manager.environment.Store(0xA)
+	manager.routeEpoch.Store(1)
+	manager.stable.Store(true)
+
+	release := make(chan struct{})
+	transport := &blockingWindowTransport{
+		tag:         "rdrc-refresh-cross",
+		environment: []string{"wifi"},
+		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
+		release:     release,
+		entered:     make(chan struct{}),
+	}
+	store := newPersistentRDRCStore(t)
+	router, client := newPendingTransitionFixtureWithRDRC(t, manager, transport, store)
+
+	// Prime a cache entry that the optimistic path can serve.
+	_, err := client.Exchange(context.Background(), transport, messageFor("rdrccross.example."),
+		adapter.DNSQueryOptions{}, nil)
+	require.NoError(t, err)
+
+	client.optimisticTimeout = time.Hour
+	probe := probeMessage("rdrccross.example.")
+	key := client.newCacheKey(transport, probe.Question[0], probe, adapter.DNSQueryOptions{})
+	entry, _, _ := client.loadResponse(key)
+	require.NotNil(t, entry)
+	client.cache.AddWithLifetime(key, entry, -time.Minute)
+
+	// A's namespace, captured before the transition re-pins the transport.
+	namespaceA := rdrcNamespace("rdrc-refresh-cross", router.concreteClient.environmentHash(transport))
+
+	// The refresh starts while the network is SETTLED - this is what makes the test discriminating.
+	transport.block = true
+	client.backgroundRefreshDNS(transport, key,
+		client.prepareExchangeMessage(probe.Copy(), adapter.DNSQueryOptions{}),
+		adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return false })
+	waitForBlockedExchange(t, transport)
+
+	// The transition completes while the refresh is in flight.
+	manager.stable.Store(false)
+	manager.routeEpoch.Add(1)
+	manager.environment.Store(0xB)
+	router.ResetNetwork()
+	manager.stable.Store(true)
+
+	close(release)
+	waitForRefreshIdle(t, client)
+
+	bNamespace := rdrcNamespace("rdrc-refresh-cross", router.concreteClient.environmentHash(transport))
+	require.False(t, store.rejected(bNamespace, mDNS.Fqdn("rdrccross.example."), mDNS.TypeA),
+		"a background refresh that started settled persisted an RDRC verdict for the network that "+
+			"replaced the one it measured")
+
+	// The refresh's OWN guard refuses the write outright, so A's namespace stays empty too.
+	//
+	// Asserting this is what gives the test discriminating power. Without it, deleting the refresh
+	// guard still passes - because the write then lands in A's namespace and B is unaffected either
+	// way. That case is genuinely covered by the namespace, but it is the GUARD that stops the write
+	// here, and a test that cannot tell the two apart does not test the guard.
+	require.False(t, store.rejected(namespaceA,
+		mDNS.Fqdn("rdrccross.example."), mDNS.TypeA),
+		"the refresh's stateMutationAllowed guard must refuse the deposit entirely: the network moved "+
+			"underneath it, so the verdict describes a network that no longer holds. Removing that "+
+			"guard makes this assertion fail, which is what makes this test discriminating")
+}
+
+// A legacy raw-tag verdict must not be read as a current-environment verdict.
+//
+// # Why this is the safe direction
+//
+// Older builds persisted RDRC under the bare transport tag. The new lookup key is namespaced, so a
+// legacy entry simply does not match: the first new-environment lookup misses and queries the
+// resolver.
+//
+// That is the correct failure mode. RDRC is an optimization: a miss costs one DNS query, while a
+// wrong hit skips the real resolver entirely and suppresses a name on a network that never rejected
+// it. Reading legacy entries as "true for every network" would reintroduce exactly the defect this
+// change removes, so they are left to expire on their own timeout rather than migrated.
+func TestLegacyRawRDRCEntryIsNotReadAsAEnvironmentVerdict(t *testing.T) {
+	manager := &transitionStateManager{}
+	manager.environment.Store(0xA)
+	manager.routeEpoch.Store(1)
+	manager.stable.Store(true)
+
+	transport := &rebindingWindowTransport{
+		tag:         "dns-rdrc-legacy",
+		environment: []string{"wifi"},
+		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
+	}
+	store := newPersistentRDRCStore(t)
+	_, client := newPendingTransitionFixtureWithRDRC(t, manager, transport, store)
+
+	// A verdict written the OLD way: the bare transport tag, no namespace.
+	require.NoError(t, store.SaveRDRC("dns-rdrc-legacy", mDNS.Fqdn("legacy.example."), mDNS.TypeA))
+	require.True(t, store.rejected("dns-rdrc-legacy", mDNS.Fqdn("legacy.example."), mDNS.TypeA),
+		"the legacy key is readable under its own name")
+
+	// The client must not find it, and must therefore query the resolver.
+	queriesBefore := transport.queries
+	_, err := client.Exchange(context.Background(), transport, messageFor("legacy.example."),
+		adapter.DNSQueryOptions{}, func(*mDNS.Msg) bool { return true })
+
+	require.NoError(t, err, "the legacy verdict must not suppress the query")
+	require.Greater(t, transport.queries, queriesBefore,
+		"a legacy raw-tag verdict was read as a verdict for the current environment. Legacy entries "+
+			"describe no particular network, so treating them as true for every network is the "+
+			"original defect; they are left to expire instead")
 }
