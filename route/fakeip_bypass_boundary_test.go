@@ -38,14 +38,14 @@ func TestFakeIPDestinationIsNeverBypassed(t *testing.T) {
 	// Sanity: without the FakeIP flag this destination WOULD be bypassed, so the assertion below
 	// is about the flag rather than about an unusable fixture.
 	require.True(t, router.canFastBypass(&metadata, packetDestination,
-		[]adapter.Outbound{outbound}, outbound),
+		[]adapter.Outbound{outbound}, outbound).BypassAllowed(),
 		"a plain literal destination is bypassable, which is what makes the next assertion "+
 			"meaningful")
 
 	// With the FakeIP marker set, it must not be.
 	metadata.FakeIP = true
 	require.False(t, router.canFastBypass(&metadata, packetDestination,
-		[]adapter.Outbound{outbound}, outbound),
+		[]adapter.Outbound{outbound}, outbound).BypassAllowed(),
 		"a FakeIP destination is synthetic and exists only inside sing-box; handing it to the "+
 			"platform would connect to an address that means nothing outside the process and would "+
 			"skip the unmapping that recovers the domain the client actually asked for")
@@ -66,7 +66,7 @@ func TestRewrittenDestinationIsNeverBypassed(t *testing.T) {
 	metadata.Destination = M.ParseSocksaddr("93.184.216.34:443")
 
 	require.False(t, router.canFastBypass(&metadata, packetDestination,
-		[]adapter.Outbound{outbound}, outbound),
+		[]adapter.Outbound{outbound}, outbound).BypassAllowed(),
 		"a destination that differs from the one the flow was created for was rewritten by a "+
 			"rule; the rewritten target is the one the userspace path must dial")
 }

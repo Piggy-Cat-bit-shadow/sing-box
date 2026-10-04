@@ -590,15 +590,24 @@ func applyRouteOptionsMetadata(metadata *adapter.InboundContext, routeOptions *R
 	}
 }
 
-// canFastBypass reports whether this connection may skip the userspace data path entirely.
+// canFastBypass reports whether this connection may skip the userspace data path entirely, and if
+// not, which condition refused it.
 //
 // # Allow-list, not deny-list
 //
-// Everything not explicitly proven safe returns false. The conditions below are the complete set
-// of reasons a plain direct connection is equivalent to an OS connect; anything the router
-// cannot see through - a sniffed domain, a rewritten destination, a tracker that must observe
-// the flow - disqualifies the connection. A miss costs one predicate call and falls through to
-// exactly the behaviour that existed before, so being conservative is free.
+// Everything not explicitly proven safe is refused. The conditions below are the complete set of
+// reasons a plain direct connection is equivalent to an OS connect; anything the router cannot see
+// through - a sniffed domain, a rewritten destination, a tracker that must observe the flow -
+// disqualifies the connection. A refusal costs one predicate call and falls through to exactly the
+// behaviour that existed before, so being conservative is free.
+//
+// # The one condition that is about the FLOW rather than the configuration
+//
+// The last check delegates to the outbound, and the outbound answers for the flow it was handed.
+// That distinction is the whole point of the owner's profile: a dial option only disqualifies a
+// flow if the userspace path would actually apply it to that flow. Comparing configurations
+// instead refused every flow through an outbound that carried a domain_resolver, including the
+// literal-IP flows that never reach a resolver.
 //
 // # Ordering
 //
@@ -613,42 +622,42 @@ func applyRouteOptionsMetadata(metadata *adapter.InboundContext, routeOptions *R
 // rewrite it. Comparing against metadata.Destination is how an override, a FakeIP rewrite or a
 // sniff override_destination is detected - the fast path may only carry a connection to the
 // address the platform already put on the wire.
-func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestination M.Socksaddr, chain []adapter.Outbound, outbound adapter.Outbound) bool {
+func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestination M.Socksaddr, chain []adapter.Outbound, outbound adapter.Outbound) BypassVerdict {
 	// v1 targets TUN only. ActionBypass is the platform handing the flow back to the OS's own
 	// routing; other inbounds have no equivalent, so they keep their existing path.
 	if metadata.InboundType != C.TypeTun {
-		return false
+		return BypassRefusedInboundType
 	}
 
 	// Only the two protocols the optimisation was reasoned about. ICMP keeps its existing flow
 	// handling, and an unknown network is not this function's business.
 	if metadata.Network != N.NetworkTCP && metadata.Network != N.NetworkUDP {
-		return false
+		return BypassRefusedNetwork
 	}
 
 	// A domain destination still needs resolution, so it cannot be bypassed.
 	if metadata.Destination.IsDomain() {
-		return false
+		return BypassRefusedDomainDestination
 	}
 
 	// FakeIP addresses are placeholders belonging to the virtual range. Handing one to the OS
 	// routing table would send it somewhere meaningless, and the mapping back to the real
 	// destination is exactly the work the userspace path exists to do.
 	if metadata.FakeIP {
-		return false
+		return BypassRefusedFakeIP
 	}
 
 	// A recovered or sniffed domain means this connection may use dual-stack recovery, which
 	// lives in the dialer and would be skipped entirely. Preserving that behaviour is worth more
 	// than the bypass.
 	if metadata.Domain != "" {
-		return false
+		return BypassRefusedSniffedDomain
 	}
 
 	// A populated candidate list means resolve, recovery or candidate planning already took
 	// part in this connection.
 	if len(metadata.DestinationAddresses) > 0 {
-		return false
+		return BypassRefusedResolvedCandidates
 	}
 
 	// The destination must be exactly what the flow was created for. Any difference means a
@@ -656,35 +665,35 @@ func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestinati
 	// replaced the target - and the rewritten destination is the one the userspace path must
 	// dial.
 	if metadata.Destination != packetDestination {
-		return false
+		return BypassRefusedDestinationRewritten
 	}
 	if metadata.RouteOriginalDestination.IsValid() {
-		return false
+		return BypassRefusedRouteOriginalDestination
 	}
 
 	// A UoT session carrying per-datagram destinations is not a fixed target; treating it as one
 	// would pin the session to whichever address arrived first.
 	if metadata.UoTDatagramDestinations {
-		return false
+		return BypassRefusedUoTDatagramDestinations
 	}
 
 	// Connected UDP has its own socket and NAT semantics that this optimisation does not
 	// reproduce. Left on the existing path deliberately.
 	if metadata.UDPConnect {
-		return false
+		return BypassRefusedUDPConnect
 	}
 
 	// Domain unmapping is performed by the userspace NAT path (splice and conn decide
 	// unidirectional NAT from it). A native bypass never reaches that code, so the option would
 	// be silently ignored for a connection that is not already an IP destination.
 	if metadata.UDPDisableDomainUnmapping {
-		return false
+		return BypassRefusedUDPDomainUnmapping
 	}
 
 	// A custom UDP timeout is applied by the userspace UDP path. The native bypass has its own
 	// lifetime semantics, so the two are not interchangeable.
 	if metadata.UDPTimeout > 0 {
-		return false
+		return BypassRefusedCustomUDPTimeout
 	}
 
 	// Network selection, interface pinning and fallback are dialer behaviour that a bypass does
@@ -693,20 +702,20 @@ func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestinati
 		len(metadata.NetworkType) > 0 ||
 		len(metadata.FallbackNetworkType) > 0 ||
 		metadata.FallbackDelay > 0 {
-		return false
+		return BypassRefusedNetworkOptions
 	}
 
 	// TLS fragmentation and spoofing rewrite the handshake in the userspace path. Bypassing
 	// would silently disable them.
 	if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSSpoof != "" {
-		return false
+		return BypassRefusedTLSOptions
 	}
 
 	// A tracker observes connections; a bypassed flow would simply never appear in traffic
 	// statistics or the connections API. Silently losing accounting is not an acceptable
 	// optimisation, so the presence of any tracker disables the fast path for now.
 	if len(r.trackers) > 0 {
-		return false
+		return BypassRefusedTracker
 	}
 
 	// Process metadata must have been OBTAINED, not merely absent.
@@ -716,23 +725,28 @@ func (r *Router) canFastBypass(metadata *adapter.InboundContext, packetDestinati
 	// indistinguishable from "no process rule applies" - and the default direct outbound would
 	// then take an irreversible bypass chosen by missing data rather than by the configuration.
 	if !r.processMetadataIsProven(metadata) {
-		return false
+		return BypassRefusedProcessMetadataUnproven
 	}
 
 	// Only a connection that resolves to exactly one outbound, with nothing in front of it. A
 	// group introduces selection, lifecycle and accounting semantics of its own, and bypassing
 	// it would skip all of them even when the selected outbound happens to be direct.
 	if len(chain) != 1 {
-		return false
+		return BypassRefusedOutboundChain
 	}
 
-	// Finally, the outbound itself must declare that it would do nothing special. This is the
-	// one condition the router cannot evaluate, so it is delegated rather than assumed.
+	// Finally, the outbound itself must declare that it would do nothing special for this flow.
+	// This is the one condition the router cannot evaluate, so it is delegated rather than
+	// assumed - and it is delegated with the flow, not with the configuration: a dial option the
+	// flow never reaches is not a reason to refuse.
 	bypassable, isBypassable := outbound.(adapter.BypassableOutbound)
 	if !isBypassable {
-		return false
+		return BypassRefusedOutboundNotBypassable
 	}
-	return bypassable.CanBypass(metadata.Network, metadata.Destination.Addr)
+	if !bypassable.CanBypass(metadata.Network, metadata.Destination.Addr) {
+		return BypassRefusedOutboundSemantics
+	}
+	return BypassAllowed
 }
 
 // preMatchFlow resolves the outbound for a matched rule and decides how the flow proceeds.
@@ -766,7 +780,7 @@ func (r *Router) preMatchFlow(ctx context.Context, metadata *adapter.InboundCont
 	// already have paid the cost this exists to avoid.
 	//
 	// On any doubt canFastBypass returns false and nothing about the previous behaviour changes.
-	if r.canFastBypass(metadata, packetDestination, chain, outbound) {
+	if r.canFastBypass(metadata, packetDestination, chain, outbound).BypassAllowed() {
 		r.logger.DebugContext(ctx, "pre-match: bypassing userspace for ", metadata.Network,
 			" connection from ", metadata.Source.AddrString(), " to ", metadata.Destination)
 		return adapter.PreMatchResult{Action: adapter.PreMatchBypass, Outbound: outbound}

@@ -453,7 +453,7 @@ func TestFastBypassPredicateDoesNotAllocate(t *testing.T) {
 	// The eligible path must not allocate either: a hit that allocated would still hand the
 	// saving to a manual GC.
 	allocs := testing.AllocsPerRun(1000, func() {
-		_ = router.canFastBypass(&metadata, destination, chain, outbound)
+		_ = router.canFastBypass(&metadata, destination, chain, outbound).BypassAllowed()
 	})
 	require.Zero(t, allocs,
 		"the fast-path predicate must not allocate; measured %.2f allocs/op", allocs)
@@ -462,7 +462,7 @@ func TestFastBypassPredicateDoesNotAllocate(t *testing.T) {
 	missMetadata := fastBypassMetadata(N.NetworkTCP, destination)
 	missMetadata.Domain = "example.com"
 	missAllocs := testing.AllocsPerRun(1000, func() {
-		_ = router.canFastBypass(&missMetadata, destination, chain, outbound)
+		_ = router.canFastBypass(&missMetadata, destination, chain, outbound).BypassAllowed()
 	})
 	require.Zero(t, missAllocs,
 		"the ineligible path must not allocate; measured %.2f allocs/op", missAllocs)
@@ -479,7 +479,7 @@ func BenchmarkCanFastBypassEligible(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if !router.canFastBypass(&metadata, destination, chain, outbound) {
+		if !router.canFastBypass(&metadata, destination, chain, outbound).BypassAllowed() {
 			b.Fatal("expected eligible")
 		}
 	}
@@ -498,7 +498,7 @@ func BenchmarkCanFastBypassIneligibleEarlyExit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if router.canFastBypass(&metadata, destination, chain, outbound) {
+		if router.canFastBypass(&metadata, destination, chain, outbound).BypassAllowed() {
 			b.Fatal("expected ineligible")
 		}
 	}
@@ -518,7 +518,7 @@ func BenchmarkCanFastBypassIneligibleLateExit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if router.canFastBypass(&metadata, destination, chain, outbound) {
+		if router.canFastBypass(&metadata, destination, chain, outbound).BypassAllowed() {
 			b.Fatal("expected ineligible")
 		}
 	}

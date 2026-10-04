@@ -89,7 +89,7 @@ func TestTransientProcessMissDoesNotBecomeADirectBypass(t *testing.T) {
 	packetDestination := metadata.Destination
 
 	require.False(t, router.canFastBypass(&metadata, packetDestination,
-		[]adapter.Outbound{outbound}, outbound),
+		[]adapter.Outbound{outbound}, outbound).BypassAllowed(),
 		"a process lookup that could not be completed must not become a native bypass; the "+
 			"decision would then be made by missing metadata rather than by the configuration, "+
 			"and a process rule selecting a proxy would be silently skipped")
@@ -98,7 +98,7 @@ func TestTransientProcessMissDoesNotBecomeADirectBypass(t *testing.T) {
 	// assertion above about the missing metadata rather than about the fixture.
 	metadata.ProcessInfo = &adapter.ConnectionOwner{ProcessPaths: []string{"/usr/bin/curl"}}
 	require.True(t, router.canFastBypass(&metadata, packetDestination,
-		[]adapter.Outbound{outbound}, outbound),
+		[]adapter.Outbound{outbound}, outbound).BypassAllowed(),
 		"with the process metadata obtained the bypass is provable and must be allowed")
 	metadata.ProcessInfo = nil
 
