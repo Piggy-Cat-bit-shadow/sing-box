@@ -145,6 +145,7 @@ Router 回答 routing/policy/metadata，profile 回答 outbound/socket。**不�
 - **L0 不是“先过 Router policy，再 L0 bypass”。** `JudgeFlow` 的顺序是 DNS hijack → route sets → router，route set 拿到的 flow **Router 从未见过**。所以 L0 只适合已经编码进 route set 的、权威的纯 IP 规则；把带 domain/process/protocol 条件的 `DIRECT` 规则编译成 route set 是错的，台账测试 `TestL0CannotExpressAnythingButAddresses` 钉住了这一点。
 - **FakeIP 永远不得 native bypass，包括 L0。** route set 先于 router，`route_address_set` 会让集合**之外**的目的地 bypass——域名刚拿到的 FakeIP 占位地址会被交给平台路由表并黑洞掉；`route_exclude_address_set` 覆盖到 `198.18.0.0/15` 也会。守卫是两次 prefix 比较，每 flow 一次（不是每包），没有 FakeIP transport 时完全不执行。
 - **DNS 仍然第一。** Direct Offload 不改变顺序，也不声称识别 DoH/DoT/DoQ，更不会为了拦 QUIC 去封 UDP/443。
+- **TrafficClass 不参与 Direct Offload 判定。** native direct flow 本来就不在 upload scheduler 的 managed domain 里（scheduler 只管 userspace copy loop 上的上传流），所以 `traffic_class` 既不授予也不否决 bypass 资格。这是产品语义，不是遗漏。
 - **tracker 存在即拒绝，这是第一轮的正确答案。** 但必须诚实报告产品效果：命中率在带 dashboard/API 的配置下是 **0**。原因是守卫看的是 tracker 的**存在**，不是它会记录什么。要做 native accounting 是独立项目。
 
 ### 已测量的事实
