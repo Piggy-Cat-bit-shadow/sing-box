@@ -17,6 +17,8 @@ import (
 	"github.com/sagernet/sing-box/common/sniff"
 	"github.com/sagernet/sing-box/common/tlsfragment"
 	"github.com/sagernet/sing-box/common/tlsspoof"
+	"github.com/sagernet/sing-box/common/trafficclass"
+	"github.com/sagernet/sing-box/common/trafficsched"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
@@ -40,11 +42,31 @@ type ConnectionManager struct {
 	// packet. See splice_diagnostics.go for why, and for what these numbers can and
 	// cannot tell you.
 	spliceDiagnostics spliceDiagnostics
+	// scheduler arbitrates the upload write path of every managed flow.
+	//
+	// It lives here rather than on the Router because the connection manager is what creates a
+	// flow and what finalises it, so the scheduler's flow lifetime is exactly a connection's.
+	// See trafficsched.Scheduler for the ownership reasoning.
+	scheduler *trafficsched.Scheduler
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
 	return &ConnectionManager{
 		logger: logger,
+		// The production default is a scheduler that is INSTALLED but deliberately inert.
+		//
+		// The contention experiment in common/trafficsched measured that the models which only
+		// change when a write starts - admission ordering and service slots - do not move the
+		// receiver-visible p99 at all, because the bytes that delay an interactive message are
+		// already inside the sender's acceptance window. Only admitting NORMAL data at no more
+		// than the rate the path actually sustains helps, and that needs a rate nobody can read
+		// out of a socket.
+		//
+		// So the gate goes in the path, observes every byte, and admits everything immediately.
+		// Turning the feature on is setting NormalRate - one line here, or a configuration field
+		// when the rate can be learned rather than supplied. Until then a scheduler that appears
+		// to do something it cannot is worse than one that plainly does nothing.
+		scheduler: trafficsched.NewScheduler(trafficsched.Options{Mode: trafficsched.ModePaced}),
 	}
 }
 
@@ -82,6 +104,12 @@ func (m *ConnectionManager) CloseAll() {
 
 func (m *ConnectionManager) Close() error {
 	m.CloseAll()
+	// Releasing the scheduler here is what unblocks a copy goroutine parked in the gate. Closing
+	// the connections above does not: a flow waiting for a permit is not inside a write, so it
+	// never observes the closed socket.
+	if m.scheduler != nil {
+		_ = m.scheduler.Close()
+	}
 	// One line per tunnel lifetime, and only when UDP actually went through the splice
 	// decision. This is the only place the diagnostics are reported, deliberately: a
 	// per-session or per-packet log would be the very cost the counters exist to measure.
@@ -197,8 +225,54 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// writer's tuning to the outbound direction as well.
 	uploadIncreaseBufferAfter := connectionIncreaseBufferAfter(this, conn, remoteConn)
 	downloadIncreaseBufferAfter := connectionIncreaseBufferAfter(this, remoteConn, conn)
-	go m.connectionCopy(ctx, conn, remoteConn, false, uploadIncreaseBufferAfter, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, downloadIncreaseBufferAfter, &done, onClose)
+	uploadWriter, uploadFlow := m.uploadStreamGate(conn, remoteConn, metadata.TrafficClass)
+	go m.connectionCopy(ctx, conn, remoteConn, false, uploadIncreaseBufferAfter, &done, onClose, uploadWriter, uploadFlow)
+	go m.connectionCopy(ctx, remoteConn, conn, true, downloadIncreaseBufferAfter, &done, onClose, nil, nil)
+}
+
+// uploadStreamGate decides whether this upload flow is scheduled, and returns the writer the copy
+// loop must use and the flow that must be released when it ends.
+//
+// # Why a kernel-splice-eligible flow is left alone
+//
+// bufio.copyDirect moves bytes between two syscall-capable ends without ever entering the
+// userspace copy loop, so a gate there would not delay anything - it would only take the kernel
+// fast path away from a flow that had it. The check below is the SAME predicate copyDirect itself
+// applies, so a flow is gated only when copyDirect would have declined anyway. Managing only the
+// userspace path is the stated scope of the first scheduler round, not a limitation discovered
+// later.
+//
+// # Why the gate goes in front of the destination and not the source
+//
+// The copy loop's scheduling point is the write: it is the only place a flow decides to hand
+// bytes to the outbound. Gating the read would leave the already-resolved writer untouched and
+// make ownership of an in-flight buffer the reader's problem instead of the writer's.
+func (m *ConnectionManager) uploadStreamGate(source net.Conn, destination net.Conn, class trafficclass.Class) (io.Writer, *trafficsched.Flow) {
+	if m.scheduler == nil {
+		return nil, nil
+	}
+	if N.SyscallAvailableForRead(source) && N.SyscallAvailableForWrite(destination) {
+		return nil, nil
+	}
+	return m.gateWriter(destination, class)
+}
+
+// gateWriter installs the scheduler gate in front of destination.
+//
+// The destination's own write counters are extracted FIRST and carried across the gate. A
+// non-replaceable gate terminates N.UnwrapCountWriter, so a gate placed outside a counter wrapper
+// would make that counter read zero while the data still flowed - an accounting loss that looks
+// exactly like a working connection. Counting is unchanged when the destination has no counters,
+// which is the common case: upload bytes are counted on the inbound READ side by the traffic
+// tracker, not here.
+func (m *ConnectionManager) gateWriter(destination io.Writer, class trafficclass.Class) (io.Writer, *trafficsched.Flow) {
+	flow := m.scheduler.NewFlow(class)
+	upstream, counters := N.UnwrapCountWriter(destination, nil)
+	gate := trafficsched.NewGate(upstream, flow)
+	if len(counters) == 0 {
+		return gate, flow
+	}
+	return &counterPreservingWriter{gate: gate, counters: counters}, flow
 }
 
 // connectionIncreaseBufferAfter reports after how many copied bytes the copy loop that
@@ -398,12 +472,73 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool
-	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose)
-	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
+	uploadPacketWriter, uploadPacketFlow := m.uploadPacketGate(destination, metadata.TrafficClass)
+	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose, uploadPacketWriter, uploadPacketFlow)
+	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose, nil, nil)
 }
 
-func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, increaseBufferAfter int64, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyWithIncreateBuffer(destination, source, increaseBufferAfter, bufio.DefaultBatchSize)
+// uploadPacketGate installs the scheduler gate on the UDP upload direction.
+//
+// There is no packet equivalent of copyDirect to protect: bufio.CopyPacket has no userspace
+// bypass, and the syscall batch writer is reached THROUGH the gate because the gate forwards
+// CreatePacketBatchWriter. So no flow is excluded here, and the batch shape is preserved rather
+// than degraded.
+func (m *ConnectionManager) uploadPacketGate(destination N.PacketWriter, class trafficclass.Class) (N.PacketWriter, *trafficsched.Flow) {
+	if m.scheduler == nil {
+		return nil, nil
+	}
+	flow := m.scheduler.NewFlow(class)
+	upstream, counters := N.UnwrapCountPacketWriter(destination, nil)
+	gate := trafficsched.NewPacketGate(upstream, flow)
+	if len(counters) == 0 {
+		return gate, flow
+	}
+	return &counterPreservingPacketWriter{gate: gate, counters: counters}, flow
+}
+
+// counterPreservingWriter keeps a destination's write counters visible across a non-replaceable
+// gate.
+//
+// It unwraps to the GATE and not to the pre-gate writer, so one unwrap pass still yields
+// destination=gate, counters=funcs: the counters are visible, the gate stays in the write path,
+// nothing is counted twice, and the recursion terminates because the writer it returns is the
+// non-replaceable gate.
+type counterPreservingWriter struct {
+	gate     io.Writer
+	counters []N.CountFunc
+}
+
+func (w *counterPreservingWriter) Write(p []byte) (int, error) {
+	return w.gate.Write(p)
+}
+
+func (w *counterPreservingWriter) UnwrapWriter() (io.Writer, []N.CountFunc) {
+	return w.gate, w.counters
+}
+
+type counterPreservingPacketWriter struct {
+	gate     N.PacketWriter
+	counters []N.CountFunc
+}
+
+func (w *counterPreservingPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	return w.gate.WritePacket(buffer, destination)
+}
+
+func (w *counterPreservingPacketWriter) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
+	return w.gate, w.counters
+}
+
+func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, increaseBufferAfter int64, done *atomic.Bool, onClose N.CloseHandlerFunc, copyWriter io.Writer, flow *trafficsched.Flow) {
+	if flow != nil {
+		// Releasing the flow is what lets a close unblock this goroutine, and what removes it from
+		// the scheduler's queues so a torn-down connection cannot hold a lane.
+		defer flow.Close()
+	}
+	if copyWriter == nil {
+		copyWriter = destination
+	}
+	_, err := bufio.CopyWithIncreateBuffer(copyWriter, source, increaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
 		common.Close(source, destination)
 	} else {
@@ -614,8 +749,14 @@ func deliverCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) 
 	return err
 }
 
-func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	_, err := bufio.CopyPacket(destination, source)
+func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc, copyWriter N.PacketWriter, flow *trafficsched.Flow) {
+	if flow != nil {
+		defer flow.Close()
+	}
+	if copyWriter == nil {
+		copyWriter = destination
+	}
+	_, err := bufio.CopyPacket(copyWriter, source)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")
