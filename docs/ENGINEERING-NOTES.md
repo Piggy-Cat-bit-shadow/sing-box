@@ -145,6 +145,9 @@ Router 回答 routing/policy/metadata，profile 回答 outbound/socket。**不�
 - **L0 不是“先过 Router policy，再 L0 bypass”。** `JudgeFlow` 的顺序是 DNS hijack → route sets → router，route set 拿到的 flow **Router 从未见过**。所以 L0 只适合已经编码进 route set 的、权威的纯 IP 规则；把带 domain/process/protocol 条件的 `DIRECT` 规则编译成 route set 是错的，台账测试 `TestL0CannotExpressAnythingButAddresses` 钉住了这一点。
 - **FakeIP 永远不得 native bypass，包括 L0。** route set 先于 router，`route_address_set` 会让集合**之外**的目的地 bypass——域名刚拿到的 FakeIP 占位地址会被交给平台路由表并黑洞掉；`route_exclude_address_set` 覆盖到 `198.18.0.0/15` 也会。守卫是两次 prefix 比较，每 flow 一次（不是每包），没有 FakeIP transport 时完全不执行。
 - **DNS 仍然第一。** Direct Offload 不改变顺序，也不声称识别 DoH/DoT/DoQ，更不会为了拦 QUIC 去封 UDP/443。
+- **`ActionBypass` 在 TUN 下不是数据面 bypass，这是本轮最重要的发现。** 三个 TUN stack（`go`/`gvisor`/`system`）都把它当 `ActionAccept` 处理：dispatcher 装一条 accept entry、不消费包，随后 stack 在 userspace 终结连接并回调 `Handler.NewConnectionEx`。唯一真正兑现的传输是 Linux `auto_redirect`（nfqueue → `NfRepeat` + output mark）。L0 route set 的 bypass 靠的是**安装 OS 路由**，和 verdict 无关。证据见 [native bypass trace](fork/native-bypass-trace.md) 与 `protocol/tun/native_bypass_{dispatcher,trace}_test.go`。
+- **因此 L1 在 TUN 下的数据面命中率是 0，而且是有代价的 0。** pre-match 的结论被丢弃，userspace 连接再从头走一次 `matchRule`，所以被判定为可 bypass 的 flow 反而多付一次规则求值。Round 2 的 85% 是**判定层**命中率，不是数据面命中率，文档已更正。
+- **tracked native bypass 被否决，不是"暂缺 tracker"。** 真正的 native path 在 TUN 下不存在；即便在 sing-tun 里实现"把包交还平台"，反向流量由 OS conntrack 直接投递给应用 socket，永不经过 sing-box——`classifyReturn` 只通过 `Port` 建立的 NAT 表找反向流，而 accept entry 不建立任何 NAT 表。所以 download 精确计量物理上不可能，强制关闭也没有对象可关。结论：**NATIVE TRACKER BRIDGE REJECTED**，tracker guard 保留。
 - **TrafficClass 不参与 Direct Offload 判定。** native direct flow 本来就不在 upload scheduler 的 managed domain 里（scheduler 只管 userspace copy loop 上的上传流），所以 `traffic_class` 既不授予也不否决 bypass 资格。这是产品语义，不是遗漏。
 - **tracker 存在即拒绝，这是第一轮的正确答案。** 但必须诚实报告产品效果：命中率在带 dashboard/API 的配置下是 **0**。原因是守卫看的是 tracker 的**存在**，不是它会记录什么。要做 native accounting 是独立项目。
 
@@ -152,8 +155,10 @@ Router 回答 routing/policy/metadata，profile 回答 outbound/socket。**不�
 
 | 项 | 值 |
 | --- | --- |
-| L1 命中（minimal，模型权重） | 3/6 shape，**85%**；全部 literal IP flow 命中 |
-| L1 命中（dashboard-enabled） | **0/6** |
+| L1 命中（minimal，模型权重，**判定层**） | 3/6 shape，**85%**；全部 literal IP flow 命中 |
+| L1 命中（dashboard-enabled，判定层） | **0/6** |
+| L1 命中（TUN 数据面，任何配置） | **0**——verdict 不被任何 TUN stack 兑现 |
+| L1 命中（Linux auto_redirect 数据面） | 兑现（nfqueue `NfRepeat`） |
 | L0 命中 | 无 route set 0/4；`route_address_set: 10/8` 2/4；`route_exclude_address_set: 198.16/12` 1/4 |
 | 资格判定成本 | 数 ns，**0 allocs**（同时是测试断言，不只是 benchmark） |
 | L1 每字节成本 | 0（连接根本不在本进程创建） |
@@ -188,5 +193,7 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 - Direct Offload 的 L1 命中率是在**模型流量配比**上加权的，per-shape 判定是精确的，加权总数只与那个假设同好坏；仓库内没有 TUN 客户端夹具，生产拓扑是服务端形态，L1 增益属于 TUN 客户端部署。
 - Direct Offload 的 L2/L3 对比跑在 loopback 上，不证明真实网卡、真实 RTT 或丢包下的差异。
 - native 路径上的 tracker accounting 尚未实现，因此带 dashboard/API 的配置目前拿不到 L1 收益。
+- Direct Offload 的 L1 在 TUN 下的数据面效果为 0，且把包"交还平台"是否会在 TUN 路由下成环，需要真实 TUN + 路由控制的 harness 才能判定（需要 root，不在自动 CI 内）。这是 real TUN harness 的第一优先问题。
+- `ActionBypass` 在 gvisor/system stack 的行为目前只有代码证据，没有行为测试：gvisor stack 通过真实设备读包、system stack 需要本地 listener，两者都无法用 in-memory TUN 驱动；共用的 dispatcher 层已有行为测试覆盖。
 
 这些条目描述当前仓库证据的边界，不预断真实部署一定存在缺陷；有可靠测试或现场记录后应更新本节。

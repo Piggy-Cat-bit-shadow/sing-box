@@ -85,19 +85,34 @@ A newly added `DialerOptions` field must not be able to make a bypass **safe** b
 
 ---
 
-## Which layers exist
+## Which layers exist, and where a bypass actually happens
 
-| Layer | What carries the bytes | In-process per-byte cost |
-| --- | --- | --- |
-| L0 | The TUN's own route sets (`route_address_set` / `route_exclude_address_set`) | zero |
-| L1 | The router's semantic bypass — this document | zero |
-| L2 | Userspace copy with a kernel socket pair (splice / `sendfile`) | two syscalls per chunk |
-| L3 | Userspace copy through buffers | a copy plus two syscalls per chunk |
+| Layer | What carries the bytes | Per-byte cost to this process | Where it is honoured |
+| --- | --- | --- | --- |
+| L0 | The TUN's own route sets (`route_address_set` / `route_exclude_address_set`) | zero | **everywhere**, by installing OS routes |
+| L1 | The router's semantic bypass — this document | zero **only in redirect mode** | Linux `auto_redirect` (nfqueue) |
+| L2 | Userspace copy with a kernel socket pair (splice / `sendfile`) | two syscalls per chunk | every TUN stack |
+| L3 | Userspace copy through buffers | a copy plus two syscalls per chunk | every TUN stack |
+
+**L1 does not bypass in TUN mode, and that is a limitation of the pinned sing-tun rather than of the
+decision this document describes.** `tun.ActionBypass` is honoured by the Linux nfqueue handler, where
+it maps to `NfRepeat` with the output mark and the packet leaves by its original path. In all three
+TUN stacks — `go`, `gvisor` and `system` — it is handled identically to `ActionAccept`: the dispatcher
+installs an accept entry, does not consume the packet, and the stack terminates the connection in
+userspace and calls the Handler back. The header of
+[native-bypass-trace.md](native-bypass-trace.md) records the trace and the experiments that establish
+it.
+
+So for a TUN client the eligibility decision in this document has **no data-plane effect**: a flow it
+marks as bypassable is still proxied in userspace, and pays one extra rule evaluation for the
+privilege, because the pre-match verdict is discarded and the userspace connection is routed from
+scratch. What it does have is a real effect in Linux redirect mode.
 
 **L0 is not "the router, then a bypass".** It runs *before* the router, so it decides with an address
 and nothing else. It cannot express a domain, a process or a protocol condition, and it must not be
 used to compile a `DIRECT` rule into a route set unless that rule is already authoritative and
-IP-only.
+IP-only. Its bypass is implemented by installing routes that keep the traffic out of the TUN at all,
+which is why it works regardless of what any verdict means.
 
 ### L0's one boundary: FakeIP
 
@@ -126,8 +141,10 @@ DoH, DoT or DoQ traffic, and it does not block UDP/443 to intercept QUIC.
 
 ### Hit rate
 
-L1, at the real pre-match entry point, over a model flow mix (the weights are a model of a desktop
-proxy's traffic; the per-shape verdicts are exact):
+The numbers below are the router's verdicts, at the real pre-match entry point, over a model flow mix
+(the weights are a model of a desktop proxy's traffic; the per-shape verdicts are exact). They are
+**decision** hit rates: read them together with the section above, which says that in TUN mode a
+bypassable verdict does not translate into a bypassed flow.
 
 | Flow shape | Weight | minimal | dashboard-enabled |
 | --- | --- | --- | --- |
@@ -138,6 +155,10 @@ proxy's traffic; the per-shape verdicts are exact):
 | FakeIP TCP | 5 | refused: FakeIP | refused: FakeIP |
 | connected UDP | 2 | refused: UDPConnect | refused: UDPConnect |
 | **total** | **100** | **3/6 shapes, 85% of weight** | **0/6 shapes** |
+
+The model-weight row is the decision's coverage, not a data-plane result, and in TUN mode the
+data-plane result for L1 is **0% in both columns** - see
+[native-bypass-trace.md](native-bypass-trace.md).
 
 **The dashboard number is the finding.** The tracker guard is absolute: it refuses on the *existence*
 of a tracker, not on what the tracker would record, so attaching the Clash API or a dashboard
@@ -161,7 +182,7 @@ From `route/direct_offload_bench_test.go`, on an Apple M1:
 
 | | Cost |
 | --- | --- |
-| Decision, all conditions pass (L1's per-flow cost) | 14–41 ns, **0 allocs** |
+| Decision, all conditions pass (L1's per-flow cost where it is honoured) | 14–41 ns, **0 allocs** |
 | Decision, refused by one of the cheap conditions | ~5–11 ns, 0 allocs |
 | The outbound profile alone | 5.3 ns, 0 allocs |
 | **Flow setup, bypassed** | **119 ns, 0 allocs** |
@@ -172,17 +193,18 @@ From `route/direct_offload_bench_test.go`, on an Apple M1:
 
 Two things follow.
 
-**A bypass saves about 1.3 µs and 26 allocations per flow, and every byte thereafter** — the
-difference between the two setup rows is what L1 avoids creating, and the per-byte row is what it
-avoids paying.
+**Where a bypass is honoured, it saves about 1.3 µs and 26 allocations per flow, and every byte
+thereafter** — the difference between the two setup rows is what L1 avoids creating, and the per-byte
+row is what it avoids paying. In TUN mode the first row is not what actually happens: the flow still
+pays the second.
 
 **L2 and L3 are indistinguishable here, and that is not a defect in the benchmark.** Loopback is the
 friendliest possible case for a userspace copy and the least favourable for a zero-copy one: nothing
 crosses a bus either way. Each benchmark asserts which of the two paths it is measuring — the kernel
 one hides nothing and the userspace one hides `ReadFrom` — so they cannot silently converge, and the
-honest reading is that **L1's per-byte cost is zero and both userspace layers pay a copy**, not that
-one of them is the faster copy. The distance that matters on a real NIC is the syscall count and the
-bus traffic, and this rig does not reproduce it.
+honest reading is that **both userspace layers pay a copy** and the distance that matters on a real
+NIC is the syscall count and the bus traffic, which this rig does not reproduce. Where a bypass is
+honoured, its per-byte cost to this process is zero, which is not a claim about bytes per second.
 
 The decision asserts 0 allocs/op as a **test**, not only as a benchmark, so a regression fails the
 suite instead of waiting for someone to read a number.
