@@ -769,6 +769,7 @@ func TestBackgroundRefreshCrossingTransitionCannotStore(t *testing.T) {
 		environment: []string{"wifi"},
 		current:     func() netip.Addr { return current },
 		release:     release,
+		entered:     make(chan struct{}),
 	}
 	router, client := newPendingTransitionFixture(t, manager, transport)
 
@@ -840,9 +841,8 @@ func (t *blockingWindowTransport) Reset()                                       
 
 func (t *blockingWindowTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
 	if t.block {
-		if t.entered == nil {
-			t.entered = make(chan struct{})
-		}
+		// entered is built with the transport, never from here: creating it on the exchange
+		// goroutine would race the test's read of the field and could lose the signal entirely.
 		t.once.Do(func() { close(t.entered) })
 		<-t.release
 	}
@@ -909,15 +909,11 @@ func waitForRefreshIdle(t *testing.T, client *Client) {
 // waitForBlockedExchange waits until the transport is inside the exchange.
 func waitForBlockedExchange(t *testing.T, transport *blockingWindowTransport) {
 	t.Helper()
-	deadline := time.After(10 * time.Second)
-	for transport.entered == nil {
-		select {
-		case <-deadline:
-			t.Fatal("the refresh never entered the transport")
-		case <-time.After(time.Millisecond):
-		}
+	select {
+	case <-transport.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the refresh never entered the transport")
 	}
-	<-transport.entered
 }
 
 // recordingRDRC records every verdict so a test can assert that none was written.
@@ -966,6 +962,7 @@ func TestCrossGenerationRejectedResponseDoesNotPersistRDRC(t *testing.T) {
 		environment: []string{"wifi"},
 		current:     func() netip.Addr { return netip.MustParseAddr("10.1.0.1") },
 		release:     release,
+		entered:     make(chan struct{}),
 	}
 	router, client := newPendingTransitionFixture(t, manager, transport)
 
