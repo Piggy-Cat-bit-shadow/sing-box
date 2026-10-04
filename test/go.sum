@@ -12,8 +12,8 @@ github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.202609292021
 github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
 github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94 h1:owmy04YW7IX5lTVtbTBgQiOAr5zEY3Sjunj/Min/PoI=
 github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
-github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260930000459-0428bc73b0df h1:FbHIcAaPbg/OB3DWy6/hZFc3cf6ZZmz24533qqOhoqc=
-github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20260930000459-0428bc73b0df/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261004063401-65adf993524d h1:IXpVF+4dCj4likaMftVpBVc83a32MOtKon6m1bNGbxs=
+github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261004063401-65adf993524d/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
 github.com/RyuaNerin/go-krypto v1.3.0/go.mod h1:9R9TU936laAIqAmjcHo/LsaXYOZlymudOAxjaBf62UM=
 github.com/RyuaNerin/testingutil v0.1.0 h1:IYT6JL57RV3U2ml3dLHZsVtPOP6yNK7WUVdzzlpNrss=
