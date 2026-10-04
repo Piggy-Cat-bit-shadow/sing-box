@@ -128,7 +128,6 @@ type Scheduler struct {
 	cond       *sync.Cond
 	closed     bool
 	lanes      [laneCount]laneState
-	flows      map[*Flow]struct{}
 	highStreak int
 	// inflightService counts the single service slot in ModeService.
 	inflightService int
@@ -187,7 +186,6 @@ func NewScheduler(options Options) *Scheduler {
 	scheduler := &Scheduler{
 		options: options.withDefaults(),
 		closeCh: make(chan struct{}),
-		flows:   make(map[*Flow]struct{}),
 	}
 	scheduler.cond = sync.NewCond(&scheduler.mu)
 	scheduler.normalTokens = float64(scheduler.options.NormalBurst)
@@ -195,19 +193,19 @@ func NewScheduler(options Options) *Scheduler {
 	return scheduler
 }
 
-// NewFlow registers a logical flow and returns its scheduler handle.
+// NewFlow returns a scheduler handle for one logical flow.
 //
 // The class is fixed for the life of the flow. It is resolved once from the outbound chain, and
 // the scheduler stays blind to why: it never sees a tag, a protocol or a destination.
+//
+// This takes no lock and touches no shared state: a connection being established on one goroutine
+// must never contend with flows already writing on another. The flow is not registered anywhere
+// until it first waits, which is also why an inert scheduler costs a connection nothing at all.
 func (s *Scheduler) NewFlow(class trafficclass.Class) *Flow {
-	flow := &Flow{sched: s, high: class.IsHighPriority()}
-	flow.lane = laneNormal
+	flow := &Flow{sched: s, high: class.IsHighPriority(), lane: laneNormal}
 	if flow.high {
 		flow.lane = laneHigh
 	}
-	s.mu.Lock()
-	s.flows[flow] = struct{}{}
-	s.mu.Unlock()
 	return flow
 }
 
@@ -236,6 +234,10 @@ type Flow struct {
 	sched *Scheduler
 	lane  lane
 	high  bool
+	// closeOnce makes Close idempotent without a registry, so creating a flow never takes the
+	// scheduler lock and a connection can be established without contending with flows that are
+	// already writing.
+	closeOnce atomic.Bool
 
 	// admitted counts the bytes this flow has handed to the outbound through the gate. It is
 	// per-flow, so the atomic is uncontended; it exists because "did the bytes really pass
@@ -319,13 +321,11 @@ func (f *Flow) Close() error {
 	if f == nil {
 		return nil
 	}
-	s := f.sched
-	s.mu.Lock()
-	if _, registered := s.flows[f]; !registered {
-		s.mu.Unlock()
+	if !f.closeOnce.CompareAndSwap(false, true) {
 		return nil
 	}
-	delete(s.flows, f)
+	s := f.sched
+	s.mu.Lock()
 	f.closed = true
 	for laneIndex := range s.lanes {
 		s.lanes[laneIndex].remove(f)
@@ -352,7 +352,6 @@ func (s *Scheduler) Close() error {
 		}
 		s.inflightService = 0
 		s.highInflight = 0
-		s.flows = make(map[*Flow]struct{})
 		s.cond.Broadcast()
 		s.mu.Unlock()
 	})
