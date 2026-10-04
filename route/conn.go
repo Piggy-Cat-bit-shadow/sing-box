@@ -86,6 +86,12 @@ func (m *ConnectionManager) Count() int {
 }
 
 func (m *ConnectionManager) CloseAll() {
+	// Release the flows first. A flow parked in the shaper is not inside a write, so closing its
+	// socket does not wake it, and it can be parked for as long as the period its own last write is
+	// worth at the configured rate. See trafficsched.Scheduler.ReleaseAll.
+	if m.scheduler != nil {
+		m.scheduler.ReleaseAll()
+	}
 	m.access.Lock()
 	var closers []io.Closer
 	for element := m.connections.Front(); element != nil; {

@@ -399,3 +399,52 @@ func TestUploadRateCanBeReplacedWhileFlowsRun(t *testing.T) {
 	require.Zero(t, manager.UploadRate(), "zero must return the scheduler to inert")
 	require.Positive(t, flow.AdmittedBytes()+1)
 }
+
+// TestNetworkTransitionReleasesAFlowParkedInTheShaper covers the transition path specifically.
+//
+// CloseAll is what a network change calls, and unlike Close it does not touch the scheduler: it
+// closes the connections and expects the copies to unwind. A flow parked in the shaper is not inside
+// a write, so the closed socket tells it nothing - it has to be released by being granted, and then
+// fail its write. That is a liveness property, not a cosmetic one: if it did not hold, every network
+// change would strand one goroutine per parked flow.
+func TestNetworkTransitionReleasesAFlowParkedInTheShaper(t *testing.T) {
+	manager := NewConnectionManager(log.NewNOPFactory().Logger())
+	// One byte per hour: every write after the first is parked for as long as the test cares.
+	configureUploadRate(t, manager, `{"traffic_scheduler":{"upload_rate":1}}`)
+
+	source, sourcePeer := net.Pipe()
+	t.Cleanup(func() { _ = source.Close(); _ = sourcePeer.Close() })
+	sink, sinkPeer := net.Pipe()
+	t.Cleanup(func() { _ = sink.Close(); _ = sinkPeer.Close() })
+	go func() { _, _ = io.Copy(io.Discard, sinkPeer) }()
+
+	copyWriter, flow := manager.uploadStreamGate(source, sink, trafficclass.ClassDefault)
+	require.NotNil(t, copyWriter)
+
+	go func() {
+		chunk := make([]byte, 64*1024)
+		for {
+			if _, err := sourcePeer.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	copyReturned := make(chan struct{})
+	go func() {
+		defer close(copyReturned)
+		var done atomic.Bool
+		manager.connectionCopy(context.Background(), source, sink, false, bufio.DefaultIncreaseBufferAfter, &done, nil, copyWriter, flow)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	manager.CloseAll()
+
+	select {
+	case <-copyReturned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a network transition must not strand a flow parked in the shaper")
+	}
+
+	require.NoError(t, manager.Close())
+}

@@ -3,7 +3,9 @@ package trafficsched
 import (
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -611,4 +613,101 @@ func TestAdmittedRateMatchesTheConfiguredRate(t *testing.T) {
 			<-copyDone
 		})
 	}
+}
+
+// TestWritePeriodSaturatesInsteadOfWrapping covers the arithmetic at the edge of what a
+// time.Duration can represent.
+//
+// The conversion from float64 nanoseconds to a Duration is undefined for a value outside the range,
+// and both directions of that are wrong in a way that would not look like a failure: a value in the
+// past admits the rate the shaper was configured to prevent, and a value in the far future stalls
+// the connection. Neither is reachable from a copy loop whose buffers are bounded, and the helper
+// that cannot produce either is three lines.
+func TestWritePeriodSaturatesInsteadOfWrapping(t *testing.T) {
+	// A generous rate with an ordinary write.
+	require.Equal(t, 1*time.Second, writePeriod(1000, 1000))
+	require.Equal(t, 500*time.Millisecond, writePeriod(1000, 2000))
+
+	// Degenerate inputs have no period rather than a negative one.
+	require.Zero(t, writePeriod(0, 1000))
+	require.Zero(t, writePeriod(-1, 1000))
+	require.Zero(t, writePeriod(1000, 0))
+	require.Zero(t, writePeriod(1000, -1))
+
+	// A period that cannot be represented saturates rather than becoming arbitrary.
+	saturated := writePeriod(math.MaxInt, 1)
+	require.Equal(t, time.Duration(math.MaxInt64), saturated)
+	require.Positive(t, saturated)
+
+	// And the value is only ever used to push a deadline forward, so saturation has to be a future
+	// time rather than a past one.
+	require.True(t, time.Now().Add(saturated).After(time.Now().Add(time.Hour)))
+}
+
+// TestPacedSchedulerLeavesNoGoroutineBehind pins the lifecycle of the wake loop and the ordering
+// modes' timer.
+//
+// An idle scheduler holds no timer at all, and a wake loop exits when the last waiter is served.
+// Both are properties that only show up as a slow leak in a process that runs for weeks, which is
+// exactly the kind of thing a test has to look for on purpose.
+func TestPacedSchedulerLeavesNoGoroutineBehind(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+
+	for iteration := 0; iteration < 20; iteration++ {
+		scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(1 << 30)})
+		flow := scheduler.NewFlow(trafficclass.ClassDefault)
+		for write := 0; write < 20; write++ {
+			require.NoError(t, flow.wait(1024))
+			flow.done()
+		}
+		require.NoError(t, scheduler.Close())
+	}
+
+	// The ordering modes start a disarm timer instead, and it has to stop too.
+	for iteration := 0; iteration < 20; iteration++ {
+		scheduler := NewScheduler(Options{Mode: ModeAdmission, HighIdleWindow: 10 * time.Millisecond})
+		high := scheduler.NewFlow(trafficclass.ClassInteractive)
+		require.NoError(t, high.wait(1))
+		high.done()
+		require.NoError(t, scheduler.Close())
+	}
+
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() <= baseline+2
+	}, 5*time.Second, 20*time.Millisecond,
+		"every scheduler goroutine must exit: the wake loop when its last waiter is served or the "+
+			"scheduler closes, and the disarm timer when it disarms or the scheduler closes (%d "+
+			"goroutines against a baseline of %d)", runtime.NumGoroutine(), baseline)
+}
+
+// TestReleaseAllDoesNotShutTheSchedulerDown pins the difference between ending the connections that
+// exist and ending the scheduler: a network transition is the first, and a connection created after
+// one must still be scheduled.
+func TestReleaseAllDoesNotShutTheSchedulerDown(t *testing.T) {
+	// A rate low enough that the first write's own period is a long wait: a flow pays for what it
+	// sends in its own future, which is exactly the parking this test needs.
+	scheduler := NewScheduler(Options{Mode: ModePaced, RateSource: NewFixedRate(100_000)})
+	defer scheduler.Close()
+
+	parked := scheduler.NewFlow(trafficclass.ClassDefault)
+	require.NoError(t, parked.wait(1<<20))
+	parked.done()
+
+	result := make(chan error, 1)
+	go func() { result <- parked.wait(1) }()
+	time.Sleep(25 * time.Millisecond)
+
+	scheduler.ReleaseAll()
+	require.ErrorIs(t, awaitResult(t, result, "the parked flow"), ErrClosed)
+
+	// The scheduler is still usable, which is the whole point of not closing it.
+	fresh := scheduler.NewFlow(trafficclass.ClassBulk)
+	require.NoError(t, fresh.wait(1), "a transition must not end the scheduler")
+	fresh.done()
+	require.False(t, fresh.HighPriority())
+
+	// ReleaseAll is safe with nothing parked, and with a flow that was already released.
+	scheduler.ReleaseAll()
+	require.NoError(t, parked.Close())
+	require.NoError(t, fresh.Close())
 }

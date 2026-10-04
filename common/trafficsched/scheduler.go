@@ -505,6 +505,32 @@ func (f *Flow) Close() error {
 	return nil
 }
 
+// ReleaseAll releases every PARKED flow with ErrClosed, without shutting the scheduler down.
+//
+// This is what a network transition needs. CloseAll closes the connections, but a flow parked in the
+// shaper is not inside a write, so a closed socket tells it nothing - and it can be parked for a
+// long time, because a flow waits out the period its own last write is worth at the configured
+// rate. A flow that is mid-write does not need releasing: its write fails on the closed connection
+// and it unwinds by itself.
+//
+// New flows are unaffected, which is the difference between this and Close: a transition ends the
+// connections that exist, not the scheduler.
+func (s *Scheduler) ReleaseAll() {
+	s.mu.Lock()
+	for laneIndex := range s.lanes {
+		lane := &s.lanes[laneIndex]
+		for index := lane.head; index < len(lane.queue); index++ {
+			flow := lane.queue[index]
+			flow.closed = true
+			s.releaseGrantLocked(flow)
+		}
+		lane.queue = nil
+		lane.head = 0
+	}
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
 // Close shuts the scheduler down and releases every parked flow with ErrClosed.
 func (s *Scheduler) Close() error {
 	s.closeOnce.Do(func() {
@@ -556,11 +582,14 @@ func (s *Scheduler) waitSlow(f *Flow, n int) error {
 // releaseGrantLocked undoes the bookkeeping a grant performed. It must be called exactly once per
 // grant, from done() on the normal path and from waitSlow/Close when a grant is abandoned.
 func (s *Scheduler) releaseGrantLocked(f *Flow) {
+	if !f.holdsSlot {
+		// Already released, by Close, by ReleaseAll, or by an abandoned wait. Releasing twice is
+		// the way a counter goes negative, and a negative count reads as a leak.
+		return
+	}
 	f.holdsSlot = false
 	if s.closed {
-		// Shutdown already zeroed the counters and dropped every queue. Decrementing them again
-		// would drive them negative, and a negative count is the kind of state that reads as a
-		// leak the next time someone inspects it.
+		// Shutdown already zeroed the counters and dropped every queue.
 		return
 	}
 	switch s.options.Mode {
