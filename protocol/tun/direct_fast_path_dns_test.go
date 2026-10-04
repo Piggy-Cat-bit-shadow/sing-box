@@ -519,3 +519,142 @@ func TestDNSHijackByPortWorksForIPv6(t *testing.T) {
 	)
 	require.Equal(t, tun.ActionAccept, verdict.Action)
 }
+
+// --- FakeIP is not an authoritative address -------------------------------------------------
+
+// fakeIPStoreStub reports a fixed FakeIP range.
+type fakeIPStoreStub struct {
+	inet4 netip.Prefix
+	inet6 netip.Prefix
+}
+
+func (s *fakeIPStoreStub) Start() error { return nil }
+func (s *fakeIPStoreStub) Close() error { return nil }
+func (s *fakeIPStoreStub) Contains(address netip.Addr) bool {
+	return s.inet4.Contains(address) || s.inet6.Contains(address)
+}
+func (s *fakeIPStoreStub) Create(string, bool) (netip.Addr, error) { return netip.Addr{}, nil }
+func (s *fakeIPStoreStub) Lookup(netip.Addr) (string, bool)        { return "", false }
+func (s *fakeIPStoreStub) Reset() error                            { return nil }
+
+// TestFakeIPIsNotBypassedByRouteAddressSet is the L0 boundary.
+//
+// The route sets decide what the PLATFORM's routing table is trusted to carry, and they run BEFORE
+// the router. A FakeIP address is a placeholder sing-box minted: the platform has no route to it
+// and the domain it stands for is only recovered by the router. With route_address_set configured,
+// every destination outside the set bypasses, so a FakeIP destination would be black-holed instead
+// of unmapped.
+func TestFakeIPIsNotBypassedByRouteAddressSet(t *testing.T) {
+	inbound, router := hijackTestInbound(t, nil, false)
+	// The router is made non-bypassing so that "reached the router" and "bypassed" cannot be
+	// confused: the assertion is on which of the two produced the verdict, not on the verdict value.
+	router.bypassable.Store(false)
+	inbound.fakeIPStore = &fakeIPStoreStub{inet4: netip.MustParsePrefix("198.18.0.0/15")}
+	// A route set that deliberately does NOT include the FakeIP range, which is what makes the
+	// outside-the-set bypass fire.
+	inbound.routeAddressSet = []*netipx.IPSet{ipSetFrom(t, "10.0.0.0/8")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("198.18.0.5:443"),
+		nil,
+	)
+	require.EqualValues(t, 1, router.preMatchCalls.Load(),
+		"a FakeIP destination must reach the router so the domain can be recovered, even though "+
+			"it is outside route_address_set")
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+
+	// The control: a real address outside the same set IS bypassed by the route set, without the
+	// router being consulted at all. Without this, the assertion above would hold just as well if
+	// the route set had stopped working.
+	router.preMatchCalls.Store(0)
+	verdict = inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("93.184.216.34:443"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action)
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+
+	// And an address inside the set reaches the router, FakeIP or not.
+	verdict = inbound.JudgeFlow(
+		uint8(headerTCP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("10.1.2.3:443"),
+		nil,
+	)
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+	require.EqualValues(t, 1, router.preMatchCalls.Load())
+}
+
+// TestFakeIPIsNotBypassedByRouteExcludeAddressSet is the same boundary for the exclude set.
+//
+// 198.18.0.0/15 sits inside several broadly written exclude sets, so this is the likelier of the
+// two ways to reach it.
+func TestFakeIPIsNotBypassedByRouteExcludeAddressSet(t *testing.T) {
+	inbound, router := hijackTestInbound(t, nil, false)
+	router.bypassable.Store(false)
+	inbound.fakeIPStore = &fakeIPStoreStub{inet4: netip.MustParsePrefix("198.18.0.0/15")}
+	// Wider than the FakeIP range on purpose, so the control below has an address inside the set
+	// that is not a placeholder.
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "198.16.0.0/12")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("198.18.0.5:443"),
+		nil,
+	)
+	require.EqualValues(t, 1, router.preMatchCalls.Load(),
+		"an exclude set that happens to cover the FakeIP range must not black-hole a placeholder; "+
+			"the router is where the FakeIP policy lives")
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+
+	// The control: a real address in the same exclude set is still bypassed by it.
+	router.preMatchCalls.Store(0)
+	verdict = inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("198.20.0.5:443"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action)
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+
+	// An IPv6 FakeIP range behaves the same way.
+	inbound.fakeIPStore = &fakeIPStoreStub{inet6: netip.MustParsePrefix("fdfe:dcba:9876::/48")}
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{
+		ipSetFrom(t, "fdfe:dcba:9876::/48"),
+	}
+	router.preMatchCalls.Store(0)
+	verdict = inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("[fd00::1]:40000"),
+		netip.MustParseAddrPort("[fdfe:dcba:9876::5]:443"),
+		nil,
+	)
+	require.NotEqual(t, tun.ActionBypass, verdict.Action)
+	require.EqualValues(t, 1, router.preMatchCalls.Load())
+}
+
+// TestNoFakeIPTransportLeavesRouteSetsUnchanged is the control for the two tests above.
+//
+// Without it they would pass just as well if the guard refused the route sets unconditionally.
+func TestNoFakeIPTransportLeavesRouteSetsUnchanged(t *testing.T) {
+	inbound, router := hijackTestInbound(t, nil, false)
+	router.bypassable.Store(false)
+	inbound.routeExcludeAddressSet = []*netipx.IPSet{ipSetFrom(t, "198.18.0.0/15")}
+
+	verdict := inbound.JudgeFlow(
+		uint8(headerUDP),
+		netip.MustParseAddrPort("192.168.1.2:40000"),
+		netip.MustParseAddrPort("198.18.0.5:443"),
+		nil,
+	)
+	require.Equal(t, tun.ActionBypass, verdict.Action,
+		"with no FakeIP transport configured these addresses are ordinary ones and the route set "+
+			"keeps its existing meaning")
+	require.EqualValues(t, 0, router.preMatchCalls.Load())
+}

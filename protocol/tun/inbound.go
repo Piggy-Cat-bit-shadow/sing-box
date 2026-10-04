@@ -39,18 +39,24 @@ func RegisterInbound(registry *inbound.Registry) {
 }
 
 type Inbound struct {
-	tag                         string
-	ctx                         context.Context
-	router                      adapter.Router
-	networkManager              adapter.NetworkManager
-	logger                      log.ContextLogger
-	tunOptions                  tun.Options
-	udpTimeout                  time.Duration
-	udpMapping                  tun.NATMapping
-	udpFiltering                tun.NATFiltering
-	udpNATMax                   uint32
-	dnsHijackAddress            []netip.Addr
-	dnsHijackByPort             bool
+	tag              string
+	ctx              context.Context
+	router           adapter.Router
+	networkManager   adapter.NetworkManager
+	logger           log.ContextLogger
+	tunOptions       tun.Options
+	udpTimeout       time.Duration
+	udpMapping       tun.NATMapping
+	udpFiltering     tun.NATFiltering
+	udpNATMax        uint32
+	dnsHijackAddress []netip.Addr
+	dnsHijackByPort  bool
+	// fakeIPStore is the configured FakeIP address space, or nil when no FakeIP transport exists.
+	//
+	// The route-set bypass below hands a destination to the platform's routing table, which is
+	// correct for a real address and meaningless for a synthetic one. This is how JudgeFlow knows
+	// the difference without asking the router, which the route sets exist to avoid.
+	fakeIPStore                 adapter.FakeIPStore
 	stack                       string
 	tunIf                       tun.Tun
 	tunStack                    tun.Stack
@@ -348,6 +354,21 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
 			inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
 			t.dnsHijackAddress = append(inet4DNSAddress, inet6DNSAddress...)
+		}
+		// Transports are constructed before any component starts, so this is the earliest point at
+		// which the FakeIP range is known. It is resolved once rather than per flow: the range is
+		// fixed for the transport's lifetime, and a per-flow lookup would put a manager call on the
+		// path this whole file exists to keep cheap.
+		if t.fakeIPStore == nil {
+			transportManager := service.FromContext[adapter.DNSTransportManager](t.ctx)
+			if transportManager != nil {
+				for _, transport := range transportManager.Transports() {
+					if fakeIPTransport, isFakeIP := transport.(adapter.FakeIPTransport); isFakeIP {
+						t.fakeIPStore = fakeIPTransport.Store()
+						break
+					}
+				}
+			}
 		}
 	case adapter.StartStateStart:
 		if t.platformInterface == nil &&
@@ -650,15 +671,32 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 	routeExcludeAddressSet := t.routeExcludeAddressSet
 	t.routeAddressSetAccess.RUnlock()
 	destinationAddress := destination.Addr()
-	if len(routeAddressSet) > 0 && !slices.ContainsFunc(routeAddressSet, func(it *netipx.IPSet) bool {
-		return it.Contains(destinationAddress)
-	}) {
-		return tun.FlowVerdict{Action: tun.ActionBypass}
-	}
-	if slices.ContainsFunc(routeExcludeAddressSet, func(it *netipx.IPSet) bool {
-		return it.Contains(destinationAddress)
-	}) {
-		return tun.FlowVerdict{Action: tun.ActionBypass}
+
+	// The route sets decide what the PLATFORM's routing table is trusted to carry, and a FakeIP
+	// address is not something the platform knows anything about: it is a placeholder this process
+	// minted, it has no route, and the domain it stands for is only recovered by the router.
+	//
+	// This check is here rather than in the router because the route sets bypass the router
+	// entirely. With route_address_set configured, every destination OUTSIDE the set is bypassed -
+	// including a FakeIP address that the DNS layer just handed to an application - so without this
+	// guard the placeholder is silently black-holed instead of being unmapped. The same applies to
+	// an exclude set that happens to cover the FakeIP range, which is not far-fetched: 198.18.0.0/15
+	// sits inside several broadly-written sets.
+	//
+	// It is two prefix comparisons on a path that already does radix lookups, runs once per flow
+	// rather than per packet, and is skipped entirely when no FakeIP transport is configured.
+	routeSetsApply := t.fakeIPStore == nil || !t.fakeIPStore.Contains(destinationAddress)
+	if routeSetsApply {
+		if len(routeAddressSet) > 0 && !slices.ContainsFunc(routeAddressSet, func(it *netipx.IPSet) bool {
+			return it.Contains(destinationAddress)
+		}) {
+			return tun.FlowVerdict{Action: tun.ActionBypass}
+		}
+		if slices.ContainsFunc(routeExcludeAddressSet, func(it *netipx.IPSet) bool {
+			return it.Contains(destinationAddress)
+		}) {
+			return tun.FlowVerdict{Action: tun.ActionBypass}
+		}
 	}
 	return adapter.JudgeFlow(t.router, adapter.InboundContext{Inbound: t.tag, InboundType: C.TypeTun}, network, source, destination, firstPacket)
 }
