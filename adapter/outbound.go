@@ -90,10 +90,14 @@ type FlowOutbound interface {
 //
 // # What it answers, and what it does not
 //
-// It answers ONE outbound-level question: "is this outbound, for this network and literal
-// destination, equivalent to connecting directly?" It knows nothing about the request it is
-// serving, and it must not guess: an outbound cannot see FakeIP state, sniffed domains,
-// destination rewrites, trackers or how it was selected.
+// It answers ONE question: "is this outbound, for THIS network and THIS literal destination,
+// equivalent to connecting directly?" The destination is part of the answer because a dial option
+// only disqualifies a flow if the userspace path would actually apply it to that flow - a domain
+// resolver is not a reason to refuse a literal destination, and tcp_fast_open is not a reason to
+// refuse a UDP flow.
+//
+// It knows nothing about the request it is serving, and it must not guess: an outbound cannot see
+// FakeIP state, sniffed domains, destination rewrites, trackers or how it was selected.
 //
 // Whether a particular connection may take the fast path is therefore decided by the router,
 // which does have that context. The split matters because the dangerous mistakes are all

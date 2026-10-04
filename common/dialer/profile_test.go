@@ -78,13 +78,9 @@ func collectDialerOptionFieldNames(t *testing.T, structType reflect.Type) []stri
 	return names
 }
 
-// TestUnclassifiedOptionFailsClosed is the runtime half of the guard above.
-//
-// It cannot use a real field, because every real field is classified - that is the point of the
-// other test. It uses the builder's contract directly: a field the table does not know, holding a
-// value, produces BlockerUnclassified. The proof that this is what the builder does is
-// TestEveryDialerOptionIsClassified plus this assertion about the shape of the result.
-func TestUnclassifiedOptionFailsClosed(t *testing.T) {
+// TestScopesDecideWhichFlowIsRefused covers the builder's dispatch: each scope is exercised through
+// the real options, so the classification table is tested as behaviour rather than only as coverage.
+func TestScopesDecideWhichFlowIsRefused(t *testing.T) {
 	// A profile built from an empty configuration blocks nothing.
 	plain := NativeBypassSemantics(option.DialerOptions{})
 	require.True(t, plain.IsPlain())
@@ -138,6 +134,37 @@ func TestUnclassifiedOptionFailsClosed(t *testing.T) {
 			require.Equal(t, testCase.blocked, !semantics.CanNativeBypass(facts))
 		})
 	}
+}
+
+// TestUnclassifiedOptionBlocksEverything is the fail-closed branch, reached by MUTATION.
+//
+// Every real field is classified - that is what the other test is for - so the branch cannot be
+// reached through any configuration. It is reached by withdrawing a classification, which is exactly
+// the situation it exists for: a field that exists, carries a value, and has no entry in the table.
+// Asserting on the branch without proving it is reachable would be a test that passes for the wrong
+// reason, and the mutation is also what shows that the entry is load-bearing rather than decorative.
+//
+// It is a separate function from the scope table above so that the table is never asserted while the
+// mutation is in place: a subtest that passes because every option refuses would pass for the wrong
+// reason too.
+func TestUnclassifiedOptionBlocksEverything(t *testing.T) {
+	classified, wasClassified := dialerOptionClassification["BindInterface"]
+	require.True(t, wasClassified, "the field used by this test must be classified to begin with")
+	delete(dialerOptionClassification, "BindInterface")
+	defer func() { dialerOptionClassification["BindInterface"] = classified }()
+
+	unclassified := NativeBypassSemantics(option.DialerOptions{
+		AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "en0"},
+	})
+	blockers := unclassified.Blockers(literalTCPFacts())
+	require.Equal(t, BlockerUnclassified, blockers,
+		"an option that is set but not classified must REFUSE, not be ignored: that is the "+
+			"difference between forgetting a field costing an optimisation and costing a socket "+
+			"semantic")
+	require.Contains(t, blockers.String(), "unclassified")
+
+	// And the mutilated profile is no longer plain, so the detour question refuses as well.
+	require.False(t, unclassified.IsPlain())
 }
 
 func literalTCPFacts() NativeBypassFacts {
@@ -286,4 +313,24 @@ func TestConnectTimeoutUsesZeroAsTheDialerDefault(t *testing.T) {
 		},
 	})
 	require.Contains(t, configured.Blockers(literalTCPFacts()).String(), "connect_timeout")
+}
+
+// TestZeroProfileRefuses is the fail-closed default.
+//
+// The zero value is what an outbound gets if it is constructed without building a profile, which is a
+// mistake someone will eventually make - an existing test in this repository built the outbound
+// struct literally rather than through its constructor. A struct whose default answer is "equivalent
+// to a plain connect" would turn that mistake into a silently bypassed connection; this one answers
+// with a refusal and names the reason.
+func TestZeroProfileRefuses(t *testing.T) {
+	var unbuilt SocketSemantics
+
+	require.Equal(t, BlockerProfileUnbuilt, unbuilt.Blockers(literalTCPFacts()))
+	require.False(t, unbuilt.CanNativeBypass(literalTCPFacts()))
+	require.False(t, unbuilt.IsPlain())
+	require.Contains(t, unbuilt.Blockers(literalTCPFacts()).String(), "never interpreted")
+
+	// The control: the SAME facts through a built profile from an empty configuration are permitted,
+	// so the assertion above is about the unbuilt state rather than about the facts.
+	require.True(t, NativeBypassSemantics(option.DialerOptions{}).CanNativeBypass(literalTCPFacts()))
 }

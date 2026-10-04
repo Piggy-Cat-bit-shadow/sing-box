@@ -301,3 +301,22 @@ func TestIsEmptyStaysConservativeForTheDetourCheck(t *testing.T) {
 		AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "en0"},
 	}).IsEmpty())
 }
+
+// TestAnUnbuiltProfileRefuses is the fail-closed default at the outbound level.
+//
+// NewOutbound always builds the profile, so this is about the outbound that was constructed some
+// other way - which is a pattern this file used to use itself. The zero profile must refuse rather
+// than permit, or that construction mistake becomes a bypassed connection.
+func TestAnUnbuiltProfileRefuses(t *testing.T) {
+	unbuilt := &Outbound{}
+	address := netip.MustParseAddr("93.184.216.34")
+
+	require.False(t, unbuilt.CanBypass(N.NetworkTCP, address),
+		"an outbound that never interpreted its options cannot claim equivalence with a plain connect")
+	require.Contains(t, unbuilt.BypassBlockers(N.NetworkTCP, address).String(), "never interpreted")
+	require.False(t, unbuilt.IsEmpty(),
+		"and it is certainly not an outbound that does nothing")
+
+	// The control: the same outbound with the profile built from empty options does bypass.
+	require.True(t, bypassable(option.DialerOptions{}).CanBypass(N.NetworkTCP, address))
+}

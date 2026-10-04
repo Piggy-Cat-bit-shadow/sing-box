@@ -103,6 +103,12 @@ const (
 	// dialer serves, which the userspace path refuses in order to keep a TUN from routing a
 	// connection back into itself.
 	BlockerSelfAddress
+	// BlockerProfileUnbuilt: the profile was never built from any options.
+	//
+	// It is the zero value's answer, and it exists because the zero value has to be the REFUSING
+	// one. A struct that answers "nothing stands in the way" until someone remembers to populate it
+	// is a fail-open default, and the whole point of this file is that the default is a refusal.
+	BlockerProfileUnbuilt
 )
 
 // blockerNames maps each bit to the name used in diagnostics. A missing entry shows up as a number,
@@ -133,6 +139,7 @@ var blockerNames = []struct {
 	{BlockerDestinationInvalid, "destination is not a usable literal address"},
 	{BlockerGlobalNetworkPolicy, "ambient network policy (bind interface, routing mark, strategy)"},
 	{BlockerSelfAddress, "destination is this host's own address"},
+	{BlockerProfileUnbuilt, "the dial options were never interpreted"},
 }
 
 // String names the set bits, for diagnostics and test failures. It allocates, so it is never on a
@@ -179,9 +186,15 @@ type NativeBypassFacts struct {
 // SocketSemantics is the precomputed profile of a set of DialerOptions.
 //
 // It is built once, when the dialer is built, and then answers per flow without reflection, without
-// maps, without allocation and without re-reading the options. The zero value is a profile with no
-// blockers, which is what a plain connect looks like.
+// maps, without allocation and without re-reading the options.
+//
+// The zero value REFUSES. Only NativeBypassSemantics produces a profile that can permit anything, so
+// an outbound constructed without one fails closed instead of bypassing every flow it is asked
+// about.
 type SocketSemantics struct {
+	// built is false in the zero value, which is what makes a profile that was never populated
+	// refuse rather than permit. Only NativeBypassSemantics sets it.
+	built bool
 	// always blocks every flow.
 	always NativeBypassBlocker
 	// tcpOnly and udpOnly block one network.
@@ -203,7 +216,7 @@ type SocketSemantics struct {
 //
 // The cost is a reflect walk per outbound, not per flow and not per packet.
 func NativeBypassSemantics(options option.DialerOptions) SocketSemantics {
-	var semantics SocketSemantics
+	semantics := SocketSemantics{built: true}
 	visitDialerOptionFields(reflect.ValueOf(&options).Elem(), func(name string, field reflect.Value) {
 		classification, classified := dialerOptionClassification[name]
 		if !classified {
@@ -251,6 +264,12 @@ func visitDialerOptionFields(value reflect.Value, visit func(name string, field 
 // Blockers reports every reason this profile cannot reproduce the userspace path for this flow.
 // The empty set means it can: the caller must treat any non-empty set as a refusal.
 func (s SocketSemantics) Blockers(facts NativeBypassFacts) NativeBypassBlocker {
+	if !s.built {
+		// A zero profile is one nobody interpreted any options into. It must refuse: a struct whose
+		// default answer is "equivalent to a plain connect" would turn a construction mistake into a
+		// silently bypassed connection.
+		return BlockerProfileUnbuilt
+	}
 	blockers := s.always
 	switch facts.Network {
 	case N.NetworkTCP:
@@ -298,6 +317,9 @@ func (s SocketSemantics) CanNativeBypass(facts NativeBypassFacts) bool {
 // still reproducible by the platform. Answering both questions from one interpretation is what
 // keeps them from disagreeing.
 func (s SocketSemantics) IsPlain() bool {
+	if !s.built {
+		return false
+	}
 	return s.always|s.tcpOnly|s.udpOnly|s.resolutionOnly == BlockerNone
 }
 
