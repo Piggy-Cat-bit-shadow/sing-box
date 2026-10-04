@@ -286,6 +286,16 @@
       },
       "additionalProperties": false
     },
+    "ByteRate": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
     "CCMUser": {
       "type": "object",
       "properties": {
@@ -343,6 +353,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "domain": {
               "anyOf": [
@@ -425,6 +444,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "domain": {
               "anyOf": [
                 {
@@ -486,6 +514,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "endpoint": {
               "type": "string"
@@ -1911,6 +1948,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -2044,6 +2090,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "inet4_range": {
               "$ref": "#/$defs/IPPrefix",
               "examples": [
@@ -2070,6 +2125,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -2205,6 +2269,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "path": {
               "anyOf": [
                 {
@@ -2248,6 +2321,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -2383,6 +2465,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -2512,6 +2603,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -2656,6 +2756,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "endpoint": {
               "type": "string"
             },
@@ -2680,6 +2789,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "endpoint": {
               "type": "string"
             },
@@ -2703,6 +2821,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -2829,6 +2956,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "service": {
               "type": "string"
             },
@@ -2849,6 +2985,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "endpoint": {
               "type": "string"
@@ -2873,6 +3018,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -2995,6 +3149,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -3120,6 +3283,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -3446,6 +3618,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -3690,6 +3871,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -3893,6 +4083,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -4173,6 +4372,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -4582,6 +4790,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -4837,6 +5054,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -5050,6 +5276,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "system": {
               "type": "boolean"
@@ -6199,6 +6434,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -6300,6 +6544,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "token": {
               "type": "string"
             },
@@ -6359,6 +6612,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -6458,6 +6720,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -6692,6 +6963,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -6847,6 +7127,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -7101,6 +7390,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -7185,6 +7483,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -7396,6 +7703,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -7465,6 +7781,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -7592,6 +7917,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -7702,6 +8036,15 @@
                 "tag": {
                   "type": "string"
                 },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
+                },
                 "version": {
                   "const": 5
                 },
@@ -7792,6 +8135,15 @@
                 },
                 "tag": {
                   "type": "string"
+                },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
                 },
                 "version": {
                   "const": 6
@@ -7886,6 +8238,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -7964,6 +8325,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "private_key": {
               "type": "string"
@@ -8138,6 +8508,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -8252,6 +8631,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -8345,6 +8733,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -8487,6 +8884,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "interface_name": {
               "type": "string"
@@ -8879,6 +9285,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -8963,6 +9378,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -11715,6 +12139,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -11854,6 +12287,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             }
           },
           "required": [
@@ -11869,6 +12311,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "interface": {
               "type": "string"
@@ -11896,6 +12347,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -12010,6 +12470,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -12205,6 +12674,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -12455,6 +12933,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -12726,6 +13213,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -12925,6 +13421,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "outbounds": {
               "type": "array",
               "items": {
@@ -12953,6 +13458,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -13157,6 +13671,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -13294,6 +13817,15 @@
                 },
                 "tag": {
                   "type": "string"
+                },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
                 },
                 "version": {
                   "const": 4
@@ -13462,6 +13994,15 @@
                 "tag": {
                   "type": "string"
                 },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
+                },
                 "version": {
                   "const": 6
                 },
@@ -13627,6 +14168,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -13815,6 +14365,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -14024,6 +14583,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "private_key": {
               "type": "string"
             },
@@ -14197,6 +14765,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "detour": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -14328,6 +14905,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -14483,6 +15069,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -14706,6 +15301,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "outbounds": {
               "type": "array",
               "items": {
@@ -14747,6 +15351,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -14908,6 +15521,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -15439,6 +16061,9 @@
     "RouteOptions": {
       "type": "object",
       "properties": {
+        "traffic_scheduler": {
+          "$ref": "#/$defs/TrafficSchedulerOptions"
+        },
         "rules": {
           "type": "array",
           "items": {
@@ -16724,6 +17349,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -16855,6 +17489,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -16942,6 +17585,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -17538,6 +18190,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -17648,6 +18309,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "listen": {
               "$ref": "#/$defs/IPAddress"
             },
@@ -17736,6 +18406,15 @@
             "tag": {
               "type": "string"
             },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
+            },
             "memory_limit": {
               "anyOf": [
                 {
@@ -17778,6 +18457,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -17848,6 +18536,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "listen": {
               "$ref": "#/$defs/IPAddress"
@@ -17930,6 +18627,15 @@
             },
             "tag": {
               "type": "string"
+            },
+            "traffic_class": {
+              "type": "string",
+              "enum": [
+                "default",
+                "interactive",
+                "bulk",
+                "realtime"
+              ]
             },
             "detour": {
               "type": "string",
@@ -18061,6 +18767,15 @@
                 "tag": {
                   "type": "string"
                 },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
+                },
                 "provider": {
                   "type": "string",
                   "enum": [
@@ -18143,6 +18858,15 @@
                 },
                 "tag": {
                   "type": "string"
+                },
+                "traffic_class": {
+                  "type": "string",
+                  "enum": [
+                    "default",
+                    "interactive",
+                    "bulk",
+                    "realtime"
+                  ]
                 },
                 "provider": {
                   "const": "dynamic"
@@ -18405,6 +19129,15 @@
         },
         "public_key": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TrafficSchedulerOptions": {
+      "type": "object",
+      "properties": {
+        "upload_rate": {
+          "$ref": "#/$defs/ByteRate"
         }
       },
       "additionalProperties": false

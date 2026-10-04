@@ -4,6 +4,7 @@ import "github.com/sagernet/sing/common/json/badoption"
 
 type RouteOptions struct {
 	GeoIP                      *GeoIPOptions                     `json:"geoip,omitempty" schema:"omit"`
+	TrafficScheduler           *TrafficSchedulerOptions          `json:"traffic_scheduler,omitempty"`
 	Geosite                    *GeositeOptions                   `json:"geosite,omitempty" schema:"omit"`
 	Rules                      []Rule                            `json:"rules,omitempty"`
 	RuleSet                    []RuleSet                         `json:"rule_set,omitempty"`
