@@ -1,0 +1,81 @@
+name: Verify
+
+# Gates every push to the long-lived branch on the assumptions this fork makes about the code it pins.
+#
+# # Why this workflow exists, and what it is not
+#
+# The artifact workflows are manual dispatch on purpose: they build, sign, smoke-test and upload, and
+# a push should not pay 20 minutes for that. But until this workflow existed, NOTHING ran on a push.
+# Thirteen commits of local semantic change could sit on `testing` with no verification at all, and
+# the fork's riskiest failure mode - upstream changing underneath a local assumption - had no gate
+# anywhere.
+#
+# So this is the cheap half: the tripwires that fail when an upstream revision changes what something
+# MEANS, plus the build matrix that fails when it changes what something IS. It deliberately does not
+# run the full unit suite, the race suite or any artifact step; those stay in the artifact workflows
+# where they are asked for explicitly.
+on:
+  push:
+    branches: [testing]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter 2>&1 || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
+      - name: pinned-upstream assumptions
+        # The one step that exists for a fork: it fails when an upstream revision changes the meaning
+        # of something this fork relies on, and it prints where each assumption lives.
+        run: ./scripts/ci/verify-upstream-assumptions.sh
+
+      - name: build matrix
+        # A signature change upstream is a build failure here rather than a silent behaviour change
+        # later. The main binary is not built for every target: only the packages this fork changes,
+        # because the artifact workflows own the products.
+        run: |
+          set -euo pipefail
+          tags="$(cat release/DEFAULT_BUILD_TAGS)"
+          packages="./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./route/... ./option/..."
+          for target in linux/amd64 windows/amd64 freebsd/amd64; do
+            goos="${target%%/*}"
+            goarch="${target##*/}"
+            echo "--- ${goos}/${goarch}"
+            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -tags "$tags" $packages
+          done
+          echo "--- darwin/arm64 low_memory"
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -tags "$tags,low_memory" ./common/trafficsched/... ./protocol/tun/... ./route/...
+          echo "PASS: build matrix"
+
+      - name: race on the fork's own data paths
+        # Bounded to the packages the fork actually changed. The artifact workflows own the full race
+        # suite; this is the subset where a fork-local regression would land first.
+        run: |
+          set -euo pipefail
+          tags="$(cat release/DEFAULT_BUILD_TAGS)"
+          go test -race -count=1 -timeout 30m -tags "$tags" ./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./route/... ./option/...

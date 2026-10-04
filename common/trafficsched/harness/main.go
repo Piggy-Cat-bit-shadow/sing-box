@@ -1,9 +1,19 @@
+//go:build !windows
+
 // Command traffic-scheduler-harness measures the upload scheduler on a real link.
 //
 // It is a manual engineering tool, not a test. The automated experiments in the parent package use
 // a synthetic link so that they are reproducible and bounded in time; this one uses the network, so
 // its numbers are the ones that describe a real deployment and its numbers are also the ones that
 // move when the coffee shop's uplink does.
+//
+// # Why it is not built for Windows
+//
+// A Windows main package in this repository cannot link against the pinned tfo-go: the linkname it
+// uses for the TCP fast-open path does not resolve there (`invalid reference to net.(*netFD).init`),
+// which is a property of the dependency and not of this tool. The tool is for Linux and the BSDs
+// anyway - it measures an uplink on a host that has one to measure - so the constraint is stated here
+// rather than left to look like a broken build.
 //
 // # Running it
 //
