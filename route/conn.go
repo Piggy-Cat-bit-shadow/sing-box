@@ -100,6 +100,36 @@ func (m *ConnectionManager) CloseAll() {
 	}
 }
 
+// SetUploadRate installs the managed upload shaping rate from the configuration.
+//
+// This is the one place configuration reaches the scheduler. A rate source rather than a number is
+// what makes the value live: the scheduler reads it on every refill, so a controller installed here
+// later changes the shaping without the connection manager, the gate or any flow being rebuilt.
+//
+// A zero or negative rate installs no source, which leaves the scheduler inert: it still observes
+// every managed byte, and it admits all of them immediately with no queue, no lock and no timer.
+// A configuration that does not ask for shaping must not get it.
+func (m *ConnectionManager) SetUploadRate(bytesPerSecond int64) {
+	if m.scheduler == nil {
+		return
+	}
+	if bytesPerSecond <= 0 {
+		m.scheduler.SetRateSource(nil)
+		return
+	}
+	m.scheduler.SetRateSource(trafficsched.NewFixedRate(bytesPerSecond))
+}
+
+// UploadRate reports the shaping rate currently in effect, in bytes per second. Zero means the
+// scheduler is inert. It is the read side of SetUploadRate, and what the configuration tests assert
+// against, so that "the option was accepted" and "the shaper is using it" cannot drift apart.
+func (m *ConnectionManager) UploadRate() int64 {
+	if m.scheduler == nil {
+		return 0
+	}
+	return m.scheduler.Rate()
+}
+
 func (m *ConnectionManager) Close() error {
 	m.CloseAll()
 	// Releasing the scheduler here is what unblocks a copy goroutine parked in the gate. Closing

@@ -273,6 +273,11 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
 	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, dnsRouter)
 	connectionManager := route.NewConnectionManager(logFactory.NewLogger("connection"))
+	// The fork's upload scheduler. Absent - the overwhelmingly common case - leaves it inert, so a
+	// configuration that does not mention it behaves exactly as it did before the field existed.
+	if trafficScheduler := routeOptions.TrafficScheduler; trafficScheduler != nil {
+		connectionManager.SetUploadRate(trafficScheduler.UploadRate.Build())
+	}
 	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions, dnsOptions)
 	if err != nil {
