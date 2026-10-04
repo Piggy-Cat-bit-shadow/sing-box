@@ -97,6 +97,30 @@ type NetworkTransitionState interface {
 	NetworkTransitionStable() bool
 }
 
+// NetworkTransitionSnapshotter reports the transition epoch and the settled state as ONE observation.
+//
+// # Why reading them separately is not equivalent
+//
+// A consumer needs both: the epoch to reject an operation that began before a transition, and the
+// settled state to reject one that began during. Reading them as two calls lets the pair tear:
+//
+//	startedStable = true      <- read first
+//	                          <- a transition begins here
+//	capturedEpoch = R2        <- reads the NEW epoch
+//
+// The consumer then records "started settled, epoch R2", which is the state of an operation begun
+// AFTER the transition - so an operation that actually began during the DURING window is recorded as
+// a valid stable one, and the commit that follows accepts it. That is the unsafe direction.
+//
+// The manager can produce both values inside its own ownership critical section, so the pair is
+// always a state the network really passed through. A manager that does not implement this keeps the
+// two-call behaviour, which is no worse than before.
+type NetworkTransitionSnapshotter interface {
+	// NetworkTransitionSnapshot returns the current transition epoch and whether the network is
+	// settled, as a single consistent observation.
+	NetworkTransitionSnapshot() (epoch uint64, stable bool)
+}
+
 type NetworkOptions struct {
 	BindInterface        string
 	RoutingMark          uint32

@@ -65,7 +65,19 @@ type NetworkManager struct {
 	interfaceUpdateAccess   sync.Mutex
 	interfaceUpdateCancel   context.CancelFunc
 	networkResetPending     bool
-	resetRunAccess          sync.Mutex
+	// networkResetPendingToken is the transition the pending notification owns.
+	//
+	// The notification claims when it is DELIVERED, not when its update goroutine finally reaches the
+	// reset lock. Between those two points the lock may be held by another reset, and if this event
+	// did not move the environment fingerprint nothing else would claim - so the network would report
+	// settled while a reset it has already been told to perform is pending, and a dial or a query in
+	// that interval would be accepted against transports that are about to be reset.
+	//
+	// A repeat notification for the same logical event COALESCES onto the token already held, rather
+	// than claiming again: each notification would otherwise advance the epoch, turning a burst of
+	// interface callbacks into a reset storm.
+	networkResetPendingToken transitionToken
+	resetRunAccess           sync.Mutex
 	// networkResetGeneration increases every time a network reset BEGINS - it is advanced as the
 	// reset's first statement, so an operation in flight when the reset starts is already stale.
 	// Read it as a reset epoch, not as a count of finished resets.
@@ -88,6 +100,15 @@ type NetworkManager struct {
 	//
 	// This flag is what makes "during" distinguishable from both "before" and "after".
 	transitionStable atomic.Bool
+	// transitionAccess guards the ownership pair (transitionOwner, transitionStable) so that
+	// claiming, checking ownership and settling are each a single atomic mutation.
+	//
+	// It is NEVER held across a reset body: CloseAll, InterfaceUpdated, the DNS reset and
+	// transport.Reset are slow and take other locks, and holding this across them would create the
+	// deadlocks the transition protocol exists to avoid. Only the ownership words are guarded.
+	transitionAccess sync.Mutex
+	// transitionOwner is the token of the transition that currently owns the settled state.
+	transitionOwner transitionToken
 	// interfaceUpdateBeforeLock, when set, runs before updateInterface acquires interfaceUpdateAccess.
 	//
 	// The decision hook below runs INSIDE that lock, so a test parked there cannot receive a real
@@ -103,14 +124,8 @@ type NetworkManager struct {
 	interfaceUpdateDecision func()
 	// environmentPublished, when set, runs immediately after a recompute publishes a new fingerprint.
 	environmentPublished func()
-	// transitionStableInitialised makes the "no transition in progress" default explicit.
-	//
-	// atomic.Bool's zero value is false, which for this field means "a transition is pending". Every
-	// manager is therefore built with the network settled, and a manager that never transitions
-	// reports stable for its whole lifetime rather than refusing every operation.
-	transitionStableInitialised bool
-	powerUpdateAccess           sync.Mutex
-	powerUpdateCancel           context.CancelFunc
+	powerUpdateAccess    sync.Mutex
+	powerUpdateCancel    context.CancelFunc
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -582,7 +597,12 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 //
 // The epoch is the ownership token every other subsystem compares against: the DNS generation
 // barrier rejects a response whose captured epoch has moved, and the dialer refuses to hand a
-// connection to a caller whose epoch is stale. Both read the SAME counter this advances.
+// connection to a caller whose epoch is stale.
+//
+// The DNS client reads a DIFFERENT counter - dns.Router.networkGeneration, advanced by
+// Router.ResetNetwork. The two are not shared, which is why advancing a transition's token here does
+// not by itself tell the DNS layer that a transition is pending: that is what the transition-state
+// capability and the DNS layer's own recorded start state are for.
 //
 // Advancing it only inside resetNetworkLocked, which runs after resetRunAccess is acquired, left a
 // window in which the transition was already half-published: recomputeNetworkEnvironment had
@@ -597,11 +617,40 @@ func (r *NetworkManager) ResetNetwork(ctx context.Context) {
 // no instant at which a reader can see the new fingerprint with the old ownership. The reset body
 // then runs without advancing the epoch a second time, so one logical transition still costs
 // exactly one epoch.
-func (r *NetworkManager) beginTransition() uint64 {
-	// Unstable BEFORE the epoch moves, so there is no instant in which the new epoch is visible
-	// while the network still looks settled.
+// transitionToken identifies one logical network transition.
+//
+// It is produced by beginTransition and must be carried to commitTransition by the SAME transition.
+// Recovering it with networkResetGeneration.Load() at commit time returns whatever claimed last, so
+// a superseded transition could settle ownership belonging to its successor.
+type transitionToken uint64
+
+// noTransition is the zero token: "this call did not claim a transition".
+const noTransition transitionToken = 0
+
+// transitionOwns reports whether the given token still describes the live transition.
+//
+// It reads the ownership state under transitionAccess rather than sampling the epoch, because
+// "am I still the owner" and "settle ownership" have to be one decision (see commitTransition).
+func (r *NetworkManager) transitionOwns(token transitionToken) bool {
+	if token == noTransition {
+		return false
+	}
+	r.transitionAccess.Lock()
+	defer r.transitionAccess.Unlock()
+	return r.transitionOwner == token
+}
+
+func (r *NetworkManager) beginTransition() transitionToken {
+	// One atomic ownership mutation: the network becomes unstable AND takes a new token.
+	//
+	// The two must move together. Storing "unstable" and then advancing the epoch as separate
+	// operations leaves an instant in which the new token is visible while the state still reads
+	// settled, which is the observation the transition exists to prevent.
+	r.transitionAccess.Lock()
+	defer r.transitionAccess.Unlock()
+	r.transitionOwner = transitionToken(r.networkResetGeneration.Add(1))
 	r.transitionStable.Store(false)
-	return r.networkResetGeneration.Add(1)
+	return r.transitionOwner
 }
 
 // commitTransition returns the network to a settled state, but only for the transition that still
@@ -618,9 +667,21 @@ func (r *NetworkManager) beginTransition() uint64 {
 // has claimed, and the network stays unstable until C finishes. The last transition to claim is the
 // one that decides when the network is settled, which is what "everything after C's linearization
 // point belongs to C" has to mean if it is to be true.
-func (r *NetworkManager) commitTransition(token uint64) {
-	if r.networkResetGeneration.Load() != token {
-		// A newer transition has claimed. It owns the settled state now.
+func (r *NetworkManager) commitTransition(token transitionToken) {
+	// One atomic ownership mutation: check and settle together.
+	//
+	// Checking the owner and then storing "stable" as two steps is a TOCTOU. B checks and finds
+	// itself current; C claims and takes the token and marks the network unstable; B then stores
+	// "stable" and the network reports SETTLED while C's body has not run. An operation issued in
+	// C's era is then accepted against a state no single transition produced.
+	//
+	// Holding transitionAccess across both makes the check and the settle indivisible, so a claim
+	// either happens entirely before (and B's commit is ignored) or entirely after (and B settles
+	// its own transition).
+	r.transitionAccess.Lock()
+	defer r.transitionAccess.Unlock()
+	if r.transitionOwner != token {
+		// A newer transition owns the settled state now.
 		return
 	}
 	r.transitionStable.Store(true)
@@ -644,6 +705,19 @@ func (r *NetworkManager) networkEnvironmentAndStability() (uint64, bool) {
 // in that state must not be handed over or cached as a stable-network result.
 func (r *NetworkManager) NetworkTransitionStable() bool {
 	return r.transitionStable.Load()
+}
+
+// NetworkTransitionSnapshot returns the epoch and the settled state as one consistent observation.
+//
+// Both are read under transitionAccess, the same lock beginTransition and commitTransition take, so
+// the pair is always a state the network actually passed through. Read as two calls they can tear:
+// a consumer can observe "settled" and then read the epoch of a transition that began in between,
+// which describes an operation started AFTER the transition rather than during it - the unsafe
+// direction, because it launders a DURING operation into a valid one.
+func (r *NetworkManager) NetworkTransitionSnapshot() (uint64, bool) {
+	r.transitionAccess.Lock()
+	defer r.transitionAccess.Unlock()
+	return uint64(r.transitionOwner), r.transitionStable.Load()
 }
 
 // NetworkResetGeneration reports the current reset epoch: it increases every time a network
@@ -703,6 +777,18 @@ func (r *NetworkManager) ReleaseMemory(ctx context.Context) {
 func (r *NetworkManager) notifyInterfaceUpdate(_ *control.Interface, _ int) {
 	r.interfaceUpdateAccess.Lock()
 	defer r.interfaceUpdateAccess.Unlock()
+	if !r.networkResetPending {
+		// First notification for this event: claim. This is what makes the network unstable before
+		// the update goroutine can be blocked on the reset lock.
+		r.networkResetPendingToken = r.beginTransition()
+	} else if !r.transitionOwns(r.networkResetPendingToken) {
+		// A newer transition claimed while this event was pending - a real environment change, say.
+		// This event is superseded, so it takes a fresh token rather than committing one that now
+		// belongs to somebody else.
+		r.networkResetPendingToken = r.beginTransition()
+	}
+	// Otherwise the pending event already owns a token and this is a repeat of it: coalesce, so a
+	// burst of notifications costs one epoch rather than one each.
 	r.networkResetPending = true
 	if r.startedCtx != nil {
 		r.dispatchInterfaceUpdateLocked()
@@ -783,7 +869,7 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 	// The locked form throughout: this function holds resetRunAccess (taken above), and the boundary
 	// resets the network. Calling the exported, self-locking entry from here would self-deadlock,
 	// because sync.Mutex is not reentrant.
-	environmentChanged := r.recomputeNetworkEnvironment()
+	environmentChanged, environmentToken := r.recomputeNetworkEnvironment()
 
 	// Consume the pending flag only if THIS update is the one that will act on it.
 	//
@@ -817,6 +903,10 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 
 	ownedByThisUpdate := false
 	superseded := false
+	// pendingToken is the transition this update consumes when it owns the pending event. It is the
+	// token the NOTIFICATION claimed, not one this update invents: the notification is what made the
+	// network unstable, so it is what owns the settle.
+	var pendingToken transitionToken
 	r.interfaceUpdateAccess.Lock()
 	if ctx.Err() != nil {
 		superseded = true
@@ -830,6 +920,8 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 			superseded = true
 		} else if r.networkResetPending {
 			r.networkResetPending = false
+			pendingToken = r.networkResetPendingToken
+			r.networkResetPendingToken = noTransition
 			ownedByThisUpdate = true
 		}
 	}
@@ -862,13 +954,19 @@ func (r *NetworkManager) updateInterface(ctx context.Context, defaultInterface *
 		// yet and the network is still marked settled: this transition must mark it unstable before
 		// it runs a reset body, or a concurrent DNS query or dial (neither of which takes
 		// resetRunAccess) would be accepted as a stable result while the transports are mid-reset.
-		var token uint64
-		if environmentChanged {
-			token = r.networkResetGeneration.Load()
-		} else {
-			token = r.beginTransition()
+		// The token comes from the claim that produced it, never from a later read.
+		//
+		//	environment moved  -> recomputeNetworkEnvironment claimed and returned that token
+		//	pending only       -> the NOTIFICATION claimed, and this update consumes its token
+		token := environmentToken
+		if !environmentChanged {
+			token = pendingToken
 		}
-		r.resetNetworkLocked(ctx)
+		// A newer transition may own the network by now. Running the body anyway would mutate the
+		// successor's state, so the stale body is skipped and only its owner resets.
+		if r.transitionOwns(token) {
+			r.resetNetworkLocked(ctx)
+		}
 		r.commitTransition(token)
 	}
 }

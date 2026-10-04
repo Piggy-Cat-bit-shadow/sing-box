@@ -51,7 +51,9 @@ type DefaultDialer struct {
 	// the epoch that is current when ownership is handed to the caller.
 	networkEpoch func() uint64
 	// networkStable reports whether the network is settled; nil when the manager has no such concept.
-	networkStable          func() bool
+	networkStable func() bool
+	// networkSnapshot returns the epoch and the settled state together; nil when the manager cannot.
+	networkSnapshot        func() (uint64, bool)
 	powerManager           *powerreport.Manager
 	outboundManager        adapter.OutboundManager
 	dnsTransportManager    adapter.DNSTransportManager
@@ -89,6 +91,14 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	var networkStable func() bool
 	if state, isState := networkManager.(adapter.NetworkTransitionState); isState {
 		networkStable = state.NetworkTransitionStable
+	}
+	// Preferred over the two calls above: it returns the epoch and the settled state as ONE
+	// observation, so the pair cannot tear. Reading them separately can record "started settled" with
+	// the epoch of a transition that began in between, which describes an operation started AFTER the
+	// transition and therefore launders a DURING dial into a valid one.
+	var networkSnapshot func() (uint64, bool)
+	if snapshotter, isSnapshotter := networkManager.(adapter.NetworkTransitionSnapshotter); isSnapshotter {
+		networkSnapshot = snapshotter.NetworkTransitionSnapshot
 	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 
@@ -279,6 +289,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		networkManager:         networkManager,
 		networkEpoch:           networkEpoch,
 		networkStable:          networkStable,
+		networkSnapshot:        networkSnapshot,
 		familyHealth:           newFamilyHealth(),
 		powerManager:           service.FromContext[*powerreport.Manager](ctx),
 		outboundManager:        service.FromContext[adapter.OutboundManager](ctx),
@@ -527,12 +538,39 @@ func (d *DefaultDialer) captureEpoch() func() bool {
 		}
 		return func() bool { return d.networkStable() }
 	}
-	captured := d.networkEpoch()
+	// The state at START, not only the state at hand-over.
+	//
+	// A commit does not advance the epoch - it only settles the state - so a dial that began during a
+	// transition captures the transition's own epoch and, once the transition commits, the epoch
+	// comparison finds no change and the network reports stable. Both checks pass and the connection
+	// is handed over, even though it was produced while ownership was unresolved and everything it
+	// observed belonged to the network being left.
+	//
+	// Remembering that the dial STARTED unsettled is what closes that: an operation that began in the
+	// DURING state cannot be laundered into a valid one by a later commit.
+	//
+	// Both values come from ONE observation when the manager can provide it. Two separate reads can
+	// tear - "settled" is observed, a transition then begins, and the epoch of that NEW transition is
+	// captured - which records an operation that began DURING as one that began settled. That is the
+	// unsafe direction, since it launders exactly the case this exists to reject.
+	var (
+		capturedEpoch uint64
+		startedStable = true
+	)
+	if d.networkSnapshot != nil {
+		capturedEpoch, startedStable = d.networkSnapshot()
+	} else {
+		startedStable = d.networkStable == nil || d.networkStable()
+		capturedEpoch = d.networkEpoch()
+	}
 	return func() bool {
+		if !startedStable {
+			return false
+		}
 		if d.networkStable != nil && !d.networkStable() {
 			return false
 		}
-		return d.networkEpoch() == captured
+		return d.networkEpoch() == capturedEpoch
 	}
 }
 

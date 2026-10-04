@@ -216,10 +216,36 @@ func (c *Client) generationStillCurrent(operation *exchangeOperation) bool {
 	return operation.generation == c.networkGeneration()
 }
 
+// responseAcceptable reports whether a completed exchange may be delivered as a stable-network result.
+//
+// # What this deliberately does NOT reject
+//
+// A query that STARTED in a settled state and whose answer arrives after the network moved is still
+// delivered. That is the fork's existing contract, asserted by cross_generation_answer_contract_test.go:
+// a DNS answer is a dated observation about a name, the generation guard keeps it out of the cache, and
+// cancelling every in-flight resolution on a transient interface event would turn a wifi blip into a
+// failed lookup. Rejecting it would be a behaviour change beyond this task's scope.
+//
+// # What it rejects
+//
+// A query that STARTED while a transition was pending. There is no settled network it can be an
+// observation of: its key names the network being left, its transport may already serve the new one,
+// and a later commit does not repair either fact - the commit advances neither the generation nor the
+// pin. Delivering it would present an unresolved-network result as a stable answer about the current
+// network, which nothing downstream can detect.
+func (c *Client) responseAcceptable(operation *exchangeOperation) bool {
+	return !operation.hasOwnershipGuard || operation.startedStable
+}
+
 // networkTransitionStable reports whether the network is settled, from the manager when it can say.
 //
 // A manager without the capability is one where the distinction does not arise, so the check
 // degrades to "settled" and the previous behaviour is preserved exactly.
+// errNetworkTransitioning reports that the query could not be answered as a stable result because
+// the network was mid-transition. It is transient: the caller retries and the next attempt, taken in
+// a settled state, succeeds normally.
+var errNetworkTransitioning = E.New("network is transitioning")
+
 func (c *Client) networkTransitionStable() bool {
 	if c.networkManager == nil {
 		return true
@@ -443,7 +469,11 @@ type exchangeOperation struct {
 	releaseCond     func()
 	// generation is the network generation this query was issued on. Captured when the operation is
 	// built, which is BEFORE the round trip, and compared before anything is stored.
-	generation         uint64
+	generation uint64
+	// startedStable is the network's settled state when the query was issued. A query that began
+	// during a transition is not a stable-network result, however the network looks when it finishes.
+	startedStable      bool
+	hasOwnershipGuard  bool
 	hasGenerationGuard bool
 }
 
@@ -490,6 +520,28 @@ func (c *Client) beginExchange(ctx context.Context, transport adapter.DNSTranspo
 		options:         options,
 		responseChecker: responseChecker,
 		disableCache:    disableCache,
+	}
+	// Record the ownership state the query STARTED in, and refuse the whole operation if it started
+	// while a transition was pending.
+	//
+	// # Why the start state must be remembered
+	//
+	// A commit does not advance the DNS generation and does not change the environment pin - it only
+	// settles the state. So a query issued DURING a transition, checked only at finish time, finds a
+	// settled network and is accepted, even though the answer it carries was produced while the
+	// transports were unresolved and its key names the network being left.
+	//
+	// # Why the cache is refused rather than waited for
+	//
+	// A DNS query can be issued from inside a reset callback or an interface callback. Waiting for
+	// the transition to settle would block that path behind the very reset it is running inside, so
+	// the operation fails fast with a transient error instead.
+	operation.startedStable = c.networkTransitionStable()
+	operation.hasOwnershipGuard = true
+	if !operation.startedStable {
+		// Returned before any cache read: the exact, NXDOMAIN and optimistic paths are all
+		// downstream of here.
+		return nil, nil, exchangeDone, errNetworkTransitioning
 	}
 	if !disableCache {
 		cacheKey := c.newCacheKey(transport, question, message, options)
@@ -586,6 +638,26 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 			logRejectedResponse(c.logger, ctx, response)
 			return response, ErrResponseRejected
 		}
+	}
+	// Ownership decides whether this response may be DELIVERED, not only whether it may be stored.
+	//
+	// The check below previously gated only the cache write, and the function ended with
+	// `return response, nil` regardless. So a response produced while the network was unsettled - or
+	// produced on a network the operation no longer belongs to - was still handed to the caller as a
+	// normal success. The caller has no way to tell: the response is well-formed, its rcode is
+	// SUCCESS, and the only thing wrong with it is which network it describes.
+	//
+	// Two conditions, and both are needed:
+	//
+	//	startedStable   the query was issued in a settled state, so it can be a stable-network result
+	//	stillOwned      the generation, the pin and the settled state all still describe that network
+	//
+	// A query that began DURING a transition fails the first even if the transition later committed,
+	// which is what stops a commit from laundering it. DisableCache is deliberately not consulted:
+	// whether a response may be cached and whether it may be trusted are different questions.
+	if !c.responseAcceptable(operation) {
+		logRejectedResponse(c.logger, ctx, response)
+		return nil, errNetworkTransitioning
 	}
 	timeToLive := applyResponseOptions(question, response, operation.options)
 	if !disableCache && c.generationStillCurrent(operation) {
@@ -1055,7 +1127,11 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		} else if response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError {
 			return
 		}
-		if !c.generationStillCurrent(refreshOperation) {
+		// The same ownership contract as the foreground path: the refresh may only deposit a result
+		// if the network it was issued on is still the network that holds. A refresh started while a
+		// transition was pending would otherwise seed the old namespace with an answer from the new
+		// network, which is the mislabelling this exists to prevent.
+		if !c.responseAcceptable(refreshOperation) {
 			return
 		}
 		storeKey, storable := c.finishCacheKey(transport, key)

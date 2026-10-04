@@ -55,10 +55,11 @@ func (r *NetworkManager) postUpdateNetworkEnvironment() {
 // establishes its boundary inline, so that one interface update produces one reset. Taking the
 // exported form from a lock holder would self-deadlock, because sync.Mutex is not reentrant.
 func (r *NetworkManager) updateNetworkEnvironment() {
-	if !r.recomputeNetworkEnvironment() {
+	changed, token := r.recomputeNetworkEnvironment()
+	if !changed {
 		return
 	}
-	r.boundEnvironmentTransitionExported()
+	r.boundEnvironmentTransitionExported(token)
 }
 
 // recomputeNetworkEnvironment refreshes the fingerprint and reports whether it changed.
@@ -69,7 +70,7 @@ func (r *NetworkManager) updateNetworkEnvironment() {
 // startedCancel - so holding environmentUpdateAccess across it would stop every later
 // postUpdateNetworkEnvironment behind a Close that is itself waiting. That is a three-way cycle, and
 // it hung the jiejie reference suite for the full 40-minute test timeout.
-func (r *NetworkManager) recomputeNetworkEnvironment() bool {
+func (r *NetworkManager) recomputeNetworkEnvironment() (bool, transitionToken) {
 	r.environmentUpdateAccess.Lock()
 	defer r.environmentUpdateAccess.Unlock()
 	var defaultInterface *adapter.NetworkInterface
@@ -125,7 +126,7 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	changed := environmentHash != r.networkEnvironment
 	if !changed {
 		r.stateAccess.Unlock()
-		return false
+		return false, noTransition
 	}
 	r.networkEnvironment = environmentHash
 	// The test hook runs HERE: after the fingerprint is written, before the transition is claimed,
@@ -140,7 +141,7 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	// new fingerprint is visible" and "the network is no longer settled" a single observation. Doing
 	// the claim after the unlock - which is what this replaced - left a window in which a reader saw
 	// the new environment while every ownership token still described the old one.
-	r.beginTransition()
+	token := r.beginTransition()
 	r.stateAccess.Unlock()
 	// A zero fingerprint is a real environment, not a missing reading.
 	//
@@ -162,7 +163,7 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 	// The transition was claimed above, while stateAccess was still held, so the publish and the
 	// claim are one observation. The caller decides whether a reset body runs; what is settled here
 	// is only that the network is no longer stable.
-	return true
+	return true, token
 }
 
 // boundEnvironmentTransition establishes the transport/generation boundary for a confirmed
@@ -218,7 +219,7 @@ func (r *NetworkManager) recomputeNetworkEnvironment() bool {
 // half-published, and claiming afterwards would leave that interval observable. Claiming first makes
 // the wait harmless - a long wait only delays the reset body, and by then the epoch has already told
 // every other subsystem to treat the previous network's operations as stale.
-func (r *NetworkManager) boundEnvironmentTransitionExported() {
+func (r *NetworkManager) boundEnvironmentTransitionExported(token transitionToken) {
 	if !r.environmentTransitionApplies() {
 		return
 	}
@@ -229,15 +230,25 @@ func (r *NetworkManager) boundEnvironmentTransitionExported() {
 	// fingerprint. Here the body runs and the transition commits, so the network is unstable for
 	// exactly the interval between publishing and finishing the reset - however long the lock is
 	// contended, and one epoch per logical transition.
-	token := r.networkResetGeneration.Load()
+	// `token` is the one THIS transition's claim produced, carried from recomputeNetworkEnvironment.
+	// Recovering it with Load() here would return whatever claimed last, letting a superseded
+	// transition commit ownership belonging to its successor.
 	defer r.commitTransition(token)
+	if !r.transitionOwns(token) {
+		return
+	}
 	r.resetRunAccess.Lock()
 	defer r.resetRunAccess.Unlock()
+	// Re-checked UNDER the reset lock: acquiring it is precisely the wait during which a newer claim
+	// happens, so the check before the lock alone would let a superseded body through.
+	if !r.transitionOwns(token) {
+		return
+	}
 	r.resetNetworkLocked(r.startedCtx)
 }
 
 // boundEnvironmentTransitionLocked is the inner form for a caller holding resetRunAccess.
-func (r *NetworkManager) boundEnvironmentTransitionLocked(ctx context.Context) {
+func (r *NetworkManager) boundEnvironmentTransitionLocked(ctx context.Context, token transitionToken) {
 	if !r.environmentTransitionApplies() {
 		return
 	}
@@ -246,9 +257,11 @@ func (r *NetworkManager) boundEnvironmentTransitionLocked(ctx context.Context) {
 	}
 	// The epoch was claimed by recomputeNetworkEnvironment, in the same step that published the new
 	// fingerprint - NOT here. Claiming again would advance the epoch twice for one logical
-	// transition, and the caller's token would then be the wrong one.
-	token := r.networkResetGeneration.Load()
+	// transition, and a token recovered afterwards would be the wrong one.
 	defer r.commitTransition(token)
+	if !r.transitionOwns(token) {
+		return
+	}
 	r.resetNetworkLocked(ctx)
 }
 

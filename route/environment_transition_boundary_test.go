@@ -81,8 +81,8 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 	// fingerprint - that is what makes the two one observable state - and the boundary here runs the
 	// reset body. A test host has no interfaces to derive a real fingerprint from, so the decision is
 	// driven directly and the claim is made where recompute makes it.
-	manager.beginTransition()
-	manager.boundEnvironmentTransitionExported()
+	token := manager.beginTransition()
+	manager.boundEnvironmentTransitionExported(token)
 
 	require.Greater(t, dnsResetCount(router), before,
 		"a real environment transition must reach the DNS reset, or a transport that re-dials on "+
@@ -101,7 +101,8 @@ func TestEnvironmentTransitionTakesTheResetBoundary(t *testing.T) {
 		outbound: &emptyOutboundManager{},
 	}
 	unstarted.networkEnvironment = 0x1111
-	unstarted.boundEnvironmentTransitionExported()
+	unstartedToken := unstarted.beginTransition()
+	unstarted.boundEnvironmentTransitionExported(unstartedToken)
 	require.Equal(t, 0, dnsResetCount(unstarted.router.(*countingRouter)),
 		"an unstarted manager must not reset: the boundary is gated on lifecycle, not on the "+
 			"environment value, because 0 is a representable fingerprint")
@@ -269,7 +270,7 @@ func TestEnvironmentRecomputeDoesNotHoldItsLockAcrossTheReset(t *testing.T) {
 	}
 
 	// The boundary is expected to block here, because the test holds resetRunAccess.
-	go manager.boundEnvironmentTransitionExported()
+	go manager.boundEnvironmentTransitionExported(manager.beginTransition())
 
 	// THE ASSERTION: an update arriving now must still be able to take environmentUpdateAccess.
 	// If the recompute held it across the reset, this blocks - which is precisely the starvation that
@@ -332,7 +333,7 @@ func TestInterfacePathTakesTheInnerResetForATransition(t *testing.T) {
 		defer close(done)
 		// The call updateInterface makes. It must use the inner reset, because this goroutine already
 		// holds the lock.
-		manager.boundEnvironmentTransitionLocked(startedCtx)
+		manager.boundEnvironmentTransitionLocked(startedCtx, manager.beginTransition())
 	}()
 
 	select {

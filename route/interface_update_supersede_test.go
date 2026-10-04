@@ -68,79 +68,19 @@ func testDefaultInterface() *control.Interface {
 	return &control.Interface{Index: 1, Name: "en0"}
 }
 
-// TestSupersededUpdateDoesNotConsumeTheNewPendingReset is the reproduction.
+// The synthetic predecessor of TestSupersedeUsesRealNotifyInterfaceUpdate has been REMOVED.
 //
-// The hook parks the update BETWEEN its context check and its pending consumption - the window the
-// defect lives in. Because the hook runs inside interfaceUpdateAccess, the notification that
-// supersedes it must be delivered by the update's own cancellation path rather than by the test
-// taking the lock, so the sequence is:
+// It parked the update inside interfaceUpdateAccess and then wrote networkResetPending directly,
+// because a real notification could not be delivered while that lock was held. That reproduced the
+// consumption ordering but not the notifier's protocol - it never exercised notifyInterfaceUpdate
+// taking the lock, claiming the transition, arming the event, cancelling the in-flight context and
+// dispatching a successor. It also wrote a private flag to simulate a public operation, which is
+// exactly the shortcut that hides the claim: the notification is what makes the network unstable, so
+// a test that arms the flag by hand exercises a state the product cannot reach.
 //
-//  1. the update passes its context check and parks in the window
-//  2. a superseding notification arrives (a second notifyInterfaceUpdate)
-//  3. it arms the flag for its own update and cancels this one
-//  4. the parked update is released and must NOT consume that flag
-func TestSupersededUpdateDoesNotConsumeTheNewPendingReset(t *testing.T) {
-	h := newTransitionWindowHarness(t)
-	h.setSSID("A")
-	h.manager.updateNetworkEnvironment()
-	base := h.manager.NetworkResetGeneration()
-
-	// The OLD update's own reason, so there is something for it to wrongly consume and so the two
-	// updates' resets can be told apart.
-	h.manager.interfaceUpdateAccess.Lock()
-	h.manager.networkResetPending = true
-	h.manager.interfaceUpdateAccess.Unlock()
-
-	oldCtx, cancelOld := context.WithCancel(context.Background())
-	defer cancelOld()
-
-	atDecision, release := parkUpdate(t, h)
-
-	oldDone := make(chan struct{})
-	go func() {
-		defer close(oldDone)
-		h.manager.updateInterface(oldCtx, testDefaultInterface())
-	}()
-
-	// 1. The old update has passed its context check and is parked in the window.
-	select {
-	case <-atDecision:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the update never reached its decision point")
-	}
-
-	// 2/3. The superseding notification: arm the flag for the NEW update and cancel the old context.
-	// This is what notifyInterfaceUpdate does, in the order it does it.
-	//
-	// It cannot take interfaceUpdateAccess here - the parked update holds it - so the flag is armed
-	// through the same field the notifier writes, and the cancellation is what the parked update will
-	// observe. That is the interleaving under test: the cancellation happens AFTER the update's
-	// context check has already passed.
-	h.manager.networkResetPending = true
-	cancelOld()
-
-	// 4. Release the parked update.
-	close(release)
-	select {
-	case <-oldDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the old update did not finish")
-	}
-
-	h.manager.interfaceUpdateAccess.Lock()
-	stillPending := h.manager.networkResetPending
-	h.manager.interfaceUpdateAccess.Unlock()
-
-	require.True(t, stillPending,
-		"the superseded update consumed the pending reset belonging to the notification that "+
-			"cancelled it. That notification's own update now finds nothing to do, so the interface "+
-			"change it announced is silently dropped")
-
-	// The new update performs it.
-	h.manager.updateInterface(h.manager.startedCtx, testDefaultInterface())
-	require.Equal(t, int(base+1), dnsResetCount(h.router),
-		"the superseding notification's reset must still be performed exactly once")
-}
+// TestSupersedeUsesRealNotifyInterfaceUpdate below covers the same semantics through the real
+// notifier, and asserts both that the superseded update cannot consume the newer event and that the
+// newer update performs the boundary exactly once.
 
 // TestUpdateThatIsNotSupersededStillConsumes covers the other side: an update that owns its event
 // must consume and reset, or the flag would be left armed for an update that never comes.
@@ -148,15 +88,18 @@ func TestUpdateThatIsNotSupersededStillConsumes(t *testing.T) {
 	h := newTransitionWindowHarness(t)
 	h.setSSID("A")
 	h.manager.updateNetworkEnvironment()
-	base := h.manager.NetworkResetGeneration()
 
-	h.manager.interfaceUpdateAccess.Lock()
-	h.manager.networkResetPending = true
-	h.manager.interfaceUpdateAccess.Unlock()
+	baseResets := dnsResetCount(h.router)
+
+	// The notification claims the transition and arms the event; the update consumes it.
+	h.manager.notifyInterfaceUpdate(testDefaultInterface(), 0)
+	require.False(t, h.manager.NetworkTransitionStable(),
+		"the notification must mark the network unstable before its update reaches the reset lock")
 
 	h.manager.updateInterface(h.manager.startedCtx, testDefaultInterface())
 
-	require.Equal(t, int(base+1), dnsResetCount(h.router), "an un-superseded update performs its reset")
+	require.Equal(t, baseResets+1, dnsResetCount(h.router), "an un-superseded update performs its reset")
+	require.True(t, h.manager.NetworkTransitionStable(), "and settles the network when it finishes")
 	h.manager.interfaceUpdateAccess.Lock()
 	pending := h.manager.networkResetPending
 	h.manager.interfaceUpdateAccess.Unlock()

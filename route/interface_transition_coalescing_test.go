@@ -58,6 +58,8 @@ func newInterfaceTransitionHarness(t *testing.T) *interfaceTransitionHarness {
 	t.Cleanup(cancel)
 	manager.startedCtx = startedCtx
 	manager.logger = logger.NOP()
+	// The notifier dispatches through the pause manager, so the harness supplies one.
+	manager.pauseManager = &noopPauseManager{}
 	// A default interface with one gateway, so the fingerprint is non-empty and the transition has
 	// something to move. networkInterfaces is what DefaultNetworkInterface resolves against.
 	// Gateways live on adapter.NetworkInterface (the control.Interface it embeds carries only index,
@@ -81,10 +83,12 @@ func (h *interfaceTransitionHarness) setSSID(ssid string) {
 }
 
 // markInterfaceResetPending arms the other reason updateInterface resets for.
+//
+// It goes through the real notifier: the notification is what CLAIMS the transition, so writing the
+// flag directly would exercise a state the product cannot reach - a pending reset whose transition
+// nobody owns.
 func (h *interfaceTransitionHarness) markInterfaceResetPending() {
-	h.manager.interfaceUpdateAccess.Lock()
-	h.manager.networkResetPending = true
-	h.manager.interfaceUpdateAccess.Unlock()
+	h.manager.notifyInterfaceUpdate(nil, 0)
 }
 
 func (h *interfaceTransitionHarness) resetCount() int { return dnsResetCount(h.router) }
@@ -150,19 +154,25 @@ func TestInterfaceEnvironmentTransitionAloneResetsOnce(t *testing.T) {
 // TestInterfacePendingResetAloneResetsOnce is the control for the pending reason.
 func TestInterfacePendingResetAloneResetsOnce(t *testing.T) {
 	harness := newInterfaceTransitionHarness(t)
-	// Settle the fingerprint, then leave it alone, so only the pending flag remains as a reason.
+	// Settle the fingerprint, then leave it alone, so only the pending event remains as a reason.
 	harness.setSSID("A")
 	harness.manager.updateInterface(harness.manager.startedCtx, &control.Interface{Index: 1, Name: "en0"})
-	harness.markInterfaceResetPending()
 
 	before := harness.resetCount()
-	generationBefore := harness.manager.NetworkResetGeneration()
+
+	// The notification itself CLAIMS the transition - that is what makes the network unstable before
+	// its update can be blocked on the reset lock - so the epoch has already moved by the time the
+	// update consumes it. The update must perform the boundary without claiming a second time.
+	harness.markInterfaceResetPending()
+	generationAfterNotify := harness.manager.NetworkResetGeneration()
 
 	harness.manager.updateInterface(harness.manager.startedCtx, &control.Interface{Index: 1, Name: "en0"})
 
 	require.Equal(t, before+1, harness.resetCount(),
-		"a pending interface reset with no environment transition must still reset")
-	require.EqualValues(t, generationBefore+1, harness.manager.NetworkResetGeneration())
+		"a pending interface event with no environment transition must still reset")
+	require.EqualValues(t, generationAfterNotify, harness.manager.NetworkResetGeneration(),
+		"the update consumes the token the notification claimed; claiming again would double the "+
+			"epoch for one logical event")
 }
 
 // TestInterfaceUpdateWithNoReasonDoesNotReset is the negative control.
