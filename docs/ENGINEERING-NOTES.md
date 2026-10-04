@@ -122,6 +122,46 @@ Naive H3 服务器不主动启用 0-RTT；未覆盖的 stream limit 和 path man
 
 调参只能由 receiver-visible 延迟与 bulk 吞吐说话，不能由 grant 延迟或队列深度说话——两者都可以很好看而 delivery 完全没有变化。任何新的调度模型先加进 `contention_test.go` 当一行，用同一台架与 baseline 对比。
 
+## Direct Offload
+
+### 架构边界
+
+| 目录 | 职责 |
+| --- | --- |
+| [`common/dialer/profile.go`](../common/dialer/profile.go) | 把 `DialerOptions` **一次性**解释为 `SocketSemantics`：哪个 option 影响哪种 flow 的 socket 语义。这是 option 语义的**唯一**解释处。 |
+| [`protocol/direct/outbound.go`](../protocol/direct/outbound.go) | 把 profile 与自身运行时守卫（ambient network policy、自身地址）合起来回答 `CanBypass`。 |
+| [`route/route.go`](../route/route.go) | 回答 policy 问题：这个 **flow** 允许绕过 userspace 吗。`canFastBypass` 返回 `BypassVerdict`。 |
+| [`protocol/tun/inbound.go`](../protocol/tun/inbound.go) | L0：DNS hijack → route sets → router 的顺序，以及 FakeIP 不得进入 route set。 |
+
+Router 回答 routing/policy/metadata，profile 回答 outbound/socket。**不要把两层合成一个巨大判断器**：profile 看不到 FakeIP、sniffed domain、tracker；router 重新解释 dial option 就是第二份解释。
+
+### 核心结论
+
+- **语义等价，不是配置为空。** 一个 option 只有在 userspace 路径**真的会作用到这个 flow** 时才算资格否决。生产拓扑里的 direct outbound 只带 `domain_resolver: local-agh`，而 literal IP flow 根本不会走到 resolver。按配置整体比较会让这条 outbound 的所有 flow 失去资格；按语义比较不会。
+- **失败方向必须是 fail closed，且要有两道。** 新增 `DialerOptions` 字段如果没被分类：(1) 运行时产生 `BlockerUnclassified`（代价是少一次优化，不是丢掉 socket 语义）；(2) `TestEveryDialerOptionIsClassified` 用 reflection 枚举结构体字段并失败，失败信息里打印各 scope 的含义。分类表还不得列出已不存在的字段，避免改名后留下死条目。
+- **`domain_strategy` 的硬家族限制会作用于 literal 地址。** dial 路径把 `ipv4_only`/`ipv6_only` 也应用到原始尝试，不只是解析出的候选。profile 因此必须向**活着的** dialer 询问有效策略；`prefer_ipv4` 只是偏好，不构成限制。
+- **`reuse_addr` 只作用于 UDP listener**，从不进入 TCP dialer；TCP 的 socket option（`tcp_fast_open`、keepalive、MPTCP）反之。按网络分流不是取巧，是读 `default.go` 得到的。
+- **`udp_fragment_default` 必须归为 ignore。** direct 构造函数自己设它，它不是运维的表达；把它当配置会让这个 fork 里每一条 direct outbound 都失去资格。
+- **L0 不是“先过 Router policy，再 L0 bypass”。** `JudgeFlow` 的顺序是 DNS hijack → route sets → router，route set 拿到的 flow **Router 从未见过**。所以 L0 只适合已经编码进 route set 的、权威的纯 IP 规则；把带 domain/process/protocol 条件的 `DIRECT` 规则编译成 route set 是错的，台账测试 `TestL0CannotExpressAnythingButAddresses` 钉住了这一点。
+- **FakeIP 永远不得 native bypass，包括 L0。** route set 先于 router，`route_address_set` 会让集合**之外**的目的地 bypass——域名刚拿到的 FakeIP 占位地址会被交给平台路由表并黑洞掉；`route_exclude_address_set` 覆盖到 `198.18.0.0/15` 也会。守卫是两次 prefix 比较，每 flow 一次（不是每包），没有 FakeIP transport 时完全不执行。
+- **DNS 仍然第一。** Direct Offload 不改变顺序，也不声称识别 DoH/DoT/DoQ，更不会为了拦 QUIC 去封 UDP/443。
+- **tracker 存在即拒绝，这是第一轮的正确答案。** 但必须诚实报告产品效果：命中率在带 dashboard/API 的配置下是 **0**。原因是守卫看的是 tracker 的**存在**，不是它会记录什么。要做 native accounting 是独立项目。
+
+### 已测量的事实
+
+| 项 | 值 |
+| --- | --- |
+| L1 命中（minimal，模型权重） | 3/6 shape，**85%**；全部 literal IP flow 命中 |
+| L1 命中（dashboard-enabled） | **0/6** |
+| L0 命中 | 无 route set 0/4；`route_address_set: 10/8` 2/4；`route_exclude_address_set: 198.16/12` 1/4 |
+| 资格判定成本 | 数 ns，**0 allocs**（同时是测试断言，不只是 benchmark） |
+| L1 每字节成本 | 0（连接根本不在本进程创建） |
+| L2 vs L3 | 都是 userspace 复制；loopback 上 L2 并不更快，因为两边都不跨总线。这些数字**不构成真实网卡上的结论** |
+
+### 维护原则
+
+新增 `DialerOptions` 字段时，先想清楚它作用在哪个网络、是否需要解析名字，然后加进分类表——运行时会 fail closed，测试会告诉你还没分类。放宽任何一条 eligibility 条件之前，先问“这个 option 会不会作用到这个 flow”，而不是“这个配置看起来空不空”。
+
 ## 探测、伪装与部署边界
 
 未认证或错误认证连接应避免直接暴露明显的代理认证响应，并在部署支持时进入合理的 masquerade/fallback。**不声称消除协议指纹**：QUIC、HTTP/3 SETTINGS、H3_DATAGRAM 与 Extended CONNECT 等仍可被观察。
@@ -144,5 +184,8 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 - 长时间 VPS 资源稳定性和生产并发上限；局部资源测试与默认流限制不构成真实部署容量结论。
 - Cronet 单/多 engine A/B、receive-window 系统扫描，以及 BBR/BBR2/CUBIC/Reno 在受控 RTT、随机丢包和突发丢包下的比较。
 - 生产 VPS 自身公网地址是否已纳入目标 ACL，需要部署环境中的真实地址与规则验证；仓库拓扑夹具不能证明现场状态。见 [Native Naive](naive.md) 的 Target ACL 章节。
+- Direct Offload 的 L1 命中率是在**模型流量配比**上加权的，per-shape 判定是精确的，加权总数只与那个假设同好坏；仓库内没有 TUN 客户端夹具，生产拓扑是服务端形态，L1 增益属于 TUN 客户端部署。
+- Direct Offload 的 L2/L3 对比跑在 loopback 上，不证明真实网卡、真实 RTT 或丢包下的差异。
+- native 路径上的 tracker accounting 尚未实现，因此带 dashboard/API 的配置目前拿不到 L1 收益。
 
 这些条目描述当前仓库证据的边界，不预断真实部署一定存在缺陷；有可靠测试或现场记录后应更新本节。
