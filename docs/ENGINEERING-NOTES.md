@@ -86,6 +86,42 @@ Cronet read/write 由异步 native callback 完成。Go 缓冲区在回调结束
 
 Naive H3 服务器不主动启用 0-RTT；未覆盖的 stream limit 和 path manager 行为遵循底层库，除非显式配置。当前设置见 [`inbound_init.go`](../protocol/naive/quic/inbound_init.go)。客户端提供默认、BBR、BBR2、CUBIC、Reno 等拥塞控制选择；可选项不等于统一最优值。Cronet 单/多 engine、receive window、拥塞控制和迁移策略都需要受控的真实网络 A/B，才可据此改默认。现有实验脚本分别为 [`bench-naive-cronet-engine.sh`](../scripts/ci/bench-naive-cronet-engine.sh) 与 [`bench-naive-receive-window.sh`](../scripts/ci/bench-naive-receive-window.sh)。
 
+## 上传流量调度（Traffic Scheduler）
+
+### 架构边界
+
+| 目录 | 职责 |
+| --- | --- |
+| [`common/trafficsched`](../common/trafficsched) | 跨 flow 的整形与 lane 仲裁、写入侧 gate、rate source 接缝。整形的**唯一**决策点。 |
+| [`common/trafficclass`](../common/trafficclass) | per-flow 的 traffic class 取值与 tag 匹配。叶子包，不认识任何协议。 |
+| [`option/traffic_scheduler.go`](../option/traffic_scheduler.go) | `route.traffic_scheduler.upload_rate` 的解析与校验；`ByteRate` 的单位与溢出处理。 |
+| [`route/conn.go`](../route/conn.go) | 决定哪些 flow 受管（`uploadStreamGate`）、装 gate、`SetUploadRate` 是配置进入 scheduler 的唯一入口。 |
+
+协议层不知道 AI，也不知道 traffic class，这条边界不要打破。
+
+### 正确性契约与证据范围
+
+- **只改变“谁先开始写”的调度没有 receiver-visible 收益。** admission ordering 与 service slot 在共享 FIFO 链路 + per-flow acceptance window 的台架上与“什么都不做”在噪声内不可区分（p99 145–155 ms vs baseline 146 ms）。被 HIGH 消息延迟的字节已经在 kernel send buffer 里，userspace 够不到。这两种模式保留为**可运行的反例**，不要删除。
+- **只有整形（pacing）有物理效果，且必须持续生效。** 按 HIGH 活动 arm 的设计在冷启动场景下保护为零：bulk 独占 1 秒后第一条 HIGH 请求 p50 128 ms，与无 gate 的 127 ms 相同；持续整形为 2 ms。台架证据见 `common/trafficsched/contention_test.go` 的三个 experiment。
+- **整形必须覆盖 HIGH lane。** 只整形 NORMAL lane 时，做 bulk 的 HIGH flow 仍能填满 window：小 HIGH probe p99 73 ms、队列均值 128 KiB，与 baseline 相同；aggregate 整形为 8 ms / 15 KiB。发布模式是 `ModePaced`（aggregate）。
+- **oversized write 必须计入预算。** 目前是两级记账：共享 bucket 只付 `min(size, burst)` 且不为负（因此任何 flow 无法绑架其他 flow），flow 自己付 `size/rate` 的时间。只按前者收费就是免费逃逸，只按后者收费会让一次巨大写入停住所有其他 flow。
+- **admitted rate 不得超过配置值。** 用真实 copy 引擎 + 真实 socket 的精度测试（`TestAdmittedRateMatchesTheConfiguredRate`）覆盖 16 KiB 与 64 KiB 写：实测 ≤ 配置值 +2%，且 ≥ 90%。
+- **不发布自动 rate controller。** prototype 在 `adaptive_research_test.go`，不在构建中，`TestAdaptiveControllerIsNotInProduction` 会在它进入生产文件时失败。理由是测量而非观点：blocked-write 时长衡量的是竞争造成的等待，不是路径速率（同一条 2.00 MB/s 链路，1 条流报 1.29 MB/s、4 条流报 0.35 MB/s，两次都很紧），基于它的 AIMD 收敛到容量上，而容量处正是队列被建起来的地方（p95 62 ms vs 固定 85% 的 8 ms）。
+- **配置语义**：`route.traffic_scheduler.upload_rate` 表示 managed upload 的**实际 shaping rate**，不是 ISP 标称带宽，不是只在竞争时生效的上限，不隐藏任何系数。缺省/0 = inert。使用该键的配置官方 sing-box 不可加载，见 [FORK-DIFF](FORK-DIFF.md)。
+
+### 已测量的取舍
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| uncontended 写入税 | ~9 ns/write，0 allocs | 裸 writer ~2 ns；其中约 2.5 ns 是 wrapper，其余是两次 atomic load（rate source 可热替换的代价） |
+| UDP batch | 未退化 | batch-64 两侧 66 allocs 一致；gate 必须自己转发 `CreatePacketBatchWriter`，否则会静默降级为 per-packet syscall |
+| headroom | 链上求和时 2× | `N.CalculateFrontHeadroom` 不检查 `WriterReplaceable` 而求和；gate 必须报真实值以保证 `WriteOwnedBuffer` 安全，代价是 buffer sizing 翻倍。已用测试钉住 |
+| MTU | 上游无 MTU 时**不实现**该接口 | 报 `math.MaxInt` 会让 `ReadWaitOptions.NewBuffer()` 溢出并塌缩读 buffer |
+
+### 维护原则
+
+调参只能由 receiver-visible 延迟与 bulk 吞吐说话，不能由 grant 延迟或队列深度说话——两者都可以很好看而 delivery 完全没有变化。任何新的调度模型先加进 `contention_test.go` 当一行，用同一台架与 baseline 对比。
+
 ## 探测、伪装与部署边界
 
 未认证或错误认证连接应避免直接暴露明显的代理认证响应，并在部署支持时进入合理的 masquerade/fallback。**不声称消除协议指纹**：QUIC、HTTP/3 SETTINGS、H3_DATAGRAM 与 Extended CONNECT 等仍可被观察。
