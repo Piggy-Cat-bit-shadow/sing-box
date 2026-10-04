@@ -58,6 +58,37 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 submodule_sha="$(git -C clients/apple rev-parse HEAD)"
+  submodule_sha="$(git -C clients/apple rev-parse HEAD)"
+
+  # ---------------------------------------------------------------------------
+  # Restore what this run changes
+  # ---------------------------------------------------------------------------
+  #
+  # prepare-apple-client.sh applies overlays that MODIFY the clients/apple submodule in place. That
+  # is by design, but it left the submodule dirty, so the next run of this script failed its own
+  # clean-tree gate and the operator had to clean up by hand after every release.
+  #
+  # The gate above has already established that the tree was clean, so anything dirty under the
+  # submodule when this script exits was produced by this script. Restoring it cannot discard user
+  # work - and restoring only the submodule, rather than running `git reset --hard` on the parent,
+  # keeps the blast radius to the one directory the overlays touch.
+  #
+  # `checkout -- .` rather than `reset --hard`: every overlay write targets a file it read first, so
+  # the changes are tracked modifications and there is nothing untracked to sweep. Both were verified
+  # against a real overlay run.
+  #
+  # Installed with `trap ... EXIT` so success, failure and Ctrl-C all take the same path.
+  restore_submodule() {
+    local status
+    status=$?
+    if [ -n "$(git -C clients/apple status --porcelain 2>/dev/null)" ]; then
+      git -C clients/apple checkout -- . 2>/dev/null || true
+      echo
+      echo "restored clients/apple to the pinned revision (overlay changes from this run discarded)"
+    fi
+    return $status
+  }
+  trap restore_submodule EXIT
 # shellcheck disable=SC1091
 eval "$(./scripts/ci/version.sh)"
 echo "  commit:    $local_sha"
@@ -145,6 +176,18 @@ step "sign and upload"
 echo "  Libbox is installed and verified; the pipeline below will not rebuild it."
 echo
 
+# The build number is derived HERE, once, for two reasons.
+#
+# It is what keeps iOS and macOS on the same number: release-apple.sh only derives one when the
+# caller left it unset, and both builders then read the same exported value.
+#
+# It is also what lets the summary below report the real number. When release-apple.sh generated it
+# in its own process, the value never reached this shell, so the summary printed a placeholder for
+# every default run. An explicit APPLE_BUILD_NUMBER from the caller still wins.
+if [ -z "${APPLE_BUILD_NUMBER:-}" ]; then
+  export APPLE_BUILD_NUMBER="$(date -u +%Y%m%d%H%M)"
+fi
+
 # APPLE_USE_PREBUILT_LIBBOX is what keeps the local run from compiling a fourth copy. release-apple.sh
 # owns signing, the overlays, archiving, export and upload; nothing about that path is duplicated here.
 APPLE_USE_PREBUILT_LIBBOX=1 ./scripts/release-apple.sh testflight
@@ -167,7 +210,7 @@ GitHub:
 Local:
   Libbox build:        SKIPPED (reused the verified artifact)
   signing style:       ${APPLE_SIGNING_STYLE:-automatic}
-  build number:        ${APPLE_BUILD_NUMBER:-<per-run>}
+  build number:        ${APPLE_BUILD_NUMBER}
 
 RESULT:
   TESTFLIGHT UPLOAD:   PASS (iOS + macOS)

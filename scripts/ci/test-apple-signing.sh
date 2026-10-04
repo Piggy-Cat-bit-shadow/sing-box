@@ -366,8 +366,18 @@ check "the template is tracked" \
   bash -c 'git ls-files --error-unmatch .env.apple.local.example >/dev/null 2>&1 || test -f .env.apple.local.example'
 check "release-apple.sh loads the local file" \
   grep -q '.env.apple.local' scripts/release-apple.sh
-check "an exported value takes precedence over the file" \
-  grep -q 'local_base_before' scripts/release-apple.sh
+# Asserted as a property rather than by naming the old variable. The previous version grepped for
+# `local_base_before`, which pinned the IMPLEMENTATION: it passed while only two of the file's
+# variables were protected, and it broke when that was replaced by a generic restore.
+#
+# The mechanism is exercised end to end by test-apple-beta-publish.sh, which loads a synthetic
+# .env.apple.local covering every supported variable and checks both directions.
+check "the loader captures the file's variables before sourcing" \
+  grep -q 'local -a _env_names' scripts/release-apple.sh
+check "the loader restores what the caller had exported" \
+  grep -q 'export "${_env_names\[\$_i\]}=\${_env_saved\[\$_i\]}"' scripts/release-apple.sh
+check "the loader derives the variable set from the file" \
+  grep -q 'sed -nE' scripts/release-apple.sh
 check "the loader refuses a non-ignored file" \
   grep -q 'refusing to read' scripts/release-apple.sh
 check "the local file is not tracked" \

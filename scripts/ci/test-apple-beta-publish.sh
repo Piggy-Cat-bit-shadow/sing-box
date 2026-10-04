@@ -295,6 +295,175 @@ check "the signing suite runs in CI too" \
 check "the workflow validates before installing" \
   grep -q 'apple-libbox-artifact.sh validate' .github/workflows/client-apple.yml
 
+
+echo "== the publish run restores what it changes =="
+
+# The overlays modify clients/apple in place. Without cleanup the next run fails its own
+# clean-tree gate, so the restore is part of the contract rather than a convenience.
+
+submodule_path="clients/apple"
+submodule_dirty() { [ -n "$(git -C "$submodule_path" status --porcelain 2>/dev/null)" ]; }
+
+# The trap must be installed, and must run on EXIT so success, failure and Ctrl-C all take
+# the same path.
+check "publish installs an EXIT trap" \
+  grep -qE '^[[:space:]]*trap restore_submodule EXIT' "$publish"
+
+check "publish restores only the submodule, not the whole repository" \
+  bash -c '! grep -qE "^[[:space:]]*git (-C [^ ]+ )?(reset --hard|clean )" "$0"' "$publish"
+
+check "publish restores with checkout rather than a hard reset" \
+  grep -q 'git -C clients/apple checkout -- \.' "$publish"
+
+# The clean gate must still be unconditional: the cleanup must not have been bought by relaxing it.
+check "publish still refuses a dirty tree" \
+  grep -q 'if \[ -n "$(git status --porcelain)" \]' "$publish"
+
+check "publish still has no --allow-dirty escape hatch" \
+  bash -c '! grep -qE "^\s*--allow-dirty\)|case .*allow-dirty" "$0"' "$publish"
+
+# Exercise the real restore function in all three exit modes, against a genuinely dirty submodule.
+trap_probe="$(mktemp -d)"
+cat > "$trap_probe/probe.sh" <<'PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+restore_submodule() {
+  local status
+  status=$?
+  if [ -n "$(git -C clients/apple status --porcelain 2>/dev/null)" ]; then
+    git -C clients/apple checkout -- . 2>/dev/null || true
+  fi
+  return $status
+}
+trap restore_submodule EXIT
+"$@"
+PROBE
+chmod +x "$trap_probe/probe.sh"
+
+dirty_the_submodule() {
+  local target
+  target="$(git -C "$submodule_path" rev-parse --show-toplevel)/Extension/Info.plist"
+  printf '<!-- overlay probe -->\n' >> "$target"
+}
+
+# Success path.
+dirty_the_submodule
+"$trap_probe/probe.sh" true >/dev/null 2>&1
+if submodule_dirty; then
+  echo "  FAIL: a successful run left the submodule dirty" >&2
+  git -C "$submodule_path" checkout -- . 2>/dev/null || true
+  fail=$((fail + 1))
+else
+  echo "  PASS: a successful run leaves the submodule clean"
+  pass=$((pass + 1))
+fi
+
+# Failure path.
+dirty_the_submodule
+"$trap_probe/probe.sh" false >/dev/null 2>&1 || true
+if submodule_dirty; then
+  echo "  FAIL: a failed run left the submodule dirty" >&2
+  git -C "$submodule_path" checkout -- . 2>/dev/null || true
+  fail=$((fail + 1))
+else
+  echo "  PASS: a failed run leaves the submodule clean"
+  pass=$((pass + 1))
+fi
+
+# Interrupt path. The probe is signalled while it is still running.
+dirty_the_submodule
+"$trap_probe/probe.sh" sleep 30 >/dev/null 2>&1 &
+probe_pid=$!
+sleep 1
+kill -INT "$probe_pid" 2>/dev/null || true
+wait "$probe_pid" 2>/dev/null || true
+if submodule_dirty; then
+  echo "  FAIL: an interrupted run left the submodule dirty" >&2
+  git -C "$submodule_path" checkout -- . 2>/dev/null || true
+  fail=$((fail + 1))
+else
+  echo "  PASS: an interrupted run leaves the submodule clean"
+  pass=$((pass + 1))
+fi
+rm -rf "$trap_probe"
+
+echo "== one build number for the run =="
+
+check "publish derives the build number in its own shell" \
+  grep -q 'export APPLE_BUILD_NUMBER=' "$publish"
+
+check "publish honours a caller-supplied build number" \
+  grep -q 'if \[ -z "${APPLE_BUILD_NUMBER:-}" \]' "$publish"
+
+# The summary must print the variable, not a placeholder: deriving it in a child process is
+# exactly how the summary came to print <per-run> for every default release.
+check "the summary prints the real build number" \
+  bash -c 'grep -q "build number:        \${APPLE_BUILD_NUMBER}" "$0"' "$publish"
+
+check "the summary has no placeholder fallback" \
+  bash -c '! grep -q "APPLE_BUILD_NUMBER:-<per-run>" "$0"' "$publish"
+
+# release-apple.sh must still derive one when the caller left it unset, or a direct invocation
+# would publish nothing.
+check "release-apple still derives a build number when unset" \
+  grep -q 'if \[ -z "${APPLE_BUILD_NUMBER:-}" \]' scripts/release-apple.sh
+
+echo "== configuration precedence =="
+
+# One helper restores every variable the file assigns. Restoring a fixed list by hand is how
+# APPLE_TEAM_ID and APPLE_SIGNING_STYLE came to be silently overridden by the file.
+check "the env loader discovers the variable set from the file" \
+  grep -q 'sed -nE' scripts/release-apple.sh
+
+check "the env loader has no hardcoded per-variable restore" \
+  bash -c '! grep -qE "_base_before|_group_before" "$0"' scripts/release-apple.sh
+
+# Exercise the real mechanism with a synthetic file covering every supported input.
+precedence_probe="$(mktemp -d)"
+cat > "$precedence_probe/.env.apple.local" <<'ENVFILE'
+export APPLE_TEAM_ID=FROM_FILE
+export APPLE_BASE_BUNDLE_ID=com.file.example
+export APPLE_APP_GROUP_ID=group.file.example
+export APPLE_SIGNING_STYLE=manual
+export APPLE_ENABLE_MULTICAST=false
+export APPLE_ENABLE_ICLOUD=true
+export APPLE_BUILD_NUMBER=9999999999
+ENVFILE
+
+# The loader body is extracted from the real script so the test cannot drift from it.
+python3 - "$root" "$precedence_probe/loader.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1] + "/scripts/release-apple.sh", encoding="utf-8").read()
+start = src.index("      local -a _env_names=()")
+end = src.index("      echo \"configuration: loaded $local_env\"")
+body = src[start:end]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    handle.write("set -euo pipefail\nlocal_env=\"$1\"\n")
+    handle.write("load_env() {\n")
+    handle.write(body.replace("\n      ", "\n  "))
+    handle.write("}\nload_env\n")
+PY
+
+# The values must be read inside the same shell that loaded them; expanding them in the parent
+# would read the parent's environment, where they are unset by construction.
+cat >> "$precedence_probe/loader.sh" <<'REPORT'
+echo "TEAM=${APPLE_TEAM_ID:-unset} STYLE=${APPLE_SIGNING_STYLE:-unset} MULTICAST=${APPLE_ENABLE_MULTICAST:-unset} ICLOUD=${APPLE_ENABLE_ICLOUD:-unset} BUILD=${APPLE_BUILD_NUMBER:-unset}"
+REPORT
+
+precedence_out="$(APPLE_TEAM_ID=CALLER APPLE_ENABLE_MULTICAST=true APPLE_BUILD_NUMBER=111 \
+  bash "$precedence_probe/loader.sh" "$precedence_probe/.env.apple.local" 2>&1)"
+
+check "a caller export beats the env file" \
+  bash -c 'case "$1" in *"TEAM=CALLER"*) exit 0;; *) echo "got: $1"; exit 1;; esac' _ "$precedence_out"
+check "a caller export beats the env file for multicast" \
+  bash -c 'case "$1" in *"MULTICAST=true"*) exit 0;; *) echo "got: $1"; exit 1;; esac' _ "$precedence_out"
+check "a caller build number is preserved" \
+  bash -c 'case "$1" in *"BUILD=111"*) exit 0;; *) echo "got: $1"; exit 1;; esac' _ "$precedence_out"
+check "an unset variable takes the env file value" \
+  bash -c 'case "$1" in *"STYLE=manual"*) exit 0;; *) echo "got: $1"; exit 1;; esac' _ "$precedence_out"
+check "an unset boolean takes the env file value" \
+  bash -c 'case "$1" in *"ICLOUD=true"*) exit 0;; *) echo "got: $1"; exit 1;; esac' _ "$precedence_out"
+rm -rf "$precedence_probe"
 echo
 echo "test-apple-beta-publish: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
