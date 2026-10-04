@@ -5,6 +5,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/pause"
 
 	"github.com/stretchr/testify/require"
 )
@@ -131,7 +133,7 @@ type loadBalanceFixture struct {
 // newLoadBalanceFixture builds a started group over the given members.
 func newLoadBalanceFixture(t *testing.T, options option.LoadBalanceOutboundOptions, members ...*recordingOutbound) *loadBalanceFixture {
 	t.Helper()
-	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
+	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
 	manager := &loadBalanceManager{members: make(map[string]adapter.Outbound, len(members))}
 	tags := make([]string, 0, len(members))
 	for _, member := range members {
@@ -394,7 +396,7 @@ func TestLoadBalanceHealthFiltersCandidates(t *testing.T) {
 	members := fourMembers()
 	fixture := newLoadBalanceFixture(t, option.LoadBalanceOutboundOptions{
 		Strategy: "round_robin",
-		URL:      "https://probe.example/generate_204",
+		URL:      "http://127.0.0.1:1/generate_204",
 	}, members...)
 
 	// Two members measured successfully, two with no evidence at all.
@@ -753,4 +755,63 @@ func TestLoadBalanceStartAfterCloseRefuses(t *testing.T) {
 
 	require.NoError(t, fixture.group.Close())
 	require.Error(t, fixture.group.Start(adapter.StartStateStart, &adapter.Scope{}))
+}
+
+// TestLoadBalanceRepeatedLifecycleDoesNotLeakGoroutines guards the one resource this group
+// owns: the health checker it composes.
+//
+// # Two oracles, because one of them is the real contract
+//
+// The contract is that the group closes the checker it owns, and that is asserted directly on
+// the engine: after Close, the engine must report itself closed. A group that dropped the
+// engine instead of closing it would leave a ticker and a context behind for every reload, and
+// the direct assertion notices that without depending on how quickly a goroutine is scheduled.
+//
+// The goroutine count is kept as the second oracle because it measures the consequence rather
+// than the call - and it is deliberately tolerant, because a measurement round in flight is a
+// goroutine too.
+//
+// The groups here are started through the STARTED stage AND touched, because the checker's
+// background work has two halves that start at different times: the first round starts with the
+// group, and the periodic ticker starts when the group is first used. A leak test that only
+// started the group would pass on an implementation that never stops the ticker.
+func TestLoadBalanceRepeatedLifecycleDoesNotLeakGoroutines(t *testing.T) {
+	members := fourMembers()
+	options := option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin",
+		URL:      "http://127.0.0.1:1/generate_204",
+	}
+
+	// Warm up so one-off runtime goroutines are already running.
+	warm := newLoadBalanceFixture(t, options, members...)
+	require.NoError(t, warm.group.Start(adapter.StartStateStarted, &adapter.Scope{}))
+	warm.group.Touch()
+	require.NoError(t, warm.group.Close())
+
+	runtime.GC()
+	time.Sleep(50 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 25; i++ {
+		options.Outbounds = []string{"A", "B", "C", "D"}
+		created, err := NewLoadBalance(warm.ctx, nil, log.NewNOPFactory().NewLogger("loadbalance"), "lb", options)
+		require.NoError(t, err)
+		group := created.(*LoadBalance)
+		require.NoError(t, group.Start(adapter.StartStateStart, &adapter.Scope{}))
+		engine := group.health.Load()
+		require.NotNil(t, engine, "a group with a URL must own a health checker")
+		require.NoError(t, group.Start(adapter.StartStateStarted, &adapter.Scope{}))
+		// Touch, so the periodic ticker exists before the close has to stop it.
+		group.Touch()
+		require.NotNil(t, group.SelectForFlow(&adapter.InboundContext{Domain: "example.com"}, N.NetworkTCP, true))
+
+		require.NoError(t, group.Close())
+		require.True(t, engine.closed,
+			"cycle %d: the group must close the health checker it owns, not merely drop it", i+1)
+	}
+
+	time.Sleep(150 * time.Millisecond)
+	after := runtime.NumGoroutine()
+	require.LessOrEqual(t, after, before+5,
+		"25 start/close cycles must not accumulate goroutines; before=%d after=%d", before, after)
 }

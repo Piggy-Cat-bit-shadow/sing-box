@@ -86,12 +86,15 @@ type LoadBalance struct {
 
 	affinity *loadBalanceAffinity
 
-	// members is the configured member list in configuration order, resolved once at
-	// start. It is published atomically and never mutated afterwards, so a selection
-	// reads it without a lock. It is read in configuration order for round-robin and as
-	// the bucket space for hashing, which must not depend on health: a hash whose bucket
-	// count moved with liveness would re-map every flow whenever any member failed.
-	members atomic.Pointer[[]adapter.Outbound]
+	// published is the configured member list in configuration order, with the union of
+	// their networks, resolved once at start and never mutated afterwards. It is one
+	// atomic pointer rather than two fields so a reader cannot observe the member list of
+	// one generation with the networks of another, and so Network() - which parent groups
+	// call per candidate per flow - does not rebuild the union on every call. The list is
+	// read in configuration order for round-robin and as the bucket space for hashing,
+	// which must not depend on health: a hash whose bucket count moved with liveness would
+	// re-map every flow whenever any member failed.
+	published atomic.Pointer[loadBalanceSnapshot]
 
 	// health measures the members when a URL is configured. It is the urltest engine,
 	// used only as a measurement source: its own Select is never called, because
@@ -100,13 +103,6 @@ type LoadBalance struct {
 	// single node.
 	health      atomic.Pointer[URLTestGroup]
 	healthScope urltest.MeasurementScope
-
-	// networks is the union of the member networks, computed at start. A parent group
-	// filters candidates by Network(), so advertising the union is what lets a
-	// loadbalance group holding both a TCP-only and a TCP+UDP member be considered for
-	// a UDP flow at all; the per-flow check inside selection is what then refuses to
-	// hand that flow to the TCP-only member.
-	networks []string
 
 	interruptGroup *interrupt.Group
 	lifecycle      sync.Mutex
@@ -175,21 +171,27 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 	return loadBalance, nil
 }
 
+// loadBalanceSnapshot is the group's resolved state: the members, and the union of the
+// networks they can carry.
+//
+// The union matters to parent groups, which filter a candidate by Network() before asking it
+// for anything: advertising it is what lets a group holding both a TCP-only and a TCP+UDP
+// member be considered for a UDP flow at all, and the per-flow check inside selection is what
+// then refuses to hand that flow to the TCP-only member.
+type loadBalanceSnapshot struct {
+	members  []adapter.Outbound
+	networks []string
+}
+
 // Network reports the union of the member networks.
 func (g *LoadBalance) Network() []string {
-	members := g.snapshot()
-	if len(members) == 0 {
+	published := g.published.Load()
+	if published == nil {
+		// Not started, or closed. Advertising both is the permissive answer a caller can
+		// still resolve against; a selection will refuse what no member can carry.
 		return []string{N.NetworkTCP, N.NetworkUDP}
 	}
-	networks := make([]string, 0, 2)
-	for _, member := range members {
-		for _, network := range member.Network() {
-			if !common.Contains(networks, network) {
-				networks = append(networks, network)
-			}
-		}
-	}
-	return networks
+	return published.networks
 }
 
 func (g *LoadBalance) All() []string {
@@ -428,11 +430,11 @@ func (g *LoadBalance) CommittedSelections() uint64 {
 }
 
 func (g *LoadBalance) snapshot() []adapter.Outbound {
-	members := g.members.Load()
-	if members == nil {
+	published := g.published.Load()
+	if published == nil {
 		return nil
 	}
-	return *members
+	return published.members
 }
 
 // Touch marks the group as in use, which is what keeps a lazy health checker checking.
@@ -517,8 +519,7 @@ func (g *LoadBalance) Start(stage adapter.StartStage, scope *adapter.Scope) erro
 			}
 			return os.ErrClosed
 		}
-		g.members.Store(&members)
-		g.networks = networks
+		g.published.Store(&loadBalanceSnapshot{members: members, networks: networks})
 		if health != nil {
 			g.health.Store(health)
 			// The scope owns the teardown, registered against the group this Start
@@ -542,7 +543,7 @@ func (g *LoadBalance) Close() error {
 	}
 	g.closed = true
 	health := g.health.Swap(nil)
-	g.members.Store(nil)
+	g.published.Store(nil)
 	g.lifecycle.Unlock()
 	// Close outside the lock: it stops a ticker and cancels background work, and holding
 	// the lifecycle lock across other components' teardown is how a deadlock starts.
@@ -554,11 +555,12 @@ func (g *LoadBalance) Close() error {
 
 // AttachConnection registers a connection with the group's interrupt group.
 //
-// The flag is false because a balancing group has no "selection changed" event to
-// propagate: a connection is attached to the member it was given, and nothing about the
-// group can move it afterwards.
+// The flag marks the connection as external, and it is true for the same reason it is true in
+// the selector: every connection attached here carries a flow that arrived from outside this
+// process. A balancing group has no "selection changed" event to propagate - a connection
+// belongs to the member it was given - which is why nothing here ever interrupts.
 func (g *LoadBalance) AttachConnection(closer io.Closer) func() {
-	return g.interruptGroup.Add(closer, false)
+	return g.interruptGroup.Add(closer, true)
 }
 
 // DialContext dials the member this flow is given.

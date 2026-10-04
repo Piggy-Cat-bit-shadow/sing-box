@@ -139,6 +139,23 @@ run_case "H class read from the group only" "$TRAFFIC" \
 	}" \
     route 'TestLoadBalanceRouteTrafficClassFollowsTheResolvedChain'
 
+# I. the group drops the health checker instead of closing it
+#
+# The group owns exactly one background resource - the measurement engine it composes - so a
+# close that forgets it leaves a ticker, a context and a goroutine behind for every reload.
+run_case "I close drops the checker" "$GROUP" \
+    "	if health != nil {
+		return health.Close()
+	}
+	return nil
+}" \
+    "	if health != nil {
+		return nil // MUTATION: the engine is dropped, never stopped
+	}
+	return nil
+}" \
+    protocol/group 'TestLoadBalanceRepeatedLifecycleDoesNotLeakGoroutines'
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "mutation sweep: PASS — every named test noticed its mutation"
