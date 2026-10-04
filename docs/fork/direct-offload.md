@@ -157,21 +157,35 @@ L0, measured where it lives:
 
 ### Cost
 
-Per flow and per byte, from `route/direct_offload_bench_test.go`:
+From `route/direct_offload_bench_test.go`, on an Apple M1:
 
 | | Cost |
 | --- | --- |
-| Decision (all router conditions + profile) | a few ns, **0 allocs** |
-| L1 per flow | the decision, and nothing else |
-| L2 / L3 per byte | a copy loop over real sockets |
+| Decision, all conditions pass (L1's per-flow cost) | 14–41 ns, **0 allocs** |
+| Decision, refused by one of the cheap conditions | ~5–11 ns, 0 allocs |
+| The outbound profile alone | 5.3 ns, 0 allocs |
+| **Flow setup, bypassed** | **119 ns, 0 allocs** |
+| **Flow setup, userspace** | **1461 ns, 2856 B, 26 allocs** |
+| TCP copy, kernel socket pair (L2) | 4742 / 5001 MB/s for 4 / 32 MiB |
+| TCP copy, userspace buffers (L3) | 3952 / 5567 MB/s for 4 / 32 MiB |
+| UDP per datagram (1400 B) | ~66 ns, 1 alloc |
+
+Two things follow.
+
+**A bypass saves about 1.3 µs and 26 allocations per flow, and every byte thereafter** — the
+difference between the two setup rows is what L1 avoids creating, and the per-byte row is what it
+avoids paying.
+
+**L2 and L3 are indistinguishable here, and that is not a defect in the benchmark.** Loopback is the
+friendliest possible case for a userspace copy and the least favourable for a zero-copy one: nothing
+crosses a bus either way. Each benchmark asserts which of the two paths it is measuring — the kernel
+one hides nothing and the userspace one hides `ReadFrom` — so they cannot silently converge, and the
+honest reading is that **L1's per-byte cost is zero and both userspace layers pay a copy**, not that
+one of them is the faster copy. The distance that matters on a real NIC is the syscall count and the
+bus traffic, and this rig does not reproduce it.
 
 The decision asserts 0 allocs/op as a **test**, not only as a benchmark, so a regression fails the
 suite instead of waiting for someone to read a number.
-
-Loopback is the friendliest case for a userspace copy and the least favourable for a zero-copy one:
-nothing crosses a bus either way. The measured L2-vs-L3 difference on loopback is therefore not a
-statement about a real NIC, and the honest summary of these benchmarks is that **L1's per-byte cost is
-zero and the two userspace layers both pay a copy** — not that one of them is the faster copy.
 
 ---
 
