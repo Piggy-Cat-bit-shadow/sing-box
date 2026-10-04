@@ -183,6 +183,15 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 
 先确立正确性与回归测试，再用 benchmark/profile 找瓶颈，最后决定优化。实验结论写清 **KEEP、REJECT、NO CHANGE** 及原因；“理论上应更快”不足以改变默认值。所有权与可证明的生命周期优先于名义上的 zero-copy。局部 `ns/op`、`allocs/op` 改善不等于 WAN 吞吐、VPS 长期内存、高 RTT 或丢包性能。
 
+## 发布边界与验证缺口（Round 4）
+
+- **本轮最重要的发现是环境性的而非代码性的**：开发机是 macOS 非特权用户（`sudo` 需要密码），没有 Linux、没有可配置地址/路由的 TUN、没有签名的 NetworkExtension。所以 **L0 route exclusion、L2 splice、flow table、真机 DNS hijack、真机 FakeIP、网络切换这几项没有任何执行证据**，只有代码论证。完整程序见 [real-tun-validation.md](fork/real-tun-validation.md)，证据状态与 blocker 见 [RELEASE-CERTIFICATE.md](RELEASE-CERTIFICATE.md)。
+- **TCP splice 目前无法被观测**：`ConnectionManager.SpliceDiagnostics()` 只覆盖 UDP（所有 reason 都是 `UDPNatConn`/packet 相关），TCP 路径的 `spliceConnection` 只返回 bool、不记录任何结果。所以"这条 direct TCP flow 到底有没有 splice"在运行中问不出来，只能从吞吐反推——这正是本仓库不接受的推断方式。补一套 per-flow（不是 per-packet）计数器是跑真机 harness 之前的**前置任务**，reason 至少要有 `source-not-GoConn`、`target-not-splice-target`、`reader-writer-mismatch`、`splice-rejected`、`skipped-for-tls-rewrite`。
+- **CI 过去不随 push 运行**：四个 workflow 全是 `workflow_dispatch`。Round 2/3 的十几个 commit 因此完全未被自动验证。新增 `verify.yml`（push to `testing` + PR）只跑上游假设 tripwire、本 fork 的构建矩阵与 race；产物 workflow 仍保持手动。上游漂移现在会明显变红。
+- **新增的上游 tripwire**：`RuleActionRouteOptions` 的 14 个字段现在被**行为 + reflection 双重覆盖**（`route/route_options_completeness_test.go`）：upstream 加字段而 fork 没有 apply 到 metadata，正是"静默失效"的典型形状——fast path 会按没有该选项的连接判定，然后 native 路径丢掉运维设置，不报错、不记日志。同一文件里还有一个变异测试证明这个完整性检查**能够失败**。
+- **内存基线（macOS arm64，真实二进制 + SOCKS 入站，无 TUN）**：idle RSS ~43 MiB；100 条连接持有期间每条约 20–40 KB；关闭后 active connection 列表回到 0；两轮之间的增长 1.6 MiB（低于 2 MiB 泄漏阈值）。RSS 在 macOS 上抖动明显，所以有意义的信号是**差值**与连接计数断言，而不是绝对值。TUN 客户端的 stack/路由镜像/flow table 不在这份基线里。
+- **半关闭不是泄漏**：客户端已关闭但对端仍未关闭的连接会继续留在 active list 里，直到 session 结束（或被 timeout 回收）。这是正确行为，harness 的断言只针对**两端都已结束**的情况，并且用了一个"两端都关"的对照实验先确立了这条契约。
+
 ## 当前未闭环的验证边界
 
 - live IPv6 H3 Packet Too Big；现有 ICMPv6 形状测试与 IPv4 live H3 PTB 均不能代替它。
