@@ -72,6 +72,16 @@ jobs:
           GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -tags "$tags,low_memory" ./common/trafficsched/... ./protocol/tun/... ./route/...
           echo "PASS: build matrix"
 
+      - name: loadbalance end to end
+        # The only step that closes a real connection through the group: the box-level tests
+        # decode a configuration, let the manager wire it, route through it and observe which
+        # member served each flow. Scoped with -run so the test module's compile cost is the
+        # only thing this adds to a push.
+        run: |
+          set -euo pipefail
+          cd test
+          go test -tags "$(cat ../release/DEFAULT_BUILD_TAGS)" -count=1 -timeout 10m -run 'TestLoadBalance' .
+
       - name: race on the fork's own data paths
         # Bounded to the packages the fork actually changed. The artifact workflows own the full race
         # suite; this is the subset where a fork-local regression would land first.

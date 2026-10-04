@@ -156,6 +156,31 @@ run_case "I close drops the checker" "$GROUP" \
 }" \
     protocol/group 'TestLoadBalanceRepeatedLifecycleDoesNotLeakGoroutines'
 
+# J. the same rotation defect, seen from a configuration file and a real connection
+#
+# The box-level test lives in its own module, so it is run from there. It is the strongest
+# oracle for this feature: the group is decoded from configuration, wired by the manager, and
+# reached by a real connection, and the members are distinguishable because one of them refuses.
+run_case_box() {
+    cp "$GROUP" "/tmp/mutation-backup-loadbalance.go"
+    python3 - "$GROUP" <<'INNER'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = "\ttarget := slot % uint64(candidates)"
+assert old in text
+open(path, "w").write(text.replace(old, "\ttarget := uint64(0) // MUTATION", 1))
+INNER
+    if (cd test && go test -tags "$TAGS" -count=1 -timeout 300s -run 'TestLoadBalanceRotatesRealConnections' . >/tmp/mutation-box.log 2>&1); then
+        echo "BAD   J box-level rotation - stayed GREEN under the mutation"
+        failures=$((failures + 1))
+    else
+        echo "ok    J box-level rotation - red as expected"
+    fi
+    cp "/tmp/mutation-backup-loadbalance.go" "$GROUP"
+}
+run_case_box
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "mutation sweep: PASS — every named test noticed its mutation"
