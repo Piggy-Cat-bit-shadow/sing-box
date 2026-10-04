@@ -393,10 +393,19 @@ func TestAdaptiveRatePrototype(t *testing.T) {
 		"the learned rate must climb back after the capacity rises rather than staying at the "+
 			"dropped capacity (dropped phase ended at %.2f MB/s, risen phase at %.2f MB/s)",
 		phaseEstimates[1]/1_000_000, phaseEstimates[2]/1_000_000)
-	require.Greater(t, phaseEstimates[1], phaseEstimates[0]*0.4,
-		"and the drop must not be an artefact of the controller collapsing to nothing "+
-			"(%.2f MB/s against %.2f MB/s before the drop)",
-		phaseEstimates[1]/1_000_000, phaseEstimates[0]/1_000_000)
+	// The rise comparison above would pass trivially if the drop had been a collapse to nothing, so
+	// the drop has to be somewhere in the NEIGHBOURHOOD of the capacity that replaced it rather than
+	// merely below the old one.
+	//
+	// The bound is a fraction of that capacity and not of the pre-drop estimate: a controller that
+	// went to a quarter of the new capacity has still followed the capacity, while one at a
+	// thousandth of it has collapsed, and comparing against the pre-drop value conflates the two
+	// with how much the capacity moved. Measured across runs the drop phase sat at 0.68 to 1.80 MB/s
+	// against a 1.00 MB/s capacity, so a quarter of it leaves a factor of about 2.7.
+	require.Greater(t, phaseEstimates[1], float64(phases[1].capacity)*0.25,
+		"the drop must not be an artefact of the controller collapsing to nothing: it should sit "+
+			"near the new capacity, not at zero (%.2f MB/s against a %.2f MB/s capacity)",
+		phaseEstimates[1]/1_000_000, float64(phases[1].capacity)/1_000_000)
 	for index, estimate := range phaseEstimates {
 		require.Positive(t, estimate, "phase %d produced a non-positive rate estimate", index)
 		require.False(t, math.IsNaN(estimate) || math.IsInf(estimate, 0),
