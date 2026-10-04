@@ -69,3 +69,8 @@ config/apple/*.env
 .env.apple.local
 .env.apple.local.*
 !.env.apple.local.example
+
+# `go build ./some/dir` with no -o drops the binary in the working directory. The
+# traffic-scheduler harness is a manual engineering tool built that way, so its default
+# output name is ignored rather than committed by accident.
+/harness
