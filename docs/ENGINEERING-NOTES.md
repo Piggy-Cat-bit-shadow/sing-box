@@ -183,6 +183,17 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 
 先确立正确性与回归测试，再用 benchmark/profile 找瓶颈，最后决定优化。实验结论写清 **KEEP、REJECT、NO CHANGE** 及原因；“理论上应更快”不足以改变默认值。所有权与可证明的生命周期优先于名义上的 zero-copy。局部 `ns/op`、`allocs/op` 改善不等于 WAN 吞吐、VPS 长期内存、高 RTT 或丢包性能。
 
+## 最终 Debug 轮发现的两个 P0（Round 5）
+
+- **v4-mapped 地址从未被规范化，policy 层大面积 fail open。** `::ffff:a.b.c.d` 是 16 字节写的 IPv4 地址，双栈应用访问 `10.0.0.53` 就是 `::ffff:10.0.0.53`，而 sing-tun 的 parser 原样透传。链路上每一个比较都是按 4 字节形式写的，映射形式对它们全部返回 false，而且**全是 fail-open 方向**：
+  - `netip.Addr` 相等 → 配置的 DNS 地址认不出来 → 查询不被劫持，DNS policy（广告过滤、FakeIP、DNS 规则）整条被跳过。实测：UDP/53 到 `10.0.0.53` 返回 `ActionHijackDNS`，同样查询到 `::ffff:10.0.0.53` 返回 **`ActionBypass`**（经真实 parser + 真实 stack 注入真实报文测得）。
+  - `netip.Prefix.Contains` → FakeIP range 不包含它自己的地址 → Round 3 加的 L0 guard 不触发 → 占位地址交给平台路由表。
+  - `netipx.IPSet.Contains` → route set 不包含它自己的地址 → include set 里应当匹配的被 bypass、exclude set 里应当 bypass 的被路由。
+  - 交给 router 的 metadata 也是映射形式 → 所有按 CIDR 匹配的规则静默不匹配。
+  修法是在**边界**规范化（TUN inbound 三个入口 + `adapter.JudgeFlow`，后者覆盖 nfqueue caller），而不是在每个比较处修。四个测试对应四个症状，都在真实 stack 上断言注入报文产生的 verdict；两个 mutation 证明它们会红（去掉 TUN 边界 → 3 个红；去掉 adapter 边界 → 第 4 个红）。
+- **cronet-go 的 replace 只覆盖了仓库根模块，native archive 一直是 upstream 的。** `replace` 只改写一个模块路径，而 cronet-go 是**模块树**：`all` 与每个 `lib/<os>_<arch>` 都是独立模块，嵌套模块不继承根模块的 replace。所以实际构建是"fork 的 Go 代码 + upstream 的 .a"。实测：fork 的 `lib/darwin_arm64/libcronet.a` 是 48110296 字节 / sha256 `f680ff96…`，upstream 的是 48112080 字节 / sha256 `9e2d603e…`，而出货客户端链接的是后者。fork 自己的 `ASYNC_BUFFER_LIFETIME.md` 明确写着它的分析基于"本仓库 vendored 的 C 头与 cgo bridge"——也就是说 Go 侧按 fork 的契约写，native 侧不是 fork 的。唯一一次响亮失败是在 linux/amd64 的 race 构建上（`skipping incompatible ... cannot find -l:libcronet.a`），因为那是本仓库第一次在 Linux 上链接 cronet（server profile 不带 naive，Apple workflow 只建 darwin）。
+  现在 30 个模块路径全部 pin，`go.sum` 带上全部 hash；parity 检查从**列表**改为**前缀规则**，upstream 将来新增平台时会要求 pin 而不是被漏掉。
+
 ## 发布边界与验证缺口（Round 4）
 
 - **本轮最重要的发现是环境性的而非代码性的**：开发机是 macOS 非特权用户（`sudo` 需要密码），没有 Linux、没有可配置地址/路由的 TUN、没有签名的 NetworkExtension。所以 **L0 route exclusion、L2 splice、flow table、真机 DNS hijack、真机 FakeIP、网络切换这几项没有任何执行证据**，只有代码论证。完整程序见 [real-tun-validation.md](fork/real-tun-validation.md)，证据状态与 blocker 见 [RELEASE-CERTIFICATE.md](RELEASE-CERTIFICATE.md)。

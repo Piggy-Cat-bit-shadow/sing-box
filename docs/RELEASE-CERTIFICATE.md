@@ -37,6 +37,8 @@ Everything else below is either verified here or named as outstanding.
 | Traffic class | Per-flow classification, whole-token matching, lane mapping | `common/trafficclass`, `route` |
 | MASQUE, Naive, protocols | Their packages' suites, in the affected-package run and in CI | CI |
 | Config and schema | `route.traffic_scheduler` round-trips, absent stays byte-identical, `docs/schema.json` regenerated | `option` |
+| Pinned dependency tree | Every module path cronet-go publishes is pinned to the fork, and the parity rule is a prefix rule so a new platform cannot be missed | `scripts/ci/check-go-module-integrity.sh` |
+| v4-mapped policy comparisons | Four symptoms (DNS hijack, FakeIP guard, route sets, router metadata) asserted end to end through the real stack, with two mutations proving they bite | `protocol/tun/mapped_address_test.go`, `adapter/judge_flow_mapped_test.go` |
 
 ## Not verified
 
@@ -61,8 +63,10 @@ Everything else below is either verified here or named as outstanding.
    inference from throughput.
 3. **An Apple manual validation run**, because that is the product environment and no CI can stand in
    for it.
-4. **A green push-triggered `Verify` run** on the commit being released. The workflow is new; it has
-   not run yet, and its first run is part of the certificate rather than a formality.
+4. **A green push-triggered `Verify` run** on the commit being released. Its first run failed and the
+   failure was real: it was the first Linux build in this repository to link cronet, and the pin
+   delivered upstream's archive, which does not link. That is fixed; the next run is what confirms the
+   Linux link rather than a rerun until it passes.
 
 ## What is not a blocker
 

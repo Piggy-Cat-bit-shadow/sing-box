@@ -45,6 +45,8 @@ Each row is an assumption, what would break if it stopped holding, and what noti
 | `bufio.CreatePacketBatchWriter` is a direct type assertion | The gate stops forwarding it, and every managed UDP flow degrades to per-packet syscalls with no visible symptom in byte counts | `common/trafficsched` — the packet-batch tests, plus `route`'s real-UDP integration test |
 | `bufio.WriteOwnedBuffer` treats the writer's own MTU as a hard ceiling | A gate that reports `math.MaxInt` makes the copy engine compute a negative buffer size | `common/trafficsched` — the MTU catastrophe test |
 | `InitializeReadWaiter` returning false means "use the waiter, do not copy" | The copy engine's batch path is skipped and the packet fast path silently reverts | `common/trafficsched` — packet batch tests |
+| A `replace` covers one module path, and cronet-go is a tree of modules | The fork's Go bindings are used with upstream's native archives: a pairing nothing built or tested, and on linux/amd64 one that does not link | `scripts/ci/check-go-module-integrity.sh` — the parity rule is a PREFIX rule, so a new `lib/<os>_<arch>` path demands a pin instead of being missed |
+| A v4-mapped address is compared against four-byte policy | DNS hijack, the FakeIP guard, route sets and every rule matching a CIDR set fail open, silently | `protocol/tun` — `mapped_address_test.go` (four symptoms, end to end through the stack) and `adapter` — `judge_flow_mapped_test.go` |
 | `tun.GoConn.Splice` requires socket-backed platform IO, and carries the counters | The spliced path stops counting, or stops being attempted, and L2 becomes L3 without saying so | compiler (the call site in `route/splice.go`), plus the splice diagnostics |
 
 ## The compile-time half
@@ -76,7 +78,12 @@ option.DialerOptions, option.AbstractDialerOptions
 4. **Re-derive, do not adjust.** If a tripwire fails because the capability changed, the documents and
    the cost models built on it are wrong, and relaxing the assertion would leave a claim nobody
    checked. Round 3 wrote this down for `ActionBypass` specifically; it applies to every row above.
-5. **Record the new revision** in the affected documents — `docs/fork/direct-offload.md` and
+5. **Check the module tree, not the module.** A fork pin that names only the repository root leaves
+   every nested module — a published subpackage, a platform binary — resolving to upstream. Run
+   `scripts/ci/check-go-module-integrity.sh` after any dependency bump: its parity rule discovers the
+   replaced paths from the root `go.mod` rather than from a list, so a new one is caught rather than
+   counted.
+6. **Record the new revision** in the affected documents — `docs/fork/direct-offload.md` and
    `docs/fork/native-bypass-trace.md` both name the pinned sing-tun revision in their reasoning.
 
 ## What is deliberately not a tripwire
