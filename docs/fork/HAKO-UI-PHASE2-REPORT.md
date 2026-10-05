@@ -530,6 +530,35 @@ xcrun simctl install booted /tmp/dd-hakoref/Build/Products/Debug-iphonesimulator
 
 ---
 
+## 5a. The completion gate, item by item
+
+The manual's iOS gate is seventeen conditions (§92). Each is listed with the evidence that
+satisfies it, or with what is missing. "Asserted" means a test fails if it stops being true.
+
+| # | gate item | state | evidence |
+| --- | --- | --- | --- |
+| 1 | Root pages unified | done | Home, Tools and More are all `HakoRootScaffold` + `HakoPageSection`; captured |
+| 2 | Root tab visible only on a root | **asserted** | `testPushingADetailHidesTheRootTabAndPoppingRestoresIt`, `testRootTabIsReachableOnEveryRoot` |
+| 3 | No stacked global status bar | done | the shell's accessory slot was removed, not left unused |
+| 4 | Home follows the Hako hierarchy | done | session · profile · outbound mode · shortcuts · traffic · runtime; captured |
+| 5 | Tools/More grouped, every row subtitled | done | captured in both appearances; `testEveryMoreDestinationOpens` |
+| 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page; the settings pages are one `Form` |
+| 7 | Proxies/Activity are complete workspaces | done | pinned strip, search, actions, group header, member grid; captured |
+| 8 | Config centre consistent | partial | chrome, progress, expiry and update-all done; the segmented libraries are not built, deliberately (§6) |
+| 9 | Reports consistent | partial-but-verified-by-build | the lists and all three read views are on `HakoReportScaffold`; nothing has *seen* them, because the fixture records no reports (§6) |
+| 10 | No raw internal keys | **asserted** | `testNoRawInternalKeysOnAnyPage` walks 3 roots + 7 destinations; `testTunnelPageShowsUserTitlesAndNoRawPropertyNames` |
+| 11 | No unrelated brand residue | **asserted** | same sweep, plus `SFM`/`SFMExtension`/`Ghostty Configuration`/`Clash Mode` removed |
+| 12 | No double chevron | **asserted** | `testNavigableRowsDrawExactlyOneIndicator` |
+| 13 | Search safe-area correct | asserted in part | `testProxyWorkspaceSearches`, `testActivityWorkspaceOffersSearch`; the sheet capsule uses `safeAreaInset` |
+| 14 | Every button works | partial | the snapshot suite drives each page through its real controls; no exhaustive audit |
+| 15 | Deep navigation works | **asserted** | `testDeepLinkToLogsBeforeToolsWasEverShown` |
+| 16 | Dynamic Type acceptable | partial | audited on Home/Tools/More at `accessibility-extra-extra-extra-large`, one defect found and fixed; the workspaces and the member grid are not audited |
+| 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
+
+Five of the seventeen are now assertions rather than impressions. The remaining gaps are
+named in §6; the two that most affect the verdict are #16 (an unaudited grid at accessibility
+sizes) and #9 (reports that build and run but have never been looked at).
+
 ## 6. What is open
 
 In the order I would attack it:
@@ -548,11 +577,18 @@ In the order I would attack it:
    Nothing has *seen* them: the fixture records no reports, so the inbox is always empty and
    there is no report to open. Reaching them needs fixture report data, which is a fixture
    change rather than a UI one.
-4. **The configuration centre is half migrated.** Its chrome is the manual's and its card
-   carries progress and expiry, but `ProfilePickerRow` still draws its own card with its own
-   insets rather than the shared row language, and the manual's segmented libraries have no
-   counterpart here: this client keeps no separate node or rule store, and a tab onto nothing
-   would be a page invented to fill a diagram.
+4. **The configuration centre's segmented libraries have no counterpart here.** This client
+   keeps no separate node or rule store, and a tab onto nothing would be a page invented to
+   fill a diagram. Everything else about the centre is done.
+   *Corrected:* an earlier version of this list said the row "still draws its own card with
+   its own insets rather than the shared row language". That was wrong, and checking it was
+   cheaper than acting on it. On iOS the row lives in a system `List` with the platform's own
+   card, which is the same idiom as this client's settings pages and the same idiom the
+   reference uses for its own sheet. What the file does contain is two non-token surfaces -
+   `Color.secondary.opacity(0.2)` with a radius of 16 on the focus platform, and
+   `NSColor.controlBackgroundColor` on the desktop - and both are inside platform branches
+   this round does not touch. The general finding is worth keeping: the token set is not
+   enforced where a legacy platform branch draws its own surface by hand.
 5. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
    fixed (§1.7a item 13). Not yet audited: the workspaces at accessibility sizes, the
    proxied grid's two-column layout when the text grows, and the modal sheets.
