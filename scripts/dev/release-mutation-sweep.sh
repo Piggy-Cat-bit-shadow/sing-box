@@ -87,8 +87,8 @@ run_case "P1 the pre-match asymmetry restored (bypass applies options with no ou
 
 run_case "P2 one field dropped by the shared applier" route/route.go route \
     'TestPreMatchAndFullMatchAgreeOnEveryOption' \
-    '\tif routeOptions.OverridePort > 0 {' \
-    '\tif false && routeOptions.OverridePort > 0 {'
+    $'\tif routeOptions.OverridePort > 0 {' \
+    $'\tif false && routeOptions.OverridePort > 0 {'
 
 run_case "P3 the full match path stops applying options" route/route.go route \
     'TestBothPassesShareTheActionDecision' \
