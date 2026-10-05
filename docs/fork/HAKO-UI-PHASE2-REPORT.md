@@ -200,7 +200,13 @@ workspace restores it.
     hid its menu, so a slow download looked like a row that had stopped responding. The row
     now carries a progress indicator - the manual's configuration card carries progress and
     expiry, and that was the progress half. Update-all is new as well.
-16. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+16. **An unreadable configuration was reported in a blocking alert.** The reference reports
+    it where it stands — its Home shows the page name, a prominent retry button and the reason
+    in the warning colour above the first card — and the cards still draw. Ours raised an
+    alert that hid them, for a condition the user had not caused. The distinction is now
+    explicit and is the reference's: a condition the client *found* is reported in place; a
+    failure the user *caused* by an action still alerts.
+17. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -299,6 +305,11 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
+- **Home's failure state**: an unreadable configuration is reported by the page's own
+  `HakoInlineNotice` - the page name, a prominent retry and the reason in the warning colour
+  above the first card - with every other card still drawn and reachable. A condition the
+  client found is not allowed to take the screen; a failure the user caused by an action
+  still alerts.
 - **The configuration centre**: the manual's modal chrome - close, centred title, and one
   action capsule holding update-all, add and edit - over a list of configurations whose cards
   carry their type, their last-updated time and a progress indicator while a remote one is
@@ -381,11 +392,15 @@ one disclosure indicator per navigable row · the tunnel page's row labels carry
 property name · Logs push/pop, cold launch, deep link, double-push, current-tab, rapid switch
 ```
 
-`HakoSnapshotUITests` — **16/16**, and it is the manual's §77/§78 coverage rather than a
-marketing capture: Home, the outbound mode, Tools, More, More scrolled to its end, Logs,
-On Demand, Tunnel, Core, Client Settings, the report inbox's empty state, the configuration
-centre, Proxies collapsed, Proxies filtered, Activity, the add-configuration sheet and the
-add flow reached from the centre itself.
+`HakoSnapshotUITests` — **17/17**, and it is the manual's §77/§78 coverage rather than a
+marketing capture: Home, Home with an unreadable configuration, the outbound mode, Tools,
+More, More scrolled to its end, Logs, On Demand, Tunnel, Core, Client Settings, the report
+inbox's empty state, the configuration centre, Proxies collapsed, Proxies filtered, Activity,
+the add-configuration sheet and the add flow reached from the centre itself.
+
+It can also start the app in a named fixture state
+(`SCREENSHOT_STATE=profileError`), which is how the failure path above is photographed at
+all: a page that exists only when something has gone wrong is a page nobody has looked at.
 
 Two of its cases assert rather than photograph, because they are the two things the manual
 names that a screenshot cannot establish: `test13MoreScrolledToBottom` asks whether the last
@@ -498,11 +513,6 @@ In the order I would attack it:
    the ones worth acting on are in §1.7a. The snapshot suite still captures dark, because the
    fixture forces it: light captures are made with
    `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`.
-6. **The connect failure state.** The reference surfaces a profile it cannot read as an
-   inline message with a prominent retry in a header row above the first card - its Home
-   shows `VPN 配置无法读取或保存。` with a `重试` button. This client surfaces failures as
-   blocking alerts, which is heavier and stops the page. Not changed in this round: it is a
-   page-level state, not a row.
 7. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
