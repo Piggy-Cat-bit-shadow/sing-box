@@ -42,6 +42,11 @@ type ConnectionManager struct {
 	// packet. See splice_diagnostics.go for why, and for what these numbers can and
 	// cannot tell you.
 	spliceDiagnostics spliceDiagnostics
+	// Stream-level splice diagnostics, with the same discipline: one atomic add per TCP
+	// connection that reaches the decision, never per read or per byte. A separate array
+	// rather than a shared one so each transport's
+	// Attempts == Successes + sum(Reasons) holds on its own.
+	tcpSpliceDiagnostics spliceDiagnostics
 	// scheduler arbitrates the upload write path of every managed flow.
 	//
 	// It lives here rather than on the Router because the connection manager is what creates a
@@ -153,6 +158,9 @@ func (m *ConnectionManager) Close() error {
 	if snapshot := m.SpliceDiagnostics(); snapshot.Attempts > 0 {
 		m.logger.Info(snapshot.SpliceSummary())
 	}
+	if snapshot := m.TCPSpliceDiagnostics(); snapshot.Attempts > 0 {
+		m.logger.Info(snapshot.TCPSpliceSummary())
+	}
 	return nil
 }
 
@@ -227,6 +235,12 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		if spliced {
 			return
 		}
+	} else {
+		// The handover is deliberately not attempted while the fork has to rewrite the
+		// stream, and that is a decision this call site makes rather than a failure inside
+		// spliceConnection. It is recorded here so that every connection that reached the
+		// decision contributes exactly one outcome, whether or not the attempt was made.
+		m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSkippedForTLSRewrite)
 	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)

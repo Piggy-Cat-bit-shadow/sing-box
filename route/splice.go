@@ -50,13 +50,23 @@ func (m *ConnectionManager) spliceClose(ctx context.Context, conn io.Closer, rem
 }
 
 func (m *ConnectionManager) spliceConnection(ctx context.Context, conn net.Conn, remoteConn net.Conn, onClose N.CloseHandlerFunc) (bool, error) {
+	// Every path out of this function records exactly one outcome, and the caller records
+	// the one case in which this function is not called at all. That is what makes
+	// Attempts == Successes + sum(Reasons) hold for the stream diagnostics without a second
+	// counter, and it is why the recording sits at the returns rather than in the caller.
 	destination, writeCounters := N.UnwrapCountWriter(conn, nil)
 	goConn, isGoConn := N.CastWriter[*tun.GoConn](destination)
 	if !isGoConn {
+		// Not a TUN stream: the connection is proxied in userspace by design, so there is
+		// nothing that could be handed to a socket.
+		m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSourceNotGoConn)
 		return false, nil
 	}
-	target, isTarget := unwrapSpliceTarget(remoteConn, false)
+	target, targetReason, isTarget := unwrapSpliceTargetWithReason(remoteConn, false)
 	if !isTarget {
+		// The outbound side refused, at one of the points the classifier can name. The
+		// reason is used as recorded: it is produced by the same walk the decision uses.
+		m.tcpSpliceDiagnostics.recordOutcome(tcpSpliceTargetReason(targetReason))
 		return false, nil
 	}
 	var (
@@ -77,6 +87,10 @@ func (m *ConnectionManager) spliceConnection(ctx context.Context, conn net.Conn,
 		_, err := remoteConn.Write(buffer.Bytes())
 		buffer.Release()
 		if err != nil {
+			// Data that had to be forwarded before the handover could not be. The
+			// connection is finished by the caller rather than falling back, so this is a
+			// terminal outcome and not a rejection.
+			m.tcpSpliceDiagnostics.recordOutcome(spliceReasonCachedWriteFailed)
 			return false, err
 		}
 		for _, counter := range readCounters {
@@ -85,13 +99,27 @@ func (m *ConnectionManager) spliceConnection(ctx context.Context, conn net.Conn,
 	}
 	goReader, isGoReader := N.CastReader[*tun.GoConn](source)
 	if !isGoReader || goReader != goConn {
+		// The reader and the writer do not resolve to the same TUN stream, so splicing
+		// would join one connection's download to another's upload.
+		m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSourceReaderWriterMismatch)
 		return false, nil
 	}
-	return goConn.Splice(target.socket, tun.SpliceOptions{
+	if goConn.Splice(target.socket, tun.SpliceOptions{
 		ReadCounters:  append(readCounters, target.writeCounters...),
 		WriteCounters: append(target.readCounters, writeCounters...),
 		OnClose:       m.spliceClose(ctx, conn, remoteConn, onClose),
-	}), nil
+	}) {
+		m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSuccess)
+		return true, nil
+	}
+	// Splice declined and returns a bare bool. Its false paths inside sing-tun include the
+	// platform lacking socket support, a stream that is not established, one that is already
+	// spliced or has a handover pending, owner.Attach being refused (typically an existing
+	// owner), and socket conversion failing. None of that is observable from here, so this is
+	// recorded as one outcome rather than guessed at - the packet path documents the same
+	// decision for the same reason.
+	m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSpliceRejected)
+	return false, nil
 }
 
 type spliceSource struct {

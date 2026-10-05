@@ -98,6 +98,35 @@ const (
 	//
 	// Splitting this needs sing-tun to report why, not sing-box to infer it.
 	spliceReasonSpliceRejected
+
+	// --- TCP-only points ----------------------------------------------------
+	//
+	// The reasons above are reachable from both the packet path and the stream path; the
+	// three below can only be produced while deciding a TCP connection, so their counters
+	// are always zero in the UDP snapshot and vice versa. They share this enum - and its
+	// String and bounds handling - because the target-side reasons are literally the same
+	// decisions: a stream and a session both ask unwrapSpliceTargetWithReason how the
+	// outbound connection ends, and answer with the same vocabulary.
+	//
+	// They are appended rather than inserted: the numeric values are what the UDP device
+	// log's bucket order is built from, and a released build's numbers should not move.
+
+	// spliceReasonSkippedForTLSRewrite: the handover was deliberately not attempted because
+	// the fork has to rewrite the stream (TLS fragmentation, record fragmentation, or TLS
+	// spoof). This one is recorded by the CALLER, at the point where the decision is made,
+	// because spliceConnection is not called at all in this case. It is observable rather
+	// than inferred: the three options are read directly.
+	spliceReasonSkippedForTLSRewrite
+	// spliceReasonSourceNotGoConn: the client-side connection is not backed by a tun.GoConn,
+	// so there is nothing that can hand the stream to a socket. This is the TCP counterpart
+	// of the packet path's source_not_nat, and on a TUN-routed connection it is the normal
+	// answer for every flow that is being proxied in userspace.
+	spliceReasonSourceNotGoConn
+	// spliceReasonCachedWriteFailed: the connection was eligible, but buffered data that had
+	// to be forwarded before the handover could not be written to the remote. The connection
+	// is finished in that case rather than falling back, so this is a distinct outcome and
+	// not a kind of rejection.
+	spliceReasonCachedWriteFailed
 )
 
 // String returns a stable lowercase name, for tests and diagnostic output.
@@ -128,18 +157,28 @@ func (r spliceReason) String() string {
 		return "target_upstream_mismatch"
 	case spliceReasonSpliceRejected:
 		return "splice_rejected"
+	case spliceReasonSkippedForTLSRewrite:
+		return "skipped_for_tls_rewrite"
+	case spliceReasonSourceNotGoConn:
+		return "source_not_go_conn"
+	case spliceReasonCachedWriteFailed:
+		return "cached_write_failed"
 	default:
 		return "unknown"
 	}
 }
 
 // spliceReasonCount is the number of distinct reasons, used to size the counters.
-const spliceReasonCount = int(spliceReasonSpliceRejected) + 1
+//
+// It covers the TCP-only reasons as well, so both diagnostics arrays are sized by the same
+// constant and neither can silently drop an outcome that the code can produce.
+const spliceReasonCount = int(spliceReasonCachedWriteFailed) + 1
 
 // spliceReasonMax is the largest valid reason, for bounds checks.
-const spliceReasonMax = spliceReasonSpliceRejected
+const spliceReasonMax = spliceReasonCachedWriteFailed
 
-// spliceDiagnostics counts how each UDP session's splice decision ended.
+// spliceDiagnostics counts how each flow's splice decision ended - one array per transport,
+// so the stream and the session each satisfy the invariant below on their own.
 //
 // # One write per session
 //
@@ -222,17 +261,46 @@ func (s SpliceSnapshot) Ratio() float64 {
 	return float64(s.Successes) / float64(s.Attempts)
 }
 
-// SpliceDiagnostics returns the current splice diagnostics.
+// SpliceDiagnostics returns the current UDP splice diagnostics.
 //
 // This is the observation hook for a real-device A/B run: a caller can read it
 // before and after a video call and compare the splice ratio and the fallback
 // reasons. Reading it allocates a small map and has no effect on forwarding.
 func (m *ConnectionManager) SpliceDiagnostics() SpliceSnapshot {
+	return m.spliceDiagnostics.view()
+}
+
+// TCPSpliceDiagnostics returns the current TCP splice diagnostics.
+//
+// The stream path answers a different question from the packet path, and a device run needs
+// both: whether a TCP connection was handed to a socket, and if not, at which point the
+// decision ended. "It was not spliced" is not an answer a report can act on, because the
+// reason decides whether anything can be done about it - a source that is not a tun.GoConn
+// means the flow is being proxied in userspace by design, while a target that refused
+// replacement means a wrapper is standing in the way of one that could be spliced.
+//
+// Same cost model as the packet path: one atomic add per connection, at the moment its
+// decision is final, and never per read or per byte.
+func (m *ConnectionManager) TCPSpliceDiagnostics() SpliceSnapshot {
+	return m.tcpSpliceDiagnostics.view()
+}
+
+// view derives a snapshot from one counter array.
+func (d *spliceDiagnostics) view() SpliceSnapshot {
 	return SpliceSnapshot{
-		Attempts:  m.spliceDiagnostics.total(),
-		Successes: m.spliceDiagnostics.successes(),
-		Reasons:   m.spliceDiagnostics.snapshot(),
+		Attempts:  d.total(),
+		Successes: d.successes(),
+		Reasons:   d.snapshot(),
 	}
+}
+
+// tcpSpliceSnapshotReason converts a target-side classification into the recorded outcome.
+//
+// The classifier returns the same enum the counters are indexed by, so this is an identity -
+// it exists to say, at the call site, that the target-side vocabulary is deliberately shared
+// with the packet path rather than mirrored.
+func tcpSpliceTargetReason(reason spliceReason) spliceReason {
+	return reason
 }
 
 // The reason-returning variants below are the originals with a failure reason
@@ -401,9 +469,18 @@ func unwrapSpliceSourceWithReason(conn N.PacketConn) (spliceSource, spliceReason
 // runs can be compared by eye and by diff. It is produced once per tunnel lifetime by the
 // caller - never per session and never per packet.
 func (s SpliceSnapshot) SpliceSummary() string {
+	return s.summary("UDP")
+}
+
+// TCPSpliceSummary renders the stream diagnostics in the same stable form.
+func (s SpliceSnapshot) TCPSpliceSummary() string {
+	return s.summary("TCP")
+}
+
+func (s SpliceSnapshot) summary(transport string) string {
 	var summary strings.Builder
-	fmt.Fprintf(&summary, "UDP splice diagnostics: attempts=%d successes=%d ratio=%.3f",
-		s.Attempts, s.Successes, s.Ratio())
+	fmt.Fprintf(&summary, "%s splice diagnostics: attempts=%d successes=%d ratio=%.3f",
+		transport, s.Attempts, s.Successes, s.Ratio())
 
 	// Enum order, so the output is stable between runs. A map would rotate key order and
 	// make two device logs needlessly hard to compare.
