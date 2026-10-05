@@ -1,15 +1,20 @@
 # RC certificate
 
 ```text
-Candidate           9e8fa9891
-origin/testing      9e8fa9891  (equal)
+Candidate           0bd28848a
+origin/testing      0bd28848a  (equal)
+Product commit      9e8fa9891 — the candidate adds only this file (docs/release: certify the RC)
+Artifacts built at  af9abd043 — the delta to the candidate is docs and one sweep script, no
+                    product code
 Worktree            clean except ` m clients/apple` — the build-time compatibility overlay that
                     scripts/ci/prepare-apple-client.sh applies, which is never committed
 sing                replace => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261004070536-dc9f4ea02e02
                     (checkout dc9f4ea02e0249d2abd3c94c85c408dedd53d58a)
 sing-tun            v0.9.7-0.20261002083955-3f8acd9da65b (unmodified, not forked)
-Final Verify        run 37249958134 on 9e8fa9891: GREEN (4m04s) — gofmt, pinned-upstream assumptions,
-                    cronet provenance (pins), build matrix, race on the fork's own data paths
+Final Verify        run 37250304913 on 0bd28848a: GREEN (4m15s) — gofmt, pinned-upstream assumptions,
+                    cronet provenance (pins), build matrix, race on the fork's own data paths,
+                    race on the configuration surface
+                    run 37249958134 on 9e8fa9891: GREEN (4m04s), the same steps
 Apple client        clients/apple @ 117f3faaa1f451cc40e8c844b929823401b38910 on hako-ui, pushed to
                     the fork, and what the parent's gitlink records
 ```
