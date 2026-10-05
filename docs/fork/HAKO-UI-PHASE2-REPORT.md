@@ -281,7 +281,13 @@ workspace restores it.
     and `test17HomeAgreesWithTheProxySheet` asserts the agreement rather than either page — a
     single-page assertion cannot see this class, because both pages were individually correct
     about their own data.
-29. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+29. **An activity row's route lost the rule that chose it.** The manual's §44 names four ways a
+    dense data row must not fail, and this was one of them, found by seeding its nine cases. A
+    route is one string composed in reading order — the outbound chain, then the rule, then the
+    inbound — and it was middle-truncated on one line, so a long chain pushed the rule into the
+    middle and the middle is what a middle truncation drops: `proxy-b / proxy-a...IP,CN` names
+    neither the rule nor which part was lost. It truncates at the end over two lines now.
+30. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -429,6 +435,10 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
+- **The activity rows under load**: the manual's §44 cases — a long domain, an IPv6 literal, a
+  Chinese rule, an English rule, a long outbound chain, several badges, a large value, zero
+  bytes, KB/MB/GB — seeded at the display layer, asserted on screen and captured. The route
+  truncation defect above came out of it.
 - **The report pages**: all three kinds - crash, out-of-memory and power - archived by the
   fixture through their archives' own writers, listed with their date, origin and unread badge,
   and read as a page that names the artifacts actually present on disk (Metadata, Crash Report,
@@ -682,6 +692,14 @@ named in §6, and they are now gaps in *coverage* rather than in the work: #9 cl
 fixture learned to archive a report, and #14 remains partially audited in the honest direction
 - every page's controls are driven by the snapshot suite, but there has been no exhaustive
 audit of controls that no fixture reaches.
+
+## 5b. What §44 taught about testing dense data
+
+The manual's list of values to test is the reason this defect was findable at all: without a
+fixture that puts a long chain *and* a rule in the same row, the truncation that drops the rule
+looks like ordinary truncation. The generalisable form is that **a composed string has an order,
+and truncating it is not order-neutral** — a middle truncation on `a · b · c` can delete `b`, and
+the reader cannot tell that anything is missing.
 
 ## 6. What is open
 
