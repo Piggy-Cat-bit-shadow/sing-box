@@ -217,7 +217,13 @@ workspace restores it.
     crash occurs." is the empty page's explanation, and it was drawn under a list that had a
     report in it — saying the opposite of what the reader could see. It is now the empty
     state's alone.
-19. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+19. **A test failed under load and passed alone.** A full run of 35 cases on a loaded machine
+    failed to reach the More page's On Demand row within 15 seconds — a row the navigation
+    suite had reached moments earlier in the same run. The case passed on its own immediately
+    after. The cause was in the tests, not the app: the snapshot suite waited 15 seconds where
+    the navigation suite waits 30 for the identical operation. A test that fails under load is
+    a defect in the test.
+20. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -462,6 +468,10 @@ More, More scrolled to its end, Logs, On Demand, Tunnel, Core, Client Settings, 
 inbox's empty state, the configuration centre, Proxies collapsed, Proxies filtered, Activity,
 the add-configuration sheet and the add flow reached from the centre itself.
 
+It also carries a case that exists because a full run once failed on it: `test21OnDemand`
+passed alone and failed in a 35-case run, which is what turned a 15-second wait into the
+30 seconds the navigation suite already used.
+
 It can also start the app in a named fixture state
 (`SCREENSHOT_STATE=profileError`) and it archives a crash report through the archive's own
 writer, which is how the failure path and the report pages are photographed at all: a page that
@@ -591,10 +601,20 @@ In the order I would attack it:
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
-3. **The other two report managers have no fixture.** Crash reports are now archived by the
-   fixture and both the list and the read view have been looked at. The out-of-memory and
-   power reports share the shape but not the fixture, so their lists and read views are still
-   unverified — the same one-hour change, for two more managers.
+3. **The other two report managers have no fixture, and should not get one the same way.**
+   `CrashReportArchive` has a public `writeArchivedReport`, so the fixture archives a report
+   through the archive's own writer. `OOMReportArchive` and `PowerReportArchive` have no
+   writer — only a directory and a scan — so seeding them would mean hand-replicating a
+   private file layout inside a test, which is a second source of truth for that layout. The
+   right fix is to give those two archives the writer their sibling already has, and then seed
+   them the same way.
+4. **One stray disclosure indicator, understood only in part.** The add-configuration modal
+   draws a chevron at the trailing edge of its three action tiles. Replacing the third tile's
+   `NavigationLink` with a `Button` did not remove it, and moving the hidden navigation
+   destination outside the form did not either, so it is not from the link. Most likely the
+   grouped `Form` gives an accessory to a section whose row holds interactive content. It is
+   cosmetic; it is recorded rather than guessed at again, and the comment in the source says
+   the same thing.
 4. **The configuration centre's segmented libraries have no counterpart here.** This client
    keeps no separate node or rule store, and a tab onto nothing would be a page invented to
    fill a diagram. Everything else about the centre is done.
@@ -621,11 +641,11 @@ In the order I would attack it:
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
    page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
-8. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
+9. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
    which still draws the legacy `ClashModeCard`.
-9. **tvOS has not been built or run** this round and shares less with iOS than before.
-10. **The parent gitlink is not updated.** Twelve submodule commits are local and unpushed;
+10. **tvOS has not been built or run** this round and shares less with iOS than before.
+11. **The parent gitlink is not updated.** Sixteen submodule commits are local and unpushed;
    the parent still records `1b26865`.
-11. **The macOS client is untouched but unverified** — see the handoff document
+12. **The macOS client is untouched but unverified** — see the handoff document
    (`docs/fork/HAKO-UI-PHASE2-HANDOFF.md`), which also lists the macOS items that the
    earlier rounds left in place.
