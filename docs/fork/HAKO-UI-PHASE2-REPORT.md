@@ -239,7 +239,13 @@ workspace restores it.
     argues against the reference, so it was being broken on the two pages no test walked. The
     STUN page also still called itself "STUN Test" while the row that opens it says "STUN & NAT".
     Both had no accessibility identifier, which is why nothing had ever walked them.
-23. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+23. **Three names for one flow, and a page that named itself.** The configuration flow's sheet
+    said "Add Configuration", its tile said "Create Manually", and the page it opened said
+    "New Profile" — with "Profile" being the vocabulary this migration replaced everywhere else.
+    The page stops naming itself now: its presenters do. It also had never worn the shared
+    chrome, so it carried the platform's back control, which no audit could address — the same
+    gap the network-quality and STUN pages had.
+24. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -609,7 +615,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 3 | No stacked global status bar | done | the shell's accessory slot was removed, not left unused |
 | 4 | Home follows the Hako hierarchy | done | session · profile · outbound mode · shortcuts · traffic · runtime; captured |
 | 5 | Tools/More grouped, every row subtitled | done | captured in both appearances; `testEveryMoreDestinationOpens` |
-| 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page; the settings pages are one `Form` |
+| 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page — three pages that were missing it are fixed (§1.7a 22, 23); the settings pages are one `Form` |
 | 7 | Proxies/Activity are complete workspaces | done | pinned strip, search, actions, group header, member grid; captured |
 | 8 | Config centre consistent | partial | chrome, progress, expiry and update-all done; the segmented libraries are not built, deliberately (§6) |
 | 9 | Reports consistent | **asserted** | all three report kinds are archived by the fixture through their archives' own writers, so every list has a row and every read view has real files behind it; `test32`, `test34` and `test36` open each and assert on the artifacts |
@@ -672,10 +678,15 @@ In the order I would attack it:
    the ones worth acting on are in §1.7a. The snapshot suite still captures dark, because the
    fixture forces it: light captures are made with
    `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`.
-7. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
-   records no requests, and Connections and Logs are still two pushed pages rather than one
-   workspace with a strip. Merging them would give the strip a use and match the reference's
-   page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
+7. **The Activity lens structure, with the reason it is not additive.** The manual asks for
+   連接 / 請求 / 日志 lenses in one workspace. Investigating it properly changed the estimate:
+   the lenses do not share their search or their actions — the connections lens searches
+   connections through the workspace's drawn field, while the logs lens owns a `.searchable`,
+   a pause control, a clear control and a menu — so a strip is not a strip, it is routing the
+   workspace's search binding and its action capsule per lens. On top of that, one of the
+   manual's three lenses has no data behind it at all: this core records no requests. The
+   right shape is a lens-aware workspace, and it is a search-and-actions refactor rather than
+   an added control.
 10. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
    which still draws the legacy `ClashModeCard`.
 11. **tvOS has not been built or run** this round and shares less with iOS than before.
