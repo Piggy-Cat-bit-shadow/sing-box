@@ -372,9 +372,21 @@ is an environment fact, traced to three separate causes, none of them the client
   the container write is still refused, so the process still exits at the database step.
 
 To run the table, build and sign the way the publish flow does - a real team, a profile carrying the
-App Group, and matching bundle identifiers. On this machine that means building with
-`APPLE_TEAM_ID=TAFD7BAGYZ APPLE_BASE_BUNDLE_ID=top.jiejie12131.jiejiebox APPLE_APP_GROUP_ID=group.top.jiejie12131.jiejiebox`,
-for which profiles already exist.
+App Group, and matching bundle identifiers. That was tried, and it does not close the gap here:
+
+- Building with `BASE_PACKAGE_IDENTIFIER=top.jiejie12131.jiejiebox` and
+  `APP_GROUP_IDENTIFIER=group.top.jiejie12131.jiejiebox` succeeds, and macOS does create
+  `~/Library/Group Containers/group.top.jiejie12131.jiejiebox` on first launch - so the identifiers
+  are not what is missing.
+- The container it creates is nonetheless unwritable, to the app and to the shell
+  (`mkdir .../Library/Caches/Working` -> "Operation not permitted", for a directory owned by `jie`).
+  macOS binds group-container ownership to the **signing identity and its provisioning profile**, not
+  to the Info.plist value; this app is signed ad-hoc with a development certificate, so the system
+  does not treat it as a member of the group. The result is `LibboxSetup`'s `MkdirAll` failing
+  silently, then `Database.swift:72` with SQLite error 14 (file not found) rather than 23.
+
+So running this app on this machine needs a build signed with a profile that actually carries the
+App Group - i.e. the real development/publish setup - not just matching identifiers.
 
 ### What still needs a real run
 
