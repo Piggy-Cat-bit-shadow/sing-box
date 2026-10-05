@@ -30,6 +30,36 @@ Only the presentation layer, under `ApplicationLibrary/Views` plus `SFI/MainView
 lifecycle, the profile model, the app name, the icons, the bundle identifiers and the signing layout
 are untouched.
 
+## Rounds recorded against it
+
+### Second UI round — secondary destinations (`747143cf0` → `16cacb701`)
+
+The first round built the shell (Home, Tools, More, the tab bar, the bottom dock) and left the
+pages behind it on their original presentation. This round took the secondary destinations:
+
+| phase | what changed |
+|---|---|
+| shell | a child page is applied after its primary has rendered, so a launch on Logs or a deep link can no longer select a page it never shows |
+| profile | the picker row leads with the shared icon tile and marks the selected profile at the trailing edge |
+| groups | shared canvas, spacing and status badge; the latency grid and segmented shape are left alone as a diagnostic |
+| connections | the list is one grouped card with dividers instead of a glass card per row; the row uses the shared language |
+| detail | every `FormTextItem` — connections, settings, tools, reports — renders the shared value line |
+| reports | the empty and loading states come from the shared empty state |
+| remote | the same, for the server list |
+| logs | the native log text view sits on the shared surface; the data path and the auto-scroll policy are unchanged |
+| macOS | the detail column is centred and inset without touching `NavigationSplitView` or any of its behaviour |
+
+The child commit is `16cacb70101f416f60c5faea12a2e6df0c1ca244` on `hako-ui`. The build-time
+compatibility overlay that `scripts/ci/prepare-apple-client.sh` applies to the submodule is not
+part of any child commit, and the nine commits touch only `ApplicationLibrary/Views/**`,
+`MacLibrary/MainView.swift` and `scripts/dev/`.
+
+Not verified in this round: the runtime behaviour of the shell routing change and every visual
+change, because this machine has no simulator runtime and no unit-test target exists to run the
+extracted routing mapping — see `scripts/dev/check-hako-primary-route.sh` for the blocker and the
+check that is ready to run where one of those exists.
+
+
 ## Updating it
 
 1. Work on a branch of the fork based on the submodule commit the parent records.
