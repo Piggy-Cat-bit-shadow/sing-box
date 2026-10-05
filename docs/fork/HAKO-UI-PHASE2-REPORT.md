@@ -232,7 +232,14 @@ workspace restores it.
     `timeline.jsonl` and `events.jsonl` while every other row used a name a person can read.
     That is the "no raw internal keys" gate item, inside a read view rather than a settings
     row, and it is the kind of thing only looking finds.
-22. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+22. **Two pages never wore the shared navigation chrome.** `NetworkQualityView` and
+    `STUNTestView` used `.navigationTitle` where every sibling uses `hakoNavigationChrome` - and
+    that modifier is what hides the root tab bar on a pushed page, so **the tab bar stayed
+    visible on two detail pages**. That is the manual's P0 rule, and the one place the report
+    argues against the reference, so it was being broken on the two pages no test walked. The
+    STUN page also still called itself "STUN Test" while the row that opens it says "STUN & NAT".
+    Both had no accessibility identifier, which is why nothing had ever walked them.
+23. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -516,6 +523,22 @@ xcrun simctl ui booted content_size large                     # restore
 Note that the fixture forces dark unless `SCREENSHOT_APPEARANCE=light` is set, so a light
 capture needs both.
 
+### 3.2b The fourth non-discriminating assertion
+
+Four assertions in this migration have failed for the same reason, and it is worth naming
+because it is a shape rather than an accident: **the assertion did not control its
+precondition.**
+
+| assertion | why it did not discriminate |
+| --- | --- |
+| a back control exists after tapping a report row | the report *list* is pushed too, so it wears one whether or not the tap navigated |
+| a mode row reports itself selected after a tap | true of the state being left as well as the state being entered |
+| the More page's last row `isHittable` | the row is below the fold, so it is false until something scrolls to it |
+| `test21OnDemand` reaches a row in 15 seconds | the sibling suite waits 30 for the identical step; under load 15 is a coin toss |
+
+Each was written as a check on the app and turned out to be a check on nothing. The pattern to
+look for is an assertion whose expected value is also the expected value of doing nothing.
+
 ### 3.3 Runtime logs
 
 ```bash
@@ -588,12 +611,12 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 11 | No unrelated brand residue | **asserted** | same sweep, plus `SFM`/`SFMExtension`/`Ghostty Configuration`/`Clash Mode` removed |
 | 12 | No double chevron | **asserted** | `testNavigableRowsDrawExactlyOneIndicator` |
 | 13 | Search safe-area correct | asserted in part | `testProxyWorkspaceSearches`, `testActivityWorkspaceOffersSearch`; the sheet capsule uses `safeAreaInset` |
-| 14 | Every button works | partial | the snapshot suite drives each page through its real controls; no exhaustive audit |
+| 14 | Every button works | **asserted for the navigation surface** | `testEveryNavigableRowOpensSomething` walks all 15 navigable rows on the three roots and asserts each opens something and comes back; the snapshot suite drives each page's own controls. Not audited: controls that only act on live network or tunnel state |
 | 15 | Deep navigation works | **asserted** | `testDeepLinkToLogsBeforeToolsWasEverShown` |
 | 16 | Dynamic Type acceptable | done for the pages that exist | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity and the configuration centre; four defects found and fixed (§1.7a 17, 18) |
 | 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
 
-Five of the seventeen are now assertions rather than impressions. The remaining gaps are
+Seven of the seventeen are now assertions rather than impressions. The remaining gaps are
 named in §6, and they are now gaps in *coverage* rather than in the work: #9 closed when the
 fixture learned to archive a report, and #14 remains partially audited in the honest direction
 - every page's controls are driven by the snapshot suite, but there has been no exhaustive
