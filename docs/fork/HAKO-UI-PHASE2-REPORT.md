@@ -223,7 +223,16 @@ workspace restores it.
     after. The cause was in the tests, not the app: the snapshot suite waited 15 seconds where
     the navigation suite waits 30 for the identical operation. A test that fails under load is
     a defect in the test.
-20. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+20. **Two report archives could not be written to.** The crash archive had a public writer and
+    its out-of-memory and power siblings had only a directory and a scan, so nothing but the
+    app's own watchdog could put a report in them — which is why their pages had never been
+    seen and why the archive layout was written out three times, twice of them read-only.
+    `ReportArchive.writeArtifact` owns the layout now and all three archives use it.
+21. **A read view listed two of its own files by filename.** The power report showed
+    `timeline.jsonl` and `events.jsonl` while every other row used a name a person can read.
+    That is the "no raw internal keys" gate item, inside a read view rather than a settings
+    row, and it is the kind of thing only looking finds.
+22. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -371,10 +380,11 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
-- **The report pages**: a report archived by the fixture through the archive's own writer,
-  listed with its date, origin and unread badge, and read as a page that names the artifacts
-  actually present on disk - Metadata, Crash Report, Go Crash Log, Configuration - with share
-  and delete in one action capsule.
+- **The report pages**: all three kinds - crash, out-of-memory and power - archived by the
+  fixture through their archives' own writers, listed with their date, origin and unread badge,
+  and read as a page that names the artifacts actually present on disk (Metadata, Crash Report,
+  Go Crash Log, Configuration; Metadata, Configuration, Log; Metadata, Energy Timeline, Power
+  Events, Log) with share and delete in one action capsule.
 - **Home's failure state**: an unreadable configuration is reported by the page's own
   `HakoInlineNotice` - the page name, a prominent retry and the reason in the warning colour
   above the first card - with every other card still drawn and reachable. A condition the
@@ -573,7 +583,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page; the settings pages are one `Form` |
 | 7 | Proxies/Activity are complete workspaces | done | pinned strip, search, actions, group header, member grid; captured |
 | 8 | Config centre consistent | partial | chrome, progress, expiry and update-all done; the segmented libraries are not built, deliberately (§6) |
-| 9 | Reports consistent | **asserted** | the fixture archives a report through the archive's own writer, so the list has a row and the read view has real files behind it; `test32ReportListAndDetail` opens both and asserts the read view lists the artifacts |
+| 9 | Reports consistent | **asserted** | all three report kinds are archived by the fixture through their archives' own writers, so every list has a row and every read view has real files behind it; `test32`, `test34` and `test36` open each and assert on the artifacts |
 | 10 | No raw internal keys | **asserted** | `testNoRawInternalKeysOnAnyPage` walks 3 roots + 7 destinations; `testTunnelPageShowsUserTitlesAndNoRawPropertyNames` |
 | 11 | No unrelated brand residue | **asserted** | same sweep, plus `SFM`/`SFMExtension`/`Ghostty Configuration`/`Clash Mode` removed |
 | 12 | No double chevron | **asserted** | `testNavigableRowsDrawExactlyOneIndicator` |
@@ -601,13 +611,6 @@ In the order I would attack it:
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
-3. **The other two report managers have no fixture, and should not get one the same way.**
-   `CrashReportArchive` has a public `writeArchivedReport`, so the fixture archives a report
-   through the archive's own writer. `OOMReportArchive` and `PowerReportArchive` have no
-   writer — only a directory and a scan — so seeding them would mean hand-replicating a
-   private file layout inside a test, which is a second source of truth for that layout. The
-   right fix is to give those two archives the writer their sibling already has, and then seed
-   them the same way.
 4. **One stray disclosure indicator, understood only in part.** The add-configuration modal
    draws a chevron at the trailing edge of its three action tiles. Replacing the third tile's
    `NavigationLink` with a `Button` did not remove it, and moving the hidden navigation
@@ -627,7 +630,10 @@ In the order I would attack it:
    `NSColor.controlBackgroundColor` on the desktop - and both are inside platform branches
    this round does not touch. The general finding is worth keeping: the token set is not
    enforced where a legacy platform branch draws its own surface by hand.
-5. **Dynamic Type** was audited on Home, Tools, More, Proxies, Activity and the
+5. **The stray disclosure indicator** on the add-configuration modal's tile row is still
+   there and still only partly understood - see §1.7a 4 below and the comment in
+   `NewProfileMenuView`.
+6. **Dynamic Type** was audited on Home, Tools, More, Proxies, Activity and the
    configuration centre and found one defect, which is
    fixed, along with the three the workspaces had (§1.7a items 17, 18). Not audited: the
    report pages and the editors, which no fixture reaches.
@@ -641,11 +647,11 @@ In the order I would attack it:
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
    page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
-9. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
+10. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
    which still draws the legacy `ClashModeCard`.
-10. **tvOS has not been built or run** this round and shares less with iOS than before.
-11. **The parent gitlink is not updated.** Sixteen submodule commits are local and unpushed;
+11. **tvOS has not been built or run** this round and shares less with iOS than before.
+12. **The parent gitlink is not updated.** Eighteen submodule commits are local and unpushed;
    the parent still records `1b26865`.
-12. **The macOS client is untouched but unverified** — see the handoff document
+13. **The macOS client is untouched but unverified** — see the handoff document
    (`docs/fork/HAKO-UI-PHASE2-HANDOFF.md`), which also lists the macOS items that the
    earlier rounds left in place.
