@@ -180,7 +180,13 @@ workspace restores it.
 11. **The fixture passed capitalized proxy type strings**, which the core's display-type
     mapping does not recognise, so every member of every snapshot read "Unknown" — a fixture
     that made the pages it exists to photograph look wrong.
-12. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+12. **Tapping a mode row did not move the selection.** Found by making the mode selection an
+    assertion rather than an impression. The legacy card this client used held the choice in
+    `@State` and sent it to the core afterwards; the replacement read the core's *published*
+    mode. With the tunnel stopped the core cannot report a mode back, so the row never moved:
+    the page looked broken and the tap looked ignored. The choice is held locally first and
+    reconciled with the core's published value, which is what the card did.
+13. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -273,6 +279,12 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   "No documentation." The switches write the same preferences with the same polarity.
   Polarity was **not** inverted even though the manual's wording is positive: inverting
   would change what an existing user sees without changing what they get.
+- **Home**: the outbound mode is a painted section of selection rows where the chosen row
+  carries the reason the mode exists, as the reference presents it - not a segmented control.
+  The legacy `DashboardCardView` that drew a second card inside this page's card, its
+  hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
+  decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
+  remains for the remote dashboard and the focus platform's overview.
 - **Proxies / Activity**: workspaces with a pinned strip where there is one, a search field
   appropriate to how the page is presented, a summary card, test-all and expand-all, and a
   group header composed from the reference's card presentation: the group's name over one
@@ -351,10 +363,17 @@ one disclosure indicator per navigable row · the tunnel page's row labels carry
 property name · Logs push/pop, cold launch, deep link, double-push, current-tab, rapid switch
 ```
 
-`HakoSnapshotUITests` — **13/13**, and it is the manual's §77/§78 coverage rather than a
-marketing capture: Home, Tools, More, Logs, On Demand, Tunnel, Core, Client Settings, the
-report inbox's empty state, Proxies collapsed, Proxies filtered, Activity and the
-add-configuration sheet. It drives each page the way a user reaches it, so a page that
+`HakoSnapshotUITests` — **15/15**, and it is the manual's §77/§78 coverage rather than a
+marketing capture: Home, the outbound mode, Tools, More, More scrolled to its end, Logs,
+On Demand, Tunnel, Core, Client Settings, the report inbox's empty state, Proxies collapsed,
+Proxies filtered, Activity and the add-configuration sheet.
+
+Two of its cases assert rather than photograph, because they are the two things the manual
+names that a screenshot cannot establish: `test13MoreScrolledToBottom` asks whether the last
+row of the longest root page is still `isHittable` after scrolling to the end - a floating bar
+covering it leaves the row present in the tree and untappable, which an existence check cannot
+see - and `test14OutboundModeSelection` selects a mode and asks the row to report itself
+selected. It drives each page the way a user reaches it, so a page that
 cannot be reached by tapping what the test taps fails here.
 
 **Where the images land:** the fastlane default, `~/Library/Caches/tools.fastlane/screenshots/`,
@@ -447,20 +466,28 @@ In the order I would attack it:
    there is no report to open. Reaching them needs fixture report data, which is a fixture
    change rather than a UI one.
 4. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
-   fixed (§1.7a item 12). Not yet audited: the workspaces at accessibility sizes, the
+   fixed (§1.7a item 13). Not yet audited: the workspaces at accessibility sizes, the
    proxied grid's two-column layout when the text grows, and the modal sheets.
-   **Dark mode** has not been compared against a light reference at all: every reference
-   screenshot is light and every capture of ours so far is dark, which is the fixture's
-   default. `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`
-   gives a like-for-like capture, and that comparison is the next cheap win.
-5. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
+   **Light mode** was compared against the light reference for Home, Tools, More and Logs
+   (`~/hako-ui-compare/ours-light/`). The surfaces, the card radius, the page inset and the
+   muted captions agree; the differences it produced were content and order, not colour, and
+   the ones worth acting on are in §1.7a. The snapshot suite still captures dark, because the
+   fixture forces it: light captures are made with
+   `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`.
+5. **The connect failure state.** The reference surfaces a profile it cannot read as an
+   inline message with a prominent retry in a header row above the first card - its Home
+   shows `VPN 配置无法读取或保存。` with a `重试` button. This client surfaces failures as
+   blocking alerts, which is heavier and stops the page. Not changed in this round: it is a
+   page-level state, not a row.
+6. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
    page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
-6. **`OverviewView` is dead on iOS** — only tvOS uses it now.
-7. **tvOS has not been built or run** this round and shares less with iOS than before.
-8. **The parent gitlink is not updated.** Four submodule commits are local and unpushed; the
-   parent still records `1b26865`.
-9. **The macOS client is untouched but unverified** — see the handoff document
+7. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
+   which still draws the legacy `ClashModeCard`.
+8. **tvOS has not been built or run** this round and shares less with iOS than before.
+9. **The parent gitlink is not updated.** Eleven submodule commits are local and unpushed;
+   the parent still records `1b26865`.
+10. **The macOS client is untouched but unverified** — see the handoff document
    (`docs/fork/HAKO-UI-PHASE2-HANDOFF.md`), which also lists the macOS items that the
    earlier rounds left in place.
