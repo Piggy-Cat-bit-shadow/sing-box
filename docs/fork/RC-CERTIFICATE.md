@@ -15,8 +15,11 @@ Final Verify        run 37250304913 on 0bd28848a: GREEN (4m15s) — gofmt, pinne
                     cronet provenance (pins), build matrix, race on the fork's own data paths,
                     race on the configuration surface
                     run 37249958134 on 9e8fa9891: GREEN (4m04s), the same steps
-Apple client        clients/apple @ 117f3faaa1f451cc40e8c844b929823401b38910 on hako-ui, pushed to
-                    the fork, and what the parent's gitlink records
+Apple client        clients/apple @ 54f67c073761a6994e301370f9f1e501c0f60bae on hako-ui, pushed to
+                    the fork (Piggy-Cat-bit-shadow/sing-box-for-apple), and what the parent's
+                    gitlink records. The UI is its own repository, so its commit is release
+                    evidence and the publish summary names it; see APPLE-UI-RC-CHECKLIST.md for
+                    what only a TestFlight run can settle.
 ```
 
 ## Verdict
