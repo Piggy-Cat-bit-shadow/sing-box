@@ -245,7 +245,14 @@ workspace restores it.
     The page stops naming itself now: its presenters do. It also had never worn the shared
     chrome, so it carried the platform's back control, which no audit could address — the same
     gap the network-quality and STUN pages had.
-24. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+24. **A labelled form field could not stack.** `FormItem` was a function returning an `HStack`
+    with the title at `lineLimit(1)`, because it shares that line with the control. At the
+    accessibility sizes the editor's "Name" sat beside its own "Required" placeholder with no room
+    between them, and a longer label — "File Path", "Profile Name" — had nowhere to go but
+    truncation. `FormPicker` was already stacking its value under its label, so the same kind of
+    row was laid out two different ways. It is a view now, so it can read the text size, and every
+    `FormItem` in the client stacks at once because it is the shared component.
+25. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -625,7 +632,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 13 | Search safe-area correct | asserted in part | `testProxyWorkspaceSearches`, `testActivityWorkspaceOffersSearch`; the sheet capsule uses `safeAreaInset` |
 | 14 | Every button works | **asserted for the navigation surface** | `testEveryNavigableRowOpensSomething` walks all 15 navigable rows on the three roots and asserts each opens something and comes back; the snapshot suite drives each page's own controls. Not audited: controls that only act on live network or tunnel state |
 | 15 | Deep navigation works | **asserted** | `testDeepLinkToLogsBeforeToolsWasEverShown` |
-| 16 | Dynamic Type acceptable | done for the pages that exist | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity, the configuration centre and the settings pages (On Demand, Tunnel, Client Settings); four defects found and fixed (§1.7a 17, 18), and the settings pages needed none |
+| 16 | Dynamic Type acceptable | done for the pages a fixture reaches | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity, the configuration centre, the settings pages and the configuration editor; five defects found and fixed (§1.7a 17, 18, 24), and the settings pages needed none |
 | 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
 
 Seven of the seventeen are now assertions rather than impressions. The remaining gaps are
