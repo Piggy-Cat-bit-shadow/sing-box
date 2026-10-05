@@ -390,3 +390,35 @@ for which profiles already exist.
   `screencapture` reports "could not create image from display", so the rows cannot be driven from
   here even once the app stays up.
 
+### Bug found and fixed: a tab did not keep its pushed page
+
+The first defect this round found, and the one row 4 of the table exists to catch.
+
+Reproduction, from the harness, ordered and executable:
+
+```text
+replay: open logs -> [tools: logs]
+replay: tap Home  -> [tools: logs]     the map is right here
+then tapping Tools back  -> popped to the Tools root
+```
+
+Two independent causes, both in `HakoPrimaryShell`:
+
+1. `primarySelection`'s setter always wrote `newPrimary.rootPage`, so selecting a tab discarded a
+   stack that tab still held. It now writes `pushedChild[newPrimary] ?? root`.
+2. Every tab's column observes the same `selection`, and `applySelectedRoute` ran the armer for all
+   of them. The armer writes the entry keyed on the *new* selection's primary, so the column being
+   left drove its own entry to `nil` - the page the user had left open. The rule now lives in
+   `HakoPrimaryChildArmer.applying(arming:pushed:selection:)`, which returns the map unchanged for a
+   column that does not own the selection.
+
+The harness had the same blind spot as the implementation: it asserted `next(...)` directly, which
+shares the implementation's assumption instead of the shell's rule, so it passed while the shell
+was wrong. It now exercises `applying(...)` and models the tap itself, including the setter's early
+return when the tapped tab already owns the selection. Fixing the test was half the fix.
+
+Both changes are confined to `HakoPrimaryShell.swift` and the harness. Verified: the harness passes
+on the rebuilt framework, macOS SFM Debug and the iOS SFI simulator build are green, and both parent
+suites still pass (publish 86/0, signing 118/0).
+
+
