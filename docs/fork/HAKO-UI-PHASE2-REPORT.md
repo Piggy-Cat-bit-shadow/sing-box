@@ -259,7 +259,14 @@ workspace restores it.
     platform gives a row that navigates a disclosure indicator. Two attempts failed by treating
     "inside the modal" and "outside the form" as the same thing. Attached to the scaffold's own
     result, it is outside the form and the indicator is gone.
-26. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+26. **The remote-connection alert showed the Go RPC stack to the reader.** Failing to reach a
+    remote server raised an alert whose message was a human sentence with the transport's own
+    account appended — `rpc error: code = Unavailable desc = "error reading server prefix: read
+    tcp 172.19.0.1:63956->192.168.1.20:9090: read: connection reset by peer"`. The sentence stays;
+    the rest is the RPC stack talking to itself and goes to the log. This is the "no raw internal
+    keys" gate item reached through an error message rather than a settings row, and it is the
+    third time a raw internal string has been found in user-facing text.
+27. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -694,11 +701,18 @@ In the order I would attack it:
    manual's three lenses has no data behind it at all: this core records no requests. The
    right shape is a lens-aware workspace, and it is a search-and-actions refactor rather than
    an added control.
-10. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
-   which still draws the legacy `ClashModeCard`.
-11. **tvOS has not been built or run** this round and shares less with iOS than before.
-12. **The parent gitlink is not updated.** Eighteen submodule commits are local and unpushed;
-   the parent still records `1b26865`.
-13. **The macOS client is untouched but unverified** — see the handoff document
+10. **Remote-control mode is still two products in one, and that is now a known unknown rather
+    than an unnoticed one.** `RemoteDashboardView` draws the legacy card grid, and configuring
+    remote control replaces the Hako Home with it. The fixture can enter the mode now
+    (`SCREENSHOT_STATE=remote`), but the grid renders only while *connected*, and on a failed
+    connect the app falls back to the local Hako Home — so seeing the grid needs a reachable
+    remote server, which is a fixture this client does not have. Migrating it is not mechanical:
+    `HakoHomeView` reads the local `ExtensionProfile` for its session card, and remote mode has
+    no local profile, so it needs a remote-aware session card rather than a substitution.
+11. **`OverviewView` is dead on iOS** — only tvOS uses it.
+12. **tvOS has not been built or run** this round and shares less with iOS than before.
+13. **The parent gitlink is not updated.** Twenty-three submodule commits are local and
+   unpushed; the parent still records `1b26865`.
+14. **The macOS client is untouched but unverified** — see the handoff document
    (`docs/fork/HAKO-UI-PHASE2-HANDOFF.md`), which also lists the macOS items that the
    earlier rounds left in place.
