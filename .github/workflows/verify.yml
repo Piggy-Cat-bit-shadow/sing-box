@@ -93,6 +93,13 @@ jobs:
       #   cd test && go test -tags "$(cat ../release/DEFAULT_BUILD_TAGS_OTHERS)" \
       #     -run 'TestLoadBalance' .
 
+      - name: cronet provenance
+        # The fork pin for cronet-go lives in 31 replace directives, and a replace written for
+        # one module is not inherited by another: module paths stay upstream so imports need no
+        # rewriting, so a missing replace is invisible in the source and links upstream in the
+        # binary. This checks the resolved replacements and the archive bytes they provide.
+        run: ./scripts/ci/verify-cronet-provenance.sh apple
+
       - name: race on the fork's own data paths
         # Bounded to the packages the fork actually changed. The artifact workflows own the full race
         # suite; this is the subset where a fork-local regression would land first.

@@ -1,0 +1,14 @@
+# Native cronet archives a release build links, by module path and content.
+#
+# The module paths are upstream by design; every one of them is replaced with the fork
+# in go.mod, and this file records WHICH BYTES that resolved to. Regenerate only when
+# the cronet pin changes:
+#
+#   scripts/ci/verify-cronet-provenance.sh --record apple
+#
+# Format: <module-path> <archive> <size-bytes> <sha256>
+github.com/sagernet/cronet-go/lib/darwin_amd64 libcronet.a 50782216 f747bb46b8602ce7edbc8e69a3602bb0911eb44a056fbee1904b4ed7e4aad850
+github.com/sagernet/cronet-go/lib/darwin_arm64 libcronet.a 48110296 f680ff966fb7a2490b3d9f4d8e8c45a107897a5b5df933d722973cde6264ef21
+github.com/sagernet/cronet-go/lib/ios_amd64_simulator libcronet.a 48696104 45e7a6924825bd6949ee606b6e6ca481ed35d32d990d0df3b0d0dc36b1c882ea
+github.com/sagernet/cronet-go/lib/ios_arm64 libcronet.a 46280672 6863693a72d461855ea0de58492af110fc2087cfb5a3f7db33e060eef6a13980
+github.com/sagernet/cronet-go/lib/ios_arm64_simulator libcronet.a 46283072 44cbf24e2b937f89f78ef432213372ccb16e9229b1c093402aa8ad82f86a087e

@@ -196,6 +196,7 @@ step "prepare the Apple client"
 # ---------------------------------------------------------------------------
 do_ios() {
   step "build signed iOS IPA"
+  step "cronet provenance"; ./scripts/ci/verify-cronet-provenance.sh apple
   ./scripts/ci/build-ios-ipa.sh dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
   step "verify the signed IPA"
   ./scripts/ci/verify-apple-signed-artifact.sh ios-ipa dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
