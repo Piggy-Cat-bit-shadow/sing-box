@@ -115,47 +115,58 @@ if ! grep -qF "LibboxPromotePowerReportDraft()" "$provider_swift"; then
   exit 1
 fi
 
-# Refuse to apply twice rather than appending a second copy.
+# The overlay is for a client that predates this fork's libbox API. Once the client carries the
+# members itself - which is the case for this fork's own branch - it needs no adaptation, and
+# failing here would report a complete client as a broken one. The guard below still refuses to
+# append a *second* copy, so running this twice remains an error; running it against a client that
+# already has the members is not.
 if grep -qF "func usePlatformAutoRedirect() -> Bool" "$platform_swift"; then
-  echo "FAIL: the compatibility overlay appears to be already applied." >&2
-  exit 1
-fi
+  echo "  [compatibility] already present in the client; nothing to overlay"
+  # The notification invariant holds for the client as authored, so it is still asserted.
+  send_count="$(grep -cE "func send\(_ notification: LibboxNotification\?\) throws" "$platform_swift" || true)"
+  if [ "$send_count" != "1" ]; then
+    echo "FAIL: expected exactly one send(_:) implementation, found $send_count." >&2
+    echo "      Notification delivery must keep a single implementation." >&2
+    exit 1
+  fi
+else
+  # Refuse to apply twice rather than appending a second copy.
+  python3 "$root/scripts/ci/apply-apple-compat-overlay.py" "$platform_swift"
 
-python3 "$root/scripts/ci/apply-apple-compat-overlay.py" "$platform_swift"
+  # --- verify what was written actually says what we intend -----------------
+  checks_failed=0
+  for required in \
+    "func usePlatformAutoRedirect() -> Bool {" \
+    "func createAutoRedirect(_ options: Data?, handler: LibboxAutoRedirectHandlerProtocol?) throws -> LibboxAutoRedirectSessionProtocol {" \
+    "auto redirect is not supported on Apple platforms" \
+    "func LibboxPromotePowerReportDraft()"
+  do
+    if ! grep -qF "$required" "$platform_swift"; then
+      echo "FAIL: expected '$required' after applying the compatibility overlay" >&2
+      checks_failed=1
+    fi
+  done
 
-# --- verify what was written actually says what we intend -------------------
-checks_failed=0
-for required in \
-  "func usePlatformAutoRedirect() -> Bool {" \
-  "func createAutoRedirect(_ options: Data?, handler: LibboxAutoRedirectHandlerProtocol?) throws -> LibboxAutoRedirectSessionProtocol {" \
-  "auto redirect is not supported on Apple platforms" \
-  "func LibboxPromotePowerReportDraft()"
-do
-  if ! grep -qF "$required" "$platform_swift"; then
-    echo "FAIL: expected '$required' after applying the compatibility overlay" >&2
+  # Behaviour-critical: redirect stays OFF, creation stays UNSUPPORTED. A future
+  # "fix" that turns these into stub successes is caught here.
+  if ! python3 "$root/scripts/ci/check-apple-compat-overlay.py" "$platform_swift"; then
     checks_failed=1
   fi
-done
 
-# Behaviour-critical: redirect stays OFF, creation stays UNSUPPORTED. A future
-# "fix" that turns these into stub successes is caught here.
-if ! python3 "$root/scripts/ci/check-apple-compat-overlay.py" "$platform_swift"; then
-  checks_failed=1
+  # Notification must NOT have been shimmed: exactly one implementation of send(_:).
+  send_count="$(grep -cE "func send\(_ notification: LibboxNotification\?\) throws" "$platform_swift" || true)"
+  if [ "$send_count" != "1" ]; then
+    echo "FAIL: expected exactly one send(_:) implementation, found $send_count." >&2
+    echo "      Notification delivery must keep a single implementation." >&2
+    checks_failed=1
+  fi
+
+  [ "$checks_failed" -eq 0 ] || exit 1
+  echo "  [compatibility] usePlatformAutoRedirect -> false"
+  echo "  [compatibility] createAutoRedirect      -> explicit unsupported error"
+  echo "  [compatibility] PromotePowerReportDraft -> no-op (no draft entry point in this libbox)"
+  echo "  [compatibility] notification send(_:)   -> untouched, single implementation"
 fi
-
-# Notification must NOT have been shimmed: exactly one implementation of send(_:).
-send_count="$(grep -cE "func send\(_ notification: LibboxNotification\?\) throws" "$platform_swift" || true)"
-if [ "$send_count" != "1" ]; then
-  echo "FAIL: expected exactly one send(_:) implementation, found $send_count." >&2
-  echo "      Notification delivery must keep a single implementation." >&2
-  checks_failed=1
-fi
-
-[ "$checks_failed" -eq 0 ] || exit 1
-echo "  [compatibility] usePlatformAutoRedirect -> false"
-echo "  [compatibility] createAutoRedirect      -> explicit unsupported error"
-echo "  [compatibility] PromotePowerReportDraft -> no-op (no draft entry point in this libbox)"
-echo "  [compatibility] notification send(_:)   -> untouched, single implementation"
 
 # ---------------------------------------------------------------------------
 # 1b. [compatibility] Fix AppConfiguration.teamID.

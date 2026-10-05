@@ -216,10 +216,21 @@ if APPLE_SIGNING_MODE=development APPLE_TEAM_ID="$TEST_TEAM" \
     bash -c '! grep -q multicast clients/apple/SystemExtension/SystemExtension.entitlements'
   check "no iCloud entitlement survives with the switch off" \
     bash -c '! grep -q "com.apple.developer.icloud" clients/apple/SFI/SFI.entitlements'
-  check "the overlay is idempotent (refuses to re-apply)" \
-    bash -c '! APPLE_SIGNING_MODE=development APPLE_TEAM_ID='"$TEST_TEAM"' \
+  # Idempotent, and asserted as the property that matters: a second run must change nothing,
+  # not fail. Both overlays now recognise their own output - compatibility because this fork's
+  # client carries the two members itself, branding because it has always detected the branded
+  # state - so "refuses to re-apply" is no longer the contract. What must hold is that running it
+  # twice appends no second copy and does not move the submodule HEAD, which is checked here and
+  # again by the script's own "submodule HEAD unchanged" assertion.
+  head_before="$(git -C clients/apple rev-parse HEAD)"
+  check "the overlay is idempotent (a second run changes nothing)" \
+    bash -c 'APPLE_SIGNING_MODE=development APPLE_TEAM_ID='"$TEST_TEAM"' \
       APPLE_BASE_BUNDLE_ID='"$TEST_BASE"' APPLE_APP_GROUP_ID=group.'"$TEST_BASE"' \
-      ./scripts/ci/prepare-apple-client.sh'
+      ./scripts/ci/prepare-apple-client.sh >/dev/null 2>&1'
+  check "re-applying the overlay does not move the submodule HEAD" \
+    test "$(git -C clients/apple rev-parse HEAD)" = "$head_before"
+  check "re-applying the overlay appends no second compatibility shim" \
+    test "$(grep -c 'func usePlatformAutoRedirect() -> Bool' clients/apple/Library/Network/ExtensionPlatformInterface.swift)" = "1"
 else
   echo "  FAIL: could not apply the overlay; skipping its assertions" >&2
   fail=$((fail + 1))
