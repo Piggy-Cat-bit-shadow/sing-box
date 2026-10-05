@@ -440,9 +440,12 @@ In the order I would attack it:
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
-3. **The report read views** (`CrashReportDetailView`, `OOMReportDetailView`,
-   `PowerReportDetailView`, `ReportFileContentView`) use the shared chrome but not the form
-   idiom; they are pushed pages in a reading context.
+3. **The report read views are converted but not verified.** They were already in the form
+   idiom — a `Form` of `Section`s — assembled per view alongside a separate chrome call;
+   they are now one `HakoReportScaffold` call each, which also gives them the page canvas.
+   Nothing has *seen* them: the fixture records no reports, so the inbox is always empty and
+   there is no report to open. Reaching them needs fixture report data, which is a fixture
+   change rather than a UI one.
 4. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
    fixed (§1.7a item 12). Not yet audited: the workspaces at accessibility sizes, the
    proxied grid's two-column layout when the text grows, and the modal sheets.
