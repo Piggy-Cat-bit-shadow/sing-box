@@ -213,7 +213,11 @@ workspace restores it.
     row exists to name rendered as `se...er2`; and the group header's `SELECTOR · SERVER`
     middle-truncated into `SEL...VER`, which is neither word. All three are a layout that works
     at four columns of body text and not at three columns of display text.
-18. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+18. **The report list's footnote contradicted the list.** "You will receive a report when a
+    crash occurs." is the empty page's explanation, and it was drawn under a list that had a
+    report in it — saying the opposite of what the reader could see. It is now the empty
+    state's alone.
+19. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -361,6 +365,10 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
+- **The report pages**: a report archived by the fixture through the archive's own writer,
+  listed with its date, origin and unread badge, and read as a page that names the artifacts
+  actually present on disk - Metadata, Crash Report, Go Crash Log, Configuration - with share
+  and delete in one action capsule.
 - **Home's failure state**: an unreadable configuration is reported by the page's own
   `HakoInlineNotice` - the page name, a prominent retry and the reason in the warning colour
   above the first card - with every other card still drawn and reachable. A condition the
@@ -455,8 +463,11 @@ inbox's empty state, the configuration centre, Proxies collapsed, Proxies filter
 the add-configuration sheet and the add flow reached from the centre itself.
 
 It can also start the app in a named fixture state
-(`SCREENSHOT_STATE=profileError`), which is how the failure path above is photographed at
-all: a page that exists only when something has gone wrong is a page nobody has looked at.
+(`SCREENSHOT_STATE=profileError`) and it archives a crash report through the archive's own
+writer, which is how the failure path and the report pages are photographed at all: a page that
+exists only when something has gone wrong is a page nobody has looked at. The archived report
+carries a `.hako-fixture` marker and `scanCrashReports` skips a marked report outside a
+screenshot run, so no developer's own simulator shows a crash that did not happen.
 
 Two of its cases assert rather than photograph, because they are the two things the manual
 names that a screenshot cannot establish: `test13MoreScrolledToBottom` asks whether the last
@@ -552,7 +563,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page; the settings pages are one `Form` |
 | 7 | Proxies/Activity are complete workspaces | done | pinned strip, search, actions, group header, member grid; captured |
 | 8 | Config centre consistent | partial | chrome, progress, expiry and update-all done; the segmented libraries are not built, deliberately (§6) |
-| 9 | Reports consistent | partial-but-verified-by-build | the lists and all three read views are on `HakoReportScaffold`; nothing has *seen* them, because the fixture records no reports (§6) |
+| 9 | Reports consistent | **asserted** | the fixture archives a report through the archive's own writer, so the list has a row and the read view has real files behind it; `test32ReportListAndDetail` opens both and asserts the read view lists the artifacts |
 | 10 | No raw internal keys | **asserted** | `testNoRawInternalKeysOnAnyPage` walks 3 roots + 7 destinations; `testTunnelPageShowsUserTitlesAndNoRawPropertyNames` |
 | 11 | No unrelated brand residue | **asserted** | same sweep, plus `SFM`/`SFMExtension`/`Ghostty Configuration`/`Clash Mode` removed |
 | 12 | No double chevron | **asserted** | `testNavigableRowsDrawExactlyOneIndicator` |
@@ -563,10 +574,10 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
 
 Five of the seventeen are now assertions rather than impressions. The remaining gaps are
-named in §6. The one that most affects the verdict now is #9: the report pages build, run and
-are on the shared scaffold, but no fixture records a report, so nothing has ever looked at
-one. #14 is honest in the other direction - every page's controls are driven by the snapshot
-suite, but there has been no exhaustive audit of controls that no fixture reaches.
+named in §6, and they are now gaps in *coverage* rather than in the work: #9 closed when the
+fixture learned to archive a report, and #14 remains partially audited in the honest direction
+- every page's controls are driven by the snapshot suite, but there has been no exhaustive
+audit of controls that no fixture reaches.
 
 ## 6. What is open
 
@@ -580,12 +591,10 @@ In the order I would attack it:
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
-3. **The report read views are converted but not verified.** They were already in the form
-   idiom — a `Form` of `Section`s — assembled per view alongside a separate chrome call;
-   they are now one `HakoReportScaffold` call each, which also gives them the page canvas.
-   Nothing has *seen* them: the fixture records no reports, so the inbox is always empty and
-   there is no report to open. Reaching them needs fixture report data, which is a fixture
-   change rather than a UI one.
+3. **The other two report managers have no fixture.** Crash reports are now archived by the
+   fixture and both the list and the read view have been looked at. The out-of-memory and
+   power reports share the shape but not the fixture, so their lists and read views are still
+   unverified — the same one-hour change, for two more managers.
 4. **The configuration centre's segmented libraries have no counterpart here.** This client
    keeps no separate node or rule store, and a tab onto nothing would be a page invented to
    fill a diagram. Everything else about the centre is done.
