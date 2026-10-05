@@ -11,11 +11,15 @@ macOS and the Mac cross-comparison section of the brief was deliberately not exe
 **NOT READY.**
 
 The design system now traces to the reference source rather than to a description of it,
-the reference app builds and runs on this simulator, and the iOS navigation suite passes
-16/16. But the round covers the design system, the shells, the root pages, the settings
-pages and the workspaces only; the complex work pages (the proxy member grid, the config
-centre, the report read views), Dynamic Type, the dark-mode pass, the snapshot suite and
-the macOS client are not done. §6 lists exactly what is open.
+the reference app builds and runs on this simulator, and **both** iOS suites pass — the
+navigation suite 16/16 and the snapshot suite 13/13, 29 tests in all, with 12 screens
+captured. Two of the defects fixed in the latest round were found only by running the
+snapshot suite, one of which had made an entire page invisible while its accessibility
+tree looked correct.
+
+Still open: the config centre, the report read views, the Activity lens structure, Dynamic
+Type, the dark-mode pass, the parent gitlink, and the macOS client (out of scope by
+instruction). §6 lists exactly what is open.
 
 ---
 
@@ -153,6 +157,30 @@ workspace restores it.
 7. **`HakoSheetCloseButton` is a plain icon-only `xmark`** in `.cancellationAction` with
    identifier `sheet.close`, not a drawn disc.
 
+### 1.7a Defects the first snapshot run found (second pass)
+
+8. **An empty pinned top bar took the whole page.** `HakoWorkspaceScaffold` pinned a strip
+   to the top of every workspace with `safeAreaBar(edge: .top)`. The proxy sheet has no
+   strip, so it pinned an `EmptyView` — and the bar still took its slot, leaving the scroll
+   view below it with no height. The sheet rendered its chrome, its search field, its action
+   capsule and nothing else: no summary, no group cards, not even the empty state.
+   **The accessibility tree still contained the rows**, which is why the navigation suite
+   passed while the page was blank: `testProxyWorkspaceSearches` asserts that a group
+   *exists*, not that it is on screen. That is a real limit of an accessibility assertion,
+   and the reason the snapshot pass exists beside it. Pinning is now a property of the
+   initializer.
+9. **The Activity workspace used the system search field in a sheet**, where there is no
+   bottom bar for it to live in. It draws the same capsule the proxy sheet does, which is
+   also what the reference's proxy sheet does; `.system` remains for a page pushed inside a
+   tab.
+10. **The profile card's add control had no accessibility label and no identifier** — an
+    icon-only button VoiceOver could not name (§70/§71), and the reason the snapshot harness
+    could not reach the add-configuration sheet. Now labelled, identified, and its target is
+    at least 44pt.
+11. **The fixture passed capitalized proxy type strings**, which the core's display-type
+    mapping does not recognise, so every member of every snapshot read "Unknown" — a fixture
+    that made the pages it exists to photograph look wrong.
+
 ### 1.8 Evidence
 
 - **Vision / screenshots**: `~/hako-ui-compare/reference/*.png` (8 screens) and
@@ -239,9 +267,16 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   "No documentation." The switches write the same preferences with the same polarity.
   Polarity was **not** inverted even though the manual's wording is positive: inverting
   would change what an existing user sees without changing what they get.
-- **Proxies / Activity**: workspaces with a pinned strip, the platform's search field, a
-  summary card, test-all and expand-all, and an expandable group header showing strategy,
-  selected member and count while collapsed.
+- **Proxies / Activity**: workspaces with a pinned strip where there is one, a search field
+  appropriate to how the page is presented, a summary card, test-all and expand-all, and a
+  group header composed from the reference's card presentation: the group's name over one
+  uppercase line of strategy and selection (`SELECTOR · SERVER`), the member count and the
+  fold chevron together on the trailing side, and the group test as a control of its own —
+  folding and testing are separate taps on purpose, so a group is not folded when the user
+  meant to test it. A selected member is marked by a tinted surface and a 3pt bar down its
+  leading edge (`HakoProxyMemberCard`), not by a checkmark that moves from column to column
+  in a grid, and members carry their own testing state so a sweep over 137 nodes shows
+  progress on the rows it is working through.
 
 ### 2.7 Legacy residue removed
 
@@ -285,11 +320,22 @@ DISABLE_SWIFTLINT=1 xcodebuild build -project sing-box.xcodeproj -scheme SFI -co
 
 The app installs and launches; screenshots are in `~/hako-ui-compare/ours/`.
 
-### 3.2 Behaviour — `SFIUITests/HakoNavigationUITests`
+### 3.2 Behaviour — both suites, **29 tests, 0 failures**
 
-**16 tests, 0 failures** on `iPhone 18 Pro Max` / iOS 27.0, serial
-(`-parallel-testing-enabled NO`). This suite had never been executed before this round; its
-first run found three client defects and eight wrong assumptions in itself.
+```bash
+xcodebuild test -project sing-box.xcodeproj -scheme SFI -configuration Debug \
+  -destination 'platform=iOS Simulator,id=D5F2B38E-F921-47A6-AF80-89843EAB0A7F' \
+  -derivedDataPath /tmp/dd-ios-signed -parallel-testing-enabled NO \
+  -only-testing:SFIUITests/HakoNavigationUITests \
+  -only-testing:SFIUITests/HakoSnapshotUITests \
+  -skipPackagePluginValidation -skipMacroValidation \
+  CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=YES \
+  APP_GROUP_IDENTIFIER=group.io.nekohasekai.sfamt BASE_PACKAGE_IDENTIFIER=io.nekohasekai.sfamt
+# Executed 29 tests, with 0 failures
+```
+
+`HakoNavigationUITests` — **16/16**. This suite had never been executed before this round;
+its first run found three client defects and eight wrong assumptions in itself.
 
 ```text
 root tab order and reachability · detail hides the tab and popping restores it ·
@@ -298,6 +344,16 @@ the proxy sheet's drawn search filters and restores · the activity search field
 one disclosure indicator per navigable row · the tunnel page's row labels carry no raw
 property name · Logs push/pop, cold launch, deep link, double-push, current-tab, rapid switch
 ```
+
+`HakoSnapshotUITests` — **13/13**, and it is the manual's §77/§78 coverage rather than a
+marketing capture: Home, Tools, More, Logs, On Demand, Tunnel, Core, Client Settings, the
+report inbox's empty state, Proxies collapsed, Proxies filtered, Activity and the
+add-configuration sheet. It drives each page the way a user reaches it, so a page that
+cannot be reached by tapping what the test taps fails here.
+
+**Where the images land:** the fastlane default, `~/Library/Caches/tools.fastlane/screenshots/`,
+as `<device>-<name>.png`. `TEST_RUNNER_SCREENSHOTS_DIR` did **not** reach the runner on this
+setup; `SIMULATOR_HOST_HOME` is what the helper consults. Copy them out after a run.
 
 ### 3.3 Runtime logs
 
@@ -355,21 +411,24 @@ xcrun simctl install booted /tmp/dd-hakoref/Build/Products/Debug-iphonesimulator
 
 In the order I would attack it:
 
-1. **The Proxies member grid.** The reference's group card is `title · strategy SELECT ·
-   <count> ⌄`, its member rows are uppercase name + type with a leading selection mark and a
-   trailing test glyph, and it has an "Ungrouped" card. Our `HakoDataRow`/`HakoProxyMemberRow`
-   are the right shape but were not compared row-against-row.
+1. **The reference's other proxies presentations.** The reference has three: the system
+   `List` (its default, and what the deep-linked screenshot shows), the card/accordion
+   presentation this client now matches, and a horizontal group-tab strip. Ours is the card
+   one, per the manual. Its "Ungrouped" card has no counterpart yet, because this client's
+   group list does not model ungrouped outbounds.
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
 3. **The report read views** (`CrashReportDetailView`, `OOMReportDetailView`,
    `PowerReportDetailView`, `ReportFileContentView`) use the shared chrome but not the form
    idiom; they are pushed pages in a reading context.
-4. **`HakoSnapshotUITests` has still never run.** It compiles; two of its cases are weak
-   (`test30ReportInboxEmpty` does not open an inbox; `test50AddConfiguration` looks for an
-   `"Add"` button that may not be the profile card's `+`).
-5. **Dynamic Type and dark mode** were not audited on any page. The fixture can capture
-   either appearance (`SCREENSHOT_APPEARANCE=light`) but no comparison was made.
+4. **Dynamic Type and dark mode** were not audited on any page. The fixture can capture
+   either appearance (`SCREENSHOT_APPEARANCE=light`) and every screenshot so far is dark,
+   which is the fixture's default; no accessibility-size or light-mode comparison was made.
+5. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
+   records no requests, and Connections and Logs are still two pushed pages rather than one
+   workspace with a strip. Merging them would give the strip a use and match the reference's
+   page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
 6. **`OverviewView` is dead on iOS** — only tvOS uses it now.
 7. **tvOS has not been built or run** this round and shares less with iOS than before.
 8. **The parent gitlink is not updated.** Four submodule commits are local and unpushed; the
