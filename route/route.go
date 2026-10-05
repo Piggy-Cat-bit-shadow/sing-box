@@ -483,14 +483,17 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol)
 			}
 		case *R.RuleActionRouteOptions:
-			applyRouteOptionsMetadata(&metadata, action)
+			applyActionRouteOptions(&metadata, action)
 		case *R.RuleActionRoute:
 			// Applied before the flow decision, so the metadata canFastBypass inspects matches
 			// what the slow path would have seen.
-			applyRouteOptionsMetadata(&metadata, &action.RuleActionRouteOptions)
+			applyActionRouteOptions(&metadata, action)
 			return r.preMatchFlow(ctx, &metadata, packetDestination, currentRule, action.Outbound)
 		case *R.RuleActionBypass:
-			applyRouteOptionsMetadata(&metadata, &action.RuleActionRouteOptions)
+			// A bypass without an outbound contributes nothing, which is what keeps the verdict
+			// below reachable: its own options can no longer rewrite the destination out from
+			// under it.
+			applyActionRouteOptions(&metadata, action)
 			if action.Outbound == "" {
 				if metadata.Destination.IsDomain() || metadata.Destination != packetDestination {
 					return continueResult
@@ -550,6 +553,55 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 //
 // It must be called BEFORE any verdict is produced, because its whole purpose is to make the
 // metadata the fast path inspects identical to the metadata the slow path would have seen.
+// routeOptionsForAction returns the route options an action contributes to the connection
+// metadata, or nil when the action contributes none.
+//
+// It exists because two passes decide which actions change how a connection is handled - the
+// pre-match decision and the full match path - and a connection judged in pre-match is only
+// equivalent to the full path if both saw the same options. They were decided in two places and
+// disagreed about exactly one case:
+//
+//	bypass() with no outbound
+//
+// The full match path applied nothing, and the pre-match pass applied the action's options. The
+// pre-match behaviour was the wrong one: a bypass action without an outbound routes nothing, so
+// there is no route for its options to configure, and the packet destination guard already treats
+// that same action as "not a decision" and keeps looking. Applying its options anyway rewrote the
+// destination before the bypass verdict was computed, the verdict's own "is this still the packet's
+// destination" test then failed, and the rule silently stopped bypassing while the full path
+// applied nothing at all - a flow the two passes genuinely disagreed about, with no error and no
+// log.
+func routeOptionsForAction(action adapter.RuleAction) *R.RuleActionRouteOptions {
+	switch action := action.(type) {
+	case *R.RuleActionRoute:
+		return &action.RuleActionRouteOptions
+	case *R.RuleActionRouteOptions:
+		return action
+	case *R.RuleActionBypass:
+		if action.Outbound == "" {
+			return nil
+		}
+		return &action.RuleActionRouteOptions
+	default:
+		return nil
+	}
+}
+
+// applyActionRouteOptions applies whatever route options the action contributes, and reports
+// whether it contributed any.
+//
+// Both passes call this and nothing else applies an action's options, so the question "which
+// actions change how a connection is handled" has one answer. The field-level work stays in
+// applyRouteOptionsMetadata; this is only the decision of whether to do it.
+func applyActionRouteOptions(metadata *adapter.InboundContext, action adapter.RuleAction) bool {
+	routeOptions := routeOptionsForAction(action)
+	if routeOptions == nil {
+		return false
+	}
+	applyRouteOptionsMetadata(metadata, routeOptions)
+	return true
+}
+
 func applyRouteOptionsMetadata(metadata *adapter.InboundContext, routeOptions *R.RuleActionRouteOptions) {
 	// The original destination is captured before any rewrite, and only the first time: it records
 	// what the application asked for, which later rules must not overwrite.
@@ -993,20 +1045,8 @@ match:
 		} else {
 			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] => ", currentRule.Action())
 		}
-		var routeOptions *R.RuleActionRouteOptions
-		switch action := currentRule.Action().(type) {
-		case *R.RuleActionRoute:
-			routeOptions = &action.RuleActionRouteOptions
-		case *R.RuleActionRouteOptions:
-			routeOptions = action
-		case *R.RuleActionBypass:
-			if action.Outbound != "" {
-				routeOptions = &action.RuleActionRouteOptions
-			}
-		}
-		if routeOptions != nil {
+		if applyActionRouteOptions(metadata, currentRule.Action()) {
 			// TODO: add nat
-			applyRouteOptionsMetadata(metadata, routeOptions)
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
