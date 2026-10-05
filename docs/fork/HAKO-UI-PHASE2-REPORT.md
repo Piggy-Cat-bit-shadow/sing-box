@@ -252,7 +252,14 @@ workspace restores it.
     truncation. `FormPicker` was already stacking its value under its label, so the same kind of
     row was laid out two different ways. It is a view now, so it can read the text size, and every
     `FormItem` in the client stacks at once because it is the shared component.
-25. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+25. **A stray disclosure indicator from a false equivalence.** The add-configuration modal drew
+    a chevron at the trailing edge of its three action tiles. It was not the tile's: the hidden
+    `NavigationLink` that pushes the manual editor was attached to `HakoModalScaffold`'s
+    *content*, and that scaffold wraps its content in a `Form` - so the link was a row, and the
+    platform gives a row that navigates a disclosure indicator. Two attempts failed by treating
+    "inside the modal" and "outside the form" as the same thing. Attached to the scaffold's own
+    result, it is outside the form and the indicator is gone.
+26. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -653,13 +660,6 @@ In the order I would attack it:
 2. **The config centre.** The reference's `HakoProductModal` (720pt, header 56, close glyph
    32, content inset 85) and its profile collection pages were not migrated. Our
    `ProfilePickerSheet` is still the previous round's.
-4. **One stray disclosure indicator, understood only in part.** The add-configuration modal
-   draws a chevron at the trailing edge of its three action tiles. Replacing the third tile's
-   `NavigationLink` with a `Button` did not remove it, and moving the hidden navigation
-   destination outside the form did not either, so it is not from the link. Most likely the
-   grouped `Form` gives an accessory to a section whose row holds interactive content. It is
-   cosmetic; it is recorded rather than guessed at again, and the comment in the source says
-   the same thing.
 4. **The configuration centre's segmented libraries have no counterpart here.** This client
    keeps no separate node or rule store, and a tab onto nothing would be a page invented to
    fill a diagram. Everything else about the centre is done.
