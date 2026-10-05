@@ -32,7 +32,7 @@ are untouched.
 
 ## Rounds recorded against it
 
-### Second UI round — secondary destinations (`747143cf0` → `16cacb701`)
+### Second UI round — secondary destinations (`747143cf0` → `eb53098`)
 
 The first round built the shell (Home, Tools, More, the tab bar, the bottom dock) and left the
 pages behind it on their original presentation. This round took the secondary destinations:
@@ -48,10 +48,11 @@ pages behind it on their original presentation. This round took the secondary de
 | remote | the same, for the server list |
 | logs | the native log text view sits on the shared surface; the data path and the auto-scroll policy are unchanged |
 | macOS | the detail column is centred and inset without touching `NavigationSplitView` or any of its behaviour |
+| pickers | the option pickers share one selection mark, which renders the unselected state as well |
 
-The child commit is `16cacb70101f416f60c5faea12a2e6df0c1ca244` on `hako-ui`. The build-time
+The child commit is `eb53098` on `hako-ui`. The build-time
 compatibility overlay that `scripts/ci/prepare-apple-client.sh` applies to the submodule is not
-part of any child commit, and the nine commits touch only `ApplicationLibrary/Views/**`,
+part of any child commit, and the ten commits touch only `ApplicationLibrary/Views/**`,
 `MacLibrary/MainView.swift` and `scripts/dev/`.
 
 Not verified in this round: the runtime behaviour of the shell routing change and every visual
