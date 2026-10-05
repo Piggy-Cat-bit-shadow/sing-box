@@ -186,7 +186,21 @@ workspace restores it.
     mode. With the tunnel stopped the core cannot report a mode back, so the row never moved:
     the page looked broken and the tap looked ignored. The choice is held locally first and
     reconciled with the core's published value, which is what the card did.
-13. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+13. **No modal in the client had a close control.** `NavigationSheet` is the container all
+    eight modals are built on, and on iOS it was a `NavigationStack` with a title: a sheet
+    could only be dismissed by dragging it down. The manual's modal chrome is a close on the
+    leading side, a centred title and the page's own actions on the trailing side; the
+    reference uses an icon-only `xmark` in that slot. The control now lives in the container
+    so it cannot be forgotten, and all eight modals gain it at once.
+14. **The configuration centre's add control lived on a different screen.** Adding a
+    configuration was only reachable from the Home profile card, so a user already looking at
+    their configurations had to close the centre to add one. Add, update-all and edit are one
+    action capsule in the centre now.
+15. **A remote configuration being fetched reported nothing.** The row disabled itself and
+    hid its menu, so a slow download looked like a row that had stopped responding. The row
+    now carries a progress indicator - the manual's configuration card carries progress and
+    expiry, and that was the progress half. Update-all is new as well.
+16. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -285,6 +299,10 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
+- **The configuration centre**: the manual's modal chrome - close, centred title, and one
+  action capsule holding update-all, add and edit - over a list of configurations whose cards
+  carry their type, their last-updated time and a progress indicator while a remote one is
+  fetched. Adding is reachable from the centre itself rather than only from the Home card.
 - **Proxies / Activity**: workspaces with a pinned strip where there is one, a search field
   appropriate to how the page is presented, a summary card, test-all and expand-all, and a
   group header composed from the reference's card presentation: the group's name over one
@@ -363,10 +381,11 @@ one disclosure indicator per navigable row · the tunnel page's row labels carry
 property name · Logs push/pop, cold launch, deep link, double-push, current-tab, rapid switch
 ```
 
-`HakoSnapshotUITests` — **15/15**, and it is the manual's §77/§78 coverage rather than a
+`HakoSnapshotUITests` — **16/16**, and it is the manual's §77/§78 coverage rather than a
 marketing capture: Home, the outbound mode, Tools, More, More scrolled to its end, Logs,
-On Demand, Tunnel, Core, Client Settings, the report inbox's empty state, Proxies collapsed,
-Proxies filtered, Activity and the add-configuration sheet.
+On Demand, Tunnel, Core, Client Settings, the report inbox's empty state, the configuration
+centre, Proxies collapsed, Proxies filtered, Activity, the add-configuration sheet and the
+add flow reached from the centre itself.
 
 Two of its cases assert rather than photograph, because they are the two things the manual
 names that a screenshot cannot establish: `test13MoreScrolledToBottom` asks whether the last
@@ -465,7 +484,12 @@ In the order I would attack it:
    Nothing has *seen* them: the fixture records no reports, so the inbox is always empty and
    there is no report to open. Reaching them needs fixture report data, which is a fixture
    change rather than a UI one.
-4. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
+4. **The configuration centre is half migrated.** Its chrome is the manual's and its card
+   carries progress and expiry, but `ProfilePickerRow` still draws its own card with its own
+   insets rather than the shared row language, and the manual's segmented libraries have no
+   counterpart here: this client keeps no separate node or rule store, and a tab onto nothing
+   would be a page invented to fill a diagram.
+5. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
    fixed (§1.7a item 13). Not yet audited: the workspaces at accessibility sizes, the
    proxied grid's two-column layout when the text grows, and the modal sheets.
    **Light mode** was compared against the light reference for Home, Tools, More and Logs
@@ -474,20 +498,20 @@ In the order I would attack it:
    the ones worth acting on are in §1.7a. The snapshot suite still captures dark, because the
    fixture forces it: light captures are made with
    `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`.
-5. **The connect failure state.** The reference surfaces a profile it cannot read as an
+6. **The connect failure state.** The reference surfaces a profile it cannot read as an
    inline message with a prominent retry in a header row above the first card - its Home
    shows `VPN 配置无法读取或保存。` with a `重试` button. This client surfaces failures as
    blocking alerts, which is heavier and stops the page. Not changed in this round: it is a
    page-level state, not a row.
-6. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
+7. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
    page shape, but it changes the shell's `NavigationPage` mapping and its deep-link path.
-7. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
+8. **`OverviewView` is dead on iOS** — only tvOS uses it, along with `RemoteDashboardView`,
    which still draws the legacy `ClashModeCard`.
-8. **tvOS has not been built or run** this round and shares less with iOS than before.
-9. **The parent gitlink is not updated.** Eleven submodule commits are local and unpushed;
+9. **tvOS has not been built or run** this round and shares less with iOS than before.
+10. **The parent gitlink is not updated.** Twelve submodule commits are local and unpushed;
    the parent still records `1b26865`.
-10. **The macOS client is untouched but unverified** — see the handoff document
+11. **The macOS client is untouched but unverified** — see the handoff document
    (`docs/fork/HAKO-UI-PHASE2-HANDOFF.md`), which also lists the macOS items that the
    earlier rounds left in place.
