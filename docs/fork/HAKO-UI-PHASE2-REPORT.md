@@ -206,7 +206,14 @@ workspace restores it.
     alert that hid them, for a condition the user had not caused. The distinction is now
     explicit and is the reference's: a condition the client *found* is reported in place; a
     failure the user *caused* by an action still alerts.
-17. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+17. **The proxy workspace did not survive accessibility text sizes.** None of it had been
+    looked at at `accessibility-extra-extra-extra-large`, and three layouts failed there: the
+    summary card's figures stayed in three columns and broke the word "Groups" in half around
+    its own cell; a per-member test control took a third of the row's width, so the member the
+    row exists to name rendered as `se...er2`; and the group header's `SELECTOR · SERVER`
+    middle-truncated into `SEL...VER`, which is neither word. All three are a layout that works
+    at four columns of body text and not at three columns of display text.
+18. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -552,12 +559,14 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 13 | Search safe-area correct | asserted in part | `testProxyWorkspaceSearches`, `testActivityWorkspaceOffersSearch`; the sheet capsule uses `safeAreaInset` |
 | 14 | Every button works | partial | the snapshot suite drives each page through its real controls; no exhaustive audit |
 | 15 | Deep navigation works | **asserted** | `testDeepLinkToLogsBeforeToolsWasEverShown` |
-| 16 | Dynamic Type acceptable | partial | audited on Home/Tools/More at `accessibility-extra-extra-extra-large`, one defect found and fixed; the workspaces and the member grid are not audited |
+| 16 | Dynamic Type acceptable | done for the pages that exist | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity and the configuration centre; four defects found and fixed (§1.7a 17, 18) |
 | 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
 
 Five of the seventeen are now assertions rather than impressions. The remaining gaps are
-named in §6; the two that most affect the verdict are #16 (an unaudited grid at accessibility
-sizes) and #9 (reports that build and run but have never been looked at).
+named in §6. The one that most affects the verdict now is #9: the report pages build, run and
+are on the shared scaffold, but no fixture records a report, so nothing has ever looked at
+one. #14 is honest in the other direction - every page's controls are driven by the snapshot
+suite, but there has been no exhaustive audit of controls that no fixture reaches.
 
 ## 6. What is open
 
@@ -589,9 +598,10 @@ In the order I would attack it:
    `NSColor.controlBackgroundColor` on the desktop - and both are inside platform branches
    this round does not touch. The general finding is worth keeping: the token set is not
    enforced where a legacy platform branch draws its own surface by hand.
-5. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
-   fixed (§1.7a item 13). Not yet audited: the workspaces at accessibility sizes, the
-   proxied grid's two-column layout when the text grows, and the modal sheets.
+5. **Dynamic Type** was audited on Home, Tools, More, Proxies, Activity and the
+   configuration centre and found one defect, which is
+   fixed, along with the three the workspaces had (§1.7a items 17, 18). Not audited: the
+   report pages and the editors, which no fixture reaches.
    **Light mode** was compared against the light reference for Home, Tools, More and Logs
    (`~/hako-ui-compare/ours-light/`). The surfaces, the card radius, the page inset and the
    muted captions agree; the differences it produced were content and order, not colour, and
