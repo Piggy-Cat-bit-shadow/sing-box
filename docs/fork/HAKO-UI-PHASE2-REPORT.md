@@ -266,7 +266,15 @@ workspace restores it.
     the rest is the RPC stack talking to itself and goes to the log. This is the "no raw internal
     keys" gate item reached through an error message rather than a settings row, and it is the
     third time a raw internal string has been found in user-facing text.
-27. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+27. **The Activity workspace never observed the object that owns its state.** `ConnectionDataModel`
+    owns `isLoading` and the connection list, and the workspace read both *through* the view model
+    — which the view does observe — so the model's changes invalidated nothing. The page rendered
+    its initial state and kept it: with the tunnel stopped it showed a spinner forever and the
+    empty state below it was unreachable, and a live connection list would not have appeared
+    either. This is the defect that took three attempts, and the first two were guesses; only
+    instrumenting the path showed that the flag *was* being cleared while the view went on
+    rendering it.
+28. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -637,7 +645,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 4 | Home follows the Hako hierarchy | done | session · profile · outbound mode · shortcuts · traffic · runtime; captured |
 | 5 | Tools/More grouped, every row subtitled | done | captured in both appearances; `testEveryMoreDestinationOpens` |
 | 6 | Secondary pages on one scaffold | done | `HakoNavigationChrome` on every detail page — three pages that were missing it are fixed (§1.7a 22, 23); the settings pages are one `Form` |
-| 7 | Proxies/Activity are complete workspaces | done | pinned strip, search, actions, group header, member grid; captured |
+| 7 | Proxies/Activity are complete workspaces | done, with one lens each | pinned chrome, search, actions, summary card, data rows; the Activity workspace's state is observed and it resolves (§1.7a 27). The manual's three lenses are two here and the reason is §6 |
 | 8 | Config centre consistent | partial | chrome, progress, expiry and update-all done; the segmented libraries are not built, deliberately (§6) |
 | 9 | Reports consistent | **asserted** | all three report kinds are archived by the fixture through their archives' own writers, so every list has a row and every read view has real files behind it; `test32`, `test34` and `test36` open each and assert on the artifacts |
 | 10 | No raw internal keys | **asserted** | `testNoRawInternalKeysOnAnyPage` walks 3 roots + 7 destinations; `testTunnelPageShowsUserTitlesAndNoRawPropertyNames` |
@@ -692,7 +700,14 @@ In the order I would attack it:
    the ones worth acting on are in §1.7a. The snapshot suite still captures dark, because the
    fixture forces it: light captures are made with
    `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`.
-7. **The Activity lens structure, with the reason it is not additive.** The manual asks for
+7. **The Activity lens structure, with the reason it is not additive, now read from the manual
+   rather than from memory.** §45 asks for 連接 / 請求 / 日志 with "selected underline" and, in its
+   own test list, **search scope and sort scope** — which confirms each lens owns its own search
+   and sort, so a strip routes the workspace's search binding and its action capsule per lens
+   rather than adding a control. §43 also names components this client does not all have:
+   `HakoRouteSummaryRow` was deleted as unreferenced in an early round, and `HakoMetricText` is
+   this client's `HakoMetricStack`.
+   The original note follows: The manual asks for
    連接 / 請求 / 日志 lenses in one workspace. Investigating it properly changed the estimate:
    the lenses do not share their search or their actions — the connections lens searches
    connections through the workspace's drawn field, while the logs lens owns a `.searchable`,
