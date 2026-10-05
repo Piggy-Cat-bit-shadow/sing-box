@@ -274,7 +274,14 @@ workspace restores it.
     either. This is the defect that took three attempts, and the first two were guesses; only
     instrumenting the path showed that the flag *was* being cleared while the view went on
     rendering it.
-28. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+28. **One number, stated two ways.** Home's proxy row said "Proxy groups" — its zero fallback —
+    while the proxy sheet said two. The groups were fabricated inside `GroupListViewModel` in
+    screenshot mode while the client every other page reads had none, so the two pages were
+    reading different fixtures rather than one being stale. The fixture lives in the client now,
+    and `test17HomeAgreesWithTheProxySheet` asserts the agreement rather than either page — a
+    single-page assertion cannot see this class, because both pages were individually correct
+    about their own data.
+29. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
     fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
     font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
     network-tool, proxy and report rows had their own labels half-covered by their icons.
@@ -563,6 +570,19 @@ change: a toggle row keeps its toggle aligned to the title with the subtitle wra
 it, and a selection row keeps its mark on the trailing side. That is worth recording as a
 result rather than as an absence - the three defects the workspace had were specific to a
 multi-column layout, and this client's settings pages were already a single column.
+
+### 3.2a The defect class this report found four times
+
+Four defects share a shape that reading the source does not reveal: **a view that renders its
+initial state and keeps it.** The proxy sheet rendered nothing at all (an empty pinned bar took
+the scroll area); the Activity workspace rendered a spinner that had already been cleared (it did
+not observe the object owning the flag); Home's counts never moved (same, through `environments`);
+and two pages disagreed about one number (two fixtures). Each was found by looking at a rendered
+page and asking why it did not match what the code said, and each was invisible to a per-page
+assertion because the page was self-consistent.
+
+The generalisation worth keeping: for every page, ask **what would make this change** - and then
+check that the view observes it.
 
 ### 3.2b The fourth non-discriminating assertion
 
