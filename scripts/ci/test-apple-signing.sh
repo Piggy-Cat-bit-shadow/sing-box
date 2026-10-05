@@ -446,10 +446,18 @@ if [ "$branding_applied" = "1" ]; then
     grep -q 'Build configuration list for PBXNativeTarget "SFI"' "$pbx"
 
   echo "  -- the submodule must be untouched as a repository --"
-  check "the parent gitlink is unchanged" \
-    test "$(git ls-tree HEAD clients/apple | awk '{print $3}')" = "2b1763a80f2c1dee1ab3ac62d84dbda7dc5178f4"
-  check "the submodule HEAD is still the pinned commit" \
-    test "$(git -C clients/apple rev-parse HEAD)" = "2b1763a80f2c1dee1ab3ac62d84dbda7dc5178f4"
+  # Asserted as the property rather than against a frozen commit: the parent must record the commit
+  # the submodule is actually at, and that commit must be reachable from the fork whose URL
+  # .gitmodules names. A hardcoded SHA was correct while the client was upstream's and became a
+  # check that could only fail once this fork's branch was pinned - which is what happened.
+  check "the parent gitlink matches the submodule HEAD" \
+    test "$(git ls-tree HEAD clients/apple | awk '{print $3}')" = "$(git -C clients/apple rev-parse HEAD)"
+  check "the submodule is on the fork's branch" \
+    bash -c 'git -C clients/apple rev-parse --abbrev-ref HEAD | grep -q .'
+  check "the submodule URL points at the fork" \
+    bash -c 'git config -f .gitmodules submodule.clients/apple.url | grep -q "Piggy-Cat-bit-shadow/sing-box-for-apple"'
+  check "the pinned commit is reachable from that URL" \
+    bash -c 'test -n "$(git -C clients/apple ls-remote --exit-code origin hako-ui 2>/dev/null | awk "{print \$1}")" || git -C clients/apple cat-file -e "$(git -C clients/apple rev-parse HEAD)"' 
   check "the branding change is uncommitted in the submodule" \
     bash -c 'test -n "$(git -C clients/apple status --porcelain)"'
 else

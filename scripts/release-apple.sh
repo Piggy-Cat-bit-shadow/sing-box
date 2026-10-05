@@ -52,6 +52,11 @@ export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
 
 # --- local publishing configuration -------------------------------------------
 #
+# A function, not a top-level block: it uses `local` so that the variables it derives cannot leak
+# into the rest of the script, which is what the signing regression test asserts. It ran as a
+# top-level block for a while, which is a syntax-level error - `local` outside a function - that
+# only fired when the file it guards existed, so a machine without .env.apple.local never saw it.
+load_local_publishing_config() {
   # Order of precedence:
   #   1. variables already exported in this shell
   #   2. .env.apple.local in the repository root, if present
@@ -104,6 +109,9 @@ export APPLE_SIGNING_STYLE="${APPLE_SIGNING_STYLE:-automatic}"
       exit 2
     fi
   fi
+}
+
+load_local_publishing_config
 
 eval "$(./scripts/ci/apple-signing-config.sh)"
 
@@ -128,6 +136,14 @@ step() {
   echo
   echo "== $* =="
 }
+
+# Which cronet archive this build will link, before anything is built.
+#
+# It runs for every target and before the first build, because the question it answers - does the
+# resolved fork pin actually reach the native archive - is a property of the checkout, not of a
+# platform, and a release that discovers it late has already built an artifact that must be thrown
+# away.
+step "cronet provenance"; ./scripts/ci/verify-cronet-provenance.sh apple
 
 # ---------------------------------------------------------------------------
 # Shared preflight
@@ -196,7 +212,6 @@ step "prepare the Apple client"
 # ---------------------------------------------------------------------------
 do_ios() {
   step "build signed iOS IPA"
-  step "cronet provenance"; ./scripts/ci/verify-cronet-provenance.sh apple
   ./scripts/ci/build-ios-ipa.sh dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
   step "verify the signed IPA"
   ./scripts/ci/verify-apple-signed-artifact.sh ios-ipa dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
