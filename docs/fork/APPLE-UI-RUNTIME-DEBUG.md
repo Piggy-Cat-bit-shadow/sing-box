@@ -336,15 +336,57 @@ would have appeared to pass while the trace stayed empty, and an empty trace is 
 from "no state changed yet" - which is why `MacLibrary/MainView.onAppear` now logs one anchor line
 per launch.
 
+### The trace is confirmed working at runtime
+
+The desktop client was built, signed and launched, and the unified log produced the anchor line:
+
+```text
+[UI] root-appear selection=0 remote=false source=MacLibrary.MainView.onAppear
+```
+
+So the whole chain - compile under `#if DEBUG`, `Logger.notice`, the `ui` category, `log stream`
+with `--predicate 'category == "ui"'` - is proven end to end on a real launch. An operator
+following section 1 will see output.
+
+Note `selection=0`: `NavigationPage` is an `Int`-backed enum, so the transition lines print raw
+values (`logs`, `tools` and `settings` are `2`, `3` and `4`). Mapping them to names is a readability
+change, not a correctness one, and is deliberately left until a run does it.
+
+### Why the app does not stay up here, and what that is not
+
+The app renders, logs its anchor line, and then exits at `Database.swift:72`
+(`SQLite error 23: authorization denied`) because it cannot write to its App Group container. That
+is an environment fact, traced to three separate causes, none of them the client:
+
+- The container belongs to a different signing identity than the certificate on this machine. The
+  installed provisioning profiles are for team `TAFD7BAGYZ` and App Group
+  `group.top.jiejie12131.jiejiebox`; the app is built for `io.nekohasekai.sfamt` and
+  `group.io.nekohasekai.sfamt`, for which no profile exists here. Writing to the group container is
+  refused for any process without that entitlement, including the shell (`touch` inside
+  `~/Library/Group Containers/group.io.nekohasekai.sfamt/...` returns "Operation not permitted").
+- Signing it *with* `com.apple.security.app-sandbox` but without a profile hangs at startup: a
+  `sample` shows the main thread parked in `_libsecinit_appsandbox` -> `_xpc_pipe_routine` ->
+  `mach_msg`, waiting on the sandbox daemon for a container it will never grant. That is the shape
+  to recognise if the app "launches and does nothing".
+- Signing it *without* the sandbox entitlement removes the hang, and the anchor line appears, but
+  the container write is still refused, so the process still exits at the database step.
+
+To run the table, build and sign the way the publish flow does - a real team, a profile carrying the
+App Group, and matching bundle identifiers. On this machine that means building with
+`APPLE_TEAM_ID=TAFD7BAGYZ APPLE_BASE_BUNDLE_ID=top.jiejie12131.jiejiebox APPLE_APP_GROUP_ID=group.top.jiejie12131.jiejiebox`,
+for which profiles already exist.
+
 ### What still needs a real run
 
 - A simulator or device run. The simulator on this machine cannot boot: all devices fail with
-  `SimLaunchHostService.RequestError code=4 / Failed to start launchd_sim`, and
-  `/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app` is absent from this Xcode
-  installation. Nothing in the client is implicated; the destination is unusable.
-- A macOS run with the trace visible. The app launches and stays up once signed with an App Group
-  entitlement (an unsigned build dies at `Database.swift:72`, `SQLite error 23: authorization
-  denied`, because the group container is unreachable). Driving the *interaction table* needs a
-  human at the window, since this environment provides no accessibility control and
-  `screencapture` is unavailable.
+  `SimLaunchHostService.RequestError code=4 / Failed to start launchd_sim`. The log shows the
+  runtime disk image mounting and `SimLaunchHost` loading `liblaunch_sim.dylib` successfully, after
+  which the `launchd_sim` stub itself trips `EXC_BREAKPOINT` (SIGTRAP) in `dyld_sim`'s `start_sim`.
+  `/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app` is also absent from this
+  Xcode installation. Nothing in the client is implicated; the destination is unusable.
+- The macOS interaction table itself. A window can be created in this session (`NSWindow`
+  `makeKeyAndOrderFront` reports `visible=1`), so rendering is not the obstacle - handling the
+  clicks is. There is no accessibility control (`osascript` blocks on permission) and
+  `screencapture` reports "could not create image from display", so the rows cannot be driven from
+  here even once the app stays up.
 
