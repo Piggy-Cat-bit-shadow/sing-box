@@ -15,7 +15,10 @@
 # export and upload are not reimplemented here.
 #
 # Usage:
-#   ./scripts/publish-apple-beta.sh [--run-id <id>]
+#   ./scripts/publish-apple-beta.sh [--run-id <id>] [--no-dispatch]
+#
+#   --run-id       publish from a specific run instead of looking one up for this commit
+#   --no-dispatch  fail when no run exists for this commit instead of dispatching one
 #
 # Environment:
 #   APPLE_BUILD_NUMBER   respected if set; otherwise derived once for the whole run
@@ -27,10 +30,12 @@ cd "$root"
 workflow="client-apple.yml"
 input_dir="build/apple-publish/input"
 run_id=""
+no_dispatch=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --run-id) run_id="${2:?--run-id needs a value}"; shift 2 ;;
+    --no-dispatch) no_dispatch=1; shift ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "publish-apple-beta: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -58,7 +63,14 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 
 submodule_sha="$(git -C clients/apple rev-parse HEAD)"
-  submodule_sha="$(git -C clients/apple rev-parse HEAD)"
+
+# The parent's gitlink and the checked-out submodule must agree: the clean-tree gate above means a
+# difference could only come from a checkout that was never staged, and publishing would then attribute
+# the build to a child commit the parent does not record.
+gitlink_sha="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
+[ "$gitlink_sha" = "$submodule_sha" ] || fail \
+  "the parent records clients/apple at $gitlink_sha but $submodule_sha is checked out.
+  The published build would be attributed to a submodule commit the parent does not record."
 
   # ---------------------------------------------------------------------------
   # Restore what this run changes
@@ -123,10 +135,53 @@ if [ -z "$run_id" ]; then
 fi
 
 if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
-  fail "no successful $workflow run found for $local_sha.
-  Dispatch it and wait, then re-run this script:
+  if [ "$no_dispatch" = "1" ]; then
+    fail "no $workflow run found for $local_sha, and --no-dispatch was given.
+  Dispatch it and wait, then re-run:
       gh workflow run $workflow --ref $branch
       gh run watch"
+  fi
+
+  # Dispatching is safe only because the run it produces is verified against the local commit before
+  # anything is published from it. A dispatch runs the BRANCH, so if the branch has moved it builds
+  # someone else's commit - and the headSha check below refuses exactly that, which is why the check
+  # is what makes this convenience permissible rather than a hole in it.
+  #
+  # The branch tip is compared first anyway, so the common mistake - publishing a commit that was
+  # never pushed - is reported as itself instead of as a 40-minute wait for a run that cannot match.
+  remote_sha="$(gh api "repos/$repo/commits/$branch" --jq .sha 2>/dev/null || true)"
+  if [ -z "$remote_sha" ]; then
+    fail "could not read $branch from $repo to check that $local_sha is pushed."
+  fi
+  [ "$remote_sha" = "$local_sha" ] || fail \
+    "$branch is at $remote_sha on $repo, but $local_sha is checked out.
+  A dispatched run would build the branch tip, not this commit. Push first, then re-run."
+
+  step "dispatching $workflow for $local_sha"
+  gh workflow run "$workflow" --ref "$branch" --repo "$repo" \
+    || fail "could not dispatch $workflow."
+
+  # Wait for the run that belongs to THIS commit. A run created for another commit never satisfies
+  # this, so the wait ends in a refusal rather than in publishing the wrong one.
+  deadline=$((SECONDS + 5400))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    read -r candidate_id candidate_status candidate_conclusion <<<"$(
+      gh run list --repo "$repo" --workflow "$workflow" --branch "$branch" --limit 20 \
+        --json databaseId,headSha,status,conclusion \
+        -q "[.[] | select(.headSha == \"$local_sha\")][0] | \"\(.databaseId) \(.status) \(.conclusion)\"" \
+        2>/dev/null || true
+    )"
+    if [ -n "${candidate_id:-}" ] && [ "$candidate_id" != "null" ] && [ "$candidate_status" = "completed" ]; then
+      run_id="$candidate_id"
+      echo "  run:        $run_id ($candidate_status)"
+      break
+    fi
+    echo "  waiting for a run of $local_sha... (${candidate_status:-not created yet})"
+    sleep 30
+  done
+  [ -n "$run_id" ] || fail \
+    "no completed $workflow run for $local_sha appeared within 90 minutes.
+  Check: gh run list --workflow $workflow --branch $branch"
 fi
 
 # Re-verify the run even when the id was supplied: --run-id is an escape hatch for re-publishing a
@@ -140,6 +195,27 @@ run_conclusion="$(gh run view "$run_id" --repo "$repo" --json conclusion -q .con
 echo "  run:        $run_id"
 echo "  conclusion: $run_conclusion"
 echo "  head SHA:   $run_sha  (matches)"
+
+# A run-level success does not prove both clients were built: the workflow's build_ios and
+# build_macos inputs skip their job without failing the run, and a skipped job contributes nothing to
+# the conclusion. The pipeline below signs and uploads BOTH clients, so the run has to have proved
+# both. This applies to --run-id as well - it is a way to re-publish a known run, not to accept one.
+jobs_json="$(gh run view "$run_id" --repo "$repo" --json jobs)" \
+  || fail "could not read the jobs of run $run_id."
+if ! job_results="$(printf '%s' "$jobs_json" | python3 scripts/ci/apple-ci-job-gate.py)"; then
+  fail "run $run_id may not be published from (see above).
+  Re-dispatch with both platforms enabled:
+      gh workflow run $workflow --ref $branch -f build_ios=true -f build_macos=true
+      gh run watch"
+fi
+job_libbox="$(printf '%s\n' "$job_results" | sed -n 's/^libbox=//p')"
+job_ios="$(printf '%s\n' "$job_results" | sed -n 's/^ios=//p')"
+job_macos="$(printf '%s\n' "$job_results" | sed -n 's/^macos=//p')"
+echo "  jobs:       libbox=$job_libbox ios=$job_ios macos=$job_macos"
+
+# The Apple client is its own fork, so which commit of it was built is release evidence rather than
+# an internal detail of the submodule.
+apple_client_url="$(git config -f .gitmodules submodule.clients/apple.url 2>/dev/null || true)"
 
 # ---------------------------------------------------------------------------
 # 4. download the Libbox artifact from that exact run
@@ -199,9 +275,17 @@ Source:
   branch:              $branch
   version:             $JJ_VERSION
 
-GitHub:
-  Apple CI:            PASS
+Apple UI:
+  repository:          ${apple_client_url:-unknown}
+  commit:              $submodule_sha
+  gitlink match:       PASS
+
+GitHub Apple CI:
   run:                 $run_id
+  libbox:              ${job_libbox:-PASS}
+  ios GUI:             ${job_ios:-PASS}
+  macOS GUI:           ${job_macos:-PASS}
+  run head SHA:        $local_sha (exact match)
   Libbox artifact:     PASS
   Libbox SHA256:       $artifact_sha
   parent SHA match:    PASS

@@ -251,6 +251,99 @@ for script in scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflig
   fi
 done
 
+echo "== the Apple CI run must have proved all three platform jobs =="
+
+# The workflow's build_ios / build_macos inputs skip their job without failing the run, so a run that
+# concludes success can still have built one client. The pipeline publishes both, so the run has to
+# have proved both - and every way of failing to prove it has to be refused, not just the obvious one.
+job_gate=scripts/ci/apple-ci-job-gate.py
+
+job_payload() {
+  python3 - "$@" <<'PAYLOAD'
+import json, sys
+jobs = []
+for spec in sys.argv[1:]:
+    name, status, conclusion = spec.split(":")
+    jobs.append({"name": name, "status": status, "conclusion": conclusion})
+print(json.dumps({"jobs": jobs}))
+PAYLOAD
+}
+
+runs_job_gate() {
+  printf '%s' "$1" | python3 "$job_gate" >/dev/null 2>&1
+}
+
+check "a run with libbox, ios and macos successful is accepted" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:success macos:completed:success)"
+
+expects_fail "an iOS-only run is refused (macos job absent)" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:success)"
+
+expects_fail "a macOS-only run is refused (ios job absent)" \
+  runs_job_gate "$(job_payload libbox:completed:success macos:completed:success)"
+
+expects_fail "a run whose macOS job was skipped is refused" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:success macos:completed:skipped)"
+
+expects_fail "a run whose iOS job was skipped is refused" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:skipped macos:completed:success)"
+
+expects_fail "a run with a cancelled platform job is refused" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:cancelled macos:completed:success)"
+
+expects_fail "a run with a failed platform job is refused" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:completed:success macos:completed:failure)"
+
+expects_fail "a run whose libbox job failed is refused" \
+  runs_job_gate "$(job_payload libbox:completed:failure ios:completed:success macos:completed:success)"
+
+expects_fail "a run whose platform job never completed is refused" \
+  runs_job_gate "$(job_payload libbox:completed:success ios:in_progress:success macos:completed:success)"
+
+expects_fail "a run with no jobs at all is refused" \
+  runs_job_gate '{"jobs":[]}'
+
+expects_fail "unparseable run data is refused" \
+  runs_job_gate 'not json'
+
+# A job display name may carry a suffix - a matrix or a label - and the required name is still the
+# name. This is asserted so the match cannot quietly become exact-only and start refusing real runs.
+check "a suffixed job name still counts as its job" \
+  runs_job_gate "$(job_payload 'libbox (ios,macos):completed:success' ios:completed:success macos:completed:success)"
+
+# The gate is worthless if the publish script does not reach it, or reaches it only in one of its two
+# paths. It is applied after the run's SHA has been verified, so --run-id passes through it too.
+check "publish applies the job gate" \
+  grep -q 'apple-ci-job-gate.py' "$publish"
+
+check "publish applies the job gate after verifying the run SHA" \
+  bash -c 'test "$(grep -n "run_sha=\"\$(gh run view" "$0" | head -1 | cut -d: -f1)" -lt "$(grep -n "apple-ci-job-gate.py" "$0" | head -1 | cut -d: -f1)"' "$publish"
+
+check "publish reports each platform job in its summary" \
+  bash -c 'grep -q "ios GUI:" "$0" && grep -q "macOS GUI:" "$0"' "$publish"
+
+echo "== one-command publish stays bound to this commit =="
+
+# Dispatching is what makes one command possible; binding the dispatched run to the local commit is
+# what makes it safe. Both halves are asserted, because either one alone is a different bug.
+check "publish can dispatch the workflow when no run exists" \
+  grep -q 'gh workflow run "\$workflow" --ref "\$branch"' "$publish"
+
+check "publish refuses to dispatch when the branch is not at this commit" \
+  grep -q '\[ "\$remote_sha" = "\$local_sha" \]' "$publish"
+
+check "publish waits only for a run of this commit" \
+  grep -qF 'select(.headSha == \"$local_sha\")' "$publish"
+
+check "the dispatch wait reads the run's own status" \
+  grep -q 'databaseId,headSha,status,conclusion' "$publish"
+
+check "publish offers a way to refuse dispatching" \
+  grep -q -- '--no-dispatch' "$publish"
+
+check "the parent gitlink must match the checked-out submodule" \
+  grep -q 'gitlink_sha' "$publish"
+
 echo "== CI workflow =="
 
 check "the workflow defines a libbox job" \
