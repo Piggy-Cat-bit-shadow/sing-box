@@ -523,6 +523,12 @@ xcrun simctl ui booted content_size large                     # restore
 Note that the fixture forces dark unless `SCREENSHOT_APPEARANCE=light` is set, so a light
 capture needs both.
 
+The settings pages were the last surface audited at accessibility sizes and they needed no
+change: a toggle row keeps its toggle aligned to the title with the subtitle wrapping beneath
+it, and a selection row keeps its mark on the trailing side. That is worth recording as a
+result rather than as an absence - the three defects the workspace had were specific to a
+multi-column layout, and this client's settings pages were already a single column.
+
 ### 3.2b The fourth non-discriminating assertion
 
 Four assertions in this migration have failed for the same reason, and it is worth naming
@@ -613,7 +619,7 @@ satisfies it, or with what is missing. "Asserted" means a test fails if it stops
 | 13 | Search safe-area correct | asserted in part | `testProxyWorkspaceSearches`, `testActivityWorkspaceOffersSearch`; the sheet capsule uses `safeAreaInset` |
 | 14 | Every button works | **asserted for the navigation surface** | `testEveryNavigableRowOpensSomething` walks all 15 navigable rows on the three roots and asserts each opens something and comes back; the snapshot suite drives each page's own controls. Not audited: controls that only act on live network or tunnel state |
 | 15 | Deep navigation works | **asserted** | `testDeepLinkToLogsBeforeToolsWasEverShown` |
-| 16 | Dynamic Type acceptable | done for the pages that exist | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity and the configuration centre; four defects found and fixed (§1.7a 17, 18) |
+| 16 | Dynamic Type acceptable | done for the pages that exist | audited at `accessibility-extra-extra-extra-large` on Home, Tools, More, Proxies, Activity, the configuration centre and the settings pages (On Demand, Tunnel, Client Settings); four defects found and fixed (§1.7a 17, 18), and the settings pages needed none |
 | 17 | Snapshots pass | done | 17/17, 18 screens, `~/hako-ui-compare/` |
 
 Seven of the seventeen are now assertions rather than impressions. The remaining gaps are
