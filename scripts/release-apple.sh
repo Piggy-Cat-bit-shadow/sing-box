@@ -143,7 +143,7 @@ step() {
 # resolved fork pin actually reach the native archive - is a property of the checkout, not of a
 # platform, and a release that discovers it late has already built an artifact that must be thrown
 # away.
-step "cronet provenance"; ./scripts/ci/verify-cronet-provenance.sh apple
+step "cronet provenance"; ./scripts/ci/verify-cronet-provenance.sh --require-archives apple
 
 # ---------------------------------------------------------------------------
 # Shared preflight

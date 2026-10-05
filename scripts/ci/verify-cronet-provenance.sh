@@ -23,6 +23,16 @@
 # Usage:
 #   scripts/ci/verify-cronet-provenance.sh apple|linux|windows [arch]
 #   scripts/ci/verify-cronet-provenance.sh --record apple|linux|windows [arch]
+#   scripts/ci/verify-cronet-provenance.sh --require-archives apple
+#
+# Two levels, because they can be checked in different places:
+#
+#   pins    every cronet module in the resolved graph must replace to the fork. This needs only the
+#           module graph, so it runs anywhere including a CI runner that has never built Apple.
+#   bytes   the archive each replaced module provides must match release/cronet-provenance.txt.
+#           This needs the modules present locally, which is true on a machine that has built the
+#           platform - so a release passes --require-archives and a runner without them reports
+#           that it could not check, rather than failing for not having them or passing silently.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -31,10 +41,14 @@ fork="github.com/Piggy-Cat-bit-shadow/cronet-go"
 tags="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
 
 record=0
-if [ "${1:-}" = "--record" ]; then
-    record=1
-    shift
-fi
+require_archives=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --record) record=1; shift ;;
+        --require-archives) require_archives=1; shift ;;
+        *) break ;;
+    esac
+done
 
 platform="${1:-apple}"
 arch="${2:-}"
@@ -109,8 +123,15 @@ fi
 echo "  every resolved cronet module replaces to the fork"
 
 if [ "${#archive_lines[@]}" -eq 0 ]; then
-    echo "FAIL: no native cronet archive found for the slices this platform links." >&2
-    exit 1
+    if [ "$require_archives" -eq 1 ]; then
+        echo "FAIL: no native cronet archive found for the slices this platform links." >&2
+        echo "      The pins are correct, but nothing could be compared against them, and a" >&2
+        echo "      release must prove the bytes it links." >&2
+        exit 1
+    fi
+    echo "SKIP: the modules for this platform are not in the local cache, so only the pins were" 
+    echo "      checked. A machine that has built this platform checks the archive bytes."
+    exit 0
 fi
 printf '  native archives linked by this platform (%d):\n' "${#archive_lines[@]}"
 printf '    %s\n' "${archive_lines[@]}"
