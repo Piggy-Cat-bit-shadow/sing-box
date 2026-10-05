@@ -259,3 +259,112 @@ func handlerFor(inbound *Inbound) *traceHandler {
 		return inbound.JudgeFlow(network, source, destination, nil)
 	})
 }
+
+// TestOnlyV4MappedAddressesAreCanonicalised is the negative control for the boundary.
+//
+// Canonicalising at ingress is only safe because it is restricted to one wire form. Inet4-in-6
+// (::ffff:a.b.c.d) denotes the IPv4 address; nothing else does, and two other families look like
+// candidates to a broader predicate:
+//
+//	NAT64 (64:ff9b::/96)          a routable IPv6 prefix that CARRIES an IPv4 address
+//	IPv4-compatible (::a.b.c.d)   the deprecated form, and not the mapped one
+//
+// Unmapping a NAT64 destination would turn a routable IPv6 address into an IPv4 address that is not
+// where the packet was going, so the connection would be dialed somewhere else entirely - and the
+// route rules, FakeIP ranges and DNS policies written against 64:ff9b::/96 would stop matching. A
+// predicate that asked "does this address embed an IPv4 address" instead of "is this the mapped
+// form" would do exactly that, which is what this test exists to prevent.
+func TestOnlyV4MappedAddressesAreCanonicalised(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		destination netip.AddrPort
+		want        netip.Addr
+		wantMapped  bool
+	}{
+		{
+			name:        "mapped v4 is unmapped",
+			destination: netip.MustParseAddrPort("[::ffff:192.0.2.1]:443"),
+			want:        netip.MustParseAddr("192.0.2.1"),
+		},
+		{
+			name:        "a plain v4 address is already canonical",
+			destination: netip.MustParseAddrPort("192.0.2.1:443"),
+			want:        netip.MustParseAddr("192.0.2.1"),
+		},
+		{
+			name:        "NAT64 stays IPv6",
+			destination: netip.MustParseAddrPort("[64:ff9b::c000:201]:443"),
+			want:        netip.MustParseAddr("64:ff9b::c000:201"),
+			wantMapped:  true,
+		},
+		{
+			name:        "the well-known NAT64 prefix itself stays IPv6",
+			destination: netip.MustParseAddrPort("[64:ff9b::1]:53"),
+			want:        netip.MustParseAddr("64:ff9b::1"),
+			wantMapped:  true,
+		},
+		{
+			name:        "IPv4-compatible is not the mapped form",
+			destination: netip.MustParseAddrPort("[::192.0.2.1]:443"),
+			want:        netip.MustParseAddr("::192.0.2.1"),
+			wantMapped:  true,
+		},
+		{
+			name:        "an ordinary global IPv6 address is untouched",
+			destination: netip.MustParseAddrPort("[2001:db8::1]:443"),
+			want:        netip.MustParseAddr("2001:db8::1"),
+			wantMapped:  true,
+		},
+		{
+			name:        "the port is never touched",
+			destination: netip.MustParseAddrPort("[64:ff9b::c000:201]:8443"),
+			want:        netip.MustParseAddr("64:ff9b::c000:201"),
+			wantMapped:  true,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := canonicalAddrPort(testCase.destination)
+			require.Equal(t, testCase.want, got.Addr(), "canonicalAddrPort")
+			require.Equal(t, testCase.destination.Port(), got.Port(), "the port must survive")
+
+			// The same predicate has to answer the same way for the userspace entry points, which
+			// take a Socksaddr rather than an AddrPort. Two implementations of one rule is how a
+			// boundary stops being one boundary.
+			canonical := canonicalSocksaddr(M.SocksaddrFrom(testCase.destination.Addr(), testCase.destination.Port()))
+			require.Equal(t, got.Addr(), canonical.Addr, "canonicalSocksaddr must agree with canonicalAddrPort")
+			require.Equal(t, testCase.destination.Port(), canonical.Port)
+
+			// No mapped form may survive canonicalisation, and no non-mapped form may lose its
+			// family: the two assertions together are the whole rule.
+			require.False(t, canonical.Addr.Is4In6(),
+				"nothing that is still mapped may pass the boundary")
+			for _, address := range []netip.Addr{got.Addr()} {
+				if testCase.wantMapped {
+					require.True(t, address.Is6() && !address.Is4(),
+						"%s denotes an IPv6 destination and must stay one", address)
+				}
+			}
+		})
+	}
+}
+
+// TestNAT64DestinationReachesTheRouterUnchanged is the same boundary through the real packet path.
+//
+// The unit test above pins the predicate; this one proves the packet path actually uses it and that
+// a NAT64 destination arrives at the router as the IPv6 address the application dialed - the failure
+// the unit test cannot see, because a caller could canonicalise with a different predicate.
+func TestNAT64DestinationReachesTheRouterUnchanged(t *testing.T) {
+	inbound, router := hijackTestInboundFor(t, nil, false)
+	harness := newMemoryTunHarness(t, handlerFor(inbound))
+
+	nat64 := netip.MustParseAddr("64:ff9b::c000:201")
+	harness.inject(t, udpDatagramV6(netip.MustParseAddrPort("[fd73:ab91:1::2]:40000"), netip.AddrPortFrom(nat64, 443), []byte("x")))
+	harness.waitForAccepted(t)
+
+	recorded := router.lastDestination.Load()
+	require.NotNil(t, recorded, "the connection must reach the router")
+	require.Equal(t, nat64, recorded.Addr(),
+		"a NAT64 destination is not a v4-mapped one: unmapping it would dial 192.0.2.1 instead")
+	require.True(t, recorded.Addr().Is6(), "and it must still be an IPv6 address")
+	require.False(t, recorded.Addr().Is4In6())
+}
