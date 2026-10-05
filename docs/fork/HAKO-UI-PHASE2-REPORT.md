@@ -213,6 +213,55 @@ workspace restores it.
     A fixed-size mark cannot scale with the text around it. `HakoIconWell` now derives the
     glyph from the tile and clamps Dynamic Type for a caller-supplied one.
 
+### 1.7b The presentation table (manual §47)
+
+The manual asks for a table of every destination's presentation class, because the failure it
+is guarding against is a set of same-level features that each happen to present differently -
+one pushed, one a sheet, one replacing the root, with no rule. This client's rule is
+centralised rather than per page:
+
+- **A page is a `NavigationPage`.** `HakoPrimaryRoute` splits it into the primary that owns it
+  and whether it is that primary's **root** or a **child pushed on top of it**
+  (`isHakoPrimaryRoot`). Nothing else decides push-versus-root.
+- **The tab bar is visible only on a primary root**, because the rule lives in
+  `HakoNavigationChrome`, which every detail page wears.
+- **A sheet is a sheet on iOS and macOS and a `fullScreenCover` on tvOS**, decided once in
+  `ViewModifiers.swift` rather than at each call site.
+- **Every modal carries a close control**, because it lives in `NavigationSheet`, the
+  container all eight are built on.
+- **A workspace presented as a sheet draws its own search field**; a page pushed inside a tab
+  uses the system's, which has a bottom bar to live in.
+
+| destination | root owner | class | tab visible | bottom search | top actions |
+| --- | --- | --- | --- | --- | --- |
+| Home | home primary **root** | tab root | yes | no | overflow menu |
+| Tools | tools primary **root** | tab root | yes | no | — |
+| More | more primary **root** | tab root | yes | no | — |
+| Logs | tools **child** | pushed | no | no | clear |
+| Proxies | Home, sheet | sheet (large) | no | drawn capsule | test-all, expand-all |
+| Activity | Home, sheet | sheet (large) | no | drawn capsule | test-all, expand-all |
+| On Demand | more primary | pushed by value | no | no | add |
+| Tunnel · Profile Override · Core · Client Settings · Remote Control · Sponsors | more primary | pushed by value | no | no | — |
+| Configuration centre | Home profile card | sheet (large) | no | no | update-all, add, edit |
+| Add configuration | configuration centre | sheet (medium) | no | no | — |
+| Edit profile · Card management · QR · QRS · share/export · SSH · Taildrop · auth URL | the page that needs them | sheet (medium) | no | no | — |
+| Network Quality · STUN & NAT · report lists and details | tools | pushed | no | no | detail: share |
+| *tvOS, everything above* | — | `fullScreenCover` | — | — | — |
+
+Two things in this table were checked because they looked like the manual's exact failure, and
+both turned out to be handled:
+
+1. **Logs is reachable two ways** - a row on Home and a row in Tools - and Home's sets
+   `selection = .logs`, which reads like the page replacing the root. It does not: `logs` is
+   declared a **child of the Tools primary**, and `HakoPrimaryRoute(.logs)` resolves to
+   `(primary: .tools, child: .logs)`, so both routes end in the same pushed page. The comment
+   that made it look otherwise is a pre-shell one that `HakoPrimaryRoute` superseded.
+2. **`HakoHomeActions` and the workspace sheet wrappers appeared to be dead code**, since
+   nothing in `ApplicationLibrary` populates the environment value or constructs
+   `GroupsSheetContent`. They are constructed in `SFI/MainView.swift`, which is where they
+   belong: the root view owns presentation state, so the shell does not have to thread
+   callbacks through every view between itself and the page that starts the navigation.
+
 ### 1.8 Evidence
 
 - **Vision / screenshots**: `~/hako-ui-compare/reference/*.png` (8 screens) and
