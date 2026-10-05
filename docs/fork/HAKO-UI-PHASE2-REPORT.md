@@ -180,6 +180,12 @@ workspace restores it.
 11. **The fixture passed capitalized proxy type strings**, which the core's display-type
     mapping does not recognise, so every member of every snapshot read "Unknown" — a fixture
     that made the pages it exists to photograph look wrong.
+12. **The icon well's glyph overflowed its tile at accessibility text sizes.** The tile is a
+    fixed 29pt (26 on the desktop) while the glyph inherited the row's Dynamic Type body
+    font, which at `accessibility-extra-extra-extra-large` is larger than the tile: the
+    network-tool, proxy and report rows had their own labels half-covered by their icons.
+    A fixed-size mark cannot scale with the text around it. `HakoIconWell` now derives the
+    glyph from the tile and clamps Dynamic Type for a caller-supplied one.
 
 ### 1.8 Evidence
 
@@ -355,6 +361,21 @@ cannot be reached by tapping what the test taps fails here.
 as `<device>-<name>.png`. `TEST_RUNNER_SCREENSHOTS_DIR` did **not** reach the runner on this
 setup; `SIMULATOR_HOST_HOME` is what the helper consults. Copy them out after a run.
 
+### 3.2a Appearance and text size
+
+The simulator's own controls are the way to vary these, and they reach the app without a
+rebuild:
+
+```bash
+xcrun simctl ui booted appearance light                       # or dark
+xcrun simctl ui booted content_size accessibility-extra-extra-extra-large
+# ... capture ...
+xcrun simctl ui booted content_size large                     # restore
+```
+
+Note that the fixture forces dark unless `SCREENSHOT_APPEARANCE=light` is set, so a light
+capture needs both.
+
 ### 3.3 Runtime logs
 
 ```bash
@@ -422,9 +443,13 @@ In the order I would attack it:
 3. **The report read views** (`CrashReportDetailView`, `OOMReportDetailView`,
    `PowerReportDetailView`, `ReportFileContentView`) use the shared chrome but not the form
    idiom; they are pushed pages in a reading context.
-4. **Dynamic Type and dark mode** were not audited on any page. The fixture can capture
-   either appearance (`SCREENSHOT_APPEARANCE=light`) and every screenshot so far is dark,
-   which is the fixture's default; no accessibility-size or light-mode comparison was made.
+4. **Dynamic Type** was audited on Home, Tools and More and found one defect, which is
+   fixed (§1.7a item 12). Not yet audited: the workspaces at accessibility sizes, the
+   proxied grid's two-column layout when the text grows, and the modal sheets.
+   **Dark mode** has not been compared against a light reference at all: every reference
+   screenshot is light and every capture of ours so far is dark, which is the fixture's
+   default. `xcrun simctl ui booted appearance light` plus `SCREENSHOT_APPEARANCE=light`
+   gives a like-for-like capture, and that comparison is the next cheap win.
 5. **The Activity lens structure.** The manual asks for 连接 / 请求 / 日志 lenses; this core
    records no requests, and Connections and Logs are still two pushed pages rather than one
    workspace with a strip. Merging them would give the strip a use and match the reference's
