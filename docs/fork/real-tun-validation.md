@@ -169,3 +169,47 @@ Not automatable and not optional: it is the product environment.
 **Do not report a Speedtest number as a result.** The figures that decide whether this ships on a phone
 are connection setup latency, CPU seconds per gigabyte, memory retained per connection, and whether the
 tunnel survives a network change without a stale row.
+
+---
+
+## RC additions
+
+The RC adds three procedures to the list above, and one item that used to be unobservable is now
+reportable from the device log alone.
+
+### TCP splice outcomes
+
+`spliceConnection` records exactly one outcome per connection, and the connection manager prints two
+lines once per tunnel lifetime at shutdown:
+
+```text
+UDP splice diagnostics: attempts=N successes=M ratio=R <reason>=<count> ...
+TCP splice diagnostics: attempts=N successes=M ratio=R <reason>=<count> ...
+```
+
+So the procedure is: start the tunnel, run the workload, stop the tunnel, read two lines. What each
+stream outcome means, and which of them the Go side cannot explain further, is documented in
+`route/splice_diagnostics.go`; `splice_rejected` is deliberately one bucket because the underlying
+call returns a boolean.
+
+The checkout of that number is the counter invariant: `attempts == successes + sum(reasons)`, per
+transport. If a device report does not add up, the report is wrong, not the code.
+
+### The single action-to-options decision
+
+A rule's route options must be applied identically in the pre-match pass and in the full route path.
+A device run checks the visible consequence: a `bypass()` rule with no outbound bypasses, and a
+`bypass()`/`route()` rule with options does not bypass when those options rewrite the destination.
+
+### The v4-mapped boundary
+
+A client that reaches the configured DNS address as `::ffff:a.b.c.d` must still be hijacked, while a
+NAT64 destination (`64:ff9b::/96`) must be dialed as IPv6. Both are checked on the wire, not in the
+metadata.
+
+### Network transition, per load balance member
+
+With a load balance group in the chain: disable a member's connectivity, confirm new flows skip it
+once its measurement is known-bad; restore it, confirm it returns. Then change the network (Wi-Fi to
+cellular on Apple, interface down/up on Linux) with a sticky session pinned, and confirm the next
+flow is re-pinned rather than dialed on a member that is no longer reachable.
