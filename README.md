@@ -1,12 +1,6 @@
 # sing-box · Jiejie Fork
 
-> **保持 upstream 完整能力，在共享网络核心上进一步优化流量调度、测速、系统代理、双栈、移动端内存与协议实现。**
-
-一个面向实际使用场景持续优化的 sing-box fork。
-
-项目并不以“增加更多协议”为唯一目标，而是尽量把优化放在**共享数据路径与控制层**：让不同协议都能受益，同时针对 MASQUE、Naive、AnyTLS 等能力补齐生产环境中的边界处理与可靠性。
-
-**关键词：** 业务感知调度 · 智能测速 · Flow-aware Load Balance · System Proxy Fast Path · iOS Low Memory · Dual Stack · Protocol Completeness
+> **保持 upstream 完整能力，在共享网络核心上进一步修改流量调度、测速、系统代理、双栈、移动端内存与协议实现。**
 
 ## ✨ 项目特色
 
@@ -43,7 +37,7 @@ URLTest、自动测速、API Delay Test 与 Load Balance 共用统一测量引�
 
 ### 🛣️ System Proxy Cooperative Fast Path
 
-针对系统代理路径进行了专门优化。
+针对系统代理路径进行修改。
 
 能够使用 HTTP / SOCKS 系统代理的应用优先经过更轻量的 Mixed / System Proxy 路径，不需要先进入完整的 TUN 包处理流程。
 
@@ -87,7 +81,7 @@ NetworkExtension 中还存在 Swift、C / CGO、系统框架、网络栈以及�
 
 ### 🌐 Shared Dual-Stack & DNS Core
 
-双栈与 DNS 优化被放在共享核心，而不是绑定到某一个代理协议。
+双栈与 DNS 改动被放在共享核心，而不是绑定到某一个代理协议。
 
 包括：
 
