@@ -31,6 +31,9 @@ import (
 type transitionDiagnostics struct {
 	// transitions counts network transitions that ran a reset body.
 	transitions atomic.Uint64
+	// oldGenerationSeen counts the connections a transition's scan found belonging to the path it
+	// was leaving. Drained and reclaimedAtTransition partition it, so the three should add up.
+	oldGenerationSeen atomic.Uint64
 	// drained counts connections that were alive when a transition ran and were deliberately left
 	// running. This is the number the whole change is about.
 	drained atomic.Uint64
@@ -46,8 +49,11 @@ type transitionDiagnostics struct {
 	sweeps atomic.Uint64
 }
 
-func (d *transitionDiagnostics) recordTransition(drained, reclaimed int) {
+func (d *transitionDiagnostics) recordTransition(drained, reclaimed, seen int) {
 	d.transitions.Add(1)
+	if seen > 0 {
+		d.oldGenerationSeen.Add(uint64(seen))
+	}
 	if drained > 0 {
 		d.drained.Add(uint64(drained))
 	}
@@ -68,6 +74,9 @@ func (d *transitionDiagnostics) recordSweep(reclaimed int) {
 type TransitionSnapshot struct {
 	// Transitions is the number of transitions that ran a reset body.
 	Transitions uint64
+	// OldGenerationSeen is the number of connections those transitions found on the path they were
+	// leaving. Drained + ReclaimedAtTransition partition it.
+	OldGenerationSeen uint64
 	// Drained is the number of connections left running by those transitions.
 	Drained uint64
 	// ReclaimedAtTransition is the number already idle when the transition ran.
@@ -99,8 +108,8 @@ func (s TransitionSnapshot) DrainRatio() float64 {
 // times, stop it, read one line.
 func (s TransitionSnapshot) TransitionSummary() string {
 	return fmt.Sprintf(
-		"network transitions: %d, drained %d connection(s), reclaimed %d at the transition and %d by sweep (%d sweep(s), drain ratio %.2f)",
-		s.Transitions, s.Drained, s.ReclaimedAtTransition, s.ReclaimedBySweep, s.Sweeps, s.DrainRatio())
+		"network transitions: %d, old-generation seen %d, drained %d, reclaimed %d at the transition and %d by sweep (%d sweep(s), drain ratio %.2f)",
+		s.Transitions, s.OldGenerationSeen, s.Drained, s.ReclaimedAtTransition, s.ReclaimedBySweep, s.Sweeps, s.DrainRatio())
 }
 
 // TransitionDiagnostics returns the current transition and drain diagnostics.
@@ -109,6 +118,7 @@ func (s TransitionSnapshot) TransitionSummary() string {
 func (m *ConnectionManager) TransitionDiagnostics() TransitionSnapshot {
 	return TransitionSnapshot{
 		Transitions:           m.transitions.transitions.Load(),
+		OldGenerationSeen:     m.transitions.oldGenerationSeen.Load(),
 		Drained:               m.transitions.drained.Load(),
 		ReclaimedAtTransition: m.transitions.reclaimedAtTransition.Load(),
 		ReclaimedBySweep:      m.transitions.reclaimedBySweep.Load(),

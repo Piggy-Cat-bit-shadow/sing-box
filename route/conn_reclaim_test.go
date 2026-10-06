@@ -350,3 +350,55 @@ func TestDeadPathIsNotDrain(t *testing.T) {
 		t.Fatal("closing sockets without releasing parked flows would leave them parked")
 	}
 }
+
+// TestDrainDiagnosticsCountOnlyTheOldGeneration is the §16 correctness fix.
+//
+// The transition used to report m.Count() as "drained", and Count() is the whole manager - so a
+// connection dialled on the NEW path while the transition was running was reported as an old-path
+// connection that had been spared. On a device, where reconnections begin immediately, that
+// inflated the exact figure the drain is judged by.
+func TestDrainDiagnosticsCountOnlyTheOldGeneration(t *testing.T) {
+	h := newDrainHarness(t)
+
+	// One old-generation connection that is working, and one that is idle.
+	active, peer := h.dial(t)
+	go func() { _, _ = peer.Write([]byte("payload")) }()
+	buffer := make([]byte, 16)
+	if _, err := active.Read(buffer); err != nil {
+		t.Fatal("the fixture could not move a byte: ", err)
+	}
+	h.idleFor(active, time.Second)
+
+	idle, _ := h.dial(t)
+	h.idleFor(idle, time.Minute)
+
+	h.manager.Reclaim(ReclaimNetworkTransition)
+
+	snapshot := h.manager.TransitionDiagnostics()
+	if snapshot.OldGenerationSeen != 2 {
+		t.Fatalf("oldGenerationSeen = %d, want 2", snapshot.OldGenerationSeen)
+	}
+	if snapshot.Drained != 1 {
+		t.Fatalf("drained = %d, want 1 (the working connection)", snapshot.Drained)
+	}
+	if snapshot.ReclaimedAtTransition != 1 {
+		t.Fatalf("reclaimedAtTransition = %d, want 1 (the idle connection)", snapshot.ReclaimedAtTransition)
+	}
+	// The partition has to hold, or the three numbers describe different populations.
+	if got := snapshot.Drained + snapshot.ReclaimedAtTransition; got != snapshot.OldGenerationSeen {
+		t.Fatalf("drained + reclaimed = %d but oldGenerationSeen = %d", got, snapshot.OldGenerationSeen)
+	}
+
+	// A connection on the NEW path is not part of that transition, however many are open.
+	if _, _ = h.dial(t); h.manager.Count() != 2 {
+		t.Fatalf("expected both remaining connections tracked, got %d", h.manager.Count())
+	}
+	after := h.manager.TransitionDiagnostics()
+	if after.Drained != 1 {
+		t.Fatalf("drained moved to %d when a new-generation connection was dialled; it must count "+
+			"only the generation the transition scanned", after.Drained)
+	}
+	if after.OldGenerationSeen != 2 {
+		t.Fatalf("oldGenerationSeen moved to %d on a dial", after.OldGenerationSeen)
+	}
+}

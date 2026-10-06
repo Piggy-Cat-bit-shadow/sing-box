@@ -245,7 +245,18 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 	}
 
 	m.access.Lock()
-	var closers []managedConn
+	var (
+		closers []managedConn
+		// seen and retained are counted in THIS scan and only for the generation being drained.
+		//
+		// The transition used to report m.Count() as "drained", which is not the same number and
+		// overstates it: Count() is the whole manager, so any connection dialled on the NEW path
+		// while the scan was running was counted as an old-path connection that had been spared. On
+		// a real device, where reconnections begin immediately, that inflated exactly the figure the
+		// drain is judged by.
+		seen     int
+		retained int
+	)
 	for element := m.connections.Front(); element != nil; {
 		nextElement := element.Next()
 		conn := element.Value
@@ -256,6 +267,9 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 		eligible := true
 		if policy.drain {
 			eligible = state.generation < staleGeneration
+			if eligible {
+				seen++
+			}
 		}
 		if eligible && policy.provenIdleFor > 0 {
 			if idle, known := state.idleFor(now); !known || idle < m.drainGrace() {
@@ -265,6 +279,8 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 		if eligible {
 			closers = append(closers, conn)
 			m.connections.Remove(element)
+		} else if policy.drain && state.generation < staleGeneration {
+			retained++
 		}
 		element = nextElement
 	}
@@ -274,16 +290,13 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 		common.Close(closer)
 	}
 	if policy.drain {
-		// What is left is what drained. Counted after the pass rather than before it, so the number
-		// is connections this transition actually spared and not connections it happened to see.
-		drained := m.Count()
-		m.transitions.recordTransition(drained, len(closers))
+		m.transitions.recordTransition(retained, len(closers), seen)
 		// Open the reconnect governor's window. The connections that were just invalidated are about
 		// to be re-dialled by their applications, all at once; this is the burst it smooths.
 		m.dialGovernor.open(time.Now())
 		// Only worth starting when the pass left something behind; otherwise there is nothing for a
 		// sweep to find.
-		if drained > 0 {
+		if retained > 0 {
 			m.beginDrainSweep()
 		}
 		if m.reclaimLog != nil {
