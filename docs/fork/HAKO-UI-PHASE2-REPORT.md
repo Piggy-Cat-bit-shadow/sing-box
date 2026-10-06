@@ -733,8 +733,24 @@ reference (Tunnel)                     this client (Tunnel)
 ```
 
 One card per setting with the explanation as that card's footnote, against one card per group
-with each row carrying its own. The second is taller per row and the first repeats a caption for
-every setting; neither is a spacing error, and the tokens are the same in both.
+with each row carrying its own. The tokens are the same in both; the row is not — 50pt compact
+against 63pt with a subtitle — and the caption is repeated per setting in the reference's model.
+
+**Decided by the owner: the reference is the source of truth on structure as well as on tokens.**
+The settings pages now follow it. Each setting carries its own section - captioned with the
+setting's own name, one row with no subtitle, and the explanation as that section's footnote:
+
+| page | before | after |
+| --- | --- | --- |
+| Tunnel | 2 sections, 6 subtitled rows | 6 sections, one compact row each, explanation as the footnote |
+| Profile Override | 1 section, 3 subtitled rows | 3 sections, one compact row each |
+| Core (Beta) | subtitled row + separate caveat | compact row, both sentences as the footnote |
+| On Demand (mode) | 3 subtitled rows | **unchanged** - it is a picker, and the reference's own picker carries the chosen row's explanation in the row |
+| destructive rows | subtitled | **unchanged** - the reference's reset row has a subtitle too |
+
+Sentences that are true of a whole page rather than of one setting - that changing any of these
+restarts the tunnel, or reloads the running service - keep a footnote-only section of their own
+rather than being repeated onto six footnotes or dropped.
 
 ## 5b. What §44 taught about testing dense data
 
