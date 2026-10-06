@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	socksinbound "github.com/sagernet/sing-box/protocol/socks"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -86,7 +87,8 @@ func (b *Bridge) acceptLoop() {
 		}
 		ctx := log.ContextWithNewID(b.ctx)
 		go func() {
-			hErr := socks.HandleConnectionEx(ctx, tcpConn, std_bufio.NewReader(tcpConn), b.authenticator, b, nil, 0, M.SocksaddrFromNet(tcpConn.RemoteAddr()), nil)
+			guardedConn := socksinbound.GuardSOCKS5Address(tcpConn)
+			hErr := socks.HandleConnectionEx(ctx, guardedConn, std_bufio.NewReader(guardedConn), b.authenticator, b, nil, 0, M.SocksaddrFromNet(tcpConn.RemoteAddr()), nil)
 			if hErr == nil {
 				return
 			}

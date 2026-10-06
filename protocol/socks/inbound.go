@@ -73,6 +73,14 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// A zero-length SOCKS5 domain would shift the stream by two bytes instead of
+	// failing cleanly; see GuardSOCKS5Address. It is installed BEFORE the reader:
+	// the parser reads through a buffered reader, so a guard placed after it
+	// would only see bytes the buffer did not already hold, which is usually
+	// none of them.
+	// The guard goes before the reader; see GuardSOCKS5Address for why the
+	// placement is the whole reason it works.
+	conn = GuardSOCKS5Address(conn)
 	err := socks.HandleConnectionEx(ctx, conn, std_bufio.NewReader(conn), h.authenticator, adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, h.udpTimeout, metadata.Source, onClose)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil {
