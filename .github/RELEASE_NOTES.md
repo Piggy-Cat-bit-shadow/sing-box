@@ -12,8 +12,8 @@ First stable release of this sing-box fork.
 
 | Platform | File |
 |---|---|
-| Linux amd64 | `jiejie-sing-box-linux-amd64-v0.1.tar.gz` |
-| macOS arm64 | `jiejie-sing-box-macos-arm64-v0.1.tar.gz` |
+| Linux amd64 | `jiejie-sing-box-linux-amd64-v0.1.3.tar.gz` |
+| macOS arm64 | `jiejie-sing-box-macos-arm64-v0.1.3.tar.gz` |
 
 Each archive contains the binary, a `BUILD-INFO` with the exact commit, tag set and
 dependency versions, the licence, and a `.sha256` for the binary. `SHA256SUMS`
