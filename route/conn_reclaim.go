@@ -202,6 +202,9 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 		// is connections this transition actually spared and not connections it happened to see.
 		drained := m.Count()
 		m.transitions.recordTransition(drained, len(closers))
+		// Open the reconnect governor's window. The connections that were just invalidated are about
+		// to be re-dialled by their applications, all at once; this is the burst it smooths.
+		m.dialGovernor.open(time.Now())
 		// Only worth starting when the pass left something behind; otherwise there is nothing for a
 		// sweep to find.
 		if drained > 0 {

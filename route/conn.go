@@ -54,6 +54,9 @@ type ConnectionManager struct {
 	// without sleeping for the production windows. Zero means "use the constant".
 	drainIdleGraceOverride     time.Duration
 	drainSweepIntervalOverride time.Duration
+	// dialGovernor bounds concurrent outbound dials in the window after a transition. Inert unless a
+	// transition opened it; see dial_governor.go.
+	dialGovernor dialGovernor
 	// Transition and drain diagnostics. One atomic add per transition and per reclaim pass,
 	// never per byte. See transition_diagnostics.go for what these numbers can and cannot say.
 	transitions transitionDiagnostics
@@ -244,11 +247,15 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn net.Conn
 		err        error
 	)
+	// The dial gate. Inert unless a transition opened its window in the last few seconds, and it
+	// never delays a flow whose class says a person is waiting on it; see dial_governor.go.
+	releaseDial := m.enterDialGate(ctx, metadata.TrafficClass)
 	if len(metadata.DestinationAddresses) > 0 || metadata.Destination.IsIP() {
 		remoteConn, err = dialer.DialSerialNetwork(ctx, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 	} else {
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
 	}
+	releaseDial()
 	if err != nil {
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {
@@ -469,6 +476,9 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		err                error
 	)
 	if metadata.UDPConnect {
+		// The dial gate, as for a stream. Establishing a UDP session is a dial too, and an app
+		// opening a burst of them after a transition is the same herd.
+		releaseDial := m.enterDialGate(ctx, metadata.TrafficClass)
 		parallelDialer, isParallelDialer := this.(dialer.ParallelInterfaceDialer)
 		if len(metadata.DestinationAddresses) > 0 {
 			if isParallelDialer {
@@ -485,6 +495,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		} else {
 			remoteConn, err = this.DialContext(ctx, N.NetworkUDP, metadata.Destination)
 		}
+		releaseDial()
 		if err != nil {
 			var remoteString string
 			if len(metadata.DestinationAddresses) > 0 {
