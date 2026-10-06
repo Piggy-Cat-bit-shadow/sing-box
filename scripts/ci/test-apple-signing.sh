@@ -454,8 +454,14 @@ if [ "$branding_applied" = "1" ]; then
     bash -c '! grep -q "IPHONEOS_DEPLOYMENT_TARGET" scripts/ci/prepare-apple-client.sh'
 
   # The floor lives in the PROJECT, never in the UI: the Hako toolbar logic is frozen.
-  check "the iOS floor was not raised by editing Swift" \
-    bash -c 'git -C clients/apple diff --name-only | grep -qE "\.swift$" && exit 1 || exit 0'
+  #
+  # Asserted on the pinned COMMIT rather than the working tree. prepare-apple-client.sh
+  # legitimately rewrites GitHubUpdateChecker.swift for the updater overlay, so a
+  # working-tree diff cannot tell an overlay edit apart from a UI edit - but the commit the
+  # floor ships in can be asked directly, and it must contain no Swift at all.
+  pinned="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
+  check "the pinned client raises the floor without touching Swift" \
+    bash -c "! git -C clients/apple show --name-only --format= '$pinned' | grep -qE '\.swift\$'"
   check "the toolbar logic is unchanged" \
     grep -q "if environments.remoteServer != nil" clients/apple/SFI/MainView.swift
 
