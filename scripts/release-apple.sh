@@ -228,12 +228,15 @@ fi
     echo "  using: $libbox"
     echo "  slices: $(ls "$libbox" | grep -v Info.plist | tr '\n' ' ')"
     # The macOS checkout is a different source tree, so the framework is placed there
-    # explicitly rather than assumed to be present.
-    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-apple-libbox.sh install
+    # explicitly rather than assumed to be present - and the SOURCE is named, because an
+    # artifact install unpacks into the iOS client and never writes the repository root.
+    ./scripts/ci/build-apple-libbox.sh install "$macos_client_dir" "$libbox"
   else
     step "build Libbox once from this fork"
     APPLE_CLIENT_DIR="$ios_client_dir" ./scripts/ci/build-apple-libbox.sh both
-    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-apple-libbox.sh install
+    # The build above left the framework at the repository root, which is this call's default
+    # source.
+    ./scripts/ci/build-apple-libbox.sh install "$macos_client_dir"
   fi
 
 # The two checkouts must link the identical framework. Checked rather than assumed: the

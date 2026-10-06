@@ -183,6 +183,36 @@ expects_fail "install into a directory that is not an Apple client is rejected" 
 expects_fail "install without an archive is rejected" \
   "$artifact_tool" install "$tmp/a_missing" "$tmp/ios-client"
 
+echo "== build-apple-libbox install takes an explicit source =="
+
+# The publish path unpacks the verified artifact into the iOS client and never writes the
+# repository root, but the macOS client - a different checkout of a different branch - still
+# needs the framework. Hardcoding the root as the source made that fail with "not built at
+# the repository root" while the framework sat verified in the iOS client, so the source is a
+# parameter and this is the regression that pins it.
+mkdir -p "$tmp/src-client/Libbox.xcframework/ios-arm64" "$tmp/dst-client/sing-box.xcodeproj"
+printf 'slice' > "$tmp/src-client/Libbox.xcframework/ios-arm64/Libbox"
+: > "$tmp/dst-client/sing-box.xcodeproj/project.pbxproj"
+python3 - "$tmp/src-client/Libbox.xcframework/Info.plist" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "wb") as handle:
+    plistlib.dump({"AvailableLibraries": [{
+        "LibraryIdentifier": "ios-arm64",
+        "SupportedArchitectures": ["arm64"],
+        "LibraryPath": "Libbox.framework",
+        "HeadersPath": "Headers",
+    }]}, handle)
+PY
+
+check "install copies the framework from an explicit source" \
+  ./scripts/ci/build-apple-libbox.sh install "$tmp/dst-client" "$tmp/src-client/Libbox.xcframework"
+check "the second client now carries the framework" \
+  test -f "$tmp/dst-client/Libbox.xcframework/ios-arm64/Libbox"
+
+# And a source that does not exist is refused rather than silently installing a stale slice.
+expects_fail "install with a source that does not exist is refused" \
+  ./scripts/ci/build-apple-libbox.sh install "$tmp/dst-client" "$tmp/no-such-framework"
+
 echo "== release-apple prebuilt mode =="
 
 # The prebuilt flag must not fall back to compiling. A fallback would publish a framework that is

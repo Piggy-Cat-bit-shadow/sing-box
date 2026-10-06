@@ -3,10 +3,13 @@
 # checkout.
 #
 # Usage:
-#   build-apple-libbox.sh [ios|macos|both]   build, then install into APPLE_CLIENT_DIR
-#   build-apple-libbox.sh install [dir]      install the already-built root framework
+#   build-apple-libbox.sh [ios|macos|both]      build, then install into APPLE_CLIENT_DIR
+#   build-apple-libbox.sh install [dir] [src]   install an existing xcframework
 #
 # APPLE_CLIENT_DIR selects the checkout to install into (default: clients/apple).
+# For `install`, `dir` defaults to APPLE_CLIENT_DIR and `src` to the repository root's
+# Libbox.xcframework - pass a source when the framework came from an artifact install,
+# which unpacks it into a client checkout rather than to the root.
 #
 # # One framework, two clients
 #
@@ -42,24 +45,35 @@ cd "$root"
 which="${1:-both}"
 client="${APPLE_CLIENT_DIR:-clients/apple}"
 
-# install_into places the framework built at the repository root into a client checkout,
-# replacing whatever was there. A stale slice left behind by an earlier build would make
-# the two platforms link different frameworks while both believed they installed the same
-# artifact, so the destination is removed rather than merged.
+# install_into places an xcframework into a client checkout, replacing whatever was there. A
+# stale slice left behind by an earlier build would make the two platforms link different
+# frameworks while both believed they installed the same artifact, so the destination is
+# removed rather than merged.
+#
+# The SOURCE is a parameter because there are two ways the framework reaches this point, and
+# they do not leave it in the same place:
+#
+#   * a local build writes it to the repository root, and
+#   * an artifact install (the publish path, APPLE_USE_PREBUILT_LIBBOX=1) unpacks it straight
+#     into the iOS client checkout and never touches the root.
+#
+# Hardcoding the root made the second case fail with "not built at the repository root" while
+# the framework was sitting in the iOS client, verified and ready to copy.
 install_into() {
-  local dest_client="$1"
+  local dest_client="$1" source="${2:-Libbox.xcframework}"
   [ -d "$dest_client" ] || {
     echo "FAIL: $dest_client is missing; check the Apple client source out first." >&2
     exit 1
   }
-  [ -d Libbox.xcframework ] || {
-    echo "FAIL: Libbox.xcframework is not built at the repository root." >&2
+  [ -d "$source" ] || {
+    echo "FAIL: no xcframework at $source." >&2
+    echo "      Build one (build-apple-libbox.sh both) or install a verified artifact first." >&2
     exit 1
   }
   rm -rf "$dest_client/Libbox.xcframework"
-  ditto Libbox.xcframework "$dest_client/Libbox.xcframework"
+  ditto "$source" "$dest_client/Libbox.xcframework"
 
-  echo "installed: $dest_client/Libbox.xcframework"
+  echo "installed: $dest_client/Libbox.xcframework  (from $source)"
   python3 - "$dest_client/Libbox.xcframework/Info.plist" <<'PY'
 import plistlib, sys
 with open(sys.argv[1], 'rb') as fh:
@@ -70,7 +84,7 @@ PY
 }
 
 if [ "$which" = "install" ]; then
-  install_into "${2:-$client}"
+  install_into "${2:-$client}" "${3:-Libbox.xcframework}"
   echo "build-apple-libbox: PASS"
   exit 0
 fi
