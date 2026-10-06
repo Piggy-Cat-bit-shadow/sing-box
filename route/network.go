@@ -781,11 +781,21 @@ func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 		// must; the streams are left to fail on their own or to finish, and the idle ones are
 		// reclaimed. See ReclaimNetworkTransition.
 		//
+		// The class is read from the LIVE state rather than threaded down from whoever decided a
+		// reset was due, and that is deliberate: what matters is whether the device has an interface
+		// at the moment the reset body runs, not what the notification that triggered it believed.
+		// A hard transition - the default interface is gone - has nothing to drain, because no
+		// connection can still be reaching anywhere.
+		//
 		// The adapter interface cannot express the policy without the reason type, and widening it
 		// would force every test double to grow a method it has no opinion about. The capability is
 		// therefore asked for directly, and its absence falls back to the previous behaviour.
+		reason := ReclaimNetworkTransition
+		if r.DefaultNetworkInterface() == nil {
+			reason = ReclaimDeadPath
+		}
 		if reclaimer, isReclaimer := r.connectionManager.(networkTransitionReclaimer); isReclaimer {
-			reclaimer.Reclaim(ReclaimNetworkTransition)
+			reclaimer.Reclaim(reason)
 		} else {
 			r.connectionManager.CloseAll()
 		}

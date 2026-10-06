@@ -276,3 +276,44 @@ func TestNoTransitionNoSummary(t *testing.T) {
 		t.Fatalf("transitions = %d before any transition, want 0", snapshot.Transitions)
 	}
 }
+
+// TestDeadPathReclaimsWhatATransitionWouldDrain is what separates hard from medium.
+//
+// A medium transition keeps an active connection because the socket might still work. A hard one -
+// the device has no default interface - has already answered that: nothing the connection does can
+// reach anywhere, so holding it only keeps memory and file descriptors alive.
+func TestDeadPathReclaimsWhatATransitionWouldDrain(t *testing.T) {
+	h := newDrainHarness(t)
+	active, peer := h.dial(t)
+	go func() { _, _ = peer.Write([]byte("payload")) }()
+	buffer := make([]byte, 16)
+	if _, err := active.Read(buffer); err != nil {
+		t.Fatal("the fixture could not move a byte: ", err)
+	}
+	h.idleFor(active, time.Second)
+
+	// The same connection, under the same activity, under both reasons.
+	if closed := h.manager.Reclaim(ReclaimNetworkTransition); closed != 0 {
+		t.Fatalf("a medium transition reclaimed %d active connection(s); it must drain", closed)
+	}
+	if closed := h.manager.Reclaim(ReclaimDeadPath); closed != 1 {
+		t.Fatalf("a hard transition reclaimed %d connection(s), want all 1", closed)
+	}
+	if h.manager.Count() != 0 {
+		t.Fatal("a hard transition left connections behind")
+	}
+}
+
+// TestDeadPathIsNotDrain pins the policy table itself, so the reason cannot quietly become a drain.
+func TestDeadPathIsNotDrain(t *testing.T) {
+	policy := reclaimPolicyFor(ReclaimDeadPath)
+	if !policy.closeAll {
+		t.Fatal("a hard transition must reclaim everything")
+	}
+	if policy.drain {
+		t.Fatal("a hard transition must not start a drain; there is nothing to drain")
+	}
+	if !policy.releaseFlows {
+		t.Fatal("closing sockets without releasing parked flows would leave them parked")
+	}
+}

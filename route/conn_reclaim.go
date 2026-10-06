@@ -35,6 +35,15 @@ const (
 	// ReclaimIdle is pause, background or a gentle memory release: reclaim what is idle, never a
 	// stream that is in use.
 	ReclaimIdle
+	// ReclaimDeadPath is a HARD transition: the device has no default interface at all, so no
+	// connection can still be reaching anywhere. There is nothing to drain and nothing to preserve.
+	//
+	// This is what distinguishes hard from medium in practice. A medium transition - a new gateway,
+	// a new SSID, a different interface - leaves open the possibility that a socket still works, so
+	// it drains and lets the socket prove otherwise. A hard one has already answered that question,
+	// and holding the connections would only keep memory and file descriptors alive on a device that
+	// is, by definition, likely to be under pressure.
+	ReclaimDeadPath
 	// ReclaimShutdown is teardown. Everything goes, including active streams, because there is
 	// nothing left to serve them.
 	ReclaimShutdown
@@ -140,6 +149,8 @@ func reclaimPolicyFor(reason ReclaimReason) reclaimPolicy {
 		return reclaimPolicy{provenIdleFor: drainIdleGrace, releaseFlows: false, drain: true}
 	case ReclaimIdle:
 		return reclaimPolicy{provenIdleFor: drainIdleGrace, releaseFlows: false}
+	case ReclaimDeadPath:
+		return reclaimPolicy{closeAll: true, releaseFlows: true}
 	default:
 		return reclaimPolicy{closeAll: true, releaseFlows: true}
 	}
