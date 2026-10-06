@@ -129,19 +129,30 @@ func BenchmarkFlowSetupBypassed(b *testing.B) {
 // gate is installed the way the connection manager installs it, with the production predicate, and
 // the flow is registered with the scheduler. It is the per-flow half of what a bypass saves,
 // independent of how many bytes the flow then carries.
+//
+// The socket pair is built outside the timed region, for the same reason the copy benchmark below
+// builds its pair that way: net.Pipe allocates a pipe and starts a goroutine per side, which is
+// fixture cost, not the cost of the gate. Measured inside the loop it WAS the whole number - the
+// benchmark reported 26 allocations and 2856 B per operation, and the code under test was none of
+// them. A benchmark whose number describes its own fixture is worse than no benchmark, because it
+// is quoted.
 func BenchmarkFlowSetupUserspace(b *testing.B) {
 	manager := NewConnectionManager(log.NewNOPFactory().Logger())
 	defer manager.Close()
 
 	b.ReportAllocs()
 	for b.Loop() {
+		b.StopTimer()
 		local, localPeer := net.Pipe()
 		remote, remotePeer := net.Pipe()
+		b.StartTimer()
 		gate, flow := manager.uploadStreamGate(local, remote, 0)
 		_ = gate
 		_ = flow.Close()
+		b.StopTimer()
 		_ = localPeer.Close()
 		_ = remotePeer.Close()
+		b.StartTimer()
 	}
 }
 
