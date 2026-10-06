@@ -110,6 +110,11 @@ func (m *ConnectionManager) spliceConnection(ctx context.Context, conn net.Conn,
 		OnClose:       m.spliceClose(ctx, conn, remoteConn, onClose),
 	}) {
 		m.tcpSpliceDiagnostics.recordOutcome(spliceReasonSuccess)
+		// Bytes now move between descriptors in the kernel, so nothing in userspace will observe
+		// this connection again. Recorded at the confirmed handover and nowhere else.
+		if state := managedConnStateOf(remoteConn); state != nil {
+			state.markKernelOwned()
+		}
 		return true, nil
 	}
 	// Splice declined and returns a bare bool. Its false paths inside sing-tun include the
@@ -203,6 +208,11 @@ func (m *ConnectionManager) splicePacketConnection(ctx context.Context, conn N.P
 	}) {
 		// The socket was found and handed over; packets now bypass userspace.
 		m.spliceDiagnostics.recordOutcome(spliceReasonSuccess)
+		// As on the stream path: confirmed handover, so userspace will never see this flow's
+		// activity again and its silence must not be read as idleness.
+		if state := managedConnStateOf(remote); state != nil {
+			state.markKernelOwned()
+		}
 		return conn, true
 	}
 	// Splice() declined, and it returns a bare bool. Its false paths inside sing-tun

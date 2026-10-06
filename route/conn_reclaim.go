@@ -72,12 +72,34 @@ type managedConnState struct {
 	generation uint64
 	// lastActive is the last observed successful byte transfer, in Unix seconds.
 	//
-	// Zero means NO TRANSFER HAS EVER BEEN OBSERVED, which is not the same as idle and must not be
-	// treated as one. It is the state of a freshly dialled connection, and of a spliced one, whose
-	// bytes move between file descriptors in the kernel and never pass through the Read/Write below.
-	// Both are protected: the alternative is reclaiming a working connection because the only
-	// instrument available cannot see it working.
+	// Zero means no transfer has been observed YET, which is not the same as idle. How long that is
+	// allowed to stand is what activityObservable decides.
 	lastActive atomic.Int64
+	// activityObservable is false once the connection has been handed to the kernel.
+	//
+	// It separates two states that "lastActive == 0" used to conflate, and they have opposite
+	// reclaim policies:
+	//
+	//	true  (an ordinary connection)  nothing has been transferred, so the clock runs from
+	//	                                createdAt. A flow that is never used is idle after the
+	//	                                grace and may be reclaimed.
+	//	false (kernel-owned)            bytes move between descriptors in the kernel and NOTHING in
+	//	                                userspace will ever observe this connection again. Its
+	//	                                silence is not evidence of idleness, so it is protected on a
+	//	                                transition and reclaimed only by pause or shutdown.
+	//
+	// Conflating them protected every never-used UDP flow for the life of the tunnel, which turned
+	// the drain into a leak.
+	activityObservable atomic.Bool
+}
+
+// markKernelOwned records that this connection's bytes no longer pass through userspace.
+//
+// It is set ONLY on a confirmed handover - the splice call returning success - never on the
+// possibility of one. A connection that merely implements SyscallConn has not been spliced, and
+// treating it as unobservable would exempt it from the drain for no reason.
+func (s *managedConnState) markKernelOwned() {
+	s.activityObservable.Store(false)
 }
 
 func (s *managedConnState) reclaimState() *managedConnState { return s }
@@ -135,9 +157,16 @@ func managedConnStateOf(conn any) *managedConnState {
 // The false return is the important one: it says "no transfer was ever observed", which the callers
 // must read as "cannot be proven idle" rather than "idle since creation".
 func (s *managedConnState) idleFor(now time.Time) (time.Duration, bool) {
+	if !s.activityObservable.Load() {
+		// Kernel-owned: silence here is not idleness, it is the absence of an instrument.
+		return 0, false
+	}
 	last := s.lastActive.Load()
 	if last == 0 {
-		return 0, false
+		// Observable and not yet used. The clock runs from creation, so a flow that never carries
+		// anything becomes reclaimable once it is older than the grace rather than being protected
+		// forever.
+		return now.Sub(s.createdAt), true
 	}
 	return now.Sub(time.Unix(last, 0)), true
 }

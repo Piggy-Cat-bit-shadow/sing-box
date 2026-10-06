@@ -90,22 +90,55 @@ func TestTransitionReclaimsAProvenIdleConnection(t *testing.T) {
 	}
 }
 
-// TestTransitionProtectsAConnectionItCannotObserve covers the conservative direction.
+// TestTransitionProtectsAKernelOwnedConnection covers the conservative direction.
 //
 // A spliced connection moves bytes between descriptors in the kernel and never reaches Read or
-// Write, so its activity is unknown. Unknown must not be read as idle: killing a working connection
-// because the only available instrument cannot see it working is the failure this guards.
-func TestTransitionProtectsAConnectionItCannotObserve(t *testing.T) {
+// Write, so its silence is not idleness - it is the absence of an instrument. Killing a working
+// connection because nothing can see it working is the failure this guards.
+func TestTransitionProtectsAKernelOwnedConnection(t *testing.T) {
 	h := newDrainHarness(t)
 	tracked, _ := h.dial(t)
-	// Created long ago, and nothing was ever observed through it.
+	// Created long ago, and nothing was ever observed through it, because nothing can be.
 	tracked.createdAt = h.now.Add(-time.Hour)
+	tracked.markKernelOwned()
 
 	if closed := h.manager.Reclaim(ReclaimNetworkTransition); closed != 0 {
-		t.Fatalf("a connection with no observable activity was reclaimed (%d)", closed)
+		t.Fatalf("a kernel-owned connection was reclaimed (%d)", closed)
 	}
 	if h.manager.Count() != 1 {
-		t.Fatal("an unobservable connection was dropped")
+		t.Fatal("a kernel-owned connection was dropped")
+	}
+}
+
+// TestNeverUsedObservableConnectionBecomesIdle is the other half of that split, and the reason it
+// exists.
+//
+// "No transfer observed" used to mean "protect forever", which is right for a spliced connection and
+// wrong for every ordinary one: an observable flow that never carries anything would sit in the list
+// for the life of the tunnel. Its clock runs from creation, so it ages out like any other idle
+// connection.
+func TestNeverUsedObservableConnectionBecomesIdle(t *testing.T) {
+	h := newDrainHarness(t)
+	tracked, _ := h.dial(t)
+	// Observable (the default), never used, and older than the grace.
+	tracked.createdAt = h.now.Add(-time.Hour)
+
+	if closed := h.manager.Reclaim(ReclaimNetworkTransition); closed != 1 {
+		t.Fatalf("a never-used observable connection reclaimed %d, want 1; it must not be protected "+
+			"for the life of the tunnel", closed)
+	}
+	if h.manager.Count() != 0 {
+		t.Fatal("the never-used observable connection is still tracked")
+	}
+}
+
+// TestFreshObservableConnectionIsStillProtected keeps the grace meaningful: a connection dialled a
+// moment ago has not had time to prove itself and must not be reclaimed out from under its caller.
+func TestFreshObservableConnectionIsStillProtected(t *testing.T) {
+	h := newDrainHarness(t)
+	h.dial(t)
+	if closed := h.manager.Reclaim(ReclaimNetworkTransition); closed != 0 {
+		t.Fatalf("a just-dialled connection was reclaimed (%d)", closed)
 	}
 }
 

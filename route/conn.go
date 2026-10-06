@@ -209,7 +209,7 @@ func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 		socketOwner: socketOwner{original: conn},
 		manager:     m,
 	}
-	tracked.managedConnState = m.newConnState()
+	m.initConnState(&tracked.managedConnState)
 	m.access.Lock()
 	tracked.element = m.connections.PushBack(tracked)
 	m.access.Unlock()
@@ -222,23 +222,28 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 		socketOwner:   socketOwner{original: conn},
 		manager:       m,
 	}
-	tracked.managedConnState = m.newConnState()
+	m.initConnState(&tracked.managedConnState)
 	m.access.Lock()
 	tracked.element = m.connections.PushBack(tracked)
 	m.access.Unlock()
 	return tracked
 }
 
-// newConnState stamps a connection with the path it was dialled on.
+// initConnState stamps a connection with the path it was dialled on.
+//
+// It writes into the caller's storage rather than returning a value, because the record holds
+// atomics and copying one is a lock copy - which is also why the embedded field is a value: method
+// promotion is what makes *trackedConn satisfy managedConn.
 //
 // The generation is read from the manager rather than passed in, so it cannot be forgotten at a call
-// site: every tracked connection is stamped with the transition in effect at the moment it entered
-// the list.
-func (m *ConnectionManager) newConnState() managedConnState {
-	return managedConnState{
-		createdAt:  time.Now(),
-		generation: m.generation.Load(),
-	}
+// site: every tracked connection is stamped with the transition in effect when it entered the list.
+func (m *ConnectionManager) initConnState(state *managedConnState) {
+	state.createdAt = time.Now()
+	state.generation = m.generation.Load()
+	// Optimistic: a fresh connection is observable until a splice handover proves otherwise. The
+	// other default would exempt every connection from the drain until something marked it, which is
+	// the state this change exists to leave behind.
+	state.activityObservable.Store(true)
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
