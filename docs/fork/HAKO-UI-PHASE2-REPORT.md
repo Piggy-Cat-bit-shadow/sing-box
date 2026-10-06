@@ -281,7 +281,19 @@ workspace restores it.
     and `test17HomeAgreesWithTheProxySheet` asserts the agreement rather than either page — a
     single-page assertion cannot see this class, because both pages were individually correct
     about their own data.
-29. **An activity row's route lost the rule that chose it.** The manual's §44 names four ways a
+29. **Forty-eight user-visible strings were never catalogued.** Reported from screenshots: the
+    Core page's footnotes read English in a Chinese interface. They were passed as
+    `LocalizedStringKey` literals, so they *would* have localised - they were simply absent from
+    the catalogue and SwiftUI falls back to the key. Sweeping every prose literal against the
+    catalogue found 48: footnotes, empty-state titles and messages, report errors, OpenConnect
+    errors, profile-update messages. The same sweep found six orphaned Apple-documentation
+    paragraphs, removed with the property-name keys beside them.
+30. **The On Demand page said one sentence twice.** Its section footnote was the *selected mode's
+    own description*, which is already the subtitle of the selected row - so the footnote repeated
+    it and cost a line of height under a card whose rows each explain themselves. That section has
+    no footnote now. This came out of the same screenshots and is the one genuine spacing defect
+    in them: a duplication rather than a measurement.
+31. **An activity row's route lost the rule that chose it.** The manual's §44 names four ways a
     dense data row must not fail, and this was one of them, found by seeding its nine cases. A
     route is one string composed in reading order — the outbound chain, then the rule, then the
     inbound — and it was middle-truncated on one line, so a long chain pushed the rule into the
@@ -692,6 +704,37 @@ named in §6, and they are now gaps in *coverage* rather than in the work: #9 cl
 fixture learned to archive a report, and #14 remains partially audited in the honest direction
 - every page's controls are driven by the snapshot suite, but there has been no exhaustive
 audit of controls that no fixture reaches.
+
+## 5a. Spacing, measured against the reference
+
+Reported from screenshots of the running app, so it was measured rather than eyeballed - and the
+first attempt at measuring was wrong, which is worth recording. A hand-cropped screen region put
+our page inset at 27% larger than the reference's, which would have sent me looking for a bug in
+a constant that is correct. Finding the screen bounds by the canvas colour instead of by eye, and
+validating the method against a capture whose numbers were already known, gave this:
+
+| measurement | reference | ours (capture) | ours (user's screenshots) |
+| --- | --- | --- | --- |
+| page inset, left/right | 20.0pt | 20.0pt | 19.8pt |
+| card width | 400.0pt | 400.0pt | 400.4pt |
+| gap between section cards | 47.7pt | 47.7pt | 47.7pt |
+| row height, with subtitle | 62.7pt | 62.7pt | 63.1pt |
+
+**The root pages agree with the reference exactly, to a tenth of a point.** The settings pages
+agree on those figures too; what differs there is structure, not spacing:
+
+```text
+reference (Tunnel)                     this client (Tunnel)
+[caption: 强制路由]                     [caption: Routing]
+[card: 强制路由        toggle]  50pt    [card: 强制路由 + explanation   toggle]  63pt
+[footnote: 如果是，…]                    [card: 包括所有网络 + explanation toggle]  63pt
+[caption: 包括所有网络]                  [card: 包括本地网络 + explanation toggle]  63pt
+[card: 包括所有网络     toggle]  50pt    …
+```
+
+One card per setting with the explanation as that card's footnote, against one card per group
+with each row carrying its own. The second is taller per row and the first repeats a caption for
+every setting; neither is a spacing error, and the tokens are the same in both.
 
 ## 5b. What §44 taught about testing dense data
 
