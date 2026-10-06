@@ -2,7 +2,6 @@ package route
 
 import (
 	"context"
-	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -51,10 +50,6 @@ const (
 	// dialGovernorBudget is how long a dial may wait for a slot before giving up on the governor and
 	// proceeding anyway.
 	dialGovernorBudget = 500 * time.Millisecond
-	// dialGovernorJitter is the range of the pause between attempts. It exists so that dials
-	// released together do not re-attempt together, which is the same synchronised wakeup the herd
-	// is made of.
-	dialGovernorJitter = 12 * time.Millisecond
 )
 
 // dialGovernor is the window and the slot count. It is zero-value inert: an unopened window applies
@@ -69,8 +64,10 @@ type dialGovernor struct {
 	limit int
 	// budget is the give-up delay, overridable in tests.
 	budget time.Duration
-	// jitter is the retry pause range, overridable in tests.
-	jitter time.Duration
+	// released wakes waiters when a slot frees. Buffered with one token: several releases collapse
+	// into one wakeup, and every waiter re-checks the slot count anyway, so a coalesced signal
+	// cannot lose a slot - it can only make one waiter do the check that another would have done.
+	released chan struct{}
 }
 
 // open starts (or extends) the window. Called on a network transition.
@@ -95,47 +92,71 @@ func isPriority(class trafficclass.Class) bool {
 
 // enter waits for a slot if the window is open and the class is bounded, and returns the release
 // function. The caller MUST call it exactly once, on every path, including error paths.
+// enter waits for a slot if the window is open and the class is bounded, and returns the release
+// function. The caller MUST call it exactly once, on every path including errors.
+//
+// # Why this waits on a channel and not on a timer
+//
+// It used to retry every 6-18ms until its budget ran out. That is a poll: with several dials waiting
+// after a transition it produces timer wakeups, scheduler wakeups and mutex contention for the whole
+// 500ms - and this fork's stated goal is fewer radio and CPU wakeups on a phone, not more. A waiter
+// now sleeps until something actually happens: a slot is released, the budget expires, the caller's
+// context is cancelled, or the window closes.
 func (g *dialGovernor) enter(ctx context.Context, class trafficclass.Class) func() {
 	if isPriority(class) {
 		return noopRelease
 	}
-	limit, budget, jitter := g.settings()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	limit, budget, _ := g.settings()
 	g.access.Lock()
-	windowEnd := g.windowEnd
-	open := time.Now().Before(windowEnd)
+	open := time.Now().Before(g.windowEnd)
 	if open && g.active < limit {
 		g.active++
 		g.access.Unlock()
 		return g.release
 	}
+	if g.released == nil {
+		g.released = make(chan struct{}, 1)
+	}
+	released := g.released
+	windowEnd := g.windowEnd
 	g.access.Unlock()
 	if !open {
 		return noopRelease
 	}
 
-	deadline := time.Now().Add(budget)
+	// The budget bounds the wait whatever happens, which is what keeps the bound SOFT: a dial that
+	// cannot get a slot proceeds unbounded rather than queueing behind the burst.
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	// The window closing is also a reason to stop waiting, and it can happen long before the budget.
+	windowTimer := time.NewTimer(time.Until(windowEnd))
+	defer windowTimer.Stop()
+
 	for {
-		if ctx != nil && ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			// The caller is already gone; do not hold a slot for a dial that will not happen.
 			return noopRelease
-		}
-		if !time.Now().Before(deadline) {
-			// Out of patience. Proceeding unbounded is the documented trade: a soft bound delays the
-			// start of a burst, it does not queue behind it.
+		case <-timer.C:
 			return noopRelease
-		}
-		time.Sleep(time.Duration(rand.Int64N(int64(jitter))) + jitter/2)
-		g.access.Lock()
-		if time.Now().After(g.windowEnd) {
-			g.access.Unlock()
+		case <-windowTimer.C:
 			return noopRelease
-		}
-		if g.active < limit {
-			g.active++
+		case <-released:
+			g.access.Lock()
+			if time.Now().After(g.windowEnd) {
+				g.access.Unlock()
+				return noopRelease
+			}
+			if g.active < limit {
+				g.active++
+				g.access.Unlock()
+				return g.release
+			}
 			g.access.Unlock()
-			return g.release
 		}
-		g.access.Unlock()
 	}
 }
 
@@ -144,12 +165,21 @@ func (g *dialGovernor) release() {
 	if g.active > 0 {
 		g.active--
 	}
+	released := g.released
 	g.access.Unlock()
+	if released != nil {
+		// Non-blocking: one token in flight is enough to wake a waiter, and every waiter re-checks
+		// the slot count, so extra tokens would only be redundant wakeups.
+		select {
+		case released <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // settings resolves the constants, with the test overrides applied.
 func (g *dialGovernor) settings() (int, time.Duration, time.Duration) {
-	limit, budget, jitter := dialGovernorLimit, dialGovernorBudget, dialGovernorJitter
+	limit, budget := dialGovernorLimit, dialGovernorBudget
 	g.access.Lock()
 	if g.limit > 0 {
 		limit = g.limit
@@ -157,11 +187,8 @@ func (g *dialGovernor) settings() (int, time.Duration, time.Duration) {
 	if g.budget > 0 {
 		budget = g.budget
 	}
-	if g.jitter > 0 {
-		jitter = g.jitter
-	}
 	g.access.Unlock()
-	return limit, budget, jitter
+	return limit, budget, 0
 }
 
 func noopRelease() {}
