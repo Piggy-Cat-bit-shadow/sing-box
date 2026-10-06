@@ -15,9 +15,9 @@
 # release: once against each source. Which source it is looking at decides the expected
 # revision, because the two platforms legitimately sit at different Apple commits.
 #
-# # Four independent overlays
+# # Three independent overlays
 #
-# This script applies four overlays, kept separate on purpose so any one can be retired
+# This script applies three overlays, kept separate on purpose so any one can be retired
 # without disturbing the others:
 #
 #   [compatibility]    Adapts the pinned Apple client to this fork's libbox API.
@@ -34,11 +34,6 @@
 #                      requested from Apple separately and is dropped for a personal
 #                      build, plus App Group consistency. Once multicast is granted this
 #                      overlay is simply dropped and the others are untouched. Step 2.
-#
-#   [platform]         Raises the iOS minimum deployment target to 16.0, because the
-#                      frozen iOS UI uses a toolbar construct the SDK only builds from
-#                      iOS 16. iOS client only; macOS and tvOS floors are asserted
-#                      unchanged. Step 1f.
 #
 # An earlier version of this comment said "two overlays" and omitted branding entirely,
 # which stopped matching the script as soon as branding was added.
@@ -331,32 +326,6 @@ fi
 echo "[apple-links] submodule=$actual_sha"
 echo "[apple-links] source=https://github.com/Piggy-Cat-bit-shadow/sing-box"
 echo "[apple-links] releases=https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"
-
-# ---------------------------------------------------------------------------
-# 1f. [platform] iOS minimum deployment target.
-# ---------------------------------------------------------------------------
-# The iOS UI installs a toolbar item conditionally, which the SDK builds with
-# `ToolbarContentBuilder.buildIf` - annotated `@available(iOS 16.0, ...)`. At the
-# project's 15.0 floor the app therefore does not compile:
-#
-#   SFI/MainView.swift:128:21: error: 'buildIf' is only available in iOS 16.0 or newer
-#
-# The UI is frozen and this fork does not support iOS 15, so the floor is raised instead of
-# wrapping the construct in an availability check. Only IPHONEOS_DEPLOYMENT_TARGET moves,
-# and only on the targets that take part in the iOS product; macOS and tvOS floors are
-# asserted unchanged by the script itself. Step 1f.
-#
-# It is scoped to the iOS client: the macOS product is built from a different Apple source
-# whose deployment targets are none of this overlay's business.
-if [ "$APPLE_CLIENT_PLATFORM" = "ios" ]; then
-  echo "overlay [platform]: iOS minimum deployment target 16.0"
-  python3 "$root/scripts/ci/apply-apple-ios-deployment-target.py" apply "$submodule_path"
-  # Re-read rather than trust the edit, so a project that did not actually end up at the
-  # floor fails here rather than 20 minutes into an archive.
-  python3 "$root/scripts/ci/apply-apple-ios-deployment-target.py" check "$submodule_path"
-else
-  echo "overlay [platform]: iOS deployment target not applicable to the $APPLE_CLIENT_PLATFORM client"
-fi
 
 # ---------------------------------------------------------------------------
 # 2. [entitlements] Multicast switch and App Group consistency.

@@ -412,8 +412,7 @@ done
 # The Python halves of the Apple tooling must import only the standard library: the GitHub
 # runner image has no PyYAML, and a script that needs it fails there for a reason unrelated
 # to what it checks. Verified by walking each script's import statements.
-for py in scripts/ci/apply-apple-link-overlay.py scripts/ci/check-apple-links.py \
-          scripts/ci/apply-apple-ios-deployment-target.py; do
+for py in scripts/ci/apply-apple-link-overlay.py scripts/ci/check-apple-links.py; do
   check "$(basename "$py") imports only the standard library" \
     bash -c "python3 -c 'import ast,sys; m=ast.parse(open(sys.argv[1]).read()); \
       mods={n.names[0].name.split(\".\")[0] for n in ast.walk(m) if isinstance(n, ast.Import)} | \
@@ -445,19 +444,20 @@ if [ "$branding_applied" = "1" ]; then
   #
   #   SFI/MainView.swift:128:21: error: 'buildIf' is only available in iOS 16.0 or newer
   #
-  # prepare-apple-client.sh raises the floor as part of preparing the iOS client. Asserted
-  # here so a repin that quietly reintroduces 15.0 is caught by the regression suite rather
-  # than by a failed release build.
-  if python3 "$root/scripts/ci/apply-apple-ios-deployment-target.py" check clients/apple >/dev/null 2>&1; then
-    check "the prepared iOS client builds at iOS 16.0 or above" true
-  else
-    check "the prepared iOS client builds at iOS 16.0 or above" false
-    python3 "$root/scripts/ci/apply-apple-ios-deployment-target.py" check clients/apple 2>&1 | sed 's/^/      /' || true
-  fi
+  # It is a plain project setting in the client now - the iOS build itself is the real gate,
+  # because at 15.0 the app does not compile - so this only records where the floor lives.
+  check "the iOS floor is declared in the project" \
+    grep -q 'IPHONEOS_DEPLOYMENT_TARGET = 16.0;' "$pbx"
 
-  # The floor is raised in the PROJECT, never in the UI: the Hako toolbar logic is frozen.
-  check "raising the iOS floor did not touch the toolbar logic" \
-    bash -c 'grep -q "if environments.remoteServer != nil" clients/apple/SFI/MainView.swift'
+  # ...and that it stays a project setting rather than becoming a build-time rewrite again.
+  check "no build step rewrites the iOS deployment target" \
+    bash -c '! grep -q "IPHONEOS_DEPLOYMENT_TARGET" scripts/ci/prepare-apple-client.sh'
+
+  # The floor lives in the PROJECT, never in the UI: the Hako toolbar logic is frozen.
+  check "the iOS floor was not raised by editing Swift" \
+    bash -c 'git -C clients/apple diff --name-only | grep -qE "\.swift$" && exit 1 || exit 0'
+  check "the toolbar logic is unchanged" \
+    grep -q "if environments.remoteServer != nil" clients/apple/SFI/MainView.swift
 
   check "the branding overlay renamed SFI" \
     grep -q 'INFOPLIST_KEY_CFBundleDisplayName = "JiejieBox"' "$pbx"
