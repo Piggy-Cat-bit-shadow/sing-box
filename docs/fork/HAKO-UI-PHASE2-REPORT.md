@@ -776,6 +776,42 @@ looks like ordinary truncation. The generalisable form is that **a composed stri
 and truncating it is not order-neutral** — a middle truncation on `a · b · c` can delete `b`, and
 the reader cannot tell that anything is missing.
 
+## 5c. The coherence audit
+
+Asked to check the whole app for what is still dated and for buttons that do not belong. Sweeping
+for the *components* rather than for screens named the offenders, and each one fixed many screens
+at once:
+
+| what the sweep found | where | fixed |
+| --- | --- | --- |
+| rows built with `FormItem` - an `HStack`, a `Text`, two spacers and a control | **21 files** | it is the platform's `LabeledContent` now |
+| action tiles drawn as a solid saturated square with a white glyph | the config centre and every other tile | the reference's soft `.tint.opacity(0.11)` panel, tinted glyph, tinted label |
+| toggle rows hand-built from a `Text` + spacer + labels-hidden `Toggle` | every settings page | the platform's `Toggle`, 74pt -> 52pt against the reference's 53 |
+
+What the same sweep counted and did **not** fix - the honest remaining inventory:
+
+```text
+eight distinct button treatments, where the design system names two
+  HakoPushRowButtonStyle          18 uses   ← the row button, correct
+  hakoPrimaryActionButtonStyle     2 uses   ← the primary button, barely used
+  buttonStyle(.plain)             47 uses   ← ad hoc
+  actionButtonStyle()             11 uses   ← legacy
+  buttonStyle(.bordered/.borderless/.borderedProminent)  16 uses
+  SelectorButtonStyle              2 uses   ← legacy, defined locally
+  ActionButtonStyle                1 def    ← legacy, defined locally
+
+still in the tree
+  DashboardCardView / DashboardCardHeader    7 files  (the pre-Hako card)
+  selectorBackground()                       4 uses   (the pre-Hako control fill)
+  FormButton                                31 uses
+  foregroundColor(                          35 uses   (superseded by foregroundStyle)
+  Color(uiColor: / Color(NSColor            20 uses   (platform colours read directly)
+  cornerRadius: 1[0-9]                      12 uses   (radii off the token scale)
+```
+
+The order to take them in is the order above: the button treatments first, because that is the
+complaint, then the legacy card and control fill, then the deprecated modifiers.
+
 ## 6. What is open
 
 In the order I would attack it:
