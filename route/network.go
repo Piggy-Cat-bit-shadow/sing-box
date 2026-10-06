@@ -823,24 +823,44 @@ func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 		}
 	}
 
-	for _, endpoint := range r.endpoint.Endpoints() {
-		listener, isListener := endpoint.(adapter.InterfaceUpdateListener)
-		if isListener {
-			listener.InterfaceUpdated(ctx)
+	// The endpoints, inbounds and outbounds are told about the new network HERE, and not while the
+	// device is paused.
+	//
+	// Almost every outbound reads InterfaceUpdated as "tear the session down" - see
+	// docs/fork/interface-update-lifecycle.md for the inventory - and while the network is paused
+	// there is no new network to hand them. The teardown cannot lead to a working connection; it can
+	// only produce a dial that is certain to fail, and it throws away a session that was still
+	// carrying traffic over a path the notification did not necessarily break. protocol/group/urltest
+	// already makes exactly this judgement for its own re-test; this applies it to the rest.
+	//
+	// The work is deferred, not skipped: the wake notification runs this same body with the pause
+	// lifted, so every listener is told once there is something to tell it about. A socket that is
+	// genuinely dead in the meantime fails on its own and reconnects, which is the behaviour this
+	// whole change set is built around.
+	//
+	// router.ResetNetwork stays unconditional and deliberately so. It is where the DNS transports and
+	// their environment pins move TOGETHER, so gating it on the pause would let the pin and the socket
+	// disagree - the exact inconsistency the pin exists to prevent. See network_environment.go.
+	if !r.networkIsPaused() {
+		for _, endpoint := range r.endpoint.Endpoints() {
+			listener, isListener := endpoint.(adapter.InterfaceUpdateListener)
+			if isListener {
+				listener.InterfaceUpdated(ctx)
+			}
 		}
-	}
 
-	for _, inbound := range r.inbound.Inbounds() {
-		listener, isListener := inbound.(adapter.InterfaceUpdateListener)
-		if isListener {
-			listener.InterfaceUpdated(ctx)
+		for _, inbound := range r.inbound.Inbounds() {
+			listener, isListener := inbound.(adapter.InterfaceUpdateListener)
+			if isListener {
+				listener.InterfaceUpdated(ctx)
+			}
 		}
-	}
 
-	for _, outbound := range r.outbound.Outbounds() {
-		listener, isListener := outbound.(adapter.InterfaceUpdateListener)
-		if isListener {
-			listener.InterfaceUpdated(ctx)
+		for _, outbound := range r.outbound.Outbounds() {
+			listener, isListener := outbound.(adapter.InterfaceUpdateListener)
+			if isListener {
+				listener.InterfaceUpdated(ctx)
+			}
 		}
 	}
 
@@ -863,8 +883,16 @@ func (r *NetworkManager) ReleaseMemory(ctx context.Context) {
 // It requires the pause manager to say so AND the state to have held for HardTransitionConfirm. Both
 // halves matter: the pause alone is true during a handover's gap, and elapsed time alone would call
 // a device offline that never paused anything (a desktop with no monitor, for instance).
+// networkIsPaused reports the platform's own view of whether the device is offline or mid-handover.
+//
+// It is the pause manager's answer rather than a fresh lookup, for the reason given at the call
+// sites: dispatchInterfaceUpdateLocked already drives that state from the platform report.
+func (r *NetworkManager) networkIsPaused() bool {
+	return r.pauseManager != nil && r.pauseManager.IsNetworkPaused()
+}
+
 func (r *NetworkManager) networkIsConfirmedOffline() bool {
-	if r.pauseManager == nil || !r.pauseManager.IsNetworkPaused() {
+	if !r.networkIsPaused() {
 		return false
 	}
 	since := r.networkPausedSince.Load()

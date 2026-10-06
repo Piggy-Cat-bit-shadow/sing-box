@@ -76,6 +76,20 @@ disconnected on a Wi-Fi roam that may not have broken anything.
 3. **What is not established:** whether the observed behaviour is *necessary*. Class A above records
    what each implementation does and why its socket is plausibly path-bound. It does not establish
    that a medium transition must be acted on at the instant it arrives rather than on the wake
-   notification that follows it — and that is the change worth making, not a rewrite of each
-   protocol. Extending the `urltest` guard to the class-A listeners would keep the work for the
-   moment the network is actually back, and is the next step this document proposes.
+   notification that follows it.
+
+## What was done about it
+
+`NetworkManager.resetNetworkLocked` now skips the endpoint, inbound and outbound notifications while
+`pause.Manager` reports the network paused, and lets the wake notification run the same body with the
+pause lifted. The work is deferred, not dropped, and no protocol implementation changed — so a
+listener still needs no opinion about the platform's state, and the ones that already had one
+(`urltest`) are not double-guarded.
+
+`router.ResetNetwork()` stays unconditional, deliberately: it is where the DNS transports and their
+environment pins move together, so gating it on the pause would let the pin and the socket disagree.
+
+This does not turn class A into class B. A socket that is genuinely dead still fails on its own and
+reconnects; what was removed is the teardown issued while there is provably nowhere to reconnect to.
+The class-C question — whether the QUIC-based outbounds should migrate rather than reconnect — is
+untouched and remains open, because nothing in this tree attempts migration today.
