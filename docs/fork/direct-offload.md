@@ -103,6 +103,16 @@ userspace and calls the Handler back. The header of
 [native-bypass-trace.md](native-bypass-trace.md) records the trace and the experiments that establish
 it.
 
+**Re-verified at sing-tun `v0.9.7-0.20261006124248-d769a7080ca2`**, the revision this fork pins after
+absorbing upstream `a4331b8d` ("Rework forward NAT with UDP mapping and fragment support"). That
+upstream work reworks forward NAT — UDP mapping/filtering options, a kernel port-selection and
+reservation protocol (`tun.PortWithSelectorRange` / `tun.PortWithSelectorReservation`, reached through
+the new `UpstreamPort()` chain), fragmentation — and leaves the handling of an `ActionBypass` verdict
+alone: the merge changed nothing in how any of the three TUN stacks treats it. The claim above is
+therefore unchanged, and it is held there by the same behavioural tripwires rather than by reading
+the new revision: `TestANewTrackerOnABypassIsNeverCreated` and `TestABypassFlowIsNeverCounted`
+(`protocol/tun`), plus the dispatcher trace this paragraph cites, all pass against the new pin.
+
 So for a TUN client the eligibility decision in this document has **no data-plane effect**: a flow it
 marks as bypassable is still proxied in userspace. What it does have is a real effect in Linux
 redirect mode.
