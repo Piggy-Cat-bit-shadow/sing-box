@@ -84,6 +84,21 @@ func newQueryMultiplexer(options queryMultiplexerOptions) *queryMultiplexer {
 	}
 	multiplexer.serial = NewConnPool(ConnPoolOptions[*multiplexConn]{
 		Mode: ConnPoolOrdered,
+		// One in-progress establishment, per transport.
+		//
+		// ConnPoolOrdered already holds at most ONE CONNECTION out at a time, which is what makes
+		// the one-outstanding-query invariant structural - but that guarantee starts once a
+		// connection exists. Before one does, every concurrent caller takes the same branch: no
+		// idle connection, so dial. A network transition invalidates the socket underneath twenty
+		// waiting queries and twenty of them dial, run a TCP handshake and a TLS handshake, and
+		// nineteen of the results are closed unused.
+		//
+		// The slot is held for the DIAL, not for the query, so this bounds establishment without
+		// serialising the queries themselves: the first caller installs the connection and the ones
+		// waiting behind it find it idle and reuse it, which is the behaviour this pool was written
+		// for. The cap is per transport - each transport builds its own multiplexer - so independent
+		// servers, and the other DNS transports, are unaffected.
+		MaxInflight: 1,
 		IsAlive: func(conn *multiplexConn) bool {
 			// Only a nil connection is rejected here.
 			//
