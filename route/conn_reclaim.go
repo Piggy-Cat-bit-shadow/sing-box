@@ -198,9 +198,13 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 		common.Close(closer)
 	}
 	if policy.drain {
+		// What is left is what drained. Counted after the pass rather than before it, so the number
+		// is connections this transition actually spared and not connections it happened to see.
+		drained := m.Count()
+		m.transitions.recordTransition(drained, len(closers))
 		// Only worth starting when the pass left something behind; otherwise there is nothing for a
 		// sweep to find.
-		if m.Count() > 0 {
+		if drained > 0 {
 			m.beginDrainSweep()
 		}
 		if m.reclaimLog != nil {
@@ -269,8 +273,11 @@ func (m *ConnectionManager) sweepStaleConnections() bool {
 	for _, closer := range closers {
 		common.Close(closer)
 	}
-	if len(closers) > 0 && m.reclaimLog != nil {
-		m.reclaimLog(ReclaimNetworkTransition, len(closers), current)
+	if len(closers) > 0 {
+		m.transitions.recordSweep(len(closers))
+		if m.reclaimLog != nil {
+			m.reclaimLog(ReclaimNetworkTransition, len(closers), current)
+		}
 	}
 	return remaining
 }

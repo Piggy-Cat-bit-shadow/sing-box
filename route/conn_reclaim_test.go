@@ -205,3 +205,74 @@ func TestIdleReclaimSparesActiveConnections(t *testing.T) {
 		t.Fatal("idle reclaim took the active connection as well")
 	}
 }
+
+// TestDrainDiagnosticsReportTheSplit is what makes a real-device run able to prove the change.
+//
+// The number that matters is DrainRatio: a transition that reclaims everything looks identical in
+// the log to one that drains, unless this distinguishes them.
+func TestDrainDiagnosticsReportTheSplit(t *testing.T) {
+	h := newDrainHarness(t)
+
+	active, peer := h.dial(t)
+	go func() { _, _ = peer.Write([]byte("payload")) }()
+	buffer := make([]byte, 16)
+	if _, err := active.Read(buffer); err != nil {
+		t.Fatal("the fixture could not move a byte: ", err)
+	}
+	h.idleFor(active, time.Second)
+
+	idle, _ := h.dial(t)
+	h.idleFor(idle, time.Minute)
+
+	if closed := h.manager.Reclaim(ReclaimNetworkTransition); closed != 1 {
+		t.Fatalf("expected the idle connection to be reclaimed, got %d", closed)
+	}
+
+	snapshot := h.manager.TransitionDiagnostics()
+	if snapshot.Transitions != 1 {
+		t.Fatalf("transitions = %d, want 1", snapshot.Transitions)
+	}
+	if snapshot.Drained != 1 {
+		t.Fatalf("drained = %d, want 1 (the active connection)", snapshot.Drained)
+	}
+	if snapshot.ReclaimedAtTransition != 1 {
+		t.Fatalf("reclaimedAtTransition = %d, want 1", snapshot.ReclaimedAtTransition)
+	}
+	if ratio := snapshot.DrainRatio(); ratio != 0.5 {
+		t.Fatalf("drain ratio = %v, want 0.5", ratio)
+	}
+	if summary := snapshot.TransitionSummary(); summary == "" {
+		t.Fatal("the summary is empty")
+	}
+
+	// Now let the drained connection fall silent: the sweep is what closes it, and the split has to
+	// move with it or the numbers would describe only the first pass.
+	h.idleFor(active, time.Minute)
+	deadline := time.Now().Add(5 * time.Second)
+	for h.manager.TransitionDiagnostics().ReclaimedBySweep == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the sweep never reclaimed the drained connection")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	after := h.manager.TransitionDiagnostics()
+	if after.Sweeps == 0 {
+		t.Fatal("a sweep reclaimed a connection but no sweep was counted")
+	}
+	if got := after.Reclaimed(); got != 2 {
+		t.Fatalf("total reclaimed = %d, want 2", got)
+	}
+	if after.Drained != 1 {
+		t.Fatalf("drained moved to %d; it describes the transition, not the sweep", after.Drained)
+	}
+}
+
+// TestNoTransitionNoSummary keeps the shutdown line honest: a tunnel that never saw a network change
+// must not print a transition report claiming zeros.
+func TestNoTransitionNoSummary(t *testing.T) {
+	h := newDrainHarness(t)
+	h.dial(t)
+	if snapshot := h.manager.TransitionDiagnostics(); snapshot.Transitions != 0 {
+		t.Fatalf("transitions = %d before any transition, want 0", snapshot.Transitions)
+	}
+}

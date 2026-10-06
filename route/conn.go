@@ -54,6 +54,9 @@ type ConnectionManager struct {
 	// without sleeping for the production windows. Zero means "use the constant".
 	drainIdleGraceOverride     time.Duration
 	drainSweepIntervalOverride time.Duration
+	// Transition and drain diagnostics. One atomic add per transition and per reclaim pass,
+	// never per byte. See transition_diagnostics.go for what these numbers can and cannot say.
+	transitions transitionDiagnostics
 	// Session-level splice diagnostics. One atomic add per UDP session, never per
 	// packet. See splice_diagnostics.go for why, and for what these numbers can and
 	// cannot tell you.
@@ -181,6 +184,18 @@ func (m *ConnectionManager) Close() error {
 	}
 	if snapshot := m.TCPSpliceDiagnostics(); snapshot.Attempts > 0 {
 		m.logger.Info(snapshot.TCPSpliceSummary())
+	}
+	// One line per tunnel lifetime, and only when the tunnel actually saw a network change. This is
+	// the evidence the drain works on a real device: it needs no instrumentation beyond starting and
+	// stopping the tunnel across a few network changes.
+	//
+	// The nil check is not decoration like it would be for the summaries above, whose counters stay
+	// zero unless a splice decision was reached: a manager can legitimately be built without a logger
+	// (the tests do), and a transition is exactly the event that would then dereference it.
+	if m.logger != nil {
+		if snapshot := m.TransitionDiagnostics(); snapshot.Transitions > 0 {
+			m.logger.Info(snapshot.TransitionSummary())
+		}
 	}
 	return nil
 }
