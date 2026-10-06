@@ -48,10 +48,17 @@ func (w *dispatcherWriteback) count() int {
 }
 
 // newTraceDispatcher builds a real dispatcher over the given handler.
+//
+// The UDP timeout is a field of a struct since sing-tun d769a708, where forward NAT gained UDP
+// mapping and filtering alongside it. Only the timeout is set: the zero Mapping and Filtering are
+// NATMappingEndpointIndependent and NATFilteringEndpointIndependent, which is the behaviour the bare
+// duration used to imply and the same default the fork's own configuration resolves to. Nothing
+// about what this dispatcher is asked to prove has changed - the parameter moved, it was not
+// relaxed.
 func newTraceDispatcher(t *testing.T, handler *traceHandler) (*tun.ForwardDispatcher, *tun.ForwardStage, *dispatcherWriteback) {
 	t.Helper()
 	writeback := &dispatcherWriteback{}
-	dispatcher := tun.NewForwardDispatcher(handler, writeback, logger.NOP(), 30*time.Second, time.Minute)
+	dispatcher := tun.NewForwardDispatcher(handler, writeback, logger.NOP(), tun.UDPNatOptions{Timeout: 30 * time.Second}, time.Minute)
 	t.Cleanup(dispatcher.Close)
 	return dispatcher, dispatcher.NewStage(writeback), writeback
 }
