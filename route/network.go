@@ -774,7 +774,21 @@ func (r *NetworkManager) NetworkResetGeneration() uint64 {
 // a lock acquisition later.
 func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 	if r.connectionManager != nil {
-		r.connectionManager.CloseAll()
+		// Drain, do not kill. This used to be CloseAll, which meant every path change - a Wi-Fi
+		// roam, a new SSID, a cell handover that moved the gateway address - terminated every
+		// stream the device was running, including ones still transferring on a socket that was
+		// perfectly healthy. The transports below are told about the new network and drop what they
+		// must; the streams are left to fail on their own or to finish, and the idle ones are
+		// reclaimed. See ReclaimNetworkTransition.
+		//
+		// The adapter interface cannot express the policy without the reason type, and widening it
+		// would force every test double to grow a method it has no opinion about. The capability is
+		// therefore asked for directly, and its absence falls back to the previous behaviour.
+		if reclaimer, isReclaimer := r.connectionManager.(networkTransitionReclaimer); isReclaimer {
+			reclaimer.Reclaim(ReclaimNetworkTransition)
+		} else {
+			r.connectionManager.CloseAll()
+		}
 	}
 
 	for _, endpoint := range r.endpoint.Endpoints() {

@@ -35,9 +35,25 @@ import (
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
 type ConnectionManager struct {
-	logger      logger.ContextLogger
-	access      sync.Mutex
-	connections list.List[io.Closer]
+	logger logger.ContextLogger
+	access sync.Mutex
+	// connections holds every dialled connection the manager owns, with the lifecycle record the
+	// reclaim policies decide on. It used to be a list of bare io.Closer, which is why the only
+	// thing it could do on a network change was close all of them; see conn_reclaim.go.
+	connections list.List[managedConn]
+	// generation counts network transitions. A connection records the value at dial time, so
+	// "belongs to a path the device has left" is one integer comparison.
+	generation atomic.Uint64
+	// sweepAccess guards sweepTimer and closed.
+	sweepAccess sync.Mutex
+	sweepTimer  *time.Timer
+	closed      atomic.Bool
+	// reclaimLog, when set, reports each reclaim pass. Diagnostics only; nil in production.
+	reclaimLog func(reason ReclaimReason, closed int, generation uint64)
+	// drainIdleGraceOverride and drainSweepIntervalOverride exist so a test can exercise the drain
+	// without sleeping for the production windows. Zero means "use the constant".
+	drainIdleGraceOverride     time.Duration
+	drainSweepIntervalOverride time.Duration
 	// Session-level splice diagnostics. One atomic add per UDP session, never per
 	// packet. See splice_diagnostics.go for why, and for what these numbers can and
 	// cannot tell you.
@@ -98,7 +114,7 @@ func (m *ConnectionManager) CloseAll() {
 		m.scheduler.ReleaseAll()
 	}
 	m.access.Lock()
-	var closers []io.Closer
+	var closers []managedConn
 	for element := m.connections.Front(); element != nil; {
 		nextElement := element.Next()
 		closers = append(closers, element.Value)
@@ -142,6 +158,11 @@ func (m *ConnectionManager) UploadRate() int64 {
 }
 
 func (m *ConnectionManager) Close() error {
+	// Order matters: mark closed so a sweep in flight will not reschedule itself, stop the timer,
+	// and only then tear the connections down. A timer that fired after this returned would be
+	// reclaiming connections on behalf of a manager whose lifecycle has ended.
+	m.closed.Store(true)
+	m.stopDrainSweep()
 	m.CloseAll()
 	// Releasing the scheduler here is what unblocks a copy goroutine parked in the gate. Closing
 	// the connections above does not: a flow waiting for a permit is not inside a write, so it
@@ -170,6 +191,7 @@ func (m *ConnectionManager) TrackConn(conn net.Conn) net.Conn {
 		socketOwner: socketOwner{original: conn},
 		manager:     m,
 	}
+	tracked.managedConnState = m.newConnState()
 	m.access.Lock()
 	tracked.element = m.connections.PushBack(tracked)
 	m.access.Unlock()
@@ -182,10 +204,23 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 		socketOwner:   socketOwner{original: conn},
 		manager:       m,
 	}
+	tracked.managedConnState = m.newConnState()
 	m.access.Lock()
 	tracked.element = m.connections.PushBack(tracked)
 	m.access.Unlock()
 	return tracked
+}
+
+// newConnState stamps a connection with the path it was dialled on.
+//
+// The generation is read from the manager rather than passed in, so it cannot be forgotten at a call
+// site: every tracked connection is stamped with the transition in effect at the moment it entered
+// the list.
+func (m *ConnectionManager) newConnState() managedConnState {
+	return managedConnState{
+		createdAt:  time.Now(),
+		generation: m.generation.Load(),
+	}
 }
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -875,8 +910,35 @@ func (o *socketOwner) close() bool {
 type trackedConn struct {
 	net.Conn
 	socketOwner
+	// Embedded, not named: promotion is what makes *trackedConn satisfy managedConn, so the
+	// lifecycle record has to be part of the value rather than a field hanging off it.
+	managedConnState
 	manager *ConnectionManager
-	element *list.Element[io.Closer]
+	element *list.Element[managedConn]
+}
+
+// Read and Write exist to observe activity, and are the only reason these two methods are declared:
+// everything else is the embedded connection.
+//
+// A transfer that succeeds is what proves the path still works, so this is exactly the signal the
+// drain policy needs, and it is recorded where the bytes already pass rather than by polling a
+// socket. The missed case is a spliced connection, whose bytes move between descriptors in the
+// kernel and never arrive here; that is why managedConnState treats "never observed" as protected
+// rather than idle.
+func (c *trackedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *trackedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.touch()
+	}
+	return n, err
 }
 
 func (c *trackedConn) SyscallConn() (syscall.RawConn, error) {
@@ -918,8 +980,9 @@ func (c *trackedConn) WriterReplaceable() bool {
 type trackedPacketConn struct {
 	N.NetPacketConn
 	socketOwner
+	managedConnState
 	manager *ConnectionManager
-	element *list.Element[io.Closer]
+	element *list.Element[managedConn]
 }
 
 func (c *trackedPacketConn) SyscallConn() (syscall.RawConn, error) {
