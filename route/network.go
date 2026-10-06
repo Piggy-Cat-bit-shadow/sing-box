@@ -35,26 +35,29 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
-	ctx                     context.Context
-	logger                  logger.ContextLogger
-	router                  adapter.Router
-	interfaceFinder         *control.DefaultInterfaceFinder
-	networkInterfaces       common.TypedValue[[]adapter.NetworkInterface]
-	autoDetectInterface     bool
-	defaultOptions          adapter.NetworkOptions
-	autoRedirectOutputMark  uint32
-	bridgeInterfaceAccess   sync.Mutex
-	bridgeInterfaces        []string
-	networkMonitor          tun.NetworkUpdateMonitor
-	interfaceMonitor        tun.DefaultInterfaceMonitor
-	packageManager          tun.PackageManager
-	powerListener           winpowrprof.EventListener
-	pauseManager            pause.Manager
-	platformInterface       adapter.PlatformInterface
-	connectionManager       adapter.ConnectionManager
-	endpoint                adapter.EndpointManager
-	inbound                 adapter.InboundManager
-	outbound                adapter.OutboundManager
+	ctx                    context.Context
+	logger                 logger.ContextLogger
+	router                 adapter.Router
+	interfaceFinder        *control.DefaultInterfaceFinder
+	networkInterfaces      common.TypedValue[[]adapter.NetworkInterface]
+	autoDetectInterface    bool
+	defaultOptions         adapter.NetworkOptions
+	autoRedirectOutputMark uint32
+	bridgeInterfaceAccess  sync.Mutex
+	bridgeInterfaces       []string
+	networkMonitor         tun.NetworkUpdateMonitor
+	interfaceMonitor       tun.DefaultInterfaceMonitor
+	packageManager         tun.PackageManager
+	powerListener          winpowrprof.EventListener
+	pauseManager           pause.Manager
+	platformInterface      adapter.PlatformInterface
+	connectionManager      adapter.ConnectionManager
+	endpoint               adapter.EndpointManager
+	inbound                adapter.InboundManager
+	outbound               adapter.OutboundManager
+	// networkPausedSince is when the device was last seen without a default interface, in Unix
+	// nanoseconds, or 0 while it has one. See networkIsConfirmedOffline.
+	networkPausedSince      atomic.Int64
 	needWIFIState           bool
 	wifiMonitor             settings.WIFIMonitor
 	wifiState               adapter.WIFIState
@@ -772,6 +775,15 @@ func (r *NetworkManager) NetworkResetGeneration() uint64 {
 // claims it as part of taking the lock. It is NOT advanced here: a transition claims its epoch
 // before it waits for the lock, so that the epoch moves with the published environment rather than
 // a lock acquisition later.
+// HardTransitionConfirm is how long the device must have been without a default interface before a
+// transition is allowed to reclaim destructively.
+//
+// It is provisional tuning, not a measured optimum: long enough that a Wi-Fi to Cellular handover
+// finishes inside it, short enough that a device which really is offline is not left holding dead
+// sockets. The cost of being wrong in the generous direction is a slower reclaim; in the stingy
+// direction it is the connection storm this work exists to prevent.
+const HardTransitionConfirm = 2 * time.Second
+
 func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 	if r.connectionManager != nil {
 		// Drain, do not kill. This used to be CloseAll, which meant every path change - a Wi-Fi
@@ -782,16 +794,26 @@ func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 		// reclaimed. See ReclaimNetworkTransition.
 		//
 		// The class is read from the LIVE state rather than threaded down from whoever decided a
-		// reset was due, and that is deliberate: what matters is whether the device has an interface
-		// at the moment the reset body runs, not what the notification that triggered it believed.
-		// A hard transition - the default interface is gone - has nothing to drain, because no
-		// connection can still be reaching anywhere.
+		// reset was due: what matters is whether the device is offline at the moment the reset body
+		// runs, not what the notification that triggered it believed.
+		//
+		// "Offline" is the pause manager's answer, not a fresh guess. dispatchInterfaceUpdateLocked
+		// already drives NetworkPause/NetworkWake from the platform's own report, and IsNetworkPaused
+		// is that state - a second judgement built from one DefaultNetworkInterface lookup would be
+		// the kind of parallel authority this fork avoids.
+		//
+		// It is also not enough on its own, because a Wi-Fi to Cellular handover really does pass
+		// through a moment with no default interface, and the environment fingerprint goes to zero
+		// there and back - so an environment transition can arrive while that moment is in effect.
+		// Classifying on the instant would close every connection of a device that is about to have
+		// a perfectly good one, which is the drain undone by its own special case. The state has to
+		// have HELD: HardTransitionConfirm of continuous pause.
 		//
 		// The adapter interface cannot express the policy without the reason type, and widening it
 		// would force every test double to grow a method it has no opinion about. The capability is
 		// therefore asked for directly, and its absence falls back to the previous behaviour.
 		reason := ReclaimNetworkTransition
-		if r.DefaultNetworkInterface() == nil {
+		if r.networkIsConfirmedOffline() {
 			reason = ReclaimDeadPath
 		}
 		if reclaimer, isReclaimer := r.connectionManager.(networkTransitionReclaimer); isReclaimer {
@@ -835,6 +857,43 @@ func (r *NetworkManager) ReleaseMemory(ctx context.Context) {
 	}
 }
 
+// networkIsConfirmedOffline reports whether the device has been without a default interface for
+// long enough to be treated as offline rather than mid-handover.
+//
+// It requires the pause manager to say so AND the state to have held for HardTransitionConfirm. Both
+// halves matter: the pause alone is true during a handover's gap, and elapsed time alone would call
+// a device offline that never paused anything (a desktop with no monitor, for instance).
+func (r *NetworkManager) networkIsConfirmedOffline() bool {
+	if r.pauseManager == nil || !r.pauseManager.IsNetworkPaused() {
+		return false
+	}
+	since := r.networkPausedSince.Load()
+	if since == 0 {
+		// Paused, but by something that did not come through this manager, so there is no onset to
+		// measure. Treated as confirmed: an explicit NetworkPause from outside is an assertion about
+		// the device, not a lookup that raced.
+		return true
+	}
+	return time.Since(time.Unix(0, since)) >= HardTransitionConfirm
+}
+
+// noteNetworkPaused records when the device lost its default interface. It is idempotent for the
+// duration of one outage, so a burst of notifications does not keep pushing the deadline out.
+func (r *NetworkManager) noteNetworkPaused() {
+	if r.pauseManager == nil {
+		return
+	}
+	if !r.pauseManager.IsNetworkPaused() {
+		// Set before the pause is recorded, so no reader can see paused-without-onset and skip the
+		// confirmation window.
+		r.networkPausedSince.Store(time.Now().UnixNano())
+	}
+}
+
+func (r *NetworkManager) clearNetworkPaused() {
+	r.networkPausedSince.Store(0)
+}
+
 func (r *NetworkManager) notifyInterfaceUpdate(_ *control.Interface, _ int) {
 	r.interfaceUpdateAccess.Lock()
 	defer r.interfaceUpdateAccess.Unlock()
@@ -859,11 +918,15 @@ func (r *NetworkManager) notifyInterfaceUpdate(_ *control.Interface, _ int) {
 func (r *NetworkManager) dispatchInterfaceUpdateLocked() {
 	defaultInterface := r.interfaceMonitor.DefaultInterface()
 	if defaultInterface == nil {
+		// Recorded before the pause so the confirmation window starts here, at the platform's own
+		// report, rather than at whatever later noticed.
+		r.noteNetworkPaused()
 		r.pauseManager.NetworkPause()
 		r.logger.Error("missing default interface")
 		return
 	}
 	r.pauseManager.NetworkWake()
+	r.clearNetworkPaused()
 	if r.interfaceUpdateCancel != nil {
 		r.interfaceUpdateCancel()
 	}
