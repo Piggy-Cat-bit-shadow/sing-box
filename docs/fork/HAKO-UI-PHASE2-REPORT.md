@@ -293,7 +293,20 @@ workspace restores it.
     it and cost a line of height under a card whose rows each explain themselves. That section has
     no footnote now. This came out of the same screenshots and is the one genuine spacing defect
     in them: a duplication rather than a measurement.
-31. **An activity row's route lost the rule that chose it.** The manual's §44 names four ways a
+31. **The home was replaced by an install button when no tunnel existed.** A reader opening the
+    app for the first time saw a button where the product should have been — no profile card, no
+    outbound mode, no shortcuts, no traffic, none of the page. The reference never reaches this
+    state, and reading its source showed why: it *provisions a bundled "Direct" profile* on first
+    run (`LocalDefaultProfileProvisioner`), so its home always has something to draw. Ours creates
+    the tunnel through the install flow, so the state is real here and the page has to survive it.
+    It does now: `ExtensionProfile.notInstalled` gives the page a profile to read, the install is an
+    inline notice *on* the page with the action that fixes it, and it takes the screen once, on the
+    first launch, remembered in `@AppStorage`.
+32. **The `.invalid` status was lying in two places.** With a placeholder profile the session card
+    read "Unknown" (the status switch's `default`) and "Switching…" (the not-switchable case
+    answering for a configuration that does not exist). It reads "Not Installed" and says nothing
+    about switching.
+33. **An activity row's route lost the rule that chose it.** The manual's §44 names four ways a
     dense data row must not fail, and this was one of them, found by seeding its nine cases. A
     route is one string composed in reading order — the outbound chain, then the rule, then the
     inbound — and it was middle-truncated on one line, so a long chain pushed the rule into the
@@ -447,6 +460,9 @@ that they do not, and the value travels in `\.hakoContainerDrawsDisclosure`.
   hand-built tab bar, and the `GeometryReader`/`PreferenceKey`/menu machinery that existed to
   decide whether its labels fitted are all gone from this page. `ClashModeCard` itself
   remains for the remote dashboard and the focus platform's overview.
+- **Home with no tunnel installed**: the whole page — notice, session card reading "Not Installed",
+  profile card, outbound mode, shortcuts, traffic — with the install offered inline, and the
+  one-time install sheet captured separately.
 - **The activity rows under load**: the manual's §44 cases — a long domain, an IPv6 literal, a
   Chinese rule, an English rule, a long outbound chain, several badges, a large value, zero
   bytes, KB/MB/GB — seeded at the display layer, asserted on screen and captured. The route
