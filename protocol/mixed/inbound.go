@@ -173,16 +173,10 @@ func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata ada
 		// earlyDataConn is therefore a transparent pass-through until the routing
 		// layer first reads from it, which is after the handshake has returned.
 		//
-		// The wrapper is only built when the buffer actually holds more than the
-		// version byte. A client that waits for the SOCKS reply before sending
-		// payload -- which is the common case, and the only case for a
-		// well-behaved SOCKS4 client -- leaves nothing to carry, and the routing
-		// layer then receives the original connection with no extra object
-		// between it and the socket.
-		// It is ALWAYS built, never conditionally. `reader.Buffered() > 1` at this
-		// point is not evidence of early data: with a 1-byte boundary the buffer
-		// holds only the version byte while the payload is still in the socket,
-		// so a conditional wrapper loses exactly the case it was meant to skip.
+		// It is ALWAYS built, never conditionally. `reader.Buffered() > 1` is not
+		// evidence of early data: with a one-byte boundary the buffer holds only
+		// the version byte while the payload is still in the socket, so a
+		// conditional wrapper would lose exactly the case it was meant to skip.
 		handshakeConn := net.Conn(newEarlyDataConn(conn, reader))
 		// HandleConnectionEx owns `conn` and `onClose` once the hand-off succeeds,
 		// which it reports by returning nil. A nil return is NOT a handshake
