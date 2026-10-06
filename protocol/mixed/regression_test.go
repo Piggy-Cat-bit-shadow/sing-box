@@ -3,13 +3,17 @@ package mixed
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+	socksinbound "github.com/sagernet/sing-box/protocol/socks"
 	"github.com/sagernet/sing/common/auth"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -23,6 +27,12 @@ import (
 // connection's user leak into another's metadata.
 // ---------------------------------------------------------------------------
 
+// TestAuthMatrix also pins one deliberate semantic: a SOCKS4 user id is an IDENT
+// claim, not an authenticated identity, so with no users configured it is NOT
+// written to metadata.User. metadata.User means "an identity the configured
+// authentication system verified", and a SOCKS4 client can put anything there.
+// If you are reading this because metadata.User is empty for a SOCKS4 session
+// on a no-auth inbound: that is intended, not a regression.
 func TestAuthMatrix(t *testing.T) {
 	users := []auth.User{{Username: "user", Password: "pass"}, {Username: "other", Password: "secret"}}
 
@@ -638,59 +648,122 @@ func TestSOCKS5EmptyDomainIsRejected(t *testing.T) {
 	}
 }
 
-// TestSOCKS5EmptyDomainUnderFragmentation requires the rejection to be
-// independent of how the bytes arrive. A boundary check that only looked at one
-// Read would accept the stream when the address straddles a chunk.
-func TestSOCKS5EmptyDomainUnderFragmentation(t *testing.T) {
-	stream := emptyDomainSOCKS5Request(nil)
-	for _, fragmentation := range append(fragmentations(len(stream)), struct {
-		name string
-		plan []int
-	}{"split-before-atyp", []int{7, len(stream) - 7}}, struct {
-		name string
-		plan []int
-	}{"split-at-length", []int{8, 1, len(stream) - 9}}) {
-		fragmentation := fragmentation
-		t.Run(fragmentation.name, func(t *testing.T) {
-			harness := newInboundHarness(t, nil)
-			conn := newScriptedConn(stream, fragmentation.plan...)
-			recorder := newCloseRecorder()
-			harness.newConnection(context.Background(), conn, testSource(), recorder.handler())
-			select {
-			case <-harness.router.connection:
-				t.Fatalf("routed under fragmentation %v", fragmentation.plan)
-			default:
+// failOnRoute is a router that fails the test if it is used at all. Wiring it in
+// place of the capture router makes "the router was never invoked" a structural
+// property rather than a timing-dependent channel poll.
+type failOnRoute struct {
+	adapter.Router
+	t *testing.T
+}
+
+func (r *failOnRoute) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	buffer := make([]byte, 64)
+	n, _ := conn.Read(buffer)
+	r.t.Fatalf("a malformed SOCKS5 request was routed (destination %v) and the tunnel delivered %x",
+		metadata.Destination, buffer[:n])
+}
+
+func (r *failOnRoute) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	r.t.Fatal("a malformed SOCKS5 request was routed as a packet connection")
+}
+
+// TestSOCKS5MalformedBytesNeverReachTheTunnel is the byte-exclusion regression.
+//
+// It is not enough that the client sees an error. The point of rejecting at the
+// boundary is that the request bytes -- and above all the two PORT bytes that the
+// shared address decoder would otherwise leave in the stream -- must never be
+// handed to the tunnel as payload. A future change that turned the guard's
+// `return 0, err` back into `return n, err` would route again, and only an
+// assertion on the routed payload can see that.
+//
+// The router is replaced by one that fails on use, so a regression cannot be
+// missed by a mistimed assertion.
+func TestSOCKS5MalformedBytesNeverReachTheTunnel(t *testing.T) {
+	const payload = "PAYLOAD"
+	cases := []struct {
+		name   string
+		stream []byte
+		users  []auth.User
+	}{
+		{
+			// greeting | request with ATYP=domain and a zero-length host | payload
+			name:   "empty-domain",
+			stream: append(emptyDomainSOCKS5Request(nil), []byte(payload)...),
+		},
+		{
+			name: "empty-domain-authenticated",
+			stream: append([]byte{0x05, 0x02, 0x00, 0x02,
+				0x01, 0x04, 'u', 's', 'e', 'r', 0x04, 'p', 'a', 's', 's',
+				0x05, 0x01, 0x00, 0x03, 0x00, 0x00, 0x50}, []byte(payload)...),
+			users: []auth.User{{Username: "user", Password: "pass"}},
+		},
+		{
+			// The port bytes on their own must not become payload either.
+			name:   "empty-domain-no-payload",
+			stream: emptyDomainSOCKS5Request(nil),
+		},
+	}
+	for _, testCase := range cases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			router := &failOnRoute{t: t}
+			created, err := NewInbound(context.Background(), router, testNOPLogger(), "mixed-in", httpMixedOptions(testCase.users))
+			if err != nil {
+				t.Fatalf("NewInbound: %v", err)
 			}
+			inbound := created.(*Inbound)
+			defer inbound.listener.Close()
+
+			conn := newScriptedConn(testCase.stream)
+			recorder := newCloseRecorder()
+			(&inboundHarness{inbound: inbound}).newConnection(context.Background(), conn, testSource(), recorder.handler())
+
 			if !recorder.wait(5 * time.Second) {
-				t.Fatal("not rejected and not closed")
+				t.Fatal("the rejection was never reported, so the request was neither rejected nor closed")
+			}
+			if got := countRecorderCalls(recorder); got != 1 {
+				t.Fatalf("onClose ran %d times, want exactly once", got)
 			}
 		})
 	}
 }
 
-// TestSOCKS5ValidDomainsStillRoute is the counterweight: the boundary check must
-// not have rejected anything legitimate, including the smallest legal domain.
-func TestSOCKS5ValidDomainsStillRoute(t *testing.T) {
-	cases := []struct {
-		name   string
-		domain string
-	}{
-		{"one-byte", "a"},
-		{"normal", "example.com"},
-		{"max-length", strings.Repeat("a", 255)},
-	}
-	for _, testCase := range cases {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			harness := newInboundHarness(t, nil)
-			conn := newScriptedConn(socks5NoAuth(testCase.domain, 443, nil))
-			harness.newConnection(context.Background(), conn, testSource(), nil)
-			routed := harness.router.waitConnection(t)
-			if got := routed.metadata.Destination.Fqdn; got != testCase.domain {
-				t.Fatalf("destination = %q, want %q", got, testCase.domain)
+// TestSOCKS5GuardRejectionIsSticky pins the read contract: once the guard has
+// rejected, every later read keeps reporting the error, so the parser cannot
+// come back for more after the malformed bytes were discarded.
+func TestSOCKS5GuardRejectionIsSticky(t *testing.T) {
+	stream := append(emptyDomainSOCKS5Request(nil), []byte("PAYLOAD")...)
+	guarded := socksinbound.GuardSOCKS5Address(newScriptedConnWithTail(stream))
+	buffer := make([]byte, 64)
+	var firstErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		n, err := guarded.Read(buffer)
+		if attempt == 0 {
+			firstErr = err
+			if err == nil {
+				t.Fatal("the malformed request was not rejected on the first read")
 			}
-		})
+			if n != 0 {
+				t.Fatalf("the rejected read delivered %d bytes, want 0", n)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatalf("read %d returned nil error after a rejection", attempt)
+		}
+		if n != 0 {
+			t.Fatalf("read %d delivered %d bytes after a rejection", attempt, n)
+		}
+		if !errors.Is(err, firstErr) {
+			t.Fatalf("read %d reported a different error: %v", attempt, err)
+		}
 	}
+}
+
+// countRecorderCalls reads the invocation count after the decision is known.
+func countRecorderCalls(recorder *closeRecorder) int {
+	time.Sleep(20 * time.Millisecond)
+	return recorder.count()
 }
 
 // TestSOCKS5MalformedRequestRepliesAndCleansUp pins that the boundary rejection

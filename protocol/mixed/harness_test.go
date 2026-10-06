@@ -106,6 +106,15 @@ func (c *scriptedConn) bytesDelivered() int {
 	return c.delivered
 }
 
+// newScriptedConnWithTail is a scripted connection whose reads continue past the
+// point where a guard rejects, so a test can prove the rejection is sticky
+// rather than a one-off.
+func newScriptedConnWithTail(stream []byte) *scriptedConn {
+	// reads=nil means "return as much as fits", which is what the guard sees on a
+	// real socket that already has the whole request buffered.
+	return newScriptedConn(append([]byte{}, stream...))
+}
+
 // appendPayload delivers more bytes to a connection that is already in use,
 // which is how a test models a client that sends its payload only after the
 // proxy has accepted the tunnel.
@@ -446,6 +455,16 @@ func (c *closeRecorder) handler() N.CloseHandlerFunc {
 func (c *closeRecorder) count() int { return int(c.calls.Load()) }
 
 // wait blocks until the connection is reported closed, or the deadline passes.
+// countPlusWait returns the number of invocations after ensuring the decision
+// has been made, so an assertion on an exact count is not a race against the
+// rejection path.
+func (c *closeRecorder) countPlusWait(timeout time.Duration) int {
+	c.wait(timeout)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.errs)
+}
+
 func (c *closeRecorder) wait(timeout time.Duration) bool {
 	select {
 	case <-c.closed:
