@@ -277,7 +277,7 @@ func runPacketCopy(t *testing.T, routeJSON string) (time.Duration, int64, int64)
 
 	var done atomic.Bool
 	start := time.Now()
-	manager.packetConnectionCopy(context.Background(), source, sink, false, &done, nil, copyWriter, flow)
+	manager.packetConnectionCopy(context.Background(), source, sink, false, &done, nil, copyWriter, flow, nil)
 	return time.Since(start), sink.batches.Load(), sink.packets.Load()
 }
 

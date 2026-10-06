@@ -94,6 +94,42 @@ func (s *managedConnState) touch() {
 	}
 }
 
+// countBytes is the N.CountFunc form of touch, for the packet copy paths.
+//
+// It exists so that packet activity is observed through the copy engine's own counting protocol
+// rather than by a wrapper type in the connection chain: see packetConnectionCopy.
+func (s *managedConnState) countBytes(n int64) {
+	if n > 0 {
+		s.touch()
+	}
+}
+
+// managedConnStateOf walks a connection's upstream chain looking for the lifecycle record this
+// manager attaches, and reports nil when the connection is not one of ours.
+//
+// The walk is necessary rather than a plain type assertion: by the time a connection reaches the
+// copy loops it may sit under the dialer's power counters or a protocol's own wrapper, and asserting
+// only on the outermost value would observe nothing for exactly those connections.
+func managedConnStateOf(conn any) *managedConnState {
+	for depth := 0; conn != nil && depth < 32; depth++ {
+		if state, isManaged := conn.(interface {
+			reclaimState() *managedConnState
+		}); isManaged {
+			return state.reclaimState()
+		}
+		upstream, hasUpstream := conn.(common.WithUpstream)
+		if !hasUpstream {
+			return nil
+		}
+		next := upstream.Upstream()
+		if next == conn {
+			return nil
+		}
+		conn = next
+	}
+	return nil
+}
+
 // idleFor reports how long the connection has been silent, and whether that is knowable at all.
 //
 // The false return is the important one: it says "no transfer was ever observed", which the callers

@@ -585,8 +585,12 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool
 	uploadPacketWriter, uploadPacketFlow := m.uploadPacketGate(destination, metadata.TrafficClass)
-	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose, uploadPacketWriter, uploadPacketFlow)
-	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose, nil, nil)
+	// The far side of this flow, which is the connection a transition would have to decide about.
+	// Nil when the dial did not go through this manager's dialer, in which case there is nothing to
+	// record and the copy behaves exactly as before.
+	activity := managedConnStateOf(remoteConn)
+	go m.packetConnectionCopy(ctx, conn, destination, false, &done, onClose, uploadPacketWriter, uploadPacketFlow, activity)
+	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose, nil, nil, activity)
 }
 
 // uploadPacketGate installs the scheduler gate on the UDP upload direction.
@@ -864,14 +868,31 @@ func deliverCachedBuffer(destinationWriter io.Writer, cachedBuffer *buf.Buffer) 
 	return err
 }
 
-func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc, copyWriter N.PacketWriter, flow *trafficsched.Flow) {
+func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc, copyWriter N.PacketWriter, flow *trafficsched.Flow, activity *managedConnState) {
 	if flow != nil {
 		defer flow.Close()
 	}
 	if copyWriter == nil {
 		copyWriter = destination
 	}
-	_, err := bufio.CopyPacket(copyWriter, source)
+	// Packet activity is observed HERE, through the copy engine's own counter arguments, and not by
+	// wrapping the connection.
+	//
+	// A wrapper would have to live in the chain the engine walks, and that chain is hostile to it in
+	// both directions: the write-side unwrap peels Upstream()/WriterReplaceable() BEFORE it looks for
+	// a counter, so a counter attached to trackedPacketConn is stripped and never seen, while a
+	// counter attached on top of it hides the SyscallConn() the UDP splice path needs. Counting at
+	// the call site has neither problem - the connection graph is untouched, so batch, splice and
+	// offload keep every capability they had, and what is measured is the bytes this loop moved.
+	//
+	// The engine invokes these from packetCopySession.Transfer, once per datagram, after the write
+	// succeeded; a zero length is not a transfer.
+	var readCounters, writeCounters []N.CountFunc
+	if activity != nil {
+		counters := []N.CountFunc{activity.countBytes}
+		readCounters, writeCounters = counters, counters
+	}
+	_, err := bufio.CopyPacketWithCounters(copyWriter, source, source, readCounters, writeCounters)
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "packet upload finished")
