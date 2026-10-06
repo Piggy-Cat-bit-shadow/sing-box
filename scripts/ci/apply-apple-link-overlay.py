@@ -5,9 +5,9 @@ Usage: apply-apple-link-overlay.py <client-dir>
 
 # What this changes, and what it deliberately does not
 
-Two links in the Settings > About section are product attribution: the row that opens
-the source repository, and the Releases item in its context menu. Both are shipped
-pointing at upstream SagerNet/sing-box, which is the wrong product for this fork.
+The Settings > About section carries product attribution: the row that opens the source
+repository, and the Releases item in its context menu. Both must point at this fork, not
+at upstream SagerNet/sing-box.
 
 The Documentation, Changelog and Configuration links are NOT touched. They point at
 sing-box.sagernet.org, which is the upstream project's technical documentation and
@@ -18,33 +18,59 @@ maintained documentation with a file that is not a substitute for it.
 The Sponsors links are not touched either. They credit the upstream author, and this
 fork has no sponsor configuration of its own to substitute.
 
-# Why an overlay rather than editing the submodule
+# Why an overlay rather than editing the client
 
-clients/apple is a pinned upstream checkout. Committing changes inside it would either
-be lost on the next submodule checkout or become an unmaintainable private fork. The
-edit is applied to the WORKING TREE at build time, and the parent repository never
-records a modified gitlink.
+The Apple checkouts are pinned revisions. Committing changes inside them would either be
+lost on the next checkout or become an unmaintainable private fork. The edit is applied
+to the WORKING TREE at build time, and the parent repository never records a modified
+gitlink.
+
+# Two clients, two shapes, one invariant
+
+This overlay runs against BOTH Apple sources - the custom iOS client and the original
+macOS client - and they are in different states:
+
+  * the original macOS client ships upstream attribution, and this overlay rewrites it;
+  * the custom iOS client already points at the fork, and is split into a per-platform
+    About section (`#if os(iOS)` carries the source row, `#if os(macOS) || os(tvOS)`
+    carries the source row and the Releases item).
+
+An earlier version matched whole Swift expressions and demanded exactly one of each. That
+only ever described one of those shapes: it reported the already-correct iOS client as
+"patched, but not to the expected shape" and refused to prepare it, because its two
+platform sections legitimately contain the same URL twice in two different spellings.
+
+So the overlay is written against the invariant that actually matters, and it is
+spelling-independent:
+
+    every sing-box GitHub URL in the About section points at the fork
+    there is at least one source link and at least one releases link
+
+The URL is matched AS A QUOTED LITERAL, including its closing quote. That is what makes
+the source URL safe to rewrite even though it is a strict prefix of the releases URL:
+after `/sing-box` the source literal requires a closing quote, and the releases URL has a
+`/` there. The prefix relationship is therefore broken by the pattern itself rather than
+by the order the replacements happen to run in.
 
 # Fail-closed
 
-The source is asserted to be in one of exactly two states: pristine upstream, or fully
-patched. Anything else - a partial application, a missing anchor, an unexpected count -
-exits non-zero rather than producing a build whose links nobody verified. If a
-repinning changes the URLs or the surrounding code, this fails and asks for review
-instead of silently shipping upstream attribution.
+Every way this can go wrong is an error: no sing-box link at all (the About section was
+restructured), an upstream link that survives the edit, a fork source or releases link
+that is missing, or a documentation anchor that the edit disturbed. A half-attributed
+build is not accepted.
 """
 
 import sys
 
 SOURCE_FILE = "ApplicationLibrary/Views/Setting/SettingView.swift"
 
-# The two links this overlay owns. Both are matched as complete Swift expressions
-# rather than as bare URLs - see replace_longest_first.
-UPSTREAM_SOURCE = 'URL(string: String("https://github.com/SagerNet/sing-box"))!'
-FORK_SOURCE = 'URL(string: String("https://github.com/Piggy-Cat-bit-shadow/sing-box"))!'
+# Matched as quoted string literals, so the surrounding Swift expression is irrelevant:
+# `URL(string: "...")!` and `URL(string: String("..."))!` both contain the same literal.
+UPSTREAM_SOURCE = '"https://github.com/SagerNet/sing-box"'
+FORK_SOURCE = '"https://github.com/Piggy-Cat-bit-shadow/sing-box"'
 
-UPSTREAM_RELEASES = 'URL(string: String("https://github.com/SagerNet/sing-box/releases"))!'
-FORK_RELEASES = 'URL(string: String("https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"))!'
+UPSTREAM_RELEASES = '"https://github.com/SagerNet/sing-box/releases"'
+FORK_RELEASES = '"https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"'
 
 # Anchors that must survive untouched, asserted so that a repinning which rewrites the
 # About section is noticed rather than silently accepted.
@@ -62,20 +88,46 @@ def fail(message: str, details: list[str] | None = None) -> None:
     raise SystemExit(1)
 
 
-def replace_all(src: str, old: str, new: str, expected: int) -> tuple[str, int]:
-    """Replace `old` exactly `expected` times, or fail.
+def counts(src: str) -> dict[str, int]:
+    return {
+        "upstream_source": src.count(UPSTREAM_SOURCE),
+        "upstream_releases": src.count(UPSTREAM_RELEASES),
+        "fork_source": src.count(FORK_SOURCE),
+        "fork_releases": src.count(FORK_RELEASES),
+    }
 
-    The count is asserted rather than assumed: a repinning that adds, removes or moves a
-    link changes the number of sites, and applying the wrong number of edits is how a
-    half-patched build ships.
-    """
-    found = src.count(old)
-    if found != expected:
+
+def describe(c: dict[str, int]) -> list[str]:
+    return [
+        f"upstream source x{c['upstream_source']}, fork source x{c['fork_source']}",
+        f"upstream releases x{c['upstream_releases']}, fork releases x{c['fork_releases']}",
+    ]
+
+
+def assert_final_state(src: str, label: str) -> None:
+    """The invariant every prepared client must satisfy, whatever its starting shape."""
+    c = counts(src)
+    if c["upstream_source"] or c["upstream_releases"]:
         fail(
-            f"expected {expected} occurrence(s) of {old!r}, found {found}",
-            ["refusing to apply a partial edit; the pinned client may have been repinned"],
+            f"{label}: an upstream SagerNet link is still present",
+            describe(c) + ["this fork must not attribute itself to the upstream project"],
         )
-    return src.replace(old, new), found
+    if c["fork_source"] < 1:
+        fail(
+            f"{label}: no source-code link points at this fork",
+            describe(c) + ["the About section may have been restructured"],
+        )
+    if c["fork_releases"] < 1:
+        fail(
+            f"{label}: no releases link points at this fork",
+            describe(c) + ["the About section may have been restructured"],
+        )
+    for anchor in DOCUMENTATION_ANCHORS:
+        if anchor not in src:
+            fail(
+                f"{label}: a documentation link this overlay must preserve is missing",
+                [f"looked for {anchor!r}", "the About section may have been restructured"],
+            )
 
 
 def main() -> int:
@@ -88,78 +140,50 @@ def main() -> int:
     except FileNotFoundError:
         fail(f"{path} is missing")
 
-    upstream_source_count = src.count(UPSTREAM_SOURCE)
-    fork_source_count = src.count(FORK_SOURCE)
-    upstream_releases_count = src.count(UPSTREAM_RELEASES)
-    fork_releases_count = src.count(FORK_RELEASES)
+    before = counts(src)
 
-    # Classify the state before editing. A file holding BOTH the upstream and the fork URL
-    # is a partially applied state that cannot be resolved safely.
-    if fork_source_count > 0 or fork_releases_count > 0:
-        if upstream_source_count > 0 or upstream_releases_count > 0:
+    # Releases BEFORE source. The quoted-literal patterns already make this safe - the source
+    # literal cannot match inside the releases URL - but releasing the longer URL first keeps
+    # the two edits independent of each other rather than relying on that.
+    releases_rewritten = before["upstream_releases"]
+    source_rewritten = before["upstream_source"]
+
+    if releases_rewritten or source_rewritten:
+        # A file holding BOTH the upstream and the fork URL is a partially applied state that
+        # cannot be resolved safely: it is not obvious which of the two the product intends.
+        if before["fork_source"] or before["fork_releases"]:
             fail(
-                "the About section references BOTH the upstream and fork links",
-                [
-                    f"upstream source x{upstream_source_count}, fork source x{fork_source_count}",
-                    f"upstream releases x{upstream_releases_count}, fork releases x{fork_releases_count}",
-                    "this is a partially applied state that cannot be resolved safely",
-                ],
+                "the About section references BOTH the upstream and the fork links",
+                describe(before) + ["this is a partially applied state that cannot be resolved safely"],
             )
-        if fork_source_count != 1 or fork_releases_count != 1:
-            fail(
-                "the About section is already patched, but not to the expected shape",
-                [
-                    f"fork source x{fork_source_count}, fork releases x{fork_releases_count}",
-                    "expected exactly one of each",
-                ],
-            )
-        state = "patched"
+        src = src.replace(UPSTREAM_RELEASES, FORK_RELEASES)
+        src = src.replace(UPSTREAM_SOURCE, FORK_SOURCE)
+        state = "upstream-rewritten"
+    elif before["fork_source"] or before["fork_releases"]:
+        state = "already-fork"
     else:
-        if upstream_source_count == 0:
-            fail(
-                "the source-code link matches neither the upstream nor the fork URL",
-                [f"looked for {UPSTREAM_SOURCE!r}", f"and {FORK_SOURCE!r}"],
-            )
-        state = "upstream"
+        fail(
+            "the About section contains no sing-box repository link at all",
+            [
+                f"looked for {UPSTREAM_SOURCE!r}",
+                f"and {FORK_SOURCE!r}",
+                "the About section may have been restructured",
+            ],
+        )
 
-    # The documentation links are upstream's own technical docs and must be left alone.
-    # Asserting them here means a repinning that rewrites the About section is caught by
-    # this overlay rather than discovered later.
-    for anchor in DOCUMENTATION_ANCHORS:
-        if anchor not in src:
-            fail(
-                "a documentation link this overlay expects to preserve is missing",
-                [f"looked for {anchor!r}", "the About section may have been restructured"],
-            )
+    if state == "upstream-rewritten":
+        open(path, "w", encoding="utf-8").write(src)
+        # Re-read rather than trusting the in-memory string.
+        src = open(path, encoding="utf-8").read()
 
-    if state == "patched":
-        print("apply-apple-link-overlay: already applied")
-        return 0
+    after = counts(src)
+    assert_final_state(src, path)
 
-    # Releases FIRST.
-    #
-    # The source URL is a strict PREFIX of the releases URL, so a naive replace of the
-    # source URL would rewrite the start of the releases URL and leave
-    # ".../sing-box/releases" attached to the fork path in an uncontrolled way. Ordering
-    # alone is not enough to rely on, which is why both patterns are complete Swift
-    # expressions ending in `))!` - the prefix relationship is broken by the closing
-    # syntax, not by the order of these calls.
-    src, releases_changed = replace_all(src, UPSTREAM_RELEASES, FORK_RELEASES, 1)
-    src, source_changed = replace_all(src, UPSTREAM_SOURCE, FORK_SOURCE, 1)
-
-    open(path, "w", encoding="utf-8").write(src)
-
-    # Re-read and assert the result rather than trusting the in-memory string.
-    verified = open(path, encoding="utf-8").read()
-    if verified.count(FORK_SOURCE) != 1 or verified.count(FORK_RELEASES) != 1:
-        fail("the edit did not produce exactly one fork source and one fork releases link")
-    if verified.count(UPSTREAM_SOURCE) or verified.count(UPSTREAM_RELEASES):
-        fail("an upstream link survived the edit")
-    for anchor in DOCUMENTATION_ANCHORS:
-        if anchor not in verified:
-            fail("the edit disturbed a documentation link", [anchor])
-
-    print(f"apply-apple-link-overlay: source x{source_changed}, releases x{releases_changed}")
+    print(
+        "apply-apple-link-overlay: "
+        f"{state}; rewrote {source_rewritten} source and {releases_rewritten} releases link(s); "
+        f"fork source x{after['fork_source']}, fork releases x{after['fork_releases']}"
+    )
     return 0
 
 

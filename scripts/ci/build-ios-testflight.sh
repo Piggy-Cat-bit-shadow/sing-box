@@ -43,7 +43,7 @@ if [ "$APPLE_SIGNING_MODE" != "testflight" ]; then
   exit 2
 fi
 
-client="clients/apple"
+client="${APPLE_CLIENT_DIR:-clients/apple}"
 work="build/apple-testflight"
 archive_path="$work/SFI.xcarchive"
 mkdir -p "$work"

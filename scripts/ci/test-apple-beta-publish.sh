@@ -55,7 +55,6 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 parent_sha="$(git rev-parse HEAD)"
-submodule_sha="$(git -C clients/apple rev-parse HEAD)"
 
 make_xcframework() {
   local dir="$1"
@@ -74,13 +73,22 @@ echo "== artifact attribution =="
 
 build_artifact "$tmp/x1/Libbox.xcframework" "$tmp/a1"
 check "an artifact built from this commit validates" \
-  "$artifact_tool" validate "$tmp/a1" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/a1" --parent-sha "$parent_sha"
 
 expects_fail "a different parent SHA is rejected" \
-  "$artifact_tool" validate "$tmp/a1" --parent-sha "0000000000000000000000000000000000000000" \
-    --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/a1" --parent-sha "0000000000000000000000000000000000000000"
 
-expects_fail "a different Apple submodule SHA is rejected" \
+# The artifact binds the parent commit ONLY. Libbox is the core and does not depend on
+# which Apple UI branch links it, and the two Apple products are built from two different
+# Apple revisions - so an artifact that recorded one Apple revision could never be valid
+# for both platforms.
+echo "== the artifact does not bind an Apple revision =="
+
+check "the manifest records no Apple client revision" \
+  bash -c "! grep -q '\"apple_submodule_sha\"' '$tmp/a1/manifest.json'"
+check "validate takes no submodule argument" \
+  bash -c "! grep -qE '^\\s+\\[ -n \"\\\$expect_submodule\" \\]' scripts/ci/apple-libbox-artifact.sh"
+check "a caller that still passes --submodule-sha is accepted" \
   "$artifact_tool" validate "$tmp/a1" --parent-sha "$parent_sha" \
     --submodule-sha "0000000000000000000000000000000000000000"
 
@@ -89,16 +97,16 @@ echo "== artifact integrity =="
 cp -R "$tmp/a1" "$tmp/a_tampered"
 printf 'tampered' >> "$tmp/a_tampered/Libbox.xcframework.tar.gz"
 expects_fail "a tampered archive is rejected" \
-  "$artifact_tool" validate "$tmp/a_tampered" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/a_tampered" --parent-sha "$parent_sha"
 
 cp -R "$tmp/a1" "$tmp/a_missing"
 rm -f "$tmp/a_missing/Libbox.xcframework.tar.gz"
 expects_fail "a missing archive is rejected" \
-  "$artifact_tool" validate "$tmp/a_missing" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/a_missing" --parent-sha "$parent_sha"
 
 mkdir -p "$tmp/a_nomanifest"
 expects_fail "an artifact with no manifest is rejected" \
-  "$artifact_tool" validate "$tmp/a_nomanifest" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/a_nomanifest" --parent-sha "$parent_sha"
 
 echo "== manifest is authoritative, not the artifact name =="
 
@@ -107,7 +115,7 @@ echo "== manifest is authoritative, not the artifact name =="
 cp -R "$tmp/a1" "$tmp/a_renamed"
 mv "$tmp/a_renamed" "$tmp/anything-at-all"
 check "validation does not depend on the directory name" \
-  "$artifact_tool" validate "$tmp/anything-at-all" --parent-sha "$parent_sha" --submodule-sha "$submodule_sha"
+  "$artifact_tool" validate "$tmp/anything-at-all" --parent-sha "$parent_sha"
 
 echo "== manifest is valid JSON whatever the build environment prints =="
 
@@ -135,23 +143,45 @@ echo "== manifest content =="
 
 check "the manifest records the parent commit" \
   grep -q "\"parent_sha\": \"$parent_sha\"" "$tmp/a1/manifest.json"
-check "the manifest records the submodule revision" \
-  grep -q "\"apple_submodule_sha\": \"$submodule_sha\"" "$tmp/a1/manifest.json"
 check "the manifest records the artifact checksum" \
   grep -q '"artifact_sha256":' "$tmp/a1/manifest.json"
 
 echo "== install =="
 
-mkdir -p "$tmp/installroot/clients/apple"
-check "install places the xcframework" \
-  "$artifact_tool" install "$tmp/a1" "$tmp/installroot"
-check "the installed framework has its iOS slice" \
-  test -d "$tmp/installroot/clients/apple/Libbox.xcframework/ios-arm64"
-check "the installed framework has its macOS slice" \
-  test -d "$tmp/installroot/clients/apple/Libbox.xcframework/macos-arm64_x86_64"
+# Install now takes the Apple client checkout itself, because the two products are built from
+# two different checkouts of two different branches. The same artifact goes into each.
+make_client_tree() {
+  local dir="$1"
+  mkdir -p "$dir/sing-box.xcodeproj"
+  : > "$dir/sing-box.xcodeproj/project.pbxproj"
+}
+make_client_tree "$tmp/ios-client"
+make_client_tree "$tmp/macos-client"
+
+check "install places the xcframework in the iOS client" \
+  "$artifact_tool" install "$tmp/a1" "$tmp/ios-client"
+check "the iOS client framework has its iOS slice" \
+  test -d "$tmp/ios-client/Libbox.xcframework/ios-arm64"
+check "the iOS client framework has its macOS slice" \
+  test -d "$tmp/ios-client/Libbox.xcframework/macos-arm64_x86_64"
+
+check "install places the same xcframework in the macOS client" \
+  "$artifact_tool" install "$tmp/a1" "$tmp/macos-client"
+check "both clients link the identical Libbox" \
+  ./scripts/ci/check-apple-shared-libbox.sh "$tmp/ios-client" "$tmp/macos-client"
+
+# A second install must replace the framework, not merge into it: a stale slice left behind
+# would make one platform link a framework the other does not have.
+printf 'stale' > "$tmp/ios-client/Libbox.xcframework/ios-arm64/STALE"
+"$artifact_tool" install "$tmp/a1" "$tmp/ios-client" >/dev/null
+check "a re-install replaces the framework rather than merging" \
+  bash -c "test ! -e '$tmp/ios-client/Libbox.xcframework/ios-arm64/STALE'"
+
+expects_fail "install into a directory that is not an Apple client is rejected" \
+  "$artifact_tool" install "$tmp/a1" "$tmp/not-a-client"
 
 expects_fail "install without an archive is rejected" \
-  "$artifact_tool" install "$tmp/a_missing" "$tmp/installroot"
+  "$artifact_tool" install "$tmp/a_missing" "$tmp/ios-client"
 
 echo "== release-apple prebuilt mode =="
 
@@ -391,22 +421,33 @@ check "the workflow validates before installing" \
 
 echo "== the publish run restores what it changes =="
 
-# The overlays modify clients/apple in place. Without cleanup the next run fails its own
-# clean-tree gate, so the restore is part of the contract rather than a convenience.
+# The overlays modify each Apple checkout in place. Without cleanup the next run fails its own
+# clean-tree gate, so the restore is part of the contract rather than a convenience. There are
+# now TWO checkouts to restore, because the two products are built from two Apple branches.
 
 submodule_path="clients/apple"
-submodule_dirty() { [ -n "$(git -C "$submodule_path" status --porcelain 2>/dev/null)" ]; }
+client_dirty() { [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]; }
 
 # The trap must be installed, and must run on EXIT so success, failure and Ctrl-C all take
 # the same path.
 check "publish installs an EXIT trap" \
-  grep -qE '^[[:space:]]*trap restore_submodule EXIT' "$publish"
+  grep -qE '^[[:space:]]*trap restore_clients EXIT' "$publish"
 
-check "publish restores only the submodule, not the whole repository" \
+check "publish restores only the Apple checkouts, not the whole repository" \
   bash -c '! grep -qE "^[[:space:]]*git (-C [^ ]+ )?(reset --hard|clean )" "$0"' "$publish"
 
 check "publish restores with checkout rather than a hard reset" \
-  grep -q 'git -C clients/apple checkout -- \.' "$publish"
+  grep -q 'git -C "$dir" checkout -- \.' "$publish"
+
+# The restore must cover BOTH sources. Restoring only the iOS submodule would leave the macOS
+# checkout dirty and fail the next run's clean-tree gate - the exact failure the restore exists
+# to prevent, reintroduced for the new platform.
+check "publish restores the iOS source" \
+  grep -q 'ios_client_dir="\$IOS_APPLE_DIR"' "$publish"
+check "publish restores the macOS source" \
+  grep -q 'macos_client_dir="\$MACOS_APPLE_DIR"' "$publish"
+check "publish's restore loops over both client directories" \
+  bash -c "grep -q 'for dir in \"\$ios_client_dir\" \"\$macos_client_dir\"' \"\$0\"" "$publish"
 
 # The clean gate must still be unconditional: the cleanup must not have been bought by relaxing it.
 check "publish still refuses a dirty tree" \
@@ -415,70 +456,79 @@ check "publish still refuses a dirty tree" \
 check "publish still has no --allow-dirty escape hatch" \
   bash -c '! grep -qE "^\s*--allow-dirty\)|case .*allow-dirty" "$0"' "$publish"
 
-# Exercise the real restore function in all three exit modes, against a genuinely dirty submodule.
+# Exercise the real restore shape in all three exit modes, against genuinely dirty checkouts.
+# The probe mirrors restore_clients with the same loop, so a regression in the two-directory
+# restore is caught here rather than after a real release.
 trap_probe="$(mktemp -d)"
-cat > "$trap_probe/probe.sh" <<'PROBE'
+probe_second="$(mktemp -d)"
+(
+  cd "$probe_second"
+  git init -q .
+  git config user.email probe@example.invalid
+  git config user.name probe
+  : > tracked.txt
+  git add tracked.txt
+  git commit -qm init
+)
+cat > "$trap_probe/probe.sh" <<PROBE
 #!/usr/bin/env bash
 set -euo pipefail
-restore_submodule() {
+restore_clients() {
   local status
-  status=$?
-  if [ -n "$(git -C clients/apple status --porcelain 2>/dev/null)" ]; then
-    git -C clients/apple checkout -- . 2>/dev/null || true
-  fi
-  return $status
+  status=\$?
+  local dir
+  for dir in $submodule_path $probe_second; do
+    [ -e "\$dir/.git" ] || continue
+    if [ -n "\$(git -C "\$dir" status --porcelain 2>/dev/null)" ]; then
+      git -C "\$dir" checkout -- . 2>/dev/null || true
+    fi
+  done
+  return \$status
 }
-trap restore_submodule EXIT
-"$@"
+trap restore_clients EXIT
+"\$@"
 PROBE
 chmod +x "$trap_probe/probe.sh"
 
-dirty_the_submodule() {
+dirty_the_clients() {
   local target
   target="$(git -C "$submodule_path" rev-parse --show-toplevel)/Extension/Info.plist"
   printf '<!-- overlay probe -->\n' >> "$target"
+  printf 'overlay probe\n' >> "$probe_second/tracked.txt"
 }
 
-# Success path.
-dirty_the_submodule
-"$trap_probe/probe.sh" true >/dev/null 2>&1
-if submodule_dirty; then
-  echo "  FAIL: a successful run left the submodule dirty" >&2
-  git -C "$submodule_path" checkout -- . 2>/dev/null || true
-  fail=$((fail + 1))
-else
-  echo "  PASS: a successful run leaves the submodule clean"
-  pass=$((pass + 1))
-fi
+any_client_dirty() {
+  client_dirty "$submodule_path" || client_dirty "$probe_second"
+}
 
-# Failure path.
-dirty_the_submodule
-"$trap_probe/probe.sh" false >/dev/null 2>&1 || true
-if submodule_dirty; then
-  echo "  FAIL: a failed run left the submodule dirty" >&2
+clean_the_clients() {
   git -C "$submodule_path" checkout -- . 2>/dev/null || true
-  fail=$((fail + 1))
-else
-  echo "  PASS: a failed run leaves the submodule clean"
-  pass=$((pass + 1))
-fi
+  git -C "$probe_second" checkout -- . 2>/dev/null || true
+}
 
-# Interrupt path. The probe is signalled while it is still running.
-dirty_the_submodule
-"$trap_probe/probe.sh" sleep 30 >/dev/null 2>&1 &
-probe_pid=$!
-sleep 1
-kill -INT "$probe_pid" 2>/dev/null || true
-wait "$probe_pid" 2>/dev/null || true
-if submodule_dirty; then
-  echo "  FAIL: an interrupted run left the submodule dirty" >&2
-  git -C "$submodule_path" checkout -- . 2>/dev/null || true
-  fail=$((fail + 1))
-else
-  echo "  PASS: an interrupted run leaves the submodule clean"
-  pass=$((pass + 1))
-fi
-rm -rf "$trap_probe"
+for mode in success failure interrupt; do
+  dirty_the_clients
+  case "$mode" in
+    success)   "$trap_probe/probe.sh" true >/dev/null 2>&1 ;;
+    failure)   "$trap_probe/probe.sh" false >/dev/null 2>&1 || true ;;
+    interrupt)
+      "$trap_probe/probe.sh" sleep 30 >/dev/null 2>&1 &
+      probe_pid=$!
+      sleep 1
+      kill -INT "$probe_pid" 2>/dev/null || true
+      wait "$probe_pid" 2>/dev/null || true
+      ;;
+  esac
+  if any_client_dirty; then
+    echo "  FAIL: an interrupted/successful/failed ($mode) run left an Apple checkout dirty" >&2
+    clean_the_clients
+    fail=$((fail + 1))
+  else
+    echo "  PASS: a $mode run leaves BOTH Apple checkouts clean"
+    pass=$((pass + 1))
+  fi
+done
+rm -rf "$trap_probe" "$probe_second"
 
 echo "== one build number for the run =="
 

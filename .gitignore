@@ -57,6 +57,12 @@ cache.db
 /build/apple-macos/
 /Libbox.xcframework/
 
+# The macOS Apple source, checked out at the pinned commit by
+# scripts/ci/apple-client-source.sh. iOS uses the clients/apple submodule, so this is
+# the only platform whose source is materialised under build/. Ephemeral by design:
+# the parent records exactly one Apple gitlink, and it is the iOS one.
+/build/apple-client-macos/
+
 # Apple signing configuration. The committed file is the .example template only;
 # a real configuration names your team, bundle IDs and profiles and must stay out
 # of the repository.

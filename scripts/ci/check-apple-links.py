@@ -11,8 +11,20 @@ the prepared source without applying anything.
 It is not enough to confirm the fork links are present. A build that had silently lost
 the documentation links - or had them rewritten to something else - would still pass a
 check that only looked for the fork URLs. Every assertion below is therefore two-sided:
-the fork links must be present exactly once, and the upstream documentation links must
-still be present exactly once.
+the fork links must be present, and the upstream documentation links must still be there.
+
+# Why "present", not "present exactly once"
+
+The two Apple sources have different About sections, and both are correct:
+
+  * the original macOS client carries one source row and one Releases item;
+  * the custom iOS client is split per platform, so the same fork source URL appears in
+    the `#if os(iOS)` section and again in the `#if os(macOS) || os(tvOS)` section.
+
+Demanding a fixed count would therefore accept one client and reject the other for being
+the shape it is. The invariant that matters is that every sing-box repository link points
+at the fork and that both link kinds exist - and, in the other direction, that no upstream
+attribution survives.
 
 # What it cannot check
 
@@ -25,18 +37,24 @@ import sys
 
 SOURCE_FILE = "ApplicationLibrary/Views/Setting/SettingView.swift"
 
-EXPECTED = {
-    "source code": 'URL(string: String("https://github.com/Piggy-Cat-bit-shadow/sing-box"))!',
-    "releases": 'URL(string: String("https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"))!',
+# Matched as quoted literals, so the surrounding Swift expression does not matter. See
+# apply-apple-link-overlay.py for why the quoted form is what makes the source URL safe to
+# look for even though it is a prefix of the releases URL.
+REQUIRED = {
+    "source code": '"https://github.com/Piggy-Cat-bit-shadow/sing-box"',
+    "releases": '"https://github.com/Piggy-Cat-bit-shadow/sing-box/releases"',
+}
+
+DOCUMENTATION = {
     "documentation": 'URL(string: String(localized: "https://sing-box.sagernet.org/"))!',
     "changelog": 'URL(string: String(localized: "https://sing-box.sagernet.org/changelog/"))!',
     "configuration": 'URL(string: String(localized: "https://sing-box.sagernet.org/configuration/"))!',
 }
 
-# Attribution that must NOT appear in the About section's product links.
+# Attribution that must NOT appear anywhere in the About section's product links.
 FORBIDDEN = {
-    "upstream source code": 'URL(string: String("https://github.com/SagerNet/sing-box"))!',
-    "upstream releases": 'URL(string: String("https://github.com/SagerNet/sing-box/releases"))!',
+    "upstream source code": '"https://github.com/SagerNet/sing-box"',
+    "upstream releases": '"https://github.com/SagerNet/sing-box/releases"',
 }
 
 
@@ -59,10 +77,15 @@ def main() -> int:
 
     problems: list[str] = []
 
-    for label, needle in EXPECTED.items():
+    for label, needle in REQUIRED.items():
         found = src.count(needle)
-        if found != 1:
-            problems.append(f"{label}: expected exactly 1, found {found} -> {needle}")
+        if found < 1:
+            problems.append(f"{label}: expected at least 1, found {found} -> {needle}")
+
+    for label, needle in DOCUMENTATION.items():
+        found = src.count(needle)
+        if found < 1:
+            problems.append(f"{label}: expected at least 1, found {found} -> {needle}")
 
     for label, needle in FORBIDDEN.items():
         found = src.count(needle)

@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-# Builds Libbox.xcframework from THIS repository and installs it into the pinned
-# Apple client submodule.
+# Builds Libbox.xcframework from THIS repository and installs it into an Apple client
+# checkout.
 #
-# Usage: build-apple-libbox.sh [ios|macos|both]
+# Usage:
+#   build-apple-libbox.sh [ios|macos|both]   build, then install into APPLE_CLIENT_DIR
+#   build-apple-libbox.sh install [dir]      install the already-built root framework
+#
+# APPLE_CLIENT_DIR selects the checkout to install into (default: clients/apple).
+#
+# # One framework, two clients
+#
+# iOS and macOS take their Swift source from two branches of the same Apple repository,
+# but they link the SAME Libbox: it is compiled once from this repository's commit and
+# the identical framework is installed into each checkout. `install` exists so the
+# release pipeline can build once and place that one build in both places, rather than
+# compiling a second copy that would differ by nothing except the compiler's mood.
 #
 # # Why this exists instead of `make lib_apple`
 #
@@ -28,16 +40,50 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
 which="${1:-both}"
+client="${APPLE_CLIENT_DIR:-clients/apple}"
+
+# install_into places the framework built at the repository root into a client checkout,
+# replacing whatever was there. A stale slice left behind by an earlier build would make
+# the two platforms link different frameworks while both believed they installed the same
+# artifact, so the destination is removed rather than merged.
+install_into() {
+  local dest_client="$1"
+  [ -d "$dest_client" ] || {
+    echo "FAIL: $dest_client is missing; check the Apple client source out first." >&2
+    exit 1
+  }
+  [ -d Libbox.xcframework ] || {
+    echo "FAIL: Libbox.xcframework is not built at the repository root." >&2
+    exit 1
+  }
+  rm -rf "$dest_client/Libbox.xcframework"
+  ditto Libbox.xcframework "$dest_client/Libbox.xcframework"
+
+  echo "installed: $dest_client/Libbox.xcframework"
+  python3 - "$dest_client/Libbox.xcframework/Info.plist" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], 'rb') as fh:
+    plist = plistlib.load(fh)
+for lib in sorted(plist['AvailableLibraries'], key=lambda x: x['LibraryIdentifier']):
+    print(f"  {lib['LibraryIdentifier']:32} {lib['SupportedArchitectures']}")
+PY
+}
+
+if [ "$which" = "install" ]; then
+  install_into "${2:-$client}"
+  echo "build-apple-libbox: PASS"
+  exit 0
+fi
+
 case "$which" in
   ios)   targets="ios" ;;
   macos) targets="macos" ;;
   both)  targets="ios,macos" ;;
-  *) echo "build-apple-libbox.sh: unknown target '$which' (ios|macos|both)" >&2; exit 2 ;;
+  *) echo "build-apple-libbox.sh: unknown target '$which' (ios|macos|both|install)" >&2; exit 2 ;;
 esac
 
-client="clients/apple"
 if [ ! -d "$client" ]; then
-  echo "FAIL: $client is missing; check out the submodule first." >&2
+  echo "FAIL: $client is missing; check the Apple client source out first." >&2
   exit 1
 fi
 
@@ -83,17 +129,7 @@ if [ "$which" != "ios" ] && [ ! -d "Libbox.xcframework/macos-arm64_x86_64" ] && 
   exit 1
 fi
 
-# Install into the submodule, replacing whatever was there. This is the step that
+# Install into the client checkout, replacing whatever was there. This is the step that
 # guarantees the app links OUR libbox rather than a stale or upstream one.
-rm -rf "$client/Libbox.xcframework"
-ditto Libbox.xcframework "$client/Libbox.xcframework"
-
-echo "installed: $client/Libbox.xcframework"
-python3 - "$client/Libbox.xcframework/Info.plist" <<'PY'
-import plistlib, sys
-with open(sys.argv[1], 'rb') as fh:
-    plist = plistlib.load(fh)
-for lib in sorted(plist['AvailableLibraries'], key=lambda x: x['LibraryIdentifier']):
-    print(f"  {lib['LibraryIdentifier']:32} {lib['SupportedArchitectures']}")
-PY
+install_into "$client"
 echo "build-apple-libbox: PASS"

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Builds an UNSIGNED iOS arm64 IPA from the pinned Apple client submodule.
+# Builds an UNSIGNED iOS arm64 IPA from the iOS Apple client source.
 #
 # Usage: build-ios-ipa.sh <output-ipa> [--app-name SFI]
+#
+# Reads APPLE_CLIENT_DIR (default: clients/apple, the pinned submodule) so the same
+# script builds whichever Apple client source the release selected.
 #
 # # What this produces
 #
@@ -42,9 +45,14 @@ eval "$("$root/scripts/ci/apple-signing-config.sh")"
 work="build/apple-ios"
 mkdir -p "$(dirname "$out")"
 
-client="clients/apple"
+# The Apple client checkout to build from. iOS and macOS take their Swift source from
+# two branches of one Apple repository (release/apple-client-refs.env), so the directory
+# is an input rather than a constant: the iOS job uses the pinned submodule, and the
+# macOS job an ephemeral checkout of the macOS pin. Same script, different source.
+client="${APPLE_CLIENT_DIR:-clients/apple}"
 if [ ! -d "$client" ]; then
-  echo "FAIL: $client is missing; run the submodule checkout first." >&2
+  echo "FAIL: $client is missing; check the Apple client source out first." >&2
+  echo "      ./scripts/ci/apple-client-source.sh checkout ios" >&2
   exit 1
 fi
 
@@ -56,7 +64,7 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   exit 1
 fi
 
-echo "libbox: built from this repository (clients/apple/Libbox.xcframework)"
+echo "libbox: built from this repository ($client/Libbox.xcframework)"
 echo "        $(find "$client/Libbox.xcframework/ios-arm64" -name Libbox -type f | head -1)"
 
 # --- 2. Build unsigned. ---------------------------------------------------------

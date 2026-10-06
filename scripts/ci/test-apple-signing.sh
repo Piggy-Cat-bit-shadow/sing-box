@@ -399,11 +399,27 @@ echo "== the Apple scripts are syntactically valid =="
 # A concatenated echo left two commands on one line, which `bash -n` accepts but
 # which runs the wrong command. Checking every script here catches that class
 # before a 20-minute build does.
-for script in scripts/release-apple.sh scripts/ci/apple-signing-config.sh \
+for script in scripts/release-apple.sh scripts/publish-apple-beta.sh scripts/ci/apple-signing-config.sh \
               scripts/ci/build-ios-testflight.sh scripts/ci/build-macos-testflight.sh \
               scripts/ci/build-ios-ipa.sh scripts/ci/build-macos-dmg.sh \
+              scripts/ci/build-apple-libbox.sh scripts/ci/apple-libbox-artifact.sh \
+              scripts/ci/apple-client-source.sh scripts/ci/check-apple-shared-libbox.sh \
+              scripts/ci/check-apple-source-selection.sh \
               scripts/ci/prepare-apple-client.sh scripts/ci/check-apple-signing-environment.sh; do
   check "$(basename "$script") parses" bash -n "$script"
+done
+
+# The Python halves of the Apple tooling must import only the standard library: the GitHub
+# runner image has no PyYAML, and a script that needs it fails there for a reason unrelated
+# to what it checks. Verified by walking each script's import statements.
+for py in scripts/ci/apply-apple-link-overlay.py scripts/ci/check-apple-links.py; do
+  check "$(basename "$py") imports only the standard library" \
+    bash -c "python3 -c 'import ast,sys; m=ast.parse(open(sys.argv[1]).read()); \
+      mods={n.names[0].name.split(\".\")[0] for n in ast.walk(m) if isinstance(n, ast.Import)} | \
+           {n.module.split(\".\")[0] for n in ast.walk(m) if isinstance(n, ast.ImportFrom) and n.module}; \
+      allowed={\"sys\",\"os\",\"re\",\"json\",\"plistlib\",\"hashlib\",\"ast\"}; \
+      bad=mods-allowed; \
+      sys.exit(1 if bad else 0)' '$py'"
 done
 
 

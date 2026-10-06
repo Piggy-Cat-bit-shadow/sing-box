@@ -62,51 +62,74 @@ if [ -n "$(git status --porcelain)" ]; then
   There is deliberately no --allow-dirty: an unreproducible build is not attributable to CI."
 fi
 
-submodule_sha="$(git -C clients/apple rev-parse HEAD)"
+# ---------------------------------------------------------------------------
+# 1b. select the two Apple sources
+# ---------------------------------------------------------------------------
+#
+# One Apple repository, two branches, two products. The iOS source is the commit the
+# parent gitlink records; the macOS source is the commit pinned in
+# release/apple-client-refs.env. They are different by design and are never merged, so
+# each is gated against its own authority rather than against a single shared SHA.
+step "Apple sources"
+eval "$(./scripts/ci/apple-client-source.sh resolve)"
 
-# The parent's gitlink and the checked-out submodule must agree: the clean-tree gate above means a
-# difference could only come from a checkout that was never staged, and publishing would then attribute
-# the build to a child commit the parent does not record.
-gitlink_sha="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
-[ "$gitlink_sha" = "$submodule_sha" ] || fail \
-  "the parent records clients/apple at $gitlink_sha but $submodule_sha is checked out.
-  The published build would be attributed to a submodule commit the parent does not record."
+ios_client_dir="$IOS_APPLE_DIR"
+macos_client_dir="$MACOS_APPLE_DIR"
+export APPLE_CLIENT_REPOSITORY IOS_APPLE_SHA IOS_APPLE_BRANCH MACOS_APPLE_SHA MACOS_APPLE_BRANCH
 
-  # ---------------------------------------------------------------------------
-  # Restore what this run changes
-  # ---------------------------------------------------------------------------
-  #
-  # prepare-apple-client.sh applies overlays that MODIFY the clients/apple submodule in place. That
-  # is by design, but it left the submodule dirty, so the next run of this script failed its own
-  # clean-tree gate and the operator had to clean up by hand after every release.
-  #
-  # The gate above has already established that the tree was clean, so anything dirty under the
-  # submodule when this script exits was produced by this script. Restoring it cannot discard user
-  # work - and restoring only the submodule, rather than running `git reset --hard` on the parent,
-  # keeps the blast radius to the one directory the overlays touch.
-  #
-  # `checkout -- .` rather than `reset --hard`: every overlay write targets a file it read first, so
-  # the changes are tracked modifications and there is nothing untracked to sweep. Both were verified
-  # against a real overlay run.
-  #
-  # Installed with `trap ... EXIT` so success, failure and Ctrl-C all take the same path.
-  restore_submodule() {
-    local status
-    status=$?
-    if [ -n "$(git -C clients/apple status --porcelain 2>/dev/null)" ]; then
-      git -C clients/apple checkout -- . 2>/dev/null || true
+gitlink_sha="$(git ls-tree HEAD "$ios_client_dir" | awk '{print $3}')"
+[ -n "$gitlink_sha" ] || fail "the parent records no gitlink at $ios_client_dir."
+[ "$gitlink_sha" = "$IOS_APPLE_SHA" ] || fail \
+  "the parent records $ios_client_dir at $gitlink_sha but the iOS source selection resolved
+  to $IOS_APPLE_SHA. The iOS build must come from the gitlink the release commit records."
+
+./scripts/ci/apple-client-source.sh assert-distinct
+echo "  iOS:   $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA  (parent gitlink)"
+echo "  macOS: $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA (release/apple-client-refs.env)"
+
+# ---------------------------------------------------------------------------
+# Restore what this run changes
+# ---------------------------------------------------------------------------
+#
+# prepare-apple-client.sh applies overlays that MODIFY each Apple checkout in place. That is
+# by design, but it left the iOS submodule dirty, so the next run of this script failed its
+# own clean-tree gate and the operator had to clean up by hand after every release.
+#
+# The gate above has already established that the tree was clean, so anything dirty under
+# either checkout when this script exits was produced by this script. Restoring cannot
+# discard user work - and restoring only the Apple checkouts, rather than running
+# `git reset --hard` on the parent, keeps the blast radius to the directories the overlays
+# touch.
+#
+# `checkout -- .` rather than `reset --hard`: every overlay write targets a file it read
+# first, so the changes are tracked modifications and there is nothing untracked to sweep.
+# Both were verified against a real overlay run.
+#
+# The macOS checkout is deliberately NOT removed: it is a pinned checkout under build/,
+# reused across runs, and leaving it in place means a re-run does not re-clone it. It is
+# restored to its own revision, not deleted.
+#
+# Installed with `trap ... EXIT` so success, failure and Ctrl-C all take the same path.
+restore_clients() {
+  local status
+  status=$?
+  local dir
+  for dir in "$ios_client_dir" "$macos_client_dir"; do
+    [ -e "$dir/.git" ] || continue
+    if [ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]; then
+      git -C "$dir" checkout -- . 2>/dev/null || true
       echo
-      echo "restored clients/apple to the pinned revision (overlay changes from this run discarded)"
+      echo "restored $dir to its pinned revision (overlay changes from this run discarded)"
     fi
-    return $status
-  }
-  trap restore_submodule EXIT
+  done
+  return $status
+}
+trap restore_clients EXIT
 # shellcheck disable=SC1091
 eval "$(./scripts/ci/version.sh)"
 echo "  commit:    $local_sha"
 echo "  branch:    $branch"
 echo "  version:   $JJ_VERSION"
-echo "  submodule: clients/apple @ $submodule_sha"
 
 # ---------------------------------------------------------------------------
 # 2. GitHub CLI preflight
@@ -213,10 +236,6 @@ job_ios="$(printf '%s\n' "$job_results" | sed -n 's/^ios=//p')"
 job_macos="$(printf '%s\n' "$job_results" | sed -n 's/^macos=//p')"
 echo "  jobs:       libbox=$job_libbox ios=$job_ios macos=$job_macos"
 
-# The Apple client is its own fork, so which commit of it was built is release evidence rather than
-# an internal detail of the submodule.
-apple_client_url="$(git config -f .gitmodules submodule.clients/apple.url 2>/dev/null || true)"
-
 # ---------------------------------------------------------------------------
 # 4. download the Libbox artifact from that exact run
 # ---------------------------------------------------------------------------
@@ -235,15 +254,27 @@ gh run download "$run_id" --repo "$repo" --name "jiejiebox-libbox-$local_sha" --
 # ---------------------------------------------------------------------------
 step "validate the Libbox artifact"
 # Everything that makes the artifact attributable lives in the manifest, so the manifest is what is
-# checked - not the artifact name.
+# checked - not the artifact name. The parent commit is the only binding: the core does not depend on
+# which Apple UI branch links it, and the two platforms deliberately use two different ones.
 ./scripts/ci/apple-libbox-artifact.sh validate "$input_dir" \
-  --parent-sha "$local_sha" \
-  --submodule-sha "$submodule_sha"
+  --parent-sha "$local_sha"
 
 artifact_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_sha256"])' \
   "$input_dir/manifest.json")"
 
-./scripts/ci/apple-libbox-artifact.sh install "$input_dir" "$PWD"
+# Materialise both Apple sources at their own pinned revisions, then install the ONE verified
+# framework into each. A failure here is fatal: publishing with only one client's source present
+# would either build the wrong UI for a platform or ship a half-configured release.
+step "check out both Apple sources"
+./scripts/ci/apple-client-source.sh checkout ios >/dev/null
+./scripts/ci/apple-client-source.sh verify ios
+./scripts/ci/apple-client-source.sh checkout macos >/dev/null
+./scripts/ci/apple-client-source.sh verify macos
+
+step "install the verified Libbox into both clients"
+./scripts/ci/apple-libbox-artifact.sh install "$input_dir" "$ios_client_dir"
+./scripts/ci/apple-libbox-artifact.sh install "$input_dir" "$macos_client_dir"
+./scripts/ci/check-apple-shared-libbox.sh "$ios_client_dir" "$macos_client_dir"
 
 # ---------------------------------------------------------------------------
 # 6. hand off to the existing release pipeline
@@ -275,10 +306,24 @@ Source:
   branch:              $branch
   version:             $JJ_VERSION
 
-Apple UI:
-  repository:          ${apple_client_url:-unknown}
-  commit:              $submodule_sha
-  gitlink match:       PASS
+Apple sources (one repository, two UI branches, never merged):
+  repository:          $APPLE_CLIENT_REPOSITORY
+
+  iOS / SFI:
+    branch:            $IOS_APPLE_BRANCH
+    commit:            $IOS_APPLE_SHA
+    source of truth:   parent clients/apple gitlink
+    gitlink match:     PASS
+    UI:                custom Hako
+
+  macOS / SFM:
+    branch:            $MACOS_APPLE_BRANCH
+    commit:            $MACOS_APPLE_SHA
+    source of truth:   release/apple-client-refs.env (MACOS_APPLE_SHA)
+    pin match:         PASS
+    UI:                original sing-box
+
+  distinct sources:    PASS (the two SHAs differ, as they must)
 
 GitHub Apple CI:
   run:                 $run_id
@@ -289,7 +334,7 @@ GitHub Apple CI:
   Libbox artifact:     PASS
   Libbox SHA256:       $artifact_sha
   parent SHA match:    PASS
-  submodule SHA match: PASS
+  shared by both:      PASS (identical framework in both Apple checkouts)
 
 Local:
   Libbox build:        SKIPPED (reused the verified artifact)
@@ -297,7 +342,7 @@ Local:
   build number:        ${APPLE_BUILD_NUMBER}
 
 RESULT:
-  TESTFLIGHT UPLOAD:   PASS (iOS + macOS)
+  TESTFLIGHT UPLOAD:   PASS (iOS + macOS, one App Store Connect record)
 
 The archive, export and upload all completed successfully. App Store Connect
 processes the build afterwards, on Apple's side; "uploaded" is not the same as

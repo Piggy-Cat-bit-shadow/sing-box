@@ -23,6 +23,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
 
+# This probe builds the iOS scheme, so it reads the iOS Apple source. It defaults to the
+# pinned submodule and honours APPLE_CLIENT_DIR so the same diagnostic works against
+# whichever checkout the iOS build actually uses.
+client="${APPLE_CLIENT_DIR:-clients/apple}"
+
 echo "Apple signing diagnosis"
 echo
 
@@ -109,7 +114,7 @@ else
   rm -rf /tmp/dsh-apple-diag-dd
   set +e
   perl -e 'alarm 240; exec @ARGV' xcodebuild \
-    -project clients/apple/sing-box.xcodeproj \
+    -project "$client/sing-box.xcodeproj" \
     -scheme SFI \
     -configuration Debug \
     -destination 'generic/platform=iOS' \

@@ -43,7 +43,7 @@ if [ "$APPLE_SIGNING_MODE" != "testflight" ]; then
   exit 2
 fi
 
-client="clients/apple"
+client="${APPLE_CLIENT_DIR:-clients/apple}"
 scheme="SFM"
 work="build/apple-testflight-macos"
 archive_path="$work/SFM.xcarchive"

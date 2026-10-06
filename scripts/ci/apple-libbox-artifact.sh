@@ -15,9 +15,23 @@
 # manifest rather than against any string a caller supplies.
 #
 # Usage:
-#   apple-libbox-artifact.sh pack  <xcframework-dir> <output-dir>
-#   apple-libbox-artifact.sh validate <input-dir> --parent-sha <sha> --submodule-sha <sha>
-#   apple-libbox-artifact.sh install <input-dir> <repo-root>
+#   apple-libbox-artifact.sh pack    <xcframework-dir> <output-dir>
+#   apple-libbox-artifact.sh validate <input-dir> --parent-sha <sha>
+#   apple-libbox-artifact.sh install  <input-dir> <client-dir>
+#
+# # What the artifact is bound to, and what it is not
+#
+# The artifact is bound to ONE thing: the parent commit it was compiled from. Libbox is
+# the sing-box core, and the core does not depend on which Apple UI branch a client was
+# built from - so the artifact deliberately records no Apple client revision and none is
+# validated against it.
+#
+# This matters because the two Apple products are built from two different Apple
+# branches (iOS from hako-ui, macOS from the pinned dev commit), with two different
+# SHAs. An earlier version of this script required the artifact's recorded Apple
+# submodule to equal the building checkout's, which could only ever hold for one of the
+# two platforms. Each platform's Apple revision is recorded in that platform's
+# BUILD-INFO instead, where it is meaningful.
 set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -62,9 +76,8 @@ pack() {
     tar -czf "$tarball" -C "$(dirname "$xcframework")" "$(basename "$xcframework")"
   fi
 
-  local parent_sha submodule_sha version go_version xcode_version
+  local parent_sha version go_version xcode_version
   parent_sha="$(git rev-parse HEAD)"
-  submodule_sha="$(git -C clients/apple rev-parse HEAD)"
   # shellcheck disable=SC1091
   eval "$(./scripts/ci/version.sh)"
   version="$JJ_ARTIFACT_VERSION"
@@ -82,7 +95,6 @@ pack() {
 Jiejie Libbox build information
 ===============================
 parent_sha:            $parent_sha
-apple_submodule_sha:   $submodule_sha
 version:               $version
 build_time_utc:        $(date -u +%Y-%m-%dT%H:%M:%SZ)
 xcode_version:         $xcode_version
@@ -95,24 +107,24 @@ EOF
 
   # manifest.json is the authoritative record. The workflow job that uploads this also names the
   # artifact after the commit, but nothing downstream trusts the name.
-  # manifest.json is the authoritative record. The workflow job that uploads this also names the
-  # artifact after the commit, but nothing downstream trusts the name.
   #
   # Written with a real JSON encoder rather than by interpolating into a heredoc. Hand-built JSON
   # cannot escape what it interpolates, and a single control character in the Xcode version string
   # was enough to make the manifest unparseable on a runner while it parsed fine on a workstation.
-  python3 - "$output/manifest.json" "$parent_sha" "$submodule_sha" "$version" \
+  #
+  # parent_sha is the ONLY commit this records. Libbox comes from the core repository and is
+  # independent of which Apple UI branch links it - see the header.
+  python3 - "$output/manifest.json" "$parent_sha" "$version" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$xcode_version" "$go_version" \
     "$(basename "$tarball")" "$artifact_sha" <<'PY'
 import json
 import sys
 
-path, parent, submodule, version, built, xcode, goversion, artifact, digest = sys.argv[1:10]
+path, parent, version, built, xcode, goversion, artifact, digest = sys.argv[1:9]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
             "parent_sha": parent,
-            "apple_submodule_sha": submodule,
             "version": version,
             "build_time_utc": built,
             "xcode_version": xcode,
@@ -149,27 +161,26 @@ PY
 
 # --- validate ----------------------------------------------------------------
 #
-# Every gate is fail-closed. A wrong commit, a wrong submodule, a missing file or a checksum
-# mismatch all stop the publish: the whole point of downloading a prebuilt xcframework is that the
-# build it came from is known to be the build being shipped.
+# Every gate is fail-closed. A wrong commit, a missing file or a checksum mismatch all stop the
+# publish: the whole point of downloading a prebuilt xcframework is that the build it came from is
+# known to be the build being shipped.
+#
+# The parent commit is the only binding. The Apple UI branch is deliberately not checked: the two
+# platforms build from two different Apple SHAs and both link this one framework.
 validate() {
-  local input="$1" expect_parent="$2" expect_submodule="$3"
+  local input="$1" expect_parent="$2"
 
   [ -d "$input" ] || fail "no artifact directory at $input"
   local manifest="$input/manifest.json"
   [ -f "$manifest" ] || fail "the artifact has no manifest.json; it cannot be attributed to a commit"
 
-  local parent_sha submodule_sha artifact_sha
+  local parent_sha artifact_sha
   parent_sha="$(manifest_field "$manifest" parent_sha)" || fail "manifest.json has no parent_sha"
-  submodule_sha="$(manifest_field "$manifest" apple_submodule_sha)" || fail "manifest.json has no apple_submodule_sha"
   artifact_sha="$(manifest_field "$manifest" artifact_sha256)" || fail "manifest.json has no artifact_sha256"
 
   [ "$parent_sha" = "$expect_parent" ] || fail \
     "the Libbox artifact was built from $parent_sha but this checkout is $expect_parent.
   Publishing it would ship a binary that does not match the commit you are releasing."
-  [ "$submodule_sha" = "$expect_submodule" ] || fail \
-    "the Libbox artifact was built against Apple submodule $submodule_sha but this checkout pins
-  $expect_submodule. The Xcode project and the framework would disagree."
 
   local tarball="$input/$(manifest_field "$manifest" artifact)"
   [ -f "$tarball" ] || fail "manifest names $(manifest_field "$manifest" artifact) but the artifact is missing"
@@ -182,24 +193,29 @@ validate() {
   actual:   $actual_sha"
 
   echo "PASS: manifest parent_sha    $parent_sha"
-  echo "PASS: manifest submodule_sha $submodule_sha"
   echo "PASS: artifact sha256        $artifact_sha"
 }
 
 # --- install -----------------------------------------------------------------
 #
-# Extracts into the submodule. The existing directory is replaced rather than merged: a stale slice
-# left behind by a previous build would make the two GUI jobs link different frameworks while both
-# believing they installed the same artifact.
+# Extracts into an Apple client checkout named by the caller, so the SAME artifact can be
+# installed into the iOS checkout and the macOS checkout. The existing directory is replaced rather
+# than merged: a stale slice left behind by a previous build would make the two platforms link
+# different frameworks while both believed they installed the same artifact.
 install() {
-  local input="$1" root="$2"
+  local input="$1" client="$2"
   local manifest="$input/manifest.json"
   [ -f "$manifest" ] || fail "no manifest.json in $input; run validate first"
+
+  [ -d "$client" ] || fail \
+    "no Apple client checkout at $client. Check the platform's source out before installing."
+  [ -f "$client/sing-box.xcodeproj/project.pbxproj" ] || fail \
+    "$client does not look like an Apple client checkout (no sing-box.xcodeproj)."
 
   local tarball="$input/$(manifest_field "$manifest" artifact)"
   [ -f "$tarball" ] || fail "artifact $(manifest_field "$manifest" artifact) is missing"
 
-  local destination="$root/clients/apple/Libbox.xcframework"
+  local destination="$client/Libbox.xcframework"
   local staging
   staging="$(mktemp -d)"
   trap 'rm -rf "$staging"' RETURN
@@ -234,21 +250,22 @@ case "$action" in
     ;;
   validate)
     shift
-    input="${1:?usage: validate <input-dir> --parent-sha <sha> --submodule-sha <sha>}"
+    input="${1:?usage: validate <input-dir> --parent-sha <sha>}"
     shift
-    expect_parent="" expect_submodule=""
+    expect_parent=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --parent-sha)    expect_parent="${2:?}"; shift 2 ;;
-        --submodule-sha) expect_submodule="${2:?}"; shift 2 ;;
+        --parent-sha) expect_parent="${2:?}"; shift 2 ;;
+        # Accepted and ignored so an older caller that still passes it is not silently
+        # mis-parsed into a different gate. It binds nothing: see the header.
+        --submodule-sha) shift 2 ;;
         *) fail "unknown argument '$1'" ;;
       esac
     done
     [ -n "$expect_parent" ] || fail "validate requires --parent-sha"
-    [ -n "$expect_submodule" ] || fail "validate requires --submodule-sha"
-    validate "$input" "$expect_parent" "$expect_submodule"
+    validate "$input" "$expect_parent"
     ;;
   install)
-    install "${2:?usage: install <input-dir> <repo-root>}" "${3:?usage: install <input-dir> <repo-root>}"
+    install "${2:?usage: install <input-dir> <client-dir>}" "${3:?usage: install <input-dir> <client-dir>}"
     ;;
 esac

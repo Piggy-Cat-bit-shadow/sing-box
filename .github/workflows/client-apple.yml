@@ -19,9 +19,23 @@ name: Apple client
 # # Why the app links THIS fork
 #
 # Before building the apps, Libbox.xcframework is generated from this repository's
-# own experimental/libbox via `make lib_apple`, and the submodule's copy is verified
+# own experimental/libbox via `make lib_apple`, and the client's copy is verified
 # to be that freshly built framework. If it were missing, the app would fail to link
 # or, worse, link whatever was already there. Nothing downloads an upstream libbox.
+#
+# # Two products, two Apple UI branches, one Libbox
+#
+# The iOS and macOS clients do NOT share an Apple UI source. They are built from two
+# branches of the same Apple client repository, pinned independently in
+# release/apple-client-refs.env:
+#
+#     iOS / SFI     Repo B @ clients/apple gitlink   branch hako-ui   custom Hako UI
+#     macOS / SFM   Repo B @ MACOS_APPLE_SHA         branch dev       original sing-box UI
+#
+# Libbox is built ONCE from this repository's commit and that same artifact is installed
+# into both checkouts, so the core is identical while each platform keeps its own UI.
+# The two branches are never merged: there is no Apple commit that carries both UIs, and
+# the parent keeps recording exactly one Apple gitlink - the iOS one.
 #
 # # Trigger
 #
@@ -52,8 +66,10 @@ jobs:
   #
   # It is the most expensive step in the Apple pipeline and depends only on the source commit - no
   # Apple secrets - so building it per platform was duplicated work. The artifact carries a manifest
-  # naming the commit and submodule it was built from, because the consumers must be able to prove
-  # the framework matches the tree they are about to sign, not merely trust an artifact name.
+  # naming the parent commit it was built from, because the consumers must be able to prove the
+  # framework matches the commit being released, not merely trust an artifact name. It records no
+  # Apple client revision: the core does not depend on which UI branch links it, and the two
+  # platforms deliberately use two different ones.
   libbox:
     if: ${{ inputs.build_ios || inputs.build_macos }}
     runs-on: macos-latest
@@ -96,11 +112,13 @@ jobs:
       - name: Apple regression tests
         # Cheap invariant checks for the failures that are otherwise silent: a signed build falling
         # back to unsigned, upstream identifiers left in place, entitlements cleared while signing,
-        # or a published artifact that does not belong to the commit being released.
+        # a published artifact that does not belong to the commit being released, or the two Apple
+        # platforms being wired to the wrong source branch.
         run: |
           set -euo pipefail
           ./scripts/ci/test-apple-signing.sh
           ./scripts/ci/test-apple-beta-publish.sh
+          ./scripts/ci/check-apple-source-selection.sh
       - name: verify the Apple submodule revision
         run: |
           set -euo pipefail
@@ -145,12 +163,15 @@ jobs:
       - name: pack the Libbox artifact
         # The manifest is what makes the artifact attributable to a commit. The artifact name is
         # informative only; consumers validate against the manifest.
+        #
+        # It records the parent commit and nothing about the Apple client: both platforms link this
+        # one framework and they build from two different Apple revisions.
         env:
           LIBBOX_ARTIFACT: jiejiebox-libbox-${{ github.sha }}
         run: |
           set -euo pipefail
           ./scripts/ci/apple-libbox-artifact.sh pack \
-            clients/apple/Libbox.xcframework \
+            "$APPLE_SUBMODULE/Libbox.xcframework" \
             dist/apple/libbox
           echo "Libbox artifact contents:"
           ls -la dist/apple/libbox
@@ -192,7 +213,28 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
+      - name: select the Apple client source
+        # The iOS product takes its Swift source from the parent's clients/apple gitlink, which is
+        # the custom Hako UI branch. The macOS product takes a different branch of the same Apple
+        # repository, selected in the macOS job. Neither job may build the other's source, so each
+        # records which platform it is and which revision that platform resolves to.
+        run: |
+          set -euo pipefail
+          eval "$(./scripts/ci/apple-client-source.sh resolve)"
+          ./scripts/ci/apple-client-source.sh assert-distinct
+          {
+            echo "APPLE_CLIENT_PLATFORM=ios"
+            echo "APPLE_CLIENT_REPOSITORY=$APPLE_CLIENT_REPOSITORY"
+            echo "APPLE_CLIENT_DIR=$IOS_APPLE_DIR"
+            echo "APPLE_CLIENT_SHA=$IOS_APPLE_SHA"
+            echo "APPLE_CLIENT_BRANCH=$IOS_APPLE_BRANCH"
+            echo "APPLE_CLIENT_UI=custom Hako"
+          } >> "$GITHUB_ENV"
+          echo "iOS Apple source: $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA in $IOS_APPLE_DIR"
+
       - name: verify the Apple submodule revision
+        # The gitlink is the authority for the iOS source, so it is checked against the checkout
+        # rather than against a copy of the value anywhere else.
         run: |
           set -euo pipefail
           recorded="$(git ls-tree HEAD "$APPLE_SUBMODULE" | awk '{print $3}')"
@@ -203,7 +245,12 @@ jobs:
             echo "FAIL: the Apple submodule is not at the revision this repository pins." >&2
             exit 1
           fi
-          echo "PASS: submodule matches the parent gitlink"
+          if [ "$actual" != "$APPLE_CLIENT_SHA" ]; then
+            echo "FAIL: the iOS source selection resolved to $APPLE_CLIENT_SHA but the gitlink is" >&2
+            echo "      $recorded. The iOS build must come from the gitlink." >&2
+            exit 1
+          fi
+          echo "PASS: submodule matches the parent gitlink and the iOS source selection"
 
       - name: download the verified Libbox artifact
         uses: actions/download-artifact@v4
@@ -213,14 +260,13 @@ jobs:
 
       - name: validate and install the Libbox artifact
         # Both GUI jobs install the SAME artifact, so the framework they sign is byte-identical by
-        # construction rather than by both having run the same compiler.
+        # construction rather than by both having run the same compiler. It is validated against the
+        # parent commit only: the Apple UI branch does not determine the core.
         run: |
           set -euo pipefail
-          submodule_sha="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
           ./scripts/ci/apple-libbox-artifact.sh validate build/apple-libbox \
-            --parent-sha "${{ github.sha }}" \
-            --submodule-sha "$submodule_sha"
-          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$PWD"
+            --parent-sha "${{ github.sha }}"
+          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$APPLE_CLIENT_DIR"
 
       - name: warm the Go module cache
         run: go mod download all
@@ -273,9 +319,18 @@ jobs:
             echo "arch:                   arm64"
             echo "target:                 SFI"
             echo "version:                $(cat release/JIEJIE_VERSION)"
+            echo ""
+            echo "parent_repo:            https://github.com/Piggy-Cat-bit-shadow/sing-box"
             echo "parent_sha:             $(git rev-parse HEAD)"
-            echo "apple_submodule_sha:    $(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
             echo "libbox_source_sha:      $(git rev-parse HEAD)"
+            echo ""
+            echo "apple_repo:             $APPLE_CLIENT_REPOSITORY"
+            echo "apple_branch:           $APPLE_CLIENT_BRANCH"
+            echo "apple_sha:              $APPLE_CLIENT_SHA"
+            echo "apple_sha_source:       parent clients/apple gitlink"
+            echo "apple_client_dir:       $APPLE_CLIENT_DIR"
+            echo "ui:                     $APPLE_CLIENT_UI"
+            echo ""
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "xcode:                  $(xcodebuild -version | head -1)"
             echo "go_version:             $(go version)"
@@ -322,7 +377,10 @@ jobs:
             echo "| field | value |"
             echo "|---|---|"
             echo "| Parent SHA | \`$(git rev-parse HEAD)\` |"
-            echo "| Apple submodule SHA | \`$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)\` |"
+            echo "| Apple repo | \`$APPLE_CLIENT_REPOSITORY\` |"
+            echo "| Apple branch | \`$APPLE_CLIENT_BRANCH\` |"
+            echo "| Apple SHA | \`$APPLE_CLIENT_SHA\` (parent gitlink) |"
+            echo "| UI | $APPLE_CLIENT_UI |"
             echo "| Version | \`$(cat release/JIEJIE_VERSION)\` |"
             echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
             echo "| Go | \`$(go version | awk '{print $3}')\` |"
@@ -378,10 +436,15 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
-      - name: check out with submodules
+      - name: check out the parent repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          # Deliberately NOT `submodules: recursive`. The macOS product does not build from
+          # the clients/apple gitlink - that is the iOS source, and materialising it here
+          # would put the custom iOS UI on disk in a job that must never build it. The
+          # macOS source is a different commit of the same Apple repository, checked out
+          # below into build/apple-client-macos.
+          submodules: false
           fetch-depth: 0
 
       - name: set up Go
@@ -406,18 +469,41 @@ jobs:
           # hdiutil if this fails, so a brew hiccup cannot break the build.
           brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"
 
-      - name: verify the Apple submodule revision
+      - name: select the Apple client source
+        # The macOS product takes its Swift source from the dev branch of the same Apple
+        # repository the iOS product uses, at the exact commit pinned in
+        # release/apple-client-refs.env. It must NOT be the iOS gitlink: that branch carries
+        # the custom Hako iOS UI, and the macOS product ships the original sing-box UI.
         run: |
           set -euo pipefail
-          recorded="$(git ls-tree HEAD "$APPLE_SUBMODULE" | awk '{print $3}')"
-          actual="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
-          echo "parent records: $recorded"
-          echo "checked out:    $actual"
-          if [ "$actual" != "$recorded" ]; then
-            echo "FAIL: the Apple submodule is not at the revision this repository pins." >&2
+          eval "$(./scripts/ci/apple-client-source.sh resolve)"
+          ./scripts/ci/apple-client-source.sh assert-distinct
+          {
+            echo "APPLE_CLIENT_PLATFORM=macos"
+            echo "APPLE_CLIENT_REPOSITORY=$APPLE_CLIENT_REPOSITORY"
+            echo "APPLE_CLIENT_DIR=$MACOS_APPLE_DIR"
+            echo "APPLE_CLIENT_SHA=$MACOS_APPLE_SHA"
+            echo "APPLE_CLIENT_BRANCH=$MACOS_APPLE_BRANCH"
+            echo "APPLE_CLIENT_UI=original sing-box"
+          } >> "$GITHUB_ENV"
+          echo "macOS Apple source: $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA in $MACOS_APPLE_DIR"
+
+      - name: check out the macOS Apple source
+        # A pinned commit, never a branch tip: `dev` moves and a release built from
+        # whatever it pointed at would not be reproducible. The resolver refuses a pin that
+        # is unreachable or that is not an ancestor of the branch it names.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/apple-client-source.sh checkout macos
+          ./scripts/ci/apple-client-source.sh verify macos
+          actual="$(git -C "$APPLE_CLIENT_DIR" rev-parse HEAD)"
+          ios_sha="$(./scripts/ci/apple-client-source.sh sha ios)"
+          if [ "$actual" = "$ios_sha" ]; then
+            echo "FAIL: the macOS job checked out the iOS source ($ios_sha)." >&2
+            echo "      macOS must build the original sing-box UI, not the custom Hako UI." >&2
             exit 1
           fi
-          echo "PASS: submodule matches the parent gitlink"
+          echo "PASS: macOS source is $actual, distinct from the iOS source $ios_sha"
 
       - name: warm the Go module cache
         run: go mod download all
@@ -432,18 +518,18 @@ jobs:
           path: build/apple-libbox
 
       - name: validate and install the Libbox artifact
-        # The SAME artifact the iOS job installs. The two signed frameworks are therefore
+        # The SAME artifact the iOS job installs. The two frameworks are therefore
         # byte-identical by construction, rather than merely both produced from this commit.
+        # Validation is against the parent commit only - the Apple UI branch does not decide
+        # the core, and the two platforms deliberately use different Apple revisions.
         run: |
           set -euo pipefail
-          submodule_sha="$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
           ./scripts/ci/apple-libbox-artifact.sh validate build/apple-libbox \
-            --parent-sha "${{ github.sha }}" \
-            --submodule-sha "$submodule_sha"
-          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$PWD"
+            --parent-sha "${{ github.sha }}"
+          ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$APPLE_CLIENT_DIR"
 
       - name: apply the build overlays
-        # Compatibility shims for the pinned client's libbox API, plus the
+        # Compatibility shims for the client's libbox API, plus the
         # multicast-entitlement removal. Both are verified and fail closed.
         run: |
           set -euo pipefail
@@ -481,9 +567,18 @@ jobs:
             echo "target:                 SFM.System"
             echo "notarized:              no"
             echo "version:                $(cat release/JIEJIE_VERSION)"
+            echo ""
+            echo "parent_repo:            https://github.com/Piggy-Cat-bit-shadow/sing-box"
             echo "parent_sha:             $(git rev-parse HEAD)"
-            echo "apple_submodule_sha:    $(git -C "$APPLE_SUBMODULE" rev-parse HEAD)"
             echo "libbox_source_sha:      $(git rev-parse HEAD)"
+            echo ""
+            echo "apple_repo:             $APPLE_CLIENT_REPOSITORY"
+            echo "apple_branch:           $APPLE_CLIENT_BRANCH"
+            echo "apple_sha:              $APPLE_CLIENT_SHA"
+            echo "apple_sha_source:       release/apple-client-refs.env (MACOS_APPLE_SHA)"
+            echo "apple_client_dir:       $APPLE_CLIENT_DIR"
+            echo "ui:                     $APPLE_CLIENT_UI"
+            echo ""
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "xcode:                  $(xcodebuild -version | head -1)"
             echo "go_version:             $(go version)"
@@ -530,7 +625,10 @@ jobs:
             echo "| field | value |"
             echo "|---|---|"
             echo "| Parent SHA | \`$(git rev-parse HEAD)\` |"
-            echo "| Apple submodule SHA | \`$(git -C "$APPLE_SUBMODULE" rev-parse HEAD)\` |"
+            echo "| Apple repo | \`$APPLE_CLIENT_REPOSITORY\` |"
+            echo "| Apple branch | \`$APPLE_CLIENT_BRANCH\` |"
+            echo "| Apple SHA | \`$APPLE_CLIENT_SHA\` (pinned) |"
+            echo "| UI | $APPLE_CLIENT_UI |"
             echo "| Version | \`$(cat release/JIEJIE_VERSION)\` |"
             echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
             echo "| Go | \`$(go version | awk '{print $3}')\` |"

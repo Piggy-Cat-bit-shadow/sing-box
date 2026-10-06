@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
-# Prepares the pinned Apple client submodule for an UNSIGNED personal-test build.
+# Prepares an Apple client checkout for an UNSIGNED personal-test build.
 #
 # Usage: prepare-apple-client.sh [--submodule-sha <sha>]
+#
+# Environment:
+#   APPLE_CLIENT_DIR       the Apple checkout to prepare (default: clients/apple)
+#   APPLE_CLIENT_PLATFORM  ios or macos (default: inferred from APPLE_CLIENT_DIR)
+#
+# # Two platforms, two Apple sources, one preparation
+#
+# iOS and macOS take their Swift source from two branches of ONE Apple client
+# repository - hako-ui and the pinned dev commit - and link ONE Libbox framework. This
+# script is what turns either checkout into a buildable client, so it runs twice per
+# release: once against each source. Which source it is looking at decides the expected
+# revision, because the two platforms legitimately sit at different Apple commits.
 #
 # # Three independent overlays
 #
@@ -26,19 +38,20 @@
 # An earlier version of this comment said "two overlays" and omitted branding entirely,
 # which stopped matching the script as soon as branding was added.
 #
-# # Why an overlay rather than editing the submodule
+# # Why an overlay rather than editing the Apple source
 #
-# clients/apple is a pinned upstream checkout. Committing changes inside it would
-# either be lost on the next submodule checkout or turn into an unmaintainable
-# private fork. The adaptation is applied to the WORKING TREE at build time, and the
-# parent repository never records a modified gitlink: the submodule HEAD is asserted
-# to equal the parent's gitlink before AND after.
+# Each Apple checkout is a pinned revision - the iOS one is the parent's submodule, the
+# macOS one an ephemeral checkout of the pinned commit. Committing changes inside either
+# would be lost on the next checkout or turn into an unmaintainable private fork. The
+# adaptation is applied to the WORKING TREE at build time, and neither repository ever
+# records a new commit: the checkout's HEAD is asserted to equal the revision its platform
+# selects before AND after, so the overlays cannot move it.
 #
 # # Fail-closed
 #
-# Every edit is anchored on text that must exist and is verified afterwards. If the
-# pinned client is ever repinned and an anchor disappears, this exits non-zero rather
-# than producing a subtly wrong app. Nothing is applied with fuzzy matching.
+# Every edit is anchored on text that must exist and is verified afterwards. If a client is
+# ever repinned and an anchor disappears, this exits non-zero rather than producing a subtly
+# wrong app. Nothing is applied with fuzzy matching.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -57,38 +70,77 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-submodule_path="clients/apple"
+submodule_path="${APPLE_CLIENT_DIR:-clients/apple}"
 platform_swift="$submodule_path/Library/Network/ExtensionPlatformInterface.swift"
 provider_swift="$submodule_path/Library/Network/ExtensionProvider.swift"
 extension_entitlements="$submodule_path/Extension/Extension.entitlements"
 
 if [ ! -e "$submodule_path/.git" ] && [ ! -d "$submodule_path/.git" ]; then
-  echo "FAIL: $submodule_path is not a checked-out submodule." >&2
-  echo "      Run: git submodule update --init --recursive" >&2
+  echo "FAIL: $submodule_path is not a checked-out Apple client." >&2
+  echo "      iOS:   git submodule update --init --recursive clients/apple" >&2
+  echo "      macOS: ./scripts/ci/apple-client-source.sh checkout macos" >&2
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 0. The submodule must be exactly the commit the parent records.
+# 0. The checkout must be exactly the revision its platform selects.
 # ---------------------------------------------------------------------------
-recorded_sha="$(git ls-tree HEAD "$submodule_path" | awk '{print $3}')"
+#
+# The two platforms build from different Apple commits, so "the right revision" is a
+# per-platform answer and is taken from the one resolver that knows it - not from the
+# iOS gitlink, which by design says nothing about the macOS source.
+if [ -z "${APPLE_CLIENT_PLATFORM:-}" ]; then
+  case "$submodule_path" in
+    "$(./scripts/ci/apple-client-source.sh dir ios)")   APPLE_CLIENT_PLATFORM=ios ;;
+    "$(./scripts/ci/apple-client-source.sh dir macos)") APPLE_CLIENT_PLATFORM=macos ;;
+    *)
+      echo "FAIL: cannot tell which Apple platform $submodule_path belongs to." >&2
+      echo "      Set APPLE_CLIENT_PLATFORM to ios or macos." >&2
+      exit 1
+      ;;
+  esac
+fi
+
+recorded_sha="$(./scripts/ci/apple-client-source.sh sha "$APPLE_CLIENT_PLATFORM")"
 actual_sha="$(git -C "$submodule_path" rev-parse HEAD)"
 
 if [ -z "$recorded_sha" ]; then
-  echo "FAIL: the parent repository records no gitlink for $submodule_path." >&2
+  echo "FAIL: no $APPLE_CLIENT_PLATFORM Apple source revision is recorded." >&2
   exit 1
 fi
 if [ "$actual_sha" != "$recorded_sha" ]; then
-  echo "FAIL: submodule is not at the commit the parent repository records." >&2
-  echo "  parent records: $recorded_sha" >&2
-  echo "  checked out:    $actual_sha" >&2
+  echo "FAIL: the $APPLE_CLIENT_PLATFORM Apple source is not at the revision this commit selects." >&2
+  echo "  selected:    $recorded_sha" >&2
+  echo "  checked out: $actual_sha  ($submodule_path)" >&2
   exit 1
 fi
 if [ -n "$expected_sha" ] && [ "$actual_sha" != "$expected_sha" ]; then
-  echo "FAIL: submodule SHA $actual_sha does not match the requested $expected_sha." >&2
+  echo "FAIL: Apple source SHA $actual_sha does not match the requested $expected_sha." >&2
   exit 1
 fi
-echo "submodule: $submodule_path @ $actual_sha (matches the parent gitlink)"
+echo "Apple source: $APPLE_CLIENT_PLATFORM $submodule_path @ $actual_sha (matches the selection)"
+
+# The checkout must also be COMPLETE. An Apple client has a nested submodule
+# (Frameworks/Runestone) that the Xcode project resolves SwiftPM packages from, and a
+# checkout without it fails much later inside xcodebuild as:
+#
+#   Could not resolve package dependencies: the package manifest at
+#   .../Frameworks/Runestone/Package.swift cannot be accessed
+#
+# which reads as a network or SwiftPM problem rather than as a missing checkout. Failing
+# here names the real cause and the command that fixes it.
+if [ -f "$submodule_path/.gitmodules" ]; then
+  while IFS= read -r nested; do
+    [ -n "$nested" ] || continue
+    if [ -z "$(ls -A "$submodule_path/$nested" 2>/dev/null)" ]; then
+      echo "FAIL: $submodule_path/$nested is empty; the client's nested submodules are not checked out." >&2
+      echo "      Populate them with:" >&2
+      echo "        git -C $submodule_path submodule update --init --recursive" >&2
+      echo "      or let the selection do it: ./scripts/ci/apple-client-source.sh checkout $APPLE_CLIENT_PLATFORM" >&2
+      exit 1
+    fi
+  done < <(git config -f "$submodule_path/.gitmodules" --get-regexp '^submodule\..*\.path$' | awk '{print $2}')
+fi
 
 # ---------------------------------------------------------------------------
 # 1. [compatibility] Adapt the pinned client to this fork's libbox API.
@@ -106,13 +158,33 @@ done
 # patching the revision it was written for.
 if ! grep -qF "public func usePlatformAutoDetectControl() -> Bool {" "$platform_swift"; then
   echo "FAIL: anchor 'usePlatformAutoDetectControl' not found in $platform_swift." >&2
-  echo "      The pinned client changed; this overlay must be reviewed." >&2
+  echo "      The $APPLE_CLIENT_PLATFORM Apple source changed; this overlay must be reviewed." >&2
   exit 1
 fi
-if ! grep -qF "LibboxPromotePowerReportDraft()" "$provider_swift"; then
-  echo "FAIL: $provider_swift no longer calls LibboxPromotePowerReportDraft();" >&2
-  echo "      its compatibility shim is no longer needed or no longer correct." >&2
+
+# The power-report-draft shim is anchored on its CALL SITE, not on the client revision.
+#
+# The two Apple sources differ here and both differences are correct: the custom iOS
+# client calls LibboxPromotePowerReportDraft() and carries the no-op global for it,
+# while the original macOS source predates the member and calls it nowhere. Stating
+# this as a hard "the call must exist" anchor - as an earlier version did - makes it
+# impossible for the macOS source to be prepared at all, and weakening it to "never
+# check" would let the iOS client lose its shim silently.
+#
+# So the invariant is the relationship between the two: if the client calls the
+# symbol, a definition must be present. Nothing may call a symbol that does not exist.
+promote_calls="$(grep -cF "LibboxPromotePowerReportDraft()" "$provider_swift" || true)"
+promote_defs="$(grep -cF "func LibboxPromotePowerReportDraft()" "$platform_swift" || true)"
+if [ "$promote_calls" -gt 0 ] && [ "$promote_defs" -eq 0 ]; then
+  echo "FAIL: $provider_swift calls LibboxPromotePowerReportDraft() but $platform_swift" >&2
+  echo "      defines no such symbol, and this libbox revision does not generate one." >&2
+  echo "      The compatibility shim is missing or no longer correct." >&2
   exit 1
+fi
+if [ "$promote_calls" -eq 0 ]; then
+  echo "  [compatibility] PromotePowerReportDraft: not called by the $APPLE_CLIENT_PLATFORM source"
+else
+  echo "  [compatibility] PromotePowerReportDraft: called by the client, backed by $promote_defs definition(s)"
 fi
 
 # The overlay is for a client that predates this fork's libbox API. Once the client carries the

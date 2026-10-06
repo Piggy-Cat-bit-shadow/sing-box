@@ -154,10 +154,34 @@ if [ -n "$(git status --porcelain)" ]; then
   git status --short | sed 's/^/    /'
 fi
 echo "  commit:   $(git rev-parse HEAD)"
-echo "  submodule: clients/apple @ $(git -C clients/apple rev-parse HEAD)"
 echo "  mode:     $APPLE_SIGNING_MODE"
 echo "  style:    $APPLE_SIGNING_STYLE"
 [ -n "${APPLE_BUILD_NUMBER:-}" ] && echo "  build:    $APPLE_BUILD_NUMBER"
+
+# ---------------------------------------------------------------------------
+# The two Apple UI sources
+# ---------------------------------------------------------------------------
+#
+# One Apple repository, two branches: iOS carries the custom Hako UI, macOS the original
+# sing-box UI. They are separate sources and are never merged. Each is materialised at the
+# exact revision the release selects - the iOS one is the parent's gitlink, the macOS one
+# the commit pinned in release/apple-client-refs.env - and the SAME Libbox build is
+# installed into both.
+step "select the Apple sources"
+eval "$(./scripts/ci/apple-client-source.sh resolve)"
+./scripts/ci/apple-client-source.sh assert-distinct
+
+ios_client_dir="$IOS_APPLE_DIR"
+macos_client_dir="$MACOS_APPLE_DIR"
+export APPLE_CLIENT_REPOSITORY IOS_APPLE_SHA IOS_APPLE_BRANCH MACOS_APPLE_SHA MACOS_APPLE_BRANCH
+
+echo "  iOS:   $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA  (custom Hako UI)   -> $ios_client_dir"
+echo "  macOS: $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA (original sing-box UI) -> $macos_client_dir"
+
+# The iOS source is the submodule the parent records; this asserts the checkout matches.
+./scripts/ci/apple-client-source.sh checkout ios >/dev/null
+# The macOS source is an ephemeral checkout of the pinned commit, created on demand.
+./scripts/ci/apple-client-source.sh checkout macos >/dev/null
 
 step "signing environment"
 # In unsigned mode this prints SKIP; otherwise it fails with an actionable message
@@ -187,9 +211,13 @@ fi
   # The mode fails closed rather than falling back: if a caller asked for a prebuilt Libbox and none
   # is installed, building one silently would make the published binary differ from the artifact the
   # caller believed it was shipping.
+  #
+  # Either way the SAME framework ends up in both checkouts. It is built once, or unpacked once from
+  # one verified artifact - never compiled per platform, which is what would let the two clients link
+  # cores that differ.
   if [ "${APPLE_USE_PREBUILT_LIBBOX:-0}" = "1" ]; then
     step "use the prebuilt Libbox"
-    libbox="clients/apple/Libbox.xcframework"
+    libbox="$ios_client_dir/Libbox.xcframework"
     if [ ! -d "$libbox" ]; then
       echo "FAIL: APPLE_USE_PREBUILT_LIBBOX=1 but $libbox is not installed." >&2
       echo "  Install a verified artifact first, then re-run with this variable set." >&2
@@ -199,27 +227,42 @@ fi
     fi
     echo "  using: $libbox"
     echo "  slices: $(ls "$libbox" | grep -v Info.plist | tr '\n' ' ')"
+    # The macOS checkout is a different source tree, so the framework is placed there
+    # explicitly rather than assumed to be present.
+    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-apple-libbox.sh install
   else
-    step "build Libbox from this fork"
-    ./scripts/ci/build-apple-libbox.sh both
+    step "build Libbox once from this fork"
+    APPLE_CLIENT_DIR="$ios_client_dir" ./scripts/ci/build-apple-libbox.sh both
+    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-apple-libbox.sh install
   fi
 
-step "prepare the Apple client"
-./scripts/ci/prepare-apple-client.sh
+# The two checkouts must link the identical framework. Checked rather than assumed: the
+# whole point of building once is that iOS and macOS ship one core, and installing is
+# where that could quietly stop being true.
+step "verify both clients link the same Libbox"
+./scripts/ci/check-apple-shared-libbox.sh "$ios_client_dir" "$macos_client_dir"
+
+step "prepare the iOS Apple client"
+APPLE_CLIENT_DIR="$ios_client_dir" APPLE_CLIENT_PLATFORM=ios ./scripts/ci/prepare-apple-client.sh
+
+step "prepare the macOS Apple client"
+APPLE_CLIENT_DIR="$macos_client_dir" APPLE_CLIENT_PLATFORM=macos ./scripts/ci/prepare-apple-client.sh
 
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
 do_ios() {
   step "build signed iOS IPA"
-  ./scripts/ci/build-ios-ipa.sh dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
+  APPLE_CLIENT_DIR="$ios_client_dir" \
+    ./scripts/ci/build-ios-ipa.sh dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
   step "verify the signed IPA"
   ./scripts/ci/verify-apple-signed-artifact.sh ios-ipa dist/apple/JiejieBox-${APPLE_SIGNING_MODE}.ipa
 }
 
 do_macos() {
   step "build signed macOS DMG"
-  ./scripts/ci/build-macos-dmg.sh dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
+  APPLE_CLIENT_DIR="$macos_client_dir" \
+    ./scripts/ci/build-macos-dmg.sh dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
   step "verify the signed DMG"
   ./scripts/ci/verify-apple-signed-artifact.sh macos-dmg dist/apple/SFM-${APPLE_SIGNING_MODE}.dmg
 }
@@ -247,22 +290,26 @@ case "$target" in
 
   testflight-ios)
     step "App Store Connect topology"; print_topology
-    step "build and upload iOS TestFlight"; ./scripts/ci/build-ios-testflight.sh
+    step "build and upload iOS TestFlight"
+    APPLE_CLIENT_DIR="$ios_client_dir" ./scripts/ci/build-ios-testflight.sh
     ;;
 
   testflight-macos)
     step "App Store Connect topology"; print_topology
-    step "build and upload macOS TestFlight"; ./scripts/ci/build-macos-testflight.sh
+    step "build and upload macOS TestFlight"
+    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-macos-testflight.sh
     ;;
 
   testflight)
-    # One shared configuration, one Libbox build, one overlay, then both platforms.
-    # Building Libbox and applying the overlay once matters: they are the slow steps
-    # and applying the overlay twice is refused by design (it fails closed), so the
-    # combined target cannot simply call the two individual ones.
+    # One shared configuration, one Libbox build, both Apple sources prepared above, then
+    # both platforms. Each TestFlight builder is pointed at its own Apple checkout: iOS at
+    # the custom-UI source, macOS at the original-UI one. Both read the same Libbox and the
+    # same APPLE_BUILD_NUMBER, which is what keeps them in one App Store Connect record.
     step "App Store Connect topology"; print_topology
-    step "build and upload iOS TestFlight"; ./scripts/ci/build-ios-testflight.sh
-    step "build and upload macOS TestFlight"; ./scripts/ci/build-macos-testflight.sh
+    step "build and upload iOS TestFlight"
+    APPLE_CLIENT_DIR="$ios_client_dir" ./scripts/ci/build-ios-testflight.sh
+    step "build and upload macOS TestFlight"
+    APPLE_CLIENT_DIR="$macos_client_dir" ./scripts/ci/build-macos-testflight.sh
     ;;
 esac
 

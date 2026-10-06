@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Builds an UNSIGNED macOS arm64 DMG from the pinned Apple client submodule.
+# Builds an UNSIGNED macOS arm64 DMG from the macOS Apple client source.
 #
 # Usage: build-macos-dmg.sh <output-dmg>
+#
+# Reads APPLE_CLIENT_DIR (default: clients/apple). The macOS source is a distinct Apple
+# branch from the iOS one - see release/apple-client-refs.env - so the release pipeline
+# points this at the macOS checkout.
 #
 # # What this produces
 #
@@ -42,9 +46,10 @@ eval "$("$root/scripts/ci/apple-signing-config.sh")"
 work="build/apple-macos"
 mkdir -p "$(dirname "$out")"
 
-client="clients/apple"
+client="${APPLE_CLIENT_DIR:-clients/apple}"
 if [ ! -d "$client" ]; then
-  echo "FAIL: $client is missing; run the submodule checkout first." >&2
+  echo "FAIL: $client is missing; check the Apple client source out first." >&2
+  echo "      ./scripts/ci/apple-client-source.sh checkout macos" >&2
   exit 1
 fi
 
@@ -52,7 +57,7 @@ if [ ! -d "$client/Libbox.xcframework" ]; then
   echo "FAIL: $client/Libbox.xcframework is missing; build it with make lib_apple first." >&2
   exit 1
 fi
-echo "libbox: built from this repository (clients/apple/Libbox.xcframework)"
+echo "libbox: built from this repository ($client/Libbox.xcframework)"
 
 # --- 1. Build unsigned, arm64. --------------------------------------------------
 rm -rf "$work"
