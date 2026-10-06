@@ -183,6 +183,47 @@ Nginx Stream 的 TCP/443 前门、SNI、ALPN 和 HTTP/1.1/no-ALPN 分流属于�
 
 先确立正确性与回归测试，再用 benchmark/profile 找瓶颈，最后决定优化。实验结论写清 **KEEP、REJECT、NO CHANGE** 及原因；“理论上应更快”不足以改变默认值。所有权与可证明的生命周期优先于名义上的 zero-copy。局部 `ns/op`、`allocs/op` 改善不等于 WAN 吞吐、VPS 长期内存、高 RTT 或丢包性能。
 
+## System Proxy Cooperative Fast Path
+
+应用主动遵守系统代理，就已经给出了比 TUN 更高层的信息（CONNECT/SOCKS 目标、域名或 IP、代理协议语义）。所以这条路径的目标是**短、薄、直接**，而不是承担 TUN 为不配合应用准备的抓包、协议栈还原、DNS 劫持与 packet→stream 重建。TUN 是 compatibility fallback；两条路径在 `RouteConnectionEx` / `RoutePacketConnectionEx` 汇合，之后复用同一套已优化的 shared core。**不为此新增 UnifiedFlow 之类的大抽象。**
+
+| 目录 | 职责 |
+| --- | --- |
+| [`protocol/mixed`](../protocol/mixed) | 协议区分（`Peek(1)`）、SOCKS/HTTP 分派、early data 交接、metadata 与 auth，然后交给 router。不做域名解析、不 sniff。 |
+| [`protocol/socks`](../protocol/socks) | 独立 SOCKS inbound，以及 **SOCKS5 地址边界护栏**。 |
+| [`transport/http`](../transport/http) | HTTP/1.1、HTTP/2 服务器与 `Reader`（含 `BufferedConn` 这一 handoff primitive）。 |
+| [`common/proxybridge`](../common/proxybridge) | Tor / Apple 传输用的本地 SOCKS 桥，是第三个会解析客户端 SOCKS5 的入口。 |
+
+### 不能被推翻的不变量
+
+1. **握手期间预读进 `bufio.Reader` 的隧道 payload 必须活到交接之后。** `Peek(1)` 与握手都从 buffered reader 读，一次 socket read 会把「握手 + payload」一起拉进来。HTTP 路径用 `Reader.BufferedConn` 把这批字节搬到交给 routing 层的连接上；SOCKS 路径的等价物是 `earlyDataConn`。搬运只能在握手消费完自己的字节之后进行：`Peek` 不消费，提前搬会把握手本身搬走，parser 随即读到 EOF。`earlyDataConn.Write` **故意不解析** delegate —— 握手先写 reply 后读 request，此时解析会把未消费的握手字节搬走并导致重复读取。回归：[`earlydata_test.go`](../protocol/mixed/earlydata_test.go)（3 协议 × 4 payload × 6 分片，外加逐字节边界）。
+
+2. **buffer 里还有未交付数据时，不能让 shared core 认为 reader 可替换。** 已解析的 delegate 是 `bufio.CachedConn`，其 `ReaderReplaceable()` 在 buffer 非空时返回 false；`earlyDataConn` 转发该值。这正是阻止 splice 绕过 userspace buffer 的闸门。回归：[`regression_test.go`](../protocol/mixed/regression_test.go) 的 `TestDangerousCapabilityIsNotExposedWhileBuffered`、[`reader_buffered_conn_test.go`](../transport/http/reader_buffered_conn_test.go)。
+
+3. **没有配置 `users` 时不得要求 SOCKS 认证，也不得把 SOCKS4 user id 当成用户身份。** sing 以 `authenticator == nil` 表示「未配置认证」；传一个非 nil 的 authenticator 会让 SOCKS5 强制用户名/密码子协商，于是无 `users` 的 mixed inbound 在 SOCKS5 下完全不可用。同理，`metadata.User` 的含义是「配置的认证体系校验过的身份」；SOCKS4 的 USERID 只是 IDENT 声明，客户端可以随便填，无认证器时**不写入** `metadata.User`。**这是有意行为，不是 bug。** 回归：`TestAuthMatrix`、`TestProtocolDetectionUnderFragmentation`。
+
+4. **SOCKS5 ATYP=domain 且长度为 0，必须在 shared 地址解码之前拒绝。** sing 的 `M.SocksaddrSerializer.ReadAddrPort` 在解出的地址 `IsValid()` 为 false 时**跳过 port 字段**，于是那两个端口字节留在流里，其后每个字节错位 2；parser 会把端口字节当成隧道 payload。修复放在协议边界（`GuardSOCKS5Address`），**不改 `common/metadata` 的共享契约** —— 其它协议和其它地址族都依赖它。护栏必须装在**连接**上、且在**任何缓冲之前**：SOCKS5 是往返协议（客户端发 greeting → 等方法选择 → 才发 request），绑在 reader 上的检查要么等待尚未发送的 request（会死锁 curl），要么只能看到 buffer 尚未持有的字节（等于没查）。护栏遇到非 SOCKS5 首字节即永久 passthrough。触发的那次 read 必须 `return 0, err`：`bufio.Reader` 没有逐 read 感知错误的缝隙，把字节和错误一起返回会让 parser 先误读地址、连接已经被路由。回归：[`guard_test.go`](../protocol/socks/guard_test.go)、`TestSOCKS5MalformedBytesNeverReachTheTunnel`、`TestSOCKS5GuardRejectionIsSticky`。
+
+5. **系统代理的 wrapper 必须保留下游需要的 connection capability。** 只嵌 `net.Conn` 的 wrapper 会静默让 shared core 看不到 `syscall.Conn` / `io.ReaderFrom` / `io.WriterTo` / `CloseRead` / `CloseWrite`，于是 splice 与零拷贝路径被关掉 —— 这比前半段省下的那几个 allocation 贵得多。`forwardedConn` 把这些显式转发，并且**通过 `Upstream()` 暴露真实对象**让消费者自己 unwrap，而不是重新声明它无法知道的接口。回归：`TestGuardPreservesCapabilities`、`TestHandoffPreservesCapabilities`、`TestHalfCloseIsForwarded`。
+
+6. **成功的 hand-off 不是握手失败。** `socks.HandleConnectionEx` 以返回 nil 表示它已接管 conn 与 onClose；把那个 nil 交给 `CloseOnHandshakeFailure` 会关闭一条活隧道、并让 onClose 二次触发（调用方用 `sync.Once` 包着它，connection manager 会把它读成「这条 flow 结束了」）。回归：`TestOnCloseExactlyOnce`、`TestRouteErrorClosesExactlyOnce`。
+
+### 已测量的取舍
+
+| 决定 | 原因 |
+| --- | --- |
+| KEEP：`earlyDataConn`、`GuardSOCKS5Address` 各占一个对象（SOCKS 路径约 +2 alloc/op） | 分别买的是 early payload 正确性与畸形地址正确性。禁止用 unsafe、全局可变池、跨连接对象复用去省它们。 |
+| KEEP：guard 装在 reader 之前（HTTP 路径约 +1 alloc/op） | 装在 reader 之后等于不查（见不变量 4）。HTTP 首字节不是 `0x05` 时护栏永久 passthrough，只付一次比较。 |
+| KEEP：`BufferedConn` 用拷贝而非引用 `bufio` 内部切片 | 引用既不正确（region 可能 `start != 0`）也不安全（池回收后仍可达）。一个 pooled allocation 换正确性。 |
+| REJECT：在此路径做域名解析、sniff、FakeIP 反查、packet flow judge | 那是 TUN 的兼容工作。shared router / DNS 本来就会做这些判断。 |
+| REJECT：为省 allocation 手写 SOCKS/HTTP parser | 需要完整覆盖 HTTP 语义、header limit、CONNECT、forward proxy、H2 共存与 fuzz，收益没有 profile 依据。 |
+| NO CHANGE：`bufio.Reader` 每连接 4 KiB 缓冲 | stdlib 行为，两侧相同；归还需要改动 reader 所有权，风险大于收益。 |
+
+### 验证缺口
+
+- **inbound TLS 已覆盖**（不再记为缺口）：TLS 下 HTTP CONNECT + early data、护栏只见密文、明文被拒、截断握手干净失败。见 [`tls_test.go`](../protocol/mixed/tls_test.go)。
+- 尚未覆盖：真实 Apple/libbox 链接路径（`experimental/libbox` 的 **test** 构建在 Go 1.25.5 + `badlinkname` 下报 `invalid reference to runtime.fwdSig`，普通 `go build` 通过，与本次改动无关）。
+
 ## 最终 Debug 轮发现的两个 P0（Round 5）
 
 - **v4-mapped 地址从未被规范化，policy 层大面积 fail open。** `::ffff:a.b.c.d` 是 16 字节写的 IPv4 地址，双栈应用访问 `10.0.0.53` 就是 `::ffff:10.0.0.53`，而 sing-tun 的 parser 原样透传。链路上每一个比较都是按 4 字节形式写的，映射形式对它们全部返回 false，而且**全是 fail-open 方向**：
