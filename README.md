@@ -1,23 +1,24 @@
 # sing-box · Jiejie Fork
 
+> **保持 upstream 完整能力，在共享网络核心上进一步优化流量调度、测速、系统代理、双栈、移动端内存与协议实现。**
+
+一个面向实际使用场景持续优化的 sing-box fork。
+
+项目并不以“增加更多协议”为唯一目标，而是尽量把优化放在**共享数据路径与控制层**：让不同协议都能受益，同时针对 MASQUE、Naive、AnyTLS 等能力补齐生产环境中的边界处理与可靠性。
+
+**关键词：** 业务感知调度 · 智能测速 · Flow-aware Load Balance · System Proxy Fast Path · iOS Low Memory · Dual Stack · Protocol Completeness
+
 ## ✨ 项目特色
 
 ### ⚡ 业务感知流量调度
 
-引入通用 `traffic_class`：
-
-- `interactive`
-- `realtime`
-- `default`
-- `bulk`
+引入通用 `traffic_class`：`interactive` · `realtime` · `default` · `bulk`
 
 在上传带宽受限时，优先保护对延迟敏感的交互流量，避免大流量传输把首包和交互请求完全堵住。
 
 AI 流量支持根据节点 / 代理组名称自动识别，包括 ChatGPT、Claude、Gemini、DeepSeek、Grok、Perplexity 等。
 
 Telegram、YouTube 及其他业务也可以通过统一的 `traffic_class` 接入同一套调度体系，而不需要让各个代理协议分别实现 QoS。
-
----
 
 ### 📡 Mihomo 风格智能测速
 
@@ -29,25 +30,16 @@ Telegram、YouTube 及其他业务也可以通过统一的 `traffic_class` 接�
 
 URLTest、自动测速、API Delay Test 与 Load Balance 共用统一测量引擎和健康数据，同时限制移动端并发测速造成的额外 Socket、TLS 与内存开销。
 
----
-
 ### ⚖️ Flow-aware Load Balance
 
 新增 fork 专属 `loadbalance` 出站组。
 
-支持：
-
-- `round_robin`
-- `consistent_hashing`
-- `sticky_sessions`
-- URLTest 健康状态过滤
+支持：`round_robin` · `consistent_hashing` · `sticky_sessions` · URLTest 健康状态过滤
 
 负载均衡以 **Flow / Session** 为单位，而不是逐包切换线路：
 
 - 一个 TCP Flow 生命周期内保持同一节点
 - 一个 UDP Session 生命周期内保持同一节点
-
----
 
 ### 🛣️ System Proxy Cooperative Fast Path
 
@@ -66,8 +58,6 @@ TUN ──────────┘
 两条路径最终汇入同一套核心，因此路由、DNS、出站协议以及大部分共享优化无需重复实现。
 
 System Proxy Fast Path 保持尽量轻量，只负责代理协议边界、目标信息与早期数据交接，不重新复制一套 TUN 的包捕获、协议栈恢复和流重建逻辑。
-
----
 
 ### 🧠 iOS NetworkExtension Low Memory Mode
 
@@ -95,8 +85,6 @@ NetworkExtension 中还存在 Swift、C / CGO、系统框架、网络栈以及�
 
 **尽量降低常驻内存与并发峰值，并在系统 Jetsam 之前更早发现和释放可回收资源。**
 
----
-
 ### 🌐 Shared Dual-Stack & DNS Core
 
 双栈与 DNS 优化被放在共享核心，而不是绑定到某一个代理协议。
@@ -113,8 +101,6 @@ NetworkExtension 中还存在 Swift、C / CGO、系统框架、网络栈以及�
 
 双栈拨号逻辑本身保持协议无关，因此 MASQUE、Naive、VLESS、AnyTLS 等不同协议可以共同受益。
 
----
-
 ### 🛡️ Fallback / Masquerade 与主动探测防护
 
 部分服务端协议加入了面向公网部署的 **Fallback / Masquerade** 处理。
@@ -130,8 +116,6 @@ NetworkExtension 中还存在 Swift、C / CGO、系统框架、网络栈以及�
 - 非预期探测请求的边界处理
 
 目标不是宣称“不可探测”，而是**尽量减少协议服务面对主动探测时暴露出的明显特征**，让节点在公网环境下表现得更接近正常 Web 服务。
-
----
 
 ### 🧩 Protocol Completeness
 
@@ -191,5 +175,3 @@ NetworkExtension 中还存在 Swift、C / CGO、系统框架、网络栈以及�
 本项目基于 [SagerNet/sing-box](https://github.com/SagerNet/sing-box) 开发。
 
 部分测速、负载均衡及相关行为参考了 Mihomo 的成熟实现与语义，并结合 sing-box 的架构重新集成。
-
----
