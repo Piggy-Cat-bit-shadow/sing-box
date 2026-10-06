@@ -402,3 +402,65 @@ func TestDrainDiagnosticsCountOnlyTheOldGeneration(t *testing.T) {
 		t.Fatalf("oldGenerationSeen moved to %d on a dial", after.OldGenerationSeen)
 	}
 }
+
+// TestSweepBacksOffWhenItCannotMakeProgress is §17, and it exists because of the kernel-owned split:
+// a connection the sweep can never judge keeps `remaining` true forever, so the base interval would
+// mean a process wakeup every fifteen seconds for the life of the tunnel. On a phone that is a
+// battery bug wearing a correctness argument.
+func TestSweepBacksOffWhenItCannotMakeProgress(t *testing.T) {
+	h := newDrainHarness(t)
+	tracked, _ := h.dial(t)
+
+	// Belongs to the previous path and can never be proven idle.
+	tracked.generation = 0
+	tracked.markKernelOwned()
+	h.manager.generation.Store(1)
+
+	base := h.manager.sweepInterval()
+	if base != h.manager.sweepEvery() {
+		t.Fatalf("the first interval is %s, want the base %s", base, h.manager.sweepEvery())
+	}
+
+	for range 3 {
+		if !h.manager.sweepStaleConnections() {
+			t.Fatal("a kernel-owned connection should keep the sweep interested")
+		}
+	}
+	backedOff := h.manager.sweepInterval()
+	if backedOff <= base {
+		t.Fatalf("the interval did not grow: %s after three fruitless passes, base %s", backedOff, base)
+	}
+
+	// And it must not grow without bound.
+	for range 20 {
+		h.manager.sweepStaleConnections()
+	}
+	if got := h.manager.sweepInterval(); got > drainSweepMaxInterval {
+		t.Fatalf("the interval grew to %s, past the cap %s", got, drainSweepMaxInterval)
+	}
+}
+
+// TestSweepBackoffResetsOnProgressAndOnANewTransition keeps the backoff from hiding work.
+//
+// Backing off is only safe because what it is waiting on is unjudgeable. The moment something IS
+// reclaimable - or a new transition brings new information - the sweep has to be responsive again.
+func TestSweepBackoffResetsOnProgressAndOnANewTransition(t *testing.T) {
+	h := newDrainHarness(t)
+
+	blocked, _ := h.dial(t)
+	blocked.generation = 0
+	blocked.markKernelOwned()
+	h.manager.generation.Store(1)
+	for range 3 {
+		h.manager.sweepStaleConnections()
+	}
+	if h.manager.sweepInterval() == h.manager.sweepEvery() {
+		t.Fatal("the fixture did not back off, so this test proves nothing")
+	}
+
+	// A reclaimable connection appears: progress resets the interval.
+	h.manager.beginDrainSweep()
+	if got := h.manager.sweepInterval(); got != h.manager.sweepEvery() {
+		t.Fatalf("a new transition left the interval at %s, want the base %s", got, h.manager.sweepEvery())
+	}
+}

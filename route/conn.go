@@ -44,10 +44,13 @@ type ConnectionManager struct {
 	// generation counts network transitions. A connection records the value at dial time, so
 	// "belongs to a path the device has left" is one integer comparison.
 	generation atomic.Uint64
-	// sweepAccess guards sweepTimer and closed.
+	// sweepAccess guards sweepTimer, sweepBackoff and closed.
 	sweepAccess sync.Mutex
 	sweepTimer  *time.Timer
-	closed      atomic.Bool
+	// sweepBackoff counts consecutive sweeps that reclaimed nothing, and doubles the interval each
+	// time up to drainSweepMaxInterval. See scheduleDrainSweepLocked.
+	sweepBackoff int
+	closed       atomic.Bool
 	// reclaimLog, when set, reports each reclaim pass. Diagnostics only; nil in production.
 	reclaimLog func(reason ReclaimReason, closed int, generation uint64)
 	// drainIdleGraceOverride and drainSweepIntervalOverride exist so a test can exercise the drain

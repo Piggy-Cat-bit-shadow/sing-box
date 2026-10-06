@@ -60,6 +60,19 @@ const drainIdleGrace = 20 * time.Second
 // while old-generation connections exist, and stops as soon as they are gone.
 const drainSweepInterval = 15 * time.Second
 
+// The longest the sweep may wait between passes once it has stopped making progress.
+//
+// Without this, one kernel-owned connection pins the sweep to its base interval for the life of the
+// tunnel. That connection can never be reclaimed by the sweep - userspace cannot observe whether it
+// is alive - so `remaining` stays true, the timer reschedules, and the process wakes every fifteen
+// seconds until the VPN is turned off. On a phone that is a battery bug wearing a correctness
+// argument.
+//
+// Backing off is safe because the sweep's only job is to notice a connection that has BECOME idle,
+// and the connections it is waiting on are the ones it cannot judge. A new transition resets the
+// interval, so nothing that is actually reclaimable waits long.
+const drainSweepMaxInterval = 5 * time.Minute
+
 // managedConnState is the per-connection lifecycle record the reclaim policies decide on.
 //
 // It is embedded in both tracked connection types, which is the only reason its methods are
@@ -315,14 +328,32 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 func (m *ConnectionManager) beginDrainSweep() {
 	m.sweepAccess.Lock()
 	defer m.sweepAccess.Unlock()
+	// A new transition is new information: whatever the last drain was waiting on, this one starts
+	// its own accounting at the base interval.
+	m.sweepBackoff = 0
 	if m.sweepTimer != nil {
 		return
 	}
 	m.scheduleDrainSweepLocked()
 }
 
+// sweepDelayLocked is the delay the next pass would use. Caller holds sweepAccess.
+func (m *ConnectionManager) sweepDelayLocked() time.Duration {
+	shift := m.sweepBackoff
+	if shift > 8 {
+		shift = 8
+	}
+	delay := m.sweepEvery() * time.Duration(1<<shift)
+	if delay > drainSweepMaxInterval || delay <= 0 {
+		delay = drainSweepMaxInterval
+	}
+	return delay
+}
+
+// scheduleDrainSweepLocked arms the sweep, doubling the delay for each pass that reclaimed nothing.
+// Caller holds sweepAccess.
 func (m *ConnectionManager) scheduleDrainSweepLocked() {
-	m.sweepTimer = time.AfterFunc(m.sweepEvery(), func() {
+	m.sweepTimer = time.AfterFunc(m.sweepDelayLocked(), func() {
 		m.sweepAccess.Lock()
 		m.sweepTimer = nil
 		m.sweepAccess.Unlock()
@@ -367,9 +398,20 @@ func (m *ConnectionManager) sweepStaleConnections() bool {
 	}
 	if len(closers) > 0 {
 		m.transitions.recordSweep(len(closers))
+		// Progress. Stay at the base interval while connections are still being found, because the
+		// next one may fall silent soon.
+		m.sweepAccess.Lock()
+		m.sweepBackoff = 0
+		m.sweepAccess.Unlock()
 		if m.reclaimLog != nil {
 			m.reclaimLog(ReclaimNetworkTransition, len(closers), current)
 		}
+	} else if remaining {
+		// Nothing reclaimed and something left. If what is left cannot be judged, this pass produced
+		// no information at all, and repeating it at the same rate produces none either.
+		m.sweepAccess.Lock()
+		m.sweepBackoff++
+		m.sweepAccess.Unlock()
 	}
 	return remaining
 }
@@ -394,4 +436,15 @@ func (m *ConnectionManager) stopDrainSweep() {
 // keep the previous, conservative "close everything" semantics.
 type networkTransitionReclaimer interface {
 	Reclaim(reason ReclaimReason) int
+}
+
+// sweepInterval is the delay the next drain pass would use.
+//
+// It exists because the property that matters here is not observable from the outside: a sweep that
+// has stopped making progress must stop asking at the base rate, and on a phone the difference is
+// wakeups. Reading it takes sweepAccess and allocates nothing.
+func (m *ConnectionManager) sweepInterval() time.Duration {
+	m.sweepAccess.Lock()
+	defer m.sweepAccess.Unlock()
+	return m.sweepDelayLocked()
 }
