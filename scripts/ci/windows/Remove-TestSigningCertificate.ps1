@@ -29,6 +29,8 @@ param(
 
 $ErrorActionPreference = "Continue"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 if ([string]::IsNullOrWhiteSpace($Thumbprint) -and -not [string]::IsNullOrWhiteSpace($env:JJ_SIGNING_THUMBPRINT)) {
     $Thumbprint = $env:JJ_SIGNING_THUMBPRINT
 }
@@ -99,9 +101,4 @@ if ($remaining.Count -gt 0) {
 
 Write-Host "  PASS: no PFX, password file or signing.local.json remains"
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate

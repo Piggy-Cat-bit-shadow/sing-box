@@ -145,6 +145,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          . (Join-Path $PWD "tooling/scripts/ci/windows/GateHelpers.ps1")
           New-Item -ItemType Directory -Path $env:RECORDS_DIR -Force | Out-Null
           $lines = New-Object System.Collections.Generic.List[string]
           $lines.Add("windows build environment")
@@ -178,6 +179,17 @@ jobs:
           if (-not $elevated) {
             Write-Host "::warning::the runner is not elevated, so the daemon service and installer lifecycle gates will fail with that as their reason"
           }
+          # The step's verdict is its own, and it is a real one: a report that silently
+          # recorded nothing is worse than no report. Complete-Gate then exits with this
+          # decision rather than inheriting the status of whichever native command ran last.
+          foreach ($tool in @("go", "node", "rustc")) {
+            $recorded = $lines | Where-Object { $_ -match "^$tool\s+\S" }
+            if ($null -eq $recorded) {
+              Write-Error "the environment report is missing a version for $tool"
+              exit 1
+            }
+          }
+          Complete-Gate
 
       # --- GATE 2: build ----------------------------------------------------
       - name: "[gate 2] create the throwaway test signing certificate"
@@ -349,6 +361,21 @@ jobs:
             -WorkingDirectory $env:SERVICE_WORK_DIR `
             -RecordPath "$env:RECORDS_DIR/daemon-service-smoke-test.txt"
 
+      - name: "[gate 5b] daemon secure service install (the installer's own path)"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # The installer runs `service install` with NO relaxed-permission flag under
+          # C:\Program Files, and aborts and rolls back when it fails. Gate 5 uses the CI
+          # escape hatch; this gate does not, so it is the one that proves the path a real
+          # installation takes - and it prints the daemon's stderr, which the installer
+          # swallows.
+          ./tooling/scripts/ci/windows/Test-SecureServiceInstall.ps1 `
+            -PackagedDirectory "$env:CLIENT_DIR/release/win-unpacked" `
+            -ProbeDirectory "C:\Program Files\sing-box-ci-probe" `
+            -WorkingDirectory "C:\ProgramData\sing-box-daemon" `
+            -RecordPath "$env:RECORDS_DIR/secure-service-install.txt"
+
       # --- GATE 6: installer lifecycle -------------------------------------
       - name: "[gate 6] NSIS install / reinstall / uninstall lifecycle"
         shell: pwsh
@@ -452,10 +479,14 @@ jobs:
           # A failed gate can leave a service or an installation behind, and a leftover
           # service is exactly what would make the NEXT run's clean-state precondition fail.
           $ErrorActionPreference = "Continue"
+          . (Join-Path $PWD "tooling/scripts/ci/windows/GateHelpers.ps1")
           $service = Get-Service -Name "sing-box-daemon" -ErrorAction SilentlyContinue
           if ($null -ne $service) {
             Write-Host "removing a leftover sing-box-daemon service"
-            sc.exe delete "sing-box-daemon" | Out-Null
+            # Expected to be non-zero when the service is already gone; captured and
+            # cleared so it cannot become this job's exit status.
+            $deleted = Invoke-NativeCommand { sc.exe delete "sing-box-daemon" }
+            Write-Host "  sc.exe delete exited $($deleted.ExitCode)"
           }
           $entries = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -eq "Jiejiebox" }
@@ -470,7 +501,14 @@ jobs:
               $null = $process | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
             }
           }
-          if (Test-Path -LiteralPath $env:SERVICE_WORK_DIR) {
-            Remove-Item -LiteralPath $env:SERVICE_WORK_DIR -Recurse -Force -ErrorAction SilentlyContinue
+          foreach ($leftover in @($env:SERVICE_WORK_DIR, "C:\Program Files\sing-box-ci-probe", "C:\ProgramData\sing-box-daemon")) {
+            if (Test-Path -LiteralPath $leftover) {
+              Write-Host "removing leftover $leftover"
+              Remove-Item -LiteralPath $leftover -Recurse -Force -ErrorAction SilentlyContinue
+            }
           }
           Write-Host "leftover cleanup finished"
+          # This step is a safety net for FAILED runs, not a gate: the clean end state is
+          # asserted by gate 6. Its exit code is its own decision, not the status of a
+          # native command that was allowed to fail.
+          Complete-Gate

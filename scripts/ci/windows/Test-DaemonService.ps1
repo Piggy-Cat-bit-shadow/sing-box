@@ -40,6 +40,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 # Native commands here are expected to exit non-zero in normal operation - `sc.exe query`
 # on a service that should be absent returns 1060 - so a non-zero exit must not become a
 # terminating error. Each call checks $LASTEXITCODE where the result matters.
@@ -90,8 +92,9 @@ function Fail-Gate {
 function Invoke-Daemon {
     param([string[]]$Arguments)
     Write-Host "  > sing-box-daemon $($Arguments -join ' ')"
-    $output = & $DaemonPath @Arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    $result = Invoke-NativeCommand { & $DaemonPath @Arguments }
+    $output = $result.Output
+    $exitCode = $result.ExitCode
     if (-not [string]::IsNullOrWhiteSpace($output)) {
         foreach ($line in ($output -split "`r?`n")) {
             if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Host "    $line" }
@@ -146,12 +149,12 @@ $lines.Add("  PASS")
 
 # --- 2. the service exists in the SCM ---------------------------------------
 $lines.Add("[2/6] service is registered with the SCM")
-$query = sc.exe query $serviceName 2>&1 | Out-String
-Write-Host $query.Trim()
-if ($LASTEXITCODE -ne 0) {
-    Fail-Gate "sc.exe query $serviceName exited $LASTEXITCODE after a successful install"
+$query = Invoke-NativeCommand { sc.exe query $serviceName }
+Write-Host $query.Output.Trim()
+if ($query.ExitCode -ne 0) {
+    Fail-Gate "sc.exe query $serviceName exited $($query.ExitCode) after a successful install"
 }
-if ($query -notmatch [regex]::Escape($serviceName)) {
+if ($query.Output -notmatch [regex]::Escape($serviceName)) {
     Fail-Gate "sc.exe query did not report $serviceName"
 }
 $state = Get-ServiceState
@@ -197,11 +200,17 @@ if ($state -ne "absent") { Fail-Gate "the service is still '$state' after uninst
 
 # A deleted service that is still "marked for deletion" blocks the next install, which is
 # exactly the residue this gate exists to catch.
-$queryAfter = sc.exe query $serviceName 2>&1 | Out-String
-if ($queryAfter -match "marked for deletion") {
+# An absent service is the expected outcome, so a non-zero exit here is the SUCCESS case
+# and is asserted as one: the registry entry must be gone, and must not be a service that
+# is still marked for deletion underneath.
+$queryAfter = Invoke-NativeCommand { sc.exe query $serviceName }
+if ($queryAfter.ExitCode -eq 0) {
+    Fail-Gate "sc.exe query still reports $serviceName after uninstall"
+}
+if ($queryAfter.Output -match "marked for deletion") {
     Fail-Gate "the service is marked for deletion after uninstall; the next install would fail"
 }
-$lines.Add("  service registry entry: absent, not marked for deletion")
+$lines.Add("  service registry entry: absent (sc.exe query exited $($queryAfter.ExitCode)), not marked for deletion")
 $lines.Add("  PASS")
 
 # --- leftovers --------------------------------------------------------------
@@ -217,9 +226,4 @@ $lines.Add("PASS: install, SCM registration, Running, status, stop and uninstall
 Save-Record
 foreach ($line in $lines) { Write-Host $line }
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate

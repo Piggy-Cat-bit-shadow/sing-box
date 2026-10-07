@@ -45,6 +45,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 if (-not (Test-Path -LiteralPath $ClientDirectory -PathType Container)) {
     throw "client directory does not exist: $ClientDirectory"
 }
@@ -132,9 +134,4 @@ if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
     Add-Content -Path $env:GITHUB_ENV -Value "JJ_SIGNING_CONFIG=$signingConfigurationPath"
 }
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate

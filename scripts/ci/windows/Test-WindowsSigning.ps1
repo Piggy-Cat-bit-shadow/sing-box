@@ -36,6 +36,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 $expected = $ExpectedThumbprint.Trim().ToUpperInvariant()
 if ($expected.Length -ne 40) {
     throw "expected thumbprint '$ExpectedThumbprint' is not a SHA-1 certificate thumbprint"
@@ -119,9 +121,4 @@ $lines.Add("      and by the same one, which is what the daemon's own checks req
 [System.IO.File]::WriteAllLines($RecordPath, $lines)
 foreach ($line in $lines) { Write-Host $line }
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate

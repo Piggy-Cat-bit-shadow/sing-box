@@ -30,6 +30,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 # Native commands here are expected to exit non-zero in normal operation - `sc.exe query`
 # on a service that should be absent returns 1060 - so a non-zero exit must not become a
 # terminating error. Each call checks $LASTEXITCODE where the result matters.
@@ -177,11 +179,15 @@ foreach ($driver in $drivers) {
     $catalogCoverageConfirmed = $false
     if (Test-Path -LiteralPath $catalogPath) {
         if ($null -ne $signTool) {
-            $verify = & $signTool verify /kp /c $catalogPath $driverPath 2>&1 | Out-String
-            $catalogCovers = ($LASTEXITCODE -eq 0)
+            # A non-zero exit here is a legitimate finding - it means this catalog does not
+            # cover this driver - so the code is captured, judged below, and cleared so it
+            # cannot become the step's exit status.
+            $verify = Invoke-NativeCommand { & $signTool verify /kp /c $catalogPath $driverPath }
+            $catalogCovers = ($verify.ExitCode -eq 0)
             $catalogCoverageConfirmed = $true
-            $lines.Add("  signtool verify /kp /c:     $(if ($catalogCovers) { 'PASS' } else { 'FAIL' })")
-            foreach ($line in ($verify -split "`r?`n")) {
+            $catalogResult = if ($catalogCovers) { "PASS" } else { "FAIL (exit $($verify.ExitCode))" }
+            $lines.Add("  signtool verify /kp /c:     $catalogResult")
+            foreach ($line in ($verify.Output -split "`r?`n")) {
                 if (-not [string]::IsNullOrWhiteSpace($line)) { $lines.Add("      $line") }
             }
         } elseif ($catalogValid) {
@@ -239,9 +245,4 @@ $lines.Add("      that ships alongside one verifies. No driver was modified or r
 Save-Record
 foreach ($line in $lines) { Write-Host $line }
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate

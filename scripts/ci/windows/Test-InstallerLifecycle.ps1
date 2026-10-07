@@ -38,6 +38,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+. (Join-Path $PSScriptRoot "GateHelpers.ps1")
+
 # Native commands here are expected to exit non-zero in normal operation - `sc.exe query`
 # on a service that should be absent returns 1060 - so a non-zero exit must not become a
 # terminating error. Each call checks $LASTEXITCODE where the result matters.
@@ -59,25 +61,6 @@ function Save-Record {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
     [System.IO.File]::WriteAllLines($RecordPath, $lines)
-}
-
-# NSIS uninstallers commonly copy themselves to a temporary directory and hand off, so the
-# process that was started can exit before the uninstallation has finished. Every
-# post-condition is therefore waited for with a deadline rather than sampled once, and the
-# individual assertions afterwards still report precisely what was wrong.
-function Wait-Until {
-    param(
-        [Parameter(Mandatory = $true)][scriptblock]$Condition,
-        [Parameter(Mandatory = $true)][string]$Description,
-        [int]$TimeoutSeconds = 300
-    )
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        if (& $Condition) { return $true }
-        Start-Sleep -Seconds 2
-    }
-    Write-Host "  timed out after $TimeoutSeconds s waiting for: $Description"
-    return $false
 }
 
 function Get-UninstallEntry {
@@ -197,9 +180,9 @@ function Assert-Installed {
     }
 
     $daemonPath = $required["resources\daemon\sing-box-daemon.exe"]
-    $versionOutput = & $daemonPath version 2>&1 | Out-String
-    $versionExit = $LASTEXITCODE
-    $versionOutput = $versionOutput.Trim()
+    $version = Invoke-NativeCommand { & $daemonPath version }
+    $versionExit = $version.ExitCode
+    $versionOutput = $version.Output.Trim()
     $lines.Add("  daemon version: $versionOutput (exit code $versionExit)")
     if ($versionExit -ne 0) { Fail-Gate "$Phase`: the installed daemon's version command exited $versionExit" }
     if ($versionOutput -notmatch [regex]::Escape("version $ExpectedVersion")) {
@@ -252,8 +235,13 @@ function Assert-Uninstalled {
     $lines.Add("  service after uninstall: $state")
     if ($state -ne "absent") { Fail-Gate "$Phase`: the $serviceName service is still '$state'" }
 
-    $query = sc.exe query $serviceName 2>&1 | Out-String
-    if ($query -match "marked for deletion") {
+    # The service must be gone, so a non-zero `sc.exe query` is the expected outcome and
+    # is asserted as one rather than tolerated.
+    $query = Invoke-NativeCommand { sc.exe query $serviceName }
+    if ($query.ExitCode -eq 0) {
+        Fail-Gate "$Phase`: sc.exe query still reports $serviceName"
+    }
+    if ($query.Output -match "marked for deletion") {
         Fail-Gate "$Phase`: the service is marked for deletion; the next install would fail"
     }
 
@@ -287,7 +275,12 @@ if ((Get-ServiceState) -ne "absent" -or $null -ne (Get-UninstallEntry)) {
     $lines.Add("clean state: a previous installation or service was present; removing it first")
     Write-Host "an installation or service was already present; uninstalling before the test"
     if ($null -ne (Get-UninstallEntry)) { Invoke-Uninstall -Phase "precondition" | Out-Null }
-    else { sc.exe delete $serviceName | Out-Null }
+    else {
+        # Best effort: the service may already be gone, so this exit code is expected to be
+        # non-zero sometimes and is captured and cleared rather than inherited.
+        $deleted = Invoke-NativeCommand { sc.exe delete $serviceName }
+        $lines.Add("precondition: sc.exe delete exited $($deleted.ExitCode)")
+    }
     Start-Sleep -Seconds 3
     if ((Get-ServiceState) -ne "absent") { Fail-Gate "could not return the machine to a clean state" }
 }
@@ -355,9 +348,4 @@ $lines.Add("      final uninstall all completed with no residual service or proc
 Save-Record
 foreach ($line in $lines) { Write-Host $line }
 
-# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
-# verified everything can still be reported as a failure if the last native command that
-# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
-# query` on a service that is correctly absent returns 1060. The verdict is decided above,
-# so the exit code is set deliberately here.
-exit 0
+Complete-Gate
