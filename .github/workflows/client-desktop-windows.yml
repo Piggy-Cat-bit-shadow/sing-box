@@ -381,10 +381,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # The diagnostic path is under RUNNER_TEMP and deliberately has no spaces: the
+          # installer parses it as a command-line option, and it must be outside $PLUGINSDIR
+          # and $INSTDIR so it survives customInstall's rollback.
           ./tooling/scripts/ci/windows/Test-InstallerLifecycle.ps1 `
             -InstallerPath "$env:CLIENT_DIR/release/Jiejiebox-v$env:CORE_VERSION-windows-x64.exe" `
             -ExpectedVersion $env:CORE_VERSION `
-            -RecordPath "$env:RECORDS_DIR/installer-lifecycle-smoke-test.txt"
+            -RecordPath "$env:RECORDS_DIR/installer-lifecycle-smoke-test.txt" `
+            -DiagnosticPath "$env:RUNNER_TEMP\jiejiebox-installer-diagnostic.txt"
 
       # --- GATE 7: driver packages -----------------------------------------
       - name: "[gate 7] driver package signature audit"

@@ -33,7 +33,12 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [Parameter(Mandatory = $true)][string]$ExpectedVersion,
     [Parameter(Mandatory = $true)][string]$RecordPath,
-    [int]$OperationTimeoutSeconds = 900
+    [int]$OperationTimeoutSeconds = 900,
+    # The installer's CI-only diagnostic channel: an absolute path OUTSIDE $PLUGINSDIR and
+    # $INSTDIR that survives customInstall's rollback. Without it a failure leaves nothing
+    # but "exited 2", because the installer deletes its own evidence. Empty means the
+    # installer runs exactly as it does for a user, with no diagnostic option at all.
+    [string]$DiagnosticPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,7 +103,44 @@ function Get-ServiceState {
     return $service.Status.ToString()
 }
 
+function Get-InstallArguments {
+    $arguments = @("/S")
+    if (-not [string]::IsNullOrWhiteSpace($DiagnosticPath)) {
+        $arguments += "/CI-DIAGNOSTIC-PATH=$DiagnosticPath"
+    }
+    return $arguments
+}
+
+function Show-InstallerDiagnostic {
+    if ([string]::IsNullOrWhiteSpace($DiagnosticPath)) {
+        Write-Host "-- installer diagnostic channel --"
+        Write-Host "   (not requested for this run)"
+        $lines.Add("installer diagnostic channel: not requested")
+        return
+    }
+    Write-Host "-- installer diagnostic channel ($DiagnosticPath) --"
+    if (-not (Test-Path -LiteralPath $DiagnosticPath)) {
+        Write-Host "   (the installer did not create it, so it failed before customInit or could not write)"
+        $lines.Add("installer diagnostic channel: file not created at $DiagnosticPath")
+        return
+    }
+    $content = Get-Content -LiteralPath $DiagnosticPath -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($content)) { $content = "(empty)" }
+    Write-Host $content
+    $lines.Add("installer diagnostic channel:")
+    foreach ($line in ($content -split "`r?`n")) { $lines.Add("  $line") }
+    # Preserved beside the record so it reaches the artifact.
+    $preserved = Join-Path (Split-Path -Parent $RecordPath) "installer-diagnostic.txt"
+    try {
+        Copy-Item -LiteralPath $DiagnosticPath -Destination $preserved -Force -ErrorAction Stop
+        Write-Host "   preserved as $preserved"
+    } catch {
+        Write-Host "   could not preserve it: $($_.Exception.Message)"
+    }
+}
+
 function Show-Diagnostics {
+    Show-InstallerDiagnostic
     foreach ($diagnostic in @(
         @{ Name = "uninstall registry entry"; Command = { Get-UninstallEntry | Format-List DisplayName, DisplayVersion, InstallLocation, UninstallString | Out-String } },
         @{ Name = "$installationLayoutKey"; Command = { Get-ItemProperty -Path $installationLayoutKey -ErrorAction SilentlyContinue | Format-List | Out-String } },
@@ -289,16 +331,19 @@ $lines.Add("")
 
 # --- first install -----------------------------------------------------------
 $lines.Add("[1/5] silent install")
-$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments @("/S") -What "install"
+$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments (Get-InstallArguments) -What "install"
 $lines.Add("  exit code $exitCode")
-if ($exitCode -ne 0) { Fail-Gate "the installer exited $exitCode. customInstall rolls back and aborts when the daemon service command fails, so this is where a signing or layout problem surfaces." }
+if ($exitCode -ne 0) {
+    # Which stage aborted is not inferred from the exit code; the diagnostic channel says.
+    Fail-Gate "the installer exited $exitCode. The stage that aborted is recorded in the installer diagnostic channel above."
+}
 $installationDirectory = Assert-Installed -Phase "after first install"
 $lines.Add("  PASS")
 $lines.Add("")
 
 # --- same-version reinstall --------------------------------------------------
 $lines.Add("[2/5] same-version reinstall")
-$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments @("/S") -What "reinstall"
+$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments (Get-InstallArguments) -What "reinstall"
 $lines.Add("  exit code $exitCode")
 if ($exitCode -ne 0) { Fail-Gate "the same-version reinstall exited $exitCode" }
 $null = Assert-Installed -Phase "after same-version reinstall"
@@ -329,7 +374,7 @@ $lines.Add("")
 
 # --- clean reinstall ---------------------------------------------------------
 $lines.Add("[4/5] clean reinstall after a full uninstall")
-$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments @("/S") -What "reinstall"
+$exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments (Get-InstallArguments) -What "reinstall"
 $lines.Add("  exit code $exitCode")
 if ($exitCode -ne 0) { Fail-Gate "the clean reinstall exited $exitCode" }
 $installationDirectory = Assert-Installed -Phase "after clean reinstall"

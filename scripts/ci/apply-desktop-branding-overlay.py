@@ -378,6 +378,126 @@ RULES = [
         1,
         note="PWA manifest short_name",
     ),
+
+    # --- installer diagnostics (CI only) --------------------------------------
+    #
+    # The NSIS installer records why a stage failed in $PLUGINSDIR and then deletes it,
+    # and customInstall responds to a failed service registration by running the
+    # uninstaller and aborting. A CI run therefore sees only "installer exited 2" with the
+    # evidence already gone - and dozens of stages can abort: customInit, the installation
+    # preflight, the installation-directory and ancestor validation, the working-directory
+    # reset, the application-data preparation, the service command, and the rollback
+    # itself.
+    #
+    # So the installer gains ONE explicit, opt-in command-line option:
+    #
+    #     /CI-DIAGNOSTIC-PATH=<absolute path>
+    #
+    # With no such option nothing changes at all: $ciDiagnosticPath stays empty and every
+    # diagnostic write below is skipped, so an ordinary user's installation behaves exactly
+    # as it does today. With the option, the diagnostic text each stage already produces is
+    # appended to a file OUTSIDE $PLUGINSDIR and $INSTDIR, which therefore survives the
+    # rollback.
+    #
+    # Nothing secret is ever written: the text is the installer's own DetailPrint/log
+    # content - stage names, exit codes, and the daemon's stdout/stderr. No certificate,
+    # password, PFX or key passes through any of this.
+    Rule(
+        "build/installer.nsh",
+        "  Var reinstallExistingInstallation\n  Var standardInstallationRadio\n",
+        "  Var reinstallExistingInstallation\n  Var standardInstallationRadio\n"
+        "  Var ciDiagnosticPath\n",
+        1,
+        kind="block",
+        note="installer.nsh: diagnostic-channel variable",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "!macro executeDaemonServiceCommand ACTION OPTIONS RESULT DETAILS\n",
+        "!macro ciDiagnostic STAGE DETAIL\n"
+        "  # CI-only, opt-in: no-op unless /CI-DIAGNOSTIC-PATH= was given. Push and Pop\n"
+        "  # $9 so the caller's registers survive.\n"
+        "  ${if} $ciDiagnosticPath != \"\"\n"
+        "    Push $9\n"
+        "    ClearErrors\n"
+        "    FileOpen $9 \"$ciDiagnosticPath\" a\n"
+        "    ${ifNot} ${Errors}\n"
+        "      FileWrite $9 \"[${STAGE}] ${DETAIL}$\\r$\\n\"\n"
+        "      FileClose $9\n"
+        "    ${endif}\n"
+        "    Pop $9\n"
+        "  ${endif}\n"
+        "!macroend\n"
+        "\n"
+        "!macro executeDaemonServiceCommand ACTION OPTIONS RESULT DETAILS\n",
+        1,
+        kind="block",
+        note="installer.nsh: ciDiagnostic macro",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "    DetailPrint \"${DETAILS}\"\n"
+        "  ${endif}\n"
+        "!macroend\n",
+        "    DetailPrint \"${DETAILS}\"\n"
+        "  ${endif}\n"
+        "  !insertmacro ciDiagnostic \"service ${ACTION}\" \"exit=${RESULT} ${DETAILS}\"\n"
+        "!macroend\n",
+        1,
+        kind="block",
+        note="installer.nsh: record the daemon service command result",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "  Delete \"$PLUGINSDIR\\installation-preflight-output.txt\"\n!macroend\n",
+        "  Delete \"$PLUGINSDIR\\installation-preflight-output.txt\"\n"
+        # One line: an NSIS string literal cannot span lines. $0 is the register the
+        # preflight macro just loaded its diagnostic text into; ${0} would be the macro's
+        # own name and ${OPTIONS} is its parameter.
+        "  !insertmacro ciDiagnostic \"preflight\" \"exit=$1 ${OPTIONS} $0\"\n"
+        "!macroend\n",
+        1,
+        kind="block",
+        note="installer.nsh: record the installation preflight result",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "  ${if} $1 != 0\n    StrCpy $5 $1\n    DetailPrint \"$(rollingBackInstallation)\"\n",
+        "  ${if} $1 != 0\n    StrCpy $5 $1\n"
+        "    !insertmacro ciDiagnostic \"customInstall\" \"service install failed with code $1; starting rollback\"\n"
+        "    DetailPrint \"$(rollingBackInstallation)\"\n",
+        1,
+        kind="block",
+        note="installer.nsh: record the service-install failure before rollback",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "    StrCpy $1 $5\n    ${if} $2 == 0\n",
+        "    StrCpy $1 $5\n"
+        "    !insertmacro ciDiagnostic \"customInstall\" \"rollback uninstaller exit=$2; original service install code=$1\"\n"
+        "    ${if} $2 == 0\n",
+        1,
+        kind="block",
+        note="installer.nsh: record the rollback result",
+    ),
+    Rule(
+        "build/installer.nsh",
+        "  StrCpy $reinstallExistingInstallation 0\n  StrCpy $customInstallation 0\n",
+        "  StrCpy $reinstallExistingInstallation 0\n  StrCpy $customInstallation 0\n"
+        "  # CI-only diagnostic channel. Absent the option this is inert: $ciDiagnosticPath\n"
+        "  # stays empty and every ciDiagnostic write is skipped.\n"
+        "  StrCpy $ciDiagnosticPath \"\"\n"
+        "  ClearErrors\n"
+        "  ${GetParameters} $R0\n"
+        "  ${GetOptions} $R0 \"/CI-DIAGNOSTIC-PATH=\" $R1\n"
+        "  ${ifNot} ${Errors}\n"
+        "    StrCpy $ciDiagnosticPath $R1\n"
+        "  ${endif}\n"
+        "  !insertmacro ciDiagnostic \"customInit\" \"diagnostic channel opened; INSTDIR=$INSTDIR\"\n",
+        1,
+        kind="block",
+        note="installer.nsh: parse /CI-DIAGNOSTIC-PATH= and open the channel",
+    ),
 ]
 
 # Strings that must still be present afterwards. These are the other side of the same
