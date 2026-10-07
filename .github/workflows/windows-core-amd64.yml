@@ -23,11 +23,21 @@ name: Windows amd64 core
 # Everything else in upstream's recipe is copied. If Windows 7 support is ever
 # wanted, that step is the only thing to add.
 #
-# Phase 3 (choosing and validating the loader/GUI) is out of scope here.
+# Dispatch only, by design. The release workflow does not build Windows: it looks for a
+# successful run of this workflow on the release commit and republishes those exact
+# verified bytes. See .github/workflows/release.yml.
 
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: >-
+          Source ref, tag or commit to build. Leave empty to build the ref this
+          workflow runs on. Set it to a tag (for example v0.1.5) to build a release
+          from that exact source: the workflow file still comes from the dispatched
+          ref, but every compiled byte comes from here.
+        required: false
+        type: string
       tags_profile:
         description: >-
           fork-windows builds the release artifact (Native Naive included).
@@ -39,65 +49,82 @@ on:
           - fork-windows
           - upstream-baseline
         default: fork-windows
-  # TEMPORARY BOOTSTRAP. GitHub only dispatches a workflow_dispatch workflow that exists
-  # on the default branch, and this repository's default branch is `testing`, which this
-  # change does not touch. Until this file is on the default branch, a push limited to
-  # this one file is how the workflow is run. It is deliberately as narrow as possible:
-  # this branch only, this path only - it is not a general per-push trigger. Once the
-  # file is on the default branch this block should be deleted, leaving workflow_dispatch.
-  push:
-    branches:
-      - windows-core-amd64
-    paths:
-      - .github/workflows/windows-core-amd64.yml
 
 permissions:
   contents: read
 
 env:
+  # Empty on a non-dispatch event, so the profile default is applied here.
+  TAGS_PROFILE: ${{ github.event.inputs.tags_profile || 'fork-windows' }}
   # Upstream's core release toolchain. go.mod declares the minimum language version
   # (go 1.25.5); this is the toolchain upstream actually builds its releases with.
   GO_VERSION: "1.26.8"
   GOOS_TARGET: windows
   GOARCH_TARGET: amd64
-  # Empty on a push event, so the profile default is applied here rather than in steps.
-  TAGS_PROFILE: ${{ github.event.inputs.tags_profile || 'fork-windows' }}
-  ARTIFACT_NAME: sing-box.exe
-  ZIP_NAME: sing-box-v0.1.5-windows-amd64.zip
 
 jobs:
   core:
     name: sing-box.exe (windows/amd64)
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the tooling
+      - name: Check out the source to build
         uses: actions/checkout@v5
         with:
+          # An explicit source_ref wins; otherwise this is the ref that was dispatched.
+          # Everything compiled below comes from this checkout and nothing else.
+          ref: ${{ github.event.inputs.source_ref || github.ref }}
           fetch-depth: 0
 
-      - name: Resolve the version and the build tags
-        id: resolve
+      - name: Resolve the version, the build tags and the provenance
         shell: bash
         run: |
           set -euo pipefail
           bash scripts/ci/version.sh >> "$GITHUB_ENV"
 
-          case "${{ env.TAGS_PROFILE }}" in
+          source_ref="${{ github.event.inputs.source_ref }}"
+          [ -n "$source_ref" ] || source_ref="${{ github.ref_name }}"
+          source_commit="$(git rev-parse HEAD)"
+
+          # If the ref names a tag we can see, the checkout must be that tag's commit.
+          # The published provenance is source_commit, and the release workflow refuses
+          # to publish Windows bytes whose source_commit is not the release tag's commit.
+          if git rev-parse -q --verify "refs/tags/$source_ref" >/dev/null; then
+            tag_commit="$(git rev-parse "$source_ref^{commit}")"
+            if [ "$tag_commit" != "$source_commit" ]; then
+              echo "FAIL: checked out $source_commit but tag $source_ref is $tag_commit" >&2
+              exit 1
+            fi
+            echo "tag $source_ref resolved to $source_commit"
+          fi
+
+          case "$TAGS_PROFILE" in
             fork-windows)      tags_file=release/DEFAULT_BUILD_TAGS_WINDOWS ;;
             upstream-baseline) tags_file=release/DEFAULT_BUILD_TAGS_OTHERS ;;
-            *) echo "unknown tags_profile" >&2; exit 1 ;;
+            *) echo "unknown tags profile: $TAGS_PROFILE" >&2; exit 1 ;;
           esac
-          # Read the tag set from the repository. Never hand-write a tag list here:
-          # whoever maintains release/*_BUILD_TAGS is the single source of truth.
+          # Read the tag set from the repository being built. Never hand-write a tag list
+          # here: whoever maintains release/*_BUILD_TAGS is the single source of truth.
+          # v0.1.5 already ships DEFAULT_BUILD_TAGS_WINDOWS, so no fallback is needed.
           tags="$(tr -d '[:space:]' < "$tags_file")"
-          echo "BUILD_TAGS=$tags" >> "$GITHUB_ENV"
+
           {
+            echo "SOURCE_REF=$source_ref"
+            echo "SOURCE_COMMIT=$source_commit"
+            echo "WORKFLOW_COMMIT=${{ github.sha }}"
+            echo "BUILD_TAGS=$tags"
             echo "TAGS_FILE=$tags_file"
-            echo "TAGS_COUNT=$(tr ',' '\n' <<<"$tags" | wc -l)"
+            echo "ARTIFACT_NAME=sing-box.exe"
+            echo "ZIP_NAME=jiejie-sing-box-windows-amd64-v$JJ_VERSION.zip"
+            echo "UPLOAD_NAME=windows-core-amd64-v$JJ_VERSION"
           } >> "$GITHUB_ENV"
-          echo "tags profile : ${{ env.TAGS_PROFILE }}"
-          echo "tags file    : $tags_file"
-          echo "tags         : $tags"
+
+          echo "source ref     : $source_ref"
+          echo "source commit  : $source_commit"
+          echo "workflow commit: ${{ github.sha }}"
+          echo "version        : $JJ_VERSION"
+          echo "tags profile   : $TAGS_PROFILE"
+          echo "tags file      : $tags_file"
+          echo "tags           : $tags"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -109,11 +136,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "building from  : $SOURCE_REF ($SOURCE_COMMIT)"
+          echo "workflow commit: $WORKFLOW_COMMIT"
           echo "version        : $JJ_VERSION"
-          echo "commit         : $JJ_COMMIT"
           echo "go (declared)  : $JJ_GO_VERSION"
           echo "go (toolchain) : $(go version)"
-          echo "tags           : $BUILD_TAGS"
           echo "target         : $GOOS_TARGET/$GOARCH_TARGET  CGO_ENABLED=0"
 
       - name: Build the Windows core
@@ -213,7 +240,7 @@ jobs:
 
           if [ "$naive_release" -le 0 ]; then
             echo "FAIL: the release build does not contain Native Naive." >&2
-            echo "      A core without it is not the core this fork exists to ship." >&2
+            echo "      A Windows core without it is not the core this fork exists to ship." >&2
             exit 1
           fi
           if [ "$masque_release" -le 0 ]; then
@@ -222,12 +249,11 @@ jobs:
           fi
           echo "PASS: Native Naive and MASQUE are linked into the artifact"
 
-          # Record the evidence with the artifact.
           {
-            echo "naive_symbols_release=$naive_release"
-            echo "naive_symbols_control=$naive_control"
-            echo "masque_symbols_release=$masque_release"
-            echo "masque_symbols_control=$masque_control"
+            echo "NAIVE_SYMBOLS_RELEASE=$naive_release"
+            echo "NAIVE_SYMBOLS_CONTROL=$naive_control"
+            echo "MASQUE_SYMBOLS_RELEASE=$masque_release"
+            echo "MASQUE_SYMBOLS_CONTROL=$masque_control"
           } >> "$GITHUB_ENV"
 
       - name: Write the checksums and the build record
@@ -241,7 +267,9 @@ jobs:
           cat > build-info.json <<JSON
           {
             "version": "$JJ_VERSION",
-            "git_commit": "$JJ_COMMIT",
+            "source_ref": "$SOURCE_REF",
+            "source_commit": "$SOURCE_COMMIT",
+            "workflow_commit": "$WORKFLOW_COMMIT",
             "branch": "$JJ_BRANCH",
             "goos": "$GOOS_TARGET",
             "goarch": "$GOARCH_TARGET",
@@ -250,7 +278,7 @@ jobs:
             "cgo_enabled": false,
             "build_tags": "$BUILD_TAGS",
             "tags_file": "$TAGS_FILE",
-            "tags_profile": "${{ env.TAGS_PROFILE }}",
+            "tags_profile": "$TAGS_PROFILE",
             "ldflags": "-X constant.Version=$JJ_VERSION \$(cat release/LDFLAGS) -s -w -buildid= -trimpath",
             "trimpath": true,
             "unsigned": true,
@@ -258,10 +286,10 @@ jobs:
             "purpose": "external-loader-core",
             "native_naive": true,
             "masque": true,
-            "naive_symbols_release": $naive_symbols_release,
-            "naive_symbols_control": $naive_symbols_control,
-            "masque_symbols_release": $masque_symbols_release,
-            "masque_symbols_control": $masque_symbols_control,
+            "naive_symbols_release": $NAIVE_SYMBOLS_RELEASE,
+            "naive_symbols_control": $NAIVE_SYMBOLS_CONTROL,
+            "masque_symbols_release": $MASQUE_SYMBOLS_RELEASE,
+            "masque_symbols_control": $MASQUE_SYMBOLS_CONTROL,
             "artifact": "$ARTIFACT_NAME",
             "size": $size,
             "sha256": "$sha256"
@@ -282,14 +310,69 @@ jobs:
           [ "$ARTIFACT_NAME" = "sing-box.exe" ] || cp "$ARTIFACT_NAME" sing-box.exe
           zip -q "$ZIP_NAME" sing-box.exe SHA256SUMS build-info.json
           unzip -l "$ZIP_NAME"
-          echo "artifact : $ZIP_NAME"
-          echo "inner    : sing-box.exe"
-          echo "sha256   : $(sha256sum "$ARTIFACT_NAME" | cut -d' ' -f1)"
+
+      - name: Verify the zip is exactly the bytes that were built
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The release publishes this zip as-is, so it is re-expanded and checked here
+          # rather than trusted. Nothing downstream re-compresses the Windows binary.
+          cd dist
+          rm -rf _verify && mkdir _verify
+          unzip -q "$ZIP_NAME" -d _verify
+
+          expected="build-info.json
+          SHA256SUMS
+          sing-box.exe"
+          actual="$(cd _verify && find . -type f | sed 's|^\./||' | sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "FAIL: the zip does not contain exactly the expected files" >&2
+            echo "expected:" >&2; printf '%s\n' "$expected" >&2
+            echo "actual:" >&2;   printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+
+          cmp sing-box.exe _verify/sing-box.exe
+          cmp build-info.json _verify/build-info.json
+          ( cd _verify && sha256sum -c SHA256SUMS )
+          rm -rf _verify
+
+          zip_sha="$(sha256sum "$ZIP_NAME" | cut -d' ' -f1)"
+          zip_size="$(stat -c %s "$ZIP_NAME")"
+          echo "zip verification: PASS (contents byte-identical, internal SHA256SUMS valid)"
+          echo "zip          : $ZIP_NAME"
+          echo "zip size     : $zip_size"
+          echo "zip sha256   : $zip_sha"
+          {
+            echo "ZIP_SHA256=$zip_sha"
+            echo "ZIP_SIZE=$zip_size"
+          } >> "$GITHUB_ENV"
+
+      - name: Summarise
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### Windows amd64 core"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$JJ_VERSION\` |"
+            echo "| source_ref | \`$SOURCE_REF\` |"
+            echo "| source_commit | \`$SOURCE_COMMIT\` |"
+            echo "| workflow_commit | \`$WORKFLOW_COMMIT\` |"
+            echo "| target | \`$GOOS_TARGET/$GOARCH_TARGET\`, CGO_ENABLED=0 |"
+            echo "| go | $(go version | awk '{print $3}') |"
+            echo "| Native Naive | COMPILED ($NAIVE_SYMBOLS_RELEASE symbols, control $NAIVE_SYMBOLS_CONTROL) |"
+            echo "| MASQUE | COMPILED ($MASQUE_SYMBOLS_RELEASE symbols) |"
+            echo "| sing-box.exe | $(stat -c %s dist/sing-box.exe) bytes, \`$(sha256sum dist/sing-box.exe | cut -d' ' -f1)\` |"
+            echo "| zip | \`$ZIP_NAME\` $(stat -c %s "dist/$ZIP_NAME") bytes, \`$ZIP_SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the core and its records
         uses: actions/upload-artifact@v4
         with:
-          name: windows-core-amd64-${{ env.TAGS_PROFILE }}
+          name: ${{ env.UPLOAD_NAME }}
           path: |
             dist/${{ env.ZIP_NAME }}
             dist/${{ env.ARTIFACT_NAME }}
