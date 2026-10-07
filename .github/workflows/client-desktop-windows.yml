@@ -45,6 +45,22 @@ name: Windows desktop installer
 # `git describe` needs, and records clients/desktop at the pin this release ships
 # (32f915ba). One checkout, both revisions, and the overlay is applied to that client.
 
+# # Gating status
+#
+# Release-blocking: the build, the package, static integrity, daemon provenance, the PE
+# architecture audit and the hash records.
+#
+# Experimental and NOT release-blocking: the daemon service gates, the NSIS install lifecycle
+# and the driver package audit. They are useful and they are kept, but a green run is not
+# Windows acceptance - UAC, Program Files ACLs, real service behaviour across reinstall,
+# driver loading, TUN, the system proxy, reboot, sleep/wake and long-running stability are
+# properties of a real Windows machine that a hosted runner cannot represent.
+#
+# The Windows runtime line is FROZEN pending a real Windows x64 debugging environment. See
+# docs/WINDOWS-STATUS.md. Do not weaken a security check to make a gate pass, and do not
+# delete a gate: fix the harness when the harness is wrong, and investigate on real hardware
+# when the product is.
+
 on:
   workflow_dispatch:
 

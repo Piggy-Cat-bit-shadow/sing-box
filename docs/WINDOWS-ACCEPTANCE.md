@@ -41,6 +41,10 @@ and this is the runbook for them:
 Until a run of this runbook passes end to end, the installer is **not** appended to the
 v0.1.5 release and `SHA256SUMS` is **not** updated.
 
+> **Frozen:** the Windows runtime line is frozen pending a real Windows x64 machine. See
+> [WINDOWS-STATUS.md](WINDOWS-STATUS.md) for what is established, what is not, and what has to
+> exist before this runbook can be completed.
+
 ## What is needed
 
 * A Windows 10 x64 or Windows 11 x64 machine. Not a VM without nested virtualisation if
