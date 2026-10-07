@@ -1,29 +1,6 @@
-First stable release of this sing-box fork.
-
-- MASQUE / CONNECT-IP implementation and optimizations
-- Native Naive server and Cronet Naive client
-- HTTP/3 / QUIC lifecycle and error-handling fixes
-- DNS and SOCKS5 improvements
-- Shadowsocks data-path optimizations
-- Native API and Clash API support
-- Linux amd64 and macOS arm64 builds
-
-## Downloads
-
-| Platform | File |
-|---|---|
-| Linux amd64 | `jiejie-sing-box-linux-amd64-v0.1.3.tar.gz` |
-| macOS arm64 | `jiejie-sing-box-macos-arm64-v0.1.3.tar.gz` |
-
-Each archive contains the binary, a `BUILD-INFO` with the exact commit, tag set and
-dependency versions, the licence, and a `.sha256` for the binary. `SHA256SUMS`
-covers the archives.
-
-Verify a download with:
-
-```sh
-sha256sum -c SHA256SUMS
-```
-
-Both binaries are built from upstream's own feature profile, so they carry the
-complete upstream protocol and service registry alongside this fork's changes.
+- 优化网络切换生命周期：支持旧路径连接排空与分级回收，减少不必要的连接中断
+- 新增网络切换后的重连调度与并发控制，降低集中重连带来的连接风暴
+- 优化 DNS 连接复用与重建逻辑，限制并发建连并保留有效 DNS 缓存
+- 完善 TCP / UDP 活跃状态跟踪、连接回收与低唤醒后台清理机制
+- 同步上游 Forward NAT 重构，加入 UDP Mapping、分片处理与端口能力更新
+- 完善 Wi-Fi / 蜂窝网络切换、MASQUE / AnyTLS 等连接生命周期处理
