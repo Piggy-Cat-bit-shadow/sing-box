@@ -11,11 +11,14 @@ Every rule is an EXACT, COUNTED replacement. There is no global substitution any
 to, and inside compatibility identifiers, and a blanket rename would corrupt the third
 group. So each edit names one line (or one block) and states how many of it must exist.
 
-The rules fall into three groups:
+The rules fall into four groups:
 
   release identity   the desktop app's version, and the installer's file name
-  unsigned build     signing off by default, and the Windows signing configuration
-                     made optional instead of mandatory
+  executable name    the installed application file keeps the name the core's Windows
+                     daemon authenticates it by; productName keeps the visible branding
+  unsigned build     signing off by default and REQUIRED when a certificate is
+                     configured, with the Windows signing configuration made optional
+                     instead of mandatory
   visible branding   the strings a user reads that name the product
 
 # Why the unsigned-build group reaches into package.ts and afterPack.cjs
@@ -182,10 +185,53 @@ RULES = [
         1,
         note="Windows installer name -> Jiejiebox-v<version>-windows-<arch>.exe",
     ),
+    # The installed Windows application executable keeps the name `sing-box.exe`.
+    #
+    # This is NOT a branding decision, and it is the one place where productName and the
+    # executable name must disagree. The core's Windows daemon hardcodes
+    # applicationExecutableName = "sing-box.exe" in two places that both break otherwise:
+    #
+    #   experimental/boxdd/security_windows.go  secureWindowsInstallation() resolves the
+    #       installed application as <install>/sing-box.exe and Authenticode-verifies it
+    #       against the daemon's own signer, refusing to register the service otherwise.
+    #       The NSIS installer runs `service install` and rolls the whole installation
+    #       back if it fails, so with Jiejiebox.exe the installer cannot complete at all.
+    #   experimental/boxdd/peer_windows.go      the runtime peer handshake resolves the
+    #       same path, so the daemon could not even start its server.
+    #
+    # productName stays Jiejiebox, so the window title, Start Menu entry, Add/Remove
+    # Programs name, installer name and installer display name are unaffected. What is
+    # pinned is the file name on disk, which is installation identity - the same rule the
+    # overlay already applies to sing-box-daemon.exe and to the appId.
+    #
+    # electron-builder honours win.executableName for productFilename (AppInfo:
+    # `platformSpecificOptions?.executableName ?? info.config.executableName`), which is
+    # the value used for the executable, for afterSign.cjs's fuse/asar check and for the
+    # NSIS shortcut target.
+    #
+    # The anchored region stops at appId on purpose. The forceCodeSigning rule below
+    # rewrites the next line, and a block whose replacement text contained it would still
+    # apply but could never be read back - the confirmation pass would find its own
+    # replacement text altered and report a rule that had in fact succeeded.
+    Rule(
+        "electron-builder.yml",
+        "win:\n  appId: io.nekohasekai.sfw\n",
+        "win:\n  appId: io.nekohasekai.sfw\n"
+        "  # EXECUTABLE NAME OVERLAY: the installed file name, not the product name.\n"
+        "  # experimental/boxdd resolves <install>/sing-box.exe to authenticate the app\n"
+        "  # against the daemon's signer, both when registering the service and on every\n"
+        "  # peer handshake. productName above still supplies everything a user reads.\n"
+        "  executableName: sing-box\n",
+        1,
+        kind="block",
+        note="Windows executable name -> sing-box.exe (the name the core authenticates)",
+    ),
     # --- unsigned build ------------------------------------------------------
     #
     # Necessary: electron-builder refuses to produce an installer without a
-    # certificate while this is true.
+    # certificate while this is true. package.ts overrides this per build: it is turned
+    # back ON whenever a certificate is configured, so a signed build cannot silently
+    # produce an unsigned artifact.
     Rule(
         "electron-builder.yml",
         "forceCodeSigning: true",
@@ -237,8 +283,12 @@ RULES = [
         "        win: {\n"
         "          artifactName,\n"
         "          // UNSIGNED BUILD OVERLAY: signtoolOptions is supplied only when a\n"
-        "          // certificate was configured. electron-builder's signing support is\n"
-        "          // left intact - a build given a certificate still signs.\n"
+        "          // certificate was configured, and forceCodeSigning is turned back ON in\n"
+        "          // exactly that case. So a certificate means a signed build is REQUIRED -\n"
+        "          // electron-builder fails rather than quietly shipping an unsigned\n"
+        "          // artifact - while no certificate still means a supported unsigned build.\n"
+        "          // Signing itself is electron-builder's; nothing here replaces it.\n"
+        "          forceCodeSigning: signingConfiguration !== undefined,\n"
         "          ...(signingConfiguration === undefined\n"
         "            ? {}\n"
         "            : {\n"
