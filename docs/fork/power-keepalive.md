@@ -62,3 +62,43 @@ the shape is:
 This is recorded rather than implemented because the alternative was a behaviour change to
 protocol transports that this work cannot verify, and because the brief is explicit that a
 protocol-correctness change is worse than an unclaimed optimisation.
+
+## Correction: WireGuard is the exception, and it moves the blocker
+
+The first version of this note said there is no live keepalive "anywhere in this tree". That was
+too broad, and the exception matters because it changes what is actually blocking.
+
+WireGuard's `PersistentKeepaliveInterval` is applied the same construction-time way in the fork —
+it is read into `Endpoint.keepalive` from the option and written once, in `Start()`, through
+
+```go
+err = wgDevice.IpcSet(ipcConf.String())
+```
+
+— but `IpcSet` is not a constructor. It is wireguard-go's live configuration API, and
+`persistent_keepalive_interval` is one of the fields it accepts. Unlike `quic.Config`, which is
+copied into a connection at dial time, this value can be changed on a device that is already
+running, with no teardown and no reconnect. So WireGuard is the one protocol in this tree where
+"lengthen the keepalive in DEEP_IDLE" is mechanically possible today.
+
+**Which means the blocker is not the mechanism. It is that the consequence cannot be verified
+here, and the consequence is connectivity.**
+
+A persistent keepalive exists to hold a NAT mapping open so the peer can reach the device
+unsolicited. Lengthening it, or suspending it, risks that mapping expiring — and whether it
+expires depends on the carrier's NAT, which varies by network and cannot be modelled from this
+repository. The failure mode is the one this work stream is least allowed to produce: a tunnel
+that is up, reports healthy, and silently cannot be reached until the user's next outbound packet
+happens to re-establish it.
+
+For a client-side mobile tunnel the argument that this is *probably* safe is real — the phone
+initiates, and a lost mapping costs one WireGuard handshake when traffic resumes rather than a
+TLS handshake storm. But "probably" is doing the work there, and the brief's own ordering is
+correctness first, then power. This is therefore a change to ship only behind device validation
+on a real mobile network: measure the mapping lifetime, confirm recovery, and only then decide
+whether the saving is worth it.
+
+What would make it implementable without that validation is a value that is lengthened by a
+bounded factor rather than suspended — long enough to remove most of the wakeups, short enough to
+stay inside a conservative mapping lifetime — but choosing that bound is exactly the measurement
+this note is saying has not been done.
