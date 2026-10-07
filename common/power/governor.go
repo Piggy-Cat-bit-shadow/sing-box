@@ -471,6 +471,42 @@ func (g *Governor) WaitActive(ctx context.Context) bool {
 	}
 }
 
+// WaitProviderRefresh blocks until the provider-refresh category is permitted, or the context ends.
+//
+// It is the alternative to polling for work that is periodic AND deferrable. A remote rule-set
+// refresh does not need to happen at a particular moment, only before the rules go stale, so it can
+// wait for the device rather than waking it - which is the whole difference between a schedule that
+// costs a radio wakeup at 3am and one that costs nothing until the phone is picked up.
+//
+// The wait is on transitions, so it is exact for the pauses it exists for: while the device is
+// QUIESCENT or DEEP IDLE the answer cannot change without a transition. During WAKING it becomes
+// permitted at the moment the state becomes ACTIVE, which raises a transition too, because
+// provider refresh carries the longest stagger.
+func (g *Governor) WaitProviderRefresh(ctx context.Context) bool {
+	return g.waitFor(ctx, func(allow Allow) bool { return allow.ProviderRefresh })
+}
+
+func (g *Governor) waitFor(ctx context.Context, permitted func(Allow) bool) bool {
+	for {
+		g.access.Lock()
+		if g.closed {
+			g.access.Unlock()
+			return false
+		}
+		if permitted(g.allowLocked()) {
+			g.access.Unlock()
+			return true
+		}
+		changed := g.stateChanged
+		g.access.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
 // AddObserver registers a state observer. It is called synchronously on every transition.
 func (g *Governor) AddObserver(observer Observer) {
 	g.access.Lock()

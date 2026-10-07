@@ -308,3 +308,52 @@ func TestWakeWithNoPathWaitsForThePath(t *testing.T) {
 	governor.NetworkWake()
 	require.Equal(t, StateWaking, governor.State())
 }
+
+// TestWaitProviderRefreshWaitsForTheDevice is the alternative to a 3am fetch.
+//
+// A remote rule-set refresh is periodic AND deferrable: it does not need to happen at a particular
+// moment, only before the rules go stale, so it can wait for the device rather than waking it. This
+// is the difference between a schedule that costs a radio wakeup while the phone is in a pocket and
+// one that costs nothing until somebody picks it up.
+func TestWaitProviderRefreshWaitsForTheDevice(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{})
+
+	// A paused device does not permit it, and must not be woken by the wait.
+	governor.DevicePaused()
+	done := make(chan bool, 1)
+	go func() { done <- governor.WaitProviderRefresh(context.Background()) }()
+
+	select {
+	case <-done:
+		t.Fatal("a provider refresh ran while the device was asleep")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	governor.DeviceWake()
+	select {
+	case permitted := <-done:
+		require.True(t, permitted, "the refresh was not released by the wake")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the refresh was never released; the rules would go stale indefinitely")
+	}
+}
+
+// TestWaitProviderRefreshHonoursContext keeps a deferred refresh from outliving its tunnel.
+func TestWaitProviderRefreshHonoursContext(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{})
+	governor.DevicePaused()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	require.False(t, governor.WaitProviderRefresh(ctx),
+		"a cancelled wait must report that it did not get permission")
+
+	closed := newStaggeredGovernor(t, WakeStagger{})
+	closed.DevicePaused()
+	closed.Close()
+	require.False(t, closed.WaitProviderRefresh(context.Background()),
+		"a closed governor must not authorise work")
+}

@@ -6,12 +6,18 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/power"
+	"github.com/sagernet/sing/service"
 )
 
 type RuleSetUpdater struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	ruleSets []*RemoteRuleSet
+	// powerGovernor is the fork's sleep authority, or nil when none was installed. RemoteRuleSet has
+	// carried an unused pauseManager field since before this - the intent to defer these refreshes was
+	// there and the wiring never was.
+	powerGovernor *power.Governor
 }
 
 func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSetUpdater {
@@ -27,9 +33,10 @@ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSet
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	return &RuleSetUpdater{
-		ctx:      ctx,
-		cancel:   cancel,
-		ruleSets: remoteRuleSets,
+		ctx:           ctx,
+		cancel:        cancel,
+		ruleSets:      remoteRuleSets,
+		powerGovernor: service.FromContext[*power.Governor](ctx),
 	}
 }
 
@@ -49,12 +56,25 @@ func (u *RuleSetUpdater) loopUpdate() {
 	}
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	// The first pass loads every rule set, and is deliberately NOT deferred: routing needs the rules
+	// before the tunnel is usable, and the device is awake at that point by definition. Only the
+	// periodic refreshes that follow are deferrable.
+	initial := true
 	for {
 		select {
 		case <-u.ctx.Done():
 			return
 		case <-timer.C:
 		}
+		if !initial && u.powerGovernor != nil {
+			// A refresh that cannot be deferred would wake a sleeping device to fetch rules it will not
+			// use until it wakes anyway. Waiting costs nothing: the rules are stale by at most one
+			// pause, and the fetch happens the moment there is somebody to use it.
+			if !u.powerGovernor.WaitProviderRefresh(u.ctx) {
+				return
+			}
+		}
+		initial = false
 		now := time.Now()
 		var updated bool
 		for i, ruleSet := range u.ruleSets {
