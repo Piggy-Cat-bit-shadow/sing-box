@@ -114,11 +114,17 @@ jobs:
         # back to unsigned, upstream identifiers left in place, entitlements cleared while signing,
         # a published artifact that does not belong to the commit being released, or the two Apple
         # platforms being wired to the wrong source branch.
+        #
+        # The macOS name check belongs in this list because the failure it guards is silent in
+        # exactly the same way: the app builds, signs and uploads, and installs as sing-box. Here it
+        # runs against its own fixtures; the assertions that need the real pinned macOS checkout run
+        # in the macos job below, which has one.
         run: |
           set -euo pipefail
           ./scripts/ci/test-apple-signing.sh
           ./scripts/ci/test-apple-beta-publish.sh
           ./scripts/ci/check-apple-source-selection.sh
+          ./scripts/ci/test-apple-macos-name.sh
       - name: verify the Apple submodule revision
         run: |
           set -euo pipefail
@@ -534,6 +540,24 @@ jobs:
         run: |
           set -euo pipefail
           ./scripts/ci/prepare-apple-client.sh
+
+      - name: verify the macOS app name
+        # The regression this workflow previously could not see: the iOS binding branded SFI
+        # and nothing branded SFM, so the macOS product built, signed and uploaded as
+        # sing-box. This asserts the branding against the REAL pinned macOS source that was
+        # just prepared - not against the script's own fixture - and it fails the run before
+        # anything is archived.
+        #
+        # The values themselves are echoed next, so the log records what will become the
+        # archived app rather than only that a test passed.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/test-apple-macos-name.sh
+          echo "prepared macOS app name:"
+          grep -n 'PRODUCT_NAME = "Jiejiebox";\|INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox";' \
+            "$APPLE_CLIENT_DIR/sing-box.xcodeproj/project.pbxproj"
+          grep -n 'BuildableName = "Jiejiebox.app"' \
+            "$APPLE_CLIENT_DIR/sing-box.xcodeproj/xcshareddata/xcschemes/SFM.xcscheme"
 
       - name: build unsigned DMG
         run: |

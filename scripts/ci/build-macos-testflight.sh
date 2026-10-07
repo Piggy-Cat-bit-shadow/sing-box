@@ -150,9 +150,31 @@ echo "archived app: $app"
 built_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || echo '?')"
 built_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist" 2>/dev/null || echo '?')"
 built_bundle="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || echo '?')"
+built_display="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$app/Contents/Info.plist" 2>/dev/null || echo '?')"
 echo "  CFBundleShortVersionString: $built_version"
 echo "  CFBundleVersion:           $built_build"
 echo "  CFBundleIdentifier:        $built_bundle"
+echo "  CFBundleDisplayName:       $built_display"
+
+# --- expected product name ----------------------------------------------------
+# The name the user sees. Read from the branding overlay rather than repeated here, so
+# the name the overlay writes, the name scripts/ci/check-macos-app-name.sh requires and
+# the name this build asserts are one value. A mismatch between those is exactly how the
+# macOS TestFlight app shipped as sing-box in the first place.
+macos_brand="$(
+  python3 - "$root/scripts/ci/apply-apple-macos-branding-overlay.py" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'^\s*NEW_NAME = "([^"]+)"', src, re.M)
+if not m:
+    sys.exit("the macOS branding overlay declares no NEW_NAME")
+print(m.group(1))
+PY
+)"
+if [ -z "$macos_brand" ]; then
+  echo "FAIL: could not resolve the expected macOS product name from the branding overlay." >&2
+  exit 1
+fi
 
 # --- pre-upload gate ----------------------------------------------------------
 # The same standard as iOS: nothing reaches Apple unless it is provably ours and
@@ -168,6 +190,12 @@ gate "bundle id is ours (not upstream)" bash -c "case '$built_bundle' in io.neko
 gate "bundle id matches the iOS app id" test "$built_bundle" = "$APPLE_IOS_APP_BUNDLE_ID"
 gate "team id is not upstream" test "$APPLE_TEAM_ID" != "P8XK3KHB48"
 gate "build number is set" test "$built_build" != "?" -a -n "$built_build"
+# The name the user sees, as its own script so the check can be run against a fixture
+# bundle without archiving anything. It is a hard gate: an app uploaded still called
+# sing-box installs under the wrong name and cannot be corrected without another build.
+# See scripts/ci/check-macos-app-name.sh for what it asserts and why.
+gate "the archived app is named $macos_brand, not sing-box" \
+  "$root/scripts/ci/check-macos-app-name.sh" "$app" "$macos_brand"
 # The archive must be signed: entitlements exist only on a signed bundle, and Apple
 # validates them from the archive rather than from the export.
 gate "the archive is signed" codesign --verify --strict "$app"

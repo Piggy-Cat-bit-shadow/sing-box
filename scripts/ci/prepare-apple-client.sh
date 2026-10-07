@@ -25,10 +25,23 @@
 #                      bindings drifted. This is a build-time source adaptation.
 #                      Steps 1 and 1b.
 #
-#   [branding]         Presents the iOS app product as JiejieBox. Scoped to the SFI
-#                      target's Debug and Release configurations only, and applied by
-#                      build-configuration id rather than by text replacement, because
-#                      three targets share PRODUCT_NAME = "sing-box". Step 1c.
+#   [branding]         Presents each platform's app product under the fork's name.
+#                      TWO scripts, one per platform, because the platforms build
+#                      different targets from different sources and must not be
+#                      renamed by a shared rule:
+#
+#                        iOS   SFI -> JiejieBox   apply-apple-branding-overlay.py
+#                        macOS SFM -> Jiejiebox   apply-apple-macos-branding-overlay.py
+#
+#                      Each is scoped to its own target's Debug and Release
+#                      configurations and applied by build-configuration id rather than
+#                      by text replacement, because three targets share
+#                      PRODUCT_NAME = "sing-box". Step 1c.
+#
+#                      The two spellings differ on purpose and are NOT to be
+#                      reconciled here: the macOS TestFlight app is Jiejiebox. macOS
+#                      also has SFM.System, the unsandboxed Developer ID product, which
+#                      neither overlay touches.
 #
 #   [entitlements]     Adjusts entitlements: the multicast switch, which has to be
 #                      requested from Apple separately and is dropped for a personal
@@ -252,20 +265,33 @@ fi
 python3 "$root/scripts/ci/fix-apple-team-id.py" "$submodule_path"
 
 # ---------------------------------------------------------------------------
-# 1c. [branding] Present the iOS app as JiejieBox.
+# 1c. [branding] Present the platform's app product under the fork's name.
 # ---------------------------------------------------------------------------
-# The product brand is JiejieBox; the underlying core remains sing-box. Only the
-# SFI target's product name and display name change, so the installed app is
-# JiejieBox.app with CFBundleDisplayName=JiejieBox.
+# The product brand is the fork's; the underlying core remains sing-box. Which target
+# carries the product name depends on the platform, and the two products do NOT share a
+# target:
 #
-# Everything technical or compatibility-related is left alone: the SFI target and
-# scheme names, the bundle identifier, the App Group, entitlements, the sing-box://
-# URL scheme, and every other target (SFT, SFM, SFM.System, the extensions). The
-# overlay resolves SFI's build configurations from the project's own configuration
-# lists rather than by string search, because three targets share
-# PRODUCT_NAME = "sing-box" and a global replacement would rename the tvOS and
-# macOS apps too.
-python3 "$root/scripts/ci/apply-apple-branding-overlay.py" "$submodule_path"
+#   iOS    SFI -> JiejieBox   JiejieBox.app,   CFBundleDisplayName=JiejieBox
+#   macOS  SFM -> Jiejiebox   Jiejiebox.app,   CFBundleDisplayName=Jiejiebox
+#
+# Both overlays leave everything technical or compatibility-related alone: the target
+# and scheme names, the bundle identifier, the App Group, entitlements, the sing-box://
+# URL scheme, and every other target. Each resolves its target's build configurations
+# from the project's own configuration lists rather than by string search, because
+# three targets share PRODUCT_NAME = "sing-box" and a global replacement would rename
+# the other platform's app too.
+#
+# The macOS overlay is deliberately a separate script rather than a platform branch
+# inside the iOS one. SFM and SFI are different targets with different configuration
+# ids in different sources, so sharing an implementation would only mean one edit that
+# can break the other platform's build. SFM.System - the unsandboxed Developer ID
+# product - is not branded by either.
+if [ "$APPLE_CLIENT_PLATFORM" = "macos" ]; then
+  # Jiejiebox, lower-case b: the spelling the macOS TestFlight app is published under.
+  python3 "$root/scripts/ci/apply-apple-macos-branding-overlay.py" "$submodule_path"
+else
+  python3 "$root/scripts/ci/apply-apple-branding-overlay.py" "$submodule_path"
+fi
 
 # ---------------------------------------------------------------------------
 # 1d. [links] Source Code and Releases point at this fork.
