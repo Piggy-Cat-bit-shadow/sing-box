@@ -35,6 +35,14 @@ type State uint8
 const (
 	// StateActive is normal operation: the device is awake and nothing is being suppressed.
 	StateActive State = iota
+	// StateWaking is the window just after a wake, during which the business data path is already up
+	// but speculative work is released in stages rather than all at once.
+	//
+	// The brief's requirement is that a wake must not be a storm: twenty subsystems deciding at the
+	// same instant to refresh, probe and re-test is a burst of radio and CPU that arrives exactly when
+	// the user is looking at the screen. Staggering costs nothing when the device is about to be used
+	// for a while anyway, and it is the difference between a wake and a spike.
+	StateWaking
 	// StateQuiescent is the device asleep or backgrounded, but recently enough that real business may
 	// still arrive - a voice call already in progress, a background upload. Speculative maintenance
 	// stops here; nothing that is carrying traffic is touched.
@@ -89,6 +97,33 @@ type Policy struct {
 	Quiescent Allow
 	// DeepIdle is what is permitted once it has.
 	DeepIdle Allow
+	// WakeStagger is how long each category waits after a wake before it may run again. Zero means
+	// "at once", which is the pre-existing behaviour for any field left unset.
+	WakeStagger WakeStagger
+}
+
+// WakeStagger delays the resumption of speculative work after a wake.
+//
+// It exists because a wake is the moment every subsystem is told to come back, and the ones that are
+// cheap to delay are also the ones that cost the most radio: a health check that runs immediately
+// competes with the request the user woke the phone to make.
+type WakeStagger struct {
+	HealthCheck     time.Duration
+	ProviderRefresh time.Duration
+	NetworkProbe    time.Duration
+	Statistics      time.Duration
+}
+
+// longest is the point at which every category has been released, and therefore the point at which
+// the governor stops being WAKING.
+func (s WakeStagger) longest() time.Duration {
+	longest := s.HealthCheck
+	for _, other := range []time.Duration{s.ProviderRefresh, s.NetworkProbe, s.Statistics} {
+		if other > longest {
+			longest = other
+		}
+	}
+	return longest
 }
 
 // DefaultPolicy is the built-in policy.
@@ -106,6 +141,15 @@ func DefaultPolicy() Policy {
 		// Deep idle keeps nothing speculative. Protocol correctness timers are not gated here: they
 		// belong to the session that owns them, not to this policy.
 		DeepIdle: Allow{},
+		// Provisional tuning, from the brief's suggested ranges, not measured optima. Orders are
+		// staggered rather than the values being precise: what matters is that a health check does not
+		// start in the same instant as a provider refresh.
+		WakeStagger: WakeStagger{
+			HealthCheck:     5 * time.Second,
+			ProviderRefresh: 15 * time.Second,
+			NetworkProbe:    5 * time.Second,
+			Statistics:      10 * time.Second,
+		},
 	}
 }
 
@@ -129,7 +173,11 @@ type Governor struct {
 	// real traffic, which is what makes the transition traffic-driven rather than a fixed countdown
 	// from the moment the screen went off.
 	idleTimer *time.Timer
-	closed    bool
+	// wakeTimer promotes WAKING to ACTIVE once every staggered category has been released.
+	wakeTimer *time.Timer
+	// wokeAt is when the current wake began, and is what Allow() measures each category against.
+	wokeAt time.Time
+	closed bool
 
 	observers []Observer
 
@@ -163,6 +211,18 @@ func (g *Governor) Allow() Allow {
 
 func (g *Governor) allowLocked() Allow {
 	switch g.state {
+	case StateWaking:
+		// Released one category at a time, measured from the wake rather than counted down by a timer
+		// each: a caller asking "may I run" gets the answer for its own category, and no subsystem has
+		// to own a stagger of its own.
+		elapsed := time.Since(g.wokeAt)
+		stagger := g.policy.WakeStagger
+		return Allow{
+			HealthCheck:     elapsed >= stagger.HealthCheck,
+			ProviderRefresh: elapsed >= stagger.ProviderRefresh,
+			NetworkProbe:    elapsed >= stagger.NetworkProbe,
+			Statistics:      elapsed >= stagger.Statistics,
+		}
 	case StateQuiescent:
 		return g.policy.Quiescent
 	case StateDeepIdle:
@@ -196,7 +256,40 @@ func (g *Governor) DeviceWake() {
 		return
 	}
 	g.devicePaused = false
-	g.recomputeLocked()
+	if g.networkPaused {
+		// No path: there is nothing to release yet. The stagger begins when the network returns.
+		g.recomputeLocked()
+		return
+	}
+	g.beginWakingLocked()
+}
+
+// beginWakingLocked releases the business path at once and staggers the rest. Caller holds the lock.
+func (g *Governor) beginWakingLocked() {
+	if g.idleTimer != nil {
+		g.idleTimer.Stop()
+		g.idleTimer = nil
+	}
+	stagger := g.policy.WakeStagger
+	longest := stagger.longest()
+	if longest <= 0 {
+		g.setStateLocked(StateActive)
+		return
+	}
+	g.wokeAt = time.Now()
+	g.setStateLocked(StateWaking)
+	if g.wakeTimer != nil {
+		g.wakeTimer.Stop()
+	}
+	g.wakeTimer = time.AfterFunc(longest, func() {
+		g.access.Lock()
+		defer g.access.Unlock()
+		g.wakeTimer = nil
+		if g.closed || g.state != StateWaking {
+			return
+		}
+		g.setStateLocked(StateActive)
+	})
 }
 
 // NetworkPaused records that the device lost its path.
@@ -223,6 +316,12 @@ func (g *Governor) NetworkWake() {
 		return
 	}
 	g.networkPaused = false
+	if !g.devicePaused && g.state != StateActive {
+		// The path came back with the device awake: the business path is usable again, and the
+		// speculative categories are released in the same staggered order as after a device wake.
+		g.beginWakingLocked()
+		return
+	}
 	g.recomputeLocked()
 }
 
@@ -324,7 +423,10 @@ func (g *Governor) WaitActive(ctx context.Context) bool {
 			g.access.Unlock()
 			return false
 		}
-		if g.state == StateActive {
+		if g.state == StateActive || g.state == StateWaking {
+			// WAKING counts: the business path is up, and a subsystem waiting to do work should not be
+			// held for the sake of a stagger that applies to speculative categories. The fine-grained
+			// question is Allow(), which answers per category.
 			g.access.Unlock()
 			return true
 		}
@@ -356,6 +458,10 @@ func (g *Governor) Close() {
 	if g.idleTimer != nil {
 		g.idleTimer.Stop()
 		g.idleTimer = nil
+	}
+	if g.wakeTimer != nil {
+		g.wakeTimer.Stop()
+		g.wakeTimer = nil
 	}
 	close(g.stateChanged)
 }

@@ -14,6 +14,9 @@ func newTestGovernor(t *testing.T) *Governor {
 	t.Helper()
 	policy := DefaultPolicy()
 	policy.DeepIdleAfter = 40 * time.Millisecond
+	// These tests pin the pause/wake machine itself, so the wake stagger is switched off here; it has
+	// its own tests below, which would otherwise be indistinguishable from a wake that never completes.
+	policy.WakeStagger = WakeStagger{}
 	governor := NewGovernor(policy)
 	t.Cleanup(governor.Close)
 	return governor
@@ -165,6 +168,7 @@ func TestWaitActiveHonoursContext(t *testing.T) {
 func TestObserversSeeEveryTransition(t *testing.T) {
 	policy := DefaultPolicy()
 	policy.DeepIdleAfter = 30 * time.Millisecond
+	policy.WakeStagger = WakeStagger{}
 	governor := NewGovernor(policy)
 	t.Cleanup(governor.Close)
 
@@ -212,4 +216,95 @@ func TestCloseIsIdempotentAndQuiet(t *testing.T) {
 	governor.ObserveTraffic()
 	governor.NetworkPaused()
 	require.False(t, governor.WaitActive(context.Background()))
+}
+
+// newStaggeredGovernor builds one with the wake stagger ON, which is the shipping default.
+func newStaggeredGovernor(t *testing.T, stagger WakeStagger) *Governor {
+	t.Helper()
+	policy := DefaultPolicy()
+	policy.DeepIdleAfter = 20 * time.Millisecond
+	policy.WakeStagger = stagger
+	governor := NewGovernor(policy)
+	t.Cleanup(governor.Close)
+	return governor
+}
+
+// TestWakeReleasesCategoriesInStages is §15: a wake must not be a storm.
+//
+// Every subsystem is told to come back at the same moment, and the ones that are cheap to delay cost
+// the most radio - a health check starting in the same instant as the request that woke the phone is
+// competing with the thing the user actually asked for.
+func TestWakeReleasesCategoriesInStages(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{
+		HealthCheck:     30 * time.Millisecond,
+		ProviderRefresh: 120 * time.Millisecond,
+		NetworkProbe:    30 * time.Millisecond,
+		Statistics:      60 * time.Millisecond,
+	})
+
+	governor.DevicePaused()
+	governor.DeviceWake()
+	require.Equal(t, StateWaking, governor.State(), "a wake must not release everything at once")
+	require.Equal(t, Allow{}, governor.Allow(), "nothing speculative may run in the first instant")
+
+	// The business path is already usable - that is what WAKING means - so a subsystem waiting for the
+	// device is not held for the stagger's sake.
+	require.True(t, governor.WaitActive(context.Background()))
+
+	require.Eventually(t, func() bool { return governor.Allow().HealthCheck },
+		3*time.Second, 5*time.Millisecond, "the health check was never released")
+	require.False(t, governor.Allow().ProviderRefresh, "provider refresh came back too early")
+
+	require.Eventually(t, func() bool { return governor.Allow().Statistics },
+		3*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return governor.Allow().ProviderRefresh },
+		3*time.Second, 5*time.Millisecond)
+}
+
+// TestWakeSettlesToActive keeps WAKING from being a terminal state.
+func TestWakeSettlesToActive(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{HealthCheck: 30 * time.Millisecond})
+	governor.DevicePaused()
+	governor.DeviceWake()
+	require.Equal(t, StateWaking, governor.State())
+
+	require.Eventually(t, func() bool { return governor.State() == StateActive },
+		3*time.Second, 5*time.Millisecond, "WAKING never became ACTIVE")
+	require.Equal(t, allowAll, governor.Allow())
+}
+
+// TestNoStaggerMeansNoWakingStage is the compatibility guarantee: a policy with no stagger behaves
+// exactly as the machine did before WAKING existed.
+func TestNoStaggerMeansNoWakingStage(t *testing.T) {
+	governor := newTestGovernor(t)
+	governor.DevicePaused()
+	governor.DeviceWake()
+	require.Equal(t, StateActive, governor.State())
+}
+
+// TestTrafficDuringWakingDoesNotReEnableSpeculation closes the loop with the traffic rule: the phone
+// is awake, a request is in flight, and the staggered categories still wait their turn.
+func TestTrafficDuringWakingDoesNotReEnableSpeculation(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{ProviderRefresh: 200 * time.Millisecond})
+	governor.DevicePaused()
+	governor.DeviceWake()
+
+	governor.ObserveTraffic()
+	require.Equal(t, StateWaking, governor.State(), "traffic short-circuited the stagger")
+	require.False(t, governor.Allow().ProviderRefresh)
+}
+
+// TestWakeWithNoPathWaitsForThePath keeps the order: the stagger is measured from the moment the
+// device is actually usable, not from the wake signal.
+func TestWakeWithNoPathWaitsForThePath(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{HealthCheck: 200 * time.Millisecond})
+	governor.NetworkPaused()
+	governor.DevicePaused()
+	governor.DeviceWake()
+
+	require.NotEqual(t, StateWaking, governor.State(),
+		"the stagger began before there was a path to stagger onto")
+
+	governor.NetworkWake()
+	require.Equal(t, StateWaking, governor.State())
 }

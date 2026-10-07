@@ -18,6 +18,10 @@ import (
 func TestApplyPauseEventMapsThePlatformVocabulary(t *testing.T) {
 	policy := power.DefaultPolicy()
 	policy.DeepIdleAfter = 50 * time.Millisecond
+	// This test pins the MAPPING between the two vocabularies, so the wake stagger is off here: with it
+	// on, a wake legitimately lands on WAKING, and a mapping failure would be indistinguishable from a
+	// stagger doing its job. The stagger has its own tests in common/power.
+	policy.WakeStagger = power.WakeStagger{}
 	governor := power.NewGovernor(policy)
 	t.Cleanup(governor.Close)
 
@@ -40,6 +44,16 @@ func TestApplyPauseEventMapsThePlatformVocabulary(t *testing.T) {
 	applyPauseEvent(governor, pause.EventNetworkPause)
 	applyPauseEvent(governor, 999)
 	require.Equal(t, power.StateQuiescent, governor.State(), "an unknown event changed the state")
+
+	// And with the SHIPPING policy a wake must land on WAKING, not ACTIVE: the mapping still has to
+	// carry the event, and the governor has to stagger what follows it. Without this, zeroing the
+	// stagger above would quietly stop this test from covering wakes at all.
+	shipping := power.NewGovernor(power.DefaultPolicy())
+	t.Cleanup(shipping.Close)
+	applyPauseEvent(shipping, pause.EventDevicePaused)
+	applyPauseEvent(shipping, pause.EventDeviceWake)
+	require.Equal(t, power.StateWaking, shipping.State(),
+		"a wake released every speculative subsystem at once")
 
 	// And a nil governor, which is what a Box without the wiring has, must not panic.
 	applyPauseEvent(nil, pause.EventDevicePaused)
