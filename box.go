@@ -600,7 +600,7 @@ func New(options Options) (*Box, error) {
 		})
 		timeService.TimeService = ntpService
 	}
-	return &Box{
+	box := &Box{
 		ctx:                 ctx,
 		ownedURLTestHistory: ownedURLTestHistory,
 		network:             networkManager,
@@ -625,7 +625,29 @@ func New(options Options) (*Box, error) {
 		internalService:     internalServices,
 		ntpService:          ntpService,
 		scope:               adapter.NewScope(ctx, logFactory.Logger()),
-	}, nil
+	}
+
+	// Releasing reusable connections is deferred to DEEP_IDLE rather than done the moment the screen
+	// goes off, and that timing is the whole point.
+	//
+	// The Apple client used to call CloseIdleConnections() from pause(), which is the shape the brief
+	// names as a trap: it looks like a saving, and it turns every unlock into a pile of DNS, TLS and
+	// QUIC handshakes at exactly the moment the user wants a request answered. What the pool is worth
+	// depends on how long the device stays asleep - a screen that goes off for a minute should cost
+	// nothing, and a phone left in a pocket for an afternoon should not hold sockets it will not use.
+	// DEEP_IDLE is precisely that distinction: the device has been paused, and no real traffic has
+	// moved, for Policy.DeepIdleAfter.
+	//
+	// Business connections are untouched at every state. The governor closes nothing itself; it
+	// reports, and this is the one place that reacts by releasing only what exists to be reused.
+	powerGovernor.AddObserver(func(state power.State) {
+		if state != power.StateDeepIdle {
+			return
+		}
+		box.CloseIdleConnections()
+	})
+
+	return box, nil
 }
 
 func (s *Box) PreStart() error {

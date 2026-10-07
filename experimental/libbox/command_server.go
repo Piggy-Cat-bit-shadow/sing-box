@@ -265,7 +265,12 @@ func (s *CommandServer) Pause() {
 	if instance == nil || instance.Box() == nil || instance.PauseManager() == nil {
 		return
 	}
-	instance.Box().CloseIdleConnections()
+	// CloseIdleConnections() used to be called here, the moment the device paused. It is not any
+	// more: closing the pool on every screen-off turns each unlock into a burst of DNS, TLS and QUIC
+	// handshakes at exactly the moment the user wants a request answered. The pool is released later,
+	// from the power governor's DEEP_IDLE transition, which is reached only once the device has stayed
+	// paused with no real traffic - so a brief screen-off costs nothing and an afternoon in a pocket
+	// does not hold sockets. See common/power and the Box observer that performs it.
 	instance.PauseManager().DevicePause()
 }
 

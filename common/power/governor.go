@@ -180,6 +180,9 @@ type Governor struct {
 	closed bool
 
 	observers []Observer
+	// pendingNotify is set by a transition and cleared by flushNotifications, which runs after the
+	// lock is released. See setStateLocked.
+	pendingNotify bool
 
 	// stateChanged is closed and replaced on every transition, so a subsystem can wait for the state
 	// to move without polling. See WaitActive.
@@ -239,6 +242,7 @@ func (g *Governor) Active() bool {
 
 // DevicePaused records that the device went to sleep or the app was backgrounded.
 func (g *Governor) DevicePaused() {
+	defer g.flushNotifications()
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.closed || g.devicePaused {
@@ -250,6 +254,7 @@ func (g *Governor) DevicePaused() {
 
 // DeviceWake records that the device woke.
 func (g *Governor) DeviceWake() {
+	defer g.flushNotifications()
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.closed || !g.devicePaused {
@@ -282,6 +287,7 @@ func (g *Governor) beginWakingLocked() {
 		g.wakeTimer.Stop()
 	}
 	g.wakeTimer = time.AfterFunc(longest, func() {
+		defer g.flushNotifications()
 		g.access.Lock()
 		defer g.access.Unlock()
 		g.wakeTimer = nil
@@ -299,6 +305,7 @@ func (g *Governor) beginWakingLocked() {
 // two signals are tracked separately because their recoveries differ, not because one implies the
 // other.
 func (g *Governor) NetworkPaused() {
+	defer g.flushNotifications()
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.closed || g.networkPaused {
@@ -310,6 +317,7 @@ func (g *Governor) NetworkPaused() {
 
 // NetworkWake records that the path came back.
 func (g *Governor) NetworkWake() {
+	defer g.flushNotifications()
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.closed || !g.networkPaused {
@@ -341,6 +349,7 @@ func (g *Governor) NetworkWake() {
 // It is deliberately cheap - one lock, and a timer stop only when one is armed - because the
 // forwarding path calls it. It must NOT be called for the core's own liveness traffic.
 func (g *Governor) ObserveTraffic() {
+	defer g.flushNotifications()
 	g.access.Lock()
 	defer g.access.Unlock()
 	if g.closed {
@@ -381,6 +390,7 @@ func (g *Governor) armIdleTimerLocked() {
 		return
 	}
 	g.idleTimer = time.AfterFunc(g.policy.DeepIdleAfter, func() {
+		defer g.flushNotifications()
 		g.access.Lock()
 		defer g.access.Unlock()
 		g.idleTimer = nil
@@ -394,6 +404,14 @@ func (g *Governor) armIdleTimerLocked() {
 }
 
 // setStateLocked applies a transition and wakes anything waiting on one.
+//
+// It does NOT call the observers. It records that they are owed a notification, and
+// flushNotifications delivers it after the caller has released the lock.
+//
+// The reason is not tidiness. An observer's job is to react to a state change, and the most useful
+// reaction - releasing connections that only exist to be reused - takes locks of its own. Calling one
+// while holding this lock makes the governor a lock-ordering hazard for every subsystem that observes
+// it, and the deadlock would appear only under the combination of a sleep and a connection close.
 func (g *Governor) setStateLocked(state State) {
 	if g.state == state {
 		return
@@ -401,9 +419,22 @@ func (g *Governor) setStateLocked(state State) {
 	g.state = state
 	close(g.stateChanged)
 	g.stateChanged = make(chan struct{})
+	g.pendingNotify = true
+}
+
+// flushNotifications delivers any notification setStateLocked owed, and must be called with the lock
+// RELEASED. Entry points arrange that with `defer g.flushNotifications()` placed before the deferred
+// unlock, so the unlock runs first.
+func (g *Governor) flushNotifications() {
+	g.access.Lock()
+	if !g.pendingNotify {
+		g.access.Unlock()
+		return
+	}
+	g.pendingNotify = false
+	state := g.state
 	observers := g.observers
-	// Observers are called outside the lock in spirit; the slice is copied so an observer that
-	// registers or unregisters during the call cannot corrupt the iteration.
+	g.access.Unlock()
 	for _, observer := range observers {
 		observer(state)
 	}

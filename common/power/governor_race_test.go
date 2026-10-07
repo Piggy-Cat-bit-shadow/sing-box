@@ -2,6 +2,7 @@ package power
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,4 +175,41 @@ func TestSignalStormIsRaceFree(t *testing.T) {
 	// Whatever the interleaving, it must still be a state the machine defines.
 	require.Contains(t, []State{StateActive, StateWaking, StateQuiescent, StateDeepIdle},
 		governor.State())
+}
+
+// TestAnObserverMayCallBackIntoTheGovernor is the regression test for a deadlock that would only ever
+// appear in the field, under the combination of a sleep and a connection close.
+//
+// An observer's real job is to react to a state change, and the most useful reaction - releasing
+// connections that exist only to be reused - takes locks of its own. If the governor called observers
+// while holding its own lock, the governor would become a lock-ordering hazard for every subsystem
+// that observes it, and the deadlock would be a hang on the user's device rather than a test failure.
+//
+// The timeout is the assertion: without it this test does not fail, it hangs.
+func TestAnObserverMayCallBackIntoTheGovernor(t *testing.T) {
+	governor := newStaggeredGovernor(t, WakeStagger{HealthCheck: 20 * time.Millisecond})
+
+	var observed atomic.Int32
+	governor.AddObserver(func(state State) {
+		observed.Add(1)
+		// Model the real observer: ask the governor something, which needs its lock.
+		_ = governor.Allow()
+		_ = governor.State()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		governor.DevicePaused()
+		governor.DeviceWake()
+		require.Eventually(t, func() bool { return governor.State() == StateActive },
+			3*time.Second, 5*time.Millisecond)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an observer that called back into the governor deadlocked it")
+	}
+	require.GreaterOrEqual(t, observed.Load(), int32(2))
 }
