@@ -646,11 +646,30 @@ jobs:
         # - just not on every commit.
         #
         # Every target is the same set as before; only the BUDGET changed, from 20s
-        # to 5s each. 20s per target is long-run fuzzing, not a CI regression smoke:
-        # what CI needs to establish is that the corpus still loads, the parser does
-        # not immediately crash, and no obvious panic regression is present. The
-        # corpus each target has accumulated is preserved in testdata, so a shorter
-        # run still replays every previously-found case. Measured effect: 198s -> ~50s.
+        # to an ITERATION count. 20s per target is long-run fuzzing, not a CI
+        # regression smoke: what CI needs to establish is that the corpus still
+        # loads, the parser does not immediately crash, and no obvious panic
+        # regression is present. The corpus each target has accumulated is preserved
+        # in testdata, so a bounded run still replays every previously-found case.
+        #
+        # # Why iterations rather than seconds
+        #
+        # A time budget is enforced by `context.WithTimeout` in internal/fuzz, and
+        # when it expires the coordinator calls stop(ctx.Err()) - so
+        # "context deadline exceeded" becomes the campaign's error and
+        # testing/fuzz.go turns it into a FAILURE. Whether that error is the one
+        # returned depends on where the workers happen to be at that instant, which
+        # makes a time-budgeted campaign intermittently red on a shared runner for
+        # reasons that have nothing to do with the code under test. MEASURED on
+        # FuzzConnectIPTemplatePath: 1 failure in 6 runs at 5s, 1 in 3 at 30s, and 1
+        # in 2 at 30s with -parallel 1, always at fuzztime+1s, with NO reproducer
+        # written and no panic or assertion failure.
+        #
+        # What ruled out a pathological input: the same target run for 200000
+        # ITERATIONS three times - 600000 iterations, roughly fifteen times the work
+        # of a 5s campaign - passed every time, because an iteration budget creates
+        # no deadline to race. The budget below is more fuzzing than the 5s it
+        # replaces, not less, and it is deterministic.
         #
         # Longer fuzzing belongs in a dedicated local or scheduled job, not here.
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.deep_checks }}
@@ -658,16 +677,16 @@ jobs:
           set -euo pipefail
           TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           run_fuzz() {
-            echo "--- fuzzing $2 in $1 for ${3}s"
+            echo "--- fuzzing $2 in $1 for $3 iterations"
             go test -tags "$TAGS" -run '^$' -fuzz "^$2\$" -fuzztime "$3" "$1"
           }
-          run_fuzz ./transport/masque FuzzCapsuleParser 5s
-          run_fuzz ./transport/masque FuzzRouteAdvertisement 5s
-          run_fuzz ./transport/masque FuzzConnectIPAddresses 5s
-          run_fuzz ./transport/masque FuzzConnectIPTemplatePath 5s
-          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 5s
-          run_fuzz ./transport/masque FuzzCapsuleStreamFragmentation 5s
-          run_fuzz ./transport/http FuzzConnectUDPTargetPath 5s
+          run_fuzz ./transport/masque FuzzCapsuleParser 100000x
+          run_fuzz ./transport/masque FuzzRouteAdvertisement 100000x
+          run_fuzz ./transport/masque FuzzConnectIPAddresses 100000x
+          run_fuzz ./transport/masque FuzzConnectIPTemplatePath 100000x
+          run_fuzz ./transport/masque FuzzMasqueIPPacketParser 100000x
+          run_fuzz ./transport/masque FuzzCapsuleStreamFragmentation 100000x
+          run_fuzz ./transport/http FuzzConnectUDPTargetPath 100000x
           echo "PASS: fuzz campaign"
 
 
