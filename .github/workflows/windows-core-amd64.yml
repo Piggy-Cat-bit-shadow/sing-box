@@ -61,7 +61,7 @@ env:
   GOOS_TARGET: windows
   GOARCH_TARGET: amd64
   # Empty on a push event, so the profile default is applied here rather than in steps.
-  TAGS_PROFILE: ${{ github.event.env.TAGS_PROFILE || 'fork-windows' }}
+  TAGS_PROFILE: ${{ github.event.inputs.tags_profile || 'fork-windows' }}
   ARTIFACT_NAME: sing-box.exe
   ZIP_NAME: sing-box-v0.1.5-windows-amd64.zip
 
