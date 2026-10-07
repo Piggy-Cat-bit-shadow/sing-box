@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regression tests for the macOS TestFlight app name.
 #
-# Usage: test-apple-macos-name.sh
+# Usage: test-apple-macos-name.sh [--source-dir <dir>]
 #
 # # The failure this exists for
 #
@@ -36,10 +36,28 @@
 # is self-consistent; it cannot prove it matches the source it will be applied to. That is
 # the failure this task exists for - an overlay that was right about a target nobody built.
 # Where no macOS checkout is present, check 7 is reported as SKIPPED, never as a pass.
+#
+# # When it must run
+#
+# Check 7 asserts the PINNED state - the sing-box anchors are present and the checkout is
+# unmodified - and applies the overlay to a COPY rather than in place. It therefore has to
+# run BEFORE prepare-apple-client.sh brands the real checkout: a run afterwards would be
+# asking the suite to observe a pristine source that the build overlays had already
+# rewritten, and it would fail on a perfectly correct build. The workflow runs it at that
+# point. --source-dir overrides which checkout is read, so the ordering can be demonstrated
+# locally against a checkout whose phase this script does not otherwise know.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$root"
+
+source_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --source-dir) source_dir="${2:?--source-dir needs a directory}"; shift 2 ;;
+    *) echo "test-apple-macos-name: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 
 overlay="$root/scripts/ci/apply-apple-macos-branding-overlay.py"
 ios_overlay="$root/scripts/ci/apply-apple-branding-overlay.py"
@@ -577,8 +595,18 @@ echo "== the pinned macOS source matches what the overlay expects =="
 # The fixture proves the overlay is self-consistent. This proves it matches the source it
 # is applied to, and that applying it there produces the branded name rather than failing
 # on a structure it no longer recognises.
-macos_dir="$(./scripts/ci/apple-client-source.sh dir macos 2>/dev/null || true)"
-macos_sha="$(./scripts/ci/apple-client-source.sh sha macos 2>/dev/null || true)"
+if [ -n "$source_dir" ]; then
+  # An explicit checkout overrides the resolver, so the phase-dependent half can be run
+  # against a specific tree - a pristine one, or a deliberately branded one to show that
+  # this half is not phase-agnostic. The expected revision still comes from the pin, and
+  # from the PARENT repository rather than from the checkout under test, so a checkout
+  # cannot nominate itself as its own authority.
+  macos_dir="$source_dir"
+  macos_sha="$(cd "$root" && . release/apple-client-refs.env && printf '%s' "$MACOS_APPLE_SHA")"
+else
+  macos_dir="$(./scripts/ci/apple-client-source.sh dir macos 2>/dev/null || true)"
+  macos_sha="$(./scripts/ci/apple-client-source.sh sha macos 2>/dev/null || true)"
+fi
 pinned_pbx="$macos_dir/sing-box.xcodeproj/project.pbxproj"
 pinned_scheme="$macos_dir/sing-box.xcodeproj/xcshareddata/xcschemes/SFM.xcscheme"
 

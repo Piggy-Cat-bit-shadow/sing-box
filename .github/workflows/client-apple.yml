@@ -511,6 +511,29 @@ jobs:
           fi
           echo "PASS: macOS source is $actual, distinct from the iOS source $ios_sha"
 
+      - name: verify the pinned macOS source and the branding overlay
+        # Deliberately BEFORE the build overlays and before Libbox is installed.
+        #
+        # The regression this workflow previously could not see: the iOS binding branded SFI
+        # and nothing branded SFM, so the macOS product built, signed and uploaded as
+        # sing-box. The check has two halves that need opposite states of the tree:
+        #
+        #   the PINNED source still declares the sing-box anchors the overlay rewrites, and
+        #   the checkout is left exactly as the pin records it
+        #
+        #   ...both of which only hold while the tree is pristine, and
+        #
+        #   the overlay really does apply to a COPY of that pinned source and produce
+        #   Jiejiebox there
+        #
+        # which is why the suite copies the checkout instead of branding it in place. Running
+        # it after prepare-apple-client.sh would ask it to observe a pristine source the build
+        # overlays had already rewritten, and it would fail on a correct build. The prepared
+        # tree is asserted separately, in the next step but one.
+        run: |
+          set -euo pipefail
+          ./scripts/ci/test-apple-macos-name.sh
+
       - name: warm the Go module cache
         run: go mod download all
 
@@ -541,23 +564,48 @@ jobs:
           set -euo pipefail
           ./scripts/ci/prepare-apple-client.sh
 
-      - name: verify the macOS app name
-        # The regression this workflow previously could not see: the iOS binding branded SFI
-        # and nothing branded SFM, so the macOS product built, signed and uploaded as
-        # sing-box. This asserts the branding against the REAL pinned macOS source that was
-        # just prepared - not against the script's own fixture - and it fails the run before
-        # anything is archived.
+      - name: verify the prepared macOS app is branded
+        # The other half of the name check: the suite above proved the overlay is right about
+        # a copy of the pinned source, and this proves the PREPARED tree - the one that will
+        # actually be archived - carries the result.
         #
-        # The values themselves are echoed next, so the log records what will become the
-        # archived app rather than only that a test passed.
+        # The tree is expected to be dirty here. The overlays rewrite the working copy by
+        # design and never commit to it, so this asserts the branded values and the untouched
+        # neighbours rather than git cleanliness. The final proof is the archived bundle
+        # itself, which check-macos-app-name.sh reads during the TestFlight build.
         run: |
           set -euo pipefail
-          ./scripts/ci/test-apple-macos-name.sh
+          pbx="$APPLE_CLIENT_DIR/sing-box.xcodeproj/project.pbxproj"
+          scheme="$APPLE_CLIENT_DIR/sing-box.xcodeproj/xcshareddata/xcschemes/SFM.xcscheme"
+
           echo "prepared macOS app name:"
-          grep -n 'PRODUCT_NAME = "Jiejiebox";\|INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox";' \
-            "$APPLE_CLIENT_DIR/sing-box.xcodeproj/project.pbxproj"
-          grep -n 'BuildableName = "Jiejiebox.app"' \
-            "$APPLE_CLIENT_DIR/sing-box.xcodeproj/xcshareddata/xcschemes/SFM.xcscheme"
+          grep -n 'PRODUCT_NAME = "Jiejiebox";\|INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox";' "$pbx"
+          grep -n 'BuildableName = "Jiejiebox.app"' "$scheme"
+
+          # Both SFM configurations, both settings: 4 values.
+          name_values="$(grep -c 'PRODUCT_NAME = "Jiejiebox";\|INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox";' "$pbx")"
+          if [ "$name_values" != "4" ]; then
+            echo "FAIL: expected SFM Debug and Release to declare Jiejiebox for PRODUCT_NAME and" >&2
+            echo "      CFBundleDisplayName (4 values), found $name_values." >&2
+            exit 1
+          fi
+          if [ "$(grep -c 'BuildableName = "Jiejiebox.app"' "$scheme")" != "3" ]; then
+            echo "FAIL: expected all three SFM scheme application buildables to be Jiejiebox.app." >&2
+            exit 1
+          fi
+
+          # The neighbours this task must not touch.
+          for untouched in 'PRODUCT_NAME = SFM;' 'PRODUCT_BUNDLE_IDENTIFIER = "$(BASE_PACKAGE_IDENTIFIER).standalone";'; do
+            grep -qF "$untouched" "$pbx" || {
+              echo "FAIL: the prepared tree no longer contains '$untouched'." >&2
+              exit 1
+            }
+          done
+          if grep -q 'PRODUCT_NAME = "Jijiebox"\|PRODUCT_NAME = "JiejieBox"' "$pbx"; then
+            echo "FAIL: the macOS product name was spelled with the wrong casing." >&2
+            exit 1
+          fi
+          echo "PASS: the prepared macOS SFM app is branded Jiejiebox"
 
       - name: build unsigned DMG
         run: |
