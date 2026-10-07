@@ -51,7 +51,9 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
 $serviceName = "sing-box-daemon"
-$productDisplayName = "Jiejiebox"
+# Set once per run: the uninstall registry is dumped in full the first time an installation
+# is identified, so the record shows what the runner actually has.
+$candidateDumpWritten = $false
 $installationLayoutKey = "HKLM:\SOFTWARE\SagerNet\sing-box"
 
 $lines = New-Object System.Collections.Generic.List[string]
@@ -68,33 +70,49 @@ function Save-Record {
     [System.IO.File]::WriteAllLines($RecordPath, $lines)
 }
 
-function Get-UninstallEntry {
-    $roots = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
-    foreach ($root in $roots) {
-        $entries = Get-ItemProperty -Path $root -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq $productDisplayName }
-        if ($null -ne $entries) {
-            $first = @($entries)[0]
-            if ($null -ne $first) { return $first }
-        }
+
+function Get-InstallationState {
+    # Identity, in the only order that is a fact rather than a guess: the SCM's own record
+    # of the daemon's command line, the layout that implies, the installer's layout
+    # registry, and only then the uninstall entry whose InstallLocation IS that root.
+    #
+    # A display name is recorded as audit metadata and never used to match. It is the
+    # product name, while the installation directory and executable are deliberately
+    # "sing-box", so the name could legitimately be either - and a name cannot establish
+    # identity even when it matches, because the first entry with that name would win.
+    $commandLine = Get-DaemonServiceCommandLine
+    $daemonPath = Get-CommandExecutablePath $commandLine
+    $root = Get-InstallationRootFromDaemonPath $daemonPath
+    $layout = Get-InstallationLayoutRegistry
+    if ([string]::IsNullOrWhiteSpace($root) -and $null -eq $layout) { return $null }
+    $matches = @()
+    if (-not [string]::IsNullOrWhiteSpace($root)) {
+        $matches = @(Get-UninstallEntriesForInstallation -InstallationRoot $root)
     }
-    return $null
+    return [pscustomobject]@{
+        ServiceCommandLine   = $commandLine
+        DaemonPath           = $daemonPath
+        Root                 = $root
+        LayoutVersion        = $(if ($null -ne $layout) { $layout.LayoutVersion } else { $null })
+        InstallationID       = $(if ($null -ne $layout) { $layout.InstallationID } else { $null })
+        DaemonDataDirectory  = $(if ($null -ne $layout) { $layout.DaemonDataDirectory } else { $null })
+        UninstallMatches     = $matches
+    }
 }
 
-function Get-InstallationDirectory {
-    $entry = Get-UninstallEntry
-    if ($null -eq $entry) { return $null }
-    if (-not [string]::IsNullOrWhiteSpace($entry.InstallLocation)) {
-        return $entry.InstallLocation.Trim('"')
+
+function Add-InstallationIdentity {
+    param($State)
+    if ($null -eq $State) {
+        $lines.Add("  installation identity: absent")
+        return
     }
-    if (-not [string]::IsNullOrWhiteSpace($entry.UninstallString)) {
-        $match = [regex]::Match($entry.UninstallString, '^\s*"([^"]+)"')
-        if ($match.Success) { return (Split-Path -Parent $match.Groups[1].Value) }
-    }
-    return $null
+    $lines.Add("  service command line: $($State.ServiceCommandLine)")
+    $lines.Add("  derived install root: $($State.Root)")
+    $lines.Add("  layout version:       $($State.LayoutVersion)")
+    $lines.Add("  installation id:      $($State.InstallationID)")
+    $lines.Add("  daemon data dir:      $($State.DaemonDataDirectory)")
+    $lines.Add("  uninstall matches:    $(@($State.UninstallMatches).Count)")
 }
 
 function Get-ServiceState {
@@ -142,11 +160,12 @@ function Show-InstallerDiagnostic {
 function Show-Diagnostics {
     Show-InstallerDiagnostic
     foreach ($diagnostic in @(
-        @{ Name = "uninstall registry entry"; Command = { Get-UninstallEntry | Format-List DisplayName, DisplayVersion, InstallLocation, UninstallString | Out-String } },
+        @{ Name = "installation identity"; Command = { $state = Get-InstallationState; Add-InstallationIdentity $state | Out-Null; ($lines | Select-Object -Last 6) -join [Environment]::NewLine } },
+        @{ Name = "uninstall registry candidates"; Command = { (Format-UninstallEntries -Entries @(Get-UninstallRegistryEntries)) -join [Environment]::NewLine } },
         @{ Name = "$installationLayoutKey"; Command = { Get-ItemProperty -Path $installationLayoutKey -ErrorAction SilentlyContinue | Format-List | Out-String } },
         @{ Name = "sc.exe query $serviceName"; Command = { sc.exe query $serviceName 2>&1 | Out-String } },
         @{ Name = "service config"; Command = { sc.exe qc $serviceName 2>&1 | Out-String } },
-        @{ Name = "install directory"; Command = { $d = Get-InstallationDirectory; if ($d -and (Test-Path -LiteralPath $d)) { Get-ChildItem -LiteralPath $d -Recurse -File | Select-Object -First 60 FullName, Length | Format-Table -AutoSize | Out-String } else { "(not present)" } } },
+        @{ Name = "install directory"; Command = { $state = Get-InstallationState; $d = ""; if ($null -ne $state) { $d = $state.Root }; if ($d -and (Test-Path -LiteralPath $d)) { Get-ChildItem -LiteralPath $d -Recurse -File | Select-Object -First 60 FullName, Length | Format-Table -AutoSize | Out-String } else { "(not present)" } } },
         @{ Name = "sing-box-daemon processes"; Command = { Get-Process -Name "sing-box-daemon" -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, Path -AutoSize | Out-String } },
         @{ Name = "System log (sing-box sources)"; Command = { Get-EventLog -LogName System -Newest 60 -ErrorAction SilentlyContinue | Where-Object { $_.Source -match 'sing-box' } | Format-List TimeGenerated, Source, EntryType, Message | Out-String } },
         @{ Name = "Application log (sing-box sources)"; Command = { Get-EventLog -LogName Application -Newest 60 -ErrorAction SilentlyContinue | Where-Object { $_.Source -match 'sing-box' } | Format-List TimeGenerated, Source, EntryType, Message | Out-String } }
@@ -186,114 +205,147 @@ function Invoke-Silently {
     return $process.ExitCode
 }
 
+
 function Assert-Installed {
     param([string]$Phase)
-    $null = Wait-Until -Description "$Phase uninstall registry entry to appear" -TimeoutSeconds 180 -Condition {
-        $null -ne (Get-UninstallEntry)
+    $null = Wait-Until -Description "$Phase installation to become identifiable" -TimeoutSeconds 180 -Condition {
+        -not [string]::IsNullOrWhiteSpace((Get-InstallationRootFromDaemonPath (Get-CommandExecutablePath (Get-DaemonServiceCommandLine))))
     }
-    $installationDirectory = Get-InstallationDirectory
-    if ([string]::IsNullOrWhiteSpace($installationDirectory)) {
-        Fail-Gate "$Phase`: no $productDisplayName uninstall registry entry, so the install did not complete"
+    $state = Get-InstallationState
+    if ($null -eq $state -or [string]::IsNullOrWhiteSpace($state.Root)) {
+        Add-InstallationIdentity $state
+        Fail-Gate "$Phase`: no installation could be identified from the SCM"
     }
-    if (-not (Test-Path -LiteralPath $installationDirectory -PathType Container)) {
-        Fail-Gate "$Phase`: the registry names '$installationDirectory', which does not exist"
-    }
-    $lines.Add("  installation directory: $installationDirectory")
+    $root = $state.Root
+    $lines.Add("  installation root: $root")
 
     $required = [ordered]@{
-        "sing-box.exe"                                = (Join-Path $installationDirectory "sing-box.exe")
-        "resources\daemon\sing-box-daemon.exe"         = (Join-Path $installationDirectory "resources\daemon\sing-box-daemon.exe")
-        "resources\daemon\libcronet.dll"              = (Join-Path $installationDirectory "resources\daemon\libcronet.dll")
-        "resources\daemon\WinDivert64.sys"            = (Join-Path $installationDirectory "resources\daemon\WinDivert64.sys")
-        "resources\native\windows_share.node"         = (Join-Path $installationDirectory "resources\native\windows_share.node")
+        "sing-box.exe"                          = (Join-Path $root "sing-box.exe")
+        "resources\daemon\sing-box-daemon.exe" = (Join-Path $root "resources\daemon\sing-box-daemon.exe")
+        "resources\daemon\libcronet.dll"       = (Join-Path $root "resources\daemon\libcronet.dll")
+        "resources\daemon\WinDivert64.sys"     = (Join-Path $root "resources\daemon\WinDivert64.sys")
+        "resources\native\windows_share.node"  = (Join-Path $root "resources\native\windows_share.node")
     }
     foreach ($name in $required.Keys) {
-        $path = $required[$name]
-        $exists = Test-Path -LiteralPath $path -PathType Leaf
+        $exists = Test-Path -LiteralPath $required[$name] -PathType Leaf
         $lines.Add("  $name : $(if ($exists) { 'present' } else { 'MISSING' })")
-        if (-not $exists) { Fail-Gate "$Phase`: $name is missing at $path" }
+        if (-not $exists) { Fail-Gate "$Phase`: $name is missing at $($required[$name])" }
     }
 
-    # The application executable must keep the name the daemon authenticates it by. If a
-    # future branding change renames it, the service registration fails and this says why
-    # rather than reporting a mysterious service error.
-    if (-not (Test-Path -LiteralPath (Join-Path $installationDirectory "sing-box.exe") -PathType Leaf)) {
-        Fail-Gate "$Phase`: <install>/sing-box.exe is absent; experimental/boxdd authenticates the application by exactly that path"
+    if ($null -eq $state.LayoutVersion -or [int]$state.LayoutVersion -ne 2) {
+        Fail-Gate "$Phase`: HKLM SagerNet sing-box does not record LayoutVersion 2 (found '$($state.LayoutVersion)'); clients/desktop reads that key at startup"
+    }
+    $lines.Add("  layout registry: LayoutVersion 2, InstallationID $($state.InstallationID)")
+
+    # Fail closed on the uninstall entry, and never silently pick the first.
+    $matches = @($state.UninstallMatches)
+    if ($matches.Count -eq 0) {
+        $lines.Add("  uninstall entries: NONE matched $root; every candidate follows")
+        foreach ($line in (Format-UninstallEntries -Entries @(Get-UninstallRegistryEntries))) { $lines.Add($line) }
+        Fail-Gate "$Phase`: no uninstall registry entry has an InstallLocation - or an uninstaller - inside $root"
+    }
+    if ($matches.Count -gt 1) {
+        $lines.Add("  uninstall entries: $($matches.Count) matched $root")
+        foreach ($line in (Format-UninstallEntries -Entries $matches)) { $lines.Add($line) }
+        Fail-Gate "$Phase`: $($matches.Count) uninstall registry entries match $root; refusing to choose one"
+    }
+    if (-not $candidateDumpWritten) {
+        $candidateDumpWritten = $true
+        $allCandidates = @(Get-UninstallRegistryEntries)
+        $lines.Add("  every uninstall registry entry on this machine: $($allCandidates.Count)")
+        foreach ($line in (Format-UninstallEntries -Entries $allCandidates)) { $lines.Add($line) }
+    }
+
+    $entry = $matches[0].Entry
+    $lines.Add("  uninstall entry:    $($entry.PSPath)")
+    $lines.Add("  display name:       $($entry.DisplayName)   (audit metadata only, never a key)")
+    $lines.Add("  display version:    $($entry.DisplayVersion)")
+    $lines.Add("  install location:   $($entry.InstallLocation)")
+    $lines.Add("  uninstall string:   $($entry.UninstallString)")
+    $lines.Add("  matched by:         $($matches[0].MatchMethod)")
+    if ([string]::IsNullOrWhiteSpace($entry.UninstallString)) {
+        Fail-Gate "$Phase`: the matched uninstall entry has no UninstallString"
     }
 
     $daemonPath = $required["resources\daemon\sing-box-daemon.exe"]
     $version = Invoke-NativeCommand { & $daemonPath version }
-    $versionExit = $version.ExitCode
     $versionOutput = $version.Output.Trim()
-    $lines.Add("  daemon version: $versionOutput (exit code $versionExit)")
-    if ($versionExit -ne 0) { Fail-Gate "$Phase`: the installed daemon's version command exited $versionExit" }
+    $lines.Add("  daemon version: $versionOutput (exit code $($version.ExitCode))")
+    if ($version.ExitCode -ne 0) { Fail-Gate "$Phase`: the installed daemon's version command exited $($version.ExitCode)" }
     if ($versionOutput -notmatch [regex]::Escape("version $ExpectedVersion")) {
         Fail-Gate "$Phase`: the installed daemon reports '$versionOutput', expected version $ExpectedVersion"
     }
 
-    $state = Get-ServiceState
-    $lines.Add("  service: $state")
-    if ($state -ne "Running") {
-        Fail-Gate "$Phase`: the $serviceName service is '$state', expected Running"
+    $serviceState = Get-ServiceState
+    $lines.Add("  service: $serviceState")
+    if ($serviceState -ne "Running") {
+        Fail-Gate "$Phase`: the $serviceName service is '$serviceState', expected Running"
     }
 
-    $layout = Get-ItemProperty -Path $installationLayoutKey -ErrorAction SilentlyContinue
-    $layoutVersion = $null
-    if ($null -ne $layout) { $layoutVersion = $layout.LayoutVersion }
-    $lines.Add("  installation layout version: $(if ($null -ne $layoutVersion) { $layoutVersion } else { '(absent)' })")
-    if ($null -eq $layoutVersion -or [int]$layoutVersion -ne 2) {
-        Fail-Gate "$Phase`: $installationLayoutKey does not record LayoutVersion 2; clients/desktop reads that key at startup"
-    }
-
-    return $installationDirectory
+    return [pscustomobject]@{ Root = $root; UninstallEntry = $entry }
 }
 
+
 function Invoke-Uninstall {
-    param([string]$Phase)
-    $entry = Get-UninstallEntry
-    if ($null -eq $entry -or [string]::IsNullOrWhiteSpace($entry.UninstallString)) {
-        Fail-Gate "$Phase`: there is no uninstall command to run"
+    param([string]$Phase, [Parameter(Mandatory = $true)]$UninstallEntry)
+    # The uninstaller is the one the discovered entry names. No path is constructed from a
+    # product name.
+    $uninstallString = [string]$UninstallEntry.UninstallString
+    if ([string]::IsNullOrWhiteSpace($uninstallString)) {
+        Fail-Gate "$Phase`: the matched uninstall entry has no UninstallString"
     }
-    $match = [regex]::Match($entry.UninstallString, '^\s*"([^"]+)"')
-    if (-not $match.Success) {
-        Fail-Gate "$Phase`: could not parse the uninstall command '$($entry.UninstallString)'"
-    }
-    $uninstaller = $match.Groups[1].Value
-    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-        Fail-Gate "$Phase`: the uninstaller '$uninstaller' does not exist"
+    $uninstaller = Get-CommandExecutablePath $uninstallString
+    if ([string]::IsNullOrWhiteSpace($uninstaller) -or -not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+        Fail-Gate "$Phase`: the uninstaller '$uninstaller' named by $($UninstallEntry.PSPath) does not exist"
     }
     # The installer's own rollback uses exactly this pair, so it is the supported one.
     $exitCode = Invoke-Silently -FilePath $uninstaller -Arguments @("/S", "/allusers") -What "$Phase uninstall"
     if ($exitCode -ne 0) { Fail-Gate "$Phase`: the uninstaller exited $exitCode" }
-    return $uninstaller
 }
 
+
 function Assert-Uninstalled {
-    param([string]$Phase)
-    $null = Wait-Until -Description "$Phase uninstall to settle (no service, no uninstall entry)" -TimeoutSeconds 300 -Condition {
-        ($null -eq (Get-UninstallEntry)) -and ((Get-ServiceState) -eq "absent")
+    param([string]$Phase, [string]$InstallationRoot, $UninstallEntry)
+    $null = Wait-Until -Description "$Phase uninstall to settle" -TimeoutSeconds 300 -Condition {
+        ($null -eq (Get-DaemonServiceCommandLine)) -and ($null -eq (Get-InstallationLayoutRegistry))
     }
+
     $state = Get-ServiceState
     $lines.Add("  service after uninstall: $state")
     if ($state -ne "absent") { Fail-Gate "$Phase`: the $serviceName service is still '$state'" }
-
-    # The service must be gone, so a non-zero `sc.exe query` is the expected outcome and
-    # is asserted as one rather than tolerated.
     $query = Invoke-NativeCommand { sc.exe query $serviceName }
-    if ($query.ExitCode -eq 0) {
-        Fail-Gate "$Phase`: sc.exe query still reports $serviceName"
-    }
+    if ($query.ExitCode -eq 0) { Fail-Gate "$Phase`: sc.exe query still reports $serviceName" }
     if ($query.Output -match "marked for deletion") {
         Fail-Gate "$Phase`: the service is marked for deletion; the next install would fail"
     }
 
-    $entry = Get-UninstallEntry
-    if ($null -ne $entry) {
-        Fail-Gate "$Phase`: the $productDisplayName uninstall registry entry survived uninstall"
+    if ($null -ne (Get-InstallationLayoutRegistry)) {
+        Fail-Gate "$Phase`: the installer layout registry key survived uninstall"
     }
-    $layout = Get-ItemProperty -Path $installationLayoutKey -ErrorAction SilentlyContinue
-    if ($null -ne $layout) {
-        Fail-Gate "$Phase`: $installationLayoutKey survived uninstall"
+    $lines.Add("  layout registry: absent")
+
+    if ($null -ne $UninstallEntry) {
+        $survivors = @(Get-UninstallRegistryEntries | Where-Object { $_.PSPath -eq $UninstallEntry.PSPath })
+        if ($survivors.Count -gt 0) {
+            Fail-Gate "$Phase`: the uninstall registry entry $($UninstallEntry.PSPath) survived uninstall"
+        }
+        $lines.Add("  uninstall entry: absent ($($UninstallEntry.PSPath))")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallationRoot)) {
+        foreach ($relative in @("sing-box.exe", "resources\daemon\sing-box-daemon.exe")) {
+            $path = Join-Path $InstallationRoot $relative
+            if (Test-Path -LiteralPath $path) {
+                Fail-Gate "$Phase`: $relative survived uninstall at $path"
+            }
+        }
+        $lines.Add("  product payload: absent from $InstallationRoot")
+        if (Test-Path -LiteralPath $InstallationRoot) {
+            # Reported rather than failed: only product payload is asserted absent. A left
+            # behind log or an empty directory is not a broken installation.
+            $remaining = @(Get-ChildItem -LiteralPath $InstallationRoot -Recurse -File -ErrorAction SilentlyContinue)
+            $lines.Add("  note: the installation directory remains with $($remaining.Count) file(s)")
+        }
     }
 
     $remaining = @(Get-Process -Name "sing-box-daemon" -ErrorAction SilentlyContinue)
@@ -340,13 +392,26 @@ $env:PSModulePath = $installerModulePath
 
 # A previous gate may have left a service behind; a clean state is a precondition, and it
 # is reported rather than assumed.
-if ((Get-ServiceState) -ne "absent" -or $null -ne (Get-UninstallEntry)) {
+$preconditionState = Get-InstallationState
+$preconditionMatches = @()
+if ($null -ne $preconditionState) { $preconditionMatches = @($preconditionState.UninstallMatches) }
+if ((Get-ServiceState) -ne "absent" -or $null -ne $preconditionState -or $preconditionMatches.Count -gt 1) {
     $lines.Add("clean state: a previous installation or service was present; removing it first")
     Write-Host "an installation or service was already present; uninstalling before the test"
-    if ($null -ne (Get-UninstallEntry)) { Invoke-Uninstall -Phase "precondition" | Out-Null }
-    else {
-        # Best effort: the service may already be gone, so this exit code is expected to be
-        # non-zero sometimes and is captured and cleared rather than inherited.
+    Add-InstallationIdentity $preconditionState
+    if ($preconditionMatches.Count -gt 1) {
+        foreach ($line in (Format-UninstallEntries -Entries $preconditionMatches)) { $lines.Add($line) }
+        Fail-Gate "the machine has $($preconditionMatches.Count) installations matching one root; refusing to remove one"
+    }
+    if ($preconditionMatches.Count -eq 1) {
+        # Only this installation's own uninstaller, discovered structurally.
+        Invoke-Uninstall -Phase "precondition" -UninstallEntry $preconditionMatches[0].Entry
+    } elseif ($null -ne $preconditionState -and -not [string]::IsNullOrWhiteSpace($preconditionState.Root)) {
+        # A service without a usable uninstall entry: remove only that service, and say so.
+        $lines.Add("precondition: no uninstall entry matched $($preconditionState.Root); deleting the service only")
+        $deleted = Invoke-NativeCommand { sc.exe delete $serviceName }
+        $lines.Add("precondition: sc.exe delete exited $($deleted.ExitCode)")
+    } elseif ((Get-ServiceState) -ne "absent") {
         $deleted = Invoke-NativeCommand { sc.exe delete $serviceName }
         $lines.Add("precondition: sc.exe delete exited $($deleted.ExitCode)")
     }
@@ -364,7 +429,9 @@ if ($exitCode -ne 0) {
     # Which stage aborted is not inferred from the exit code; the diagnostic channel says.
     Fail-Gate "the installer exited $exitCode. The stage that aborted is recorded in the installer diagnostic channel above."
 }
-$installationDirectory = Assert-Installed -Phase "after first install"
+$installed = Assert-Installed -Phase "after first install"
+$installationRoot = $installed.Root
+$uninstallEntry = $installed.UninstallEntry
 $lines.Add("  PASS")
 $lines.Add("")
 
@@ -373,29 +440,17 @@ $lines.Add("[2/5] same-version reinstall")
 $exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments (Get-InstallArguments) -What "reinstall"
 $lines.Add("  exit code $exitCode")
 if ($exitCode -ne 0) { Fail-Gate "the same-version reinstall exited $exitCode" }
-$null = Assert-Installed -Phase "after same-version reinstall"
-$lines.Add("  PASS (no ERROR_SERVICE_EXISTS, no marked-for-deletion, no StopPending stall)")
+$reinstalled = Assert-Installed -Phase "after same-version reinstall"
+if ($reinstalled.Root -ne $installationRoot) {
+    Fail-Gate "the reinstall moved the installation from $installationRoot to $($reinstalled.Root)"
+}
+$lines.Add("  PASS (same root, no ERROR_SERVICE_EXISTS, no marked-for-deletion, no StopPending stall)")
 $lines.Add("")
 
 # --- uninstall ---------------------------------------------------------------
 $lines.Add("[3/5] silent uninstall")
-$null = Invoke-Uninstall -Phase "first"
-Assert-Uninstalled -Phase "after first uninstall"
-$leftover = @(Test-Path -LiteralPath $installationDirectory)
-$lines.Add("  installation directory still present: $($leftover[0])")
-if ($leftover[0]) {
-    $remainingFiles = @(Get-ChildItem -LiteralPath $installationDirectory -Recurse -File -ErrorAction SilentlyContinue)
-    $names = ($remainingFiles | Select-Object -First 10 -ExpandProperty Name) -join ", "
-    $lines.Add("  remaining files: $($remainingFiles.Count) ($names)")
-    $appExecutable = Join-Path $installationDirectory "sing-box.exe"
-    if (Test-Path -LiteralPath $appExecutable) {
-        Fail-Gate "sing-box.exe survived uninstall at $appExecutable"
-    }
-    $daemonExecutable = Join-Path $installationDirectory "resources\daemon\sing-box-daemon.exe"
-    if (Test-Path -LiteralPath $daemonExecutable) {
-        Fail-Gate "the daemon survived uninstall at $daemonExecutable"
-    }
-}
+Invoke-Uninstall -Phase "first" -UninstallEntry $uninstallEntry
+Assert-Uninstalled -Phase "after first uninstall" -InstallationRoot $installationRoot -UninstallEntry $uninstallEntry
 $lines.Add("  PASS")
 $lines.Add("")
 
@@ -404,14 +459,16 @@ $lines.Add("[4/5] clean reinstall after a full uninstall")
 $exitCode = Invoke-Silently -FilePath $InstallerPath -Arguments (Get-InstallArguments) -What "reinstall"
 $lines.Add("  exit code $exitCode")
 if ($exitCode -ne 0) { Fail-Gate "the clean reinstall exited $exitCode" }
-$installationDirectory = Assert-Installed -Phase "after clean reinstall"
+$reinstalled = Assert-Installed -Phase "after clean reinstall"
+$installationRoot = $reinstalled.Root
+$uninstallEntry = $reinstalled.UninstallEntry
 $lines.Add("  PASS")
 $lines.Add("")
 
 # --- final teardown ----------------------------------------------------------
 $lines.Add("[5/5] final uninstall")
-$null = Invoke-Uninstall -Phase "final"
-Assert-Uninstalled -Phase "after final uninstall"
+Invoke-Uninstall -Phase "final" -UninstallEntry $uninstallEntry
+Assert-Uninstalled -Phase "after final uninstall" -InstallationRoot $installationRoot -UninstallEntry $uninstallEntry
 $lines.Add("  PASS")
 $lines.Add("")
 

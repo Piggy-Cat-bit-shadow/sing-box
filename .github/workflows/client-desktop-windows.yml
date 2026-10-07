@@ -492,18 +492,33 @@ jobs:
             $deleted = Invoke-NativeCommand { sc.exe delete "sing-box-daemon" }
             Write-Host "  sc.exe delete exited $($deleted.ExitCode)"
           }
-          $entries = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -eq "Jiejiebox" }
-          foreach ($entry in @($entries)) {
-            if ($null -eq $entry -or [string]::IsNullOrWhiteSpace($entry.UninstallString)) { continue }
-            $match = [regex]::Match($entry.UninstallString, '^\s*"([^"]+)"')
-            if (-not $match.Success) { continue }
-            $uninstaller = $match.Groups[1].Value
-            if (Test-Path -LiteralPath $uninstaller) {
-              Write-Host "running leftover uninstaller $uninstaller"
-              $process = Start-Process -FilePath $uninstaller -ArgumentList "/S", "/allusers" -PassThru
-              $null = $process | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+          # Identity comes from the shared resolver, not from a display name. The installation
+          # directory and executable are "sing-box" while the product name is "Jiejiebox", so
+          # matching on the name would be both wrong and unsafe: it would also match an entry
+          # this test did not create.
+          $state = Get-InstallationState
+          if ($null -ne $state) {
+            Write-Host "leftover installation: root=$($state.Root) layoutVersion=$($state.LayoutVersion)"
+            $matches = @($state.UninstallMatches)
+            if ($matches.Count -eq 1) {
+              $uninstaller = Get-CommandExecutablePath ([string]$matches[0].Entry.UninstallString)
+              if (Test-Path -LiteralPath $uninstaller) {
+                Write-Host "running the discovered uninstaller $uninstaller"
+                $process = Start-Process -FilePath $uninstaller -ArgumentList "/S", "/allusers" -PassThru
+                $null = $process | Wait-Process -Timeout 600 -ErrorAction SilentlyContinue
+              } else {
+                Write-Host "::warning::the matched uninstall entry's uninstaller does not exist: $uninstaller"
+              }
+            } elseif ($matches.Count -gt 1) {
+              Write-Host "::warning::$($matches.Count) uninstall entries match $($state.Root); removing none of them"
+              foreach ($line in (Format-UninstallEntries -Entries $matches)) { Write-Host $line }
+            } else {
+              Write-Host "no uninstall entry matched $($state.Root); deleting only the service"
+              $deleted = Invoke-NativeCommand { sc.exe delete "sing-box-daemon" }
+              Write-Host "  sc.exe delete exited $($deleted.ExitCode)"
             }
+          } else {
+            Write-Host "no leftover installation was identifiable"
           }
           foreach ($leftover in @($env:SERVICE_WORK_DIR, "C:\Program Files\sing-box-ci-probe", "C:\ProgramData\sing-box-daemon")) {
             if (Test-Path -LiteralPath $leftover) {
