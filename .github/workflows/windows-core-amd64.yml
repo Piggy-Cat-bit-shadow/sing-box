@@ -79,7 +79,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/version.sh >> "$GITHUB_ENV"
+          # Values written to $GITHUB_ENV reach LATER steps only, so anything this step needs
+          # itself is read from the same output right here. Referring to $JJ_VERSION in this
+          # step is an unbound variable under `set -u`, which is exactly how the first run
+          # failed.
+          version_env="$(bash scripts/ci/version.sh)"
+          printf '%s\n' "$version_env" >> "$GITHUB_ENV"
+          version_now="$(printf '%s\n' "$version_env" | sed -n 's/^JJ_VERSION=//p')"
+          [ -n "$version_now" ] || { echo "FAIL: version.sh did not report JJ_VERSION" >&2; exit 1; }
 
           source_ref="${{ github.event.inputs.source_ref }}"
           [ -n "$source_ref" ] || source_ref="${{ github.ref_name }}"
@@ -114,14 +121,14 @@ jobs:
             echo "BUILD_TAGS=$tags"
             echo "TAGS_FILE=$tags_file"
             echo "ARTIFACT_NAME=sing-box.exe"
-            echo "ZIP_NAME=jiejie-sing-box-windows-amd64-v$JJ_VERSION.zip"
-            echo "UPLOAD_NAME=windows-core-amd64-v$JJ_VERSION"
+            echo "ZIP_NAME=jiejie-sing-box-windows-amd64-v$version_now.zip"
+            echo "UPLOAD_NAME=windows-core-amd64-v$version_now"
           } >> "$GITHUB_ENV"
 
           echo "source ref     : $source_ref"
           echo "source commit  : $source_commit"
           echo "workflow commit: ${{ github.sha }}"
-          echo "version        : $JJ_VERSION"
+          echo "version        : $version_now"
           echo "tags profile   : $TAGS_PROFILE"
           echo "tags file      : $tags_file"
           echo "tags           : $tags"
