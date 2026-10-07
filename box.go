@@ -15,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/netns"
+	"github.com/sagernet/sing-box/common/power"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
@@ -33,11 +34,33 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 )
 
 var _ adapter.SimpleLifecycle = (*Box)(nil)
+
+// applyPauseEvent is the whole bridge between the platform's lifecycle and the power governor.
+//
+// It is a named function rather than an inline closure so the mapping can be tested without building
+// a Box: this is the only place the two vocabularies meet, and a mis-mapped event here would show up
+// as a device that never sleeps rather than as anything resembling a failure.
+func applyPauseEvent(governor *power.Governor, event int) {
+	if governor == nil {
+		return
+	}
+	switch event {
+	case pause.EventDevicePaused:
+		governor.DevicePaused()
+	case pause.EventDeviceWake:
+		governor.DeviceWake()
+	case pause.EventNetworkPause:
+		governor.NetworkPaused()
+	case pause.EventNetworkWake:
+		governor.NetworkWake()
+	}
+}
 
 type Box struct {
 	ctx context.Context
@@ -45,6 +68,9 @@ type Box struct {
 	// the caller supplied one, so a Box never closes state it does not own.
 	ownedURLTestHistory *urltest.HistoryStorage
 	createdAt           time.Time
+	powerGovernor       *power.Governor
+	pauseManager        pause.Manager
+	pauseCallback       *list.Element[pause.Callback]
 	debugOptions        option.DebugOptions
 	logFactory          log.Factory
 	logger              log.ContextLogger
@@ -185,6 +211,16 @@ func New(options Options) (*Box, error) {
 	}
 
 	ctx = pause.WithDefaultManager(ctx)
+	// The power governor is the single authority for how much background work is allowed while the
+	// device is asleep. It is registered as a service so a subsystem asks it rather than deriving a
+	// sleep policy of its own, and it is driven from the platform's own lifecycle rather than from a
+	// timer: see common/power.
+	powerGovernor := power.NewGovernor(power.DefaultPolicy())
+	service.MustRegister[*power.Governor](ctx, powerGovernor)
+	pauseManager := service.FromContext[pause.Manager](ctx)
+	pauseCallback := pauseManager.RegisterCallback(func(event int) {
+		applyPauseEvent(powerGovernor, event)
+	})
 	experimentalOptions := common.PtrValueOrDefault(options.Experimental)
 	debugOptions := common.PtrValueOrDefault(experimentalOptions.Debug)
 	err := checkDebugOptions(debugOptions)
@@ -580,6 +616,9 @@ func New(options Options) (*Box, error) {
 		referenceManager:    referenceManager,
 		httpClientService:   httpClientService,
 		createdAt:           createdAt,
+		powerGovernor:       powerGovernor,
+		pauseManager:        pauseManager,
+		pauseCallback:       pauseCallback,
 		debugOptions:        debugOptions,
 		logFactory:          logFactory,
 		logger:              logFactory.Logger(),
@@ -769,6 +808,16 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() error {
+	// The governor is closed first and its callback unregistered, so no lifecycle event can arrive
+	// while the scope is tearing down components that would have asked it what to do.
+	if s.pauseManager != nil && s.pauseCallback != nil {
+		s.pauseManager.UnregisterCallback(s.pauseCallback)
+		s.pauseCallback = nil
+	}
+	if s.powerGovernor != nil {
+		s.powerGovernor.Close()
+		s.powerGovernor = nil
+	}
 	// The scope owns teardown. Every component registered through scope.Start, and everything that
 	// added itself through scope.Add, is closed here in reverse registration order - which is the
 	// ordering the old hand-written close list was trying to express.
