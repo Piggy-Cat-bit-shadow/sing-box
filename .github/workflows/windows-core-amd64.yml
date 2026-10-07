@@ -1,0 +1,284 @@
+name: Windows amd64 core
+
+# One custom sing-box core for Windows, for an external loader.
+#
+# This builds the CORE BINARY ONLY: ./cmd/sing-box for GOOS=windows GOARCH=amd64.
+# It deliberately contains no Electron, no pnpm, no Node, no NSIS, no installer, no
+# service installation, no daemon and no Authenticode signing. Those belonged to the
+# retired desktop experiment, where we were trying to make this fork fit upstream's
+# desktop client. We no longer do that: we ship a core and let a third-party loader
+# consume it.
+#
+# The recipe is upstream's own core release recipe, taken from SagerNet/sing-box
+# .github/workflows/build.yml (CGO_ENABLED=0, GOOS/GOARCH, -trimpath,
+# -ldflags "-X constant.Version=... $(cat release/LDFLAGS) -s -w -buildid=",
+# ./cmd/sing-box) and identical to this repository's own Makefile `build` target.
+# The one deliberate difference from upstream is the tag set: upstream ships Windows
+# without Native Naive, and this fork's whole point is that it has it.
+#
+# Not adopted from upstream: the legacy Windows 7 toolchain
+# (.github/setup_go_for_windows7.sh, which upstream applies to its windows/amd64 and
+# windows/386 rows). It is a patched Go build whose purpose is Windows 7 API
+# compatibility; this artifact targets Windows 10/11 x64 under an external loader.
+# Everything else in upstream's recipe is copied. If Windows 7 support is ever
+# wanted, that step is the only thing to add.
+#
+# Phase 3 (choosing and validating the loader/GUI) is out of scope here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags_profile:
+        description: >-
+          fork-windows builds the release artifact (Native Naive included).
+          upstream-baseline is a locator probe only: it reproduces upstream's
+          Windows tag set, which has no Native Naive, to prove the check below can
+          tell the two apart.
+        type: choice
+        options:
+          - fork-windows
+          - upstream-baseline
+        default: fork-windows
+
+permissions:
+  contents: read
+
+env:
+  # Upstream's core release toolchain. go.mod declares the minimum language version
+  # (go 1.25.5); this is the toolchain upstream actually builds its releases with.
+  GO_VERSION: "1.26.8"
+  GOOS_TARGET: windows
+  GOARCH_TARGET: amd64
+  ARTIFACT_NAME: sing-box.exe
+  ZIP_NAME: sing-box-v0.1.5-windows-amd64.zip
+
+jobs:
+  core:
+    name: sing-box.exe (windows/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tooling
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve the version and the build tags
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/ci/version.sh >> "$GITHUB_ENV"
+
+          case "${{ inputs.tags_profile }}" in
+            fork-windows)      tags_file=release/DEFAULT_BUILD_TAGS_WINDOWS ;;
+            upstream-baseline) tags_file=release/DEFAULT_BUILD_TAGS_OTHERS ;;
+            *) echo "unknown tags_profile" >&2; exit 1 ;;
+          esac
+          # Read the tag set from the repository. Never hand-write a tag list here:
+          # whoever maintains release/*_BUILD_TAGS is the single source of truth.
+          tags="$(tr -d '[:space:]' < "$tags_file")"
+          echo "BUILD_TAGS=$tags" >> "$GITHUB_ENV"
+          {
+            echo "TAGS_FILE=$tags_file"
+            echo "TAGS_COUNT=$(tr ',' '\n' <<<"$tags" | wc -l)"
+          } >> "$GITHUB_ENV"
+          echo "tags profile : ${{ inputs.tags_profile }}"
+          echo "tags file    : $tags_file"
+          echo "tags         : $tags"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Report the resolved inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "version        : $JJ_VERSION"
+          echo "commit         : $JJ_COMMIT"
+          echo "go (declared)  : $JJ_GO_VERSION"
+          echo "go (toolchain) : $(go version)"
+          echo "tags           : $BUILD_TAGS"
+          echo "target         : $GOOS_TARGET/$GOARCH_TARGET  CGO_ENABLED=0"
+
+      - name: Build the Windows core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          export CGO_ENABLED=0 GOOS="$GOOS_TARGET" GOARCH="$GOARCH_TARGET"
+          ldflags="-X 'github.com/sagernet/sing-box/constant.Version=$JJ_VERSION' $(cat release/LDFLAGS) -s -w -buildid="
+
+          # The release artifact: exactly the repository's own recipe.
+          go build -v -trimpath -o "dist/$ARTIFACT_NAME" -tags "$BUILD_TAGS" \
+            -ldflags "$ldflags" ./cmd/sing-box
+
+          # Two symbol-bearing builds, only so the feature check below can inspect what was
+          # linked in. They must NOT carry -s -w: stripping removes the symbol table, and
+          # `go tool nm` then reports zero symbols for everything - which would fail the
+          # feature check on a perfectly good artifact. The version stamp and
+          # release/LDFLAGS are kept so these differ from the artifact only by stripping.
+          inspect_ldflags="-X 'github.com/sagernet/sing-box/constant.Version=$JJ_VERSION' $(cat release/LDFLAGS)"
+
+          go build -trimpath -o dist/sing-box-unstripped.exe -tags "$BUILD_TAGS" \
+            -ldflags "$inspect_ldflags" ./cmd/sing-box
+
+          # Negative control: upstream's Windows tag set, which has no Native Naive.
+          # Without this, a feature check that always reports "present" would prove nothing.
+          go build -trimpath -o dist/control-baseline.exe -tags "$(tr -d '[:space:]' < release/DEFAULT_BUILD_TAGS_OTHERS)" \
+            -ldflags "$inspect_ldflags" ./cmd/sing-box
+
+          ls -la dist
+
+      - name: Verify the binary is a windows/amd64 PE
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct, sys
+          p = "dist/sing-box.exe"
+          data = open(p, "rb").read()
+          assert data[:2] == b"MZ", "not an MZ executable"
+          pe = struct.unpack_from("<I", data, 0x3C)[0]
+          assert data[pe:pe+4] == b"PE\0\0", "no PE signature"
+          machine = struct.unpack_from("<H", data, pe + 4)[0]
+          magic = struct.unpack_from("<H", data, pe + 24)[0]
+          names = {0x014c: "i386", 0x8664: "amd64", 0xAA64: "arm64", 0x01c4: "arm"}
+          got = names.get(machine, hex(machine))
+          print(f"PE machine   : {got} ({hex(machine)})")
+          print(f"optional hdr : {hex(magic)} ({'PE32+' if magic == 0x20b else 'PE32'})")
+          if got != "amd64":
+              sys.exit(f"FAIL: expected amd64, got {got}")
+          if magic != 0x20b:
+              sys.exit("FAIL: expected PE32+")
+          print("PASS: windows amd64 PE32+")
+          PY
+          echo
+          echo "=== go version -m (build metadata embedded in the artifact) ==="
+          go version -m "dist/$ARTIFACT_NAME"
+
+      - name: Verify the custom features are actually linked in
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Symbol-level, not string-level: a feature that was compiled out leaves no
+          # package symbols at all. The baseline control is what makes this meaningful
+          # - if it also reported the feature present, the check would prove nothing.
+          count() { go tool nm "$1" 2>/dev/null | grep -cE "$2" || true; }
+
+          # Native Naive's OUTBOUND is the tag-gated half: protocol/naive/outbound.go carries
+          # //go:build with_naive_outbound, while the inbound is built unconditionally.
+          # Counting the whole package would be a fake check - measured against the control
+          # below, an upstream-tag build still contains 180 protocol/naive symbols, so only
+          # the gated constructor discriminates. MASQUE is not tag-gated at all (it arrives
+          # with the QUIC stack), which the control confirms by containing it too.
+          NAIVE_RE='sing-box/protocol/naive\.NewOutbound'
+          MASQUE_RE='sing-box/protocol/masque\.'
+
+          naive_release="$(count dist/sing-box-unstripped.exe "$NAIVE_RE")"
+          naive_control="$(count dist/control-baseline.exe "$NAIVE_RE")"
+          masque_release="$(count dist/sing-box-unstripped.exe "$MASQUE_RE")"
+          masque_control="$(count dist/control-baseline.exe "$MASQUE_RE")"
+
+          echo "protocol/naive  symbols: release=$naive_release control=$naive_control"
+          echo "protocol/masque symbols: release=$masque_release control=$masque_control"
+          echo
+
+          if [ "$naive_control" -ne 0 ]; then
+            echo "FAIL: the control build contains the gated Native Naive outbound, so this" >&2
+            echo "      check cannot discriminate and would prove nothing" >&2
+            exit 1
+          fi
+          echo "control is sound: upstream's tag set really does exclude the Native Naive outbound"
+          echo "(MASQUE present in the control too, as expected: it is not tag-gated)"
+
+          status() { [ "$1" -gt 0 ] && echo COMPILED || echo "NOT COMPILED"; }
+          echo "Native Naive  : $(status "$naive_release")"
+          echo "MASQUE        : $(status "$masque_release")"
+
+          if [ "$naive_release" -le 0 ]; then
+            echo "FAIL: the release build does not contain Native Naive." >&2
+            echo "      A core without it is not the core this fork exists to ship." >&2
+            exit 1
+          fi
+          if [ "$masque_release" -le 0 ]; then
+            echo "FAIL: the release build does not contain MASQUE" >&2
+            exit 1
+          fi
+          echo "PASS: Native Naive and MASQUE are linked into the artifact"
+
+          # Record the evidence with the artifact.
+          {
+            echo "naive_symbols_release=$naive_release"
+            echo "naive_symbols_control=$naive_control"
+            echo "masque_symbols_release=$masque_release"
+            echo "masque_symbols_control=$masque_control"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the checksums and the build record
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256="$(sha256sum "$ARTIFACT_NAME" | cut -d' ' -f1)"
+          size="$(stat -c %s "$ARTIFACT_NAME")"
+
+          cat > build-info.json <<JSON
+          {
+            "version": "$JJ_VERSION",
+            "git_commit": "$JJ_COMMIT",
+            "branch": "$JJ_BRANCH",
+            "goos": "$GOOS_TARGET",
+            "goarch": "$GOARCH_TARGET",
+            "go_toolchain": "$(go version | awk '{print $3}')",
+            "go_declared_in_go_mod": "$JJ_GO_VERSION",
+            "cgo_enabled": false,
+            "build_tags": "$BUILD_TAGS",
+            "tags_file": "$TAGS_FILE",
+            "tags_profile": "${{ inputs.tags_profile }}",
+            "ldflags": "-X constant.Version=$JJ_VERSION \$(cat release/LDFLAGS) -s -w -buildid= -trimpath",
+            "trimpath": true,
+            "unsigned": true,
+            "authenticode_signed": false,
+            "purpose": "external-loader-core",
+            "native_naive": true,
+            "masque": true,
+            "naive_symbols_release": $naive_symbols_release,
+            "naive_symbols_control": $naive_symbols_control,
+            "masque_symbols_release": $masque_symbols_release,
+            "masque_symbols_control": $masque_symbols_control,
+            "artifact": "$ARTIFACT_NAME",
+            "size": $size,
+            "sha256": "$sha256"
+          }
+          JSON
+          cat build-info.json
+          sha256sum "$ARTIFACT_NAME" build-info.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Package the loader-consumable artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f sing-box-unstripped.exe control-baseline.exe
+          cp "$ARTIFACT_NAME" sing-box.exe
+          zip -q "$ZIP_NAME" sing-box.exe SHA256SUMS build-info.json
+          unzip -l "$ZIP_NAME"
+          echo "artifact : $ZIP_NAME"
+          echo "inner    : sing-box.exe"
+          echo "sha256   : $(sha256sum "$ARTIFACT_NAME" | cut -d' ' -f1)"
+
+      - name: Upload the core and its records
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-core-amd64-${{ inputs.tags_profile }}
+          path: |
+            dist/${{ env.ZIP_NAME }}
+            dist/${{ env.ARTIFACT_NAME }}
+            dist/SHA256SUMS
+            dist/build-info.json
+          if-no-files-found: error
+          retention-days: 30
