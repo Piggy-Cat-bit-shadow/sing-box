@@ -328,9 +328,9 @@ jobs:
           rm -rf _verify && mkdir _verify
           unzip -q "$ZIP_NAME" -d _verify
 
-          expected="build-info.json
-          SHA256SUMS
-          sing-box.exe"
+          # Both sides sorted: find|sort is ASCII-ordered, so an unsorted expected list
+          # never matches even when the contents are correct.
+          expected="$(printf '%s\n' build-info.json SHA256SUMS sing-box.exe | sort)"
           actual="$(cd _verify && find . -type f | sed 's|^\./||' | sort)"
           if [ "$actual" != "$expected" ]; then
             echo "FAIL: the zip does not contain exactly the expected files" >&2
