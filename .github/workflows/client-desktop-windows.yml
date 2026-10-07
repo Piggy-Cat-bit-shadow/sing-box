@@ -173,6 +173,19 @@ jobs:
           ls -la "$CLIENT_DIR/release/win-unpacked/resources/daemon" \
                  "$CLIENT_DIR/release/win-unpacked/resources/native" || true
 
+      - name: Verify the packaged application's integrity checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          # electron-builder runs the client's afterSign hook as part of its SIGNING step,
+          # and this build is unsigned - so whether that hook ran is not something to
+          # assume. It proves the executable embeds the current app.asar hash and that the
+          # Electron fuses are the expected ones, so it is run explicitly here.
+          node tooling/scripts/ci/verify-desktop-package-integrity.cjs \
+            "$CLIENT_DIR" \
+            "$CLIENT_DIR/release/win-unpacked" \
+            Jiejiebox
+
       - name: Verify the packaged daemon is the v0.1.5 core daemon
         shell: bash
         run: |
