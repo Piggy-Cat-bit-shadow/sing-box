@@ -201,6 +201,7 @@ def main():
             + (f"  [allowed: {exempt}]" if exempt and machine != expected else "")
             for relative, machine, name, size, exempt in sorted(rows)
         ]
+        pathlib.Path(arguments.record).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(arguments.record).write_text("\n".join(lines) + "\n")
         print(f"  record written to {arguments.record}")
 

@@ -215,7 +215,12 @@ def main():
         print(f"  {line}")
 
     if arguments.record:
-        pathlib.Path(arguments.record).write_text(
+        record_path = pathlib.Path(arguments.record)
+        # The caller names a path, not a directory; creating the parent is this script's
+        # job. It failed on a Windows run for exactly this reason, after the verification
+        # itself had already passed.
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(
             "desktop daemon provenance\n"
             + "".join(f"{line}\n" for line in record)
             + f"verified by    scripts/ci/verify-desktop-daemon-provenance.py\n"
