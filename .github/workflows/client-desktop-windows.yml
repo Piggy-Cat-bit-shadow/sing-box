@@ -202,24 +202,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          # The payload is held to x64 strictly. The installer is an NSIS stub, which is
-          # 32-bit by design whatever it installs, so it is an explicit, justified
-          # exception rather than a silent one.
+          # The payload is held to the desktop-win-x64 profile: x64 strictly, with the
+          # required contents and the declared exceptions named in the audit script.
+          # The installer is added here as one more declared exception - an NSIS stub is
+          # 32-bit whatever it installs, and it is not shipped payload.
           python tooling/scripts/ci/audit-windows-pe-architecture.py \
             "$CLIENT_DIR/release/win-unpacked" \
             "$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe" \
+            --profile desktop-win-x64 \
             --root "$CLIENT_DIR/release/win-unpacked" \
-            --expect amd64 \
             --allow "Jiejiebox-v*-windows-x64.exe=i386 NSIS installer stub (electron-builder), not shipped payload" \
-            --require "Jiejiebox.exe" \
-            --require "resources/daemon/sing-box-daemon.exe" \
-            --require "resources/daemon/libcronet.dll" \
-            --require "resources/daemon/WinDivert64.sys" \
-            --require "resources/daemon/VBoxUSB.sys" \
-            --require "resources/daemon/VBoxUSBMon.sys" \
-            --require "resources/daemon/usbip2_ude.sys" \
-            --require "resources/daemon/usbip2_filter.sys" \
-            --require "resources/native/windows_share.node" \
             --record build/pe-architecture-audit.txt
 
       - name: Audit the payload the installer actually carries

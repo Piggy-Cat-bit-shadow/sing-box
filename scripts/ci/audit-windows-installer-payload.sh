@@ -89,18 +89,11 @@ echo "  extracted files: $file_count"
 [ "$file_count" -gt 0 ] || { echo "FAIL: the payload archive extracted to nothing" >&2; exit 1; }
 
 echo "== auditing the payload the installer carries =="
+# The expected contents and the declared exceptions are one named profile, shared with
+# the audit of the tree electron-builder produced, so the two cannot drift apart.
 "$python_bin" "$root/scripts/ci/audit-windows-pe-architecture.py" "$app_dir" \
+  --profile desktop-win-x64 \
   --root "$app_dir" \
-  --expect amd64 \
-  --require "Jiejiebox.exe" \
-  --require "resources/daemon/sing-box-daemon.exe" \
-  --require "resources/daemon/libcronet.dll" \
-  --require "resources/daemon/WinDivert64.sys" \
-  --require "resources/daemon/VBoxUSB.sys" \
-  --require "resources/daemon/VBoxUSBMon.sys" \
-  --require "resources/daemon/usbip2_ude.sys" \
-  --require "resources/daemon/usbip2_filter.sys" \
-  --require "resources/native/windows_share.node" \
   --record "$workdir/installer-payload-audit.txt"
 
 echo "PASS: the installer's own payload is entirely x64"
