@@ -1,10 +1,13 @@
 package box
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/common/power"
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 
 	"github.com/stretchr/testify/require"
@@ -57,4 +60,51 @@ func TestApplyPauseEventMapsThePlatformVocabulary(t *testing.T) {
 
 	// And a nil governor, which is what a Box without the wiring has, must not panic.
 	applyPauseEvent(nil, pause.EventDevicePaused)
+}
+
+// TestFailedConstructionDoesNotLeakThePauseCallback is the lifecycle half of the power wiring.
+//
+// The governor and its callback are registered early in NewBox, and there are many ways to fail
+// afterwards. The manager is not necessarily ours: WithDefaultManager returns an EXISTING manager
+// unchanged, and the libbox path supplies one, so a callback left behind would keep calling into a
+// governor whose Box was never returned - for every device pause and wake, for the life of the
+// process.
+//
+// The assertions are on observable behaviour rather than on the list internals: a callback that is
+// still registered is one that still runs.
+func TestFailedConstructionDoesNotLeakThePauseCallback(t *testing.T) {
+	ctx := pause.WithDefaultManager(context.Background())
+	manager := service.FromContext[pause.Manager](ctx)
+
+	var calls atomic.Int32
+	governor := power.NewGovernor(power.DefaultPolicy())
+	callback := manager.RegisterCallback(func(int) { calls.Add(1) })
+
+	// Registered: a pause reaches the callback.
+	manager.DevicePause()
+	require.Equal(t, int32(1), calls.Load(), "a registered callback did not receive the pause")
+	manager.DeviceWake()
+	require.Equal(t, int32(2), calls.Load())
+
+	// The construction fails, so the registration is undone.
+	releasePowerGovernor(governor, manager, callback)
+
+	manager.DevicePause()
+	manager.DeviceWake()
+	require.Equal(t, int32(2), calls.Load(),
+		"a callback survived a failed construction: it would keep signalling a governor whose Box was never returned")
+
+	// And the governor it belonged to is closed, so it cannot authorise work either.
+	require.False(t, governor.Active())
+}
+
+// TestReleasePowerGovernorToleratesNils keeps the teardown safe on the paths where only part of the
+// wiring was reached.
+func TestReleasePowerGovernorToleratesNils(t *testing.T) {
+	require.NotPanics(t, func() {
+		releasePowerGovernor(nil, nil, nil)
+	})
+	require.NotPanics(t, func() {
+		releasePowerGovernor(power.NewGovernor(power.DefaultPolicy()), nil, nil)
+	})
 }

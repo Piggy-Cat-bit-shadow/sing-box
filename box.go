@@ -41,6 +41,19 @@ import (
 
 var _ adapter.SimpleLifecycle = (*Box)(nil)
 
+// releasePowerGovernor undoes the governor registration on a construction that is not going to
+// return a Box. It is a named function so the cleanup can be tested directly: reaching it through
+// NewBox would need every registry in the context satisfied first, and the failure it prevents
+// happens precisely when one of them is not.
+func releasePowerGovernor(governor *power.Governor, manager pause.Manager, callback *list.Element[pause.Callback]) {
+	if manager != nil && callback != nil {
+		manager.UnregisterCallback(callback)
+	}
+	if governor != nil {
+		governor.Close()
+	}
+}
+
 // applyPauseEvent is the whole bridge between the platform's lifecycle and the power governor.
 //
 // It is a named function rather than an inline closure so the mapping can be tested without building
@@ -221,6 +234,21 @@ func New(options Options) (*Box, error) {
 	pauseCallback := pauseManager.RegisterCallback(func(event int) {
 		applyPauseEvent(powerGovernor, event)
 	})
+	// From here there are many ways to fail - every registry check, every manager constructor - and a
+	// callback registered on a manager this Box does not own would outlive it.
+	//
+	// That is not hypothetical: WithDefaultManager returns an EXISTING manager unchanged, and the
+	// libbox/Apple path supplies one, so the manager belongs to the caller and lives as long as the
+	// process does. RegisterCallback only appends to a list, and nothing else would ever remove the
+	// entry - every device pause and wake for the rest of the session would call into a governor whose
+	// Box was never returned.
+	boxConstructed := false
+	defer func() {
+		if boxConstructed {
+			return
+		}
+		releasePowerGovernor(powerGovernor, pauseManager, pauseCallback)
+	}()
 	experimentalOptions := common.PtrValueOrDefault(options.Experimental)
 	debugOptions := common.PtrValueOrDefault(experimentalOptions.Debug)
 	err := checkDebugOptions(debugOptions)
@@ -644,9 +672,18 @@ func New(options Options) (*Box, error) {
 		if state != power.StateDeepIdle {
 			return
 		}
+		// Re-check before acting, because notifications are coalesced: flushNotifications delivers the
+		// state as it is when the flush runs, but real traffic can move the governor on between that
+		// read and this call. The two directions are not equally bad - missing an idle-pool release
+		// costs one wakeup's worth of sockets, while releasing a pool that traffic has just started
+		// using costs a handshake at the worst possible moment - so this errs toward doing nothing.
+		if powerGovernor.State() != power.StateDeepIdle {
+			return
+		}
 		box.CloseIdleConnections()
 	})
 
+	boxConstructed = true
 	return box, nil
 }
 

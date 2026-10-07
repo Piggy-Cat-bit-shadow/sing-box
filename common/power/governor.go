@@ -56,6 +56,8 @@ func (s State) String() string {
 	switch s {
 	case StateActive:
 		return "active"
+	case StateWaking:
+		return "waking"
 	case StateQuiescent:
 		return "quiescent"
 	case StateDeepIdle:
@@ -236,8 +238,18 @@ func (g *Governor) allowLocked() Allow {
 }
 
 // Active reports whether speculative background work may run.
+//
+// A closed governor reports false, which is the same answer WaitActive gives and for the same
+// reason: it cannot authorise work against a lifecycle that has ended. Reporting true here would mean
+// a subsystem holding a stale reference - which is exactly what a failed construction leaves behind -
+// could act on a governor that is no longer being driven.
 func (g *Governor) Active() bool {
-	return g.State() == StateActive
+	g.access.Lock()
+	defer g.access.Unlock()
+	if g.closed {
+		return false
+	}
+	return g.state == StateActive
 }
 
 // DevicePaused records that the device went to sleep or the app was backgrounded.
@@ -359,13 +371,33 @@ func (g *Governor) ObserveTraffic() {
 		// The common case, and the cheapest: nothing to do.
 		return
 	}
+	if g.state == StateDeepIdle {
+		g.setStateLocked(StateQuiescent)
+	}
+	// The deadline is RESET, not destroyed.
+	//
+	// Stopping the timer without re-arming it looks equivalent and is not: nothing else arms it,
+	// because recomputeLocked - its only other caller - runs on device and network signals alone. A
+	// single transient request would therefore strand the governor in QUIESCENT for as long as the
+	// device stayed paused, and QUIESCENT still permits health checks and probes. The deepest saving
+	// state would become unreachable after the first background push of the night, which is the
+	// opposite of what this package is for.
+	//
+	// "Idle" means no real activity for DeepIdleAfter, so an activity moves the deadline rather than
+	// cancelling it.
+	if g.devicePaused || g.networkPaused {
+		g.resetIdleTimerLocked()
+	}
+}
+
+// resetIdleTimerLocked restarts the countdown to DEEP_IDLE from now. Caller holds the lock and has
+// already established that something is suppressing.
+func (g *Governor) resetIdleTimerLocked() {
 	if g.idleTimer != nil {
 		g.idleTimer.Stop()
 		g.idleTimer = nil
 	}
-	if g.state == StateDeepIdle {
-		g.setStateLocked(StateQuiescent)
-	}
+	g.armIdleTimerLocked()
 }
 
 // recomputeLocked decides the state from the signals, and is the only place a transition to
