@@ -222,6 +222,18 @@ jobs:
             --require "resources/native/windows_share.node" \
             --record build/pe-architecture-audit.txt
 
+      - name: Audit the payload the installer actually carries
+        shell: bash
+        env:
+          PYTHON: python
+        run: |
+          # The audit above checks the tree electron-builder produced. This extracts the
+          # built installer and audits what it contains, which is the thing a user
+          # installs - the two can differ, and only this one is the package.
+          bash tooling/scripts/ci/audit-windows-installer-payload.sh \
+            "$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe" \
+            build/installer-payload
+
       - name: Confirm no x86 or ARM64 image was mixed in
         shell: bash
         run: |
@@ -259,6 +271,8 @@ jobs:
             cat build/daemon-provenance.txt
             echo
             cat build/pe-architecture-audit.txt
+            echo
+            cat build/installer-payload/installer-payload-audit.txt
           } > build/BUILD-INFO-WINDOWS.txt
           cat build/BUILD-INFO-WINDOWS.txt
           sha256sum "$installer" > build/SHA256SUMS-WINDOWS.txt
