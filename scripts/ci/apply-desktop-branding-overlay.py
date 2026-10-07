@@ -552,7 +552,14 @@ def fail(message, details=None):
 # but it means the overlay was silently modifying every file it touched rather than only
 # the lines its rules name.
 def read_text(path):
-    with open(path, encoding="utf-8", newline="") as stream:
+    # Universal newlines: the text is normalised to LF, so the multi-line literals in the
+    # rules - which are written in LF - match whichever line endings the checkout has.
+    #
+    # This matters because a Windows checkout is not necessarily LF. git's core.autocrlf
+    # converts on checkout, and the runner's client checkout is CRLF, which made every block
+    # rule report "expected 1 ..., found 0" while leaving the CRLF-agnostic line rules
+    # working. Normalising here is what makes the rules independent of that.
+    with open(path, encoding="utf-8", newline=None) as stream:
         return stream.read()
 
 
@@ -560,7 +567,10 @@ def write_atomically(path, text):
     directory = os.path.dirname(path) or "."
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=".overlay-")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
+        # Written back as LF, which is the form the repository stores: normalising on read
+        # and writing LF here means a CRLF checkout is corrected rather than half-converted,
+        # and files this overlay does not touch are left exactly as they were.
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
         os.chmod(temporary, os.stat(path).st_mode & 0o7777)
         os.replace(temporary, path)
