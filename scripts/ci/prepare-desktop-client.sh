@@ -24,9 +24,18 @@
 #   IPC / service ids     internal identifiers
 #   driver, WinDivert     driver names
 #   config schema         user configuration compatibility
+#   localStorage keys     renaming them would silently discard a user's theme and accent
+#   attribution           SagerNet authorship, the licence and the fork lineage
 #
 # The rule is the one the brief states: the user sees Jiejiebox, and the internals keep the
 # names they already have. There is no global string replacement here.
+#
+# # Why the rules live in a Python file
+#
+# The edit set is exact, counted, multi-line, and has to be planned before anything is
+# written so that a partial overlay is impossible. Expressing that in shell heredocs is
+# what broke an earlier attempt at this overlay, so it lives next to the other
+# apply-*-overlay.py scripts instead.
 set -euo pipefail
 
 brand="${1:-}"
@@ -35,6 +44,7 @@ case "$brand" in
   *) echo "usage: prepare-desktop-client.sh [--brand]" >&2; exit 2 ;;
 esac
 
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 client_dir="${DESKTOP_CLIENT_DIR:-clients/desktop}"
 [ -d "$client_dir" ] || { echo "FAIL: $client_dir is missing" >&2; exit 1; }
 
@@ -44,56 +54,14 @@ for f in "$builder" "$pkg"; do
   [ -f "$f" ] || { echo "FAIL: $f is missing; is $client_dir a desktop checkout?" >&2; exit 1; }
 done
 
-# The overlay is expressed as replacements that must APPLY, and that are idempotent: after the
-# first run the file already holds the target value, and a second run is a no-op rather than a
-# double-application.
-apply_once() {
-  local file="$1" from="$2" to="$3" label="$4"
-  if grep -qF -- "$to" "$file"; then
-    echo "  already applied: $label"
-    return 0
-  fi
-  if ! grep -qF -- "$from" "$file"; then
-    # Neither the original nor the target is present. The client has changed shape underneath
-    # us, and guessing would produce a build that is branded in a way nobody verified.
-    echo "FAIL: $label: expected to find '$from' in $file" >&2
-    exit 1
-  fi
-  # A literal, whole-line replacement. Not a global substitution: only the exact line named
-  # here changes, so an unrelated occurrence of the same text is not collateral.
-  python3 - "$file" "$from" "$to" <<'PY'
-import sys, pathlib
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
-p = pathlib.Path(path)
-lines = p.read_text().splitlines(keepends=True)
-changed = 0
-old = old.strip()
-for i, line in enumerate(lines):
-    if line.strip() == old:
-        indent = line[:len(line) - len(line.lstrip())]
-        lines[i] = f"{indent}{new}\n"
-        changed += 1
-if changed != 1:
-    sys.stderr.write(f"FAIL: expected exactly one line '{old}' in {path}, found {changed}\n")
-    raise SystemExit(1)
-p.write_text("".join(lines))
-PY
-  echo "  applied: $label"
-}
+overlay="$root/scripts/ci/apply-desktop-branding-overlay.py"
+[ -f "$overlay" ] || { echo "FAIL: $overlay is missing" >&2; exit 1; }
 
 echo "== desktop overlay: $client_dir =="
 
-# --- branding ---------------------------------------------------------------
-# productName is the user-visible product name: window title, Start Menu entry, installer
-# display name and the default artifact name all derive from it. This is the single highest
-# value branding change and the only one that is not UI source.
-apply_once "$builder" "productName: sing-box" "productName: Jiejiebox" "productName -> Jiejiebox"
-
-# --- unsigned mode ----------------------------------------------------------
-# Upstream requires a certificate. A development and an unsigned release build must be able to
-# complete WITHOUT one, and a signed build must still be possible when a certificate is
-# configured - so this turns the hard requirement off rather than removing signing support.
-# electron-builder still signs automatically when it is given a certificate.
-apply_once "$builder" "  forceCodeSigning: true" "  forceCodeSigning: false" "allow unsigned build"
+# Every rule is resolved before the first byte is written, and every rule is re-read
+# afterwards. A rule that cannot find its anchor - because the pinned client changed shape -
+# aborts the whole overlay instead of leaving a client branded in some places and not others.
+python3 "$overlay" "$client_dir"
 
 echo "PASS: desktop client prepared"
