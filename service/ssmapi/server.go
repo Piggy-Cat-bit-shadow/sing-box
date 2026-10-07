@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/power"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -145,15 +146,26 @@ func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 }
 
 func (s *Service) loopSaveCache(ctx context.Context, saveTicker *time.Ticker) {
+	// The governor is optional, and a Service started without one - every test, and any caller that
+	// never installed it - behaves exactly as it did before.
+	governor := service.FromContext[*power.Governor](ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-saveTicker.C:
-			err := s.saveCache()
-			if err != nil {
-				s.logger.Error(E.Cause(err, "save cache"))
-			}
+		}
+		// Writing traffic totals is housekeeping, and the totals change slowly. While the device is
+		// paused there is nothing to lose by leaving the file alone until the next wake: the scope
+		// saves on close regardless, so a tunnel stopped while asleep still flushes, and a tunnel
+		// killed outright loses at most the minutes since the pause - against a disk write and a
+		// wakeup every minute, for the life of a phone left in a pocket.
+		if governor != nil && !governor.Allow().Statistics {
+			continue
+		}
+		err := s.saveCache()
+		if err != nil {
+			s.logger.Error(E.Cause(err, "save cache"))
 		}
 	}
 }
