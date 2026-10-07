@@ -39,6 +39,17 @@ on:
           - fork-windows
           - upstream-baseline
         default: fork-windows
+  # TEMPORARY BOOTSTRAP. GitHub only dispatches a workflow_dispatch workflow that exists
+  # on the default branch, and this repository's default branch is `testing`, which this
+  # change does not touch. Until this file is on the default branch, a push limited to
+  # this one file is how the workflow is run. It is deliberately as narrow as possible:
+  # this branch only, this path only - it is not a general per-push trigger. Once the
+  # file is on the default branch this block should be deleted, leaving workflow_dispatch.
+  push:
+    branches:
+      - windows-core-amd64
+    paths:
+      - .github/workflows/windows-core-amd64.yml
 
 permissions:
   contents: read
@@ -49,6 +60,8 @@ env:
   GO_VERSION: "1.26.8"
   GOOS_TARGET: windows
   GOARCH_TARGET: amd64
+  # Empty on a push event, so the profile default is applied here rather than in steps.
+  TAGS_PROFILE: ${{ github.event.env.TAGS_PROFILE || 'fork-windows' }}
   ARTIFACT_NAME: sing-box.exe
   ZIP_NAME: sing-box-v0.1.5-windows-amd64.zip
 
@@ -69,7 +82,7 @@ jobs:
           set -euo pipefail
           bash scripts/ci/version.sh >> "$GITHUB_ENV"
 
-          case "${{ inputs.tags_profile }}" in
+          case "${{ env.TAGS_PROFILE }}" in
             fork-windows)      tags_file=release/DEFAULT_BUILD_TAGS_WINDOWS ;;
             upstream-baseline) tags_file=release/DEFAULT_BUILD_TAGS_OTHERS ;;
             *) echo "unknown tags_profile" >&2; exit 1 ;;
@@ -82,7 +95,7 @@ jobs:
             echo "TAGS_FILE=$tags_file"
             echo "TAGS_COUNT=$(tr ',' '\n' <<<"$tags" | wc -l)"
           } >> "$GITHUB_ENV"
-          echo "tags profile : ${{ inputs.tags_profile }}"
+          echo "tags profile : ${{ env.TAGS_PROFILE }}"
           echo "tags file    : $tags_file"
           echo "tags         : $tags"
 
@@ -237,7 +250,7 @@ jobs:
             "cgo_enabled": false,
             "build_tags": "$BUILD_TAGS",
             "tags_file": "$TAGS_FILE",
-            "tags_profile": "${{ inputs.tags_profile }}",
+            "tags_profile": "${{ env.TAGS_PROFILE }}",
             "ldflags": "-X constant.Version=$JJ_VERSION \$(cat release/LDFLAGS) -s -w -buildid= -trimpath",
             "trimpath": true,
             "unsigned": true,
@@ -274,7 +287,7 @@ jobs:
       - name: Upload the core and its records
         uses: actions/upload-artifact@v4
         with:
-          name: windows-core-amd64-${{ inputs.tags_profile }}
+          name: windows-core-amd64-${{ env.TAGS_PROFILE }}
           path: |
             dist/${{ env.ZIP_NAME }}
             dist/${{ env.ARTIFACT_NAME }}
