@@ -149,7 +149,8 @@ def plan(text, rule):
     for index in indices:
         line = lines[index]
         indent = line[: len(line) - len(line.lstrip())]
-        reindented.append(f"{indent}{new_text}\n")
+        ending = "\r\n" if line.endswith("\r\n") else "\n"
+        reindented.append(f"{indent}{new_text}{ending}")
     for index, replacement in zip(indices, reindented):
         lines[index] = replacement
     return "pending", "".join(lines)
@@ -536,11 +537,30 @@ def fail(message, details=None):
     raise SystemExit(1)
 
 
+# Every file this overlay reads or writes is UTF-8, and its line endings are not this
+# script's business.
+#
+# Both of those have to be said explicitly, because the defaults are not what they look
+# like. Python picks the text encoding from the platform locale, which on a Windows runner
+# is cp1252 - and build/installer.nsh contains Chinese and Farsi LangStrings, so reading it
+# with the default raised
+#
+#     UnicodeDecodeError: 'charmap' codec can't decode byte 0x81 in position 5915
+#
+# and aborted the whole overlay. The default also translates newlines, so on Windows an LF
+# file was being rewritten with CRLF endings - invisible, because nothing compared bytes,
+# but it means the overlay was silently modifying every file it touched rather than only
+# the lines its rules name.
+def read_text(path):
+    with open(path, encoding="utf-8", newline="") as stream:
+        return stream.read()
+
+
 def write_atomically(path, text):
     directory = os.path.dirname(path) or "."
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=".overlay-")
     try:
-        with os.fdopen(handle, "w") as stream:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="") as stream:
             stream.write(text)
         os.chmod(temporary, os.stat(path).st_mode & 0o7777)
         os.replace(temporary, path)
@@ -562,8 +582,7 @@ def main():
         if rule.path not in originals:
             if not os.path.isfile(path):
                 fail(f"{rule.path} is missing; is this a desktop client checkout?")
-            with open(path) as stream:
-                originals[rule.path] = stream.read()
+            originals[rule.path] = read_text(path)
 
     planned = dict(originals)
     failures = []
@@ -590,8 +609,7 @@ def main():
     # --- confirm what was written, by re-reading it -------------------------
     confirmed = []
     for rule in RULES:
-        with open(os.path.join(root, rule.path)) as stream:
-            text = stream.read()
+        text = read_text(os.path.join(root, rule.path))
         if rule.kind == "block":
             count = text.count(rule.new)
         else:
@@ -602,16 +620,14 @@ def main():
 
     preserved_failures = []
     for path, needle, why in PRESERVED:
-        with open(os.path.join(root, path)) as stream:
-            if needle not in stream.read():
+        if needle not in read_text(os.path.join(root, path)):
                 preserved_failures.append(f"{path}: {why} ({needle!r} is gone)")
     if preserved_failures:
         fail("a preserved non-branding string was destroyed by this overlay", preserved_failures)
 
     spelling_failures = []
     for path in originals:
-        with open(os.path.join(root, path)) as stream:
-            text = stream.read()
+        text = read_text(os.path.join(root, path))
         for wrong in WRONG_SPELLINGS:
             if wrong in text:
                 spelling_failures.append(f"{path}: contains {wrong!r}")
