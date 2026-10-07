@@ -57,7 +57,33 @@ func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata ad
 	return nil
 }
 
+// observeTraffic reports real device traffic to the power governor, if one is installed.
+//
+// It is a named method rather than a nil check inlined twice, so the glue can be tested without
+// building a Router: a Router built directly in a test has no governor, and the interesting
+// behaviour - that the call is nil-safe and that it actually forwards - is one line that would
+// otherwise only ever be exercised by an integration test nobody writes.
+func (r *Router) observeTraffic() {
+	if r.powerGovernor != nil {
+		r.powerGovernor.ObserveTraffic()
+	}
+}
+
 func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// Real traffic, observed at the one place that can distinguish it.
+	//
+	// This is the router's entry for a flow the DEVICE asked for, after rule matching and before any
+	// outbound: the TUN inbound, a local inbound, an inbound detour. The core's own liveness traffic
+	// does not come through here - a URLTest probe and a DNS query dial their outbound or their
+	// transport directly - which is exactly the discrimination the governor needs. Waking it on the
+	// health checks it gates would be a loop: the governor's own maintenance would keep the device
+	// out of the idle state that maintenance is supposed to stop in.
+	//
+	// Per CONNECTION rather than per byte, deliberately. A connection is a strong, cheap signal that
+	// somebody is using the device, and the forwarding path already pays enough per byte without a
+	// shared atomic on top. A transfer that outlives the pause is not harmed by the governor going
+	// idle: it gates speculative work and closes nothing. See common/power.
+	r.observeTraffic()
 	err := r.routeConnection(ctx, conn, metadata, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
@@ -258,6 +284,9 @@ func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, m
 }
 
 func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	// As above: a UDP session the device asked for is real traffic, and the core's own probes do not
+	// arrive here.
+	r.observeTraffic()
 	err := r.routePacketConnection(ctx, conn, metadata, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/power"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
@@ -30,13 +31,16 @@ type Router struct {
 	// logFactory is kept for its level alone, so a hot-path diagnostic can be skipped rather than
 	// built and discarded. It is nil in tests that construct a Router directly, which is why every
 	// use of it goes through debugLogging.
-	logFactory        log.Factory
-	inbound           adapter.InboundManager
-	outbound          adapter.OutboundManager
-	dns               adapter.DNSRouter
-	dnsTransport      adapter.DNSTransportManager
-	connection        adapter.ConnectionManager
-	network           adapter.NetworkManager
+	logFactory   log.Factory
+	inbound      adapter.InboundManager
+	outbound     adapter.OutboundManager
+	dns          adapter.DNSRouter
+	dnsTransport adapter.DNSTransportManager
+	connection   adapter.ConnectionManager
+	network      adapter.NetworkManager
+	// powerGovernor is the fork's sleep authority, or nil when none was installed - which is what
+	// every test that builds a Router directly has, so every use of it is nil-checked.
+	powerGovernor     *power.Governor
 	httpClientManager adapter.HTTPClientManager
 	rules             []adapter.Rule
 	needFindProcess   bool
@@ -67,6 +71,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		dns:               service.FromContext[adapter.DNSRouter](ctx),
 		dnsTransport:      service.FromContext[adapter.DNSTransportManager](ctx),
 		connection:        service.FromContext[adapter.ConnectionManager](ctx),
+		powerGovernor:     service.FromContext[*power.Governor](ctx),
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
