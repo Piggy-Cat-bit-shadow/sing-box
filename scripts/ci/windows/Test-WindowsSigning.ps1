@@ -118,3 +118,10 @@ $lines.Add("PASS: every binary is Authenticode-signed, Valid, and signed by this
 $lines.Add("      and by the same one, which is what the daemon's own checks require")
 [System.IO.File]::WriteAllLines($RecordPath, $lines)
 foreach ($line in $lines) { Write-Host $line }
+
+# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
+# verified everything can still be reported as a failure if the last native command that
+# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
+# query` on a service that is correctly absent returns 1060. The verdict is decided above,
+# so the exit code is set deliberately here.
+exit 0

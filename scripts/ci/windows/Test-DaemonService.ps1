@@ -39,6 +39,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Native commands here are expected to exit non-zero in normal operation - `sc.exe query`
+# on a service that should be absent returns 1060 - so a non-zero exit must not become a
+# terminating error. Each call checks $LASTEXITCODE where the result matters.
+$PSNativeCommandUseErrorActionPreference = $false
+
 $serviceName = "sing-box-daemon"
 
 $lines = New-Object System.Collections.Generic.List[string]
@@ -210,3 +216,10 @@ $lines.Add("")
 $lines.Add("PASS: install, SCM registration, Running, status, stop and uninstall all verified")
 Save-Record
 foreach ($line in $lines) { Write-Host $line }
+
+# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
+# verified everything can still be reported as a failure if the last native command that
+# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
+# query` on a service that is correctly absent returns 1060. The verdict is decided above,
+# so the exit code is set deliberately here.
+exit 0

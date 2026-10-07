@@ -37,6 +37,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Native commands here are expected to exit non-zero in normal operation - `sc.exe query`
+# on a service that should be absent returns 1060 - so a non-zero exit must not become a
+# terminating error. Each call checks $LASTEXITCODE where the result matters.
+$PSNativeCommandUseErrorActionPreference = $false
+
 $serviceName = "sing-box-daemon"
 $productDisplayName = "Jiejiebox"
 $installationLayoutKey = "HKLM:\SOFTWARE\SagerNet\sing-box"
@@ -53,6 +59,25 @@ function Save-Record {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
     [System.IO.File]::WriteAllLines($RecordPath, $lines)
+}
+
+# NSIS uninstallers commonly copy themselves to a temporary directory and hand off, so the
+# process that was started can exit before the uninstallation has finished. Every
+# post-condition is therefore waited for with a deadline rather than sampled once, and the
+# individual assertions afterwards still report precisely what was wrong.
+function Wait-Until {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Condition,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [int]$TimeoutSeconds = 300
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host "  timed out after $TimeoutSeconds s waiting for: $Description"
+    return $false
 }
 
 function Get-UninstallEntry {
@@ -138,6 +163,9 @@ function Invoke-Silently {
 
 function Assert-Installed {
     param([string]$Phase)
+    $null = Wait-Until -Description "$Phase uninstall registry entry to appear" -TimeoutSeconds 180 -Condition {
+        $null -ne (Get-UninstallEntry)
+    }
     $installationDirectory = Get-InstallationDirectory
     if ([string]::IsNullOrWhiteSpace($installationDirectory)) {
         Fail-Gate "$Phase`: no $productDisplayName uninstall registry entry, so the install did not complete"
@@ -217,6 +245,9 @@ function Invoke-Uninstall {
 
 function Assert-Uninstalled {
     param([string]$Phase)
+    $null = Wait-Until -Description "$Phase uninstall to settle (no service, no uninstall entry)" -TimeoutSeconds 300 -Condition {
+        ($null -eq (Get-UninstallEntry)) -and ((Get-ServiceState) -eq "absent")
+    }
     $state = Get-ServiceState
     $lines.Add("  service after uninstall: $state")
     if ($state -ne "absent") { Fail-Gate "$Phase`: the $serviceName service is still '$state'" }
@@ -323,3 +354,10 @@ $lines.Add("PASS: install, verify, same-version reinstall, uninstall, clean rein
 $lines.Add("      final uninstall all completed with no residual service or process state")
 Save-Record
 foreach ($line in $lines) { Write-Host $line }
+
+# GitHub's pwsh wrapper ends the step with `exit $LASTEXITCODE`, so a gate that has just
+# verified everything can still be reported as a failure if the last native command that
+# ran happened to exit non-zero. In this script that is normal, not an error: `sc.exe
+# query` on a service that is correctly absent returns 1060. The verdict is decided above,
+# so the exit code is set deliberately here.
+exit 0
