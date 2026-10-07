@@ -1,0 +1,267 @@
+name: Windows desktop installer
+
+# Builds the unsigned Windows x64 NSIS installer for the desktop client.
+#
+# # What this workflow is and is not
+#
+# It IS the build of record for the Windows installer: a GitHub-hosted Windows runner is
+# the only place available to it that can run electron-builder's Windows packaging, build
+# the Rust native module for windows-msvc, and execute the resulting daemon.
+#
+# It is NOT runtime acceptance. A green run here says the installer was produced and that
+# the binaries inside it are the intended ones for the intended architecture. It says
+# nothing about whether TUN, the system proxy, WinDivert or the IPC path actually work on
+# a real machine - see docs/WINDOWS-ACCEPTANCE.md. "built" and "works" are different
+# claims and only the second one gates the release.
+#
+# # Why the core is checked out at the v0.1.5 commit rather than at this branch
+#
+# scripts/package.ts does not download a daemon; it builds one from the core checkout it
+# finds next to the desktop client, and cmd/internal/build_boxdd stamps the version from
+# `git describe --tags` in that checkout. Two things follow:
+#
+#   * the checkout must be exactly the v0.1.5 commit, or the daemon reports a version
+#     like "0.1.5-<commit>" instead of "0.1.5";
+#   * its tags must be fetched, because with no tags at all `git describe` fails and the
+#     daemon build fails outright.
+#
+# The v0.1.5 commit also records clients/desktop at the pin this release ships
+# (32f915ba...), so one checkout supplies both the core and the client at the exact
+# revisions the release names - and the overlay is applied to that client rather than to
+# a second copy of it.
+#
+# # What is deliberately absent
+#
+# No code-signing certificate. The build is unsigned by design for the first release;
+# SmartScreen will warn. The overlay makes the absence of a certificate a supported state
+# without removing electron-builder's ability to sign, so adding a certificate later is a
+# secret, not a code change. No secret is read by this workflow and none can be: it is
+# `contents: read` and nothing else.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The v0.1.5 core. The daemon's provenance is this commit, and the desktop client pin
+  # recorded by it.
+  CORE_SHA: e70f3d2c8527ca159231f11405be52604008504c
+  CORE_VERSION: "0.1.5"
+  CLIENT_DIR: core/clients/desktop
+
+jobs:
+  installer:
+    name: unsigned Windows x64 NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the publishing tooling
+        uses: actions/checkout@v4
+        with:
+          # The overlays and the verification scripts are the parent's, not the pinned
+          # client's, so they come from the ref this run was dispatched for.
+          path: tooling
+          fetch-depth: 1
+
+      - name: Check out the v0.1.5 core
+        uses: actions/checkout@v4
+        with:
+          path: core
+          ref: ${{ env.CORE_SHA }}
+          # Submodules are initialised below, for the desktop client only. The core also
+          # records clients/apple and clients/android - neither is used here, and the
+          # Apple one alone is large enough to be worth not fetching.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check out the pinned desktop client and its dashboard
+        shell: bash
+        run: git -C core submodule update --init --recursive clients/desktop
+
+      - name: Confirm the core checkout is the source of record
+        shell: bash
+        run: |
+          set -euo pipefail
+          head_sha="$(git -C core rev-parse HEAD)"
+          echo "core HEAD:      $head_sha"
+          echo "core describe:  $(git -C core describe --tags)"
+          [ "$head_sha" = "$CORE_SHA" ] || {
+            echo "FAIL: core is at $head_sha, expected $CORE_SHA" >&2; exit 1; }
+          [ "$(git -C core describe --tags)" = "v$CORE_VERSION" ] || {
+            echo "FAIL: the daemon version stamp is derived from \`git describe --tags\`," >&2
+            echo "      which must be v$CORE_VERSION in this checkout" >&2; exit 1; }
+          echo "desktop client: $(git -C core rev-parse HEAD:clients/desktop)"
+          echo "desktop HEAD:   $(git -C "$CLIENT_DIR" rev-parse HEAD)"
+          git -C core submodule status clients/desktop
+
+      - name: Read the client's declared toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import { readFileSync, appendFileSync } from "node:fs";
+            const version = JSON.parse(readFileSync("core/clients/desktop/version.json", "utf8"));
+            const manifest = JSON.parse(readFileSync("core/clients/desktop/package.json", "utf8"));
+            const version2 = version.go_version.replace(/^go/u, "");
+            const pnpm = manifest.packageManager.split("@")[1];
+            appendFileSync(process.env.GITHUB_OUTPUT,
+              `go=${version2}\nnode=${manifest.engines.node}\npnpm=${pnpm}\n`);
+            console.log(`go=${version2} node=${manifest.engines.node} pnpm=${pnpm}`);
+          '
+
+      - name: Install Go ${{ steps.toolchain.outputs.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.toolchain.outputs.go }}
+          # The client's own scripts/package.ts asserts this exact version, so it is taken
+          # from the client rather than chosen here.
+          cache: false
+
+      - name: Install Node ${{ steps.toolchain.outputs.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.toolchain.outputs.node }}
+
+      - name: Install pnpm ${{ steps.toolchain.outputs.pnpm }}
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ steps.toolchain.outputs.pnpm }}
+
+      - name: Show the toolchain
+        shell: bash
+        run: |
+          go version
+          node --version
+          pnpm --version
+          rustup show active-toolchain || rustc --version
+          cargo --version
+
+      - name: Apply the Jiejiebox branding and unsigned-build overlay
+        shell: bash
+        env:
+          DESKTOP_CLIENT_DIR: ${{ env.CLIENT_DIR }}
+          PYTHON: python
+        run: bash tooling/scripts/ci/prepare-desktop-client.sh
+
+      - name: Install the client's dependencies
+        working-directory: ${{ env.CLIENT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the unsigned x64 NSIS installer
+        working-directory: ${{ env.CLIENT_DIR }}
+        # `package:win x64` reuses the client's own pipeline: it builds the daemon from
+        # the core above with cmd/internal/build_boxdd, stages the Cronet library and the
+        # WinDivert and USBIP drivers that build_boxdd emits, builds windows_share.node
+        # with Cargo for x86_64-pc-windows-msvc, checks the staged binaries' PE machine
+        # type, and hands off to electron-builder. None of that is reimplemented here.
+        run: pnpm run package:win x64
+
+      - name: Report what was produced
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== installer =="
+          ls -la "$CLIENT_DIR/release"/*.exe || true
+          echo
+          echo "== packaged application =="
+          ls -la "$CLIENT_DIR/release/win-unpacked" | head -30
+          echo
+          echo "== packaged daemon and native module =="
+          ls -la "$CLIENT_DIR/release/win-unpacked/resources/daemon" \
+                 "$CLIENT_DIR/release/win-unpacked/resources/native" || true
+
+      - name: Verify the packaged daemon is the v0.1.5 core daemon
+        shell: bash
+        run: |
+          python tooling/scripts/ci/verify-desktop-daemon-provenance.py \
+            "$CLIENT_DIR/release/win-unpacked/resources/daemon/sing-box-daemon.exe" \
+            --core-dir core \
+            --expect-core-sha "$CORE_SHA" \
+            --expect-version "$CORE_VERSION" \
+            --require-execution \
+            --record build/daemon-provenance.txt
+
+      - name: Audit the architecture of everything in the package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          # The payload is held to x64 strictly. The installer is an NSIS stub, which is
+          # 32-bit by design whatever it installs, so it is an explicit, justified
+          # exception rather than a silent one.
+          python tooling/scripts/ci/audit-windows-pe-architecture.py \
+            "$CLIENT_DIR/release/win-unpacked" \
+            "$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe" \
+            --root "$CLIENT_DIR/release/win-unpacked" \
+            --expect amd64 \
+            --allow "Jiejiebox-v*-windows-x64.exe=i386 NSIS installer stub (electron-builder), not shipped payload" \
+            --require "Jiejiebox.exe" \
+            --require "resources/daemon/sing-box-daemon.exe" \
+            --require "resources/daemon/libcronet.dll" \
+            --require "resources/daemon/WinDivert64.sys" \
+            --require "resources/daemon/VBoxUSB.sys" \
+            --require "resources/daemon/VBoxUSBMon.sys" \
+            --require "resources/daemon/usbip2_ude.sys" \
+            --require "resources/daemon/usbip2_filter.sys" \
+            --require "resources/native/windows_share.node" \
+            --record build/pe-architecture-audit.txt
+
+      - name: Confirm no x86 or ARM64 image was mixed in
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The audit above already fails on a wrong architecture; this is the same fact
+          # stated as a count, so a run that passes cannot be mistaken for a run that
+          # skipped the check.
+          if grep -E "^  (i386|arm64|armnt|arm) " build/pe-architecture-audit.txt; then
+            echo "FAIL: a non-x64 image is in the package" >&2
+            exit 1
+          fi
+          echo "no i386, arm or arm64 PE image in the packaged payload"
+          echo "amd64 images: $(grep -c '^  amd64' build/pe-architecture-audit.txt)"
+
+      - name: Record the build
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe"
+          {
+            echo "Jiejiebox Windows installer build record"
+            echo
+            echo "core SHA          $CORE_SHA"
+            echo "core version      $CORE_VERSION"
+            echo "desktop client    $(git -C core rev-parse HEAD:clients/desktop)"
+            echo "desktop HEAD      $(git -C "$CLIENT_DIR" rev-parse HEAD)"
+            echo "tooling commit    $(git -C tooling rev-parse HEAD)"
+            echo "daemon version    $CORE_VERSION"
+            echo "daemon arch       windows/amd64"
+            echo "signing           unsigned (no certificate configured)"
+            echo "artifact          $(basename "$installer")"
+            echo "artifact bytes    $(stat -c %s "$installer")"
+            echo "artifact sha256   $(sha256sum "$installer" | cut -d' ' -f1)"
+            echo
+            cat build/daemon-provenance.txt
+            echo
+            cat build/pe-architecture-audit.txt
+          } > build/BUILD-INFO-WINDOWS.txt
+          cat build/BUILD-INFO-WINDOWS.txt
+          sha256sum "$installer" > build/SHA256SUMS-WINDOWS.txt
+          cat build/SHA256SUMS-WINDOWS.txt
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejiebox-windows-x64-${{ env.CORE_VERSION }}-unsigned
+          path: ${{ env.CLIENT_DIR }}/release/Jiejiebox-v${{ env.CORE_VERSION }}-windows-x64.exe
+          if-no-files-found: error
+
+      - name: Upload the build records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejiebox-windows-build-records
+          path: build/
+          if-no-files-found: warn

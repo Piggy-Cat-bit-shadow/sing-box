@@ -57,11 +57,25 @@ done
 overlay="$root/scripts/ci/apply-desktop-branding-overlay.py"
 [ -f "$overlay" ] || { echo "FAIL: $overlay is missing" >&2; exit 1; }
 
+# The overlay itself is Python. macOS and Linux expose it as python3; the Windows
+# runners this overlay also has to run on usually expose it as python, so the name is
+# resolved rather than assumed, and PYTHON overrides both.
+python_bin="${PYTHON:-}"
+if [ -z "$python_bin" ]; then
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      python_bin="$candidate"
+      break
+    fi
+  done
+fi
+[ -n "$python_bin" ] || { echo "FAIL: python3 is required to apply the overlay" >&2; exit 1; }
+
 echo "== desktop overlay: $client_dir =="
 
 # Every rule is resolved before the first byte is written, and every rule is re-read
 # afterwards. A rule that cannot find its anchor - because the pinned client changed shape -
 # aborts the whole overlay instead of leaving a client branded in some places and not others.
-python3 "$overlay" "$client_dir"
+"$python_bin" "$overlay" "$client_dir"
 
 echo "PASS: desktop client prepared"
