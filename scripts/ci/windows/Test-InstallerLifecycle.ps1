@@ -287,7 +287,7 @@ function Assert-Installed {
 
 
 function Invoke-Uninstall {
-    param([string]$Phase, [Parameter(Mandatory = $true)]$UninstallEntry)
+    param([string]$Phase, [Parameter(Mandatory = $true)]$UninstallEntry, [switch]$DeleteAppData)
     # The uninstaller is the one the discovered entry names. No path is constructed from a
     # product name.
     $uninstallString = [string]$UninstallEntry.UninstallString
@@ -298,14 +298,23 @@ function Invoke-Uninstall {
     if ([string]::IsNullOrWhiteSpace($uninstaller) -or -not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
         Fail-Gate "$Phase`: the uninstaller '$uninstaller' named by $($UninstallEntry.PSPath) does not exist"
     }
-    # The installer's own rollback uses exactly this pair, so it is the supported one.
-    $exitCode = Invoke-Silently -FilePath $uninstaller -Arguments @("/S", "/allusers") -What "$Phase uninstall"
+    # The installer's own rollback uses /S /allusers, so that pair is the supported one.
+    $arguments = @("/S", "/allusers")
+    if ($DeleteAppData) {
+        # build/installer.nsh: `--delete-app-data` sets $keepUninstallData to unchecked,
+        # which is the ONLY path that runs the data-removal branch. Without it the
+        # uninstaller keeps the data by design (electron-builder.yml:
+        # deleteAppDataOnUninstall: false) and the installer layout registry key is
+        # deliberately left behind so a reinstall can reuse the data directories.
+        $arguments += "--delete-app-data"
+    }
+    $exitCode = Invoke-Silently -FilePath $uninstaller -Arguments $arguments -What "$Phase uninstall"
     if ($exitCode -ne 0) { Fail-Gate "$Phase`: the uninstaller exited $exitCode" }
 }
 
 
 function Assert-Uninstalled {
-    param([string]$Phase, [string]$InstallationRoot, $UninstallEntry)
+    param([string]$Phase, [string]$InstallationRoot, $UninstallEntry, [switch]$DataPreserved)
     $null = Wait-Until -Description "$Phase uninstall to settle" -TimeoutSeconds 300 -Condition {
         ($null -eq (Get-DaemonServiceCommandLine)) -and ($null -eq (Get-InstallationLayoutRegistry))
     }
@@ -319,10 +328,25 @@ function Assert-Uninstalled {
         Fail-Gate "$Phase`: the service is marked for deletion; the next install would fail"
     }
 
-    if ($null -ne (Get-InstallationLayoutRegistry)) {
-        Fail-Gate "$Phase`: the installer layout registry key survived uninstall"
+    $layout = Get-InstallationLayoutRegistry
+    if ($DataPreserved) {
+        # The uninstaller keeps the data directories unless it is told not to, and it keeps
+        # the layout key with them so a reinstall can reuse them. Asserting the key gone
+        # here would be asserting behaviour the product does not have; the next phase runs
+        # the uninstall that DOES remove it, so the assertion is still made - just where it
+        # is actually about something.
+        if ($null -ne $layout) {
+            $lines.Add("  layout registry: retained by design (LayoutVersion $($layout.LayoutVersion), InstallationID $($layout.InstallationID))")
+            $lines.Add("    the uninstaller preserves data unless --delete-app-data is given; the final phase passes it")
+        } else {
+            $lines.Add("  layout registry: absent (not retained by this uninstall)")
+        }
+    } else {
+        if ($null -ne $layout) {
+            Fail-Gate "$Phase`: the installer layout registry key survived a data-removing uninstall"
+        }
+        $lines.Add("  layout registry: absent after --delete-app-data")
     }
-    $lines.Add("  layout registry: absent")
 
     if ($null -ne $UninstallEntry) {
         $survivors = @(Get-UninstallRegistryEntries | Where-Object { $_.PSPath -eq $UninstallEntry.PSPath })
@@ -450,7 +474,7 @@ $lines.Add("")
 # --- uninstall ---------------------------------------------------------------
 $lines.Add("[3/5] silent uninstall")
 Invoke-Uninstall -Phase "first" -UninstallEntry $uninstallEntry
-Assert-Uninstalled -Phase "after first uninstall" -InstallationRoot $installationRoot -UninstallEntry $uninstallEntry
+Assert-Uninstalled -Phase "after first uninstall" -InstallationRoot $installationRoot -UninstallEntry $uninstallEntry -DataPreserved
 $lines.Add("  PASS")
 $lines.Add("")
 
@@ -467,7 +491,7 @@ $lines.Add("")
 
 # --- final teardown ----------------------------------------------------------
 $lines.Add("[5/5] final uninstall")
-Invoke-Uninstall -Phase "final" -UninstallEntry $uninstallEntry
+Invoke-Uninstall -Phase "final" -UninstallEntry $uninstallEntry -DeleteAppData
 Assert-Uninstalled -Phase "after final uninstall" -InstallationRoot $installationRoot -UninstallEntry $uninstallEntry
 $lines.Add("  PASS")
 $lines.Add("")
