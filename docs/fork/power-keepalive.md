@@ -102,3 +102,13 @@ What would make it implementable without that validation is a value that is leng
 bounded factor rather than suspended — long enough to remove most of the wakeups, short enough to
 stay inside a conservative mapping lifetime — but choosing that bound is exactly the measurement
 this note is saying has not been done.
+
+
+## Status
+
+**Accepted as device-validation work, not scheduled for implementation.** Recorded in
+`power-governor.md` alongside what the governor does cover.
+
+The measurement that would unblock it: a carrier NAT mapping's actual lifetime, and whether a
+WireGuard tunnel recovers cleanly once one has expired. With that number, a bounded lengthening is a
+small change; without it, any value chosen is a guess about somebody else's network.
