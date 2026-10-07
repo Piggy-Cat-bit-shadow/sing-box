@@ -311,6 +311,30 @@ if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
     Fail-Gate "the installer does not exist: $InstallerPath"
 }
 
+# The installer runs its preflight and its service command through Windows PowerShell 5.1
+# ($SYSDIR\WindowsPowerShell\v1.0\powershell.exe). Started from PowerShell 7 - which is what
+# this gate and GitHub's runner use - that child inherits PowerShell 7's PSModulePath, which
+# does not contain the 5.1 module directory, and its preflight then fails with
+#
+#     exit=30  The 'Get-Acl' command was found in the module 'Microsoft.PowerShell.Security',
+#              but the module could not be loaded.
+#
+# A user who double-clicks the installer inherits Explorer's environment and does not hit
+# this, and neither does one run from a 5.1 prompt; it is an artefact of launching the
+# installer from PowerShell 7. The 5.1 module directory is put back for the installer and
+# everything it spawns. This changes the harness's environment, not the product's behaviour.
+$windowsPowerShellModules = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules"
+if (-not (Test-Path -LiteralPath $windowsPowerShellModules)) {
+    Fail-Gate "the Windows PowerShell 5.1 module directory is missing: $windowsPowerShellModules"
+}
+if ($env:PSModulePath -notlike "*$windowsPowerShellModules*") {
+    $lines.Add("psmodulepath: prepended $windowsPowerShellModules so the installer's Windows PowerShell 5.1 children can autoload their modules")
+    Write-Host "prepending $windowsPowerShellModules to PSModulePath for the installer"
+    $env:PSModulePath = "$windowsPowerShellModules;$env:PSModulePath"
+} else {
+    $lines.Add("psmodulepath: already contains the Windows PowerShell 5.1 module directory")
+}
+
 # A previous gate may have left a service behind; a clean state is a precondition, and it
 # is reported rather than assumed.
 if ((Get-ServiceState) -ne "absent" -or $null -ne (Get-UninstallEntry)) {
