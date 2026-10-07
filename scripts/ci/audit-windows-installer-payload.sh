@@ -102,11 +102,15 @@ echo "== auditing the payload the installer carries =="
 #
 # The paths are exact. There is no wildcard for elevate.exe, no resources/*.exe, and no
 # rule that would admit any other i386 image: anything not named here still fails.
+# The installed application executable is sing-box.exe, not Jiejiebox.exe: that is the
+# name experimental/boxdd resolves and Authenticode-verifies when it registers the service
+# and on every peer handshake, so it is the name the payload must contain. productName is
+# still Jiejiebox and is what the user reads.
 "$python_bin" "$root/scripts/ci/audit-windows-pe-architecture.py" "$app_dir" \
   --root "$app_dir" \
   --expect amd64 \
   --allow "resources/elevate.exe=i386 electron-builder NSIS UAC elevation helper" \
-  --require "Jiejiebox.exe" \
+  --require "sing-box.exe" \
   --require "resources/daemon/sing-box-daemon.exe" \
   --require "resources/daemon/libcronet.dll" \
   --require "resources/daemon/WinDivert64.sys" \
