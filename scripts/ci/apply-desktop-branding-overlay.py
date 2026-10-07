@@ -14,14 +14,28 @@ group. So each edit names one line (or one block) and states how many of it must
 The rules fall into three groups:
 
   release identity   the desktop app's version, and the installer's file name
-  unsigned build     signing off by default
+  unsigned build     signing off by default, and the Windows signing configuration
+                     made optional instead of mandatory
   visible branding   the strings a user reads that name the product
 
-# Why the unsigned-build group is only one rule so far
+# Why the unsigned-build group reaches into package.ts and afterPack.cjs
 
-`forceCodeSigning: false` is necessary but NOT sufficient for an unsigned build: two more
-places in the pinned client require a certificate, and they are handled separately from
-this overlay, which is concerned with naming and identity.
+`forceCodeSigning: false` in electron-builder.yml is necessary but NOT sufficient. Two
+more places require a certificate before electron-builder is even reached or once it has
+packed:
+
+  scripts/package.ts     readWindowsSigningConfiguration() throws when signing.local.json
+                         is absent, so the build never started. The fix is to make the
+                         absence of that file mean "build unsigned", while keeping a
+                         PRESENT but invalid file a hard error, and to supply
+                         signtoolOptions only when a certificate was configured.
+  scripts/afterPack.cjs  signs sing-box-daemon.exe and windows_share.node - which the
+                         app's own signature does not cover - and throws if that did not
+                         happen. With no certificate it returns instead.
+
+Both use the same predicate: a certificate is configured exactly when signing.local.json
+exists. electron-builder's signing support is left intact in both cases - give it a
+certificate and it still signs, and afterPack still enforces that it did.
 
 # Fail closed, and atomically
 
@@ -170,11 +184,8 @@ RULES = [
     ),
     # --- unsigned build ------------------------------------------------------
     #
-    # Upstream requires a certificate. A development and an unsigned release build must be
-    # able to complete WITHOUT one, and a signed build must still be possible when a
-    # certificate is configured - so this turns the hard requirement off rather than
-    # removing signing support. electron-builder still signs when it is given a
-    # certificate.
+    # Necessary: electron-builder refuses to produce an installer without a
+    # certificate while this is true.
     Rule(
         "electron-builder.yml",
         "forceCodeSigning: true",
@@ -184,6 +195,89 @@ RULES = [
     ),
     # Sufficient, together with the three edits below: package.ts otherwise requires
     # signing.local.json even when electron-builder would not have signed anything.
+    Rule(
+        "scripts/package.ts",
+        "function readWindowsSigningConfiguration(): WindowsSigningConfiguration {",
+        "function readWindowsSigningConfiguration(): WindowsSigningConfiguration | undefined {",
+        1,
+        note="the signing configuration becomes optional",
+    ),
+    Rule(
+        "scripts/package.ts",
+        "  let value: unknown;\n  try {\n",
+        "  // UNSIGNED BUILD OVERLAY: an absent configuration file means no certificate is\n"
+        "  // configured, so the build proceeds unsigned. A file that EXISTS but is invalid\n"
+        "  // is still a hard error, so a broken signing setup cannot silently ship an\n"
+        "  // unsigned installer.\n"
+        "  if (!fs.existsSync(signingConfigurationPath)) {\n"
+        "    return undefined;\n"
+        "  }\n"
+        "\n"
+        "  let value: unknown;\n  try {\n",
+        1,
+        kind="block",
+        note="absent signing.local.json means build unsigned",
+    ),
+    Rule(
+        "scripts/package.ts",
+        "  signingConfiguration: WindowsSigningConfiguration,",
+        "  signingConfiguration: WindowsSigningConfiguration | undefined,",
+        1,
+        note="runWindowsElectronBuilder accepts an absent certificate",
+    ),
+    Rule(
+        "scripts/package.ts",
+        "        win: {\n"
+        "          artifactName,\n"
+        "          signtoolOptions: {\n"
+        "            certificateFile: signingConfiguration.certificateFile,\n"
+        "            certificatePassword: signingConfiguration.certificatePassword,\n"
+        "          },\n"
+        "        },\n",
+        "        win: {\n"
+        "          artifactName,\n"
+        "          // UNSIGNED BUILD OVERLAY: signtoolOptions is supplied only when a\n"
+        "          // certificate was configured. electron-builder's signing support is\n"
+        "          // left intact - a build given a certificate still signs.\n"
+        "          ...(signingConfiguration === undefined\n"
+        "            ? {}\n"
+        "            : {\n"
+        "                signtoolOptions: {\n"
+        "                  certificateFile: signingConfiguration.certificateFile,\n"
+        "                  certificatePassword: signingConfiguration.certificatePassword,\n"
+        "                },\n"
+        "              }),\n"
+        "        },\n",
+        1,
+        kind="block",
+        note="signtoolOptions supplied only when a certificate is configured",
+    ),
+    # Upstream signs these two binaries - which electron-builder does NOT cover with the
+    # app's own signature - and hard-fails if that did not happen. With no certificate
+    # configured there is nothing to sign, so the hook returns instead of throwing. The
+    # predicate is the same one package.ts uses: a configured certificate is the presence
+    # of signing.local.json, so "signed build" means one thing in both places.
+    Rule(
+        "scripts/afterPack.cjs",
+        '  if (context.electronPlatformName !== "win32") {\n'
+        "    return;\n"
+        "  }\n"
+        "  for (const relativePath of [\n",
+        '  if (context.electronPlatformName !== "win32") {\n'
+        "    return;\n"
+        "  }\n"
+        "  // UNSIGNED BUILD OVERLAY: the two binaries below are signed separately because\n"
+        "  // electron-builder's app signature does not cover them. With no certificate\n"
+        "  // configured there is nothing to sign, so this is a no-op rather than a failure.\n"
+        "  // electron-builder's own signing support is untouched.\n"
+        '  if (!fs.existsSync(path.join(context.packager.projectDir, "signing.local.json"))) {\n'
+        "    return;\n"
+        "  }\n"
+        "  for (const relativePath of [\n",
+        1,
+        kind="block",
+        note="afterPack no longer requires signing when no certificate is configured",
+    ),
     # --- visible branding ----------------------------------------------------
     #
     # The five audit-confirmed user-visible product names, plus productName - which is the
@@ -250,6 +344,16 @@ PRESERVED = [
     ("package.json", '"name": "sing-box"', "package and appId identity"),
     ("package.json", '"name": "SagerNet"', "SagerNet attribution"),
     ("electron-builder.yml", "copyright: nekohasekai", "upstream copyright"),
+    (
+        "scripts/afterPack.cjs",
+        "await context.packager.signIf(executablePath);",
+        "the daemon and native module are still signed when a certificate is configured",
+    ),
+    (
+        "scripts/package.ts",
+        "signtoolOptions: {",
+        "electron-builder signing support is still present",
+    ),
 ]
 
 WRONG_SPELLINGS = ["Jijiebox", "JieJieBox", "JiejieBox"]
