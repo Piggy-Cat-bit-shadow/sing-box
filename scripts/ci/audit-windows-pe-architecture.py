@@ -4,8 +4,6 @@
 Usage:
     audit-windows-pe-architecture.py <path>... [options]
 
-    --profile NAME          fill in the expected architecture, the required contents and
-                            the justified exceptions for a known package (see PROFILES)
     --root DIR              directory that --require paths are relative to
                             (default: the first path when it is a directory)
     --expect NAME           the architecture every PE image must be (default: amd64)
@@ -29,32 +27,12 @@ package, which is what this audits.
 Only PE images are judged. A package legitimately contains .pak, .asar, .js, .json and
 image files; those are counted and skipped rather than reported as failures.
 
-# Why the expected contents are a profile
+# On the installer itself
 
-"Everything in the Jiejiebox Windows package is x64, and it contains these files" is one
-fact about one product. Stating it twice - once for the tree electron-builder produced and
-once for the payload extracted from the built installer - is how the two drift apart, and
-the drift is invisible because both would still pass. The profile is that fact, named
-once, and both audits use it.
-
-# Exceptions are declared, never inferred
-
-Two i386 images appear in a correct build, for reasons that have nothing to do with the
-target architecture:
-
-  Jiejiebox-v*-windows-x64.exe   an NSIS installer is a 32-bit stub whatever it installs.
-                                 This is the file the user runs, and it is not the payload.
-  resources/elevate.exe          electron-builder's own elevate helper, which it packs
-                                 into the application by default (packElevateHelper). The
-                                 client does not use it - src/main/repair.ts elevates with
-                                 PowerShell's "runas" verb instead - but it is
-                                 electron-builder's file and it is not this overlay's
-                                 place to remove it. It runs as a 32-bit process on 64-bit
-                                 Windows, which is what it is for.
-
-Neither is excused by a wildcard. Each is named, and each states why it is not a defect.
-An exception that never matched anything is reported as unused rather than passing
-silently, so a stale one is visible.
+An NSIS installer is a 32-bit stub regardless of the architecture it installs - that is
+a property of NSIS, not a mistake in the package. So the installer is passed with
+--allow and a reason, and its architecture is still printed. The payload is what is held
+to the rule.
 """
 import argparse
 import fnmatch
@@ -74,30 +52,6 @@ EXPECTED_MACHINES = {
     "i386": 0x014C,
     "arm64": 0xAA64,
     "arm": 0x01C0,
-}
-
-PROFILES = {
-    "desktop-win-x64": {
-        "expect": "amd64",
-        "require": [
-            "Jiejiebox.exe",
-            "resources/daemon/sing-box-daemon.exe",
-            "resources/daemon/libcronet.dll",
-            "resources/daemon/WinDivert64.sys",
-            "resources/daemon/VBoxUSB.sys",
-            "resources/daemon/VBoxUSBMon.sys",
-            "resources/daemon/usbip2_ude.sys",
-            "resources/daemon/usbip2_filter.sys",
-            "resources/native/windows_share.node",
-        ],
-        "allow": {
-            "resources/elevate.exe": (
-                "i386 electron-builder's elevate helper (packElevateHelper), shipped by "
-                "electron-builder, not by this fork; the client elevates with PowerShell "
-                "runas and does not use it"
-            ),
-        },
-    },
 }
 
 
@@ -135,9 +89,22 @@ def collect(paths):
             fail(f"{path} does not exist")
 
 
-def parse_allows(entries):
+def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("paths", nargs="+")
+    parser.add_argument("--root")
+    parser.add_argument("--expect", default="amd64")
+    parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument("--require", action="append", default=[])
+    parser.add_argument("--record")
+    arguments = parser.parse_args()
+
+    if arguments.expect not in EXPECTED_MACHINES:
+        fail(f"unknown --expect {arguments.expect!r}; expected one of {', '.join(EXPECTED_MACHINES)}")
+    expected = EXPECTED_MACHINES[arguments.expect]
+
     allowed = {}
-    for entry in entries:
+    for entry in arguments.allow:
         pattern, separator, reason = entry.partition("=")
         if not separator or not reason.strip():
             fail(
@@ -145,29 +112,6 @@ def parse_allows(entries):
                 ["every architecture exception must say why it is not a defect"],
             )
         allowed[pattern] = reason.strip()
-    return allowed
-
-
-def main():
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("paths", nargs="+")
-    parser.add_argument("--profile", choices=sorted(PROFILES))
-    parser.add_argument("--root")
-    parser.add_argument("--expect")
-    parser.add_argument("--allow", action="append", default=[])
-    parser.add_argument("--require", action="append", default=[])
-    parser.add_argument("--record")
-    arguments = parser.parse_args()
-
-    profile = PROFILES[arguments.profile] if arguments.profile else {}
-    expect = arguments.expect or profile.get("expect") or "amd64"
-    if expect not in EXPECTED_MACHINES:
-        fail(f"unknown architecture {expect!r}; expected one of {', '.join(EXPECTED_MACHINES)}")
-    expected = EXPECTED_MACHINES[expect]
-
-    required = list(profile.get("require", [])) + arguments.require
-    allow_entries = [f"{pattern}={reason}" for pattern, reason in profile.get("allow", {}).items()]
-    allowed = parse_allows(allow_entries + arguments.allow)
 
     paths = [pathlib.Path(item) for item in arguments.paths]
     root = pathlib.Path(arguments.root) if arguments.root else (
@@ -176,7 +120,6 @@ def main():
     root = root.resolve()
 
     rows, skipped, violations, exemptions = [], 0, [], []
-    used_patterns = set()
     for path in collect(paths):
         machine = pe_machine(path)
         if machine is None:
@@ -191,7 +134,6 @@ def main():
         for pattern, reason in allowed.items():
             if fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(path.name, pattern):
                 exempt = reason
-                used_patterns.add(pattern)
                 break
         rows.append((relative, machine, name, path.stat().st_size, exempt))
         if machine == expected:
@@ -208,17 +150,13 @@ def main():
     print()
     print(f"  PE images audited:     {len(rows)}")
     print(f"  non-PE files skipped:  {skipped}")
-    print(f"  expected architecture: {expect} (0x{expected:04x})")
+    print(f"  expected architecture: {arguments.expect} (0x{expected:04x})")
     print(f"  exemptions applied:    {len(exemptions)}")
     for relative, name, reason in exemptions:
         print(f"    {relative}: {name} - {reason}")
-    unused = sorted(set(allowed) - used_patterns)
-    if unused:
-        print(f"  exceptions not needed: {', '.join(unused)}")
-        print("    (declared but nothing needed them; consider removing them)")
 
     missing = []
-    for relative in required:
+    for relative in arguments.require:
         candidate = (root / relative).resolve()
         if not candidate.is_file():
             missing.append(f"{relative}: missing")
@@ -228,14 +166,14 @@ def main():
             missing.append(f"{relative}: not a Windows executable")
         elif machine != expected:
             missing.append(
-                f"{relative}: {MACHINE_NAMES.get(machine, hex(machine))}, expected {expect}"
+                f"{relative}: {MACHINE_NAMES.get(machine, hex(machine))}, expected {arguments.expect}"
             )
     if missing:
         fail("required package contents are wrong", missing)
 
     if violations:
         fail(
-            f"{len(violations)} PE image(s) are not {expect}",
+            f"{len(violations)} PE image(s) are not {arguments.expect}",
             [f"{relative}: {name}" for relative, name in violations]
             + ["the Windows client ships x64 only; x86 and ARM64 must not be mixed in"],
         )
@@ -243,17 +181,16 @@ def main():
     print()
     if exemptions:
         print(
-            f"PASS: every audited PE image is {expect}, except "
-            f"{len(exemptions)} declared exception(s) listed above"
+            f"PASS: every audited PE image is {arguments.expect}, except "
+            f"{len(exemptions)} explicitly allowed exception(s) listed above"
         )
     else:
-        print(f"PASS: every audited PE image in this package is {expect}")
+        print(f"PASS: every audited PE image in this package is {arguments.expect}")
 
     if arguments.record:
         lines = [
             "windows package architecture audit",
-            f"profile                {arguments.profile or '(none)'}",
-            f"expected               {expect} (0x{expected:04x})",
+            f"expected               {arguments.expect} (0x{expected:04x})",
             f"pe images audited      {len(rows)}",
             f"non-pe files skipped   {skipped}",
             f"exemptions             {len(exemptions)}",
@@ -264,9 +201,8 @@ def main():
             + (f"  [allowed: {exempt}]" if exempt and machine != expected else "")
             for relative, machine, name, size, exempt in sorted(rows)
         ]
-        record_path = pathlib.Path(arguments.record)
-        record_path.parent.mkdir(parents=True, exist_ok=True)
-        record_path.write_text("\n".join(lines) + "\n")
+        pathlib.Path(arguments.record).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(arguments.record).write_text("\n".join(lines) + "\n")
         print(f"  record written to {arguments.record}")
 
 

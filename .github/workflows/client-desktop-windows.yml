@@ -202,16 +202,35 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build
-          # The payload is held to the desktop-win-x64 profile: x64 strictly, with the
-          # required contents and the declared exceptions named in the audit script.
-          # The installer is added here as one more declared exception - an NSIS stub is
-          # 32-bit whatever it installs, and it is not shipped payload.
+          # Every PE image must be amd64. The only non-amd64 images a correct build
+          # contains are the two electron-builder ones named below, each with its reason,
+          # and each named by its exact path. There is no wildcard for either: anything
+          # not listed here fails.
+          #
+          #   Jiejiebox-...-windows-x64.exe   an NSIS installer is a 32-bit stub whatever
+          #                                   it installs. It is the file the user runs,
+          #                                   not shipped payload.
+          #   resources/elevate.exe           electron-builder's NSIS UAC elevation
+          #                                   helper, which electron-builder packs into
+          #                                   the application by default. A legitimate
+          #                                   32-bit helper; it is not x64 payload
+          #                                   contamination.
           python tooling/scripts/ci/audit-windows-pe-architecture.py \
             "$CLIENT_DIR/release/win-unpacked" \
             "$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe" \
-            --profile desktop-win-x64 \
             --root "$CLIENT_DIR/release/win-unpacked" \
+            --expect amd64 \
             --allow "Jiejiebox-v*-windows-x64.exe=i386 NSIS installer stub (electron-builder), not shipped payload" \
+            --allow "resources/elevate.exe=i386 electron-builder NSIS UAC elevation helper" \
+            --require "Jiejiebox.exe" \
+            --require "resources/daemon/sing-box-daemon.exe" \
+            --require "resources/daemon/libcronet.dll" \
+            --require "resources/daemon/WinDivert64.sys" \
+            --require "resources/daemon/VBoxUSB.sys" \
+            --require "resources/daemon/VBoxUSBMon.sys" \
+            --require "resources/daemon/usbip2_ude.sys" \
+            --require "resources/daemon/usbip2_filter.sys" \
+            --require "resources/native/windows_share.node" \
             --record build/pe-architecture-audit.txt
 
       - name: Audit the payload the installer actually carries
@@ -226,19 +245,34 @@ jobs:
             "$CLIENT_DIR/release/Jiejiebox-v$CORE_VERSION-windows-x64.exe" \
             build/installer-payload
 
-      - name: Confirm no x86 or ARM64 image was mixed in
+      - name: Confirm the architecture audit recorded the expected x64 payload
         shell: bash
         run: |
           set -euo pipefail
-          # The audit above already fails on a wrong architecture; this is the same fact
-          # stated as a count, so a run that passes cannot be mistaken for a run that
-          # skipped the check.
-          if grep -E "^  (i386|arm64|armnt|arm) " build/pe-architecture-audit.txt; then
-            echo "FAIL: a non-x64 image is in the package" >&2
-            exit 1
-          fi
-          echo "no i386, arm or arm64 PE image in the packaged payload"
-          echo "amd64 images: $(grep -c '^  amd64' build/pe-architecture-audit.txt)"
+          # This step reports; it does not judge. The audit script is the single authority
+          # on architecture and exits non-zero for any PE image that is neither amd64 nor a
+          # declared exception, so reaching this step already means the policy held.
+          #
+          # Re-deriving the verdict here is how the two came to disagree. The record's
+          # rows carry no leading indent, so a grep anchored with two spaces matched
+          # nothing at all; and a grep for "i386" would have failed the very exceptions
+          # the audit had just approved - the NSIS stub and electron-builder's elevate
+          # helper. Either way this step was asserting something the audit had already
+          # decided, from a different copy of the rule.
+          for record in build/pe-architecture-audit.txt \
+                        build/installer-payload/installer-payload-audit.txt; do
+            [ -f "$record" ] || { echo "FAIL: $record is missing" >&2; exit 1; }
+            amd64_count="$(grep -c '^amd64' "$record" || true)"
+            [ "$amd64_count" -gt 0 ] || {
+              echo "FAIL: $record records no amd64 PE image" >&2; exit 1; }
+            echo "== $record =="
+            grep -E '^(expected|pe images audited|non-pe files skipped|exemptions)' "$record" \
+              | sed 's/^/  /'
+            echo "  amd64 rows: $amd64_count"
+            echo
+          done
+          echo "the architecture audit passed for both the packaged tree and the"
+          echo "payload extracted from the installer; the rows above are what it recorded."
 
       - name: Record the build
         shell: bash

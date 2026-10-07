@@ -89,11 +89,32 @@ echo "  extracted files: $file_count"
 [ "$file_count" -gt 0 ] || { echo "FAIL: the payload archive extracted to nothing" >&2; exit 1; }
 
 echo "== auditing the payload the installer carries =="
-# The expected contents and the declared exceptions are one named profile, shared with
-# the audit of the tree electron-builder produced, so the two cannot drift apart.
+# The same policy the workflow applies to the tree electron-builder produced: every PE
+# image must be amd64, and the only non-amd64 images that may appear are the ones named
+# here with a reason. Both are electron-builder's own, and neither is x64 payload:
+#
+#   resources/elevate.exe   electron-builder's NSIS UAC elevation helper, which
+#                           electron-builder packs into the application by default. It is
+#                           a legitimate 32-bit helper and it runs as such on 64-bit
+#                           Windows. The client does not use it (src/main/repair.ts
+#                           elevates with PowerShell's "runas" verb), but it is
+#                           electron-builder's file rather than this fork's.
+#
+# The paths are exact. There is no wildcard for elevate.exe, no resources/*.exe, and no
+# rule that would admit any other i386 image: anything not named here still fails.
 "$python_bin" "$root/scripts/ci/audit-windows-pe-architecture.py" "$app_dir" \
-  --profile desktop-win-x64 \
   --root "$app_dir" \
+  --expect amd64 \
+  --allow "resources/elevate.exe=i386 electron-builder NSIS UAC elevation helper" \
+  --require "Jiejiebox.exe" \
+  --require "resources/daemon/sing-box-daemon.exe" \
+  --require "resources/daemon/libcronet.dll" \
+  --require "resources/daemon/WinDivert64.sys" \
+  --require "resources/daemon/VBoxUSB.sys" \
+  --require "resources/daemon/VBoxUSBMon.sys" \
+  --require "resources/daemon/usbip2_ude.sys" \
+  --require "resources/daemon/usbip2_filter.sys" \
+  --require "resources/native/windows_share.node" \
   --record "$workdir/installer-payload-audit.txt"
 
 echo "PASS: the installer's own payload is entirely x64"
