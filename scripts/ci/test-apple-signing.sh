@@ -455,13 +455,26 @@ if [ "$branding_applied" = "1" ]; then
 
   # The floor lives in the PROJECT, never in the UI: the Hako toolbar logic is frozen.
   #
-  # Asserted on the pinned COMMIT rather than the working tree. prepare-apple-client.sh
-  # legitimately rewrites GitHubUpdateChecker.swift for the updater overlay, so a
-  # working-tree diff cannot tell an overlay edit apart from a UI edit - but the commit the
-  # floor ships in can be asked directly, and it must contain no Swift at all.
+  # This used to assert that the PINNED COMMIT contained no Swift at all, on the theory that the
+  # commit raising the floor should be a settings-only change. That invariant is not expressible
+  # in this repository, and the assertion had quietly become something else:
+  #
+  #   * the floor did not arrive in a dedicated commit. `git log -S
+  #     'IPHONEOS_DEPLOYMENT_TARGET = 16.0'` resolves to the INITIAL IMPORT, which by definition
+  #     contains every Swift file in the project, so there is no commit to anchor to.
+  #   * hako-ui is a live UI branch, so the pin is a UI commit by design. "The current pin has no
+  #     Swift" therefore cannot hold, and it stopped meaning anything the moment the pin moved off
+  #     the settings-only commit it was written for.
+  #
+  # What actually matters is that the OVERLAY - which rewrites bundle ids, app groups and branding
+  # - does not disturb the floor. That is checkable, it is the property a branding change could
+  # plausibly break, and it does not depend on where the pin happens to be.
   pinned="$(git ls-tree HEAD clients/apple | awk '{print $3}')"
-  check "the pinned client raises the floor without touching Swift" \
-    bash -c "! git -C clients/apple show --name-only --format= '$pinned' | grep -qE '\.swift\$'"
+  pinned_floor="$(git -C clients/apple show "$pinned:sing-box.xcodeproj/project.pbxproj" \
+    | grep -o 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;' | sort -u)"
+  prepared_floor="$(grep -o 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;' "$pbx" | sort -u)"
+  check "the overlay leaves the iOS deployment floor untouched" \
+    test -n "$pinned_floor" -a "$pinned_floor" = "$prepared_floor"
   check "the toolbar logic is unchanged" \
     grep -q "if environments.remoteServer != nil" clients/apple/SFI/MainView.swift
 
