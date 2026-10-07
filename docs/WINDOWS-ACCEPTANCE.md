@@ -1,13 +1,42 @@
 # Windows runtime acceptance
 
-The Windows installer is built by `.github/workflows/client-desktop-windows.yml` on a
-GitHub-hosted Windows runner. That run proves the installer was produced, that it carries
-the v0.1.5 daemon, and that every executable inside it is x64.
+`.github/workflows/client-desktop-windows.yml` builds, signs, installs and tears down the
+Windows client on a hosted runner. What that run proves and what it cannot are different
+things, and this document is the second half.
 
-It does not prove the client works. Nothing on a hosted runner can: TUN mode needs
-WinDivert loaded as a kernel driver, the system proxy needs the real registry and WinINET,
-and the IPC path needs the installed service. Those are runtime facts about a real
-machine, and only this runbook establishes them.
+## What CI already proves
+
+Everything below fails the workflow, so a green run means these are established:
+
+| gate | what it establishes |
+| --- | --- |
+| source / toolchain | the exact core commit, the desktop pin, and the toolchain versions |
+| build | the installer was produced from that source, with a throwaway signing certificate |
+| package integrity | `app.asar` hash and all nine Electron fuses are as expected |
+| daemon provenance | the packaged daemon is the v0.1.5 core daemon, `windows/amd64`, with the required build tags, and it reports `0.1.5` when run |
+| PE architecture | every PE image in the package and in the installer's extracted payload is amd64, except two named exceptions (the 32-bit NSIS stub and electron-builder's `resources/elevate.exe`) |
+| signing | `sing-box.exe`, the daemon and `windows_share.node` carry an Authenticode signature, it verifies, it is the certificate the run created, and all three share one signer |
+| daemon service | `service install`, SCM registration, Running, the daemon's own `status`, stop, and uninstall |
+| installer lifecycle | silent install, file and version and service and layout-registry verification, same-version reinstall, uninstall, clean reinstall, final uninstall |
+| driver packages | each `.sys` has an embedded signature or verified catalog coverage |
+
+The signing gate is worth one note here, because it constrains everything else. The core's
+Windows daemon authenticates the installed application against the daemon's own signer and
+refuses to register the service - and refuses every peer handshake - when the two differ
+(`experimental/boxdd/security_windows.go`, `peer_windows.go`). It also resolves the
+application by the exact path `<install>/sing-box.exe`. So the installed executable keeps
+that file name; `productName` stays `Jiejiebox` and supplies everything a user reads.
+
+## What only a real machine can prove
+
+A hosted runner is not a user's machine and cannot stand in for one. These remain manual,
+and this is the runbook for them:
+
+* TUN mode, WinDivert as a loaded kernel driver, and real traffic interception
+* DNS resolution through the tunnel
+* the system proxy, and whether disabling it restores the previous registry values
+* IPC between the GUI and the daemon under real use
+* sleep/wake, network switching, and long-running stability
 
 Until a run of this runbook passes end to end, the installer is **not** appended to the
 v0.1.5 release and `SHA256SUMS` is **not** updated.
