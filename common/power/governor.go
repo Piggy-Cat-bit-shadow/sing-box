@@ -175,8 +175,21 @@ type Governor struct {
 	// real traffic, which is what makes the transition traffic-driven rather than a fixed countdown
 	// from the moment the screen went off.
 	idleTimer *time.Timer
+	// idleGeneration is the era of the current deadline. Every invalidation bumps it, and a callback
+	// captured its own value when it was armed: a callback whose generation is no longer current
+	// belongs to a deadline that has been superseded and must not act at all.
+	//
+	// This is not belt-and-braces. time.Timer.Stop() cannot recall a callback that has ALREADY begun,
+	// and that callback goes on to take the lock. Without an era check it would clear the reference to
+	// the replacement timer and put the governor into DEEP_IDLE - ignoring the traffic that had just
+	// bought another DeepIdleAfter. The mutex does not help: both goroutines are correctly
+	// synchronised and the sequence is still wrong, so the race detector cannot see it either.
+	idleGeneration uint64
 	// wakeTimer promotes WAKING to ACTIVE once every staggered category has been released.
 	wakeTimer *time.Timer
+	// wakeGeneration is the same idea for the wake stagger: a stagger superseded by a newer wake must
+	// not release work early on its predecessor's schedule.
+	wakeGeneration uint64
 	// wokeAt is when the current wake began, and is what Allow() measures each category against.
 	wokeAt time.Time
 	closed bool
@@ -185,6 +198,12 @@ type Governor struct {
 	// pendingNotify is set by a transition and cleared by flushNotifications, which runs after the
 	// lock is released. See setStateLocked.
 	pendingNotify bool
+	// idleCallbackEntered, when set, runs at the very start of the idle timer callback BEFORE the lock
+	// is taken. It exists so a test can force the one interleaving that cannot be reached by sleeping:
+	// a callback that has already committed to running but has not yet acquired the lock, while
+	// ObserveTraffic resets the deadline underneath it. Set before the timer is armed and never
+	// mutated afterwards, so it needs no synchronisation of its own.
+	idleCallbackEntered func()
 
 	// stateChanged is closed and replaced on every transition, so a subsystem can wait for the state
 	// to move without polling. See WaitActive.
@@ -297,13 +316,24 @@ func (g *Governor) beginWakingLocked() {
 	g.setStateLocked(StateWaking)
 	if g.wakeTimer != nil {
 		g.wakeTimer.Stop()
+		g.wakeTimer = nil
 	}
+	// Same era discipline as the idle deadline, and it is needed for the same reason: a stagger that
+	// has already begun cannot be recalled by Stop(), and if a NEWER wake has since put the governor
+	// back into WAKING, the old callback would end that new stagger early on its predecessor's
+	// schedule. The state check alone does not catch that - the state IS WAKING, just not this
+	// callback's WAKING.
+	g.wakeGeneration++
+	generation := g.wakeGeneration
 	g.wakeTimer = time.AfterFunc(longest, func() {
 		defer g.flushNotifications()
 		g.access.Lock()
 		defer g.access.Unlock()
+		if g.closed || generation != g.wakeGeneration {
+			return
+		}
 		g.wakeTimer = nil
-		if g.closed || g.state != StateWaking {
+		if g.state != StateWaking {
 			return
 		}
 		g.setStateLocked(StateActive)
@@ -353,13 +383,17 @@ func (g *Governor) NetworkWake() {
 // notification's request. The brief calls that a wake storm, and it is how a power optimisation pays
 // for itself twice over.
 //
-// What it does is keep the situation from getting deeper. The traffic already has its link; the
-// countdown to DEEP_IDLE is disarmed because a device carrying traffic is not idle however long the
-// screen has been off, and DEEP_IDLE itself is lifted back to QUIESCENT so the link that is in use
-// keeps the little maintenance QUIESCENT permits.
+// What it does is move the deadline. The traffic already has its link; the countdown to DEEP_IDLE
+// restarts from now, because "idle" means no real activity for DeepIdleAfter; and DEEP_IDLE itself is
+// lifted back to QUIESCENT so the link that is in use keeps the little maintenance QUIESCENT permits.
 //
-// It is deliberately cheap - one lock, and a timer stop only when one is armed - because the
-// forwarding path calls it. It must NOT be called for the core's own liveness traffic.
+// Activity is per FLOW, so a single long-lived transfer does not keep pushing the deadline out and the
+// governor may reach DEEP_IDLE while one is running. That is safe and intended: DEEP_IDLE stops
+// speculative work and releases only genuinely idle reusable pools, and never terminates an active
+// flow.
+//
+// It is deliberately cheap - one lock, and a timer reset only while something is suppressing - because
+// the forwarding path calls it. It must NOT be called for the core's own liveness traffic.
 func (g *Governor) ObserveTraffic() {
 	defer g.flushNotifications()
 	g.access.Lock()
@@ -393,10 +427,7 @@ func (g *Governor) ObserveTraffic() {
 // resetIdleTimerLocked restarts the countdown to DEEP_IDLE from now. Caller holds the lock and has
 // already established that something is suppressing.
 func (g *Governor) resetIdleTimerLocked() {
-	if g.idleTimer != nil {
-		g.idleTimer.Stop()
-		g.idleTimer = nil
-	}
+	g.cancelIdleTimerLocked()
 	g.armIdleTimerLocked()
 }
 
@@ -404,10 +435,7 @@ func (g *Governor) resetIdleTimerLocked() {
 // Quiescent or DeepIdle is begun.
 func (g *Governor) recomputeLocked() {
 	if !g.devicePaused && !g.networkPaused {
-		if g.idleTimer != nil {
-			g.idleTimer.Stop()
-			g.idleTimer = nil
-		}
+		g.cancelIdleTimerLocked()
 		g.setStateLocked(StateActive)
 		return
 	}
@@ -421,18 +449,43 @@ func (g *Governor) armIdleTimerLocked() {
 	if g.idleTimer != nil || g.policy.DeepIdleAfter <= 0 {
 		return
 	}
+	g.idleGeneration++
+	generation := g.idleGeneration
 	g.idleTimer = time.AfterFunc(g.policy.DeepIdleAfter, func() {
 		defer g.flushNotifications()
+		if g.idleCallbackEntered != nil {
+			g.idleCallbackEntered()
+		}
 		g.access.Lock()
 		defer g.access.Unlock()
+		// First, and before anything is mutated: does this callback still own the deadline?
+		//
+		// A superseded callback must not clear g.idleTimer - that reference now belongs to a newer
+		// timer, and clearing it would leave a live timer that nothing can stop - and must not touch
+		// the state.
+		if g.closed || generation != g.idleGeneration {
+			return
+		}
 		g.idleTimer = nil
 		// Either suppression is enough to have reached here; both being lifted means recompute
 		// already returned to ACTIVE and disarmed this timer.
-		if g.closed || (!g.devicePaused && !g.networkPaused) {
+		if !g.devicePaused && !g.networkPaused {
 			return
 		}
 		g.setStateLocked(StateDeepIdle)
 	})
+}
+
+// cancelIdleTimerLocked invalidates the pending countdown.
+//
+// It bumps the generation as well as stopping the timer, because Stop() cannot recall a callback that
+// has already started - see the era check in the callback itself.
+func (g *Governor) cancelIdleTimerLocked() {
+	if g.idleTimer != nil {
+		g.idleTimer.Stop()
+		g.idleTimer = nil
+	}
+	g.idleGeneration++
 }
 
 // setStateLocked applies a transition and wakes anything waiting on one.
@@ -554,13 +607,11 @@ func (g *Governor) Close() {
 		return
 	}
 	g.closed = true
-	if g.idleTimer != nil {
-		g.idleTimer.Stop()
-		g.idleTimer = nil
-	}
+	g.cancelIdleTimerLocked()
 	if g.wakeTimer != nil {
 		g.wakeTimer.Stop()
 		g.wakeTimer = nil
 	}
+	g.wakeGeneration++
 	close(g.stateChanged)
 }

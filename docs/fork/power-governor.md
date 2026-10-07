@@ -34,8 +34,21 @@ the user picks the phone up.
 
 **Traffic does not return the governor to ACTIVE.** A push notification arriving while the phone is
 in a pocket forwards one request; returning the whole governor to ACTIVE for it would re-enable
-every speculative subsystem at once. Traffic gets its link, the countdown to DEEP_IDLE is disarmed,
-and DEEP_IDLE lifts back to QUIESCENT. This is the brief's "wake storm" requirement.
+every speculative subsystem at once. Traffic gets its link, the DEEP_IDLE deadline is RESET to now +
+`DeepIdleAfter`, and DEEP_IDLE lifts back to QUIESCENT. This is the brief's "wake storm" requirement.
+
+Note what this does and does not claim, because an earlier version of this document overstated it.
+Activity is observed **per flow**, not per byte, so a single long-lived transfer does not keep
+resetting the deadline while it runs and the governor CAN reach DEEP_IDLE during one. That is
+intended, and it is safe, because DEEP_IDLE does not terminate an active flow: it suppresses
+speculative maintenance and releases genuinely idle reusable pools, and every keeper only touches
+resources with no active user traffic (see the audit below). The accurate statement is:
+
+    new real-flow activity postpones DEEP_IDLE;
+    DEEP_IDLE itself does not terminate active business flows.
+
+Not "a device carrying traffic is never treated as idle" - per-flow observation cannot establish
+that, and it is not what the code does.
 
 **The discrimination between real and generated traffic is structural, not a heuristic.**
 `RouteConnectionEx` / `RoutePacketConnectionEx` are reached by a flow the DEVICE asked for; a URLTest
