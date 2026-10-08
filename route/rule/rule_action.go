@@ -534,7 +534,17 @@ func (r *RuleActionSniff) build() error {
 			r.PacketSniffers = append(r.PacketSniffers, sniff.DomainNameQuery)
 		case C.ProtocolSTUN:
 			r.PacketSniffers = append(r.PacketSniffers, sniff.STUNMessage)
+		case C.ProtocolWireGuard:
+			// WireGuard is selectable on its own so a config can ask for the classification
+			// without also enabling the BitTorrent sniffers it used to be confused with.
+			r.PacketSniffers = append(r.PacketSniffers, sniff.WireGuard)
 		case C.ProtocolBitTorrent:
+			// WireGuard is registered unconditionally ahead of UTP here, not only when the config
+			// also names "wireguard". The loop walks SnifferNames in the order the user wrote, so
+			// a config naming only "bittorrent" would otherwise reproduce LX 078: a 148-byte
+			// handshake initiation starts 01 00 00 00 and satisfies UTP's two-nibble heuristic.
+			// This mirrors defaultPacketSniffers, where the same order is load-bearing.
+			r.PacketSniffers = append(r.PacketSniffers, sniff.WireGuard)
 			r.StreamSniffers = append(r.StreamSniffers, sniff.BitTorrent)
 			r.PacketSniffers = append(r.PacketSniffers, sniff.UTP)
 			r.PacketSniffers = append(r.PacketSniffers, sniff.UDPTracker)
