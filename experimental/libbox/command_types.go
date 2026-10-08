@@ -112,7 +112,32 @@ type ConnectionEventIterator interface {
 	HasNext() bool
 }
 
+// Connections is the live connection list a platform UI renders.
+//
+// # Why this type is synchronized, and what it was before
+//
+// Its methods are called from TWO goroutines by design, not by accident: the command client receives
+// the event stream on its own goroutine (command_client.go's `go c.handleConnectionsStream(...)`
+// reaches the platform handler, which calls ApplyEvents), while the UI thread calls Iterator and the
+// Sort/Filter methods to draw and sort the list. Nothing here was synchronized, which made three
+// distinct unsynchronized accesses reachable:
+//
+//  1. `connectionMap` was ITERATED by ApplyEvents (and read by FilterState) while ApplyEvents could
+//     concurrently WRITE it. In Go that is not a race the program can recover from: it is
+//     `fatal error: concurrent map iteration and map write`, a runtime throw that kills the process
+//     with no panic to catch. On Android that is a user-visible crash from background traffic.
+//  2. `filtered` was re-sliced and refilled by ApplyEvents/FilterState while SortBy* sorted the same
+//     backing array and Iterator walked it.
+//  3. Iterator handed the caller the LIVE `filtered` slice, so even a caller that only read the
+//     result raced with the next ApplyEvents rewriting the array underneath it.
+//
+// The lock is a plain mutex because every holder does bounded in-memory work - there is no I/O, no
+// callback into user code and no call into the router under it, so it cannot participate in a lock
+// cycle and the critical sections are short. It is deliberately NOT held across the return of an
+// iterator: see Iterator, which snapshots instead.
 type Connections struct {
+	// access guards every field below. Lock order: nothing else is ever taken while it is held.
+	access        sync.Mutex
 	connectionMap map[string]*Connection
 	input         []Connection
 	filtered      []Connection
@@ -126,10 +151,20 @@ func NewConnections() *Connections {
 	}
 }
 
+// ApplyEvents applies a batch from the event stream. Safe to call concurrently with every other
+// method; the platform calls it from the stream goroutine.
 func (c *Connections) ApplyEvents(events *ConnectionEvents) {
 	if events == nil {
 		return
 	}
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.applyEventsLocked(events)
+}
+
+// applyEventsLocked is the body of ApplyEvents. It exists so the caller can compose it with other
+// locked work; it must only ever be called with access held.
+func (c *Connections) applyEventsLocked(events *ConnectionEvents) {
 	if events.Reset {
 		c.connectionMap = make(map[string]*Connection)
 	}
@@ -171,13 +206,19 @@ func (c *Connections) ApplyEvents(events *ConnectionEvents) {
 		c.input = append(c.input, *conn)
 	}
 	if c.filterApplied {
-		c.FilterState(c.filterState)
+		// The LOCKED variant, not the public method: FilterState takes the mutex, so calling it here
+		// would deadlock against the lock this function's caller already holds.
+		c.filterStateLocked(c.filterState)
 	} else {
 		c.filtered = c.filtered[:0]
 		c.filtered = append(c.filtered, c.input...)
 	}
 }
 
+// evictClosedConnections drops connections that have been closed longer than closedConnectionMaxAge.
+//
+// Called ONLY from applyEventsLocked, i.e. with access already held, which is why it takes no lock
+// of its own: it exists to keep the event loop readable, not to be part of the public surface.
 func (c *Connections) evictClosedConnections(nowMilliseconds int64) {
 	for id, conn := range c.connectionMap {
 		if conn.ClosedAt == 0 {
@@ -189,7 +230,16 @@ func (c *Connections) evictClosedConnections(nowMilliseconds int64) {
 	}
 }
 
+// FilterState selects which connections are visible. Safe to call concurrently with every other
+// method; the platform calls it from the UI thread.
 func (c *Connections) FilterState(state int32) {
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.filterStateLocked(state)
+}
+
+// filterStateLocked is the body of FilterState, for callers that already hold access.
+func (c *Connections) filterStateLocked(state int32) {
 	c.filterApplied = true
 	c.filterState = state
 	c.filtered = c.filtered[:0]
@@ -211,7 +261,12 @@ func (c *Connections) FilterState(state int32) {
 	}
 }
 
+// SortByDate sorts the visible list. The sort runs under the lock because it reorders the same
+// backing array the event stream is refilling; sorting a copy and publishing it would work
+// too, but every caller sorts immediately before iterating, so the copy would be pure garbage.
 func (c *Connections) SortByDate() {
+	c.access.Lock()
+	defer c.access.Unlock()
 	slices.SortStableFunc(c.filtered, func(x, y Connection) int {
 		if x.CreatedAt < y.CreatedAt {
 			return 1
@@ -223,7 +278,12 @@ func (c *Connections) SortByDate() {
 	})
 }
 
+// SortByTraffic sorts the visible list. The sort runs under the lock because it reorders the same
+// backing array the event stream is refilling; sorting a copy and publishing it would work
+// too, but every caller sorts immediately before iterating, so the copy would be pure garbage.
 func (c *Connections) SortByTraffic() {
+	c.access.Lock()
+	defer c.access.Unlock()
 	slices.SortStableFunc(c.filtered, func(x, y Connection) int {
 		xTraffic := x.Uplink + x.Downlink
 		yTraffic := y.Uplink + y.Downlink
@@ -237,7 +297,12 @@ func (c *Connections) SortByTraffic() {
 	})
 }
 
+// SortByTrafficTotal sorts the visible list. The sort runs under the lock because it reorders the same
+// backing array the event stream is refilling; sorting a copy and publishing it would work
+// too, but every caller sorts immediately before iterating, so the copy would be pure garbage.
 func (c *Connections) SortByTrafficTotal() {
+	c.access.Lock()
+	defer c.access.Unlock()
 	slices.SortStableFunc(c.filtered, func(x, y Connection) int {
 		xTraffic := x.UplinkTotal + x.DownlinkTotal
 		yTraffic := y.UplinkTotal + y.DownlinkTotal
@@ -251,8 +316,21 @@ func (c *Connections) SortByTrafficTotal() {
 	})
 }
 
+// Iterator walks the visible connections.
+//
+// It returns an iterator over a SNAPSHOT, not over the live slice. Handing out `c.filtered` itself
+// would be a race even for a caller that only reads: the next ApplyEvents or FilterState refills the
+// same backing array (and SortBy* reorders it), so the consumer would be walking memory that is
+// being rewritten under it - and the platform consumer is a gomobile caller on another thread, which
+// is exactly the case that made this reachable in practice.
+//
+// The copy is the correct trade: an iterator is consumed across a UI frame, and a UI frame that
+// shows a list which is one event batch stale is strictly better than one that reads torn memory.
 func (c *Connections) Iterator() ConnectionIterator {
-	return newPtrIterator(c.filtered)
+	c.access.Lock()
+	snapshot := append([]Connection(nil), c.filtered...)
+	c.access.Unlock()
+	return newPtrIterator(snapshot)
 }
 
 type ProcessInfo struct {
