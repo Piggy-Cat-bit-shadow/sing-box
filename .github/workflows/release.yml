@@ -31,6 +31,10 @@ on:
       tag:
         description: 'Existing tag to release (e.g. v0.1)'
         required: true
+      dry_run:
+        description: 'Validate only: resolve, wait for CI, download and verify artifacts, but do NOT publish'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -191,7 +195,13 @@ jobs:
         env:
           TAG: ${{ steps.tag.outputs.tag }}
 
+      # The ONLY step a dry run skips. Everything before it - resolving the tag, waiting for the CI
+      # runs for that commit, downloading the artifacts those runs produced, verifying their
+      # SHA256s, and flattening the asset set - is the part that can be wrong, and a dry run
+      # exercises all of it. Publishing is the one irreversible act, so it is the one behind the
+      # flag, and the flag defaults to false so the real path is unchanged.
       - name: create the release
+        if: ${{ inputs.dry_run != true }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

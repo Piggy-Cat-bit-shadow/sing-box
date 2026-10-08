@@ -236,13 +236,15 @@ jobs:
       - name: Verify provenance and the ARM64 payload
         run: |
           set -euo pipefail
-          prov=""
-          for candidate in libbox.provenance libs/libbox.provenance clients/android/app/libs/libbox.provenance; do
-            if [ -f "$candidate" ]; then prov="$candidate"; break; fi
-          done
-          if [ -z "$prov" ]; then
-            echo "FAIL: no libbox.provenance was written; the build did not record what it built" >&2
-            find . -name 'libbox.provenance' -not -path './clients/*' | head >&2
+          # The builder's real output paths, confirmed from a successful run rather than guessed:
+          # writeProvenance writes "libbox.provenance" and the Android variant's OutputName is
+          # "libbox.aar", both relative to the working directory. An earlier revision searched with
+          # `find`, which would have accepted an artifact from anywhere in the tree - including a
+          # stale one left by an earlier step.
+          prov="libbox.provenance"
+          if [ ! -f "$prov" ]; then
+            echo "FAIL: the builder did not write $prov; it did not record what it built" >&2
+            ls -la | head -20 >&2
             exit 1
           fi
           echo "--- $prov ---"; cat "$prov"
@@ -253,8 +255,8 @@ jobs:
           fi
           echo "PASS: provenance names the commit that was built"
 
-          aar="$(find . -name 'libbox*.aar' -not -path './clients/*' | head -1)"
-          if [ -z "$aar" ]; then echo "FAIL: no libbox .aar produced" >&2; exit 1; fi
+          aar="libbox.aar"
+          if [ ! -f "$aar" ]; then echo "FAIL: the builder did not produce $aar" >&2; ls -la | head -20 >&2; exit 1; fi
           echo "aar: $aar ($(stat -c%s "$aar") bytes)"
           rm -rf /tmp/aar && mkdir -p /tmp/aar && unzip -q "$aar" -d /tmp/aar
           find /tmp/aar -name '*.so' -printf '%p %s\n' | sort
@@ -305,7 +307,7 @@ jobs:
             echo "| ndk | \`${ANDROID_NDK_HOME:-unset}\` |"
             echo "| target abi | android/arm64 |"
             echo "| resolved tags | \`$(cat /tmp/android-tags.txt 2>/dev/null || echo unavailable)\` |"
-            echo "| aar | \`$(find . -name 'libbox*.aar' -not -path './clients/*' | head -1)\` |"
+            echo "| aar | \`libbox.aar\` |"
             echo "| sha256 | see the SHA256SUMS.txt artifact |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -315,7 +317,7 @@ jobs:
         with:
           name: android-core-arm64-${{ github.sha }}
           path: |
-            **/libbox*.aar
-            **/libbox.provenance
+            libbox.aar
+            libbox.provenance
             SHA256SUMS.txt
           if-no-files-found: error
