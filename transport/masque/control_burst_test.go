@@ -1242,8 +1242,33 @@ func TestTheOwnershipScanIsLinearHereToo(t *testing.T) {
 		routes = append(routes, AddressRange{Start: address, End: address, Protocol: 0})
 	}
 
+	// Best-of-N, alternating, instead of one sample of each.
+	//
+	// # Why the estimator had to change, and not the bound
+	//
+	// The claim is real - a per-packet scan over the advertised ranges must stay linear in
+	// their number - but a single wall-clock pair does not measure it. The two samples run at
+	// different moments, so a scheduling spike, a GC pause or a co-tenant build during the
+	// WIDE sample lands entirely in the numerator, and the ratio then reports the machine
+	// rather than the algorithm. That is not hypothetical: it failed this way on a loaded
+	// runner at 33.8x-40.7x the bound, while passing every time the host was quiet.
+	//
+	// A spike can only ever make a sample SLOWER, never faster, so the MINIMUM of several
+	// alternating samples is the least-disturbed estimate of each side's true cost, and the
+	// ratio of the minima is robust to exactly the interference that broke the single-pair
+	// version. The bound is unchanged: the estimator and the threshold are separate things,
+	// and it was the estimator that was wrong.
+	const samples = 5
 	wide := measure(t, routes)
 	narrow := measure(t, routes[:1])
+	for range samples - 1 {
+		if candidate := measure(t, routes); candidate < wide {
+			wide = candidate
+		}
+		if candidate := measure(t, routes[:1]); candidate < narrow {
+			narrow = candidate
+		}
+	}
 	if narrow <= 0 {
 		t.Fatalf("the baseline measurement must be positive, or no ratio can be formed")
 	}
@@ -1253,9 +1278,9 @@ func TestTheOwnershipScanIsLinearHereToo(t *testing.T) {
 	// of a one-range scan. 4x that is the bound: generous enough for a loaded runner,
 	// orders of magnitude below quadratic.
 	bound := 4 * float64(maxRoutesPerCapsule)
-	t.Logf("%d lookups: %d ranges -> %v, 1 range -> %v, ratio %.1fx (linear expectation "+
-		"%dx, bound %.0fx)", lookups, maxRoutesPerCapsule, wide, narrow, ratio,
-		maxRoutesPerCapsule, bound)
+	t.Logf("%d lookups, best of %d: %d ranges -> %v, 1 range -> %v, ratio %.1fx (linear "+
+		"expectation %dx, bound %.0fx)", lookups, samples, maxRoutesPerCapsule, wide, narrow,
+		ratio, maxRoutesPerCapsule, bound)
 
 	if ratio > bound {
 		t.Fatalf("%d lookups over %d advertised ranges took %v versus %v over one range "+
