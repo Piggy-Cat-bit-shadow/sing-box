@@ -254,15 +254,33 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string, xmuxClient 
 // the connection is established (httptrace GotConn) and processes the response
 // asynchronously. lx: SPEC 002.
 func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xmuxClient *xmuxClient, release *xmuxRelease) (net.Conn, error) {
+	// lx: SPEC 077 for packet-up — the dial context bounds CONSTRUCTION, and
+	// construction here is entirely synchronous. There is no upload pipe to
+	// adopt (every Write is its own bounded POST) and the download response may
+	// not arrive until the first uplink (the deadlock note above), so unlike
+	// stream-one/stream-up there is no network event this dial can wait for.
+	// What remains of the net.Dialer contract is the part the caller can
+	// observe: a dial context cancelled before the dial returns must fail the
+	// dial, not hand back a connection the caller is no longer waiting for.
+	// Before this check the function ignored ctx outright (`_ = ctx`), so an
+	// already-reusable XMUX connection made a pre-cancelled dial return a conn
+	// as if it had succeeded. The slot DialContext took is returned by its error
+	// path exactly once (release.release is sync.Once-guarded), so this failure
+	// leaves the pooled connection's openUsage at zero.
+	//
+	// The residual race is net.Dialer's own, not something this check can close:
+	// a cancel landing between ctx.Err() and the return is indistinguishable
+	// from one landing an instruction after it, and net.Dialer documents the
+	// same ("once successfully connected, any expiration of the context will not
+	// affect the connection"). A conn that wins that race is not "merely looking
+	// successful": the pending download GET and every upload POST ride connCtx
+	// under the TRANSPORT lifetime (lx: SPEC 072), not the dial context, so it
+	// stays usable and the caller's Close releases the slot.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// lx: SPEC 072 — conn-scoped request context (see dialStreamOne); the
-	// download GET and every upload POST ride it, and Close/fail cancel it. The
-	// dial context is deliberately NOT waited on here (lx: SPEC 077 applies to
-	// the streamed modes only): there is no upload pipe to adopt — every Write
-	// is its own bounded POST — and the download response is allowed to arrive
-	// only after the first upload (see the deadlock note above), so it is no
-	// raise precondition; a caller that cancels its dial abandons the conn and
-	// tears everything down via Close.
-	_ = ctx
+	// download GET and every upload POST ride it, and Close/fail cancel it.
 	connCtx, connCancel := context.WithCancel(c.transportContext())
 	// Download stream: GET with the session id but no seq (downlink).
 	downReq, err := c.newRequest(connCtx, http.MethodGet, sessionID, "", nil)
