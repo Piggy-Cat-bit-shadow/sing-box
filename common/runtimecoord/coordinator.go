@@ -34,6 +34,10 @@ import (
 // with that lock released, because those calls take locks of their own. A registration's own lock
 // guards only that registration's state.
 type Coordinator struct {
+	// parent is the context every lease is derived from. A coordinator with no parent is legal (a
+	// manager built directly in a test), which is why it is created rather than required.
+	parent      context.Context
+	parentStop  context.CancelFunc
 	access      sync.Mutex
 	epoch       uint64
 	changed     chan struct{}
@@ -46,7 +50,10 @@ type Coordinator struct {
 // A zero epoch means "no reset has happened yet", which is the correct description of a core that
 // has just started: every resource registered against it belongs to generation zero.
 func New() *Coordinator {
+	parent, parentStop := context.WithCancel(context.Background())
 	return &Coordinator{
+		parent:      parent,
+		parentStop:  parentStop,
 		changed:     make(chan struct{}),
 		registrated: make(map[*Registration]struct{}),
 	}
@@ -122,6 +129,9 @@ func (c *Coordinator) Close() error {
 	for _, registration := range registrations {
 		registration.invalidate()
 	}
+	// And the structural backstop: every lease is derived from this context, so a lease that was
+	// somehow missed by the loop above is still cancelled.
+	c.parentStop()
 	return nil
 }
 
@@ -188,12 +198,108 @@ type Registration struct {
 	// observed is whether the generation this registration was built against has been acted on.
 	// It is what makes Stale() mean "this resource still belongs to a previous network" rather than
 	// merely "the counter moved": observing a notification is not rebuilding the resource.
-	observed    bool
-	pending     bool
-	lastRebind  time.Time
+	observed bool
+	// lease is the recovery currently in flight, or nil. It carries an IDENTITY, not just a flag.
+	//
+	// # Why a bare bool was wrong
+	//
+	// With a bool, an old generation's completion could clear a new generation's in-flight
+	// recovery: grant for generation N, publish N+1 (which resets the flag), grant for N+1, then the
+	// N rebind finishes and clears the flag that N+1 now owns. A third trigger would then be granted
+	// while the N+1 rebind was still running, so "one logical recovery at a time" was not actually
+	// guaranteed across a generation change - and a generation change is exactly when several
+	// triggers arrive together.
+	//
+	// The lease also gives the generation change something to CANCEL. Resetting bookkeeping is not
+	// cancellation: a rebind blocked in a dial observes its context, so the context has to be the
+	// thing that is revoked.
+	lease      *RebindLease
+	nextLease  uint64
+	lastRebind time.Time
+	// rebindCount counts granted recoveries. Telemetry and tests.
 	rebindCount uint64
 	// window overrides adapter.RecoveryWindow when non-zero; tests set it.
 	window time.Duration
+}
+
+// RebindLease is the identity of one granted recovery.
+//
+// It is what makes a completion attributable: only the lease that is still the current owner may
+// release the registration, so a late completion from a superseded generation is a no-op rather
+// than an amnesty for whatever is running now.
+type RebindLease struct {
+	registration *Registration
+	id           uint64
+	generation   uint64
+	reason       adapter.RebindReason
+	ctx          context.Context
+	cancel       context.CancelFunc
+	expired      bool
+}
+
+// ID is the lease identity, for tests and logs.
+func (l *RebindLease) ID() uint64 {
+	if l == nil {
+		return 0
+	}
+	return l.id
+}
+
+// Generation is the network generation this recovery was granted for.
+func (l *RebindLease) Generation() uint64 {
+	if l == nil {
+		return 0
+	}
+	return l.generation
+}
+
+// Reason is the trigger that earned this recovery.
+func (l *RebindLease) Reason() adapter.RebindReason {
+	if l == nil {
+		return adapter.RebindHandshakeGiveUp
+	}
+	return l.reason
+}
+
+// Context is cancelled when the lease stops being the owner: a generation change, a close, or the
+// owner's own parent context. A rebind must observe it, because it is the only thing that reaches
+// work already blocked in a dial.
+func (l *RebindLease) Context() context.Context {
+	if l == nil {
+		return context.Background()
+	}
+	return l.ctx
+}
+
+// Expired reports whether this lease has been superseded or the registration closed.
+func (l *RebindLease) Expired() bool {
+	if l == nil {
+		return true
+	}
+	l.registration.access.Lock()
+	defer l.registration.access.Unlock()
+	return l.expired || l.registration.closed || l.registration.lease != l
+}
+
+// Complete releases the recovery, if this lease is still the owner.
+//
+// A late completion from a superseded generation is deliberately a no-op: it must not release a
+// recovery that a newer generation owns.
+func (l *RebindLease) Complete() {
+	if l == nil {
+		return
+	}
+	registration := l.registration
+	registration.access.Lock()
+	current := registration.lease == l
+	if current {
+		registration.lease = nil
+	}
+	l.expired = true
+	registration.access.Unlock()
+	// The context is always released, even for a superseded lease: its cancel func must not be left
+	// registered against a parent that outlives it.
+	l.cancel()
 }
 
 func newRegistration(coordinator *Coordinator, label string) *Registration {
@@ -247,20 +353,41 @@ func (r *Registration) observeEpoch(epoch uint64) {
 	}
 	r.epoch = epoch
 	r.observed = false
-	r.pending = false
+	// Supersede the in-flight recovery: mark it expired so its completion is a no-op, and take its
+	// cancel func so the rebind actually observes the revocation. Clearing a flag is not
+	// cancellation, and a rebind blocked in a dial only learns about a generation change through its
+	// context.
+	superseded := r.lease
+	if superseded != nil {
+		superseded.expired = true
+		r.lease = nil
+	}
 	// The previous window described a network that no longer exists. A failure on the new one is a
 	// new fact and may be acted on immediately; if it does not fail, nothing happens, which is the
 	// correct cost of a reset for a resource that is actually healthy.
 	r.lastRebind = time.Time{}
 	r.access.Unlock()
+	if superseded != nil {
+		// Outside the lock: cancel runs the context's own callbacks, which take their own locks.
+		superseded.cancel()
+	}
 }
 
 // invalidate makes the registration inert: nothing it schedules will run.
 func (r *Registration) invalidate() {
 	r.access.Lock()
 	r.closed = true
-	r.pending = false
+	superseded := r.lease
+	if superseded != nil {
+		superseded.expired = true
+		r.lease = nil
+	}
 	r.access.Unlock()
+	if superseded != nil {
+		// A lease must not outlive its registration: a rebind that is still running when the owner
+		// closes has to observe the close, or it can act on a resource that is being torn down.
+		superseded.cancel()
+	}
 }
 
 // ScheduleRebind decides whether this trigger earns a rebind for this resource.
@@ -273,45 +400,88 @@ func (r *Registration) invalidate() {
 // of ten resets, are one rebind. Only a *new* failure signal re-arms it, and a network change
 // re-arms it because the previous window described a different network.
 func (r *Registration) ScheduleRebind(reason adapter.RebindReason) bool {
-	if r == nil {
+	lease, granted := r.BeginRebind(reason)
+	if !granted {
 		return false
+	}
+	// The caller asked only whether it may proceed, so the lease it is not going to use has to be
+	// released here or it would hold the recovery open forever.
+	lease.Complete()
+	return true
+}
+
+// BeginRebind decides whether this trigger earns a rebind, and returns an owned lease when it does.
+//
+// The lease is what the caller must run the recovery under and complete afterwards. Its context is
+// cancelled when the recovery is superseded by a generation change or by a close, which is the only
+// mechanism that reaches work already blocked in a dial.
+func (r *Registration) BeginRebind(reason adapter.RebindReason) (*RebindLease, bool) {
+	if r == nil {
+		return nil, false
 	}
 	r.access.Lock()
 	defer r.access.Unlock()
 	if r.closed {
-		return false
+		return nil, false
 	}
-	if r.pending {
-		return false
+	if r.lease != nil {
+		return nil, false
 	}
 	window := r.window
 	if window == 0 {
 		window = adapter.RecoveryWindow
 	}
 	if !r.lastRebind.IsZero() && time.Since(r.lastRebind) < window {
-		return false
+		return nil, false
 	}
 	// Armed here, not when the rebind finishes. A rebind that completes instantly must still leave
 	// the window consumed, or a burst of triggers - each of which completes before the next arrives
 	// - would earn one rebind per trigger. That is the whole point of the window.
+	r.nextLease++
+	parent := context.Background()
+	if r.coordinator != nil {
+		parent = r.coordinator.parent
+	}
+	leaseCtx, cancel := context.WithCancel(parent)
+	lease := &RebindLease{
+		registration: r,
+		id:           r.nextLease,
+		generation:   r.epoch,
+		reason:       reason,
+		ctx:          leaseCtx,
+		cancel:       cancel,
+	}
+	r.lease = lease
 	r.lastRebind = time.Now()
-	r.pending = true
 	r.rebindCount++
-	return true
+	return lease, true
 }
 
-// CompleteRebind records that the caller's rebind finished, releasing the in-flight mark.
+// InflightLease reports the recovery currently owned, or nil. Tests and diagnostics.
+func (r *Registration) InflightLease() *RebindLease {
+	if r == nil {
+		return nil
+	}
+	r.access.Lock()
+	defer r.access.Unlock()
+	return r.lease
+}
+
+// CompleteRebind releases whatever recovery this registration currently owns.
 //
-// The window stays consumed whether it succeeded or failed: the retry cadence is the handshake
-// cycle's, not a busy loop. A failure is reported by the resource's own logs, and the next proven
-// failure after the window earns another attempt.
+// It exists for callers that used ScheduleRebind and never held a lease. It is deliberately not
+// "clear the flag": only the owner may release, and a caller with no lease has nothing to release,
+// so this is a no-op rather than an amnesty for a recovery somebody else is running.
 func (r *Registration) CompleteRebind() {
 	if r == nil {
 		return
 	}
 	r.access.Lock()
-	r.pending = false
+	lease := r.lease
 	r.access.Unlock()
+	if lease != nil {
+		lease.Complete()
+	}
 }
 
 // Stale reports whether the resource belongs to a previous generation.
