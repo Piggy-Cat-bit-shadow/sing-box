@@ -59,10 +59,17 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.UDPOverStream && options.UDPRelayMode != "" {
 		return nil, E.New("udp_over_stream is conflict with udp_relay_mode")
 	}
+	// The empty value is the documented default, and it must be spelled out here: a value with a
+	// typo used to fall through the switch and silently mean `native`, so a user who wrote
+	// "qiuc" got a working relay in the wrong mode and no signal at all - while the neighbouring
+	// `congestion_control` typo does produce an error. An unrecognised value is now a
+	// configuration error.
 	switch options.UDPRelayMode {
-	case "native":
+	case "", "native":
 	case "quic":
 		tuicUDPStream = true
+	default:
+		return nil, E.New("unknown udp_relay_mode: ", options.UDPRelayMode, " (expected native or quic)")
 	}
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {

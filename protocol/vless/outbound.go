@@ -71,7 +71,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, err
 		}
-		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		// See the trojan outbound: tls.enabled=false yields a nil config by contract, and a dialer
+		// built around it turns the first dial into a nil-config ClientHandshake and a process-wide
+		// SIGSEGV. No config means the node is plain TCP, so no TLS dialer is built.
+		if outbound.tlsConfig != nil {
+			outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		}
 	}
 	if options.Transport != nil {
 		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)

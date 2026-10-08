@@ -68,7 +68,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, err
 		}
-		outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		// A nil config means "no TLS", and tls.NewClientWithOptions returns (nil, nil) for
+		// tls.enabled=false - by contract, not as an error. Wrapping that nil config in a live
+		// dialer makes the first dial call ClientHandshake with a nil config and take the whole
+		// process down with a SIGSEGV, so the dialer is only built when there is a config to
+		// handshake with. Plain TCP is the correct behaviour for a trojan node without TLS.
+		if outbound.tlsConfig != nil {
+			outbound.tlsDialer = tls.NewDialer(outboundDialer, outbound.tlsConfig)
+		}
 	}
 	if options.Transport != nil {
 		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)

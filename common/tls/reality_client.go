@@ -75,6 +75,16 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 	if len(publicKey) != 32 {
 		return nil, E.New("invalid public_key")
 	}
+	// The length is checked BEFORE the decode, not after it.
+	//
+	// hex.Decode writes len(src)/2 bytes into dst without checking dst's capacity, so a short_id
+	// longer than 16 hex characters runs off the end of the [8]byte INSIDE hex.Decode and panics
+	// with "index out of range", taking the whole process down while the configuration is only
+	// being loaded. The post-decode "decodedLen > 8" test below cannot catch it: control never
+	// gets there. A short_id comes from a subscription, so it is untrusted input.
+	if len(options.Reality.ShortID) > 16 {
+		return nil, E.New("invalid short_id")
+	}
 	var shortID [8]byte
 	decodedLen, err := hex.Decode(shortID[:], []byte(options.Reality.ShortID))
 	if err != nil {

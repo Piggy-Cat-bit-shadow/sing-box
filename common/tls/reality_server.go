@@ -108,6 +108,12 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		tlsConfig.ShortIds[[8]byte{0}] = true
 	} else {
 		for i, shortIDString := range options.Reality.ShortID {
+			// Checked before the decode for the reason given in the client: hex.Decode does not
+			// respect dst's capacity, so an over-long id panics inside the decoder and the
+			// post-decode length test is unreachable.
+			if len(shortIDString) > 16 {
+				return nil, E.New("invalid short_id[", i, "]: ", shortIDString)
+			}
 			var shortID [8]byte
 			decodedLen, err := hex.Decode(shortID[:], []byte(shortIDString))
 			if err != nil {

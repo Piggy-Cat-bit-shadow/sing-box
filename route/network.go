@@ -785,6 +785,14 @@ func (r *NetworkManager) NetworkResetGeneration() uint64 {
 const HardTransitionConfirm = 2 * time.Second
 
 func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
+	// The router is assigned on the initialize stage, and a reset can arrive before the manager
+	// has reached it: the command protocol publishes the instance before Start finishes, so a
+	// network-change RPC in that window (a Wi-Fi to cellular handover during tunnel startup, for
+	// instance) used to dereference a nil router and take the whole process down. A reset of a
+	// manager that has no router yet has nothing to publish, so it is a no-op.
+	if r.router == nil {
+		return
+	}
 	if r.connectionManager != nil {
 		// Drain, do not kill. This used to be CloseAll, which meant every path change - a Wi-Fi
 		// roam, a new SSID, a cell handover that moved the gateway address - terminated every
