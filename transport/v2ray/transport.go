@@ -48,21 +48,14 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 	if options.Type == "" {
 		return nil, nil
 	}
-	switch options.Type {
-	case C.V2RayTransportTypeHTTP:
-		return v2rayhttp.NewClient(ctx, dialer, serverAddr, options.HTTPOptions, tlsConfig)
-	case C.V2RayTransportTypeGRPC:
-		return NewGRPCClient(ctx, dialer, serverAddr, options.GRPCOptions, tlsConfig)
-	case C.V2RayTransportTypeWebsocket:
-		return v2raywebsocket.NewClient(ctx, dialer, serverAddr, options.WebsocketOptions, tlsConfig)
-	case C.V2RayTransportTypeQUIC:
-		if tlsConfig == nil {
-			return nil, C.ErrTLSRequired
-		}
-		return NewQUICClient(ctx, dialer, serverAddr, options.QUICOptions, tlsConfig)
-	case C.V2RayTransportTypeHTTPUpgrade:
-		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
-	default:
+	// The client side is a registry rather than a switch, so a transport that is compiled in
+	// conditionally (XHTTP, behind with_xhttp) can register itself from its own package and keep the
+	// diff to this file at zero. The built-in transports register in registry.go with exactly the
+	// behaviour the switch had, QUIC's TLS check included. The SERVER side stays a switch: this fork
+	// has no XHTTP server, and an inbound that asks for one is correctly "unknown transport type".
+	constructor, loaded := lookupClientTransport(options.Type)
+	if !loaded {
 		return nil, E.New("unknown transport type: " + options.Type)
 	}
+	return constructor(ctx, dialer, serverAddr, options, tlsConfig)
 }
