@@ -89,82 +89,81 @@ run_tripwire \
   "./protocol/tun/" \
   'TestDNSHijack|TestFakeIPIsNot|TestNoFakeIPTransport|TestNonDNS|TestL0'
 
-# gVisor is a SHIPPED stack on Android, so the 048 nil-handshake crash is a shipped crash surface.
+# GVISOR MUST NOT BE SHIPPED.
 #
-# The original check here read the profile tag files and concluded "no profile names with_gvisor".
-# That was true and irrelevant: the Android libbox builder appends with_gvisor in its own tag
-# composition, so the artifacts compiled a stack the check never looked at. A text scan of profile
-# files is not a check on what ships.
+# This block used to assert the OPPOSITE: that with_gvisor was compiled into Android and that the
+# linked gVisor was therefore our patched fork carrying the 048 nil-handshake guard. That was
+# correct at the time - 048 was a real crash surface on a shipped stack.
 #
-# The check is now on the real build path, in three parts:
+# The product condition has changed. The Android UI no longer depends on "stack": "mixed"/"gvisor",
+# so gVisor is retired from shipped artifacts. The risk is gone because the EXPOSURE is gone, not
+# because 048 was never real, and the check is INVERTED rather than deleted: deleting it would
+# delete the only thing that notices the exposure coming back.
+#
+# Three parts, unchanged in shape:
 #   1. the libbox builder's own tag-policy test, which asks the same function the builders use
-#      (cmd/internal/build_libbox) - covering android-main, android-legacy and apple;
+#      (cmd/internal/build_libbox) - the property that made it catch the real thing;
 #   2. the profile files, still scanned, so the two tag sources cannot drift apart;
-#   3. the dependency invariant: shipping with_gvisor requires the patched gVisor fork, checked
-#      against the resolved module (not a comment) and against the guard's presence in the linked
-#      source by token, never by line number.
+#   3. the dependency invariant, inverted: no shipped variant names with_gvisor, so the retired
+#      fork must not still be wired into go.mod.
 echo
-echo "--- gVisor: shipped stack, real tag composition, patched pin"
+echo "--- gVisor: retired from shipped artifacts (inverted invariant)"
 if ! go test -count=1 ./cmd/internal/build_libbox/ >/dev/null 2>&1; then
-  echo "FAIL: the libbox tag-policy test failed. It asserts which variants compile with_gvisor and" >&2
-  echo "      that the GVisor dependency is the patched fork. Run it directly for the detail:" >&2
+  echo "FAIL: the libbox tag-policy test failed. It asserts that NO shipped variant compiles" >&2
+  echo "      with_gvisor, and that the retired fork is not still wired into go.mod." >&2
+  echo "      Run it directly for the detail:" >&2
   echo "          go test -v ./cmd/internal/build_libbox/" >&2
   exit 1
 fi
-echo "PASS: libbox tag composition matches the recorded policy (android ships with_gvisor; apple does not)"
+echo "PASS: no shipped variant (android-main, android-legacy, apple) compiles with_gvisor"
 
 for tags_file in release/DEFAULT_BUILD_TAGS release/DEFAULT_BUILD_TAGS_OTHERS release/DEFAULT_BUILD_TAGS_WINDOWS; do
   if [ ! -f "$tags_file" ]; then
     continue
   fi
   if grep -q 'with_gvisor' "$tags_file"; then
-    echo "FAIL: $tags_file names with_gvisor. The tag belongs to the Android libbox build path only;" >&2
-    echo "      if a profile is meant to carry it, the 048 audit must be repeated for that profile." >&2
+    echo "FAIL: $tags_file names with_gvisor. gVisor was intentionally retired after the Android UI" >&2
+    echo "      stopped depending on mixed/gvisor. Re-enabling it requires a new product review and" >&2
+    echo "      restoring and re-auditing LX 048. See docs/fork/upstream-sync-2026-10.md." >&2
     exit 1
   fi
 done
-echo "PASS: no profile tag file carries with_gvisor (the Android builder injects it)"
+echo "PASS: no profile tag file carries with_gvisor"
 
-# The dependency half. with_gvisor is compiled into Android, so the linked gVisor must be the fork.
+# The inverted dependency half. This is the tripwire against a silent re-enable: while no shipped
+# variant compiles the tag, the retired fork must not still be the replacement for gVisor.
 gvisor_replace="$(go list -m -f '{{if .Replace}}{{.Replace.Path}}@{{.Replace.Version}}{{end}}' github.com/sagernet/gvisor 2>/dev/null || true)"
 case "$gvisor_replace" in
-  github.com/Piggy-Cat-bit-shadow/gvisor@*)
-    echo "      gvisor replace: $gvisor_replace" ;;
   "")
-    echo "FAIL: github.com/sagernet/gvisor is not replaced, but with_gvisor is compiled into Android." >&2
-    echo "      The pinned upstream dereferences a nil handshake in handleConnecting (LX 048): a late" >&2
-    echo "      TCP segment crashes the whole process from inside gVisor's own goroutine." >&2
-    echo "      Expected: replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor <version>" >&2
-    exit 1 ;;
+    echo "PASS: gVisor carries no replacement; the retired fork is no longer wired in" ;;
+  github.com/Piggy-Cat-bit-shadow/gvisor@*)
+    # PENDING, not FAIL, and the distinction is the whole point.
+    #
+    # The SHIPPED exposure is already zero: the builder test above asserts that no variant compiles
+    # with_gvisor, which is the thing that made 048 a crash surface. What remains is the dependency
+    # edge, and it cannot be removed yet for a concrete reason: protocol/tun still imports gVisor
+    # behind the with_gvisor build tag, so the module graph keeps requiring it until the upstream Go
+    # TUN stack (a1b01b4) replaces that code path. That is upstream's own ordering - ede8d9a
+    # "Remove dependency on gVisor" follows the Go stack rather than preceding it.
+    #
+    # Failing here would make CI red for a state that is correct and mid-migration, which trains
+    # people to ignore the check. Passing silently would lose the fact. So it reports, and it is
+    # tied to a named migration rather than to a date.
+    echo "PENDING: gVisor is still replaced by the retired fork: $gvisor_replace"
+    echo "         The shipped exposure is already zero (no variant compiles with_gvisor, asserted)."
+    echo "         The dependency edge is removed by the Go TUN stack migration (upstream a1b01b4,"
+    echo "         then ede8d9a), because protocol/tun still imports gVisor behind the build tag."
+    echo "         When that lands, this branch must become a FAIL if the replace survives."
+    echo "         See docs/fork/upstream-sync-2026-10.md." ;;
   *)
-    echo "FAIL: gvisor is replaced by '$gvisor_replace', which is not this fork." >&2
-    echo "      Re-audit the LX 048 pin before accepting a different replacement." >&2
+    echo "FAIL: gvisor is replaced by '$gvisor_replace', which is neither the retired fork nor absent." >&2
+    echo "      Re-audit this before accepting a different replacement." >&2
     exit 1 ;;
 esac
 
-gvisor_dir="$(go list -m -f '{{.Dir}}' github.com/sagernet/gvisor 2>/dev/null || true)"
-gvisor_dispatcher="$gvisor_dir/pkg/tcpip/transport/tcp/dispatcher.go"
-if [ -z "$gvisor_dir" ] || [ ! -f "$gvisor_dispatcher" ]; then
-  echo "FAIL: cannot locate the pinned gVisor source to check its handshake guard." >&2
-  echo "      Install the module (go mod download) or update this check; do not skip it silently." >&2
-  exit 1
-fi
-# Token-level, not line-number-level: the guard must be inside handleConnecting and must release
-# the endpoint lock on the way out, because processSegments requires it held (+checklocks:h.ep.mu).
-if ! awk '/^func handleConnecting\(/ { inFunc = 1 } inFunc { print } inFunc && /^}/ { exit }' "$gvisor_dispatcher" | grep -q 'ep\.h == nil'; then
-  echo "FAIL: the pinned gVisor handleConnecting has no nil-handshake guard." >&2
-  echo "      LX 048 is back: a segment arriving after performHandshake clears ep.h but before the" >&2
-  echo "      endpoint leaves the connecting state dereferences nil inside gVisor's goroutine." >&2
-  exit 1
-fi
-if ! awk '/^func handleConnecting\(/ { inFunc = 1 } inFunc { print } inFunc && /^}/ { exit }' "$gvisor_dispatcher" \
-     | awk '/ep\.h == nil/ { seen = 1 } seen && /Unlock\(\)/ { unlocked = 1 } END { exit (unlocked ? 0 : 1) }'; then
-  echo "FAIL: the nil-handshake guard does not release the endpoint lock." >&2
-  echo "      processSegments carries +checklocks:h.ep.mu, so the lock is held at the guard; a return" >&2
-  echo "      without Unlock() deadlocks the endpoint instead of crashing it." >&2
-  exit 1
-fi
-echo "PASS: the pinned gVisor guards the nil handshake and releases the lock"
+# Whatever gVisor remains (upstream still supports the tag until the Go TUN stack lands), it must
+# not be reachable from a shipped artifact. The builder-level assertion above is what guarantees
+# that; this records the intent so a reader knows the guard is deliberate.
 
 # Artifact-level proof, not a module-graph claim: link the probe with the Android tag composition
 # and read the dependency out of the built binary. This is the check that would have caught the
