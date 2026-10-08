@@ -2,10 +2,19 @@
 
 Owner decision: follow the upstream TUN architecture and retire gVisor from shipped artifacts.
 
-**Status: partially executed.** The Android gVisor retirement (stage B) is done, committed and
-pushed. The Go TUN stack migration (stages E–H) is **not started**, and the reason is a real ordering
-constraint described in §3 rather than a lack of effort. Nothing in this document claims more than
-was run.
+**Status: executed.** The Android gVisor retirement (stage B) was done first. The Go TUN stack
+migration, the sing-tun 040 re-base, the legacy `stack` semantics and the gVisor dependency removal
+(stages C–G) were subsequently executed; §7 records what was actually done and the evidence for it.
+Sections §3 and §4 are kept as the state **at the time of writing** and are explicitly marked
+superseded where they no longer describe the tree, because the reasoning in them is what the next
+stage acted on and rewriting it would erase why the order was chosen.
+
+One correction worth stating up front, because §3 asserted the opposite: the dependency edge was
+**not** blocked on the Go TUN stack. At the point the PENDING branch was written, no file in
+`protocol/tun` imported gVisor at all — the fork's own earlier gVisor removal had already deleted
+that path. The only main-module importer was `cmd/ci-artifact-probe/probe_gvisor.go`, the phase-1
+tripwire's own *positive control*, which existed to prove the fork pin. The edge the tripwire
+reported as pending was being held open by the tripwire itself. §7 records the correction.
 
 ## 1. Baseline (read from the repositories, not assumed)
 
@@ -62,6 +71,10 @@ Android variants and requires them to be non-empty (so the assertion is not vacu
 
 ## 3. The blocker: gVisor cannot leave `go.mod` until the Go stack lands
 
+> **SUPERSEDED — see §7.** This section described the state before the Go TUN stack landed, and the
+> premise it rests on ("`protocol/tun` still contains a `with_gvisor`-tagged code path") was already
+> false when it was written. It is kept because it is the reasoning the next stage was handed.
+
 This is the finding that determines the order of the remaining stages, and it is why stages C and E
 cannot be done in the sequence the brief suggests.
 
@@ -93,6 +106,9 @@ radius of the defect is already closed; what remains is housekeeping that the ne
 When `a1b01b4`+`ede8d9a` land, **that branch must become a hard failure** if the `replace` survives.
 
 ## 4. Stages NOT started
+
+> **SUPERSEDED — see §7.** The table below is the state at the time of writing. C, D, E, F and G, and
+> the `PENDING` conversion, were executed afterwards; H, J, K and P remain unstarted.
 
 Listed explicitly so the gap is not mistaken for completion.
 
@@ -142,3 +158,59 @@ retired because the **exposure** is gone, not because the finding was mistaken. 
 remote `Piggy-Cat-bit-shadow/gvisor` is deliberately **not** deleted.
 
 Nothing in phase 1 was rewritten.
+
+## 7. Executed (second pass) — what actually changed
+
+### 7.1 sing-tun: 040 re-based, not retired
+
+| | |
+| --- | --- |
+| Old required version | `v0.9.7-0.20261006124248-d769a7080ca2`, replaced by `Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df` (`fix/acceptloop-selfheal` @ `1cd9bc2216df`) |
+| New required version | `v0.9.7-0.20261007151655-7539c9855f19` — what upstream `testing` @ `fe92ab3e7` requires *and* what `a1b01b4` itself is written against (`a1b01b4` does not change sing-tun) |
+| 040 at the new revision | **still present.** `stack_system.go`'s `acceptLoop` still does `conn, err := listener.Accept(); if err != nil { return }`. Every `SagerNet/sing-tun` branch (`dev`, `main`, `stable`, `dev-firewalld`, `draft-windows-auto-redirect`, `codex/propose-fix-for-docker-firewall-policy-bypass`) still returns bare. Upstream has not fixed it |
+| Is `stack: "system"` reachable? | **Yes.** `option/tun.go` keeps `Stack string` (declared field, so still decoded; removed from the schema enum only) → `protocol/tun` `stack: options.Stack` → `tun.NewStack` → sing-tun `case "system": return NewSystem(...)`. Only `includeAllNetworks` rejects it |
+| Action | new branch `sync/go-stack-plus-040`, base `7539c9855f19`, 040 code cherry-picked from `665fbe2`, plus its regression test and the provenance notice. Final SHA `46cfb7ff31fea7c2015b02f8126aae12af2baf4c`, pseudo-version `v0.0.0-20261008131128-46cfb7ff31fe` |
+| Red/green | a behavioural probe written against the pre-fix API (`acceptLoop(listener, tcpNat)`) that injects one unexpected accept error and then offers a new connection fails on `7539c9855f19` ("the accept loop exited permanently…"); the four committed tests pass with the change |
+
+### 7.2 `a1b01b4` semantic port
+
+The tree already carried a semantic port of `a1b01b4` (the fork's own `Add go TUN stack` commits,
+applied on each upstream sync). The second pass verified every hunk of the upstream commit against
+the fork's tree and classified it; see the migration report rather than repeating the table here.
+The outcome is that every hunk is either present unchanged or superseded by a stronger fork
+implementation, and no upstream interface was allowed to replace a fork one.
+
+### 7.3 gVisor dependency removal (stage C rest + G)
+
+- `go.mod`: the `replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor …`
+  directive is deleted and replaced by a retirement record; the direct `require` is gone. `go mod
+  tidy` leaves `github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 // indirect`, which is
+  exactly upstream's own end state — sing-tun still contains `with_gvisor`-tagged packages, so the
+  module stays in the graph without being active.
+- `cmd/ci-artifact-probe/probe_gvisor.go` is deleted. It was the last importer, and it existed to
+  prove the now-retired fork pin; keeping it would have kept gVisor an active dependency purely to
+  test a dependency that must not exist. The probe itself stays and now carries a negative assertion.
+- The retired fork's remote is **not** deleted.
+- Both `PENDING` branches became hard failures:
+  `cmd/internal/build_libbox/tag_policy_test.go` (`TestGVisorIsRetiredFromTheModuleGraph`: no
+  replace, no active require, no import anywhere in the module) and
+  `scripts/ci/verify-upstream-assumptions.sh` (same, plus an artifact-level check: the probe linked
+  with the shipped tag set must show no gVisor module and no `with_gvisor` tag in `go version -m`).
+- 048 is FIX → **RETIRED** with the remote preserved, as recorded in
+  `docs/fork/lx-stability-audit-phase1.md`.
+
+### 7.4 Legacy `stack` semantics (stage D)
+
+Final behaviour matches upstream 1.15: unset selects sing-tun's Go stack; `system` selects the
+system stack; `gvisor` and `mixed` are still parsed and still reported as deprecated, and then fail
+at stack construction with `gVisor is not included in this build, rebuild with -tags with_gvisor`
+in a build without the tag — they are **never** mapped onto the Go stack. A genuinely unknown value
+fails with `unknown stack: <value>`. Tests live in
+`protocol/tun/legacy_stack_semantics_test.go` and cover unset, `go`, `system`, `gvisor`, `mixed` and
+an unknown value, through the production constructor.
+
+### 7.5 Still not started
+
+Stages H, J, K and P from §4 are unchanged: the Android auto-redirect / DNS-mode / forward-NAT
+chain, the dedicated red-team matrix, the resource/performance comparison, and the full 39-commit
+`MERGE_BASE..UPSTREAM_TIP` audit.
