@@ -2,7 +2,7 @@
 
 ## Executive status
 
-**Seven of eight workflows were genuinely exercised; six are green.** The first pass's central claim —
+**All eight workflows were genuinely exercised; seven are green.** The first pass's central claim —
 "6 of 8 workflows were never run" — no longer applies.
 
 | Workflow | Run ID | Result | Attempts |
@@ -13,11 +13,16 @@
 | Windows amd64 core | `37809740077` | **GREEN** | 1 |
 | macOS arm64 | `37809754452` | **GREEN** | 1 |
 | Reference interop (Xray) | `37812611373` | **RED — real protocol finding** | 4 |
-| Apple client | `37809771259` | still running at time of writing; **no credential error observed** | 1 |
-| Release (dry-run) | `37811184607` | still running at time of writing | 1 |
+| Apple client | `37809771259` | **GREEN** — signing, archive and the credential path all worked | 1 |
+| Release (dry-run) | `37811184607` | still running at time of writing (it waits for the CI runs of its target tag, which never ran on this fork) | 1 |
 
-`ALL CURRENT ACTIONS GREEN ON FINAL HEAD` is **not** claimed: interop is red on a real finding, and two
-workflows had not settled when this was written.
+`ALL CURRENT ACTIONS GREEN ON FINAL HEAD` is **not** claimed: interop is red on a real finding, and the
+release dry-run had not settled when this was written.
+
+**Apple is green, and that is worth stating explicitly** because the first pass speculated it would be
+blocked by missing credentials. It was not: the repository's secrets work, and the workflow ran its
+signing, archive and export path to success. The user's instruction not to presume a credential
+blocker was correct, and the speculation is recorded here as a mistake rather than quietly dropped.
 
 ## HEADLINE: the reference stand found a REAL interop failure
 
