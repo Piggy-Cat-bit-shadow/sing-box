@@ -102,12 +102,16 @@ jobs:
 
       - name: install gomobile
         # gomobile is what produces the xcframework; it is not on the runner image.
+        #
+        # The version is NOT written here. It is read from the one declaration in
+        # scripts/ci/gomobile-toolchain.sh, which also installs both binaries, adds
+        # them to PATH, and proves from each binary's own `go version -m` that it
+        # was built from the module and version it claims. The same script is what
+        # the Makefile's lib_install target calls, so a local build and CI cannot
+        # disagree about the toolchain.
         run: |
           set -euo pipefail
-          # Match the version the repository pins, so a local build and CI agree.
-          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
-          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          ./scripts/ci/gomobile-toolchain.sh install apple
 
       - name: Apple regression tests
         # Cheap invariant checks for the failures that are otherwise silent: a signed build falling
@@ -468,9 +472,8 @@ jobs:
       - name: install gomobile and create-dmg
         run: |
           set -euo pipefail
-          go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
-          go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          # One declaration, one installer: see the note on the iOS job's step.
+          ./scripts/ci/gomobile-toolchain.sh install apple
           # create-dmg makes a Finder-friendly image. The script falls back to
           # hdiutil if this fails, so a brew hiccup cannot break the build.
           brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"

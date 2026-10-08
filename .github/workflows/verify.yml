@@ -49,6 +49,32 @@ jobs:
           fi
           echo "PASS: gofmt clean"
 
+      - name: release gate self-test
+        # The release gate decides what gets published, and its expensive failure
+        # modes are invisible to a happy path: the previous version waited out its
+        # full 90-minute deadline on a commit that had no CI runs at all (run
+        # 37811184607), and could not pass at all for a commit whose workflow had
+        # been re-run. Both are reproduced here in seconds against a mock `gh`.
+        #
+        # It needs no network and no Go, so it runs on every push rather than only
+        # when a release is attempted: the release is the worst moment to discover
+        # that the gate is broken.
+        run: ./scripts/ci/test-release-artifacts.sh
+
+      - name: gomobile single-source check
+        # `github.com/sagernet/gomobile/cmd/gomobile@v0.1.13` used to be written out
+        # three times: twice in the Apple workflow and once in the Makefile. Nothing
+        # breaks when copies stop agreeing - the build just uses a different
+        # generator than the reviewer read - so the check is on the TREE: no version
+        # literal outside the one declaration, and every install site going through
+        # the script that owns it.
+        #
+        # The network half (really installing and reading each binary's
+        # `go version -m`) is opt-in via GOMOBILE_TOOLCHAIN_TEST_INSTALL=1 and is not
+        # run here: it would add a module download to every push for a fact that only
+        # changes when the declaration does.
+        run: ./scripts/ci/test-gomobile-toolchain.sh
+
       - name: pinned-upstream assumptions
         # The one step that exists for a fork: it fails when an upstream revision changes the meaning
         # of something this fork relies on, and it prints where each assumption lives.

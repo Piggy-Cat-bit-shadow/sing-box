@@ -268,9 +268,18 @@ lib_android_new:
 lib_apple_new:
 	$(SING_FFI) generate --config $(LIBBOX_FFI_CONFIG) --platform-type apple
 
+# Installs the gomobile toolchain this fork's Apple product is built with.
+#
+# The version is not written here: scripts/ci/gomobile-toolchain.sh is the one
+# declaration, and it installs both binaries and verifies each one's module and
+# version from its own `go version -m`. The Apple workflows call the same script,
+# so a local `make lib_install` and CI cannot end up on different generators.
+#
+# `apple` rather than `project` because that is what this target installed before
+# the literal was removed - it sits beside lib_apple - and root go.mod's pin is one
+# patch behind it for reasons recorded in the script's header.
 lib_install:
-	go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
-	go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+	./scripts/ci/gomobile-toolchain.sh install apple
 
 docs:
 	venv/bin/mkdocs serve
