@@ -244,7 +244,23 @@ func (e *RealityClientConfig) prepareFirstFlight(uConn *utls.UConn, uConfig *utl
 
 	hello := uConn.HandshakeState.Hello
 	hello.SessionId = e.buildSessionID(nowTime)
-	copy(hello.Raw[39:], hello.SessionId)
+	// The session_id region of the RAW greeting stays ZEROED while the seal is computed; only the
+	// copy held in hello.SessionId carries the version, the time and the short id.
+	//
+	// The additional data of that seal is the greeting itself, and the server rebuilds it by
+	// ZEROING session_id inside the ClientHello it received before it opens the seal (Xray and the
+	// uTLS server both do `copy(hs.clientHello.sessionId, plainText)`, where the parsed session_id
+	// aliases raw[39:]). Xray's own client arrives at the same bytes by assigning a zeroed
+	// make([]byte, 32) and copying THAT into the raw before it fills the field, so the zeroed
+	// buffer - not the plaintext - is the authenticated one.
+	//
+	// Copying the FILLED session_id here instead, which is what folding that sequence into
+	// buildSessionID() naturally produces, changes the additional data by the 16 plaintext bytes.
+	// The GCM tag then fails inside the server's REALITY handler, the connection is answered by the
+	// camouflage site, and the client reports exactly the "reality verification failed" that a
+	// wrong public key produces - there is no diagnostic path from that symptom back to this line,
+	// which is why it has a test that replays the server's parser.
+	copy(hello.Raw[39:], make([]byte, len(hello.SessionId)))
 	if debug.Enabled {
 		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
 	}
@@ -497,13 +513,31 @@ func clientHelloCarriesHybridShare(uConn *utls.UConn) bool {
 // Xray >= v26.9.8 does not check the field at all - the default was commented out in the same change
 // that made the hybrid key share mandatory - so this is required for v26.7.11 through v26.9.x and
 // harmless afterwards. It is not a claim about our build: the server reads it as a number.
+// buildSessionID lays out the 32-byte REALITY session id: the client version in the first three
+// bytes, a timestamp in the next four, and the short id from byte 8.
+//
+// # One clock source
+//
+// Every field is derived from the `now` the caller resolved, and `time.Now()` is never read here.
+// The two disagreeing was a real defect: the version/time field was built from `now` while the
+// timestamp four bytes later came from a SECOND, fresh clock read, so a caller injecting a clock
+// through uTLS's `Config.Time` - which is exactly how a test makes the greeting reproducible, and
+// how a caller with a corrected clock keeps it consistent - controlled one field and not the other.
+// The server checks the timestamp against its own clock, so the net effect was that the client's
+// greeting was not the one the caller asked for, and no test could pin it.
+//
+// The layout, for the record, since it is easy to misread: the PutUint64 writes the seconds across
+// bytes 0-7, the version then overwrites 0-2, and the uint32 timestamp overwrites 4-7. Byte 3 is the
+// only surviving byte of the 64-bit write and is zero for any current Unix time, which is what the
+// reference sends too - the write is kept because it is what the reference does, not because the
+// value is used.
 func (e *RealityClientConfig) buildSessionID(now time.Time) []byte {
 	sessionID := make([]byte, 32)
 	binary.BigEndian.PutUint64(sessionID, uint64(now.Unix()))
 	sessionID[0] = realityMinClientVersionMajor
 	sessionID[1] = realityMinClientVersionMinor
 	sessionID[2] = realityMinClientVersionPatch
-	binary.BigEndian.PutUint32(sessionID[4:], uint32(time.Now().Unix()))
+	binary.BigEndian.PutUint32(sessionID[4:], uint32(now.Unix()))
 	copy(sessionID[8:], e.shortID[:])
 	return sessionID
 }
