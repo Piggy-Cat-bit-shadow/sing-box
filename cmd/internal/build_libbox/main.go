@@ -42,6 +42,28 @@ func main() {
 	case "apple":
 		buildApple()
 	}
+
+	writeProvenance()
+}
+
+// writeProvenance records exactly which source revision and version string the
+// artifacts in this directory were built with. The Android client reads this
+// file, so "which core is in this APK" has one authoritative answer.
+func writeProvenance() {
+	content := "commit=" + buildCommit + "\n" +
+		"version=" + buildVersion + "\n"
+	for _, name := range []string{"libbox.provenance", filepath.Join("..", "sing-box-for-android", "app", "libs", "libbox.provenance")} {
+		if dir := filepath.Dir(name); dir != "." {
+			if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+				continue
+			}
+		}
+		if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+			log.Warn("write ", name, ": ", err)
+			continue
+		}
+		log.Info("wrote ", name, " (commit=", buildCommit, " version=", buildVersion, ")")
+	}
 }
 
 var (
@@ -55,6 +77,16 @@ var (
 	debugTags   []string
 )
 
+// buildVersion is the value baked into constant.Version, and buildCommit is the
+// source revision it was built from. Both are resolved ONCE here and then written
+// to libbox.provenance next to the artifacts, so a consumer (the Android client)
+// reads the version from the same record that produced the binary instead of
+// re-deriving it from a possibly-advanced checkout.
+var (
+	buildVersion string
+	buildCommit  string
+)
+
 func init() {
 	sharedFlags = append(sharedFlags, "-trimpath")
 	sharedFlags = append(sharedFlags, "-buildvcs=false")
@@ -62,6 +94,8 @@ func init() {
 	if err != nil {
 		currentTag = "unknown"
 	}
+	buildVersion = currentTag
+	buildCommit = build_shared.ReadCommit()
 	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
 	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
 

@@ -34,6 +34,18 @@ func ReadTag() (string, error) {
 	return version.String() + "-" + shortCommit, nil
 }
 
+// ReadCommit returns the git revision the working tree is on, or "unknown"
+// when it cannot be determined (no git, detached non-repo build).
+func ReadCommit() string {
+	if injected := os.Getenv("SING_BOX_BUILD_COMMIT"); injected != "" {
+		return injected
+	}
+	if commit, err := shell.Exec("git", "rev-parse", "HEAD").ReadOutput(); err == nil && commit != "" {
+		return commit
+	}
+	return "unknown"
+}
+
 func ReadTagVersionRev() (badversion.Version, error) {
 	currentTagRev := common.Must1(shell.Exec("git", "describe", "--tags", "--abbrev=0").ReadOutput())
 	return badversion.Parse(currentTagRev[1:]), nil
