@@ -222,3 +222,17 @@ type MDNSDNSServerOptions struct {
 	LocalDNSServerOptions
 	Interface badoption.Listable[string] `json:"interface,omitempty"`
 }
+
+// GroupDNSServerOptions holds several existing DNS servers behind one tag.
+//
+// The member list is the group's dependency list, not a configuration copy:
+// members are resolved through the transport manager at start so a group can
+// name any tag a normal server could, including another group. Mode and the two
+// TTLs are optional; the zero values select stable mode and the documented
+// defaults, which is why they carry no explicit default in the schema.
+type GroupDNSServerOptions struct {
+	Servers  badoption.Listable[string] `json:"servers"`
+	Mode     string                     `json:"mode,omitempty"`
+	ErrorTTL badoption.Duration         `json:"error_ttl,omitempty"`
+	WinTTL   badoption.Duration         `json:"win_ttl,omitempty"`
+}
