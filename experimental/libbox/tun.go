@@ -162,6 +162,32 @@ func (o *tunOptions) IsHTTPProxyEnabled() bool {
 	return o.TunPlatformOptions.HTTPProxy.Enabled
 }
 
+// GetHTTPProxyServer returns the HTTP proxy address the platform should point the TUN interface at.
+//
+// # Why this is deliberately still a bare string, against the rule above
+//
+// It has the shape that rule exists to catch - a Go-implemented accessor read FROM the bound
+// language, so it goes through the generated cgo //export wrapper and its packed result frame. The
+// fix would be the same one GetDNSMode uses: return *StringBox and read it through Value.
+//
+// It is not applied here because the blocked dependency is on the OTHER side of the boundary. The
+// shipped Apple client calls this and expects a string:
+//
+//	clients/apple/Library/Network/ExtensionPlatformInterface.swift
+//	    options.getHTTPProxyServer()
+//
+// Changing the Go signature rewrites the generated ObjC method from `- (NSString *)` to
+// `- (LibboxStringBox *)`, so the Apple client stops compiling until that one call site becomes
+// `options.getHTTPProxyServer()?.value`. That is a coordinated two-repository release, and doing
+// half of it here would break the Apple build to remove a risk that is currently theoretical:
+// upstream's fix (cmd/cgo CL 692935, Go 1.26) is about frame alignment, and whether any particular
+// generated frame lands off an 8-byte boundary depends on the platform C compiler's frame offset,
+// which is not visible from here.
+//
+// So it is registered as checked debt in gomobile_surface_test.go instead. The tripwire still fails
+// on any NEW occurrence, and it fails if this entry is removed without the signature being fixed,
+// so the register cannot rot into a mute allowlist. Converting this belongs with the Apple client
+// migration, where the call site can move in the same commit.
 func (o *tunOptions) GetHTTPProxyServer() string {
 	return o.TunPlatformOptions.HTTPProxy.Server
 }
