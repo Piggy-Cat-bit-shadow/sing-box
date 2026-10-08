@@ -255,4 +255,7 @@ type OutboundRealityOptions struct {
 	Enabled   bool   `json:"enabled,omitempty"`
 	PublicKey string `json:"public_key,omitempty"`
 	ShortID   string `json:"short_id,omitempty"`
+	// KeyShare is the REALITY key_share policy: "", "classical" or "hybrid". See
+	// constant.RealityKeyShare*. The empty value means "as the configured fingerprint carries it".
+	KeyShare string `json:"key_share,omitempty" enum:"classical,hybrid"`
 }

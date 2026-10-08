@@ -49,6 +49,9 @@ type RealityClientConfig struct {
 	uClient   *UTLSClientConfig
 	publicKey []byte
 	shortID   [8]byte
+	// keyShare is the ClientHello key_share policy (constant.RealityKeyShare*). It is a property of
+	// the greeting's CONTENT; the fingerprint still decides its shape.
+	keyShare string
 }
 
 func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions) (Config, error) {
@@ -66,6 +69,16 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 	uClient, err := newUTLSClient(ctx, logger, serverAddress, options, allowEmptyServerName)
 	if err != nil {
 		return nil, err
+	}
+
+	// Validated before anything is built, so a typo cannot silently become the default. A caller
+	// that asked for a policy the core cannot honour must be told, not quietly served something
+	// else: "reality verification failed" at the server is indistinguishable from a wrong key.
+	switch options.Reality.KeyShare {
+	case C.RealityKeyShareDefault, C.RealityKeyShareClassical, C.RealityKeyShareHybrid:
+	default:
+		return nil, E.New("unknown reality key_share: ", options.Reality.KeyShare,
+			` (expected "hybrid" or "classical")`)
 	}
 
 	publicKey, err := base64.RawURLEncoding.DecodeString(options.Reality.PublicKey)
@@ -94,7 +107,13 @@ func newRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid short_id")
 	}
 
-	var config Config = &RealityClientConfig{ctx, uClient.(*UTLSClientConfig), publicKey, shortID}
+	var config Config = &RealityClientConfig{
+		ctx:       ctx,
+		uClient:   uClient.(*UTLSClientConfig),
+		publicKey: publicKey,
+		shortID:   shortID,
+		keyShare:  options.Reality.KeyShare,
+	}
 	if options.KernelRx || options.KernelTx {
 		if !C.IsLinux {
 			return nil, E.New("kTLS is only supported on Linux")
@@ -141,6 +160,31 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
 	return ClientHandshake(context.Background(), conn, e)
 }
 
+// newClientUConn builds the ClientHello the REALITY handshake will send: it applies the
+// first-flight transforms, builds uTLS, and applies the key_share policy.
+//
+// It is split out of ClientHandshake because it is the part that decides WHAT goes on the wire, and
+// it does no I/O - so it is the part a test can inspect. ClientHandshake is then only "send it and
+// check the answer".
+func (e *RealityClientConfig) newClientUConn(conn net.Conn) (*utls.UConn, error) {
+	// The same first-flight transforms the plain uTLS path applies. REALITY has its own handshake,
+	// so without this the configured fragmentation - and the automatic record-fragment default for a
+	// detoured dial - were accepted and then silently ignored on exactly the path where the
+	// oversized hybrid greeting makes them matter most.
+	wrapped, err := e.uClient.wrapClientConn(conn)
+	if err != nil {
+		return nil, err
+	}
+	uConfig := e.uClient.config.Clone()
+	uConfig.InsecureSkipVerify = true
+	uConfig.SessionTicketsDisabled = true
+	uConn := utls.UClient(wrapped, uConfig, e.uClient.id)
+	if err = prepareClientHello(uConn, e.keyShare, e.uClient.id); err != nil {
+		return nil, err
+	}
+	return uConn, nil
+}
+
 func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
 	verifier := &realityVerifier{
 		serverName: e.uClient.ServerName(),
@@ -149,93 +193,18 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+	uConn, err := e.newClientUConn(conn)
+	if err != nil {
+		return nil, err
+	}
 	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
+	authKey, err := e.prepareFirstFlight(uConn, uConfig)
 	if err != nil {
 		return nil, err
-	}
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
-		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		}
-	}
-	err = uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, err
-	}
-
-	if len(uConfig.NextProtos) > 0 {
-		for _, extension := range uConn.Extensions {
-			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
-				alpnExtension.AlpnProtocols = uConfig.NextProtos
-				break
-			}
-		}
-	}
-
-	hello := uConn.HandshakeState.Hello
-	hello.SessionId = make([]byte, 32)
-	copy(hello.Raw[39:], hello.SessionId)
-
-	var nowTime time.Time
-	if uConfig.Time != nil {
-		nowTime = uConfig.Time()
-	} else {
-		nowTime = time.Now()
-	}
-	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
-
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
-	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
-	copy(hello.SessionId[8:], e.shortID[:])
-	if debug.Enabled {
-		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
-	}
-	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
-	if err != nil {
-		return nil, err
-	}
-	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
-	if keyShareKeys == nil {
-		return nil, E.New("nil KeyShareKeys")
-	}
-	ecdheKey := keyShareKeys.Ecdhe
-	if ecdheKey == nil {
-		return nil, E.New("nil ecdheKey")
-	}
-	authKey, err := ecdheKey.ECDH(publicKey)
-	if err != nil {
-		return nil, err
-	}
-	if authKey == nil {
-		return nil, E.New("nil auth_key")
 	}
 	verifier.authKey = authKey
-	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
-	if err != nil {
-		return nil, err
-	}
-	aesBlock, _ := aes.NewCipher(authKey)
-	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
-	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
-	copy(hello.Raw[39:], hello.SessionId)
-	if debug.Enabled {
-		fmt.Printf("REALITY hello.sessionId: %v\n", hello.SessionId)
-		fmt.Printf("REALITY uConn.AuthKey: %v\n", authKey)
-	}
 
-	err = uConn.HandshakeContext(ctx)
-	if err != nil {
+	if err := uConn.HandshakeContext(ctx); err != nil {
 		return nil, err
 	}
 
@@ -249,6 +218,79 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 
 	return &realityClientConnWrapper{uConn}, nil
+}
+
+// prepareFirstFlight completes the REALITY greeting: ALPN, the sealed session_id and the auth key.
+//
+// It is separate from ClientHandshake so that every decision about what goes on the wire can be
+// asserted without a server, which is the only way a silent compatibility break in this area is
+// detectable at all.
+func (e *RealityClientConfig) prepareFirstFlight(uConn *utls.UConn, uConfig *utls.Config) ([]byte, error) {
+	var nowTime time.Time
+	if uConfig.Time != nil {
+		nowTime = uConfig.Time()
+	} else {
+		nowTime = time.Now()
+	}
+
+	if len(uConfig.NextProtos) > 0 {
+		for _, extension := range uConn.Extensions {
+			if alpnExtension, isALPN := extension.(*utls.ALPNExtension); isALPN {
+				alpnExtension.AlpnProtocols = uConfig.NextProtos
+				break
+			}
+		}
+	}
+
+	hello := uConn.HandshakeState.Hello
+	hello.SessionId = e.buildSessionID(nowTime)
+	copy(hello.Raw[39:], hello.SessionId)
+	if debug.Enabled {
+		fmt.Printf("REALITY hello.sessionId[:16]: %v\n", hello.SessionId[:16])
+	}
+	publicKey, err := ecdh.X25519().NewPublicKey(e.publicKey)
+	if err != nil {
+		return nil, err
+	}
+	keyShareKeys := uConn.HandshakeState.State13.KeyShareKeys
+	if keyShareKeys == nil {
+		return nil, E.New("nil KeyShareKeys")
+	}
+	// The X25519 private key of whichever key share uTLS put FIRST, because that is the one the
+	// REALITY server reads.
+	//
+	// uTLS records a classical first share in Ecdhe and a hybrid (X25519MLKEM768) first share in
+	// MlkemEcdhe - the X25519 half of the hybrid, whose public half travels inside the hybrid share
+	// the server parses. Only the first non-GREASE share is recorded at all, so "Ecdhe, else
+	// MlkemEcdhe" is exactly "the share the server will use", with no second guess available.
+	// A build that reads only Ecdhe therefore has to delete the hybrid share to work at all, which
+	// is the state this fork was in and which breaks REALITY against Xray >= v26.9.8.
+	ecdheKey := keyShareKeys.Ecdhe
+	if ecdheKey == nil {
+		ecdheKey = keyShareKeys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
+		return nil, E.New("nil ecdheKey")
+	}
+	authKey, err := ecdheKey.ECDH(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	if authKey == nil {
+		return nil, E.New("nil auth_key")
+	}
+	_, err = hkdf.New(sha256.New, authKey, hello.Random[:20], []byte("REALITY")).Read(authKey)
+	if err != nil {
+		return nil, err
+	}
+	aesBlock, _ := aes.NewCipher(authKey)
+	aesGcmCipher, _ := cipher.NewGCM(aesBlock)
+	aesGcmCipher.Seal(hello.SessionId[:0], hello.Random[20:], hello.SessionId[:16], hello.Raw)
+	copy(hello.Raw[39:], hello.SessionId)
+	if debug.Enabled {
+		fmt.Printf("REALITY hello.sessionId: %v\n", hello.SessionId)
+	}
+	return authKey, nil
 }
 
 func realityClientFallback(ctx context.Context, uConn net.Conn, serverName string, fingerprint utls.ClientHelloID) {
@@ -276,11 +318,14 @@ func realityClientFallback(ctx context.Context, uConn net.Conn, serverName strin
 }
 
 func (e *RealityClientConfig) Clone() Config {
+	// Named fields rather than positional: a positional literal silently drops a field added to the
+	// struct, and the clones are what every dial actually uses.
 	return &RealityClientConfig{
-		e.ctx,
-		e.uClient.Clone().(*UTLSClientConfig),
-		e.publicKey,
-		e.shortID,
+		ctx:       e.ctx,
+		uClient:   e.uClient.Clone().(*UTLSClientConfig),
+		publicKey: e.publicKey,
+		shortID:   e.shortID,
+		keyShare:  e.keyShare,
 	}
 }
 
@@ -355,3 +400,117 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
 func (c *realityClientConnWrapper) WriterReplaceable() bool {
 	return false
 }
+
+// prepareClientHello applies the REALITY key_share policy to the uTLS ClientHello and marshals it.
+//
+// # Why the policy exists at all
+//
+// A post-quantum hybrid key share (X25519MLKEM768) makes the ClientHello roughly 1.7 KB and,
+// depending on the fingerprint, it leaves as two TCP segments. Some paths silently drop a greeting
+// that arrives that way, and the failure is a timeout, not an error - the same symptom as a wrong
+// public key. The policy lets a single node ask for the classical greeting without pretending to be
+// a different browser.
+//
+// # Why the default does not strip
+//
+// Stripping is a CONTENT change with a compatibility cost in the other direction: Xray >= v26.9.8
+// derives the REALITY auth key from the hybrid share and rejects a client that does not send one.
+// So neither behaviour can be the unconditional default; "whatever the fingerprint carries" is the
+// only default that is not a claim about the network, and the fingerprint is the thing the user
+// actually chose.
+//
+// uTLS applies a preset exactly once (`clientHelloBuildStatus == BuildByUtls`); the second
+// BuildHandshakeState below only re-marshals the greeting from the filtered extensions, which is
+// why the filter must run between the two calls.
+func prepareClientHello(uConn *utls.UConn, keySharePolicy string, fingerprint utls.ClientHelloID) error {
+	err := uConn.BuildHandshakeState()
+	if err != nil {
+		return err
+	}
+	switch keySharePolicy {
+	case C.RealityKeyShareClassical:
+		for _, extension := range uConn.Extensions {
+			if curves, isCurves := extension.(*utls.SupportedCurvesExtension); isCurves {
+				curves.Curves = common.Filter(curves.Curves, func(curveID utls.CurveID) bool {
+					return curveID != utls.X25519MLKEM768
+				})
+			}
+			if shares, isShares := extension.(*utls.KeyShareExtension); isShares {
+				shares.KeyShares = common.Filter(shares.KeyShares, func(share utls.KeyShare) bool {
+					return share.Group != utls.X25519MLKEM768
+				})
+			}
+		}
+		return uConn.BuildHandshakeState()
+	case C.RealityKeyShareHybrid:
+		// Checked as a WIRE fact - is the share in the greeting the server will receive - rather
+		// than against a table of fingerprint names. A table would go stale with every uTLS update
+		// and, worse, would be a claim about a preset rather than about what was built.
+		err = uConn.BuildHandshakeState()
+		if err != nil {
+			return err
+		}
+		if !clientHelloCarriesHybridShare(uConn) {
+			return E.New(`reality key_share "hybrid": fingerprint `, fingerprint.Client,
+				` carries no X25519MLKEM768 key share`)
+		}
+		return nil
+	default:
+		// The default keeps the greeting the preset built, for the reason in the doc comment.
+		return nil
+	}
+}
+
+// clientHelloCarriesHybridShare reports whether the built ClientHello's key_share extension
+// contains X25519MLKEM768.
+func clientHelloCarriesHybridShare(uConn *utls.UConn) bool {
+	for _, extension := range uConn.Extensions {
+		shares, isShares := extension.(*utls.KeyShareExtension)
+		if !isShares {
+			continue
+		}
+		return common.Any(shares.KeyShares, func(share utls.KeyShare) bool {
+			return share.Group == utls.X25519MLKEM768
+		})
+	}
+	return false
+}
+
+// buildSessionID returns the PLAINTEXT session_id the REALITY greeting carries before it is sealed.
+//
+// # Layout (from the Xray server's parser)
+//
+//	[0:3]  the client version, compared as a big-endian integer against the server's minimum
+//	[3]    zero
+//	[4:8]  the low four bytes of the unix time
+//	[8:16] the short_id
+//	[16:]  zero, then replaced by the AEAD tag when the greeting is sealed
+//
+// # Why the version is a real protocol value and not our own epoch
+//
+// Upstream sing-box wrote 1.8.1 here - its own release epoch. Xray v26.7.11 raised its default
+// minimum to 26.3.27 and compares with >=, so every client still declaring 1.8.1 was rejected. The
+// rejection is SILENT: a failed REALITY verification is answered with the camouflage site, so the
+// client reports "reality verification failed", which is exactly what a wrong public_key produces.
+// There is no diagnostic path from the symptom back to this constant, which is why it has a test.
+//
+// Xray >= v26.9.8 does not check the field at all - the default was commented out in the same change
+// that made the hybrid key share mandatory - so this is required for v26.7.11 through v26.9.x and
+// harmless afterwards. It is not a claim about our build: the server reads it as a number.
+func (e *RealityClientConfig) buildSessionID(now time.Time) []byte {
+	sessionID := make([]byte, 32)
+	binary.BigEndian.PutUint64(sessionID, uint64(now.Unix()))
+	sessionID[0] = realityMinClientVersionMajor
+	sessionID[1] = realityMinClientVersionMinor
+	sessionID[2] = realityMinClientVersionPatch
+	binary.BigEndian.PutUint32(sessionID[4:], uint32(time.Now().Unix()))
+	copy(sessionID[8:], e.shortID[:])
+	return sessionID
+}
+
+// The minimum REALITY client version, as Xray packs and compares it. See buildSessionID.
+const (
+	realityMinClientVersionMajor = 26
+	realityMinClientVersionMinor = 3
+	realityMinClientVersionPatch = 27
+)
