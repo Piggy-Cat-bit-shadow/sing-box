@@ -310,13 +310,32 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// Strict mode is checked BEFORE the failure is classified, and it covers EVERY way H3 can
+		// fail - including running out of the window above.
+		//
+		// The check used to sit inside `if !probeExpired`, so a window expiry skipped it and fell
+		// through to HTTP/2 while also arming the H3-broken memory; the next dial then saw H3 as
+		// unavailable and went to HTTP/2 as well. A configuration that said "do not fall back to
+		// another HTTP version" fell back on that dial and on every dial during the backoff.
+		//
+		// Nothing is armed here either, for the same reason: arming the memory is itself a fallback,
+		// because it makes the next dial skip H3.
+		//
+		// This is a user-facing option on two config surfaces (the MASQUE client and the plain HTTP
+		// outbound), so "strict" has to mean strict rather than "strict except when it matters".
+		if c.disableVersionFallback {
+			if probeExpired {
+				// A window expiry surfaces as the probe context's own deadline, which would be
+				// indistinguishable from the caller's deadline at the call site. Name the cause.
+				return nil, E.Cause(err, "HTTP/3 attempt exceeded ", http3EstablishTimeout)
+			}
+			return nil, err
+		}
 		// An attempt that merely ran out of its window is still an attempt that did not work.
 		// Returning that error would hand a QUIC timeout to the caller and never try H2, which is
 		// the opposite of what the window is for.
-		if !probeExpired {
-			if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
-				return nil, err
-			}
+		if !probeExpired && !errors.Is(err, ErrHTTP3Unavailable) {
+			return nil, err
 		}
 		c.markHTTP3Broken()
 	}
