@@ -85,11 +85,24 @@ jobs:
       # sdkmanager exit - inside the action, before any of this workflow's own steps run. The
       # runner's image already ships cmdline-tools and a populated SDK, so the action was doing
       # nothing this needs, and the NDK installs fine directly.
+      #
+      # The NDK VERSION IS DERIVED, from the same file the Android client uses. A literal here is a
+      # second source of truth, and it was wrong: this workflow pinned 27.0.12077973 while the client
+      # pins 28.0.13004108 in clients/android/gradle.properties. That is not a cosmetic difference -
+      # the older NDK's linker cannot process a relocation in the prebuilt Cronet static library
+      # ("unknown relocation (315) against symbol typeinfo for std::domain_error"), so CI failed at
+      # the product link with a toolchain the product does not use.
       - name: Install NDK
         run: |
           set -euo pipefail
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          NDK_VERSION="$(sed -n 's/^ndkVersion[[:space:]]*=[[:space:]]*//p' clients/android/gradle.properties | tr -d '[:space:]')"
+          if [ -z "$NDK_VERSION" ]; then
+            echo "FAIL: no ndkVersion in clients/android/gradle.properties; refusing to guess one" >&2
+            exit 1
+          fi
+          echo "ndk version (from the client's gradle.properties): $NDK_VERSION"
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
           if [ -z "$SDKMANAGER" ]; then
             echo "FAIL: no sdkmanager under $SDK_ROOT/cmdline-tools; the runner image changed" >&2
@@ -98,10 +111,9 @@ jobs:
           fi
           # </dev/null, NOT `yes |`. Under `set -o pipefail` a `yes |` pipeline fails with
           # "yes: standard output: Broken pipe" the moment sdkmanager exits, so the install reports
-          # failure even when it succeeded. Licences are already accepted in the runner image, and if
-          # they are not the install fails here loudly and the directory check below catches it.
-          "$SDKMANAGER" --install "ndk;27.0.12077973" </dev/null >/dev/null
-          NDK_DIR="$SDK_ROOT/ndk/27.0.12077973"
+          # failure even when it succeeded.
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION" </dev/null >/dev/null
+          NDK_DIR="$SDK_ROOT/ndk/$NDK_VERSION"
           if [ ! -d "$NDK_DIR" ]; then
             echo "FAIL: the NDK was not installed at $NDK_DIR" >&2
             ls "$SDK_ROOT/ndk" >&2 || true
@@ -109,7 +121,7 @@ jobs:
           fi
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
-          echo "PASS: NDK at $NDK_DIR"
+          echo "PASS: NDK $NDK_VERSION at $NDK_DIR"
 
       # The project's OWN gomobile fork, at the version root go.mod pins. NOT golang.org/x/mobile.
       #
