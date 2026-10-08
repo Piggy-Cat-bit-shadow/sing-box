@@ -12,7 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/service/powerreport"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
@@ -40,13 +42,23 @@ type Endpoint struct {
 	egressPool     *tun.UDPEgressPool
 	pause          pause.Manager
 	pauseCallback  *list.Element[pause.Callback]
-	stateAccess    sync.Mutex
-	suspended      atomic.Bool
-	networkPaused  bool
+	// deviceWakeCallback is the DeviceWake half of the recovery nudge. It is separate from
+	// pauseCallback because the two events mean different things; see onDeviceWake.
+	deviceWakeCallback *list.Element[pause.Callback]
+	stateAccess        sync.Mutex
+	suspended          atomic.Bool
+	networkPaused      bool
 	// closing is set by Close under stateAccess. Start checks it in the same critical section, so
 	// a Close that lands while the device is still being built cannot leave a live device behind
 	// a closed tun, and cannot resurrect a nil device pointer after teardown.
 	closing bool
+	// recovery is the runtime-lifecycle state: which peers are stale, and the worker that acts on
+	// it. See recovery.go and docs/fork/runtime-lifecycle-phase1.5.md.
+	recovery recoveryState
+	// registration is this endpoint's handle on the runtime coordinator, used to coalesce and
+	// bound rebinds. It is inert (not nil) when no coordinator is installed.
+	registration       *runtimecoord.Registration
+	removeRegistration func()
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -122,6 +134,15 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 }
 
 func (e *Endpoint) Initialize(memoryPressure func() tun.MemoryPressure) error {
+	e.initRecovery()
+	// Registered for the endpoint's lifetime: the registration is what bounds recovery to one
+	// rebind per window and makes a network change cancel a rebind that belonged to the old one.
+	// The coordinator is optional, so an endpoint built without a core still works.
+	if coordinator := service.FromContext[*runtimecoord.Coordinator](e.options.Context); coordinator != nil {
+		e.registration, e.removeRegistration = coordinator.Register(e.RuntimeResourceLabel())
+	} else {
+		e.registration, e.removeRegistration = (*runtimecoord.Coordinator)(nil).Register(e.RuntimeResourceLabel())
+	}
 	options := e.options
 	deviceOptions := DeviceOptions{
 		Context:         options.Context,
@@ -293,12 +314,20 @@ func (e *Endpoint) Start(postStart bool) error {
 	e.device.Store(wgDevice)
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
-		// Registered under the lock so a Close that is already waiting sees the callback and
-		// unregisters it, instead of leaving it live on a closed endpoint.
+		// Registered under the lock so a Close that is already waiting sees the callbacks and
+		// unregisters them, instead of leaving them live on a closed endpoint.
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
+		e.deviceWakeCallback = e.pause.RegisterCallback(e.onDeviceWake)
 	}
 	e.allowedIPs = wgDevice.AllowedIPs()
 	e.stateAccess.Unlock()
+
+	// Observe session transitions. Set AFTER the initial IpcSet, so the configuration's own
+	// handshake start is already accounted for, and before any traffic can drive a retry.
+	//
+	// The callback contract is strict (see sessionStateChanged): cheap, serialized per peer, and it
+	// must not call back into Device. It records state and nudges the recovery worker; nothing else.
+	wgDevice.SetSessionStateFunc(e.sessionStateChanged)
 	return nil
 }
 
@@ -306,15 +335,43 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	e.resume()
+	if err := e.resumeForCaller(ctx); err != nil {
+		return nil, err
+	}
 	return e.tunDevice.DialContext(ctx, network, destination)
+}
+
+// resumeForCaller wakes a suspended endpoint only for a caller that is allowed to.
+//
+// # Why a background probe may not wake it
+//
+// A suspended endpoint has been released deliberately - nothing references it, or the device is
+// paused - so its device is down. A periodic health check that woke it would spin up a tunnel
+// engine for a measurement, which is the opposite of what the idle policy is for, and it would also
+// mean the device never stays idle. The probe therefore fails, with a sentinel the health layer
+// recognises, and the endpoint's existing health evidence is left alone: "not measured" is not
+// "unhealthy".
+//
+// Real device traffic never reaches here. A flow the device asked for is handed to the endpoint's
+// own tun path, which is where demand wakes it.
+func (e *Endpoint) resumeForCaller(ctx context.Context) error {
+	if !e.suspended.Load() {
+		return nil
+	}
+	if adapter.IsBackgroundProbe(ctx) {
+		return adapter.ErrResourceSuspended
+	}
+	e.resume()
+	return nil
 }
 
 func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
-	e.resume()
+	if err := e.resumeForCaller(ctx); err != nil {
+		return nil, err
+	}
 	return e.tunDevice.ListenPacket(ctx, destination)
 }
 
@@ -363,11 +420,23 @@ func (e *Endpoint) Close() error {
 	// The closing flag is set under the lock Start takes to publish a device. A start that is
 	// still building sees it at that point and closes what it built instead of publishing it, so
 	// a Close landing mid-start cannot leave a live device behind a closed tun.
+	// Stop recovery first: a rebind must not be able to reopen a socket on an endpoint that is
+	// going away. The flag is set under the lock the worker reads, and the worker also observes the
+	// context, so this cannot leave a rebind in flight.
+	e.closeRecovery()
+	if e.removeRegistration != nil {
+		e.removeRegistration()
+		e.removeRegistration = nil
+	}
 	e.stateAccess.Lock()
 	e.closing = true
 	if e.pauseCallback != nil {
 		e.pause.UnregisterCallback(e.pauseCallback)
 		e.pauseCallback = nil
+	}
+	if e.deviceWakeCallback != nil {
+		e.pause.UnregisterCallback(e.deviceWakeCallback)
+		e.deviceWakeCallback = nil
 	}
 	wgDevice := e.device.Swap(nil)
 	if wgDevice != nil {
@@ -417,6 +486,26 @@ func (e *Endpoint) onPauseUpdated(event int) {
 		if !e.suspended.Load() {
 			wgDevice.Up()
 		}
+	}
+}
+
+// onDeviceWake is the consumer's nudge (trigger 3 of the recovery contract).
+//
+// # Why this is a separate callback from onPauseUpdated
+//
+// They are different events with different meanings. EventNetworkWake says the routing environment
+// came back; EventDeviceWake says the DEVICE woke - the foreground/background transition the Apple
+// and Android clients drive through PauseManager.DeviceWake. A tunnel that slept through a device
+// wake is precisely the field case LX 041 was written for: the handshake is still retrying into a
+// flow the sleep destroyed, and the user is looking at the screen.
+//
+// The nudge applies the same stale predicate as the other triggers, so a healthy session costs
+// nothing, and it skips a suspended endpoint, so it cannot spin up a tunnel the idle policy
+// released.
+func (e *Endpoint) onDeviceWake(event int) {
+	switch event {
+	case pause.EventDeviceWake:
+		go e.rebindOnWake()
 	}
 }
 
