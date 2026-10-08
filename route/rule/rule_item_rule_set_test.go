@@ -19,6 +19,10 @@ type ruleSetItemTestRouter struct {
 }
 
 func (r *ruleSetItemTestRouter) Start(adapter.StartStage, *adapter.Scope) error { return nil }
+
+// TrimIdleResources is part of adapter.Router. This double has no pools, so it is a no-op - which is
+// also the correct behaviour for a router built without a reference manager.
+func (r *ruleSetItemTestRouter) TrimIdleResources() {}
 func (r *ruleSetItemTestRouter) PreMatch(adapter.InboundContext, []byte) adapter.PreMatchResult {
 	return adapter.PreMatchResult{}
 }

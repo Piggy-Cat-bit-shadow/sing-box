@@ -93,6 +93,11 @@ type Client struct {
 	lastError       error
 	stateUpdated    chan struct{}
 	loopDone        chan struct{}
+	// activeLoops counts running event loops. It exists so the single-loop invariant is assertable
+	// rather than merely intended: Suspend, Resume and RestartSession must all influence the one
+	// loop, and a second Start (or a restart path that spawned a worker) must be visible as a
+	// count above one instead of as a silent duplicate reconnect engine.
+	activeLoops atomic.Int64
 }
 
 // clientSession is one established MASQUE tunnel.
@@ -221,6 +226,19 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}, nil
 }
 
+// ActiveLoops reports how many session loops are running.
+//
+// It is 0 or 1 by construction, and that is the point: it is exported so the single-engine
+// invariant can be asserted from outside the package (runtime lifecycle tests, diagnostics) rather
+// than taken on trust. A caller that observes a value above 1 has found a second reconnect engine,
+// which no policy in this fork is designed to tolerate.
+func (c *Client) ActiveLoops() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.activeLoops.Load()
+}
+
 func (c *Client) Start() {
 	c.loopDone = make(chan struct{})
 	go c.loop()
@@ -252,6 +270,8 @@ func (c *Client) notifyStateLocked() {
 }
 
 func (c *Client) loop() {
+	c.activeLoops.Add(1)
+	defer c.activeLoops.Add(-1)
 	defer close(c.loopDone)
 	backoff := reconnectBackoffInitial
 	for {

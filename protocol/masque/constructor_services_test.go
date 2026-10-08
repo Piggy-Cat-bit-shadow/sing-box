@@ -108,6 +108,7 @@ func (m *stubNetworkManager) WIFIState() adapter.WIFIState                     {
 func (m *stubNetworkManager) UpdateWIFIState(ctx context.Context)              {}
 func (m *stubNetworkManager) ResetNetwork(ctx context.Context)                 {}
 func (m *stubNetworkManager) ReleaseMemory(ctx context.Context)                {}
+func (m *stubNetworkManager) TrimMemory(ctx context.Context)                   {}
 
 // newTestRegistryContext builds a context whose service registry satisfies everything
 // NewClientEndpoint reaches for on the path under test.
