@@ -291,19 +291,26 @@ replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v
 //
 // Fork: github.com/Piggy-Cat-bit-shadow/sing-tun (a fork of SagerNet/sing-tun)
 //   base:   7539c9855f19bb51a75f0908ecf6ae1d2d749490  (= the version this replaces)
-//   branch: sync/go-stack-plus-040 @ 46cfb7ff31fea7c2015b02f8126aae12af2baf4c
-//   change: stack_system.go only - classify the accept error, re-bind on an unexpected failure,
-//           bounded backoff, never resurrect the listener after Close, plus its regression tests.
-//   remove: when upstream makes acceptLoop recover on its own. verify-upstream-assumptions.sh
-//           checks the pin really is this fork and probes upstream on every run.
+//   branch: sync/go-stack-plus-040-and-race @ 8dde9c8cbe27c8fa2be94fe68de10a05396b0379
+//   change: stack_system.go (040: classify the accept error, re-bind on an unexpected failure,
+//           bounded backoff, never resurrect the listener after Close) and stack_go.go (make the Go
+//           stack's Start/Close a published handshake under the existing s.access lock: Close owns
+//           the started state and snapshots the resources under the lock, Start refuses once closed,
+//           a duplicate Start is a no-op), plus their regression tests.
+//   prior:  sync/go-stack-plus-040 @ 46cfb7ff31fea7c2015b02f8126aae12af2baf4c (040 only)
+//   remove: when upstream makes acceptLoop recover on its own and makes the Go stack's Start/Close a
+//           published handshake. verify-upstream-assumptions.sh checks the pin really is this fork
+//           and probes upstream on every run.
 // The branch is based on the revision the Go TUN stack is written against rather than on the
 // previous pin, because the previous pin (d769a7080ca2) is an upstream revision that upstream has
 // since rewritten out of `dev`; carrying the fix on a dead base would ship a stack revision nobody
-// else has tested. Every upstream branch still ends the accept loop on any error (checked
-// 2026-10-08), so the fix is still the only thing standing between an unexpected accept failure and
-// a permanently dead TCP path while UDP/QUIC keep working.
+// else has tested. Every upstream branch still ends the accept loop on any error and no upstream
+// branch has fixed the Go stack race (checked 2026-10-08), so the fix is still the only thing
+// standing between an unexpected accept failure and a permanently dead TCP path while UDP/QUIC keep
+// working, and between a stop landing on a starting stack and a reported data race (a nil-engine
+// panic on the unpinned revision).
 // See docs/fork/lx-stability-audit-phase1.md (040) and FORK.md in the fork.
-replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008131128-46cfb7ff31fe
+replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008172655-8dde9c8cbe27
 
 // gVisor is RETIRED, and this is deliberately a comment rather than a replace directive.
 //

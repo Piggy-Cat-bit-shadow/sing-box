@@ -31,12 +31,15 @@ func TestStackDeviceStartAfterCloseIsRefused(t *testing.T) {
 		"a start after close must be refused, not panic on a closed event channel")
 }
 
-// This test is deliberately NOT run under -race.
+// This test runs under -race, and it is the local leg that caught the module's own Start/Close race
+// before the fork fixed it.
 //
-// The sing-tun Go stack at the pinned revision has a known Start/Close race of its own (the same
-// three upstream races documented for the start/close window); it is outside this fork's code and
-// outside this guarantee. What is being pinned here is the fork's own contract: no panic from the
-// event channel. Run with -race and the module's race is what fires, not this one.
+// The pinned fork (sync/go-stack-plus-040-and-race, stack_go.go) makes the Go stack's Start/Close a
+// published handshake: Close owns the started state and snapshots the resources under the publish
+// lock, Start refuses once closed, and nothing can start again after Close returns. Before that fix
+// this test - and intermittently the two lifecycle tests around it - failed under -race on the
+// module's race. What is being pinned here is the fork's own contract: no panic from the event
+// channel, concurrently with a start/close handshake the detector can see.
 func TestStackDeviceConcurrentStartAndCloseDoNotPanic(t *testing.T) {
 	t.Parallel()
 
