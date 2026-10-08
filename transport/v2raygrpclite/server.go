@@ -42,7 +42,8 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options option.
 		tlsConfig: tlsConfig,
 		logger:    logger,
 		handler:   handler,
-		path:      "/" + options.ServiceName + "/Tun",
+		// The service name is a PATH, not a path segment; service_name.go has the reference's rule.
+		path: servicePath(options.ServiceName),
 		h2Server: &http2.Server{
 			IdleTimeout: time.Duration(options.IdleTimeout),
 		},
@@ -66,8 +67,12 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.h2cHandler.ServeHTTP(writer, request)
 		return
 	}
-	if request.URL.Path != s.path {
-		s.invalidRequest(writer, request, http.StatusNotFound, E.New("bad path: ", request.URL.Path))
+	// EscapedPath, not Path: net/http DECODES the request target into Path, so a service name that
+	// is itself an escape (`a%2Fb`) could never match its own literal comparison - and a name with a
+	// literal `/` would match a path the reference would not have sent. EscapedPath() is the raw
+	// path the reference server dispatches on; see service_name.go.
+	if request.URL.EscapedPath() != s.path {
+		s.invalidRequest(writer, request, http.StatusNotFound, E.New("bad path: ", request.URL.EscapedPath()))
 		return
 	}
 	if request.Method != http.MethodPost {

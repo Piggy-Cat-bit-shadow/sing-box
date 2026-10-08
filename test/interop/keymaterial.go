@@ -227,9 +227,23 @@ func vlessEncFromReference(referenceBinary string) (EncryptionKeyMaterial, error
 // parseVlessEncOutput pulls the encryption/decryption pair out of the reference
 // generator's output.
 //
-// The whole output is tried first (the documented shape is one JSON object), and
-// only then the outermost brace-delimited span, so a banner line before the JSON
-// or a log line after it does not defeat the parse.
+// Two shapes are understood, because the shape is a property of the installed
+// reference build and a harness that understands only one of them skips the
+// encryption scenarios for a reason that has nothing to do with the protocol:
+//
+//   - a JSON object, or an object embedded in surrounding prose, which is the
+//     shape the documentation shows; and
+//   - the `"decryption": "..."` / `"encryption": "..."` lines the shipping
+//     generator actually prints, under an `Authentication: ...` header.
+//
+// The second shape is why this function must not simply take the first
+// `encryption` and the first `decryption` it can find. The generator prints TWO
+// complete pairs - one authenticated with X25519, one with ML-KEM-768 - and says
+// in as many words to choose one and not mix them. Both are internally matched
+// and either is accepted by the reference, but a pair assembled from one half of
+// each would describe two different key materials, and the failure would surface
+// as an opaque decryption error at the reference. The line scanner therefore
+// pairs the halves of ONE block.
 func parseVlessEncOutput(raw string) (string, string, error) {
 	type pair struct {
 		Encryption string `json:"encryption"`
@@ -255,8 +269,64 @@ func parseVlessEncOutput(raw string) (string, string, error) {
 		}
 		return parsed.Encryption, parsed.Decryption, nil
 	}
+	if encryption, decryption, found := parseVlessEncSpecLines(raw); found {
+		return encryption, decryption, nil
+	}
 	if lastErr == nil {
 		lastErr = E.New("no JSON object found in output")
 	}
 	return "", "", lastErr
+}
+
+// parseVlessEncSpecLines returns the first COMPLETE pair of spec lines from ONE block.
+//
+// A non-blank line that is not a spec line ends the block in progress - the `Authentication: ...`
+// headers and the banner do exactly that - so a build that prints the two authentication modes as
+// separate blocks cannot have its halves crossed, and a lone `encryption` line with no partner is
+// reported as "no pair" rather than silently paired with the next block's `decryption`.
+func parseVlessEncSpecLines(raw string) (string, string, bool) {
+	var encryption, decryption string
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		key, value, isSpecLine := parseVlessEncSpecLine(line)
+		if !isSpecLine {
+			encryption, decryption = "", ""
+			continue
+		}
+		switch key {
+		case "encryption":
+			encryption = value
+		case "decryption":
+			decryption = value
+		default:
+			encryption, decryption = "", ""
+			continue
+		}
+		if encryption != "" && decryption != "" {
+			return encryption, decryption, true
+		}
+	}
+	return "", "", false
+}
+
+// parseVlessEncSpecLine recognises `"encryption": "<spec>"`, and the unquoted
+// `encryption: <spec>` / `encryption=<spec>` spellings, which cost nothing to accept.
+//
+// A spec is one whitespace-free token, and that is what distinguishes it from the prose around it:
+// `Authentication: X25519, not Post-Quantum` also has a colon, and pairing the word after it with a
+// real spec would produce a key the reference cannot parse.
+func parseVlessEncSpecLine(line string) (string, string, bool) {
+	separator := strings.IndexAny(line, ":=")
+	if separator < 0 {
+		return "", "", false
+	}
+	key := strings.Trim(strings.TrimSpace(line[:separator]), `"'`)
+	value := strings.Trim(strings.TrimSpace(line[separator+1:]), `"',`)
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" || strings.ContainsAny(value, " \t") {
+		return "", "", false
+	}
+	return strings.ToLower(key), value, true
 }

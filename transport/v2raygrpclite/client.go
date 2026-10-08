@@ -48,6 +48,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	} else {
 		host = serverAddr.String()
 	}
+	clientPath, clientRawPath := serviceURLPath(options.ServiceName)
 	client := &Client{
 		ctx:        ctx,
 		serverAddr: serverAddr,
@@ -57,11 +58,13 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			PingTimeout:        time.Duration(options.PingTimeout),
 			DisableCompression: true,
 		},
+		// Path and RawPath together are what make the request line the reference's string; see
+		// service_name.go for why neither alone can.
 		url: &url.URL{
 			Scheme:  "https",
 			Host:    serverAddr.String(),
-			Path:    "/" + options.ServiceName + "/Tun",
-			RawPath: "/" + url.PathEscape(options.ServiceName) + "/Tun",
+			Path:    clientPath,
+			RawPath: clientRawPath,
 		},
 		host: host,
 	}

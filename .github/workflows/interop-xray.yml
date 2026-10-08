@@ -12,13 +12,32 @@ name: Reference interop (Xray)
 # never actually started a reference process would be worse than no workflow at
 # all.
 #
+# # Why the reference is a MATRIX of pinned tags and not `latest`
+#
+# REALITY's two key_share policies are accepted by disjoint version ranges: a
+# hybrid-stripped greeting is only accepted below v26.9.8, and the hybrid share is
+# only accepted at or above it. One binary therefore cannot cover the scenario
+# matrix, and `latest` - which the GitHub releases API resolves to the newest
+# NON-prerelease release - silently picks one side: at the time of writing it is
+# below v26.9.8, so five of the ten scenarios skipped on every run and the hybrid,
+# encryption, Vision and XHTTP halves of the debt were never exercised at all.
+#
+# The default is now the two tags that cover both sides, and the job runs once per
+# tag. `latest` is still accepted as an entry for an operator who wants to know
+# what the newest release does; it is just not the default, because "the newest
+# release" is not a statement about which side of the split the stand needs.
+#
+# v26.9.30 is a prerelease: the hybrid requirement landed on the prerelease line,
+# and the newest non-prerelease release is below the threshold. A release tag is a
+# tag; the download step does not care which line it is on.
+#
 # # What it does and does not prove
 #
-# It proves or falsifies the wire format against the reference for the scenarios
-# the reference accepts. It does NOT prove anything about the classical
-# key_share against a current Xray: that scenario SKIPS with the version reason.
-# Run it a second time with an Xray below v26.9.8 (set the `xray_version` input)
-# to cover it.
+# It proves or falsifies the wire format against each reference in the matrix, for
+# the scenarios that reference accepts. The remaining scenario SKIPs in a leg are
+# the version gate working, not a gap: `reality-classical` skips on the hybrid
+# leg and the hybrid scenarios skip on the classical leg, and each leg's artifact
+# list records which one ran.
 #
 # The default (non-live) half of the stand runs in the `Verify` workflow on every
 # push; this one adds the reference.
@@ -26,13 +45,14 @@ name: Reference interop (Xray)
 on:
   workflow_dispatch:
     inputs:
-      xray_version:
+      xray_versions:
         description: >-
-          Xray-core release tag to test against, or `latest`. Use a tag below
-          v26.9.8 to exercise the REALITY classical key_share scenario; a current
-          release makes that one scenario skip.
+          JSON array of Xray-core release tags to run the matrix against, e.g.
+          ["v26.9.30", "v26.3.27"]. An entry may be `latest` to resolve the
+          newest non-prerelease release. The default covers BOTH sides of the
+          REALITY key_share split, which no single binary can.
         required: false
-        default: latest
+        default: '["v26.9.30", "v26.3.27"]'
       run_filter:
         description: 'Go test -run filter (default: the whole live matrix).'
         required: false
@@ -45,6 +65,13 @@ jobs:
   interop:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      # One leg failing must not cancel the others: the two legs answer different
+      # questions, and losing the second answer because the first found a bug is
+      # exactly how half a matrix rots.
+      fail-fast: false
+      matrix:
+        xray_version: ${{ fromJSON(inputs.xray_versions) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -78,9 +105,11 @@ jobs:
 
       - name: resolve the reference version
         id: reference
+        env:
+          REQUESTED: ${{ matrix.xray_version }}
         run: |
           set -euo pipefail
-          requested="${{ inputs.xray_version }}"
+          requested="$REQUESTED"
           if [ "$requested" = "latest" ]; then
             # Fetch to a FILE, then parse the file. Not `curl ... | grep -m1 ...`.
             #
@@ -92,12 +121,16 @@ jobs:
             #
             # Parsing a complete file has no such coupling: a reader that stops early cannot make
             # the fetch look like a failure.
+            #
             # Authenticated: the unauthenticated GitHub API allows 60 requests per hour PER IP, and
             # hosted runners share IPs, so this step failed with
             #     curl: (22) The requested URL returned error: 403
             # from rate limiting rather than from anything about Xray. The run's own token raises the
             # limit enough that the failure stops being a coin flip, and reading a public release is
             # within the read-only permission this workflow already declares.
+            #
+            # Note that the API's `latest` is the newest NON-prerelease release. That is exactly why
+            # it is not the matrix default; see the header.
             curl -fsSL -o /tmp/xray-release.json \
               -H "Authorization: Bearer ${{ github.token }}" \
               -H "Accept: application/vnd.github+json" \
@@ -163,13 +196,24 @@ jobs:
             echo "::error::the interop matrix matched no tests; the -run filter is stale" >&2
             exit 1
           fi
-          echo "reference interop reported $ran test results"
+          # A leg that only SKIPPED is the failure mode this workflow was in: `latest`
+          # resolved to the side of the key_share split that skipped half the matrix,
+          # and the run reported green for a leg that had proved nothing. Every leg
+          # exists to cover the other's skips, so every leg must pass something.
+          passed="$(grep -cE '^--- PASS:' "$RUNNER_TEMP/interop.log" || true)"
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::this reference passed no scenario; a leg that only skips proves nothing" >&2
+            exit 1
+          fi
+          echo "reference interop (${{ steps.reference.outputs.version }}) reported $ran test results, $passed passed"
 
       - name: collect the generated configs and both sides' logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: interop-artifacts
+          # Per-leg: both legs upload in the same run, and a shared name would make
+          # one overwrite the other.
+          name: interop-artifacts-${{ steps.reference.outputs.version }}
           if-no-files-found: ignore
           retention-days: 14
           path: |

@@ -1,16 +1,22 @@
 # Reference interop stand (REALITY · VLESS encryption · XHTTP · Vision)
 
-> **REFERENCE INTEROP: HARNESS ONLY — NOT RUN.**
+> **REFERENCE INTEROP: RUN AGAINST REAL REFERENCES — KEEP IT THAT WAY.**
 >
-> Nothing in this directory has been executed against a reference Xray-core
-> server. This environment has no external network and no container runtime, so
-> the live half of the stand **skips by default** and the reference side was
-> never started here. What *has* been verified is the generator and the gate:
-> the configurations this stand hands to a reference are asserted, field by
-> field, both as raw JSON and through this repository's own config parser.
+> The live half has been executed against real Xray-core binaries (v26.3.27, the
+> newest non-prerelease release, and v26.9.30, the newest prerelease at the time
+> of writing), and it paid for itself on the first run: the REALITY scenario
+> found two authentication bugs in this fork's client, which are fixed and pinned
+> by `common/tls/reality_handshake_test.go`. See
+> [The gaps this stand found](#the-gaps-this-stand-found).
+>
+> The default (non-live) half still runs everywhere, with no reference installed,
+> and the live half still **skips by default** rather than passing: the gate in
+> [The gate](#the-gate) is unchanged, and a machine without a binary has not
+> demonstrated anything.
 >
 > A maintainer on a machine with Xray installed can run the live half with the
-> command in [Running it](#running-it).
+> command in [Running it](#running-it); the CI workflow runs it against both sides
+> of the REALITY version split, because one binary cannot cover both.
 
 ## Why this exists
 
@@ -40,7 +46,7 @@ binary, the live tests skip; they do not pass.
 | `client.go` | This fork's `box`: parse the generated config, start, stop, restart, and the readiness probe that makes a real proxied request. |
 | `registry.go` | The shared compiled-in registry context. |
 | `gate.go`, `tag_live_*.go`, `capabilities_*.go` | The gate, its compile-time halves, and the build-capability constants. |
-| `optionlayer.go` | The probe for the option-layer gap this stand found (and that is now fixed) — see [The gap this stand found](#the-gap-this-stand-found). |
+| `optionlayer.go` | The probe for the option-layer gap this stand found (and that is now fixed) — see [The gaps this stand found](#the-gaps-this-stand-found). |
 | `live_test.go` | One top-level test per scenario. Compiled and registered always; the body is gated. |
 | `validate_test.go` | The tests that run everywhere. |
 | `orchestration_test.go` | Tests for the harness itself (target, camouflage, process exit handling). |
@@ -177,7 +183,7 @@ Further conditions also skip, each naming what is missing:
 - **an option-layer regression** — only if the probe in `optionlayer.go` reports
   that this build can no longer load an `xhttp` transport from JSON. That probe
   currently reports success and nothing skips on it; see
-  [The gap this stand found](#the-gap-this-stand-found).
+  [The gaps this stand found](#the-gaps-this-stand-found).
 
 The live tests are **compiled and registered in every build**; only their bodies
 are gated. `go test -list .` always reports the full inventory.
@@ -230,11 +236,15 @@ compares bytes:
 - **Anything downstream of the reference's `freedom` outbound.** The target is a
   local HTTP server; no external destination is ever contacted.
 
-## The gap this stand found
+## The gaps this stand found
+
+Both of them were found by running the live half, not by reading it, and both
+are recorded here because that is the clearest evidence of what the stand is for.
+
+### 1. The option layer could not load an `xhttp` transport (validation half)
 
 The first run of the validation tests failed on every xhttp scenario, for a
-reason that had nothing to do with the reference. It is recorded here because
-finding it is the clearest evidence of what this stand is for.
+reason that had nothing to do with the reference.
 
 `option.V2RayTransportOptions.UnmarshalJSON` switches on the transport type to
 choose a sub-options struct, and its switch had cases for `http`, `ws`, `quic`,
@@ -265,6 +275,49 @@ It was reported to the `option/**` owner and fixed in commit
 scenarios now round-trip through the parser and through `box.New` and are
 verified here like every other scenario.
 
+### 2. The REALITY greeting could not authenticate against any server (live half)
+
+The first live run failed `reality-classical` with the reference logging
+
+```
+REALITY: processed invalid connection from 127.0.0.1:…: authentication failed or validation criteria not met
+```
+
+and the client reporting `reality verification failed` — the same message a wrong
+public key produces. The three candidates had to be separated by measurement, and
+the measurements said product, not harness:
+
+- The generated pair was correct. An **Xray** client using the generated server
+  config (same `publicKey`, `shortId`, `serverNames`, `dest`) authenticated and
+  proxied a request end to end, and the client's public key was independently
+  derived from the server's private key with an RFC 7748 implementation.
+- Capturing the fork's actual ClientHello and replaying the server's acceptance
+  path over it showed SNI, short id, key share and auth key all correct, and the
+  AES-GCM **open of the sealed session_id failing**. The client was sealing with
+  the greeting's plaintext session id as the additional data; the server rebuilds
+  the additional data by **zeroing** `session_id` inside the ClientHello it
+  received before it opens the seal. Sixteen authenticated bytes differed, so the
+  tag never checked out.
+- With that fixed, the server accepted the connection and the client STILL said
+  `reality verification failed`: the refactor that introduced the key_share policy
+  had moved the uTLS connection construction into a helper that cloned the stored
+  config a second time, which dropped `realityVerifier` — the callback that checks
+  the server's REALITY certificate. The handshake then ran with
+  `InsecureSkipVerify` and no callback at all.
+
+Both are fixed in `common/tls/reality_client.go` and pinned, against a server,
+by `common/tls/reality_handshake_test.go`: one test replays the reference's
+acceptance path over the greeting that would be sent, and one completes a real
+handshake against `utls.RealityServer` — the same implementation
+`common/tls/reality_server.go` hands every REALITY inbound to. `reality-classical`
+then passed, and the matrix was extended to the hybrid side, where every scenario
+passed too.
+
+Both bugs came from the same refactor, and neither had a local symptom. That is
+the case for the stand in one paragraph.
+
+### Machinery kept, because the classes of defect are not fixed by fixing one case
+
 The machinery is kept, because the class of defect it guards against is not
 fixed by fixing one case:
 
@@ -280,6 +333,9 @@ fixed by fixing one case:
   `box.New`, and the live xhttp scenarios — **skip** with a message naming
   `option/v2ray_transport.go` if the probe ever reports a gap again, instead of
   failing for a reason that has nothing to do with the reference.
+- The REALITY bugs are pinned by tests that need a **server**, not by assertions
+  about the client's own construction: the AAD test replays the server's parser
+  over the wire bytes, so a change that only looks right to this package fails.
 
 The **raw-JSON assertions are never gated**: the generator's output is correct
 whether or not this build can parse it back, and those tests run either way.
@@ -300,6 +356,27 @@ does not pretend otherwise:
   `$XRAY_BINARY vlessenc` and parsing the pair it prints. Both halves are taken
   **verbatim**; the reference is the authority on what it will accept.
 
+The generator's output is **not JSON**, whatever an older version of this
+document implied, and the parser now understands both shapes:
+
+```
+Authentication: X25519, not Post-Quantum
+"decryption": "mlkem768x25519plus.native.600s.<key>"
+"encryption": "mlkem768x25519plus.native.0rtt.<key>"
+
+Authentication: ML-KEM-768, Post-Quantum
+"decryption": "mlkem768x25519plus.native.600s.<key>"
+"encryption": "mlkem768x25519plus.native.0rtt.<key>"
+```
+
+It prints **two complete pairs**, one per authentication mode, and says in as many
+words to choose one and not mix them. The parser therefore pairs the halves of one
+block and refuses to assemble a pair from one half of each: the two specs would
+describe different key material, and the failure would surface at the reference as
+an opaque decryption error. (The `invalid character 'C' looking for beginning of
+value` that skipped the encryption scenarios came from feeding the
+`Authentication: …` banner to a JSON decoder.)
+
 If neither source is available and a scenario needs encryption, that scenario
 skips with the exact `xray vlessenc` / `export …` sequence to run. It does not
 fall back to synthetic material, and it does not fail.
@@ -318,19 +395,41 @@ releases, and one binary cannot satisfy both. The stand reads the reference's ow
 
 An unparseable version is treated as *compatible*: failing to parse a version is
 the harness's problem, and silently skipping a scenario because of it would hide
-a real regression. To cover the classical scenario, point `XRAY_BINARY` at a
-pre-v26.9.8 build and run `-run TestLiveInteropRealityClassical`; the workflow
-takes the same choice through its `xray_version` input.
+a real regression. The split is not a guess: a hybrid-stripped greeting against
+v26.9.30 was rejected with `authentication failed or validation criteria not met`,
+and the same greeting against v26.3.27 authenticated.
+
+## The loopback destination, and a current reference's default block
+
+Xray gives the `freedom` outbound behind a proxied inbound (`vless`, `vmess`,
+`trojan`, shadowsocks…) a default rule that **blocks every private destination**
+and blackholes the connection for a random 30–90 seconds. The stand's destination
+is `127.0.0.1` by design — that is what makes it runnable with no external network
+— so on such a reference every scenario fails with the tunnel up and the target
+unreachable, which reads like a transport bug on the client and is logged only on
+the reference's side (`blocked target: …`). The generated server config therefore
+carries an explicit `finalRules` allow for `127.0.0.0/8` and `::1/128`; an
+explicit rule is consulted before the default one, and a reference that predates
+the field ignores it, so one generated file stays correct on both sides of the
+split.
 
 ## CI
 
 `.github/workflows/interop-xray.yml` is `workflow_dispatch` only. It runs the
-default (non-live) half unconditionally, resolves an Xray-core release tag
-(`latest` by default, overridable), downloads the linux/amd64 binary, runs the
-live matrix with both halves of the gate set, and uploads the generated configs
-and both logs as an artifact on every outcome. It fails if the `-run` filter
-matches nothing, because a vacuous green tick is the failure mode this stand
-exists to prevent.
+default (non-live) half unconditionally, and then runs the live matrix once per
+reference tag in its `xray_versions` matrix — two tags by default, one on each
+side of the REALITY key_share split, because no single binary covers both. It
+downloads the linux/amd64 binary per leg, runs the live matrix with both halves of
+the gate set, and uploads the generated configs and both logs as a per-leg
+artifact on every outcome.
+
+The default used to be `latest`, which the releases API resolves to the newest
+**non-prerelease** release. That is below the hybrid threshold, so five of the ten
+scenarios skipped on every run and reported green: the hybrid, encryption, Vision
+and XHTTP halves of the debt were never exercised. A leg that passes no scenario
+is now a failure, so a leg that only skips cannot report green again. The `-run`
+filter matching nothing is still a failure, because a vacuous green tick is the
+failure mode this stand exists to prevent.
 
 The default (non-live) half is **not** wired into the push-time `Verify`
 workflow: that workflow's test steps are scoped to the packages this fork
@@ -349,11 +448,13 @@ Honest summary:
 | Configuration generator | **Implemented and verified here.** Every scenario generates a pair; the client config is asserted as raw JSON and through `badjson.UnmarshalExtendedContext[option.Options]`, and accepted by `box.New`; the server config is asserted key-by-key against Xray's schema; the REALITY and encryption key pairs are proven matched by deriving the public half from the private half. |
 | Gate | **Implemented and verified here.** The default run reports one skip per scenario with the enable command; `-tags liveinterop` without the environment variable still skips cleanly; the message wording is asserted by a test. |
 | Harness (target, camouflage, process orchestration) | **Implemented and verified here** for everything that does not need a reference: echo semantics, TLS with ALPN h2, exit detection (clean and failing), log capture, and the artifact-on-failure path. |
-| Live wiring (config → `box.New` → `Start` → outbound dial) | **Driven to a real socket here** against a stand-in reference that listens but speaks no protocol (see [Smoke-testing the harness without a reference](#smoke-testing-the-harness-without-a-reference)). The client started from the generated config, the proxied request reached the outbound, and the failure message carried both logs. The stand-in speaks nothing, so **no wire format was exercised**. |
-| Live interop against a real Xray | **NOT RUN.** Never executed, in this environment or any other, for any scenario. |
-| The classical/hybrid version split | **Encoded and unit-tested as a rule; not observed.** |
+| Live wiring (config → `box.New` → `Start` → outbound dial) | **Driven to a real socket** against a stand-in reference that speaks no protocol (see [Smoke-testing the harness without a reference](#smoke-testing-the-harness-without-a-reference)), and against real references end to end. |
+| Live interop against a real Xray | **RUN.** `reality-classical` and `reality-encryption` pass against v26.3.27; `reality-hybrid`, `reality-encryption`, `reality-encryption-vision`, all four XHTTP modes and the priority `reality-encryption-vision-xhttp-stream-one` scenario pass against v26.9.30. Every scenario asserts five behaviours (sequential, concurrent, cancel, deadline, restart) with byte-exact payload comparison. |
+| The classical/hybrid version split | **Observed.** A hybrid-stripped greeting authenticates to v26.3.27 and is rejected by v26.9.30; the Chrome fingerprint's hybrid greeting authenticates to both. The workflow therefore runs one leg per side. |
 | The option-layer gap this stand found | **Found, reported, and fixed** in `8ce22abd7`; the xhttp scenarios now validate end to end through this build's parser and `box.New`. |
+| The REALITY authentication bugs this stand found | **Found and fixed** in `common/tls/reality_client.go`, pinned by `common/tls/reality_handshake_test.go`. See [The gaps this stand found](#the-gaps-this-stand-found). |
 
-The generator is a harness component. The wire format it targets is still
-unverified against a reference server until someone runs the live command on a
-machine with Xray. This document will say so until then.
+The generator is a harness component. The wire format it targets is verified
+against a reference for the scenarios above, and the matrix is only complete when
+**both** legs of the CI workflow have run: one binary cannot be on both sides of
+the REALITY key_share split.

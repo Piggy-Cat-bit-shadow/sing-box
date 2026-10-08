@@ -271,9 +271,39 @@ type xrayXHTTPSettings struct {
 }
 
 type xrayOutbound struct {
-	Protocol string `json:"protocol"`
-	Tag      string `json:"tag,omitempty"`
+	Protocol string               `json:"protocol"`
+	Tag      string               `json:"tag,omitempty"`
+	Settings *xrayFreedomSettings `json:"settings,omitempty"`
 }
+
+// xrayFreedomSettings is the `settings` block of the reference's freedom outbound.
+//
+// The stand needs exactly one rule in it, and the rule is not optional on a current reference: Xray
+// gives the freedom outbound behind a proxied inbound (vless, vmess, trojan, shadowsocks) a DEFAULT
+// rule that blocks every private destination and blackholes the connection for a random 30-90
+// seconds. A blocked connection is not an error the client can attribute - the tunnel is up, the
+// reference logs "blocked target" on its own side, and the client just sees a request that never
+// answers, which is the shape of a transport bug. The stand's destination is loopback by design,
+// because that is what makes it runnable with no external network, so without this rule every
+// scenario fails against such a reference for a reason that has nothing to do with the protocol.
+//
+// An explicit rule is consulted BEFORE the default one (proxy/freedom's matchFinalRule walks the
+// outbound's own rules first), and an older reference that does not know the field ignores it, so
+// emitting it unconditionally is what keeps one generated file correct for both sides of the
+// version split.
+type xrayFreedomSettings struct {
+	FinalRules []xrayFreedomFinalRule `json:"finalRules"`
+}
+
+type xrayFreedomFinalRule struct {
+	Action string   `json:"action"`
+	IP     []string `json:"ip"`
+}
+
+// xrayLoopbackCIDRs is every destination the stand can hand the reference: the target is always on
+// 127.0.0.1, and ::1 is listed so a future IPv6-loopback target does not silently become the one
+// blocked case.
+var xrayLoopbackCIDRs = []string{"127.0.0.0/8", "::1/128"}
 
 // ---------------------------------------------------------------------------
 
@@ -532,6 +562,10 @@ func (in Input) buildServerConfig() xrayServerConfig {
 		Outbounds: []xrayOutbound{{
 			Protocol: "freedom",
 			Tag:      "direct",
+			Settings: &xrayFreedomSettings{FinalRules: []xrayFreedomFinalRule{{
+				Action: "allow",
+				IP:     xrayLoopbackCIDRs,
+			}}},
 		}},
 	}
 }

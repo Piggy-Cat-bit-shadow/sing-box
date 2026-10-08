@@ -308,6 +308,21 @@ func TestGeneratedServerConfigJSONShape(t *testing.T) {
 			}
 			require.NotContains(t, inbound, "realitySettings",
 				"REALITY settings belong under streamSettings in Xray's schema")
+
+			// The freedom outbound's explicit loopback allow. A current reference blackholes a
+			// private destination by default, and the stand's destination is loopback by design, so
+			// its absence would turn every scenario into "the tunnel came up and nothing answered".
+			outbounds := jsonArrayAt(t, root, "outbounds")
+			require.Len(t, outbounds, 1)
+			outbound := asObject(t, outbounds[0], "outbounds[0]")
+			require.Equal(t, "freedom", jsonStringAt(t, outbound, "protocol"))
+			freedom := asObject(t, outbound["settings"], "outbounds[0].settings")
+			finalRules := jsonArrayAt(t, freedom, "finalRules")
+			require.Len(t, finalRules, 1)
+			finalRule := asObject(t, finalRules[0], "outbounds[0].settings.finalRules[0]")
+			require.Equal(t, "allow", jsonStringAt(t, finalRule, "action"))
+			require.Equal(t, []any{"127.0.0.0/8", "::1/128"}, jsonArrayAt(t, finalRule, "ip"),
+				"the allow must cover every loopback destination the stand can use")
 		})
 	}
 }
@@ -564,8 +579,8 @@ func TestReferenceVersionGateIsCorrect(t *testing.T) {
 
 // TestVlessEncOutputParsing pins the key-material parser, which is the one piece
 // of the live path that can be exercised without a reference binary: its output
-// shape is a property of the installed build, so it has to tolerate the
-// documented JSON, a fenced variant, and trailing noise.
+// shape is a property of the installed build, so it has to tolerate both the
+// documented JSON and the line form the shipping generator actually prints.
 func TestVlessEncOutputParsing(t *testing.T) {
 	t.Parallel()
 	clientSpec, serverSpec, err := parseVlessEncOutput(`{"encryption":"enc","decryption":"dec"}`)
@@ -581,6 +596,43 @@ func TestVlessEncOutputParsing(t *testing.T) {
 
 	_, _, err = parseVlessEncOutput(`{"encryption":"enc"}`)
 	require.Error(t, err)
+
+	// The shape the SHIPPING generator prints: no JSON at all, two complete pairs under their own
+	// headers, and the instruction not to mix them. This is the shape that made the encryption
+	// scenarios skip with `invalid character 'C' looking for beginning of value`, which reads as a
+	// harness problem only because it is one.
+	clientSpec, serverSpec, err = parseVlessEncOutput(
+		"Choose one Authentication to use, do not mix them. Ephemeral key exchange is Post-Quantum safe anyway.\n" +
+			"\n" +
+			"Authentication: X25519, not Post-Quantum\n" +
+			"\"decryption\": \"mlkem768x25519plus.native.600s.x25519-decryption\"\n" +
+			"\"encryption\": \"mlkem768x25519plus.native.0rtt.x25519-encryption\"\n" +
+			"\n" +
+			"Authentication: ML-KEM-768, Post-Quantum\n" +
+			"\"decryption\": \"mlkem768x25519plus.native.600s.mlkem-decryption\"\n" +
+			"\"encryption\": \"mlkem768x25519plus.native.0rtt.mlkem-encryption\"\n")
+	require.NoError(t, err)
+	require.Equal(t, "mlkem768x25519plus.native.0rtt.x25519-encryption", clientSpec,
+		"the returned pair is one block's, not one half of each")
+	require.Equal(t, "mlkem768x25519plus.native.600s.x25519-decryption", serverSpec)
+
+	// A decryptor from one block and an encryptor from the other are two different key materials.
+	// Returning them as a pair would move the failure to the reference, where it surfaces as an
+	// opaque decryption error, so the split has to be an error here instead.
+	_, _, err = parseVlessEncOutput(
+		"Authentication: X25519, not Post-Quantum\n" +
+			"\"encryption\": \"mlkem768x25519plus.native.0rtt.only-an-encryptor\"\n" +
+			"\n" +
+			"Authentication: ML-KEM-768, Post-Quantum\n" +
+			"\"decryption\": \"mlkem768x25519plus.native.600s.only-a-decryptor\"\n")
+	require.Error(t, err)
+
+	// The unquoted spelling of the same shape, which costs nothing to accept.
+	clientSpec, serverSpec, err = parseVlessEncOutput("encryption=enc3\ndecryption=dec3\n")
+	require.NoError(t, err)
+	require.Equal(t, "enc3", clientSpec)
+	require.Equal(t, "dec3", serverSpec)
+
 	_, _, err = parseVlessEncOutput("no json at all")
 	require.Error(t, err)
 }
