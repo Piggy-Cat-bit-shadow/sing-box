@@ -24,7 +24,10 @@ import (
 	mDNS "github.com/miekg/dns"
 )
 
-var _ adapter.DNSTransport = (*Transport)(nil)
+var (
+	_ adapter.DNSTransport         = (*Transport)(nil)
+	_ adapter.IdleConnectionKeeper = (*Transport)(nil)
+)
 
 func RegisterTransport(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteTLSDNSServerOptions](registry, C.DNSTypeQUIC, NewQUIC)
@@ -89,6 +92,36 @@ func (t *Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 
 func (t *Transport) Reset() {
 	t.connection.Reset()
+}
+
+// CloseIdleConnections drops the pooled QUIC connection when no query is using it, and keeps the
+// pool's generation.
+//
+// # Why this is not Reset
+//
+// Reset advances the pool's generation: it replaces the state, cancels the context every wait and
+// dial in the old generation watches, and closes what it owned. That is the network-change
+// operation, and it costs a fresh handshake on the next query. A memory trim is not a network
+// change and must not be able to cause a dial, so it cannot go through Reset.
+//
+// What is reachable here is exactly the idle half of the pool. ConnPoolSingle.CloseIdle closes the
+// shared connection only when sharedUsers and sharedWaiters are both zero: a query that has the
+// connection checked out is mid-exchange, and a waiting caller is mid-dial, so neither is touched.
+// Nothing in this method dials, opens a stream or replaces the state, so a trim concurrent with a
+// live query neither breaks it nor makes the next query rebuild the pool.
+//
+// Resetting instead would be the bug common/httpclient/managed_transport.go documents at length: a
+// trim that swaps the generation is indistinguishable, at the next Exchange, from "never dialed",
+// so it rebuilds MORE than it released and re-learns every verdict (here, the whole QUIC handshake)
+// on a network it was still valid for.
+func (t *Transport) CloseIdleConnections() {
+	t.connection.CloseIdle()
+}
+
+// SetKeepIdleConnections makes the pool itself own the retention decision, so a no-keep caller
+// cannot have a later Release put the connection straight back. See ConnPool.SetKeepIdle.
+func (t *Transport) SetKeepIdleConnections(keep bool) {
+	t.connection.SetKeepIdle(keep)
 }
 
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {

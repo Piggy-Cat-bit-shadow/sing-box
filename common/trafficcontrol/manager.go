@@ -95,8 +95,15 @@ func (m *Manager) leave(tracker Tracker) {
 		m.closedConnectionsAccess.Unlock()
 		return
 	}
-	metadata.ClosedAt = closedAt
+	// ClosedAt is written to the COPY that goes into the closed list, never to metadata itself.
+	//
+	// metadata is the live tracker's own struct, and Connections hands that same pointer out.
+	// Writing it here would race a reader that is still holding the pointer it got from
+	// Connections - the shape the Clash API's connection list has, and one -race reports as a
+	// read/write pair on ClosedAt. The value is only meaningful for a connection that has left,
+	// so there is nothing to publish on the live view anyway.
 	metadataCopy := *metadata
+	metadataCopy.ClosedAt = closedAt
 	if m.closedConnections.Len() >= closedConnectionsLimit {
 		evicted := m.closedConnections.PopFront()
 		m.closedUploadTotal += evicted.Upload.Load()
