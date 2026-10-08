@@ -61,6 +61,23 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          # Only the Android client is checked out, and only because the build pins live in it.
+          #
+          # clients/android is a submodule (SagerNet/sing-box-for-android), so the NDK version this
+          # workflow derives is NOT in the superproject and an uninitialised checkout has no
+          # gradle.properties to read. clients/apple is deliberately NOT fetched: it is a large
+          # submodule with its own signing and provisioning config, nothing in an Android build needs
+          # it, and pulling it would slow every run and couple this workflow to Apple release state.
+
+      - name: Check out the Android client submodule
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth 1 clients/android
+          if [ ! -f clients/android/gradle.properties ]; then
+            echo "FAIL: clients/android was not checked out; the NDK pin cannot be read" >&2
+            exit 1
+          fi
+          echo "android client at $(git -C clients/android rev-parse --short HEAD)"
 
       - uses: actions/setup-go@v5
         with:
