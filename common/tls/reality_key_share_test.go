@@ -352,7 +352,10 @@ func TestRealityAppliesFirstFlightTransforms(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
 			defer clientConn.Close()
 			defer serverConn.Close()
-			uConn, err := client.newClientUConn(clientConn)
+			// The same config constructor ClientHandshake uses, minus the server check: this test
+			// never completes a handshake, and the point of going through the constructor is that a
+			// config built any other way is not the config a real dial uses.
+			uConn, err := client.newClientUConn(clientConn, client.realityUConfig(nil))
 			require.NoError(t, err)
 
 			_, isFragmentConn := uConn.NetConn().(*tf.Conn)

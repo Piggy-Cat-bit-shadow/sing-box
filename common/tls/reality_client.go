@@ -166,7 +166,17 @@ func (e *RealityClientConfig) Client(conn net.Conn) (Conn, error) {
 // It is split out of ClientHandshake because it is the part that decides WHAT goes on the wire, and
 // it does no I/O - so it is the part a test can inspect. ClientHandshake is then only "send it and
 // check the answer".
-func (e *RealityClientConfig) newClientUConn(conn net.Conn) (*utls.UConn, error) {
+//
+// The caller's config is used AS IS rather than cloned again from the stored one, because the
+// connection's certificate verification lives on that config. REALITY does not authenticate the
+// server with a CA chain: the server proves itself by HMACing the public half of a temporary
+// ed25519 key under the REALITY auth key, and realityVerifier is the check for that. A second clone
+// here silently dropped it - the handshake then ran with InsecureSkipVerify and no callback at all,
+// verifier.verified stayed false, and every dial ended in "reality verification failed" against a
+// server that had authenticated the client perfectly. The callback cannot live on the shared config
+// either: it closes over the uConn it inspects, so it is per-connection state and has to travel
+// with the connection.
+func (e *RealityClientConfig) newClientUConn(conn net.Conn, uConfig *utls.Config) (*utls.UConn, error) {
 	// The same first-flight transforms the plain uTLS path applies. REALITY has its own handshake,
 	// so without this the configured fragmentation - and the automatic record-fragment default for a
 	// detoured dial - were accepted and then silently ignored on exactly the path where the
@@ -175,9 +185,6 @@ func (e *RealityClientConfig) newClientUConn(conn net.Conn) (*utls.UConn, error)
 	if err != nil {
 		return nil, err
 	}
-	uConfig := e.uClient.config.Clone()
-	uConfig.InsecureSkipVerify = true
-	uConfig.SessionTicketsDisabled = true
 	uConn := utls.UClient(wrapped, uConfig, e.uClient.id)
 	if err = prepareClientHello(uConn, e.keyShare, e.uClient.id); err != nil {
 		return nil, err
@@ -185,15 +192,34 @@ func (e *RealityClientConfig) newClientUConn(conn net.Conn) (*utls.UConn, error)
 	return uConn, nil
 }
 
+// realityUConfig is the one uTLS config a REALITY connection is built with, shared by the
+// connection and by the greeting that completes it.
+//
+// It exists because building that config twice is a silent bug, not a style choice: the first
+// version of this split cloned the stored config a second time inside newClientUConn, which dropped
+// the certificate check set here. The handshake then completed with InsecureSkipVerify and no
+// callback, verifier.verified stayed false, and a client whose REALITY authentication the server
+// had just accepted reported "reality verification failed" - the same message a wrong public key
+// produces, with no path from the symptom back to the dropped line. One constructor, used by
+// ClientHandshake and by the tests that inspect the greeting, is the guard.
+//
+// verifyPeerCertificate is REALITY's own server check (an HMAC over a temporary ed25519 key, not a
+// CA chain) and is per-connection state, because it closes over the connection it inspects; nil is
+// correct only for a caller that never performs a handshake.
+func (e *RealityClientConfig) realityUConfig(verifyPeerCertificate func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error) *utls.Config {
+	uConfig := e.uClient.config.Clone()
+	uConfig.InsecureSkipVerify = true
+	uConfig.SessionTicketsDisabled = true
+	uConfig.VerifyPeerCertificate = verifyPeerCertificate
+	return uConfig
+}
+
 func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
 	verifier := &realityVerifier{
 		serverName: e.uClient.ServerName(),
 	}
-	uConfig := e.uClient.config.Clone()
-	uConfig.InsecureSkipVerify = true
-	uConfig.SessionTicketsDisabled = true
-	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn, err := e.newClientUConn(conn)
+	uConfig := e.realityUConfig(verifier.VerifyPeerCertificate)
+	uConn, err := e.newClientUConn(conn, uConfig)
 	if err != nil {
 		return nil, err
 	}
