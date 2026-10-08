@@ -144,15 +144,24 @@ jobs:
               exit 1
             fi
           done
-          # The installed binary must report the version go.mod pins, so a silently different
-          # toolchain fails here rather than producing artifacts nobody can reproduce.
-          installed="$("$gobin/gomobile" version 2>&1 || true)"
-          echo "gomobile version output: $installed"
-          if [ -n "$installed" ] && ! printf '%s' "$installed" | grep -qF "$GOMOBILE_VERSION"; then
-            echo "FAIL: installed gomobile does not report the pinned version $GOMOBILE_VERSION" >&2
-            exit 1
-          fi
-          echo "PASS: gomobile and gobind installed from the pinned fork at $GOMOBILE_VERSION"
+          # Prove WHICH MODULE the binaries came from by reading their build info, not by asking
+          # `gomobile version`.
+          #
+          # `gomobile version` prints "gomobile version unknown: binary is out of date, re-install it"
+          # for a binary installed with `go install` from a module, because it looks for a version
+          # file that only exists in its own release layout. Treating that as a version mismatch
+          # failed this step even though the install was fine. `go version -m` reads the stamped
+          # module path and version out of the binary itself, which is both reliable and a stronger
+          # statement - it names the exact module the toolchain was built from.
+          for tool in gomobile gobind; do
+            echo "--- $tool build info"
+            go version -m "$gobin/$tool" | sed -n '1,8p'
+            if ! go version -m "$gobin/$tool" | grep -q "github.com/sagernet/gomobile[[:space:]]*$GOMOBILE_VERSION"; then
+              echo "FAIL: $gobin/$tool was not built from github.com/sagernet/gomobile@$GOMOBILE_VERSION" >&2
+              exit 1
+            fi
+          done
+          echo "PASS: gomobile and gobind are built from the pinned fork at $GOMOBILE_VERSION"
 
       # Cheap structural gates first, so a failure lands near its cause instead of at the end of a
       # 15-minute native build.
