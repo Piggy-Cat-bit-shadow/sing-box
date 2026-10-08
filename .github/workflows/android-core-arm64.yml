@@ -111,11 +111,48 @@ jobs:
           echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
           echo "PASS: NDK at $NDK_DIR"
 
-      - name: Install gomobile and gobind
+      # The project's OWN gomobile fork, at the version root go.mod pins. NOT golang.org/x/mobile.
+      #
+      # This is a source-of-truth rule, not a convenience. root go.mod requires
+      # github.com/sagernet/gomobile, which is the toolchain this project's Android product is built
+      # with; installing upstream golang.org/x/mobile instead means CI builds with a DIFFERENT
+      # generator than the product, and the two can disagree about binding output.
+      #
+      # It also fails outright: x/mobile@latest now carries `go >= 1.26.0`, so GOTOOLCHAIN tries to
+      # fetch go1.26.9 as a module and the proxy 404s, which is how this workflow first appeared to be
+      # blocked by the environment. The pin has a go directive of 1.23 and needs no toolchain jump.
+      #
+      # The version is DERIVED, never copied: a literal here would be a second source of truth and
+      # would silently diverge the first time go.mod moves.
+      - name: Install the pinned gomobile toolchain
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          GOMOBILE_VERSION="$(go list -m -f '{{.Version}}' github.com/sagernet/gomobile)"
+          if [ -z "$GOMOBILE_VERSION" ] || [ "$GOMOBILE_VERSION" = "null" ]; then
+            echo "FAIL: root go.mod does not require github.com/sagernet/gomobile" >&2
+            exit 1
+          fi
+          echo "gomobile module: github.com/sagernet/gomobile@$GOMOBILE_VERSION"
+          go install "github.com/sagernet/gomobile/cmd/gomobile@$GOMOBILE_VERSION"
+          go install "github.com/sagernet/gomobile/cmd/gobind@$GOMOBILE_VERSION"
+          gobin="$(go env GOPATH)/bin"
+          echo "$gobin" >> "$GITHUB_PATH"
+          for tool in gomobile gobind; do
+            if [ ! -x "$gobin/$tool" ]; then
+              echo "FAIL: $tool was not installed to $gobin" >&2
+              ls "$gobin" >&2 || true
+              exit 1
+            fi
+          done
+          # The installed binary must report the version go.mod pins, so a silently different
+          # toolchain fails here rather than producing artifacts nobody can reproduce.
+          installed="$("$gobin/gomobile" version 2>&1 || true)"
+          echo "gomobile version output: $installed"
+          if [ -n "$installed" ] && ! printf '%s' "$installed" | grep -qF "$GOMOBILE_VERSION"; then
+            echo "FAIL: installed gomobile does not report the pinned version $GOMOBILE_VERSION" >&2
+            exit 1
+          fi
+          echo "PASS: gomobile and gobind installed from the pinned fork at $GOMOBILE_VERSION"
 
       # Cheap structural gates first, so a failure lands near its cause instead of at the end of a
       # 15-minute native build.
