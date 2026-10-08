@@ -252,28 +252,38 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) serverConfig(ctx gliderssh.Context) *gossh.ServerConfig {
+	// The pre-auth connection is the only handle that can deliver a banner while
+	// the SSH policy is being enforced, so it is captured per connection here and
+	// handed to authenticate below. There is deliberately no BannerCallback: see
+	// applyAction for why one can never work for this policy.
+	var preAuthConn gossh.ServerPreAuthConn
 	config := &gossh.ServerConfig{
+		PreAuthConnCallback: func(conn gossh.ServerPreAuthConn) {
+			preAuthConn = conn
+		},
 		NoClientAuthCallback: func(conn gossh.ConnMetadata) (*gossh.Permissions, error) {
-			return s.authenticate(ctx, conn)
+			return s.authenticate(ctx, preAuthConn, conn)
 		},
 		PasswordCallback: func(conn gossh.ConnMetadata, password []byte) (*gossh.Permissions, error) {
-			return s.authenticate(ctx, conn)
+			return s.authenticate(ctx, preAuthConn, conn)
 		},
 		PublicKeyCallback: func(conn gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
-			return s.authenticate(ctx, conn)
-		},
-		BannerCallback: func(conn gossh.ConnMetadata) string {
-			connInfo := s.connInfoFromContext(ctx)
-			if connInfo != nil && connInfo.action.Message != "" {
-				return connInfo.action.Message
-			}
-			return ""
+			return s.authenticate(ctx, preAuthConn, conn)
 		},
 	}
 	return config
 }
 
-func (s *Server) authenticate(ctx gliderssh.Context, conn gossh.ConnMetadata) (*gossh.Permissions, error) {
+// authBannerSender is the single method of gossh.ServerPreAuthConn that the
+// authorization path needs. gossh.ServerPreAuthConn embeds an unexported
+// interface, so it cannot be implemented outside x/crypto/ssh (including in
+// tests); depending on this narrow interface keeps the banner sequencing
+// testable, and a real ServerPreAuthConn satisfies it.
+type authBannerSender interface {
+	SendAuthBanner(message string) error
+}
+
+func (s *Server) authenticate(ctx gliderssh.Context, preAuthConn gossh.ServerPreAuthConn, conn gossh.ConnMetadata) (*gossh.Permissions, error) {
 	if s.connInfoFromContext(ctx) != nil {
 		return &gossh.Permissions{}, nil
 	}
@@ -298,32 +308,56 @@ func (s *Server) authenticate(ctx gliderssh.Context, conn gossh.ConnMetadata) (*
 		s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", conn.User(), ": ", err)
 		return nil, &gossh.PartialSuccessError{}
 	}
-	if connInfo.action.Reject {
-		s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", conn.User())
-		return nil, &gossh.PartialSuccessError{}
-	}
+	return s.applyAction(ctx, preAuthConn, connInfo, node, conn.User(), srcIP)
+}
+
+// applyAction enforces the action chosen by policy evaluation and follows any
+// hold-and-delegate chain. Banners are sent from here, not from
+// gossh.ServerConfig.BannerCallback: x/crypto/ssh calls BannerCallback after key
+// exchange but before authentication, while connInfo is only installed into the
+// connection context once this function accepts, so a BannerCallback would always
+// observe a nil connInfo and the operator's action.Message would never reach the
+// client — including on the Reject path, where the message is the only explanation
+// the client gets. SendAuthBanner is valid for the whole pre-auth phase, so every
+// action that carries a message emits its banner before it is enforced, including
+// each hop of a hold-and-delegate chain.
+func (s *Server) applyAction(ctx gliderssh.Context, bannerSender authBannerSender, connInfo *sshConnInfo, node tailcfg.NodeView, sshUser string, srcIP netip.Addr) (*gossh.Permissions, error) {
+	userProfile := connInfo.userProfile
 	connInfo.action0 = connInfo.action
-	for hops := 0; connInfo.action.HoldAndDelegate != ""; hops++ {
+	for hops := 0; ; hops++ {
+		if connInfo.action.Message != "" {
+			err := bannerSender.SendAuthBanner(connInfo.action.Message)
+			if err != nil {
+				// The banner is often the only way the operator explains a
+				// rejection to the client; a banner that cannot be delivered must
+				// not silently turn into an accepted connection.
+				s.logger.Info("SSH auth: send banner: ", err)
+				return nil, &gossh.PartialSuccessError{}
+			}
+		}
+		if connInfo.action.Reject {
+			s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", sshUser)
+			return nil, &gossh.PartialSuccessError{}
+		}
+		if connInfo.action.HoldAndDelegate == "" {
+			break
+		}
 		if hops >= 10 {
 			s.logger.Info("SSH auth rejected: hold-and-delegate chain too long")
 			return nil, &gossh.PartialSuccessError{}
 		}
-		delegatedAction, delegateErr := s.holdAndDelegate(ctx, connInfo.action, node, conn.User(), connInfo.localUser, srcIP)
+		delegatedAction, delegateErr := s.holdAndDelegate(ctx, connInfo.action, node, sshUser, connInfo.localUser, srcIP)
 		if delegateErr != nil {
 			s.logger.Info("SSH auth rejected for ", userProfile.LoginName, ": ", delegateErr)
 			return nil, &gossh.PartialSuccessError{}
 		}
 		connInfo.action = delegatedAction
-		if connInfo.action.Reject {
-			s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", conn.User())
-			return nil, &gossh.PartialSuccessError{}
-		}
 	}
 	if !connInfo.action.Accept {
-		s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", conn.User())
+		s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", sshUser)
 		return nil, &gossh.PartialSuccessError{}
 	}
-	connInfo.sshUser = conn.User()
+	connInfo.sshUser = sshUser
 	connInfo.srcIP = srcIP
 	connInfo.connID = newConnID()
 	ctx.SetValue(sshConnContextKey{}, connInfo)
