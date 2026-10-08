@@ -32,7 +32,7 @@ type TunOptions interface {
 	GetIncludePackage() StringIterator
 	GetExcludePackage() StringIterator
 	IsHTTPProxyEnabled() bool
-	GetHTTPProxyServer() string
+	GetHTTPProxyServer() *StringBox
 	GetHTTPProxyServerPort() int32
 	GetHTTPProxyBypassDomain() StringIterator
 	GetHTTPProxyMatchDomain() StringIterator
@@ -43,22 +43,36 @@ type RoutePrefix struct {
 	prefix  int
 }
 
-func (p *RoutePrefix) Address() string {
-	return p.address.String()
+// Address and Mask return *StringBox rather than string. Both are Go-implemented accessors read
+// FROM the bound language, so the generated //export wrapper puts the string's pointer into
+// cmd/cgo's packed result frame - the `bulkBarrierPreWrite: unaligned arguments` shape that
+// gomobile_surface_test.go exists to catch. StringBox moves the pointer into a heap object and
+// leaves only a refnum in the frame. The box is the package's own established workaround
+// (panic.go), and the client reads it through the Value field accessor exactly as it already
+// does for TunOptions.GetDNSMode:
+//
+//	Swift   address.address()!.value
+//	Kotlin  address.address().value
+//
+// The identical change was applied to TunOptions.GetHTTPProxyServer and DeprecatedNote.Message
+// and BridgeSession.Name in the same sweep; the shipped call sites are listed per entry in
+// gomobile_surface_test.go so the eventual artifact rebuild can be checked against them.
+func (p *RoutePrefix) Address() *StringBox {
+	return wrapString(p.address.String())
 }
 
 func (p *RoutePrefix) Prefix() int32 {
 	return int32(p.prefix)
 }
 
-func (p *RoutePrefix) Mask() string {
+func (p *RoutePrefix) Mask() *StringBox {
 	var bits int
 	if p.address.Is6() {
 		bits = 128
 	} else {
 		bits = 32
 	}
-	return net.IP(net.CIDRMask(p.prefix, bits)).String()
+	return wrapString(net.IP(net.CIDRMask(p.prefix, bits)).String())
 }
 
 func (p *RoutePrefix) String() string {
@@ -164,32 +178,27 @@ func (o *tunOptions) IsHTTPProxyEnabled() bool {
 
 // GetHTTPProxyServer returns the HTTP proxy address the platform should point the TUN interface at.
 //
-// # Why this is deliberately still a bare string, against the rule above
+// # Why this now returns *StringBox
 //
-// It has the shape that rule exists to catch - a Go-implemented accessor read FROM the bound
-// language, so it goes through the generated cgo //export wrapper and its packed result frame. The
-// fix would be the same one GetDNSMode uses: return *StringBox and read it through Value.
+// It has the shape that the package rule exists to catch: a Go-implemented accessor read FROM the
+// bound language, so it goes through the generated cgo //export wrapper and its packed result
+// frame. Returning *StringBox applies the same fix GetDNSMode already uses - the pointer lives in
+// a heap object and only a refnum crosses the frame.
 //
-// It is not applied here because the blocked dependency is on the OTHER side of the boundary. The
-// shipped Apple client calls this and expects a string:
+// This was registered debt until the client side could move with it, because changing the result
+// type rewrites the generated ObjC method from `- (NSString *)` to `- (LibboxStringBox *)` and
+// the one shipped call site then has to read `.value`:
 //
 //	clients/apple/Library/Network/ExtensionPlatformInterface.swift
-//	    options.getHTTPProxyServer()
+//	    options.getHTTPProxyServer()!.value
 //
-// Changing the Go signature rewrites the generated ObjC method from `- (NSString *)` to
-// `- (LibboxStringBox *)`, so the Apple client stops compiling until that one call site becomes
-// `options.getHTTPProxyServer()?.value`. That is a coordinated two-repository release, and doing
-// half of it here would break the Apple build to remove a risk that is currently theoretical:
-// upstream's fix (cmd/cgo CL 692935, Go 1.26) is about frame alignment, and whether any particular
-// generated frame lands off an 8-byte boundary depends on the platform C compiler's frame offset,
-// which is not visible from here.
-//
-// So it is registered as checked debt in gomobile_surface_test.go instead. The tripwire still fails
-// on any NEW occurrence, and it fails if this entry is removed without the signature being fixed,
-// so the register cannot rot into a mute allowlist. Converting this belongs with the Apple client
-// migration, where the call site can move in the same commit.
-func (o *tunOptions) GetHTTPProxyServer() string {
-	return o.TunPlatformOptions.HTTPProxy.Server
+// That Swift change is carried in a worktree cut from the recorded clients/apple gitlink (the
+// user's checkout is dirty and must not be touched), together with the other Apple call sites of
+// this sweep. The clients link a PREBUILT Libbox.xcframework, so the Go signature, the Swift
+// call sites and the rebuilt framework are one release unit; the register in
+// gomobile_surface_test.go records each shipped call site so that unit can be verified.
+func (o *tunOptions) GetHTTPProxyServer() *StringBox {
+	return wrapString(o.TunPlatformOptions.HTTPProxy.Server)
 }
 
 func (o *tunOptions) GetHTTPProxyServerPort() int32 {

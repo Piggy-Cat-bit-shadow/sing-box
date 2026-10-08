@@ -58,7 +58,16 @@ type BridgeOptions struct {
 
 type BridgeSession interface {
 	FileDescriptor() int32
-	Name() string
+	// Name returns *StringBox rather than string: NewBridgeService hands a Go implementation of
+	// this interface to the platform, so the platform's call comes back through the generated
+	// //export wrapper and its packed result frame (gomobile_surface_test.go). The box moves the
+	// pointer out of the frame. Shipped call sites that move with it:
+	//
+	//	clients/apple/Library/Network/BridgeTunTracker.swift               session.name()!.value
+	//	clients/apple/HelperService/RootHelperService.swift                session.name()!.value
+	//	clients/apple/JailbreakDaemon/IOSRootHelperService.swift           session.name()!.value
+	//	clients/android/.../bg/RootServer.kt                               session.name().value
+	Name() *StringBox
 	Inet6Active() bool
 	SetEgress(interfaceName string) error
 	Close() error
@@ -166,7 +175,13 @@ type OnDemandRule interface {
 	DNSServerAddressMatch() StringIterator
 	InterfaceTypeMatch() int32
 	SSIDMatch() StringIterator
-	ProbeURL() string
+	// ProbeURL returns *StringBox rather than string for the same packed-result-frame reason as
+	// BridgeSession.Name. Unlike the PlatformInterface methods, this interface is not implemented
+	// by the platform: it has no producer, no consumer and no client conformance anywhere in this
+	// module or in clients/apple and clients/android (both clients have their own native
+	// OnDemandRule type; only the prebuilt headers name LibboxOnDemandRule). The pointer-bearing
+	// frame was therefore latent rather than live, which is why the conversion is free.
+	ProbeURL() *StringBox
 }
 
 type OnDemandRuleIterator interface {

@@ -1,5 +1,28 @@
-//go:build darwin && badlinkname
+//go:build darwin && badlinkname && tfogo_checklinkname0
 
+// This file reaches into the runtime's signal state by SYMBOL NAME (getsig, setsig,
+// fwdSig, handlingSig). Those four are not in the linker's blockedLinknames allowlist,
+// they have no linkname push in the runtime, and none of them is an ABI wrapper, so the
+// Go linker rejects every one of them under its default -checklinkname policy:
+//
+//	link: github.com/sagernet/sing-box/experimental/libbox: invalid reference to runtime.fwdSig
+//
+// The release recipes pass -ldflags=-checklinkname=0, and tfogo_checklinkname0 is the tag
+// that records exactly that flag (see docs/installation/build-from-source.md: "Indicates
+// the build uses the -checklinkname=0 linker flag. Required together with badlinkname").
+//
+// The constraint used to be `darwin && badlinkname`, which conflated two different
+// contracts. badlinkname only means "the linkname opt-in is acceptable"; it says nothing
+// about the linker policy. Gating on it made `go test -tags <mobile tags>` unlinkable,
+// because the test binary is linked by cmd/go with the default -checklinkname policy and
+// no recipe injects the flag. That is not the file's fault and not a reason to drop
+// badlinkname from the tests: it is the wrong tag. Requiring tfogo_checklinkname0 makes
+// the constraint say what the code actually needs, so a test build can keep badlinkname
+// (and exercise every other linknamed path such as runtimeinfo and badtls) while taking
+// the no-op stub from signal_handler_stub.go, which is what a test binary must do.
+//
+// The stub's constraint is the exact negation, so the two files can never both be
+// compiled and never both be absent.
 package libbox
 
 /*

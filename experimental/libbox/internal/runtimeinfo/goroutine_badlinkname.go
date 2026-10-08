@@ -1,5 +1,17 @@
-//go:build badlinkname
+//go:build badlinkname && tfogo_checklinkname0
 
+// The allgs linkname below is a pull of a runtime variable that has no linkname push, is not
+// an ABI wrapper and is not in the linker's blockedLinknames allowlist, so the default
+// -checklinkname policy rejects it:
+//
+//	link: .../internal/runtimeinfo: invalid reference to runtime.allgs
+//
+// It therefore needs the -checklinkname=0 contract, which is what tfogo_checklinkname0
+// records; badlinkname alone only permits the linkname, it does not change the linker policy.
+// Gating on badlinkname alone made every test binary of this module unlinkable, because cmd/go
+// links tests with the default policy and no recipe can inject -ldflags per package.
+//
+// The stub negates both tags, so the package always has exactly one collectGoroutines.
 package runtimeinfo
 
 import (

@@ -55,6 +55,10 @@ func archiveCrashReport(path string, crashReportsDir string) {
 	writeReportMetadata(destPath, metadata)
 	os.Remove(path)
 	copyConfigSnapshot(destPath)
+	// Bound the archive only after the new report is complete, and hand the new directory in
+	// as keepPath so the current crash report can never be the one evicted. This is the call
+	// that makes a crash loop - one archive per process start - stop mattering.
+	pruneReports(crashReportsDir, destPath, time.Now().UTC())
 }
 
 func configSnapshotPath() string {

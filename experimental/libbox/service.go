@@ -340,7 +340,9 @@ func (w *bridgeSessionWrapper) FileDescriptor() int {
 }
 
 func (w *bridgeSessionWrapper) Name() string {
-	return w.session.Name()
+	// BridgeSession.Name returns *StringBox so the platform's own implementation cannot put a
+	// pointer in the packed //export frame; the internal adapter interface still speaks string.
+	return w.session.Name().Value
 }
 
 func (w *bridgeSessionWrapper) Inet6Active() bool {

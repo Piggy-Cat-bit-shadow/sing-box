@@ -1,4 +1,4 @@
-//go:build !badlinkname
+//go:build !badlinkname || !tfogo_checklinkname0
 
 package runtimeinfo
 

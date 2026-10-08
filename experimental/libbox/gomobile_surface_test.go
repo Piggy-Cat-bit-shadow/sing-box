@@ -213,73 +213,110 @@ func (e gomobileSurfaceEntry) summary() string {
 
 // gomobileResultDebt is the explicit register of pre-existing flagged declarations. The
 // key is "<Type>.<Method>" for methods and "<Func>" for package-level functions. Values
-// are the reason the declaration was NOT converted in this change. Nothing may be added
-// here without a reason: the point of the register is that it only ever shrinks.
+// are the reason the declaration was NOT converted in this change, plus the shipped call
+// sites a future conversion has to move. Nothing may be added here without a reason: the
+// point of the register is that it only ever shrinks.
+//
+// This sweep converted seven entries to the safe shape - a bound *StringBox read through its
+// Value accessor - and deleted them from the register:
+//
+//	TunOptions.GetHTTPProxyServer   Apple-only call site; Swift moved to .value in the
+//	                                clients/apple worktree cut from the recorded gitlink
+//	RoutePrefix.Mask                Apple-only call site; same worktree
+//	RoutePrefix.Address             Apple + Android call sites; Android moved in place
+//	DeprecatedNote.Message          Apple + Android call sites; both moved
+//	BridgeSession.Name              Apple + Android call sites; both moved
+//	DeprecatedNote.MessageWithLink  no call site anywhere; a pure frame-shape removal
+//	OnDemandRule.ProbeURL           no implementation or call site anywhere; the interface
+//	                                had no producer or consumer, so the frame was latent
+//
+// The register's stale check is the other half of the proof: those keys are gone, and the
+// tripwire fails if a converted declaration is ever changed back to a bare result.
 var gomobileResultDebt = map[string]string{
-	"TunOptions.GetHTTPProxyServer": "The shipped Apple client calls options.getHTTPProxyServer() and " +
-		"expects a string (clients/apple/Library/Network/ExtensionPlatformInterface.swift). Returning " +
-		"*StringBox rewrites the generated ObjC method to - (LibboxStringBox *), so the signature and " +
-		"that call site must move together in one commit; doing it here alone breaks the Apple build. " +
-		"Convert it with the Apple client migration and delete this entry.",
-	// Called (or implemented) by a shipped client as a bare string/[]byte today. Changing
-	// the Go signature is a coordinated migration across clients/android and
-	// clients/apple, not a local edit; until that migration happens the Go 1.26 cmd/cgo
-	// alignment fix is the mechanism that removes the hazard.
-	"DeprecatedNote.Message":             debtShippedClientCallSite,
-	"DeprecatedNote.MessageWithLink":     debtShippedClientCallSite,
-	"Connection.DisplayDestination":      debtShippedClientCallSite,
-	"RoutePrefix.Address":                debtShippedClientCallSite,
-	"RoutePrefix.Mask":                   debtShippedClientCallSite,
-	"ErrorMessage.Encode":                debtShippedClientCallSite,
-	"ProfileContent.Encode":              debtShippedClientCallSite,
-	"ProfileContentRequest.Encode":       debtShippedClientCallSite,
-	"ProfileEncoder.Encode":              debtShippedClientCallSite,
-	"BridgeSession.Name":                 debtShippedClientCallSite,
-	"PlatformInterface.LookupSFTPServer": debtShippedClientCallSite,
+	// Connection lives in command_types.go, which is owned by another change in flight and is
+	// not modifiable here. The call sites are recorded so the conversion can be finished by
+	// whoever owns that file.
+	"Connection.DisplayDestination": debtCallSites(debtDisplayDestination,
+		"clients/apple/ApplicationLibrary/Views/Connections/ConnectionListViewModel.swift:175 (goConnection.displayDestination())",
+		"clients/android/app/src/main/java/io/nekohasekai/sfa/compose/model/Connection.kt:97 (connection.displayDestination())"),
 
-	// PlatformInterface is implemented by the platform (Kotlin PlatformInterfaceWrapper /
-	// Swift ExtensionPlatformInterface) and only consumed by Go, so the shipped path is the
-	// Go -> C cproxy call, whose result is copied into Go memory and cannot be misaligned.
+	// []byte results. No safe shape exists in this package today - see debtEncodedBytesResult.
+	"ErrorMessage.Encode": debtCallSites(debtEncodedBytesResult,
+		"clients/apple/ApplicationLibrary/Service/ProfileServer.swift:163 (errorMessage.encode())"),
+	"ProfileContent.Encode": debtCallSites(debtEncodedBytesResult,
+		"clients/apple/Library/Database/Profile+Transferable.swift:57,208,229 and ApplicationLibrary/Service/ProfileServer.swift:137 (content.encode())",
+		"clients/android/app/src/main/java/io/nekohasekai/sfa/ktx/Shares.kt:34, .../dashboard/ProfilesCard.kt:638, .../dashboard/ProfilePickerSheet.kt:204 (content.encode())"),
+	"ProfileContentRequest.Encode": debtCallSites(debtEncodedBytesResult,
+		"clients/apple/ApplicationLibrary/Views/Profile/ImportProfileViewModel.swift:121 (request.encode())"),
+	"ProfileEncoder.Encode": debtCallSites(debtEncodedBytesResult,
+		"clients/apple/ApplicationLibrary/Service/ProfileServer.swift:157 (encoder.encode())"),
+
+	// The platform implements these (Kotlin PlatformInterfaceWrapper / Swift
+	// ExtensionPlatformInterface) and Go only consumes them, so the shipped path is the Go -> C
+	// cproxy call, whose C struct result is copied into a Go stack slot that cgo always lays out
+	// aligned. cmd/gobind still emits the C -> Go //export wrapper, but no shipped client reaches
+	// it, so the flagged frame is unreachable. Converting them would rewrite the protocol the
+	// platform conforms to, which is a larger change than the risk it removes.
+	"PlatformInterface.LookupSFTPServer":     debtPlatformImplemented,
 	"PlatformInterface.ReadSystemSSHHostKey": debtPlatformImplemented,
 	"PlatformInterface.TailscaleHostname":    debtPlatformImplemented,
-	"OnDemandRule.ProbeURL":                  debtPlatformImplemented,
 
 	// String() is fmt.Stringer; the iterator is generic and is also implemented by the
 	// platform when it hands a string list INTO Go.
 	"RoutePrefix.String":  debtStringer,
 	"StringIterator.Next": debtIterator,
 
-	// Package-level helpers. They have no bound-object accessor to move to, they are part
-	// of the published surface of the AAR/XCFramework, and they return one value, so the
-	// frame holds exactly one pointer word.
-	"EncodeChunkedMessage":            debtUtilityFunction,
-	"FormatBitrate":                   debtUtilityFunction,
-	"FormatBytes":                     debtUtilityFunction,
-	"FormatDuration":                  debtUtilityFunction,
-	"FormatFQDN":                      debtUtilityFunction,
-	"FormatMemoryBytes":               debtUtilityFunction,
-	"FormatNATFiltering":              debtUtilityFunction,
-	"FormatNATMapping":                debtUtilityFunction,
-	"GenerateRemoteProfileImportLink": debtUtilityFunction,
-	"GoVersion":                       debtUtilityFunction,
-	"GoroutineDump":                   debtUtilityFunction,
-	"ProxyDisplayType":                debtUtilityFunction,
-	"Version":                         debtUtilityFunction,
+	// Package-level helpers. They have no bound object to hang an accessor on, they are part of
+	// the published surface of the AAR/XCFramework as static methods, and their single result is
+	// one pointer word. The call sites are recorded so a future sweep knows the blast radius.
+	"EncodeChunkedMessage": debtCallSites(debtUtilityFunction,
+		"clients/apple/Library/Network/NWSocket.swift"),
+	"FormatBitrate": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Tools/NetworkQualityView.swift"),
+	"FormatBytes": debtCallSites(debtUtilityFunction,
+		"clients/apple: MacLibrary/StatusBarController.swift, ApplicationLibrary/Views/Tools/TaildropView.swift, .../Dashboard/Cards/UploadTrafficCard.swift, .../DownloadTrafficCard.swift, .../Components/ExtensionStatusView.swift, .../Connections/ConnectionView.swift, ConnectionDetailsView.swift, ConnectionListView.swift, .../Setting/CoreView.swift"),
+	"FormatDuration": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Connections/ConnectionView.swift"),
+	"FormatFQDN": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Tools/TailscalePeerView.swift",
+		"clients/android/app/src/main/java/io/nekohasekai/sfa/compose/screen/tools/TailscalePeerScreen.kt"),
+	"FormatMemoryBytes": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Tools/OOMReportListView.swift, .../Dashboard/Cards/StatusCard.swift, .../Components/ExtensionStatusView.swift"),
+	"FormatNATFiltering": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Tools/STUNTestView.swift"),
+	"FormatNATMapping": debtCallSites(debtUtilityFunction,
+		"clients/apple/ApplicationLibrary/Views/Tools/STUNTestView.swift"),
+	"GenerateRemoteProfileImportLink": debtCallSites(debtUtilityFunction,
+		"clients/apple/Library/Database/Profile+Share.swift, .../Views/Profile/QRCodeSheet.swift",
+		"clients/android/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/ProfilesCard.kt, ProfilePickerSheet.kt"),
+	"GoVersion": debtCallSites(debtUtilityFunction,
+		"clients/apple/Library/Shared/CrashReportManager.swift"),
+	// GoroutineDump is the one utility with no caller in Go, Apple or Android: it is dead API,
+	// and only the checked-in prebuilt headers still name it. It is held here rather than
+	// converted because the instruction for package-level helpers is to leave them registered,
+	// and converting a published static method that nothing calls is pure API churn. Deleting
+	// the function outright would remove the entry as well and is the better future cleanup.
+	"GoroutineDump": debtUtilityFunction,
+	"ProxyDisplayType": debtCallSites(debtUtilityFunction,
+		"clients/apple/Library/Network/OutboundGroup.swift",
+		"clients/android/app/src/main/java/io/nekohasekai/sfa/compose/screen/tools/OutboundPickerScreen.kt, .../compose/model/Groups.kt"),
+	"Version": debtCallSites(debtUtilityFunction,
+		"clients/apple/Library/Network/HTTPClient.swift, Library/Shared/CrashReportManager.swift, Library/Shared/Variant.swift, ApplicationLibrary/Views/Setting/CoreView.swift"),
 }
 
 const (
-	// The dominant reason, and the one that is easy to get wrong: the shape is unsafe, but
-	// the call site that would have to change lives in another repository. Examples that
-	// make this concrete rather than theoretical:
-	//   RoutePrefix.Address()            clients/android .../bg/VPNService.kt (4 call sites)
-	//   Connection.DisplayDestination()  clients/android .../compose/model/Connection.kt
-	//   DeprecatedNote.Message()         clients/android .../dashboard/DashboardViewModel.kt
-	//   ProfileContent.Encode()          clients/android .../ktx/Shares.kt and two more
-	//   BridgeSession.Name()             clients/android .../bg/RootServer.kt
-	//   PlatformInterface.LookupSFTPServer  overridden by PlatformInterfaceWrapper.kt
-	debtShippedClientCallSite = "pre-existing; a shipped Android/Apple client calls or overrides this " +
-		"accessor as a bare string/[]byte today, so converting it is a coordinated cross-repository API " +
-		"migration rather than a local edit"
+	// command_types.go is owned by another in-flight change, so this declaration's method set
+	// cannot be edited by the gomobile sweep regardless of how reachable it is.
+	debtDisplayDestination = "pre-existing; declared in command_types.go, which this change does not own"
+	// []byte is the shape with no existing safe home. *StringBox is for text and these payloads
+	// are binary (ProfileContent.Encode gzips its body), so a string round-trip would corrupt
+	// them; the existing iterators are for lists, and a per-byte platform round trip would turn
+	// one socket write into N calls; a result struct is the shape for several scalar fields. The
+	// remaining options are to invent a BytesBox type - exactly the API invention this register
+	// exists to avoid - or to wait for the Go 1.26 cmd/cgo alignment fix (CL 692935) that the
+	// pinned toolchain predates.
+	debtEncodedBytesResult = "pre-existing; a []byte result has no bound-object, iterator or result-struct shape " +
+		"in this package that preserves an opaque binary wire frame"
 	// PlatformInterface, OnDemandRule and friends are supplied BY the platform and only
 	// consumed by Go, so the shipped path is the Go -> C cproxy call: its C struct result is
 	// copied into a Go stack slot, which cgo always lays out aligned. cmd/gobind still emits
@@ -294,6 +331,16 @@ const (
 	debtUtilityFunction = "pre-existing; package-level helper with a single pointer-bearing result and no bound " +
 		"object to move the accessor to; converting it would rename a published API for no frame-shape gain"
 )
+
+// debtCallSites renders the reason together with the shipped call sites a conversion has to
+// move. Recording them per entry is the point of this sweep: "a shipped client calls it" was
+// true for most entries but told the next reader nothing they could act on.
+func debtCallSites(reason string, callSites ...string) string {
+	if len(callSites) == 0 {
+		return reason
+	}
+	return reason + " Shipped call sites that must move with it: " + strings.Join(callSites, "; ") + "."
+}
 
 // TestGomobileMethodResultSurface is the tripwire. It walks the source of this package,
 // derives the gomobile-reachable surface, and fails when a declaration carries a

@@ -46,8 +46,8 @@ func (s *bridgeServiceSession) FileDescriptor() int32 {
 	return int32(s.service.FileDescriptor())
 }
 
-func (s *bridgeServiceSession) Name() string {
-	return s.service.Name()
+func (s *bridgeServiceSession) Name() *StringBox {
+	return wrapString(s.service.Name())
 }
 
 func (s *bridgeServiceSession) Inet6Active() bool {

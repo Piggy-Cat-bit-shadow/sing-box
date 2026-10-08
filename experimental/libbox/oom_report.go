@@ -262,8 +262,14 @@ func writeOOMProfile(filePath string, name string) {
 
 func PromoteOOMDraft() {
 	oomkiller.PromoteDraft(sWorkingPath, acceptOOMDraft)
+	pruneReports(filepath.Join(sWorkingPath, oomkiller.ReportsDirectoryName), "", time.Now().UTC())
 }
 
 func PromoteOOMDraftAt(workingPath string) {
 	oomkiller.PromoteDraft(workingPath, acceptOOMDraft)
+	// OOM reports carry a heap dump and six pprof profiles, so this is the archive where the
+	// size bound does the real work; the just-promoted report is the newest and survives the
+	// oldest-first deletion. The draft directory is untouched - it is live state, not an
+	// archive.
+	pruneReports(filepath.Join(workingPath, oomkiller.ReportsDirectoryName), "", time.Now().UTC())
 }
