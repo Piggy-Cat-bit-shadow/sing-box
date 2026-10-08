@@ -19,12 +19,14 @@ import (
 var _ Device = (*stackDevice)(nil)
 
 type stackDevice struct {
-	stack        *tun.Go
-	router       *peerRouter
-	mtu          uint32
-	events       chan wgTun.Event
-	closed       chan struct{}
-	closeOnce    sync.Once
+	stack     *tun.Go
+	router    *peerRouter
+	mtu       uint32
+	events    chan wgTun.Event
+	closed    chan struct{}
+	closeOnce sync.Once
+	// sendAccess serialises a Start's event send against Close's close of the channel.
+	sendAccess   sync.Mutex
 	inet4Address netip.Addr
 	inet6Address netip.Addr
 }
@@ -120,6 +122,21 @@ func (w *stackDevice) Start() error {
 	if err != nil {
 		return err
 	}
+	// The send and the close of events are serialised by sendAccess.
+	//
+	// A select over the send and the closed channel is NOT enough: select picks uniformly among
+	// ready cases, so when both branches are ready - the buffered slot is empty AND the device is
+	// closing - it can choose the send, and if it chooses it after Close has closed the channel
+	// the process dies on "send on closed channel". Holding the same lock Close takes to publish
+	// the close makes the decision deterministic: the send either happens before the close or
+	// sees the closed channel and refuses.
+	w.sendAccess.Lock()
+	defer w.sendAccess.Unlock()
+	select {
+	case <-w.closed:
+		return os.ErrClosed
+	default:
+	}
 	w.events <- wgTun.EventUp
 	return nil
 }
@@ -160,10 +177,13 @@ func (w *stackDevice) Events() <-chan wgTun.Event {
 func (w *stackDevice) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
-		close(w.events)
+		w.sendAccess.Lock()
+		defer w.sendAccess.Unlock()
+		// closed is published before events is closed so a later Start sees it immediately.
 		close(w.closed)
-		err = E.Errors(w.stack.Close(), w.router.close())
+		close(w.events)
 	})
+	err = E.Errors(w.stack.Close(), w.router.close())
 	return err
 }
 

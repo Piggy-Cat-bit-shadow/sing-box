@@ -3,6 +3,8 @@ package box
 import (
 	"context"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -77,6 +79,13 @@ func applyPauseEvent(governor *power.Governor, event int) {
 
 type Box struct {
 	ctx context.Context
+	// closeOnce makes Close idempotent and safe to call concurrently. The daemon serialises its
+	// own stop against start, but Close is exported and an embedder may call it from any
+	// goroutine - including while Start is still running, which the daemon deliberately allows.
+	// Without this, two Closes unregister the same pause callback, close the same governor and
+	// walk the same scope concurrently.
+	closeOnce sync.Once
+	closeErr  atomic.Pointer[error]
 	// ownedURLTestHistory is the storage this Box created, and therefore must close. It is nil when
 	// the caller supplied one, so a Box never closes state it does not own.
 	ownedURLTestHistory *urltest.HistoryStorage
@@ -403,7 +412,7 @@ func New(options Options) (*Box, error) {
 			transportOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize DNS server[", i, "]")
+			return nil, E.Cause(err, "initialize DNS server[", i, "] ", transportOptions.Type, "[", tag, "]")
 		}
 	}
 	err = dnsRouter.Initialize(dnsOptions.Rules)
@@ -433,7 +442,7 @@ func New(options Options) (*Box, error) {
 			endpointOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize endpoint[", i, "]")
+			return nil, E.Cause(err, "initialize endpoint[", i, "] ", endpointOptions.Type, "[", tag, "]")
 		}
 	}
 	for i, inboundOptions := range options.Inbounds {
@@ -452,7 +461,7 @@ func New(options Options) (*Box, error) {
 			inboundOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize inbound[", i, "]")
+			return nil, E.Cause(err, "initialize inbound[", i, "] ", inboundOptions.Type, "[", tag, "]")
 		}
 	}
 	for i, serviceOptions := range options.Services {
@@ -470,7 +479,7 @@ func New(options Options) (*Box, error) {
 			serviceOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize service[", i, "]")
+			return nil, E.Cause(err, "initialize service[", i, "] ", serviceOptions.Type, "[", tag, "]")
 		}
 	}
 	for i, outboundOptions := range options.Outbounds {
@@ -508,7 +517,7 @@ func New(options Options) (*Box, error) {
 			outboundOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize outbound[", i, "]")
+			return nil, E.Cause(err, "initialize outbound[", i, "] ", outboundOptions.Type, "[", tag, "]")
 		}
 	}
 
@@ -550,7 +559,7 @@ func New(options Options) (*Box, error) {
 			certificateProviderOptions.Options,
 		)
 		if err != nil {
-			return nil, E.Cause(err, "initialize certificate provider[", i, "]")
+			return nil, E.Cause(err, "initialize certificate provider[", i, "] ", certificateProviderOptions.Type, "[", tag, "]")
 		}
 	}
 	outboundManager.Initialize(func() (adapter.Outbound, error) {
@@ -867,6 +876,20 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() error {
+	// Idempotent, and safe against a concurrent second call: a repeat Close joins the first one
+	// rather than unregistering a callback that is already gone or walking a half-torn-down scope.
+	s.closeOnce.Do(func() {
+		closeErr := s.close()
+		s.closeErr.Store(&closeErr)
+	})
+	stored := s.closeErr.Load()
+	if stored == nil {
+		return nil
+	}
+	return *stored
+}
+
+func (s *Box) close() error {
 	// The governor is closed first and its callback unregistered, so no lifecycle event can arrive
 	// while the scope is tearing down components that would have asked it what to do.
 	if s.pauseManager != nil && s.pauseCallback != nil {

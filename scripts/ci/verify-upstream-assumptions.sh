@@ -89,6 +89,30 @@ run_tripwire \
   "./protocol/tun/" \
   'TestDNSHijack|TestFakeIPIsNot|TestNoFakeIPTransport|TestNonDNS|TestL0'
 
+# The retired gVisor build tag must not come back into any profile.
+#
+# The pinned sagernet/gvisor still has the LX 048 window: performHandshake nils ep.h and releases
+# its mutex before Close(), while handleConnecting gates only on the endpoint state, so an
+# unestablished TCP endpoint can dereference a nil handshake from an internal goroutine - a panic
+# no recover() in our goroutine can catch (Leadaxe's fix needs a third module fork, which this
+# fork's architecture deliberately does not carry). The protection is that the tag is not in any
+# profile: without it sing-tun returns ErrGVisorNotIncluded for stack gvisor/mixed, which is a
+# clean configuration error. If a profile ever names it again, this fails here instead of shipping
+# an unrecoverable panic.
+echo
+echo "--- no build profile carries with_gvisor"
+for tags_file in release/DEFAULT_BUILD_TAGS release/DEFAULT_BUILD_TAGS_OTHERS release/DEFAULT_BUILD_TAGS_WINDOWS; do
+  if [ ! -f "$tags_file" ]; then
+    continue
+  fi
+  if grep -q 'with_gvisor' "$tags_file"; then
+    echo "FAIL: $tags_file names with_gvisor. The pinned gvisor still has the handshake nil-deref" >&2
+    echo "      window (LX 048); enabling it needs the fork documented in the phase-1 audit." >&2
+    exit 1
+  fi
+done
+echo "PASS: no profile names with_gvisor"
+
 echo
 echo "== the compile-time half =="
 # Assumptions the compiler already enforces, listed so an audit knows they are covered: if upstream

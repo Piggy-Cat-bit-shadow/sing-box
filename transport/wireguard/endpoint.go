@@ -43,6 +43,10 @@ type Endpoint struct {
 	stateAccess    sync.Mutex
 	suspended      atomic.Bool
 	networkPaused  bool
+	// closing is set by Close under stateAccess. Start checks it in the same critical section, so
+	// a Close that lands while the device is still being built cannot leave a live device behind
+	// a closed tun, and cannot resurrect a nil device pointer after teardown.
+	closing bool
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -153,11 +157,22 @@ func (e *Endpoint) Start(postStart bool) error {
 	if postStart != hasDomainPeer {
 		return nil
 	}
+	// Box.Close is legal at any point of Box.Start - the daemon deliberately lets a stop arrive
+	// while a start is still running. The expensive part of the build runs OUTSIDE stateAccess so
+	// a concurrent Close is not held up by it, and the publish step at the end re-checks the
+	// closing flag under the lock: a start that lost the race closes what it built instead of
+	// publishing a live device on top of a torn-down endpoint.
+	//
+	// Holding the lock across the whole build was the first shape of this fix, and it is wrong:
+	// wgDevice.IpcSet brings the device up, which runs the pause/network callbacks, and those
+	// take the same lock - a self-deadlock.
 	var bind conn.Bind
 	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
 	if isUDPListener {
 		listenerControl, egressEnabled := udpListener.UDPListenerControl()
-		standardBind := conn.NewStdNetBind(listenerControl).(*conn.StdNetBind)
+		// Only the bind gets the family-tolerant view. The egress pool keeps the raw control,
+		// where a per-member failure is already tolerated by the pool itself.
+		standardBind := conn.NewStdNetBind(familyTolerantListenerControl(listenerControl)).(*conn.StdNetBind)
 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
 			standardBind.SetSinglePeerMode()
 		}
@@ -266,13 +281,24 @@ func (e *Endpoint) Start(postStart bool) error {
 			wgPeers = append(wgPeers, wgPeer)
 		}
 	}
+	e.stateAccess.Lock()
+	if e.closing {
+		// Close ran while this device was being built. Nothing was published, so nothing owns the
+		// device: close it here rather than leaving it running against a torn-down endpoint.
+		e.stateAccess.Unlock()
+		wgDevice.Close()
+		return os.ErrClosed
+	}
 	e.tunDevice.SetDevice(wgDevice, wgPeers)
 	e.device.Store(wgDevice)
 	e.pause = service.FromContext[pause.Manager](e.options.Context)
 	if e.pause != nil {
+		// Registered under the lock so a Close that is already waiting sees the callback and
+		// unregisters it, instead of leaving it live on a closed endpoint.
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
 	e.allowedIPs = wgDevice.AllowedIPs()
+	e.stateAccess.Unlock()
 	return nil
 }
 
@@ -334,21 +360,26 @@ func (e *Endpoint) resumeLocked(wgDevice *device.Device) {
 }
 
 func (e *Endpoint) Close() error {
+	// The closing flag is set under the lock Start takes to publish a device. A start that is
+	// still building sees it at that point and closes what it built instead of publishing it, so
+	// a Close landing mid-start cannot leave a live device behind a closed tun.
+	e.stateAccess.Lock()
+	e.closing = true
 	if e.pauseCallback != nil {
 		e.pause.UnregisterCallback(e.pauseCallback)
 		e.pauseCallback = nil
 	}
-	if e.egressPool != nil {
-		e.egressPool.Close()
-		e.egressPool = nil
-	}
-	e.stateAccess.Lock()
 	wgDevice := e.device.Swap(nil)
 	if wgDevice != nil {
 		wgDevice.Down()
 		wgDevice.Close()
 	}
 	e.stateAccess.Unlock()
+
+	if e.egressPool != nil {
+		e.egressPool.Close()
+		e.egressPool = nil
+	}
 	if wgDevice != nil {
 		return nil
 	}
