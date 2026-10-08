@@ -66,12 +66,11 @@ this fork does not have · **N/A** = the architecture does not involve it ·
 | 016 (connections map mutex), 024 (runtime loop guard), 012 (TCP downlink stall) | Not applicable / not reproducible | 016 is in the removed command surface; 024 is deferred in LX too (static `lintOutbound` cycle detection is present here); 012 was closed in LX as not reproducible |
 | 091 (§2, masque `uri`) | Architecturally absent | This fork's `protocol/masque` is the upstream-style endpoint implementation; no `profile`/`uri`/`vhttp` keys exist, so LX's ordering bug cannot be written |
 
-### 2.3 Deferred — needs a module fork or a feature this fork lacks
+### 2.3 Deferred — needs a feature this fork lacks, or a module fix not worth a fork
 
 | LX | Why deferred | Exact requirement |
 | --- | --- | --- |
-| 040 (sing-tun acceptLoop self-heal) — **DEFER · P0 severity · dependency-owned** | Real in the pin, and the worst failure shape recorded here: `stack_system.go` `acceptLoop` does `conn, err := listener.Accept(); if err != nil { return }` — no log, no flag, no re-listen — while `s.tcpPort` stays the port every new SYN is NAT-rewritten onto. So one unexpected `Accept` error (the observed trigger is a foreign close of the listener fd during a fast restart that shares the process fd space) makes **all new TCP fail until the TUN/VPN is rebuilt**, with QUIC/UDP unaffected, which is why it presents as "the browser is dead but Telegram works" | **Decision: no sing-tun fork is introduced in this phase.** `acceptLoop`/`tcpPort` are unexported and `ResetNetwork` does not re-listen, so a wrapper, a retry goroutine or a `ResetNetwork` hack would be a fake fix. Reopens only if (a) upstream fixes it — the tripwire below then fails and the deferral is deleted, or (b) we reproduce it on a target client and decide to maintain a fork. Pin: `github.com/sagernet/sing-tun@v0.9.7-0.20261006124248-d769a7080ca2` |
-| ↑ tripwire | The deferral must not be carried forward unexamined | `scripts/ci/verify-upstream-assumptions.sh` locates the pinned sing-tun source and fails if `System.acceptLoop` stops ending on a bare `return` after an `Accept` error (predicate validated against a simulated upstream fix: real pin → PASS, patched copy → FAIL) |
+| 040 | The system stack's TCP `acceptLoop` returned on **any** `Accept` error. The listener is bound to the stack's own address and its port is what the forward path rewrites every new SYN onto; nothing cleared that port, so the stack kept rewriting new connections onto a port nobody was listening on, the OS answered RST, and every new TCP connection failed instantly until the tunnel was rebuilt — while existing connections, UDP and QUIC kept working. The listener can be closed from outside the stack (shared fd space; a fast restart is the observed trigger), so the error says nothing about whether the stack is finished | **FIX — dependency fork** | **Published.** Fork `Piggy-Cat-bit-shadow/sing-tun` (a real GitHub fork of `SagerNet/sing-tun`), base `d769a7080ca203f63735ba93e95014e363e25d62` (= `v0.9.7-0.20261006124248-d769a7080ca2`), branch `fix/acceptloop-selfheal`, tip `1cd9bc2216df5edd8e2d5b684d05f32c1dc72835` (patch `665fbe204ce76c691ff40f58e9e33020af5e44f1` + docs). Upstream `dev` @ `7539c9855f` was re-checked on 2026-10-08 and **still returns bare**, so no upgrade path existed. `go.mod`: `replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df`. Patch is `stack_system.go` + a new test file: classify the error (orderly close → quiet exit; anything else → recover), close the unusable listener, re-bind the same address, publish the new port under a lock, bounded backoff 10 ms → 1 s, `Close` interrupts the wait and stops further attempts, recovery counter. Published via the GitHub Git Database API because `github.com`'s git transport was unreachable while `api.github.com` was not | `stack_system_accept_test.go` (in the fork): transient error recovers and dispatches, repeated failure is spaced not spun, `Close` interrupts the backoff, orderly close stays quiet. Red/green proven by reverting only the loop body (three of four red on base), `-race` clean, and re-run from the downloaded archive |
 | 041 (WG give-up rebind) — **DEFER → PHASE 1.5** | No equivalent recovery here. It is not a bug fix but a lifecycle mechanism: a lazily-started worker, a shared debounce, a stale-endpoint predicate, a wake trigger, a rebind via `listen_port`, and its interaction with network transitions and shutdown cancellation. Those pieces belong with this fork's existing `NetworkResetGeneration`, `NetworkTransitionSnapshot`, `OnDemandEndpoint`, `Wake()` and `Scope` cancellation, so bolting them on in phase 1 would design them twice | **Priority P0/P1 · implementation feasibility: in-tree, no fork required.** Hooks the pin already exports: `device.SetSessionStateFunc`, UAPI `listen_port=0` for a fresh ephemeral port. This fork already routes `Wake()`/`WakeNow()` → `PauseManager().DeviceWake()` → the endpoint callback, so no new API is needed. **Do not write the implementation before Phase 1.5.** See the handoff section |
 | 048 (gvisor handshake nil deref) | Real panic class, **unreachable in every profile this fork ships**: no tag file names `with_gvisor`, and without it `tun.NewStack("gvisor"/"mixed")` returns `ErrGVisorNotIncluded` as a clean configuration error. The pinned gvisor still has the window (`accept.go` nils `ep.h` then unlocks; `dispatcher.go` `handleConnecting` gates on state but not `h`) | A third module fork. Instead, a CI tripwire now fails if any profile names `with_gvisor` (`scripts/ci/verify-upstream-assumptions.sh`) |
 | 069 root cause | The module still clobbers the surviving v4 port to 0 after a per-family failure, and still closes the sibling socket | `wireguard-go` fork/bump, or the already-owned `Piggy-Cat-bit-shadow/sing` fork (`common/control/bind_windows.go` is byte-identical to upstream and carries the `""` vs `"[::]"` asymmetry) |
@@ -182,13 +181,46 @@ Phase-1 freeze: `aac61e522` → `c2e34cf6f` plus the finalization commit that re
 040/041 rows, adds the sing-tun `acceptLoop` tripwire and appends this handoff. No squash,
 no rebase, no history rewrite.
 
+## Dependency policy
+
+Forking a dependency is permitted only when **all five** hold:
+
+1. the failure is product-critical — it reaches users as a permanent failure state, not
+   as a rough edge;
+2. no correct in-tree workaround exists — a wrapper, a retry goroutine or a lifecycle
+   hack around the boundary would be a fake fix;
+3. the patch is small and isolated — one concern, one file where possible, no
+   opportunistic changes;
+4. upstream has not provided a usable fix — verified against upstream head at fork time,
+   not assumed;
+5. regression coverage and an upstream-exit path are maintained — the fork carries a test
+   that fails without the patch, and the removal condition is recorded and checked.
+
+This exists to stop the pattern of forking a dependency for every small defect. The 040
+fork is the worked example: product-critical (all new TCP dies permanently), no in-tree
+workaround (`acceptLoop`/`tcpPort` are unexported and `ResetNetwork` does not re-listen),
+one file changed, upstream verified still broken on 2026-10-08, four regression tests plus
+a tripwire in `verify-upstream-assumptions.sh` that verifies the pin really is the fork,
+checks the fix is present, and probes upstream on every run to say when the fork can be
+retired.
+
+Publishing it went through the GitHub Git Database API rather than `git push`, because
+`github.com`'s git transport was unreachable (curl to `github.com` timed out, `git
+ls-remote` failed after 75 s) while `api.github.com` and `codeload.github.com` answered.
+The fork is a genuine GitHub fork, so upstream's objects are in the network and the base
+commit needed no re-upload: the patch is two trees built with `base_tree` over upstream's
+base tree, each with one parent, and one ref. That is also why the remote history has two
+commits rather than the local two — the local base commit was only a content snapshot and
+the remote history descends from upstream's real commit.
+
 ## Next-stage handoff
 
 Constraints the next stages inherit. This is a handoff, not a design document.
 
 ### Runtime Lifecycle / Network Recovery (Phase 1.5)
 
-- **041 WG give-up rebind** — the first item of the stage, not a standalone patch: lazy worker, shared debounce, stale-endpoint predicate, wake trigger, rebind, `listen_port` policy, network transition, shutdown cancellation. Priority P0/P1; in-tree, no fork.
+- **041 WG give-up rebind** — the first item of the stage, not a standalone patch: lazy worker, shared debounce, stale-endpoint predicate, wake trigger, rebind, `listen_port` policy, network transition, shutdown cancellation. Priority P0/P1; in-tree, **no fork**. 040 and 041 are kept separate on purpose: 040 was a correctness bug (a listener death becomes a permanent failure state), while 041 is a recovery policy decision that belongs with the runtime primitives.
+- **040 removal condition** — when upstream sing-tun makes the accept loop recover on its own, retire the fork, drop the `replace` and let `verify-upstream-assumptions.sh` say so. The tripwire already probes upstream `dev` on every run when `gh` is authenticated.
 - The mechanism must be designed against the generation/transition primitives that already exist here (`NetworkResetGeneration`, `NetworkTransitionSnapshot`), not beside them: a rebind is a state mutation and must obey the same ownership checks a DNS answer does.
 - **Wake ≠ rebind.** A wake with a healthy session must cost nothing; only a stale predicate (no keypair, or handshake older than the reject window) justifies a rebind.
 - **An idle/suspended endpoint must not be woken by background recovery.** No timers or goroutines while the endpoint is idle, asleep or closed; recovery is demand-driven or event-driven.

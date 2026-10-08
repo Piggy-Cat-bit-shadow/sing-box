@@ -282,3 +282,19 @@ replace github.com/sagernet/cronet-go/lib/windows_arm64 => github.com/Piggy-Cat-
 // v0.61.0-sing-box-mod.9, which brings the OOB socket read fix; the additive DATAGRAM
 // commits are unchanged and SendDatagram keeps its copying semantics.
 replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94
+
+// The system stack's TCP accept loop used to die permanently on one unexpected listener error:
+// the listener is bound to the stack's own address and its port is what every new SYN is rewritten
+// onto, so once the loop exited the stack kept rewriting connections onto a dead port, the OS
+// answered RST, and all new TCP failed until the tunnel was rebuilt while UDP/QUIC kept working.
+// Upstream dev still returns bare on that error (checked 2026-10-08), so the fix is carried here.
+//
+// Fork: github.com/Piggy-Cat-bit-shadow/sing-tun (a fork of SagerNet/sing-tun)
+//   base:   d769a7080ca203f63735ba93e95014e363e25d62  (= the version this replaces)
+//   branch: fix/acceptloop-selfheal @ 1cd9bc2216df5edd8e2d5b684d05f32c1dc72835
+//   change: stack_system.go only - classify the accept error, re-bind on an unexpected failure,
+//           bounded backoff, never resurrect the listener after Close, plus its regression tests.
+//   remove: when upstream makes acceptLoop recover on its own. verify-upstream-assumptions.sh
+//           checks the pin really is this fork and probes upstream on every run.
+// See docs/fork/lx-stability-audit-phase1.md (040) and FORK.md in the fork.
+replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df
