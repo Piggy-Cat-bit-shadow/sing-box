@@ -75,6 +75,16 @@ type LoadBalance struct {
 	tolerance      uint16
 	idleTimeout    time.Duration
 
+	// failover is whether the configuration opted into the bounded retry and the live-dial
+	// failure ledger.
+	//
+	// It gates the capability rather than only the retry: an unopted group is resolved and
+	// dialled by the route path exactly as it was before the failover existed, so the
+	// compatibility guarantee is the absence of the new code path, not a retry that happens
+	// to make one attempt. It is read once at construction and never changes, which is why it
+	// is a plain field and not an atomic.
+	failover bool
+
 	history *urltest.HistoryStorage
 
 	// cursor is the round-robin position, counted in committed selections.
@@ -191,6 +201,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		interval:       interval,
 		tolerance:      options.Tolerance,
 		idleTimeout:    idleTimeout,
+		failover:       options.Failover,
 		history:        service.PtrFromContext[urltest.HistoryStorage](ctx),
 		runtime:        service.FromContext[*runtimecoord.Coordinator](ctx),
 		now:            time.Now,
@@ -675,10 +686,11 @@ func (g *LoadBalance) AttachConnection(closer io.Closer) func() {
 // # Why this is still a single attempt
 //
 // The failover retry lives in DialWithFailover, which the route path asks for through the
-// optional capability. It is NOT folded in here because this is the path a MEASUREMENT takes
-// when the group is a member of a urltest group: a probe that fails would otherwise write
-// live-traffic penalties, and a probe's job is to observe, not to move the group. A config
-// that does not route through the capability keeps exactly the behaviour it had.
+// optional capability and only when the configuration set `failover: true`. It is NOT folded
+// in here because this is the path a MEASUREMENT takes when the group is a member of a urltest
+// group: a probe that fails would otherwise write live-traffic penalties, and a probe's job is
+// to observe, not to move the group. A config that does not opt in, or does not route through
+// the capability, keeps exactly the behaviour it had.
 func (g *LoadBalance) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	member := g.SelectForFlow(adapter.ContextFrom(ctx), network, true)
 	if member == nil {

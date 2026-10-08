@@ -21,9 +21,12 @@ import (
 //
 // # Why a group without the capability is untouched
 //
-// routeDialOwner answers nil for every outbound that does not implement the interface, and
-// both call sites below then take exactly the path they took before: the chain is resolved
-// with the same commit flag, and the leaf is handed to the connection manager as the dialer.
+// routeDialOwner answers nil for every outbound that does not implement the interface AND for
+// every group whose configuration did not opt into failover, and both call sites below then
+// take exactly the path they took before: the chain is resolved with the same commit flag,
+// and the leaf is handed to the connection manager as the dialer. The opt-in group therefore
+// does not merely skip its retry - it is routed through the pre-capability code, which is the
+// only way an upgrade can promise identical behaviour.
 
 // routeDialOwner reports the group that owns this flow's dial, or nil.
 //
@@ -31,11 +34,22 @@ import (
 // the selection the dial commits: resolving with commit=true here would advance the group's
 // cursor for a choice the group is about to make again, and every flow would consume two
 // rotation slots instead of one.
+//
+// FailoverEnabled is part of the answer, not an optimization. The capability interface is
+// implemented unconditionally, so without this check a configuration that never asked for
+// failover would be routed through the preview-and-shim path and would still reach the
+// group's dial. Requiring the predicate here means such a configuration resolves with commit
+// and dials the resolved leaf exactly as it did before the capability existed - which is the
+// compatibility guarantee an upgrade depends on, not merely a retry that happens to make one
+// attempt.
 func routeDialOwner(outbound adapter.Outbound) adapter.FailoverOutboundGroup {
 	if outbound == nil {
 		return nil
 	}
-	failover, _ := outbound.(adapter.FailoverOutboundGroup)
+	failover, isFailover := outbound.(adapter.FailoverOutboundGroup)
+	if !isFailover || !failover.FailoverEnabled() {
+		return nil
+	}
 	return failover
 }
 

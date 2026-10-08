@@ -60,17 +60,32 @@ type LoadBalanceOutboundOptions struct {
 	Tolerance uint16 `json:"tolerance,omitempty"`
 	// IdleTimeout stops the health checker after the group has been idle this long.
 	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	// Failover enables the bounded retry and the live-dial failure ledger.
 	//
-	// There is deliberately no failover option, and the always-on policy is narrow enough
-	// not to need one: a failed attempt is replaced only when the failure proves the PATH to
-	// the member is dead - a timeout or an unreachable network - which is exactly the case
-	// in which no application byte can have reached the destination and a second member is
-	// safe to try. A refusal, a reset or the caller's own cancellation is reported
-	// unchanged. Bounding the retry to one alternate and reusing the caller's remaining
-	// deadline is what keeps it a replacement for a dead path rather than a second attempt
-	// at a live one.
+	// # Why this is opt-in and not always-on
 	//
-	// There is no knob because there is nothing to tune that a configuration could express
-	// better than the code: the threshold, the alternate bound and the evidence that clears
-	// a penalty are properties of the failure, not preferences.
+	// Before this option existed the group made exactly one dial attempt per flow and never
+	// recorded a failure, and an upgrade must not silently change which member carries a
+	// flow. Turning the option on adds two observable behaviours: a second dial attempt
+	// against one alternate when the first member's own path is provably broken, and the
+	// penalty records that retry can accumulate until a member is demoted out of the primary
+	// rotation. Both are visible to an operator, so neither may happen unless the
+	// configuration asks for them.
+	//
+	// # What enabling it does not change
+	//
+	// The chosen member, the strategy and the health filter are untouched in the normal
+	// case. A flow whose first dial succeeds makes exactly one attempt, and a success is
+	// never second-guessed. round_robin still rotates, consistent_hashing still keeps the
+	// bucket space fixed, and sticky_sessions still honours a pin; the retry is a
+	// replacement for a dead path, not a second selection policy.
+	//
+	// # One budget for the whole flow
+	//
+	// The retry is bounded to ONE alternate for the entire flow, including a nested group's
+	// own retry: a flow through two balancing groups makes at most two dial attempts in
+	// total, not two per level. The budget is per-flow state created by the outermost
+	// capability dial and consumed by every nested one, so nesting depth cannot multiply
+	// the cost of one outage.
+	Failover bool `json:"failover,omitempty"`
 }

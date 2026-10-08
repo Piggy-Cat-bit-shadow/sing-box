@@ -3,6 +3,8 @@ package group
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -15,9 +17,12 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -27,7 +32,8 @@ import (
 )
 
 // Live dial failure feedback and the bounded failover retry: classification, penalties,
-// generation scoping, the TTL, and the two-attempt bound.
+// generation scoping, the TTL, the opt-in, and the one-attempt budget shared by a nested
+// chain.
 //
 // Every test drives the group through DialWithFailover - the capability the route path asks
 // for - rather than through the penalty helpers, because the failure mode this feature is
@@ -171,27 +177,34 @@ func failoverDestination() M.Socksaddr {
 // --- 1. classification ------------------------------------------------------------------
 
 // timeoutDialError is a net.Error timeout that is not one of the sentinel values, so the
-// Timeout() branch of the classifier is exercised on its own.
+// Timeout() branch of the classifiers is exercised on its own.
 type timeoutDialError struct{}
 
 func (timeoutDialError) Error() string   { return "i/o timeout" }
 func (timeoutDialError) Timeout() bool   { return true }
 func (timeoutDialError) Temporary() bool { return true }
 
-func TestLoadBalanceDialFailureClassification(t *testing.T) {
+// TestLoadBalanceRetryClassification pins the FLOW classifier on its own. It is the
+// permissive half of the split: everything that could plausibly be fixed by another member is
+// retried, and only the failures that a second member provably cannot fix are refused.
+func TestLoadBalanceRetryClassification(t *testing.T) {
 	for _, testCase := range []struct {
-		name     string
-		err      error
-		pathDead bool
+		name  string
+		err   error
+		retry bool
 	}{
 		{"no failure", nil, false},
 		{"caller cancelled", context.Canceled, false},
 		{"wrapped caller cancellation", errors.Join(errors.New("dial failed"), context.Canceled), false},
-		{"connection refused", syscall.ECONNREFUSED, false},
-		{"wrapped connection refused", errors.Join(errors.New("dial failed"), syscall.ECONNREFUSED), false},
+		{"closed by this process", net.ErrClosed, false},
+		{"wrapped closed by this process", errors.Join(errors.New("dial failed"), net.ErrClosed), false},
 		{"connection reset", syscall.ECONNRESET, false},
 		{"wrapped connection reset", errors.Join(errors.New("read failed"), syscall.ECONNRESET), false},
+		{"io eof", io.EOF, false},
+		{"wrapped io eof", errors.Join(errors.New("handshake failed"), io.EOF), false},
 		{"plain failure", errors.New("something else"), false},
+		{"connection refused", syscall.ECONNREFUSED, true},
+		{"wrapped connection refused", errors.Join(errors.New("dial failed"), syscall.ECONNREFUSED), true},
 		{"attempt deadline", context.DeadlineExceeded, true},
 		{"wrapped attempt deadline", errors.Join(errors.New("dial failed"), context.DeadlineExceeded), true},
 		{"socket deadline", os.ErrDeadlineExceeded, true},
@@ -199,12 +212,71 @@ func TestLoadBalanceDialFailureClassification(t *testing.T) {
 		{"host unreachable", syscall.EHOSTUNREACH, true},
 		{"network unreachable", syscall.ENETUNREACH, true},
 		{"timed out", syscall.ETIMEDOUT, true},
+		{"address not available", syscall.EADDRNOTAVAIL, true},
+		{"network down", syscall.ENETDOWN, true},
 		{"wrapped network unreachable", errors.Join(errors.New("dial failed"), syscall.ENETUNREACH), true},
 		{"dialer timeout", timeoutDialError{}, true},
+		{"wrapped dialer timeout", errors.Join(errors.New("dial failed"), timeoutDialError{}), true},
+		{"nested cause chain", E.Cause(E.Cause(syscall.ECONNREFUSED, "dial 203.0.113.7:443"), "outbound vless: connect"), true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			require.Equal(t, testCase.pathDead, isPathDeadDialError(testCase.err),
-				"classification of %v", testCase.err)
+			require.Equal(t, testCase.retry, RetryThisFlow(testCase.err),
+				"retry decision for %v", testCase.err)
+		})
+	}
+}
+
+// TestLoadBalanceGlobalPenaltyClassification is the conservative half, and it is deliberately
+// separate from the retry test: the whole point of the split is that one errno answers two
+// questions differently. Every row asserts BOTH decisions, so a future change that collapses
+// them again fails here rather than in production.
+func TestLoadBalanceGlobalPenaltyClassification(t *testing.T) {
+	proxyMember := &stubOutbound{tag: "proxy", typeName: "vless"}
+	directMember := &stubOutbound{tag: "direct", typeName: C.TypeDirect}
+	blockMember := &stubOutbound{tag: "block", typeName: C.TypeBlock}
+
+	for _, testCase := range []struct {
+		name    string
+		member  adapter.Outbound
+		err     error
+		retry   bool
+		penalty bool
+	}{
+		// The three rows the asymmetry is about.
+		{"proxy endpoint refused", proxyMember, syscall.ECONNREFUSED, true, true},
+		{"proxy endpoint timeout", proxyMember, context.DeadlineExceeded, true, false},
+		{"proxy healthy but destination timeout", proxyMember,
+			errors.Join(errors.New("open connection"), context.DeadlineExceeded), true, false},
+		{"proxy healthy but destination reset", proxyMember, syscall.ECONNRESET, false, false},
+		{"proxy healthy but destination eof", proxyMember, io.EOF, false, false},
+		{"proxy healthy but destination refused, reported in band", proxyMember,
+			errors.New("socks: request rejected: connection refused"), false, false},
+		{"direct member, destination refused", directMember, syscall.ECONNREFUSED, true, false},
+		{"direct member, destination timeout", directMember, context.DeadlineExceeded, true, false},
+		{"direct member, destination unreachable", directMember, syscall.ENETUNREACH, true, false},
+		{"block member, refused", blockMember, syscall.ECONNREFUSED, true, false},
+		// Path and lifecycle evidence.
+		{"caller cancel", proxyMember, context.Canceled, false, false},
+		{"closed by this process", proxyMember, net.ErrClosed, false, false},
+		{"network transition unreachable", proxyMember, syscall.ENETUNREACH, true, true},
+		{"host unreachable", proxyMember, syscall.EHOSTUNREACH, true, true},
+		{"address not available is local", proxyMember, syscall.EADDRNOTAVAIL, true, false},
+		{"network down is local", proxyMember, syscall.ENETDOWN, true, false},
+		{"kernel connect timeout is a timeout", proxyMember, syscall.ETIMEDOUT, true, false},
+		{"unclassified", proxyMember, errors.New("something else"), false, false},
+		// Wrapping must not hide any of it.
+		{"nested outbound error wrapping", proxyMember,
+			E.Cause(E.Cause(syscall.ECONNREFUSED, "dial 203.0.113.7:443"), "outbound vless: connect"), true, true},
+		{"wrapped net.Error", proxyMember,
+			errors.Join(errors.New("dial failed"), timeoutDialError{}), true, false},
+		{"nil member", nil, syscall.ECONNREFUSED, true, false},
+		{"nil error", proxyMember, nil, false, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Equal(t, testCase.retry, RetryThisFlow(testCase.err),
+				"retry decision for %v", testCase.err)
+			require.Equal(t, testCase.penalty, PenalizeMemberGlobally(testCase.member, testCase.err),
+				"global penalty decision for member %v and error %v", testCase.member, testCase.err)
 		})
 	}
 }
@@ -219,7 +291,7 @@ func TestLoadBalanceFailoverUsesThePrimaryWhenItWorks(t *testing.T) {
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.NoError(t, err)
@@ -234,15 +306,20 @@ func TestLoadBalanceFailoverUsesThePrimaryWhenItWorks(t *testing.T) {
 }
 
 // TestLoadBalanceFailoverRetriesAnAlternateAndMovesSelection is the feature's happy path.
+//
+// ENETUNREACH is used rather than a timeout on purpose: it is the error set that earns a
+// GLOBAL penalty - the member's own network is gone - so this test covers the retry, the
+// move, the penalty AND the proof of life that clears it. A timeout is asserted separately as
+// "retried but never penalised".
 func TestLoadBalanceFailoverRetriesAnAlternateAndMovesSelection(t *testing.T) {
 	ctx := failoverContext(t)
 	harness := newFailoverHarness(t)
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
-	nodeA.setDialError(context.DeadlineExceeded)
+	nodeA.setDialError(syscall.ENETUNREACH)
 	harness.add(nodeA, nodeB)
 	groupLogger := &failoverLogger{ContextLogger: log.NewNOPFactory().NewLogger("loadbalance")}
-	group := harness.group(t, "lb", groupLogger, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", groupLogger, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.NoError(t, err, "the alternate carried the flow")
@@ -252,7 +329,7 @@ func TestLoadBalanceFailoverRetriesAnAlternateAndMovesSelection(t *testing.T) {
 	require.Equal(t, 2, nodeA.dialCount()+nodeB.dialCount(), "exactly two attempts")
 	require.Equal(t, 1, nodeA.dialCount())
 	require.Equal(t, 1, nodeB.dialCount())
-	require.Equal(t, 1, penaltyCountOf(group, "node-a"), "the path-dead member is penalised once")
+	require.Equal(t, 1, penaltyCountOf(group, "node-a"), "the member whose network is gone is penalised once")
 	require.Equal(t, 0, penaltyCountOf(group, "node-b"), "the alternate produced proof of life")
 	require.Equal(t, uint64(2), group.CommittedSelections(),
 		"the retry re-ran the selection, so the move is part of the group's state")
@@ -267,16 +344,16 @@ func TestLoadBalanceFailoverStopsAfterTwoAttemptsAndReturnsTheOriginalError(t *t
 	harness := newFailoverHarness(t)
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
-	primaryErr := errors.Join(errors.New("open connection"), context.DeadlineExceeded)
+	primaryErr := errors.Join(errors.New("open connection"), syscall.ENETUNREACH)
 	nodeA.setDialError(primaryErr)
-	nodeB.setDialError(syscall.ENETUNREACH)
+	nodeB.setDialError(syscall.EHOSTUNREACH)
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.Error(t, err)
 	require.Nil(t, conn)
-	require.ErrorIs(t, err, context.DeadlineExceeded, "the FIRST failure is what the caller sees")
+	require.ErrorIs(t, err, syscall.ENETUNREACH, "the FIRST failure is what the caller sees")
 	require.Equal(t, 2, nodeA.dialCount()+nodeB.dialCount(), "at most two attempts, never a third")
 	require.Equal(t, 1, penaltyCountOf(group, "node-a"))
 	require.Equal(t, 1, penaltyCountOf(group, "node-b"))
@@ -291,7 +368,7 @@ func TestLoadBalanceFailoverDoesNotRetryACancelledCaller(t *testing.T) {
 	nodeB := &stubOutbound{tag: "node-b"}
 	nodeA.setDialError(context.Canceled)
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.ErrorIs(t, err, context.Canceled, "the caller's cancellation is reported unchanged")
@@ -302,21 +379,98 @@ func TestLoadBalanceFailoverDoesNotRetryACancelledCaller(t *testing.T) {
 	require.Equal(t, uint64(1), group.CommittedSelections())
 }
 
-func TestLoadBalanceFailoverDoesNotRetryARefusedDestination(t *testing.T) {
+// TestLoadBalanceFailoverDoesNotPenaliseAHealthyMemberForADeadDestination is the asymmetry
+// this split exists for, asserted end to end.
+//
+// The member is DIRECT: its dial IS the destination dial, so a refusal there is the target
+// answering and says nothing about the member. The flow is still retried - another member
+// might reach it - but the member's ledger must stay empty, or a client that retries a closed
+// port a few times would demote a perfectly working outbound.
+func TestLoadBalanceFailoverDoesNotPenaliseAHealthyMemberForADeadDestination(t *testing.T) {
 	ctx := failoverContext(t)
 	harness := newFailoverHarness(t)
-	nodeA := &stubOutbound{tag: "node-a"}
+	nodeA := &stubOutbound{tag: "node-a", typeName: C.TypeDirect}
 	nodeB := &stubOutbound{tag: "node-b"}
 	nodeA.setDialError(syscall.ECONNREFUSED)
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
-	require.ErrorIs(t, err, syscall.ECONNREFUSED)
+	require.NoError(t, err, "the flow had a chance on another member and took it")
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+
+	require.Equal(t, 2, nodeA.dialCount()+nodeB.dialCount(), "the flow was retried")
+	require.Equal(t, 0, penaltyCountOf(group, "node-a"),
+		"a refused destination must not demote the member that dialled it")
+	require.Equal(t, 0, penaltyCountOf(group, "node-b"))
+}
+
+// TestLoadBalanceFailoverDoesNotRetryADestinationFailureReportedInBand pins the shape a
+// proxying member actually produces for "the destination refused": the protocol reports it in
+// band, as a plain error, long after the first hop succeeded. It is neither retried nor
+// penalised, because the member carried the request to an answer.
+func TestLoadBalanceFailoverDoesNotRetryADestinationFailureReportedInBand(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a", typeName: "socks"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(errors.New("socks: request rejected: connection refused"))
+	harness.add(nodeA, nodeB)
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
+
+	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.Error(t, err)
 	require.Nil(t, conn)
-	require.Equal(t, 1, nodeA.dialCount(), "the node answered; a second member cannot fix that")
+	require.Equal(t, 1, nodeA.dialCount(), "the proxy answered; another member cannot fix a rejected request")
 	require.Equal(t, 0, nodeB.dialCount())
 	require.Equal(t, 0, penaltyCountOf(group, "node-a"))
+	require.Equal(t, uint64(1), group.CommittedSelections())
+}
+
+// TestLoadBalanceFailoverPenalisesARefusedMemberEndpoint is the other side of the same errno:
+// on a PROXY member the refusal is the member's own endpoint, before any proxying, so it is
+// both retried and penalised.
+func TestLoadBalanceFailoverPenalisesARefusedMemberEndpoint(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a", typeName: "vless"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(syscall.ECONNREFUSED)
+	harness.add(nodeA, nodeB)
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
+
+	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+
+	require.Equal(t, 2, nodeA.dialCount()+nodeB.dialCount())
+	require.Equal(t, 1, penaltyCountOf(group, "node-a"),
+		"the member's own listener refused, which is genuine first-hop evidence")
+}
+
+// TestLoadBalanceFailoverRetriesATimeoutWithoutPenalisingTheMember pins the conservative half
+// of the split end to end: a timeout is worth one alternate, and it is NEVER global evidence,
+// because a first-hop timeout and a destination-side timeout are the same error.
+func TestLoadBalanceFailoverRetriesATimeoutWithoutPenalisingTheMember(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a", typeName: "vless"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(errors.Join(errors.New("handshake"), context.DeadlineExceeded))
+	harness.add(nodeA, nodeB)
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
+
+	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.NoError(t, err, "the flow was worth one alternate")
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+
+	require.Equal(t, 2, nodeA.dialCount()+nodeB.dialCount())
+	require.Equal(t, 0, penaltyCountOf(group, "node-a"),
+		"a timeout is indistinguishable from a destination-side timeout and must not demote")
+	require.Equal(t, 0, penaltyCountOf(group, "node-b"), "the alternate produced proof of life")
 }
 
 // --- 7. proof of life -------------------------------------------------------------------
@@ -330,7 +484,7 @@ func TestLoadBalanceProofOfLifeClearsADemotedMember(t *testing.T) {
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	// node-a is demoted by three path-dead failures and no success in between.
 	for i := 0; i < loadBalancePenaltyThreshold; i++ {
@@ -342,7 +496,7 @@ func TestLoadBalanceProofOfLifeClearsADemotedMember(t *testing.T) {
 
 	// The primary is now node-b and it dies; the retry has nothing left but the demoted
 	// node-a, which is exactly the alternate slot that lets a member come back.
-	nodeB.setDialError(context.DeadlineExceeded)
+	nodeB.setDialError(syscall.ENETUNREACH)
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.NoError(t, err)
 	require.NotNil(t, conn)
@@ -430,7 +584,7 @@ func TestLoadBalancePenaltyIsScopedToTheNetworkGeneration(t *testing.T) {
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	for i := 0; i < loadBalancePenaltyThreshold; i++ {
 		group.recordPenalty(nodeA)
@@ -463,7 +617,7 @@ func TestLoadBalancePenaltyExpiresWithoutATimer(t *testing.T) {
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
 	harness.add(nodeA, nodeB)
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	now := time.Now()
 	group.now = func() time.Time { return now }
@@ -499,7 +653,7 @@ func TestLoadBalanceFailoverIsBoundedToTwoAttemptsOutOfTen(t *testing.T) {
 		members = append(members, member)
 		harness.add(member)
 	}
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
 	require.Error(t, err)
@@ -533,7 +687,7 @@ func TestLoadBalanceFailoverPreservesTheStrategies(t *testing.T) {
 			members = append(members, member)
 			harness.add(member)
 		}
-		group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+		group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 		var dialed []string
 		for i := 0; i < 4; i++ {
 			previous := make([]int, len(members))
@@ -650,6 +804,7 @@ func TestLoadBalanceFailoverStaysInsideTheConfiguredList(t *testing.T) {
 	harness.add(nodeA, nodeB, unlisted)
 	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{
 		Strategy:  "round_robin",
+		Failover:  true,
 		Outbounds: []string{"node-a", "node-b"},
 	})
 
@@ -682,15 +837,17 @@ func TestLoadBalanceNestedFailoverStaysInsideTheNestedList(t *testing.T) {
 	nodeA := &stubOutbound{tag: "node-a"}
 	nodeB := &stubOutbound{tag: "node-b"}
 	unlisted := &stubOutbound{tag: "unlisted"}
-	nodeA.setDialError(context.DeadlineExceeded)
+	nodeA.setDialError(syscall.ENETUNREACH)
 	harness.add(nodeA, nodeB, unlisted)
 
 	inner := harness.group(t, "inner", nil, option.LoadBalanceOutboundOptions{
 		Strategy:  "round_robin",
+		Failover:  true,
 		Outbounds: []string{"node-a", "node-b"},
 	})
 	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
 		Strategy:  "round_robin",
+		Failover:  true,
 		Outbounds: []string{"inner"},
 	})
 
@@ -727,6 +884,7 @@ func TestLoadBalanceFailoverRepeatedCyclesDoNotLeak(t *testing.T) {
 	warm.add(warmA, warmB)
 	warmGroup := warm.group(t, "lb", nil, option.LoadBalanceOutboundOptions{
 		Strategy: "round_robin",
+		Failover: true,
 		URL:      "http://127.0.0.1:1/generate_204",
 	})
 	_, err := warmGroup.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
@@ -741,10 +899,11 @@ func TestLoadBalanceFailoverRepeatedCyclesDoNotLeak(t *testing.T) {
 		harness := newFailoverHarness(t)
 		nodeA := &stubOutbound{tag: "node-a"}
 		nodeB := &stubOutbound{tag: "node-b"}
-		nodeA.setDialError(context.DeadlineExceeded)
+		nodeA.setDialError(syscall.ENETUNREACH)
 		harness.add(nodeA, nodeB)
 		group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{
 			Strategy: "round_robin",
+			Failover: true,
 			URL:      "http://127.0.0.1:1/generate_204",
 		})
 		conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
@@ -780,7 +939,7 @@ func TestLoadBalanceFailoverIsRaceFreeUnderConcurrentFailures(t *testing.T) {
 		members = append(members, member)
 		harness.add(member)
 	}
-	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin"})
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
 
 	const (
 		workers = 8
@@ -817,6 +976,357 @@ func TestLoadBalanceFailoverIsRaceFreeUnderConcurrentFailures(t *testing.T) {
 
 	require.LessOrEqual(t, group.CommittedSelections(), uint64(workers*rounds*2),
 		"at most two committed decisions per flow")
+}
+
+// --- 15. one retry budget for the whole flow --------------------------------------------
+
+// failoverDialTotal sums the dial attempts over a set of members, so a bound is asserted as a
+// count and not as a distribution.
+func failoverDialTotal(members ...*stubOutbound) int {
+	total := 0
+	for _, member := range members {
+		total += member.dialCount()
+	}
+	return total
+}
+
+// TestLoadBalanceFailoverSpendsOneAlternateAcrossTwoNestedGroups is the nesting regression:
+// outer attempt #1 -> inner#1 #1, inner#1 #2; outer alternate -> inner#2 #3, inner#2 #4. With
+// a per-group bound that is four dials and it multiplies with depth. With one flow budget it
+// is two, and the outer's alternate chain is never entered.
+func TestLoadBalanceFailoverSpendsOneAlternateAcrossTwoNestedGroups(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeC := &stubOutbound{tag: "node-c"}
+	nodeD := &stubOutbound{tag: "node-d"}
+	for _, member := range []*stubOutbound{nodeA, nodeB, nodeC, nodeD} {
+		member.setDialError(syscall.ENETUNREACH)
+		harness.add(member)
+	}
+	innerOne := harness.group(t, "inner-1", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-a", "node-b"},
+	})
+	harness.group(t, "inner-2", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-c", "node-d"},
+	})
+	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"inner-1", "inner-2"},
+	})
+
+	conn, err := outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.Error(t, err)
+	require.Nil(t, conn)
+
+	require.Equal(t, 2, failoverDialTotal(nodeA, nodeB, nodeC, nodeD),
+		"one primary plus one alternate for the WHOLE flow, not two per nested group")
+	require.Equal(t, 0, nodeC.dialCount()+nodeD.dialCount(),
+		"the second nested chain must never be entered once the budget is spent")
+	require.Equal(t, uint64(2), innerOne.CommittedSelections(),
+		"the nested group made its committed primary choice and its committed alternate choice")
+}
+
+// TestLoadBalanceFailoverSpendsOneAlternateAcrossThreeLevels pushes the same bound through
+// three levels, where a per-level bound would reach six dials.
+func TestLoadBalanceFailoverSpendsOneAlternateAcrossThreeLevels(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(syscall.ENETUNREACH)
+	nodeB.setDialError(syscall.ENETUNREACH)
+	harness.add(nodeA, nodeB)
+	harness.group(t, "inner", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-a", "node-b"},
+	})
+	harness.group(t, "middle", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"inner"},
+	})
+	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"middle"},
+	})
+
+	conn, err := outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.Equal(t, 2, failoverDialTotal(nodeA, nodeB), "still exactly two attempts at three levels")
+
+	// The same chain with a working primary is one dial, so the budget did not become a
+	// minimum.
+	nodeA.setDialError(nil)
+	conn, err = outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+	require.Equal(t, 2, nodeA.dialCount(), "the successful flow added exactly one primary attempt")
+	require.Equal(t, 1, nodeB.dialCount(), "and no alternate was touched")
+}
+
+// TestLoadBalanceFailoverBudgetIsSpentByTheAlternateChain pins the ORDER the budget is spent
+// in: when the outer's primary is a leaf and its alternate is a group, the group must inherit
+// a spent budget and dial only its primary.
+func TestLoadBalanceFailoverBudgetIsSpentByTheAlternateChain(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	primary := &stubOutbound{tag: "primary"}
+	primary.setDialError(syscall.ENETUNREACH)
+	nodeA.setDialError(syscall.ENETUNREACH)
+	nodeB.setDialError(syscall.ENETUNREACH)
+	harness.add(primary, nodeA, nodeB)
+	harness.group(t, "inner", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-a", "node-b"},
+	})
+	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"primary", "inner"},
+	})
+
+	conn, err := outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.Equal(t, 1, primary.dialCount(), "the outer primary was attempted once")
+	require.Equal(t, 1, nodeA.dialCount(), "the alternate chain made its primary attempt")
+	require.Equal(t, 0, nodeB.dialCount(),
+		"the alternate chain inherited a spent budget and must not retry")
+	require.Equal(t, 2, failoverDialTotal(primary, nodeA, nodeB))
+}
+
+// TestLoadBalanceFailoverDoesNotStartTheAlternateOnAnExhaustedDeadline pins the deadline rule
+// and the budget together: the alternate is not dialled AND is not consumed, because nothing
+// was started.
+func TestLoadBalanceFailoverDoesNotStartTheAlternateOnAnExhaustedDeadline(t *testing.T) {
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(syscall.ENETUNREACH)
+	harness.add(nodeA, nodeB)
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	ctx, budget := failoverBudget(expired)
+	require.Equal(t, 1, budget.remainingAlternates)
+
+	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.ErrorIs(t, err, syscall.ENETUNREACH)
+	require.Nil(t, conn)
+	require.Equal(t, 1, nodeA.dialCount(), "no second attempt on a context that cannot complete")
+	require.Equal(t, 0, nodeB.dialCount())
+	require.Equal(t, 1, budget.remainingAlternates,
+		"the alternate was not spent, because it was never used")
+}
+
+// TestLoadBalanceFailoverCancellationDoesNotConsumeTheAlternate is the same rule for a
+// cancellation that arrives as the first failure: the retry is refused before it is charged.
+func TestLoadBalanceFailoverCancellationDoesNotConsumeTheAlternate(t *testing.T) {
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(context.Canceled)
+	harness.add(nodeA, nodeB)
+	group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true})
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx, budget := failoverBudget(cancelled)
+
+	conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, conn)
+	require.Equal(t, 1, nodeA.dialCount())
+	require.Equal(t, 0, nodeB.dialCount())
+	require.Equal(t, 1, budget.remainingAlternates,
+		"a cancelled flow must not leave a retry charged that it never used")
+}
+
+// TestLoadBalanceFailoverBudgetIsRaceFreeUnderConcurrentNestedFlows drives the shared chain
+// from many goroutines. Each flow derives its own budget inside the outermost dial, so there
+// is no shared counter at all - which is exactly the property `-race` is asked to confirm.
+func TestLoadBalanceFailoverBudgetIsRaceFreeUnderConcurrentNestedFlows(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	nodeA.setDialError(syscall.ENETUNREACH)
+	nodeB.setDialError(syscall.ENETUNREACH)
+	harness.add(nodeA, nodeB)
+	harness.group(t, "inner", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-a", "node-b"},
+	})
+	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"inner"},
+	})
+
+	const (
+		workers = 8
+		rounds  = 20
+	)
+	start := make(chan struct{})
+	var waitGroup sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			for i := 0; i < rounds; i++ {
+				conn, err := outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+				if err == nil && conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+
+	require.LessOrEqual(t, failoverDialTotal(nodeA, nodeB), workers*rounds*2,
+		"every flow is bounded to two attempts, however many run at once")
+	require.GreaterOrEqual(t, failoverDialTotal(nodeA, nodeB), workers*rounds,
+		"and every flow made at least its primary attempt")
+}
+
+// TestLoadBalanceFailoverNestedPrimarySuccessIsOneDial is the other end of the bound: the
+// budget must not turn a working first nested dial into a minimum of two.
+func TestLoadBalanceFailoverNestedPrimarySuccessIsOneDial(t *testing.T) {
+	ctx := failoverContext(t)
+	harness := newFailoverHarness(t)
+	nodeA := &stubOutbound{tag: "node-a"}
+	nodeB := &stubOutbound{tag: "node-b"}
+	harness.add(nodeA, nodeB)
+	harness.group(t, "inner", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"node-a", "node-b"},
+	})
+	outer := harness.group(t, "outer", nil, option.LoadBalanceOutboundOptions{
+		Strategy: "round_robin", Failover: true, Outbounds: []string{"inner"},
+	})
+
+	conn, err := outer.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.NoError(t, conn.Close())
+	require.Equal(t, 1, failoverDialTotal(nodeA, nodeB),
+		"a working first nested dial is one attempt, not a minimum of two")
+	require.Equal(t, 1, nodeA.dialCount())
+	require.Equal(t, 0, nodeB.dialCount())
+}
+
+// TestLoadBalanceFailoverRetryNeverBouncesAFlowOntoAThirdMember pins the budget as a strategy
+// property for the two pinned strategies: one flow spends at most one alternate, so it can be
+// carried by at most two members, and the replacement is the one the strategy's own exclusion
+// rule names rather than an index walk down the list.
+func TestLoadBalanceFailoverRetryNeverBouncesAFlowOntoAThirdMember(t *testing.T) {
+	ctx := failoverContext(t)
+	for _, strategy := range []string{"consistent_hashing", "sticky_sessions"} {
+		t.Run(strategy, func(t *testing.T) {
+			harness := newFailoverHarness(t)
+			members := make([]*stubOutbound, 0, 4)
+			for _, tag := range []string{"A", "B", "C", "D"} {
+				member := &stubOutbound{tag: tag}
+				members = append(members, member)
+				harness.add(member)
+			}
+			group := harness.group(t, "lb", nil, option.LoadBalanceOutboundOptions{
+				Strategy: strategy, Failover: true,
+			})
+			metadata := failoverMetadata("shop.example.com")
+
+			// The preview names the member the committed dial will choose, so exactly one
+			// member is made to fail and the flow has somewhere to go.
+			preview := group.SelectForFlow(metadata, N.NetworkTCP, false)
+			require.NotNil(t, preview)
+			for _, member := range members {
+				if member.Tag() == preview.Tag() {
+					member.setDialError(syscall.ENETUNREACH)
+				}
+			}
+
+			conn, err := group.DialWithFailover(ctx, metadata, N.NetworkTCP, failoverDestination())
+			require.NoError(t, err, "the strategy's own replacement carried the flow")
+			require.NotNil(t, conn)
+			require.NoError(t, conn.Close())
+
+			require.Equal(t, 2, failoverDialTotal(members...), "one primary and one alternate")
+			dialed := 0
+			for _, member := range members {
+				if member.dialCount() > 0 {
+					dialed++
+				}
+			}
+			require.Equal(t, 2, dialed, "one flow may be carried by at most two members")
+		})
+	}
+}
+
+// --- 16. opt-in migration ----------------------------------------------------------------
+
+// loadBalanceOptionsFromText decodes the SAME text a user would put in a configuration, so the
+// migration test exercises the option surface rather than a Go literal.
+func loadBalanceOptionsFromText(t *testing.T, config string) option.LoadBalanceOutboundOptions {
+	t.Helper()
+	var options option.LoadBalanceOutboundOptions
+	require.NoError(t, json.UnmarshalContext(context.Background(), []byte(config), &options))
+	return options
+}
+
+// TestLoadBalanceFailoverIsOptInAndAnOldConfigIsUnchanged is the compatibility test.
+//
+// The two branches decode the same member list from two config TEXTS that differ by one field,
+// and drive the identical failing dial. Without the field the group must make one attempt, report
+// the error and record nothing - the behaviour that existed before the failover was written.
+func TestLoadBalanceFailoverIsOptInAndAnOldConfigIsUnchanged(t *testing.T) {
+	ctx := failoverContext(t)
+	oldOptions := loadBalanceOptionsFromText(t, `{"outbounds":["node-a","node-b"],"strategy":"round_robin"}`)
+	newOptions := loadBalanceOptionsFromText(t, `{"outbounds":["node-a","node-b"],"strategy":"round_robin","failover":true}`)
+	require.False(t, oldOptions.Failover, "the absent field must decode to the zero value, not to enabled")
+	require.True(t, newOptions.Failover)
+
+	t.Run("the old text keeps the old behaviour", func(t *testing.T) {
+		harness := newFailoverHarness(t)
+		nodeA := &stubOutbound{tag: "node-a"}
+		nodeB := &stubOutbound{tag: "node-b"}
+		nodeA.setDialError(syscall.ENETUNREACH)
+		harness.add(nodeA, nodeB)
+		group := harness.group(t, "lb", nil, oldOptions)
+		require.False(t, group.FailoverEnabled(),
+			"a config that did not ask for failover must not advertise the capability")
+
+		conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+		require.ErrorIs(t, err, syscall.ENETUNREACH, "the first failure is reported, as it always was")
+		require.Nil(t, conn)
+		require.Equal(t, 1, nodeA.dialCount(), "one dial attempt, exactly as before the failover existed")
+		require.Equal(t, 0, nodeB.dialCount(), "no automatic dial of another member")
+		require.Equal(t, 0, penaltyCountOf(group, "node-a"),
+			"no penalty may be recorded for a config that did not opt in")
+		require.Equal(t, uint64(1), group.CommittedSelections())
+	})
+
+	t.Run("the new text enables the bounded retry", func(t *testing.T) {
+		harness := newFailoverHarness(t)
+		nodeA := &stubOutbound{tag: "node-a"}
+		nodeB := &stubOutbound{tag: "node-b"}
+		nodeA.setDialError(syscall.ENETUNREACH)
+		harness.add(nodeA, nodeB)
+		group := harness.group(t, "lb", nil, newOptions)
+		require.True(t, group.FailoverEnabled())
+
+		conn, err := group.DialWithFailover(ctx, failoverMetadata("example.com"), N.NetworkTCP, failoverDestination())
+		require.NoError(t, err, "the opt-in enables the alternate")
+		require.NotNil(t, conn)
+		require.NoError(t, conn.Close())
+		require.Equal(t, 2, failoverDialTotal(nodeA, nodeB), "two dial attempts, and no more")
+		require.Equal(t, 1, penaltyCountOf(group, "node-a"))
+	})
+}
+
+// TestLoadBalanceFailoverRejectsAnInvalidValue is the fail-fast requirement: a failover value
+// that is not a boolean cannot be decoded, so the configuration is refused when it is loaded
+// rather than at the first dial.
+func TestLoadBalanceFailoverRejectsAnInvalidValue(t *testing.T) {
+	var options option.LoadBalanceOutboundOptions
+	err := json.UnmarshalContext(context.Background(), []byte(`{"outbounds":["node-a"],"failover":"yes"}`), &options)
+	require.Error(t, err, "a non-boolean failover must fail at decode, not at dial time")
 }
 
 // TestLoadBalanceRetestValveThrottlesFromTheEndOfTheRun pins the valve on its own, because

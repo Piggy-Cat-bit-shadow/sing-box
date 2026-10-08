@@ -20,15 +20,26 @@ import (
 // Tests for the URLTest group's scoped selection and atomic published state.
 
 // stubOutbound is a group member that records dial attempts and can be made to fail.
+//
+// typeName lets a test state the member's KIND, which the global-penalty classifier consults:
+// a direct member dials the destination itself, so its errno describes the destination, while
+// every proxy member's synchronous error is a first hop of its own. An empty name is reported
+// as "stub", a proxy-like member, which is what the older tests expect.
 type stubOutbound struct {
 	adapter.Outbound
 	tag      string
+	typeName string
 	dialErr  error
 	dialed   int
 	dialLock sync.Mutex
 }
 
-func (o *stubOutbound) Type() string      { return "stub" }
+func (o *stubOutbound) Type() string {
+	if o.typeName != "" {
+		return o.typeName
+	}
+	return "stub"
+}
 func (o *stubOutbound) Tag() string       { return o.tag }
 func (o *stubOutbound) Network() []string { return []string{N.NetworkTCP, N.NetworkUDP} }
 

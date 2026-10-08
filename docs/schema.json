@@ -13248,6 +13248,9 @@
             },
             "idle_timeout": {
               "$ref": "#/$defs/Duration"
+            },
+            "failover": {
+              "type": "boolean"
             }
           },
           "required": [

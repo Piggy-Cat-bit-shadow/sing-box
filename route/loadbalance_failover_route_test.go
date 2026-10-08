@@ -54,7 +54,7 @@ func routeFailoverDestination() M.Socksaddr {
 func TestRouteFailoverCapabilityOwnsTheDialAndTheSelection(t *testing.T) {
 	members := fourRouteMembers()
 	members[0].setDialError(context.DeadlineExceeded)
-	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 
 	metadata := routeFailoverMetadata()
 	// The route path's rule: a group that owns the dial owns the selection too, so the walk
@@ -85,7 +85,7 @@ func TestRouteFailoverCapabilityOwnsTheDialAndTheSelection(t *testing.T) {
 // that does not implement the capability takes exactly the path it took before.
 func TestRouteWithoutTheCapabilityFallsThroughUnchanged(t *testing.T) {
 	members := fourRouteMembers()
-	inner, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	inner, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 
 	ctx := service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage())
 	manager := &routeGroupManager{members: map[string]adapter.Outbound{"lb": inner}}
@@ -130,7 +130,7 @@ func TestRouteWithoutTheCapabilityOnALeafIsATrivialFallThrough(t *testing.T) {
 // across, because it is asked of the DIALER after the connection exists.
 func TestRouteFailoverShimForwardsTheCopyBufferOptIn(t *testing.T) {
 	members := fourRouteMembers()
-	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 	owner := routeDialOwner(outbound)
 	require.NotNil(t, owner)
 
@@ -154,7 +154,7 @@ func TestRouteFailoverShimForwardsTheCopyBufferOptIn(t *testing.T) {
 func TestRouteFailoverDoesNotRetryThePacketPath(t *testing.T) {
 	members := fourRouteMembers()
 	members[0].setDialError(syscall.ECONNREFUSED)
-	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 
 	metadata := lbMetadata(N.NetworkUDP, "example.com", "192.168.1.9")
 	chain, err := resolveOutbound(outbound, metadata, N.NetworkUDP, true)
@@ -177,7 +177,7 @@ func TestRouteFailoverDoesNotRetryThePacketPath(t *testing.T) {
 // committed selection, dialled by the leaf.
 func TestRouteFailoverDoesNotReSelectPerAddress(t *testing.T) {
 	members := fourRouteMembers()
-	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 
 	metadata := lbMetadata(N.NetworkTCP, "example.com", "192.168.1.9")
 	metadata.DestinationAddresses = []netip.Addr{
@@ -231,6 +231,7 @@ func TestRouteFailoverGroupOverAConnectionHandlerStillCommitsOnce(t *testing.T) 
 	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
 	created, err := group.NewLoadBalance(ctx, nil, log.NewNOPFactory().NewLogger("loadbalance"), "lb", option.LoadBalanceOutboundOptions{
 		Strategy:  "round_robin",
+		Failover:  true,
 		Outbounds: []string{"handler", "other"},
 	})
 	require.NoError(t, err)
@@ -256,7 +257,7 @@ func TestRouteFailoverGroupOverAConnectionHandlerStillCommitsOnce(t *testing.T) 
 func TestRouteFailoverUsesTheCallersDeadline(t *testing.T) {
 	members := fourRouteMembers()
 	members[0].setDialError(context.DeadlineExceeded)
-	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin", Failover: true}, members...)
 	owner := routeDialOwner(outbound)
 	require.NotNil(t, owner)
 
@@ -271,4 +272,36 @@ func TestRouteFailoverUsesTheCallersDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 	require.NoError(t, ctx.Err(), "the whole sequence finished inside the caller's deadline")
+}
+
+// TestRouteFailoverIsNotAdvertisedWithoutTheOption is the route half of the migration
+// guarantee.
+//
+// A group whose configuration did not opt in answers routeDialOwner with nil, so
+// routeDialDecision resolves with commit and routeDialer returns the resolved leaf. That is
+// literally the pre-capability path - not "the retry path, but the retry declines" - which is
+// the only form of compatibility an upgrade can promise.
+func TestRouteFailoverIsNotAdvertisedWithoutTheOption(t *testing.T) {
+	members := fourRouteMembers()
+	members[0].setDialError(syscall.ENETUNREACH)
+	outbound, _ := newLoadBalanceRouteFixture(t, option.LoadBalanceOutboundOptions{Strategy: "round_robin"}, members...)
+
+	require.Nil(t, routeDialOwner(outbound),
+		"a group that did not opt in must not be treated as owning the dial")
+
+	metadata := routeFailoverMetadata()
+	chain, owner, err := routeDialDecision(outbound, metadata, N.NetworkTCP)
+	require.NoError(t, err)
+	require.Nil(t, owner)
+	require.Equal(t, uint64(1), loadBalanceCursor(t, outbound),
+		"the walk commits exactly as it did before the capability existed")
+	require.Equal(t, chain[len(chain)-1], routeDialer(chain[len(chain)-1], owner, metadata),
+		"the connection manager is handed the leaf itself, never the shim")
+
+	_, err = chain[len(chain)-1].DialContext(context.Background(), N.NetworkTCP, routeFailoverDestination())
+	require.ErrorIs(t, err, syscall.ENETUNREACH)
+	require.Equal(t, 1, members[0].dialCount(), "the flow made exactly one attempt")
+	for _, member := range members[1:] {
+		require.Equal(t, 0, member.dialCount(), "no alternate may be dialled without the opt-in")
+	}
 }

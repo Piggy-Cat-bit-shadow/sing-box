@@ -213,8 +213,26 @@ type FlowAwareOutboundGroup interface {
 // group, immediately after a failure that proves nothing was delivered, does not have that
 // problem - and that is why the capability owns the dial rather than handing the error
 // back.
+//
+// # Why the interface is implemented unconditionally and the behaviour is not
+//
+// A group implements this interface whenever it COULD own a dial, and reports through
+// FailoverEnabled whether its configuration actually asked for the retry. Splitting the two
+// keeps the route path's assertion cheap and free of a registry, while making the behaviour
+// opt-in: a group that reports false is resolved and dialled by the old path, so an
+// existing configuration that never asked for failover keeps the single attempt it had
+// before this capability existed.
 type FailoverOutboundGroup interface {
 	OutboundGroup
+
+	// FailoverEnabled reports whether this group's configuration opted into the retry.
+	//
+	// A group that reports false MUST NOT be asked to DialWithFailover. The route path
+	// treats it as an outbound without the capability - the chain is resolved with commit
+	// and the resolved leaf is handed to the connection manager - and a parent group
+	// resolves it to a leaf and dials once. That is what makes "opt-in" mean exactly the
+	// pre-capability behaviour rather than "the same path with the retry disabled".
+	FailoverEnabled() bool
 
 	// DialWithFailover dials this flow through the group's own selection.
 	//
@@ -226,8 +244,10 @@ type FailoverOutboundGroup interface {
 	//
 	// The contract the caller depends on:
 	//
-	//   - At most two dial attempts per call. A third would turn a bounded replacement into
-	//     a scan of the member list on every outage.
+	//   - At most two dial attempts for the WHOLE flow, across nesting. The budget is
+	//     carried in the context from the outermost capability dial to every nested one, so
+	//     a chain of groups cannot spend one alternate per level. A third attempt overall
+	//     would turn a bounded replacement into a scan of the member list on every outage.
 	//   - The caller's context is used unchanged, so the retry shares the remaining
 	//     deadline instead of extending it. The retry is worth having only while the caller
 	//     is still waiting.

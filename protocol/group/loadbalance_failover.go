@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/interrupt"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -46,14 +48,38 @@ import (
 // mechanisms below answer that: the ledger is scoped to the network GENERATION the
 // coordinator publishes, and a record expires on its own. Both are described where they are
 // implemented.
+//
+// # Opt-in, because behaviour is part of the configuration
+//
+// The feature predates its option and used to be always on, which silently rewrote
+// "a timeout reports an error" into "a timeout dials another member" for every existing
+// config. It is now gated on `"failover": true`: an unopted group does not even advertise
+// the capability, so the route path resolves and dials it through the code that existed
+// before this file. See the option's own comment for the full reasoning.
+//
+// # Two questions, never one errno
+//
+// A single classifier used to decide both whether to retry and whether to blame the member.
+// Those are different questions with different right answers: RetryThisFlow is permissive and
+// about the flow, PenalizeMemberGlobally is conservative and about the member's own first
+// hop. They are separate functions here, and each carries the set it accepts and why.
+//
+// # One budget for the whole flow
+//
+// The retry is bounded per FLOW, not per group, through failoverAttemptState in the context:
+// a nested chain spends one alternate in total, so depth cannot multiply the cost of an
+// outage. The budget owns no lock, no goroutine and no timer.
 
 // loadBalancePenaltyThreshold is the failure count at which a member is demoted.
 //
-// Three, because one path-dead failure is not evidence: a single timeout is as likely to be
-// a transient on a working path as a dead one, and the retry already replaces the flow. Three
-// failures with no success in between is a member that is not carrying traffic, and the cost
-// of being wrong is bounded - a demoted member is still an ALTERNATE, so it keeps earning
-// proof of life rather than being locked out.
+// Three, because one first-hop failure is not evidence: a single refusal or lost route is as
+// likely to be a transient on a working path as a dead one, and the retry already replaces the
+// flow. Three failures with no success in between is a member whose own endpoint is not
+// carrying traffic, and the cost of being wrong is bounded - a demoted member is still an
+// ALTERNATE, so it keeps earning proof of life rather than being locked out.
+//
+// The threshold is only ever reached by the conservative classifier in this file: a timeout is
+// never counted at all, so three is three refusals, not three website outages.
 const loadBalancePenaltyThreshold = 3
 
 // loadBalancePenaltyTTL is how long a failure record may keep demoting its member.
@@ -78,44 +104,70 @@ const loadBalancePenaltyTTL = 2 * time.Minute
 // round.
 const loadBalanceForcedRetestInterval = 2 * time.Minute
 
-// isPathDeadDialError classifies a dial failure.
+// RetryThisFlow reports whether another member could still carry this flow.
 //
-// It answers exactly one question: does this failure say something about the PATH to the
-// member, as opposed to the destination or the caller? The answer decides whether the group
-// is allowed to conclude anything about its own choice.
+// It answers the FLOW question - "would this attempt have a chance elsewhere?" - and it is
+// deliberately the more permissive of the two classifiers, because the two costs are not
+// symmetric. A wrong yes costs one extra dial, bounded by the flow's own budget; a wrong no
+// fails a flow while a working member sits idle. Nothing classified here has been handed to a
+// caller yet, so no application byte has been delivered and a second attempt cannot replay a
+// request the destination already saw.
 //
-// NEUTRAL - never penalised, because the node answered or the caller withdrew:
-//
-//	nil                  no failure at all
-//	context.Canceled     the caller gave up; a second member cannot help
-//	ECONNREFUSED         the destination (or the member's listener) answered and refused
-//	ECONNRESET           something on the path answered and then closed
-//
-// PATH DEAD - penalised, because the attempt never reached an answer:
+// RETRY - the attempt produced no answer, or a listener refused:
 //
 //	context.DeadlineExceeded, os.ErrDeadlineExceeded   the attempt timed out
-//	EHOSTUNREACH, ENETUNREACH, ETIMEDOUT               the path itself is gone
 //	any net.Error whose Timeout() reports true         the dialer's own timeout
+//	EHOSTUNREACH, ENETUNREACH, EADDRNOTAVAIL, ENETDOWN the path is gone at the kernel
+//	ETIMEDOUT                                          the connect timed out in the kernel
+//	ECONNREFUSED                                       a listener refused; another member's
+//	                                                   listener may be up
+//
+// NEUTRAL - a second member cannot help, or the failure is not understood:
+//
+//	nil                  no failure at all
+//	context.Canceled     the caller gave up; nobody is waiting for a second attempt
+//	net.ErrClosed        this process tore the dial down (a group close, a network switch)
+//	ECONNRESET, io.EOF   something on the path answered and then closed - which is also how a
+//	                     proxy protocol reports a destination-side failure in band
+//	anything unclassified
+//
+// The last line is the conservative default: an error this code has never heard of is not
+// evidence that another member would behave differently, and retrying it would spend the
+// flow's only alternate on a guess.
 //
 // The list is consulted with errors.Is/errors.As, so a wrapped error is classified by its
 // cause rather than by the message some layer above it added.
-func isPathDeadDialError(err error) bool {
+func RetryThisFlow(err error) bool {
 	if err == nil {
 		return false
 	}
-	// The neutral set first: these are the failures a second member cannot fix, and reading
-	// one of them as evidence about the path is the mistake that makes a group chase a
-	// destination's outage.
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		// The caller withdrew, or this process did. A second member cannot fix either, and
+		// retrying on a cancelled context would turn one cancelled flow into two attempts on
+		// a context that is already done.
 		return false
 	}
-	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) {
+		// Something answered and then closed. That is the shape of a destination-side
+		// failure reported in band by a proxy protocol, so it is explicitly NOT retried: an
+		// alternate member would very likely reproduce it, and the flow's one alternate is
+		// worth more than a second look at a target that already spoke.
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
-	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.ETIMEDOUT) {
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL) || errors.Is(err, syscall.ENETDOWN) ||
+		errors.Is(err, syscall.ETIMEDOUT) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		// A refusal is the one answer that is worth a second member. On a proxying member the
+		// refusal came from the member's own endpoint, and a different member's endpoint is
+		// very likely listening; on a direct member it came from the destination, where the
+		// extra dial costs one attempt out of a budget of two and proves the target is
+		// closed. The two are indistinguishable here, and the cheap, safe reading is to try.
 		return true
 	}
 	var netError net.Error
@@ -123,6 +175,82 @@ func isPathDeadDialError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// PenalizeMemberGlobally reports whether a dial failure is evidence that this MEMBER's own
+// first hop is broken.
+//
+// It answers a different question from RetryThisFlow - "is the member's path establishment
+// broken?" - and it is deliberately far narrower, because the two situations it must separate
+// can produce an identical final error:
+//
+//	client -> member endpoint       OK
+//	member -> blocked destination   timeout
+//
+// The DialContext error is a timeout in both cases. Reading it as "the member is dead" means a
+// blocked or down destination costs a healthy member a penalty on every flow, and a client
+// that retries a few times demotes that member for every destination - exactly the penalty the
+// ledger then applies to a node that is carrying traffic perfectly.
+//
+// # What the stack does and does not tell this function
+//
+// There is no stage tag anywhere in the dial path: the proxy outbounds return their first-hop
+// transport error unwrapped, and a destination-side failure is reported in band, on the
+// connection, rather than as the dial error. So the errno alone cannot separate the two rows
+// above, and this function refuses to guess from it. The one structural fact available is the
+// member's own kind, used below: a member that dials the DESTINATION (direct, block) never
+// gets a global verdict, because the same errno there describes the destination.
+//
+// GLOBAL PENALTY - kernel evidence that a first hop failed before any answer:
+//
+//	ECONNREFUSED    a listener on the member's endpoint refused
+//	EHOSTUNREACH    no route to the member's endpoint
+//	ENETUNREACH     the network carrying the member's endpoint is gone
+//
+// NO GLOBAL PENALTY - and this is the point of the split:
+//
+//	a timeout, at any layer   a first-hop timeout and a destination-side timeout are
+//	                          indistinguishable in the final error, so the member keeps its
+//	                          retries and only a health probe may retire it
+//	EADDRNOTAVAIL, ENETDOWN   the local interface, which every member shares
+//	ECONNRESET, io.EOF        something answered and closed; possibly the remote destination
+//	context.Canceled          the caller withdrew
+//	a destination dial        member.Type() is direct or block: the error is the destination's
+//	anything unclassified
+//
+// The result is a ledger that fires rarely but is almost always right: a member is demoted
+// only when a listener refused it or its network is gone, never because a website was down.
+func PenalizeMemberGlobally(member adapter.Outbound, err error) bool {
+	if err == nil || member == nil {
+		return false
+	}
+	if memberDialsDestination(member) {
+		// The member IS the destination dial. A refusal or an unreachable here describes the
+		// destination, and demoting the member for a target that happened to be closed would
+		// take a working outbound out of the rotation for every future flow.
+		return false
+	}
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH)
+}
+
+// memberDialsDestination reports whether a failure from this member describes the flow's
+// destination rather than the member's own first hop.
+//
+// protocol/direct and protocol/block perform the connection to the destination themselves, so
+// their DialContext error IS the destination's answer. Every proxying outbound terminates the
+// flow at an endpoint of its own first and only reports the remote's verdict in band, so a
+// synchronous error from one of those is a first-hop error. A member that is itself a group is
+// treated the same way: the group's dial is still a first hop, whichever leaf inside it
+// answers.
+func memberDialsDestination(member adapter.Outbound) bool {
+	switch member.Type() {
+	case C.TypeDirect, C.TypeBlock:
+		return true
+	default:
+		return false
+	}
 }
 
 // loadBalancePenalty is one member's failure record.
@@ -452,11 +580,79 @@ func (g *LoadBalance) requestForcedRetest() {
 	}()
 }
 
+// failoverAttemptState is one FLOW's retry budget, carried in the context.
+//
+// # Why the budget is per-flow context state
+//
+// The retry belongs to a user flow, not to a group call. A flow through outer -> inner must
+// make at most two dial attempts in total, and a per-group bound multiplies with nesting:
+// outer attempt #1 -> inner #1, inner #2; outer alternate -> inner #3, inner #4. A
+// package-level counter would be shared by unrelated flows; a parameter would have to be
+// threaded through every caller, including the route path, which has no retry of its own to
+// name; and a mutex would be needed for either. The context is the one channel every attempt
+// already shares, and deriving it inside the outermost capability dial makes it per-flow by
+// construction.
+//
+// The state is touched only on the flow's own sequential path - a dial returns before its
+// retry begins - so it owns no lock, no atomic, no goroutine and no timer. The zero value is
+// not a usable budget: one is created with exactly one alternate for the whole flow.
+type failoverAttemptState struct {
+	remainingAlternates int
+}
+
+// failoverAttemptStateKey is the context key for the budget.
+//
+// It is an unexported struct type, so no other package can install a budget the group would
+// then trust: only the group's own outermost dial can start one, and the group is the only
+// code that can widen it.
+type failoverAttemptStateKey struct{}
+
+// failoverBudget returns the flow's budget and a context carrying it, creating the budget when
+// this call is the outermost capability dial.
+//
+// "Outermost" is identified by the ABSENCE of a budget, not by a flag: a nested group called
+// with the derived context finds the existing one and consumes it, which is exactly what stops
+// nesting from multiplying the alternates. Creation installs the budget on a context derived
+// for this call only, so two concurrent flows that share a parent context never share a
+// budget.
+func failoverBudget(ctx context.Context) (context.Context, *failoverAttemptState) {
+	budget, loaded := ctx.Value(failoverAttemptStateKey{}).(*failoverAttemptState)
+	if loaded && budget != nil {
+		return ctx, budget
+	}
+	budget = &failoverAttemptState{remainingAlternates: 1}
+	return context.WithValue(ctx, failoverAttemptStateKey{}, budget), budget
+}
+
+// FailoverEnabled implements adapter.FailoverOutboundGroup.
+//
+// It reports the configuration's choice, read once at construction. The route path and a
+// parent group both refuse to use the retry when it is false, so a configuration that predates
+// the option keeps the single attempt it had before the capability existed.
+func (g *LoadBalance) FailoverEnabled() bool {
+	return g.failover
+}
+
 // DialWithFailover implements adapter.FailoverOutboundGroup.
 //
-// One selection, one dial; on a path-dead failure, one more selection with the failed member
-// excluded and one more dial. Never a third attempt, never a fresh deadline, never an
-// interruption of a connection that already exists.
+// One selection, one dial; on a failure that leaves another member worth trying, one more
+// selection with the failed member excluded and one more dial. Never a third attempt, never a
+// fresh deadline, never an interruption of a connection that already exists.
+//
+// # Why the two classifiers are separate
+//
+// The retry decision (RetryThisFlow) is about the flow and may be permissive; the penalty
+// decision (PenalizeMemberGlobally) is about the member and must be conservative. They were
+// once one errno test, which is how a destination that was merely down could demote a healthy
+// member for every flow. See the two functions for the sets and the reasoning.
+//
+// # Why the budget is consumed only after every check
+//
+// The alternate is the flow's last dial, so it is not spent until a dial is actually about to
+// happen: a failure that is not retryable, an exhausted budget, a caller whose deadline is
+// already gone, and a selection that can name nobody all return before the counter moves.
+// That is what makes "a cancellation does not consume a retry it then does not use" true
+// rather than incidental.
 //
 // # Why the alternate is chosen by re-running the strategy
 //
@@ -469,11 +665,19 @@ func (g *LoadBalance) requestForcedRetest() {
 //
 // # Why the original error is what a failed retry returns
 //
-// Two path-dead failures are two facts, and both members are penalised for their own. The
-// error the caller sees is the FIRST one, because that is the failure of the member the
-// group chose: reporting the alternate's error would describe a member the caller never
-// heard of and hide the fact that the preferred choice is the one that failed.
+// Two failed attempts are two facts, and each member is penalised for its own. The error the
+// caller sees is the FIRST one, because that is the failure of the member the group chose:
+// reporting the alternate's error would describe a member the caller never heard of and hide
+// the fact that the preferred choice is the one that failed.
 func (g *LoadBalance) DialWithFailover(ctx context.Context, metadata *adapter.InboundContext, network string, destination M.Socksaddr) (net.Conn, error) {
+	if !g.failover {
+		// Both call sites refuse to reach here on an unopted group, so this is the honest
+		// answer for a direct caller rather than a business path: one committed selection,
+		// one dial, and not one touch of the failure ledger, which is the behaviour the group
+		// had before the retry existed.
+		return g.dialOnce(ctx, metadata, network, destination)
+	}
+	ctx, budget := failoverBudget(ctx)
 	members := g.snapshot()
 	if len(members) == 0 {
 		return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", g.Tag())
@@ -488,14 +692,27 @@ func (g *LoadBalance) DialWithFailover(ctx context.Context, metadata *adapter.In
 		g.recordProofOfLife(member)
 		return g.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 	}
-	if !isPathDeadDialError(err) {
+	if !RetryThisFlow(err) {
 		// The node answered, or the caller withdrew. A second member cannot fix either, and
-		// retrying on the caller's cancellation would turn one cancelled flow into two
-		// attempts on a context that is already done.
+		// the flow's one alternate is not spent on it.
 		return nil, err
 	}
-	if g.recordPenalty(member) >= loadBalancePenaltyThreshold {
-		g.requestForcedRetest()
+	if PenalizeMemberGlobally(member, err) {
+		if g.recordPenalty(member) >= loadBalancePenaltyThreshold {
+			g.requestForcedRetest()
+		}
+	}
+	if budget.remainingAlternates <= 0 {
+		// A nested group already spent the flow's alternate on its own retry. The budget is
+		// what turns "one alternate per group" into "one alternate per flow": without it this
+		// branch would dial a second chain and a two-level nesting could reach four attempts.
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		// The caller's deadline is already gone (or the flow was cancelled) after the first
+		// attempt. Starting a second on a context that can no longer complete would spend the
+		// alternate to produce nothing, so the budget is left intact.
+		return nil, err
 	}
 	alternate := g.selectForFlow(members, metadata, network, true, g.attempt(members, network, member))
 	if alternate == nil || alternate == member {
@@ -503,13 +720,14 @@ func (g *LoadBalance) DialWithFailover(ctx context.Context, metadata *adapter.In
 		// Reporting the original failure is the honest answer.
 		return nil, err
 	}
+	budget.remainingAlternates--
 	if g.logger != nil {
 		g.logger.Debug("loadbalance group ", g.Tag(), ": ", member.Tag(), " failed (", err, "), trying ", alternate.Tag())
 	}
 	alternateConn, alternateErr := g.dialMember(ctx, alternate, metadata, network, destination)
 	if alternateErr != nil {
-		if isPathDeadDialError(alternateErr) {
-			// Both paths are dead, and both facts are worth keeping: the alternate failed
+		if PenalizeMemberGlobally(alternate, alternateErr) {
+			// Both first hops failed, and both facts are worth keeping: the alternate failed
 			// for its own reason, not because the first member did.
 			g.recordPenalty(alternate)
 		}
@@ -526,15 +744,38 @@ func (g *LoadBalance) DialWithFailover(ctx context.Context, metadata *adapter.In
 	return g.interruptGroup.NewConn(alternateConn, interrupt.IsExternalConnectionFromContext(ctx)), nil
 }
 
+// dialOnce is the pre-failover behaviour: one committed selection, one dial, no ledger and no
+// retry.
+//
+// It exists so the compatibility guarantee has a single implementation to point at. A group
+// that did not opt in reaches it through DialWithFailover's guard, and the route path reaches
+// the equivalent behaviour by never asking for the capability at all.
+func (g *LoadBalance) dialOnce(ctx context.Context, metadata *adapter.InboundContext, network string, destination M.Socksaddr) (net.Conn, error) {
+	member := g.SelectForFlow(metadata, network, true)
+	if member == nil {
+		return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", g.Tag())
+	}
+	g.Touch()
+	conn, err := g.dialMember(ctx, member, metadata, network, destination)
+	if err != nil {
+		return nil, err
+	}
+	return g.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx)), nil
+}
+
 // dialMember dials one selected member.
 //
-// A member that is itself a failover-capable group is asked to dial through its OWN policy,
-// so a nested group's replacement stays inside the nested group: the outer group chose the
-// nested group, and which member inside it serves the flow is the nested group's decision.
-// Any other group is resolved to its leaf here - committing the nested choice, because the
-// connection this is for is real - and the leaf dials.
+// A member that is itself an OPTED-IN failover-capable group is asked to dial through its OWN
+// policy, so a nested group's replacement stays inside the nested group: the outer group chose
+// the nested group, and which member inside it serves the flow is the nested group's decision.
+// The nested call receives the same context, so it consumes the flow's shared budget instead of
+// starting a second one.
+//
+// A group that did NOT opt in - and any leaf - is resolved here, committing the nested choice,
+// because the connection this is for is real, and dialled exactly once. The opt-in of a member
+// is the member's own decision: an outer group cannot enable a nested group's retry.
 func (g *LoadBalance) dialMember(ctx context.Context, member adapter.Outbound, metadata *adapter.InboundContext, network string, destination M.Socksaddr) (net.Conn, error) {
-	if failover, isFailover := member.(adapter.FailoverOutboundGroup); isFailover {
+	if failover, isFailover := member.(adapter.FailoverOutboundGroup); isFailover && failover.FailoverEnabled() {
 		return failover.DialWithFailover(ctx, metadata, network, destination)
 	}
 	leaf, err := loadBalanceDialLeaf(member, metadata, network)

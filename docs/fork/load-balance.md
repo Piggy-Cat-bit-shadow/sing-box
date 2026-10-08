@@ -114,23 +114,74 @@ Refusing would turn a slow or misconfigured probe into an outage.
 
 ## Live dial failure feedback and failover
 
-A probe result is evidence about a node; it is not the only evidence. A member a check marked
-healthy that then times out on real traffic is fed back into selection, and the flow that
-failed it is retried against one alternate.
+A probe result is evidence about a node; it is not the only evidence. When failover is enabled, a
+member a check marked healthy that then fails real traffic is fed back into selection, and the
+flow that failed it is retried against one alternate.
 
-A dial failure is classified before it concludes anything:
+Failover is **opt-in** and off by default:
 
-| Failure | Classification | What the group does |
-| --- | --- | --- |
-| target refused (`ECONNREFUSED`), remote reset (`ECONNRESET`) | neutral | reports the error, no penalty, no retry |
-| caller cancelled (`context.Canceled`) | neutral | reports the error, no penalty, no retry |
-| timeout (`context.DeadlineExceeded`, `os.ErrDeadlineExceeded`, any `net.Error` with `Timeout()`) | **path dead** | one penalty, one alternate |
-| unreachable (`EHOSTUNREACH`, `ENETUNREACH`, `ETIMEDOUT`) | **path dead** | one penalty, one alternate |
+```json
+{
+  "type": "loadbalance",
+  "tag": "proxy",
+  "outbounds": ["hy2", "tuic"],
+  "strategy": "round_robin",
+  "failover": true
+}
+```
 
-Only a path-dead failure earns a penalty, because only that proves the attempt never reached an
-answer — which is also the only condition under which a second attempt cannot have been observed
-by the destination. A node that carried the connection perfectly can produce every neutral
-failure, so none of them says anything about the node.
+This is a compatibility guarantee, not a tuning knob. Before the option existed the group made
+exactly one dial attempt per flow and never recorded a failure; an upgrade must not silently
+rewrite "a timeout reports an error" into "a timeout dials another member". With the field absent
+the group does not even advertise the failover capability, so the route path resolves and dials it
+through the code that existed before the feature — one attempt, no penalty, no retry.
+
+When enabled, a successful first dial is still the end of the story: one flow, one attempt, no
+second-guessing. `round_robin`, `consistent_hashing` and `sticky_sessions` are unchanged in the
+normal case; the retry is a replacement for a dead path, not a second selection policy.
+
+### Two classifiers, not one errno
+
+A failure is asked two different questions, and they have deliberately different answers, because
+the two situations below produce an *identical* final error:
+
+```text
+client -> member endpoint      OK
+member -> blocked destination  timeout
+```
+
+Treating that timeout as "the member is dead" would demote a healthy member for every destination
+a client retries. So the flow-level and member-level decisions are separate:
+
+**Retry the flow** (`RetryThisFlow`) — "would this flow have a chance on another member?" This one
+is relatively permissive; the flow's alternate is bounded, and nothing has been delivered yet.
+
+| Failure | Retried? |
+| --- | --- |
+| timeout (`context.DeadlineExceeded`, `os.ErrDeadlineExceeded`, any `net.Error` with `Timeout()`, `ETIMEDOUT`) | yes |
+| unreachable (`ENETUNREACH`, `EHOSTUNREACH`, `EADDRNOTAVAIL`, `ENETDOWN`) | yes |
+| endpoint refused (`ECONNREFUSED`) | yes — another member's endpoint may be listening |
+| caller cancelled (`context.Canceled`), closed by this process (`net.ErrClosed`) | no |
+| reset (`ECONNRESET`), `io.EOF`, anything unclassified | no |
+
+**Penalise the member globally** (`PenalizeMemberGlobally`) — "is this member's own first hop
+broken?" This one is conservative, and it is the reason the split exists.
+
+| Failure | Penalty? |
+| --- | --- |
+| `ECONNREFUSED` on a proxying member | yes — the member's own listener refused, before any proxying |
+| `EHOSTUNREACH`, `ENETUNREACH` on a proxying member | yes — the member's own route is gone |
+| **any timeout** | **no** — a first-hop timeout and a destination-side timeout are the same error |
+| `EADDRNOTAVAIL`, `ENETDOWN` | no — local interface state that every member shares |
+| `ECONNRESET`, `io.EOF` | no — possibly the remote destination answering and closing |
+| anything on a `direct` or `block` member | no — that member dials the *destination*, so the errno describes the target |
+
+The dial stack carries no stage tag: this fork's proxy outbounds return their first-hop transport
+error unwrapped, and a destination-side failure is reported in band, on the connection. The one
+structural fact available is the member's own kind, which is why a `direct` or `block` member never
+earns a global penalty. Where evidence cannot justify a global verdict, the flow still gets its
+retry and the ledger stays empty. The practical consequence is that a member which *blackholes*
+rather than refusing is not demoted by live traffic; only a health probe retires it.
 
 **Penalty.** One counter per member. At `3` the member is *demoted*: it leaves the primary
 rotation. Demotion never deletes health evidence and never interrupts an existing connection. A
@@ -153,16 +204,24 @@ selection time — no timer, no sweeper goroutine. This is safe because demotion
 an expired record makes the member a candidate again, and it can only clear itself for real by
 carrying a connection.
 
-**Bounded retry.** On a path-dead failure the group re-runs its own selection with the failed
-member excluded and dials **one** alternate — two dial attempts per call, never a scan of the
-member list. The retry runs on the caller's context, so it shares the remaining deadline. If the
-alternate also fails, the **original** error is returned: that is the failure of the member the
-group chose. A successful fallback moves the selection (the rotation, or the sticky pin) and is
-logged.
+**Bounded retry — one budget for the whole flow.** On a failure worth retrying the group re-runs
+its own selection with the failed member excluded and dials **one** alternate. The budget belongs
+to the user *flow*, not to a group call: a chain such as `outer -> inner` spends **one** alternate
+in total, so two dial attempts for the entire chain, no matter how deeply it nests. A per-group
+bound would multiply — `outer #1 -> inner #1, inner #2; outer alternate -> inner #3, inner #4` —
+so the budget is carried in the context, created by the outermost capability dial and consumed by
+every nested one. It owns no lock, no goroutine and no timer, and it is not spent on an attempt
+that never starts: a failure that is not retryable, a caller whose deadline has already gone, or a
+selection that can name nobody returns before the counter moves.
+
+The retry runs on the caller's context, so it shares the remaining deadline. If the alternate also
+fails, the **original** error is returned: that is the failure of the member the group chose. A
+successful fallback moves the selection (the rotation, or the sticky pin) and is logged.
 
 The retry lives behind the optional `adapter.FailoverOutboundGroup` capability, which the route
-path asks the matched outbound for. A group that does not implement it — every other group type —
-resolves and dials exactly as before.
+path asks the matched outbound for and which a group only advertises when its configuration opted
+in. Every other group type, and every group that did not opt in, resolves and dials exactly as
+before.
 
 ## Network compatibility
 
