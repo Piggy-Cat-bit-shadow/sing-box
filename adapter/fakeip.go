@@ -16,10 +16,15 @@ type FakeIPStore interface {
 
 type FakeIPStorage interface {
 	FakeIPMetadata() *FakeIPMetadata
+	// FakeIPSaveMetadata persists the address cursor synchronously. Do not add an
+	// async variant back: the store reserves a window of addresses ahead of the
+	// persisted cursor and rewrites the metadata once per window, so the cursor on
+	// disk already leads every address handed out. Buffering that one write per
+	// window only makes the reservation pointless: while the write sits in the
+	// batch the cursor on disk is at an address that was already issued, and a
+	// crash then makes the next start re-issue addresses that clients may still
+	// hold mappings for.
 	FakeIPSaveMetadata(metadata *FakeIPMetadata) error
-	// FakeIPSaveMetadataAsync writes the metadata without blocking the allocation path; the
-	// buffered cache file coalesces the writes. Added by upstream's storage-consistency fix.
-	FakeIPSaveMetadataAsync(metadata *FakeIPMetadata)
 	FakeIPStore(address netip.Addr, domain string) error
 	FakeIPStoreAsync(address netip.Addr, domain string, logger logger.Logger)
 	FakeIPLoad(address netip.Addr) (string, bool)

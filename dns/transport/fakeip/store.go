@@ -133,6 +133,13 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 	} else if isIPv6 && !s.inet6Current.IsValid() {
 		return netip.Addr{}, E.New("missing IPv6 fakeip address range")
 	}
+	// Advance and persist the cursor a whole window ahead of the addresses this
+	// store is about to hand out, and then leave the metadata alone until the
+	// window is exhausted. The allocation path therefore never depends on a
+	// metadata write that could still be buffered when the process dies: whatever
+	// point it dies at, the cursor on disk is already past every address issued in
+	// this window, so a restart resumes past them instead of re-issuing addresses
+	// that are still live.
 	if s.reservedCount == 0 {
 		metadata := &adapter.FakeIPMetadata{
 			Inet4Range:   s.inet4Range,
@@ -164,12 +171,6 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 		address = s.inet6Current
 	}
 	s.storage.FakeIPStoreAsync(address, domain, s.logger)
-	s.storage.FakeIPSaveMetadataAsync(&adapter.FakeIPMetadata{
-		Inet4Range:   s.inet4Range,
-		Inet6Range:   s.inet6Range,
-		Inet4Current: s.inet4Current,
-		Inet6Current: s.inet6Current,
-	})
 	return address, nil
 }
 

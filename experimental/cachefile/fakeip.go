@@ -1,6 +1,7 @@
 package cachefile
 
 import (
+	"bytes"
 	"net/netip"
 	"os"
 
@@ -19,9 +20,20 @@ var (
 	keyMetadata         = []byte(fakeipBucketPrefix + "metadata")
 )
 
+// FakeIPMetadata reads the persisted address cursor without consuming it. This runs
+// on the FakeIP store's Start path, so it must stay a read-only view: the previous
+// implementation used a write batch that deleted the key, which took the single
+// write lock during startup and destroyed the only persisted copy of the cursor.
+// The delete is committed before the call returns, so afterwards the cursor exists
+// only in the caller's memory until the store saves it again (the next reserved
+// window, or Close). A process that died in between left no metadata at all, and
+// the next Start then takes the metadata == nil branch, resets the whole FakeIP
+// bucket, and starts re-issuing from the beginning of the range — wiping every
+// cached domain mapping and handing addresses to different domains while clients
+// may still resolve the old ones.
 func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 	var metadata adapter.FakeIPMetadata
-	err := c.batch(func(tx *bbolt.Tx) error {
+	err := c.view(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketFakeIP)
 		if bucket == nil {
 			return os.ErrNotExist
@@ -29,10 +41,6 @@ func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 		metadataBinary := bucket.Get(keyMetadata)
 		if len(metadataBinary) == 0 {
 			return os.ErrInvalid
-		}
-		err := bucket.Delete(keyMetadata)
-		if err != nil {
-			return err
 		}
 		return metadata.UnmarshalBinary(metadataBinary)
 	})
@@ -42,18 +50,19 @@ func (c *CacheFile) FakeIPMetadata() *adapter.FakeIPMetadata {
 	return &metadata
 }
 
+// FakeIPSaveMetadata stages the cursor and flushes immediately. Flush takes
+// pendingAccess itself, so the lock is released explicitly before calling it
+// (a defer would deadlock). The caller — the FakeIP store — only calls this once
+// per reserved address window plus once on Close, so blocking here is cheap and
+// keeps the cursor on disk ahead of the addresses issued from that window.
 func (c *CacheFile) FakeIPSaveMetadata(metadata *adapter.FakeIPMetadata) error {
-	c.FakeIPSaveMetadataAsync(metadata)
-	c.Flush()
-	return nil
-}
-
-func (c *CacheFile) FakeIPSaveMetadataAsync(metadata *adapter.FakeIPMetadata) {
 	c.pendingAccess.Lock()
-	defer c.pendingAccess.Unlock()
 	added := c.pending.fakeIPMetadata == nil
 	c.pending.fakeIPMetadata = metadata
 	c.enqueueLocked(added, 0)
+	c.pendingAccess.Unlock()
+	c.Flush()
+	return nil
 }
 
 func putFakeIPMetadata(tx *bbolt.Tx, metadata *adapter.FakeIPMetadata) error {
@@ -78,24 +87,34 @@ func (c *CacheFile) FakeIPStoreAsync(address netip.Addr, domain string, logger l
 	c.queueFakeIP(address, domain)
 }
 
+// queueFakeIP records a new address allocation in the pending batch. The replaced
+// mapping is looked up through FakeIPLoad, not just through the pending map: the
+// address may already be persisted by an earlier batch, in which case the old
+// domain still exists in the on-disk reverse bucket and would otherwise be handed
+// out (and size-accounted) as if it were still live. The old domain's reverse
+// entry is left as an explicit tombstone rather than deleted, because putFakeIP
+// may legitimately keep the on-disk entry (the domain may have been re-mapped to
+// another address since), and a plain delete would then let the stale on-disk
+// address leak back out through FakeIPLoadDomain.
 func (c *CacheFile) queueFakeIP(address netip.Addr, domain string) {
+	oldDomain, loaded := c.FakeIPLoad(address)
 	c.pendingAccess.Lock()
 	defer c.pendingAccess.Unlock()
-	oldDomain, loaded := c.pending.fakeIPDomain[address]
 	if loaded {
 		if address.Is4() {
-			delete(c.pending.fakeIPAddress4, oldDomain)
+			c.pending.fakeIPAddress4[oldDomain] = netip.Addr{}
 		} else {
-			delete(c.pending.fakeIPAddress6, oldDomain)
+			c.pending.fakeIPAddress6[oldDomain] = netip.Addr{}
 		}
 	}
+	pendingDomain, pendingLoaded := c.pending.fakeIPDomain[address]
 	c.pending.fakeIPDomain[address] = domain
 	if address.Is4() {
 		c.pending.fakeIPAddress4[domain] = address
 	} else {
 		c.pending.fakeIPAddress6[domain] = address
 	}
-	c.enqueueLocked(!loaded, len(domain)-len(oldDomain))
+	c.enqueueLocked(!pendingLoaded, len(domain)-len(pendingDomain))
 }
 
 func putFakeIP(tx *bbolt.Tx, address netip.Addr, domain string) error {
@@ -117,7 +136,12 @@ func putFakeIP(tx *bbolt.Tx, address netip.Addr, domain string) error {
 	if err != nil {
 		return err
 	}
-	if oldDomain != nil {
+	// A forward entry can outlive its reverse entry: the same domain may have been
+	// re-mapped to another address (which overwrote the reverse bucket) while this
+	// address still points at it in the forward bucket. Deleting the reverse entry
+	// here unconditionally would tear down a mapping that is still live for the
+	// other address, so only delete it when it still points back at this address.
+	if oldDomain != nil && bytes.Equal(bucket.Get(oldDomain), addressBytes) {
 		err = bucket.Delete(oldDomain)
 		if err != nil {
 			return err
@@ -164,7 +188,11 @@ func (c *CacheFile) FakeIPLoadDomain(domain string, isIPv6 bool) (netip.Addr, bo
 	}
 	c.pendingAccess.RUnlock()
 	if cached {
-		return address, true
+		// A pending entry with an invalid address is a tombstone written by
+		// queueFakeIP for a domain whose mapping was replaced; report it as not
+		// loaded so the caller falls through to a fresh policy evaluation instead
+		// of resolving the domain to a stale on-disk address.
+		return address, address.IsValid()
 	}
 	_ = c.view(func(tx *bbolt.Tx) error {
 		var bucket *bbolt.Bucket
