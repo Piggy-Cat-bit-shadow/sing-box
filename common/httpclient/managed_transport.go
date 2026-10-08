@@ -139,13 +139,38 @@ func (t *ManagedTransport) RoundTrip(request *http.Request) (*http.Response, err
 	return response, roundTripErr
 }
 
+// CloseIdleConnections releases the epoch's idle connections and keeps the epoch itself.
+//
+// # Why the epoch is NOT swapped out here
+//
+// This used to be Reset's body minus the cheap rebuild: Swap(nil), close the old epoch's idle
+// connections, retire it. Swapping is what makes the difference, and it is the wrong difference for
+// a trim. The pointer becoming nil is indistinguishable, at the next RoundTrip, from "no transport
+// has been built yet", so getEpoch runs the factory - a NEW inner transport, a new base TLS config
+// consumer, a new socket pool - and every request issued after the swap races a live stream on the
+// OLD epoch: two transports dialing the same server at once, which is more connections and more
+// memory than the trim released. It also discards the inner transport's remembered verdicts (the
+// H3-broken memory, most visibly) on a network they were still true for, so the next request
+// re-learns them at the cost of a failed dial.
+//
+// The two callers that must replace the inner transport both go through Reset, which is where the
+// generation boundary lives: DNS ResetNetwork and the reference manager's unreferenced-transport
+// reset. CloseIdleConnections is reached from the memory-trim pass, from a pause, from an
+// unreferenced outbound and from a one-shot probe's defer - every one of them wants the pools
+// dropped, not the transport replaced. A trim that replaced it would be a reconnect trigger
+// wearing a memory-management name, which is the shape the memory-pressure path must not have.
+//
+// # Live streams
+//
+// The deferred close is untouched: the active count on the epoch still governs when the transport
+// is torn down, so a stream mid-body keeps its connection until the body is closed. Nothing here
+// waits on one either, which is what keeps the ramp-beside-a-blocked-writer teardown bounded.
 func (t *ManagedTransport) CloseIdleConnections() {
-	oldEpoch := t.epoch.Swap(nil)
-	if oldEpoch == nil {
+	epoch := t.epoch.Load()
+	if epoch == nil {
 		return
 	}
-	oldEpoch.transport.CloseIdleConnections()
-	t.retireEpoch(oldEpoch)
+	epoch.transport.CloseIdleConnections()
 }
 
 func (t *ManagedTransport) Reset() {

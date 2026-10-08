@@ -100,6 +100,13 @@ func TestManagedTransportCloseDoesNotRebuild(t *testing.T) {
 }
 
 // Closing idle connections must not rebuild: a trim that caused a dial would not be a trim.
+//
+// The assertion that catches the real defect is the REQUEST AFTER the trim. An earlier version of
+// this test only compared built.Load() across the CloseIdleConnections call itself, which the old
+// implementation passed while still swapping the epoch to nil: the rebuild was lazy, so it landed
+// on the next RoundTrip instead of inside the call. The next request then built a SECOND transport
+// while a stream could still be live on the first, and every post-trim request dialed through a
+// pool the trim had just emptied for no reason.
 func TestManagedTransportCloseIdleConnectionsDoesNotRebuild(t *testing.T) {
 	t.Parallel()
 	var built atomic.Int64
@@ -116,10 +123,23 @@ func TestManagedTransportCloseIdleConnectionsDoesNotRebuild(t *testing.T) {
 	require.NoError(t, response.Body.Close())
 
 	before := built.Load()
+	epochBefore := transport.epoch.Load()
+	require.NotNil(t, epochBefore)
 	transport.CloseIdleConnections()
 	require.EqualValues(t, before, built.Load(),
 		"releasing idle connections must not rebuild the transport")
 	require.EqualValues(t, 1, idleClosed.Load())
+	require.Same(t, epochBefore, transport.epoch.Load(),
+		"the trim must keep the epoch: a nil epoch means the next request builds a second "+
+			"transport beside any stream still running on the first")
+
+	// The request after the trim is where a swap would surface.
+	response, err = transport.RoundTrip(newTestRequest())
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	require.EqualValues(t, before, built.Load(),
+		"the request after a trim must reuse the transport it trimmed; building one would "+
+			"make the trim a reconnect trigger")
 }
 
 type fakeInnerTransport struct {
