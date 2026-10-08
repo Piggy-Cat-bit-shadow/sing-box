@@ -40,7 +40,6 @@ require (
 	github.com/sagernet/fswatch v0.1.2
 	github.com/sagernet/gliderssh v0.3.4-0.20260531100337-2194faca5648
 	github.com/sagernet/gomobile v0.1.12
-	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf
 	github.com/sagernet/nftables v0.3.0-mod.4
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.9
@@ -55,7 +54,7 @@ require (
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b
 	github.com/sagernet/sing-shadowtls v0.2.2-0.20260928201441-a9c0127d5c99
 	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f
-	github.com/sagernet/sing-tun v0.9.7-0.20261006124248-d769a7080ca2
+	github.com/sagernet/sing-tun v0.9.7-0.20261007151655-7539c9855f19
 	github.com/sagernet/sing-usbip v0.0.0-20260817040617-28bd42667eca
 	github.com/sagernet/sing-vmess v0.2.9-0.20260929152519-9b95ab8c9478
 	github.com/sagernet/smux v1.5.50-sing-box-mod.1
@@ -171,6 +170,7 @@ require (
 	github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f // indirect
 	github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260929213014-a1cafd93eb1f // indirect
 	github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260929213014-a1cafd93eb1f // indirect
+	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 // indirect
 	github.com/smallstep/pkcs7 v0.1.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
@@ -290,26 +290,41 @@ replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v
 // Upstream dev still returns bare on that error (checked 2026-10-08), so the fix is carried here.
 //
 // Fork: github.com/Piggy-Cat-bit-shadow/sing-tun (a fork of SagerNet/sing-tun)
-//   base:   d769a7080ca203f63735ba93e95014e363e25d62  (= the version this replaces)
-//   branch: fix/acceptloop-selfheal @ 1cd9bc2216df5edd8e2d5b684d05f32c1dc72835
+//   base:   7539c9855f19bb51a75f0908ecf6ae1d2d749490  (= the version this replaces)
+//   branch: sync/go-stack-plus-040 @ 46cfb7ff31fea7c2015b02f8126aae12af2baf4c
 //   change: stack_system.go only - classify the accept error, re-bind on an unexpected failure,
 //           bounded backoff, never resurrect the listener after Close, plus its regression tests.
 //   remove: when upstream makes acceptLoop recover on its own. verify-upstream-assumptions.sh
 //           checks the pin really is this fork and probes upstream on every run.
+// The branch is based on the revision the Go TUN stack is written against rather than on the
+// previous pin, because the previous pin (d769a7080ca2) is an upstream revision that upstream has
+// since rewritten out of `dev`; carrying the fix on a dead base would ship a stack revision nobody
+// else has tested. Every upstream branch still ends the accept loop on any error (checked
+// 2026-10-08), so the fix is still the only thing standing between an unexpected accept failure and
+// a permanently dead TCP path while UDP/QUIC keep working.
 // See docs/fork/lx-stability-audit-phase1.md (040) and FORK.md in the fork.
-replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df
+replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008131128-46cfb7ff31fe
 
-// The gVisor netstack is a shipped stack on Android (with_gvisor), and the pinned upstream
-// dereferences the TCP endpoint's handshake after checking only the endpoint state. The
-// handshake is cleared before the endpoint leaves the connecting state, so a late segment can
-// hit a nil handshake inside gVisor's own goroutine - an unrecoverable process crash.
+// gVisor is RETIRED, and this is deliberately a comment rather than a replace directive.
 //
-// Fork: github.com/Piggy-Cat-bit-shadow/gvisor (a fork of SagerNet/gvisor, branch go)
+// LX 048 was real: the pinned gVisor dereferences the TCP endpoint's handshake after checking only
+// the endpoint state, and the handshake is cleared before the endpoint leaves the connecting state,
+// so a late segment could hit a nil handshake inside gVisor's own goroutine - an unrecoverable
+// process crash. The dependency fork below was the correct response WHILE gVisor shipped.
+//
+// gVisor no longer ships: the Android UI stopped depending on "stack": "mixed"/"gvisor" and the Go
+// TUN stack replaced that code path, so no shipped variant compiles with_gvisor any more. The
+// exposure is gone, so the replacement is gone with it.
+//
+// Retired fork, preserved for the record (NOT deleted on the remote):
+//   github.com/Piggy-Cat-bit-shadow/gvisor
 //   base:   e9989ea3436fa7e226f61a2bcd64f38fb42b23d4  (= tag v0.0.0-20260727.0-sing-box-mod.1)
 //   branch: fix/tcp-handshake-nil-guard @ 0ef874d4b88c6c0bd09924e6d18142b8d2f81475
-//   change: pkg/tcpip/transport/tcp/dispatcher.go only - guard the nil handshake on the same
-//           unlock-and-return path the state check uses, plus its regression tests.
-//   remove: when upstream guards it. verify-upstream-assumptions.sh checks the pin and probes
-//           upstream on every run.
-// See docs/fork/lx-stability-audit-phase1.md (048) and FORK.md in the fork.
-replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor v0.0.0-20261008084547-0ef874d4b88c
+//
+// `github.com/sagernet/gvisor` therefore stays in the module graph only as a transitive
+// requirement of sing-tun, which still contains with_gvisor-tagged packages; it must remain
+// `// indirect` and must never be imported by this module again. The hard invariant lives in
+// cmd/internal/build_libbox/tag_policy_test.go (TestGVisorIsRetiredFromTheModuleGraph) and
+// scripts/ci/verify-upstream-assumptions.sh.
+//
+// See docs/fork/lx-stability-audit-phase1.md (048) and docs/fork/upstream-sync-2026-10.md.
