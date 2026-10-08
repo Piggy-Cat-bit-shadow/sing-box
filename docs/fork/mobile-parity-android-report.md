@@ -5,25 +5,65 @@ what is Apple-only, what is deferred, and — most importantly — **what was no
 
 ---
 
-## HEADLINE: one decision is NOT made
+## HEADLINE: Android ships `with_low_memory` — ENABLED on evidence
 
-**Android does not ship `with_low_memory`, and I did not enable it.**
+**Both Android variants now build the low-memory geometry.** The decision was made from measurement,
+not from "phones have less memory", and the numbers are below.
 
-The brief is explicit that the tag must not be enabled on the strength of "phones have less memory",
-and must be justified by measurement. The measurement package (`common/bufgeom`) is built, documented
-and green, but the benchmark comparison **was still running when this phase closed**. Enabling the tag
-without its numbers would be exactly the reasoning the brief forbids, and enabling it is a one-line
-change that can be made in minutes once the table exists.
+> **Correction.** An earlier revision of this document said the opposite — that the tag was not
+> enabled and the benchmark was still running. That was true when it was written and became false
+> when the geometry landed in `cmd/internal/build_libbox/main.go`. The contradiction is recorded
+> rather than quietly edited away, because the way it happened is the lesson: the geometry edits were
+> swept into an unrelated commit by a broad `git add` of the builder directory, so the code moved
+> ahead of the document that described it.
 
-So: geometry is **NOT enabled**, and the reason is "the evidence is not finished", not "it seemed
-risky". `common/bufgeom/doc.go` records the confound that makes the measurement non-trivial — the tag
-also flips `sing.LowMemory`, which changes which copy loop `copyExtended` enters for sources whose read
-waiter needs a copy. Socket sources report `needCopy=false` and take the pooled loop in both
-geometries, so the socket benchmarks isolate buffer size; that is a property of those sources, not of
-the tag.
+### The measured case (HOST BENCHMARK — Apple M1, loopback, in-process; never device or battery)
 
-Also not finished: the Android **Kotlin client wiring**. The core API and policy are complete and
-tested; the app-side calls are specified in §"Device validation" below.
+Live heap per flow, 2 buffers per flow, GC-observed and deterministic:
+
+| flows | standard per-flow | low-memory per-flow | standard total | low-memory total |
+| --- | --- | --- | --- | --- |
+| 32 | 65664 B (64.1 KiB) | 32896 B (32.1 KiB) | 2052 KiB | 1028 KiB |
+| 128 | 65664 B | 32896 B | 8208 KiB | 4112 KiB |
+| 512 | 65664 B | 32907 B | 32.06 MiB | 16.07 MiB |
+
+**16.0 MiB saved at 512 flows**, and the halving is exact and geometry-determined rather than a
+measurement artefact.
+
+### Why bulk TCP does not pay for it — proven, not argued
+
+`copyExtended` grows the read buffer past its 512 KiB threshold to 65535 bytes in **both** geometries,
+so bulk transfer is not geometry-bound. `TestCopyLoopGrowsPastTheGeometry` records what a real 8 MiB
+copy actually hands over: largest buffer capacity **65535 in both**, ~191 `WriteBuffer` calls. The
+benchmark agrees (`max-buffer-cap` 65540/65540). Only a flow's **first 512 KiB** and the
+geometry-bound upload paths see the smaller buffers.
+
+### The honest cost
+
+| path | effect |
+| --- | --- |
+| plain-socket TCP / UDP / latency / concurrency | **no resolvable difference** — sample ranges overlap in both directions |
+| a flow's first 512 KiB | 8 → 16 writes per 256 KiB, 15 → 22 allocs (2× loop iterations) |
+| Shadowsocks MTU-advertised upload | `ShadowRealCopyLoop/writer-mtu` **+4.1% time, +80% allocs**; `ShadowMTUWrappedPath` **+19.4% time, +71% allocs** |
+
+That last row is the real price and it is bounded: `WriterMTU = BufferSize − 34`, so halving the
+geometry doubles that loop's buffer count. Accepted in exchange for halving resident buffers — and it
+is the geometry iOS and tvOS already ship.
+
+### Correctness
+
+Full suites **both ways**: 67 `ok` each, with **identical** failures (all pre-existing:
+`common/tlsfragment` needs external network, `experimental/libbox` test-binary `runtime.fwdSig`). The
+framing-boundary regression that is *recorded as the reason this tag is dangerous* — the SS2022 over
+ShadowTLS v3 `panic: buffer overflow` — is covered by all 14 `TestStreamMTU_*` tests, which pass in
+**both** geometries, including `TestStreamMTU_OldImplementationWouldFail`. The repo's own gate
+`scripts/ci/test-low-memory.sh` passes and now covers the Android composition too.
+
+**A methodology finding worth keeping:** a naive standard-then-low-memory run reported a uniform 2–5×
+regression *including in a metric where buffers are provably identical*. TIME_WAIT accumulation had
+degraded the host partway through, so whichever geometry ran second measured a sicker machine. Fixed
+with `SO_LINGER(0)` teardown and order-alternated sampling. Socket A/B numbers without that control
+are not trustworthy.
 
 ---
 
@@ -45,7 +85,7 @@ tested; the app-side calls are specified in §"Device validation" below.
 | Handover coalescing | core | don't storm; don't swallow | **already correct** | **ANDROID EQUIVALENT** | proven, no debounce added | `handover_coalescing_test.go` |
 | Expensive / constrained | `NetworkInterface` | probe pacing, background suppression | **already wired** | **ALREADY SHARED** | sources confirmed | `TestNetworkInterfaceExpensiveAndConstrainedHaveAndroidSources` |
 | Idle pool retirement | core | retire idle only, never a live stream | **shared** | **ALREADY SHARED** | unchanged | per-pool tests |
-| Low-memory geometry | `with_low_memory` | halve the steady-state buffer | **absent** | **DEFER** | **not enabled** — see headline | `common/bufgeom` (measurement) |
+| Low-memory geometry | `with_low_memory` | halve the steady-state buffer | absent | **PORT** | **enabled for both Android variants** | `common/bufgeom`, `TestAndroidShipsTheMobileGeometry`, `scripts/ci/test-low-memory.sh` |
 | MSL / 50 MiB budget | NetworkExtension | — | — | **APPLE ONLY** | not copied | — |
 | Darwin dispatch source | `service_darwin.go` | — | — | **APPLE ONLY** | not copied | — |
 | Apple screen / entitlement APIs | Apple | — | — | **APPLE ONLY** | not copied | — |
@@ -57,10 +97,10 @@ tested; the app-side calls are specified in §"Device validation" below.
 ```
 portable mobile optimisations audited   17
 already shared (core, Android free)      8
-ported to Android this round             4
+ported to Android this round             5  (incl. the low-memory geometry)
 Android-equivalent (different mechanism) 1
 Apple-only, not portable                 3
-deferred with a reason                   2  (low-memory geometry, Cronet/DoQ/DoH3 trim)
+deferred with a reason                   1  (Cronet/DoQ/DoH3 trim)
 ```
 
 Nothing was ported to make a number look better, and nothing portable was left unported for
@@ -166,7 +206,8 @@ pre-existing failures (`common/tlsfragment` — external network; `experimental/
 
 ## Remaining risks
 
-1. **The low-memory decision is open** (headline). It is a small, reversible change waiting on data.
+1. **The low-memory decision is made and measured** — but on a HOST, not a device. The geometry is
+   reversible in one line if a device shows the Shadowsocks upload path costing more than it is worth.
 2. **The trim mapping is provisional** and unvalidated on any OEM.
 3. **No Kotlin wiring**, so no Android-side end-to-end test exists yet; the core is tested, the app is
    not.

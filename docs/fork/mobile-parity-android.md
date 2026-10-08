@@ -13,7 +13,11 @@ Almost everything turned out to be already on the right side of that line. The m
 network generation, the trim chain, the background-probe marker and the idle-resource rules all live
 in core and are platform-neutral, so Android was already receiving them. What was Apple-specific was
 the **signal source** — Darwin's memory-pressure dispatch source — and one **compile-time geometry**
-tag.
+tag, which Android now ships on measured evidence.
+
+The four things Android actually gained: the platform event API, the trim-level mapping, the
+lifecycle axes, and the low-memory geometry. Everything else was already shared or already
+equivalent.
 
 ## 2. Build-tag layering
 
