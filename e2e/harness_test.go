@@ -57,6 +57,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/trafficclass"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	singtun "github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
@@ -94,36 +95,59 @@ type chain struct {
 // a product bug. A configuration error is never retried - it is reported with the full text.
 func startChain(t *testing.T, configJSON string) *chain {
 	t.Helper()
-	ctx, cancel := context.WithCancel(include.Context(context.Background()))
-	require.NotEmpty(t, configJSON)
+	return startChainWithWriter(t, configJSON, nil)
+}
+
+// startChainWithWriter is startChain with the box's platform log writer supplied by the test.
+//
+// The writer is a production interface - it is how the mobile clients forward the box's log - and
+// it is the only in-process observation point the box offers that is taken on every start. A test
+// uses it to observe WHEN the box reports something, and, by blocking, to hold the reporting
+// goroutine while it decides what the box does next.
+func startChainWithWriter(t *testing.T, configJSON string, platformLogWriter log.PlatformWriter) *chain {
+	t.Helper()
 	var (
-		instance *box.Box
-		err      error
+		result *chain
+		err    error
 	)
 	for attempt := 0; attempt < 3; attempt++ {
-		var options option.Options
-		err = options.UnmarshalJSONContext(ctx, []byte(configJSON))
-		if err != nil {
-			cancel()
-			t.Fatalf("configuration was rejected before the box was built: %v\n--- config ---\n%s", err, configJSON)
-		}
-		instance, err = box.New(box.Options{Context: ctx, Options: options})
-		if err != nil {
-			cancel()
-			t.Fatalf("box.New failed: %v\n--- config ---\n%s", err, configJSON)
-		}
-		err = instance.Start()
+		result = buildChain(t, configJSON, platformLogWriter)
+		err = result.instance.Start()
 		if err == nil {
 			break
 		}
-		instance.Close()
+		result.closeNow()
 		if !strings.Contains(err.Error(), "address already in use") {
-			cancel()
 			t.Fatalf("box.Start failed: %v\n--- config ---\n%s", err, configJSON)
 		}
 		t.Logf("port collision on attempt %d, retrying: %v", attempt, err)
 	}
 	require.NoError(t, err, "box.Start never succeeded")
+	return result
+}
+
+// buildChain builds a box from configJSON without starting it, so a test can drive Start itself -
+// from its own goroutine, or with something held open inside it. The box is closed at cleanup
+// whether or not the test ever starts it.
+func buildChain(t *testing.T, configJSON string, platformLogWriter log.PlatformWriter) *chain {
+	t.Helper()
+	ctx, cancel := context.WithCancel(include.Context(context.Background()))
+	require.NotEmpty(t, configJSON)
+	var options option.Options
+	err := options.UnmarshalJSONContext(ctx, []byte(configJSON))
+	if err != nil {
+		cancel()
+		t.Fatalf("configuration was rejected before the box was built: %v\n--- config ---\n%s", err, configJSON)
+	}
+	instance, err := box.New(box.Options{
+		Context:           ctx,
+		Options:           options,
+		PlatformLogWriter: platformLogWriter,
+	})
+	if err != nil {
+		cancel()
+		t.Fatalf("box.New failed: %v\n--- config ---\n%s", err, configJSON)
+	}
 	result := &chain{t: t, instance: instance, ctx: ctx, cancel: cancel, tracker: newFlowRecorder()}
 	instance.Router().AppendTracker(result.tracker)
 	t.Cleanup(func() {

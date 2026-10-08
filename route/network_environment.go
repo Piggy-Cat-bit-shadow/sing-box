@@ -62,6 +62,65 @@ func (r *NetworkManager) updateNetworkEnvironment() {
 	r.boundEnvironmentTransitionExported(token)
 }
 
+// EstablishInitialNetworkEnvironment publishes and bounds the box's FIRST environment observation,
+// and returns only once that boundary has run.
+//
+// # Why the first observation is a step of Start rather than a background update
+//
+// The first observation is not a network change: there is no previous network for anything to
+// belong to. It is still a transition in the machinery - the fingerprint moves from the zero value,
+// an epoch is claimed, the network is marked unsettled, the reset body re-pins every transport to
+// the network the box is actually on, and the transition commits - and through the ordinary update
+// path that whole sequence runs on a goroutine spawned during StartStatePostStart.
+//
+// Being a goroutine, it could land arbitrarily late: after Start had returned, while a caller's
+// first connection was in flight. Such a connection was dialled on the network the box was merely
+// LEARNING, and the transition refused it - "network changed while dialling" from the dialer's epoch
+// guard, or a cancelled dial setup context from ConnectionManager.Reclaim - so the first connection
+// through a freshly started box failed on a network that had not changed. Measured on this tree: 1
+// of 300 isolated starts, and it is the only defect that reproduces in both -race runs of the e2e
+// suite.
+//
+// So the box does not report itself started until its network manager is on a network it has
+// observed. The caller is the composition root, after its last start stage, so the reset body
+// reaches components that have finished starting instead of racing them - which is what the
+// background update was doing anyway, only non-deterministically.
+//
+// # What this is not
+//
+// It is not a new kind of transition and it does not skip anything: the claim, the body and the
+// commit are the ordinary ones, so a genuine change still moves the epoch, cancels in-flight dials
+// and re-pins the transports exactly as before. It changes only WHEN the first one happens.
+//
+// # Serialisation
+//
+// An interface update holds resetRunAccess for its whole life - recompute, claim, body, commit - so
+// taking it here either waits for an update already in flight or gets there first; in both orders
+// exactly one transition is claimed for the first observation. A pending interface notification is
+// unaffected either way: notifyInterfaceUpdate claims its own token, and its own update consumes and
+// commits it.
+//
+// A genuine change detected during Start keeps its own transition, from whichever entry point
+// detected it; this call then finds the fingerprint unchanged and does nothing.
+func (r *NetworkManager) EstablishInitialNetworkEnvironment() {
+	// Nothing is owed before the manager has started: the reset body is gated on the lifecycle, so a
+	// transition claimed there could never be committed and the network would report itself unsettled
+	// for the rest of the process - every dial refused, on a network that never changed.
+	if !r.environmentTransitionApplies() {
+		return
+	}
+	r.resetRunAccess.Lock()
+	defer r.resetRunAccess.Unlock()
+	changed, token := r.recomputeNetworkEnvironment()
+	if !changed {
+		// An update already observed the environment, or there is nothing to observe (no default
+		// interface). Both leave the manager in the state this call exists to guarantee.
+		return
+	}
+	r.resetNetworkLocked(r.startedCtx)
+	r.commitTransition(token)
+}
+
 // recomputeNetworkEnvironment refreshes the fingerprint and reports whether it changed.
 //
 // It holds environmentUpdateAccess for the whole computation, which is what serialises concurrent
@@ -70,9 +129,25 @@ func (r *NetworkManager) updateNetworkEnvironment() {
 // startedCancel - so holding environmentUpdateAccess across it would stop every later
 // postUpdateNetworkEnvironment behind a Close that is itself waiting. That is a three-way cycle, and
 // it hung the jiejie reference suite for the full 40-minute test timeout.
+//
+// # A manager that has not started does not observe its environment
+//
+// The observation belongs to a RUNNING box. Before StartStatePostStart there is nothing bound to any
+// environment for a boundary to move - the monitors are the only reason this can be reached at all,
+// because the network monitor is started one stage earlier and reports route changes immediately -
+// and a transition claimed here cannot be completed: the body is gated on the same lifecycle, so
+// boundEnvironmentTransitionExported returns without committing and the network is left unsettled
+// for the rest of the process, refusing every dial on a network that never changed. Publishing
+// without claiming is not an option either: the fingerprint would move while the transports still
+// named the previous environment, and the first observation could no longer be told apart from a
+// real transition. So the observation is deferred, and EstablishInitialNetworkEnvironment makes it
+// before Start returns - which is also what makes it reach a dial at the right moment.
 func (r *NetworkManager) recomputeNetworkEnvironment() (bool, transitionToken) {
 	r.environmentUpdateAccess.Lock()
 	defer r.environmentUpdateAccess.Unlock()
+	if !r.environmentTransitionApplies() {
+		return false, noTransition
+	}
 	var defaultInterface *adapter.NetworkInterface
 	if r.interfaceMonitor != nil {
 		defaultInterface = r.DefaultNetworkInterface()
