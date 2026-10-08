@@ -1,0 +1,132 @@
+name: Reference interop (Xray)
+
+# The reference-interop stand for REALITY key_share, VLESS application-layer
+# encryption, XHTTP and Vision.
+#
+# # Why this is workflow_dispatch only
+#
+# The stand needs a real Xray-core binary; nothing here stubs it. That makes the
+# workflow useless without network access to the release download and impossible
+# to satisfy in a sandbox, so it is manual on purpose: a push should not fail
+# because GitHub's release CDN was briefly unavailable, and a green tick that
+# never actually started a reference process would be worse than no workflow at
+# all.
+#
+# # What it does and does not prove
+#
+# It proves or falsifies the wire format against the reference for the scenarios
+# the reference accepts. It does NOT prove anything about the classical
+# key_share against a current Xray: that scenario SKIPS with the version reason.
+# Run it a second time with an Xray below v26.9.8 (set the `xray_version` input)
+# to cover it.
+#
+# The default (non-live) half of the stand runs in the `Verify` workflow on every
+# push; this one adds the reference.
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_version:
+        description: >-
+          Xray-core release tag to test against, or `latest`. Use a tag below
+          v26.9.8 to exercise the REALITY classical key_share scenario; a current
+          release makes that one scenario skip.
+        required: false
+        default: latest
+      run_filter:
+        description: 'Go test -run filter (default: the whole live matrix).'
+        required: false
+        default: TestLiveInterop
+
+permissions:
+  contents: read
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
+
+      - name: default (non-live) half of the stand
+        # Runs first and unconditionally: if the generator or the gate is broken,
+        # there is no point downloading a reference to find out.
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          cd test
+          go test -count=1 -tags "$TAGS" -v ./interop/
+
+      - name: resolve the reference version
+        id: reference
+        run: |
+          set -euo pipefail
+          requested="${{ inputs.xray_version }}"
+          if [ "$requested" = "latest" ]; then
+            requested="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+              | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+          fi
+          if [ -z "$requested" ]; then
+            echo "::error::could not resolve an Xray-core release tag" >&2
+            exit 1
+          fi
+          echo "version=$requested" >> "$GITHUB_OUTPUT"
+          echo "resolved Xray-core $requested"
+
+      - name: download the reference binary
+        run: |
+          set -euo pipefail
+          version="${{ steps.reference.outputs.version }}"
+          mkdir -p "$RUNNER_TEMP/xray"
+          curl -fsSL -o "$RUNNER_TEMP/xray.zip" \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip"
+          unzip -o -q "$RUNNER_TEMP/xray.zip" -d "$RUNNER_TEMP/xray"
+          chmod +x "$RUNNER_TEMP/xray/xray"
+          "$RUNNER_TEMP/xray/xray" version
+
+      - name: live reference interop
+        # The two halves of the gate are both set here. The build tag is what this
+        # workflow exists to exercise; the environment variable keeps the live
+        # path from ever running because a build happened to include the tag.
+        env:
+          XRAY_BINARY: ${{ runner.temp }}/xray/xray
+          RUN_LIVE_XRAY_INTEROP: '1'
+          INTEROP_KEEP_ARTIFACTS: '1'
+        run: |
+          set -euo pipefail
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          cd test
+          go test -count=1 -timeout 30m -v \
+            -tags "$TAGS,liveinterop" \
+            -run "${{ inputs.run_filter }}" \
+            ./interop/ 2>&1 | tee "$RUNNER_TEMP/interop.log" || {
+              tail -200 "$RUNNER_TEMP/interop.log" >&2
+              exit 1
+            }
+          # A -run filter that matches nothing passes vacuously. The stand's whole
+          # purpose is to not do that, so an empty run is a failure here.
+          ran="$(grep -cE '^--- (PASS|FAIL|SKIP):' "$RUNNER_TEMP/interop.log" || true)"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::the interop matrix matched no tests; the -run filter is stale" >&2
+            exit 1
+          fi
+          echo "reference interop reported $ran test results"
+
+      - name: collect the generated configs and both sides' logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-artifacts
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            /tmp/sing-box-interop-*
+            ${{ runner.temp }}/interop.log
