@@ -134,13 +134,7 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.HTTP3Options.InitialPacketSize == 0 {
 		options.HTTP3Options.InitialPacketSize = min(int(options.MTU)+masque.QUICPacketOverhead, math.MaxUint16)
 	}
-	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
-		Context:          ctx,
-		Options:          options.DialerOptions,
-		RemoteIsDomain:   options.ServerIsDomain(),
-		ResolverOnDetour: true,
-		NewDialer:        true,
-	})
+	outboundDialer, err := dialer.NewWithOptions(tunnelDialerOptions(ctx, options))
 	if err != nil {
 		return nil, err
 	}
@@ -855,4 +849,41 @@ func (c *ClientEndpoint) PreferredAddress(metadata *adapter.InboundContext, addr
 		protocol = uint8(header.ICMPv4ProtocolNumber)
 	}
 	return masque.RoutesContain(state.routes, address, protocol)
+}
+
+// tunnelDialerOptions builds the dialer options for the tunnel's OWN UDP leg.
+//
+// # Why this is a named function and not four lines at the call site
+//
+// The one non-obvious line in it is the fragmentation default, and it is the kind of line a
+// refactor drops without noticing: everything still compiles, the tunnel still comes up on a
+// generous path, and the failure only appears on a path whose MTU is close to the datagram size -
+// where it appears as "this node does not work" rather than as an MTU problem.
+//
+// # Why the fragmentation default must be set here
+//
+// A MASQUE client's transport is UDP, and this dialer opens the QUIC socket - directly to the
+// server, or through a whole detour chain. common/dialer FORBIDS IP fragmentation by default
+// (IP_PMTUDISC_DO on Linux/Android, IP_DONTFRAG on Darwin). That is right for a general-purpose
+// socket and wrong for one whose payload is deliberately near the path MTU: encapsulation adds
+// tens of bytes, so an over-size datagram dies SILENTLY - locally as EMSGSIZE, or on the path as a
+// DF drop whose ICMP PTU never comes back.
+//
+// The symptom is misleading in exactly the way this comment exists to prevent: the tunnel does not
+// come up at all ("dial quic: timeout"), or comes up and carries no data, while a direct node
+// through the same detour works because its datagrams are small. A QUIC Initial is 1242 bytes;
+// wrapped for an inner tunnel it becomes an outer datagram that is exactly the size a short path
+// drops.
+//
+// This is a DEFAULT, not a coercion: an explicit `udp_fragment` in the configuration still wins,
+// because UDPFragment is a pointer and its presence takes priority over the default.
+func tunnelDialerOptions(ctx context.Context, options option.MASQUEClientEndpointOptions) dialer.Options {
+	options.DialerOptions.UDPFragmentDefault = true
+	return dialer.Options{
+		Context:          ctx,
+		Options:          options.DialerOptions,
+		RemoteIsDomain:   options.ServerIsDomain(),
+		ResolverOnDetour: true,
+		NewDialer:        true,
+	}
 }

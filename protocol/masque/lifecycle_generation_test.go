@@ -1,10 +1,13 @@
 package masque
 
 import (
+	"context"
 	"net/netip"
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/option"
 
 	"github.com/stretchr/testify/require"
 )
@@ -119,4 +122,39 @@ func TestMasqueRestartCyclesDoNotLeakLoops(t *testing.T) {
 	}
 	require.LessOrEqual(t, runtime.NumGoroutine(), baseline+6,
 		"repeated MASQUE lifecycles leaked goroutines")
+}
+
+// The tunnel's own UDP leg must be allowed to fragment.
+//
+// # The failure this pins
+//
+// common/dialer FORBIDS IP fragmentation by default, which is right for a general-purpose socket
+// and wrong for the socket a MASQUE tunnel rides on: its payload is deliberately near the path
+// MTU, and encapsulation adds tens of bytes, so an over-size datagram dies SILENTLY - locally as
+// EMSGSIZE, or on the path as a DF drop whose ICMP PTU never comes back. The observed symptom is
+// "this node does not work": the QUIC handshake never completes, or the tunnel comes up and
+// carries nothing, while a direct node through the same detour is fine because its datagrams are
+// small.
+//
+// This asserts the default is set on the options the constructor actually builds. It does NOT
+// assert the socket flag, which needs a real socket and a per-OS getsockopt, and it does NOT
+// reproduce the MTU failure end to end - see the phase report, where that is recorded as a gap
+// rather than as covered.
+func TestTunnelDialerAllowsUDPFragmentation(t *testing.T) {
+	t.Parallel()
+	built := tunnelDialerOptions(context.Background(), option.MASQUEClientEndpointOptions{})
+	require.True(t, built.Options.UDPFragmentDefault,
+		"the tunnel's UDP leg must permit fragmentation, or an over-MTU datagram dies silently")
+
+	// An explicit configuration still wins: common/dialer prefers the pointer when it is set, so
+	// this default can never override what the user asked for.
+	explicit := false
+	configured := option.MASQUEClientEndpointOptions{}
+	configured.DialerOptions.UDPFragment = &explicit
+	configuredOptions := tunnelDialerOptions(context.Background(), configured)
+	require.True(t, configuredOptions.Options.UDPFragmentDefault,
+		"the default is still set; the explicit pointer is what takes precedence")
+	require.NotNil(t, configuredOptions.Options.UDPFragment)
+	require.False(t, *configuredOptions.Options.UDPFragment,
+		"an explicit udp_fragment: false must survive the default being applied")
 }

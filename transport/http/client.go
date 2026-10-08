@@ -293,13 +293,30 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if c.http3Available() {
-		conn, err := c.http3.DialContext(ctx, destination)
+		// The H3 attempt gets its OWN window, not the caller's whole dial budget; see
+		// http3EstablishTimeout. context.WithTimeout resolves to the EARLIER of this window and
+		// the caller's deadline, so a caller with less time than the window is not delayed by it.
+		probeCtx, cancelProbe := context.WithTimeout(ctx, http3EstablishTimeout)
+		conn, err := c.http3.DialContext(probeCtx, destination)
+		probeExpired := probeCtx.Err() != nil
+		cancelProbe()
 		if err == nil {
 			c.clearHTTP3Broken()
 			return conn, nil
 		}
-		if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
-			return nil, err
+		// The CALLER gave up, or the core is closing. That is a local lifecycle event: it is not
+		// evidence about H3 and it is not a reason to fall back - the user is gone, and starting an
+		// H2 dial for them would be work nobody is waiting for.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// An attempt that merely ran out of its window is still an attempt that did not work.
+		// Returning that error would hand a QUIC timeout to the caller and never try H2, which is
+		// the opposite of what the window is for.
+		if !probeExpired {
+			if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
+				return nil, err
+			}
 		}
 		c.markHTTP3Broken()
 	}
@@ -426,6 +443,25 @@ const (
 	http3BrokenBackoffInitial = 5 * time.Second
 	http3BrokenBackoffMax     = 5 * time.Minute
 )
+
+// http3EstablishTimeout is the window the HTTP/3 attempt gets inside one dial.
+//
+// # Why the version fallback needs a bound of its own
+//
+// The fallback to HTTP/2 exists in the code below, but without a window of its own it is
+// unreachable in exactly the failure it was written for. A peer whose UDP path is silently
+// blackholed - packets dropped, nothing refused - makes the QUIC handshake wait until the
+// CALLER's deadline (15s for a proxied dial, more for a detour), and only then does the code
+// reach the H2 branch. The caller has usually given up by then, so the observed behaviour is
+// "this node does not work over UDP", not "this node fell back".
+//
+// A bounded window makes the fallback real, and it costs that window once per backoff period
+// rather than once per connection: an expired window marks H3 broken below, exactly as an
+// explicit refusal does.
+//
+// A var rather than a const because it is a tunable that tests shrink, like the two backoff
+// bounds above it.
+var http3EstablishTimeout = 3 * time.Second
 
 var (
 	ErrHTTP2Unsupported           = E.New("server does not support HTTP/2")

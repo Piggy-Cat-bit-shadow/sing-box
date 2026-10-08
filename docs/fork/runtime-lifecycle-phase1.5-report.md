@@ -217,12 +217,18 @@ once per transition, and resources that have no continuous worker pull at reuse 
 
 No lifetime change. The audit's three concerns were each either already handled or now pinned:
 
-1. **Remembered H2/H3 verdict across a network change.** `ManagedTransport.Reset` swaps the epoch and
-   (for the Go engine) builds a fresh inner transport, so the H3-broken backoff memory — which lives
-   inside that transport — does not survive. Pinned by
-   `TestManagedTransportResetReplacesTheInnerTransport`; the counter-cases (no reset → one epoch;
-   `Close`/`CloseIdleConnections` → no rebuild) are pinned too. The rebuild is lazy, so a reset does
-   not produce a dial.
+1. **Remembered H2/H3 verdict across a network change.** Two different mechanisms, on two different
+   transports, and an earlier version of this paragraph conflated them:
+   - **DoH / `common/httpclient`** uses `ManagedTransport`, whose `Reset` swaps the epoch and (for the
+     Go engine) builds a fresh inner transport, so the H3-broken memory inside it does not survive.
+     Pinned by `TestManagedTransportResetReplacesTheInnerTransport`; the counter-cases (no reset → one
+     epoch; `Close`/`CloseIdleConnections` → no rebuild) are pinned too. The rebuild is lazy, so a
+     reset does not produce a dial.
+   - **The MASQUE tunnel** does NOT use `common/httpclient` — it builds a `transport/http.Client`
+     directly. Its verdict is cleared by `RestartSession`/`Suspend` → `ResetConnections()`, which
+     calls `clearHTTP3Broken()` and `http3.ResetConnection()`. Same practical outcome on the same
+     transition, different component. (Corrected after Phase 3 re-read the code; the tunnel's own
+     generation-level coverage is a Phase 3 addition.)
 2. **`Close` vs a blocked writer.** The H2 request path already wires cancellation
    (`context.AfterFunc` → `cancel`) and the H3 setup does the same with `CancelRead`/`CancelWrite`;
    the tunnel setup uses `context.AfterFunc` as well. Newly assertable rather than assumed: the

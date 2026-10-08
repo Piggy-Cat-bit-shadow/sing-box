@@ -16,9 +16,12 @@ import (
 //
 // The mechanism: ManagedTransport.Reset swaps the epoch, and when the transport is cheap to rebuild
 // the replacement is made immediately. The H3-broken memory lives INSIDE the inner transport, so a
-// fresh instance is what clears it. This test pins that relationship, because it is the reason the
-// MASQUE "remembered H2 winner" cannot stick across a network change: there is no remembered winner
-// left to stick.
+// fresh instance is what clears it. This test pins that relationship: it is what stops a DoH
+// transport's remembered H3 verdict from outliving the network it described.
+//
+// It is NOT the MASQUE mechanism. The MASQUE tunnel builds a transport/http.Client directly rather
+// than going through common/httpclient, and its verdict is cleared by RestartSession/Suspend ->
+// ResetConnections. An earlier version of this comment claimed otherwise.
 //
 // Invariant reference: docs/fork/runtime-lifecycle-phase1.5.md §17 (a new generation must not trust
 // the old transport).
