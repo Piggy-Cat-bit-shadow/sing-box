@@ -69,20 +69,35 @@ jobs:
       # The gate's own tests first. They need no network and take seconds, and they
       # are the only way a defect in the selection logic can be caught before the
       # logic is trusted with a published binary.
-      - name: check out the release tooling
-        uses: actions/checkout@v4
-
-      - name: test the release gate
-        run: ./scripts/ci/test-release-artifacts.sh
-
-      # The tag is validated before it is used for anything. It arrives as an
-      # environment variable and never as an interpolation into a shell body:
-      # `${{ inputs.tag }}` inside `run:` would be a script-injection sink.
+      # ORDER MATTERS, and getting it wrong is how this workflow first failed on a real
+      # runner with "./tooling/scripts/ci/release-artifacts.sh: No such file or directory" (exit 127).
+      #
+      # `check-tag` proves that HEAD IS the tagged commit, so the tag has to be checked out
+      # at the workspace root. But a release tag points at a commit that may predate the
+      # tooling itself - the first tag tried here does - so checking the tag out at the root
+      # deletes the very script the next step runs.
+      #
+      # So the tag lands at the root and the tooling lands in `tooling/`, from the default
+      # branch, where the tag's checkout cannot remove it. The script is invoked through
+      # that path but still RUNS FROM the root, which is what makes its `git rev-parse HEAD`
+      # resolve to the tagged commit rather than to the tooling checkout.
       - name: check out the tagged commit
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
+
+      - name: check out the release tooling
+        uses: actions/checkout@v4
+        with:
+          path: tooling
+
+      - name: test the release gate
+        run: ./tooling/scripts/ci/test-release-artifacts.sh
+
+      # The tag is validated before it is used for anything. It arrives as an
+      # environment variable and never as an interpolation into a shell body:
+      # `${{ inputs.tag }}` inside `run:` would be a script-injection sink.
 
       - name: resolve and validate the tag
         id: tag
@@ -90,7 +105,7 @@ jobs:
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          ./scripts/ci/release-artifacts.sh check-tag --tag "$INPUT_TAG"
+          ./tooling/scripts/ci/release-artifacts.sh check-tag --tag "$INPUT_TAG"
           echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
 
       # Computed, never inferred inline. Anything that is not exactly `true` or
@@ -102,7 +117,7 @@ jobs:
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-          publish="$(./scripts/ci/release-artifacts.sh publish-flag --dry-run "$INPUT_DRY_RUN")"
+          publish="$(./tooling/scripts/ci/release-artifacts.sh publish-flag --dry-run "$INPUT_DRY_RUN")"
           echo "publish=$publish" >> "$GITHUB_OUTPUT"
           if [ "$publish" = "true" ]; then
             echo "this run WILL publish a release"
@@ -124,7 +139,7 @@ jobs:
           # Published to later steps through the environment so the publish step
           # names the same commit this step verified.
           echo "RELEASE_SHA=$sha" >> "$GITHUB_ENV"
-          ./scripts/ci/release-artifacts.sh plan \
+          ./tooling/scripts/ci/release-artifacts.sh plan \
             --repo "$GITHUB_REPOSITORY" \
             --sha "$sha" \
             --out release-plan/runs.tsv \
@@ -138,7 +153,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ./scripts/ci/release-artifacts.sh download \
+          ./tooling/scripts/ci/release-artifacts.sh download \
             --repo "$GITHUB_REPOSITORY" \
             --plan release-plan/runs.tsv \
             --dir release-assets
@@ -150,7 +165,7 @@ jobs:
       - name: verify the downloaded artifacts
         run: |
           set -euo pipefail
-          ./scripts/ci/release-artifacts.sh verify \
+          ./tooling/scripts/ci/release-artifacts.sh verify \
             --dir release-assets \
             --sha "$RELEASE_SHA"
 
@@ -161,7 +176,7 @@ jobs:
           RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          ./scripts/ci/release-artifacts.sh flatten \
+          ./tooling/scripts/ci/release-artifacts.sh flatten \
             --plan release-plan/runs.tsv \
             --dir release-assets \
             --out upload \
