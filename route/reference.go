@@ -316,6 +316,28 @@ func (m *ReferenceManager) applyKeepIdle(keepIdle map[any]bool, target idleTarge
 	target.keeper.SetKeepIdleConnections(target.keep)
 }
 
+// TrimIdleResources is the progressive memory pass.
+//
+// # Why it is not CloseIdleConnections
+//
+// CloseIdleConnections is called from paths that must release everything reusable: DEEP_IDLE, a
+// pause, a memory-pressure reset. Those are all points where the device is genuinely not being used
+// and the cost of a later handshake is paid once.
+//
+// Trim is the weaker pass for memory that is merely elevated: it releases what is reusable and
+// cheap to lose, and it must not be able to cause a dial. If a trim could start a connection it
+// would be a reconnect trigger wearing a memory-management name, which is exactly the shape the
+// memory-pressure path must not have.
+//
+// In this tree the two are the same set of operations, because closing an idle pool cannot dial:
+// every keeper drops a connection that has no active user traffic, and the next demand re-dials.
+// The distinction that matters is therefore at the CALLER - when to be aggressive - and this method
+// exists so that caller has a name for the weaker pass and the stronger one is not silently reused
+// for it.
+func (m *ReferenceManager) TrimIdleResources() {
+	m.CloseIdleConnections()
+}
+
 func (m *ReferenceManager) CloseIdleConnections() {
 	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
 	transportManager := service.FromContext[adapter.DNSTransportManager](m.ctx)

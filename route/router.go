@@ -65,6 +65,16 @@ type Router struct {
 	// goroutines that HijackDNSPacket hands to the DNS router, so a dead resolver cannot turn a
 	// query flood into unbounded growth. See dnsHijackConcurrency.
 	dnsHijackInFlight atomic.Int64
+
+	// referenceManager owns the idle/keep decision and the reusable pools. It is optional: a Router
+	// built directly in a test has none, and the memory-trim pass is then a no-op.
+	referenceManager *ReferenceManager
+}
+
+// SetReferenceManager attaches the reference manager, so the memory-trim pass can reach the reusable
+// pools it already knows how to release.
+func (r *Router) SetReferenceManager(manager *ReferenceManager) {
+	r.referenceManager = manager
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -278,6 +288,18 @@ func (r *Router) NeedFindNeighbor() bool {
 
 func (r *Router) NeighborResolver() adapter.NeighborResolver {
 	return r.neighborResolver
+}
+
+// TrimIdleResources is the router's half of the progressive memory pass: it releases reusable
+// pools (outbound idle connections and DNS transport connections) and nothing else.
+//
+// It is deliberately separate from ResetNetwork, which is a barrier - it advances the DNS
+// generation and retires every transport - and therefore costs a rebuild. Memory that is only
+// elevated must not pay that.
+func (r *Router) TrimIdleResources() {
+	if r.referenceManager != nil {
+		r.referenceManager.TrimIdleResources()
+	}
 }
 
 func (r *Router) ResetNetwork() {

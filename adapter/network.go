@@ -37,7 +37,14 @@ type NetworkManager interface {
 	WIFIState() WIFIState
 	UpdateWIFIState(ctx context.Context)
 	ResetNetwork(ctx context.Context)
+	// ReleaseMemory is the aggressive pass: it resets the network and releases everything reusable.
+	// It is the right answer to a genuine OOM and the wrong answer to memory that is merely
+	// elevated, because rebuilding costs handshakes the user waits on.
 	ReleaseMemory(ctx context.Context)
+	// TrimMemory is the progressive pass: release what is reusable and cheap to lose, without a
+	// network reset, without touching a resource that is carrying traffic, and without causing a
+	// dial. It must only ever make the process smaller.
+	TrimMemory(ctx context.Context)
 }
 
 // NetworkResetCounter is implemented by a network manager that can report how many network resets

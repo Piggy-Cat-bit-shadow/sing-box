@@ -48,6 +48,9 @@ type countingRouter struct {
 
 	access  sync.Mutex
 	entered int
+	// trims counts TrimIdleResources calls, which must be distinguishable from resets.
+	trimAccess sync.Mutex
+	trims      int
 	// inFlight is the number of resets currently inside the router's reset. Anything above one is
 	// the interleaving under test.
 	inFlight atomic.Int32
@@ -98,6 +101,20 @@ func newCountingRouter() *countingRouter {
 	signal := make(chan struct{})
 	router.signal.Store(&signal)
 	return router
+}
+
+// trimCount reports how many times the memory-trim path was entered. It is separate from `entered`
+// so a test can prove a trim is NOT a reset rather than only that something happened.
+func (r *countingRouter) trimCount() int {
+	r.trimAccess.Lock()
+	defer r.trimAccess.Unlock()
+	return r.trims
+}
+
+func (r *countingRouter) TrimIdleResources() {
+	r.trimAccess.Lock()
+	r.trims++
+	r.trimAccess.Unlock()
 }
 
 // count reports how many resets have been entered.

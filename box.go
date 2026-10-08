@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/netns"
 	"github.com/sagernet/sing-box/common/power"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
@@ -110,7 +111,10 @@ type Box struct {
 	httpClientService   adapter.LifecycleService
 	internalService     []adapter.LifecycleService
 	ntpService          *ntp.Service
-	scope               *adapter.Scope
+	// runtimeCoordinator publishes network generations to registered network-bound resources. It is
+	// registered as a service so a subsystem asks it instead of inventing a second epoch.
+	runtimeCoordinator *runtimecoord.Coordinator
+	scope              *adapter.Scope
 }
 
 type Options struct {
@@ -239,6 +243,11 @@ func New(options Options) (*Box, error) {
 	// timer: see common/power.
 	powerGovernor := power.NewGovernor(power.DefaultPolicy())
 	service.MustRegister[*power.Governor](ctx, powerGovernor)
+	// The runtime resource coordinator is the one place that knows which network generation is
+	// current and which resources have registered against it. It is created before the router so
+	// the router can publish generations to it; see docs/fork/runtime-lifecycle-phase1.5.md.
+	runtimeCoordinator := runtimecoord.New()
+	service.MustRegister[*runtimecoord.Coordinator](ctx, runtimeCoordinator)
 	pauseManager := service.FromContext[pause.Manager](ctx)
 	pauseCallback := pauseManager.RegisterCallback(func(event int) {
 		applyPauseEvent(powerGovernor, event)
@@ -390,6 +399,9 @@ func New(options Options) (*Box, error) {
 		internalServices = append(internalServices, clashMode)
 	}
 	referenceManager := route.NewReferenceManager(ctx, logFactory.NewLogger("reference"), options.Options)
+	// The router's memory-trim pass reaches the reusable pools through the reference manager, which
+	// already owns the idle/keep decision for them.
+	router.SetReferenceManager(referenceManager)
 	internalServices = append(internalServices, referenceManager)
 	ntpOptions := common.PtrValueOrDefault(options.NTP)
 	var timeService *tls.TimeServiceWrapper
@@ -654,6 +666,7 @@ func New(options Options) (*Box, error) {
 		httpClientService:   httpClientService,
 		createdAt:           createdAt,
 		powerGovernor:       powerGovernor,
+		runtimeCoordinator:  runtimeCoordinator,
 		pauseManager:        pauseManager,
 		pauseCallback:       pauseCallback,
 		debugOptions:        debugOptions,
@@ -749,6 +762,10 @@ func (s *Box) preStart() error {
 	if err != nil {
 		return E.Cause(err, "start logger")
 	}
+	// Registered before every component, so reverse-order cleanup stops the coordinator LAST: a
+	// resource must be unregistered by its own cleanup before the coordinator that would call it
+	// goes away.
+	s.scope.Add(s.runtimeCoordinator.Close)
 	s.scope.Add(s.logFactory.Close)
 	// Close the URL-test storage THIS Box created, and only that one.
 	//

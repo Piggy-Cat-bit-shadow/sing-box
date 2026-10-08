@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/settings"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
@@ -140,8 +141,12 @@ type NetworkManager struct {
 	// environment with the old ownership - so a test that waits for it and then reads the epoch is
 	// reading a value the claim has not necessarily produced yet.
 	transitionClaimed func(transitionToken)
-	powerUpdateAccess sync.Mutex
-	powerUpdateCancel context.CancelFunc
+	// runtimeCoordinator publishes each transition to the network-bound resources registered with it.
+	// It is optional: a manager built without one simply has no runtime policy, which is what a unit
+	// test that constructs a NetworkManager directly wants.
+	runtimeCoordinator *runtimecoord.Coordinator
+	powerUpdateAccess  sync.Mutex
+	powerUpdateCancel  context.CancelFunc
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -158,6 +163,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 	nm := &NetworkManager{
 		ctx:                 ctx,
 		logger:              logger,
+		runtimeCoordinator:  service.FromContext[*runtimecoord.Coordinator](ctx),
 		interfaceFinder:     control.NewDefaultInterfaceFinder(),
 		autoDetectInterface: options.AutoDetectInterface,
 		defaultOptions: adapter.NetworkOptions{
@@ -690,6 +696,17 @@ func (r *NetworkManager) beginTransition() transitionToken {
 	if r.transitionClaimed != nil {
 		r.transitionClaimed(r.transitionOwner)
 	}
+	// Published BEFORE the lock is released? No - deliberately after, via the deferred call below.
+	// A registered resource reacts by scheduling or cancelling its own recovery, which takes the
+	// resource's locks; doing that while holding transitionAccess would put a protocol's lock
+	// ordering inside the network manager's, which is the shape of the ABBA deadlock this fork
+	// already paid for once. transitionAccess guards ownership only.
+	claimed := uint64(r.transitionOwner)
+	defer func() {
+		if r.runtimeCoordinator != nil {
+			r.runtimeCoordinator.Advance(claimed)
+		}
+	}()
 	return r.transitionOwner
 }
 
@@ -873,6 +890,37 @@ func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 	}
 
 	r.router.ResetNetwork()
+}
+
+// TrimMemory is the progressive memory pass: release reusable pools and drop caches, without a
+// network reset.
+//
+// # Why this is not ReleaseMemory
+//
+// ReleaseMemory resets the network, which retires every transport and every ownership epoch. That is
+// correct when the process is about to be killed, and wrong when memory is merely elevated: the
+// rebuild costs handshakes the user waits on, and doing it for a soft threshold would trade a
+// memory reading for latency.
+//
+// A trim must only reduce memory. Everything here closes a pool that has no active user traffic;
+// nothing dials, nothing wakes, and nothing rebuilds. If a trim could cause a connection it would be
+// a reconnect trigger wearing a memory-management name.
+func (r *NetworkManager) TrimMemory(ctx context.Context) {
+	if r.router != nil {
+		r.router.TrimIdleResources()
+	}
+	for _, endpoint := range r.endpoint.Endpoints() {
+		keeper, isKeeper := endpoint.(adapter.IdleConnectionKeeper)
+		if isKeeper {
+			keeper.CloseIdleConnections()
+		}
+	}
+	for _, outbound := range r.outbound.Outbounds() {
+		keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+		if isKeeper {
+			keeper.CloseIdleConnections()
+		}
+	}
 }
 
 func (r *NetworkManager) ReleaseMemory(ctx context.Context) {

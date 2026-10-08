@@ -28,6 +28,10 @@ type Router interface {
 	NeighborResolver() NeighborResolver
 	AppendTracker(tracker ConnectionTracker)
 	ResetNetwork()
+	// TrimIdleResources is the progressive memory pass: release reusable pools without a network
+	// reset. It must only reduce memory - see NetworkManager.TrimMemory for why the distinction
+	// matters.
+	TrimIdleResources()
 }
 
 type PreMatchAction uint8
