@@ -179,7 +179,28 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	taildropDirectory = filemanager.BasePath(ctx, os.ExpandEnv(taildropDirectory))
 	taildropDirectory, _ = filepath.Abs(taildropDirectory)
 	tailscaleEndpoint := &Endpoint{
-		Adapter:           endpoint.NewAdapter(C.TypeTailscale, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, nil),
+		// The detour is a DEPENDENCY, not only a reference.
+		//
+		// # Why this endpoint must declare the edge it dials through
+		//
+		// Every byte this endpoint puts on the wire leaves through outboundDialer above, which is a
+		// DetourDialer whenever `detour` is set: the control plane, DERP and the direct peer path all
+		// dial through it. That makes `detour` a real, always-taken edge of the outbound graph - the
+		// same edge References() already reported.
+		//
+		// References() alone is not enough, because the two accessors are consumed by different
+		// machinery. References() feeds the idle-resource walk in route/reference.go; the startup
+		// topological sort in adapter/outbound/manager.go reads Dependencies(). With nil dependencies
+		// this node sorted as a root, so a configuration whose detour leads back here - directly, or
+		// through a selector that lists this endpoint as a member - passed the startup cycle check.
+		// The first dial through that selection then recursed
+		// Selector.DialContext -> Endpoint.DialContext -> DetourDialer -> Selector.DialContext until
+		// the stack was exhausted, which is a fatal runtime error no recover() can contain.
+		//
+		// Declaring it here, where the edge is created, is what re-enables the check that already
+		// exists for every other node: the sort now refuses such a configuration with `circular
+		// outbound dependency`, exactly as it does for a proxy whose `detour` loops.
+		Adapter:           endpoint.NewAdapterWithDialerOptions(C.TypeTailscale, tag, []string{N.NetworkTCP, N.NetworkUDP, N.NetworkICMP}, options.DialerOptions),
 		ctx:               ctx,
 		router:            router,
 		logger:            logger,
