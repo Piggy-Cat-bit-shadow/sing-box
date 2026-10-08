@@ -72,7 +72,7 @@ this fork does not have · **N/A** = the architecture does not involve it ·
 | --- | --- | --- |
 | 040 | The system stack's TCP `acceptLoop` returned on **any** `Accept` error. The listener is bound to the stack's own address and its port is what the forward path rewrites every new SYN onto; nothing cleared that port, so the stack kept rewriting new connections onto a port nobody was listening on, the OS answered RST, and every new TCP connection failed instantly until the tunnel was rebuilt — while existing connections, UDP and QUIC kept working. The listener can be closed from outside the stack (shared fd space; a fast restart is the observed trigger), so the error says nothing about whether the stack is finished | **FIX — dependency fork** | **Published.** Fork `Piggy-Cat-bit-shadow/sing-tun` (a real GitHub fork of `SagerNet/sing-tun`), base `d769a7080ca203f63735ba93e95014e363e25d62` (= `v0.9.7-0.20261006124248-d769a7080ca2`), branch `fix/acceptloop-selfheal`, tip `1cd9bc2216df5edd8e2d5b684d05f32c1dc72835` (patch `665fbe204ce76c691ff40f58e9e33020af5e44f1` + docs). Upstream `dev` @ `7539c9855f` was re-checked on 2026-10-08 and **still returns bare**, so no upgrade path existed. `go.mod`: `replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df`. Patch is `stack_system.go` + a new test file: classify the error (orderly close → quiet exit; anything else → recover), close the unusable listener, re-bind the same address, publish the new port under a lock, bounded backoff 10 ms → 1 s, `Close` interrupts the wait and stops further attempts, recovery counter. Published via the GitHub Git Database API because `github.com`'s git transport was unreachable while `api.github.com` was not | `stack_system_accept_test.go` (in the fork): transient error recovers and dispatches, repeated failure is spaced not spun, `Close` interrupts the backoff, orderly close stays quiet. Red/green proven by reverting only the loop body (three of four red on base), `-race` clean, and re-run from the downloaded archive |
 | 041 (WG give-up rebind) — **DEFER → PHASE 1.5** | No equivalent recovery here. It is not a bug fix but a lifecycle mechanism: a lazily-started worker, a shared debounce, a stale-endpoint predicate, a wake trigger, a rebind via `listen_port`, and its interaction with network transitions and shutdown cancellation. Those pieces belong with this fork's existing `NetworkResetGeneration`, `NetworkTransitionSnapshot`, `OnDemandEndpoint`, `Wake()` and `Scope` cancellation, so bolting them on in phase 1 would design them twice | **Priority P0/P1 · implementation feasibility: in-tree, no fork required.** Hooks the pin already exports: `device.SetSessionStateFunc`, UAPI `listen_port=0` for a fresh ephemeral port. This fork already routes `Wake()`/`WakeNow()` → `PauseManager().DeviceWake()` → the endpoint callback, so no new API is needed. **Do not write the implementation before Phase 1.5.** See the handoff section |
-| 048 (gvisor handshake nil deref) | Real panic class, **unreachable in every profile this fork ships**: no tag file names `with_gvisor`, and without it `tun.NewStack("gvisor"/"mixed")` returns `ErrGVisorNotIncluded` as a clean configuration error. The pinned gvisor still has the window (`accept.go` nils `ep.h` then unlocks; `dispatcher.go` `handleConnecting` gates on state but not `h`) | A third module fork. Instead, a CI tripwire now fails if any profile names `with_gvisor` (`scripts/ci/verify-upstream-assumptions.sh`) |
+| 048 | `handleConnecting` dereferenced the endpoint's handshake after checking only the endpoint **state**. `performHandshake`'s failure path runs `ep.h = nil; ep.mu.Unlock(); ep.Close()` in that order, so there is a window in which the handshake is gone and the lock is free while the endpoint still reports `SynSent`/`SynRecv` (`Close` sets `StateClose` afterwards). A segment arriving in that window — SYN retransmission from an unreachable peer is the everyday case — passes the state check and hits `ep.h.processSegments()` on a nil receiver. That is a nil dereference inside gVisor's **own** goroutine: no `recover()` in the embedding program can catch it, the process dies | **FIX — dependency fork** | **Published.** The exposure changed after the original audit: `aaaefb00b` ("为 Android libbox 启用 gVisor netstack") added `with_gvisor` to the Android libbox build path, so the gVisor netstack is a **shipped stack on Android** and this is a shipped crash surface. The original entry said "unreachable in every profile this fork ships" — true when it was written (no profile named the tag, so `tun.NewStack` returned `ErrGVisorNotIncluded`), and invalidated by that later build-configuration change, not by an error in the audit. Fork `Piggy-Cat-bit-shadow/gvisor` (a GitHub fork of `SagerNet/gvisor`): base `e9989ea3436fa7e226f61a2bcd64f38fb42b23d4` (tag `v0.0.0-20260727.0-sing-box-mod.1`), branch `fix/tcp-handshake-nil-guard` @ `0ef874d4b88c6c0bd09924e6d18142b8d2f81475` (guard `b95acb6a313730948779c271061fcae53ebde6be` + docs), `go.mod` `replace` at `v0.0.0-20261008084547-0ef874d4b88c`. Upstream `go` @ `d5740a8a43` was re-checked and **still dereferences nil**, so no upgrade path existed (upgrading would also pull the inline-dispatch TCP rework) | `pkg/tcpip/transport/tcp/dispatcher_nil_handshake_test.go` (in the fork): nil handshake in every connecting state must not panic, the lock must be re-acquirable (a guard that returns without unlocking deadlocks instead of crashing), a real handshake still reaches `processSegments`, and the teardown/dispatch interleaving is forced with a barrier. Red/green by deleting only the guard: `invalid memory address or nil pointer dereference`; `-race` clean |
 | 069 root cause | The module still clobbers the surviving v4 port to 0 after a per-family failure, and still closes the sibling socket | `wireguard-go` fork/bump, or the already-owned `Piggy-Cat-bit-shadow/sing` fork (`common/control/bind_windows.go` is byte-identical to upstream and carries the `""` vs `"[::]"` asymmetry) |
 | 101 (GSO retry log noise) | Cosmetic, module-only | `wireguard-go/device/send.go` — fold into the next pin bump |
 | 113 (tailscale DERP rebind leak) | Not planned in LX either; needs a `sagernet/tailscale` fork | Do not set `TS_DEBUG_ALWAYS_USE_DERP=true` on standard Stop/Apply paths |
@@ -113,7 +113,7 @@ Run on macOS arm64 with `GOTOOLCHAIN=go1.25.5`. Tags unless noted:
 | Command | Result |
 | --- | --- |
 | `gofmt -l cmd include option protocol route service transport common dns adapter box.go` | clean |
-| `./scripts/ci/verify-upstream-assumptions.sh` | PASS (all tripwires + the new `with_gvisor` tripwire); pins printed |
+| `./scripts/ci/verify-upstream-assumptions.sh` | PASS. The two dependency tripwires verify the pins really are the forks (not a comment), that each fix is present in the linked source, and that a **linked artifact** built with the Android tag composition embeds the patched gVisor; upstream is probed on every run to report when a fork can be retired |
 | `go build -tags "$tags" -o /tmp/sing-box-final ./cmd/sing-box` | OK; `version` prints `go1.25.5 darwin/arm64` (the release path with `badlinkname` links as a real binary) |
 | `go test` over `common dns route protocol transport adapter option service experimental` + root, without `badlinkname` | 50 packages ok; the only failure is `common/tlsfragment` (3 tests, external network: `dial tcp 1.1.1.1:443: operation timed out`) — this environment has no external connectivity |
 | same with `badlinkname` | additionally `experimental/libbox [build failed]: link: invalid reference to runtime.fwdSig` — **pre-existing and unrelated**: it only occurs in a test binary, the release binary links fine, and it disappears without the tag. The `badlinkname` pin predates this phase |
@@ -178,6 +178,8 @@ stays deferred with the AWG feature itself (§2.3).
 | `c2e34cf6f` | `docs(fork): phase-1 LX stability audit — findings, fixes, deferred items` |
 | `38d539094` | `docs(fork): finalize phase 1 — deferral decisions, 040 tripwire, handoff` |
 | `acbe11ada` | `stability: pin the sing-tun accept-loop self-heal fork (LX 040)` |
+| `e57e6614a` | `docs(fork): record the 040 reopen and the fork pin in the commit log` |
+| (this change) | `stability: pin the gVisor nil-handshake guard fork (LX 048)` + `test(ci): check the real build-tag composition` |
 
 Phase-1 freeze: `aac61e522` → `c2e34cf6f` plus the finalization commit that rewrote the
 040/041 rows, added the sing-tun `acceptLoop` tripwire and appended this handoff. No
@@ -188,6 +190,11 @@ permanent failure state is this project's bug even when its cause sits in a pinn
 dependency, and "it is in a dependency" is not a reason to leave it deferred. `acbe11ada`
 pins the published fork; §2.3 and the dependency policy record it. 041 stays deferred to
 Phase 1.5 — 040 was a correctness bug, 041 is a recovery-policy decision.
+
+**048 was reopened** in the same session, by the same reasoning, when `aaaefb00b` gave the
+Android libbox builds `with_gvisor`: the crash surface moved from unreachable to shipped.
+Its fork and the corrected tripwire land together, because the check that missed it —
+scanning profile tag files instead of the build path — is part of the finding.
 
 ## Dependency policy
 
@@ -204,13 +211,25 @@ Forking a dependency is permitted only when **all five** hold:
 5. regression coverage and an upstream-exit path are maintained — the fork carries a test
    that fails without the patch, and the removal condition is recorded and checked.
 
-This exists to stop the pattern of forking a dependency for every small defect. The 040
-fork is the worked example: product-critical (all new TCP dies permanently), no in-tree
-workaround (`acceptLoop`/`tcpPort` are unexported and `ResetNetwork` does not re-listen),
-one file changed, upstream verified still broken on 2026-10-08, four regression tests plus
-a tripwire in `verify-upstream-assumptions.sh` that verifies the pin really is the fork,
-checks the fix is present, and probes upstream on every run to say when the fork can be
-retired.
+This exists to stop the pattern of forking a dependency for every small defect. There are
+two worked examples, both from phase 1, and both passed all five tests before a fork was
+opened:
+
+| | 040 (sing-tun) | 048 (gvisor) |
+| --- | --- | --- |
+| Product-critical | all new TCP dies permanently after one unexpected accept error | process-wide crash from a late TCP segment on any shipped gVisor stack |
+| No in-tree workaround | `acceptLoop`/`tcpPort` unexported; `ResetNetwork` does not re-listen | the dereference is inside gVisor's own goroutine; no `recover()` reaches it |
+| Small and isolated | `stack_system.go` only | `dispatcher.go` only, one guard on an existing unlock-and-return path |
+| Upstream unfixed | `dev` @ `7539c9855f`, re-checked | `go` @ `d5740a8a43`, re-checked |
+| Coverage + exit path | four regression tests, red/green by reverting the loop body; tripwire verifies the pin and probes upstream | four regression tests, red/green by deleting the guard; tripwire verifies the pin, the guard's presence and the lock release, and probes upstream |
+
+The 048 case also produced a second lesson, which is why the tripwire was rewritten in the
+same change: **a check on the profile files is not a check on what ships.** The original
+check read `release/DEFAULT_BUILD_TAGS*` and concluded the gVisor stack was unreachable,
+while the Android libbox builder appended `with_gvisor` in its own tag composition. The
+composition is now a single function (`build_libbox.ResolveBuildTags`) that the builders,
+the artifact provenance and a test all use, and the tripwire checks a linked artifact's
+module provenance rather than a text file.
 
 Publishing it went through the GitHub Git Database API rather than `git push`, because
 `github.com`'s git transport was unreachable (curl to `github.com` timed out, `git
@@ -229,6 +248,7 @@ Constraints the next stages inherit. This is a handoff, not a design document.
 
 - **041 WG give-up rebind** — the first item of the stage, not a standalone patch: lazy worker, shared debounce, stale-endpoint predicate, wake trigger, rebind, `listen_port` policy, network transition, shutdown cancellation. Priority P0/P1; in-tree, **no fork**. 040 and 041 are kept separate on purpose: 040 was a correctness bug (a listener death becomes a permanent failure state), while 041 is a recovery policy decision that belongs with the runtime primitives.
 - **040 removal condition** — when upstream sing-tun makes the accept loop recover on its own, retire the fork, drop the `replace` and let `verify-upstream-assumptions.sh` say so. The tripwire already probes upstream `dev` on every run when `gh` is authenticated.
+- **048 removal condition** — same shape for the gVisor fork: when upstream `SagerNet/gvisor` guards the handshake in `handleConnecting`, retire it. Two things must move together with any future gVisor bump: the fork has to be re-based, and the Android tag question re-asked (if Android ever stops compiling `with_gvisor`, the pin stops being load-bearing and the tripwire will say so).
 - The mechanism must be designed against the generation/transition primitives that already exist here (`NetworkResetGeneration`, `NetworkTransitionSnapshot`), not beside them: a rebind is a state mutation and must obey the same ownership checks a DNS answer does.
 - **Wake ≠ rebind.** A wake with a healthy session must cost nothing; only a stale predicate (no keypair, or handshake older than the reject window) justifies a rebind.
 - **An idle/suspended endpoint must not be woken by background recovery.** No timers or goroutines while the endpoint is idle, asleep or closed; recovery is demand-driven or event-driven.

@@ -40,6 +40,7 @@ require (
 	github.com/sagernet/fswatch v0.1.2
 	github.com/sagernet/gliderssh v0.3.4-0.20260531100337-2194faca5648
 	github.com/sagernet/gomobile v0.1.12
+	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1
 	github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf
 	github.com/sagernet/nftables v0.3.0-mod.4
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.9
@@ -169,7 +170,6 @@ require (
 	github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f // indirect
 	github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260929213014-a1cafd93eb1f // indirect
 	github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260929213014-a1cafd93eb1f // indirect
-	github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 // indirect
 	github.com/smallstep/pkcs7 v0.1.1 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
@@ -298,3 +298,18 @@ replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v
 //           checks the pin really is this fork and probes upstream on every run.
 // See docs/fork/lx-stability-audit-phase1.md (040) and FORK.md in the fork.
 replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008082323-1cd9bc2216df
+
+// The gVisor netstack is a shipped stack on Android (with_gvisor), and the pinned upstream
+// dereferences the TCP endpoint's handshake after checking only the endpoint state. The
+// handshake is cleared before the endpoint leaves the connecting state, so a late segment can
+// hit a nil handshake inside gVisor's own goroutine - an unrecoverable process crash.
+//
+// Fork: github.com/Piggy-Cat-bit-shadow/gvisor (a fork of SagerNet/gvisor, branch go)
+//   base:   e9989ea3436fa7e226f61a2bcd64f38fb42b23d4  (= tag v0.0.0-20260727.0-sing-box-mod.1)
+//   branch: fix/tcp-handshake-nil-guard @ 0ef874d4b88c6c0bd09924e6d18142b8d2f81475
+//   change: pkg/tcpip/transport/tcp/dispatcher.go only - guard the nil handshake on the same
+//           unlock-and-return path the state check uses, plus its regression tests.
+//   remove: when upstream guards it. verify-upstream-assumptions.sh checks the pin and probes
+//           upstream on every run.
+// See docs/fork/lx-stability-audit-phase1.md (048) and FORK.md in the fork.
+replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor v0.0.0-20261008084547-0ef874d4b88c

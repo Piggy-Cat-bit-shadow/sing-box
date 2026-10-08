@@ -8,6 +8,10 @@
 /dist/
 /sing-box
 /sing-box.exe
+# Root-level binaries from building the cmd/internal tooling and the CI artifact probe by path
+# (their default output name is the package directory).
+/build_libbox
+/ci-artifact-probe
 /build/
 /*.jar
 /*.aar

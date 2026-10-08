@@ -72,6 +72,8 @@ github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_amd64 v0.0.0-2026092920211
 github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_amd64 v0.0.0-20260929202119-8c68ce89873c/go.mod h1:G1otAaHTYRaXZ6mm8TxjvA/Kpyfz82yG2ATRu1RY2Po=
 github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_arm64 v0.0.0-20260929202119-8c68ce89873c h1:EIgOQRW9IabMbMAp6j+qOuZ9CDplHSHjTjf3jpPG6Is=
 github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_arm64 v0.0.0-20260929202119-8c68ce89873c/go.mod h1:AHSjG1k9wfhEfZhRCQCdUosL+qgyd//Ww9lwiRvBhhg=
+github.com/Piggy-Cat-bit-shadow/gvisor v0.0.0-20261008084547-0ef874d4b88c h1:+XYaVOW7za/nNdFUuT0Bn23wfXUAQVZINxcTZ9tCMRE=
+github.com/Piggy-Cat-bit-shadow/gvisor v0.0.0-20261008084547-0ef874d4b88c/go.mod h1:9O3SQskYuCfdHNvHEsWuEAgoyKEF74PiWp4NsNUia8g=
 github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94 h1:owmy04YW7IX5lTVtbTBgQiOAr5zEY3Sjunj/Min/PoI=
 github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
 github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261004070536-dc9f4ea02e02 h1:RcNlTCfqdbvYs16bnc1LX/5IqCjXkmS+ove/Li9H160=
@@ -314,8 +316,6 @@ github.com/sagernet/gliderssh v0.3.4-0.20260531100337-2194faca5648 h1:IWVjKBARzV
 github.com/sagernet/gliderssh v0.3.4-0.20260531100337-2194faca5648/go.mod h1:FmW0l0t/PzGIdJMr3iXOL+KuxvJTt6XAfF4GxbMlfZc=
 github.com/sagernet/gomobile v0.1.12 h1:XwzjZaclFF96deLqwAgK8gU3w0M2A8qxgDmhV+A0wjg=
 github.com/sagernet/gomobile v0.1.12/go.mod h1:A8l3FlHi2D/+mfcd4HHvk5DGFPW/ShFb9jHP5VmSiDY=
-github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1 h1:IdQ7yTKkB2wv8txwshxUroPlO4npOYAV71xb7xQ7Lys=
-github.com/sagernet/gvisor v0.0.0-20260727.0-sing-box-mod.1/go.mod h1:9O3SQskYuCfdHNvHEsWuEAgoyKEF74PiWp4NsNUia8g=
 github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf h1:b/3rm+KvxzuYRcnMdLq/hmcqX6/2B8k24l6SDHL2Piw=
 github.com/sagernet/netlink v0.0.0-20260814022025-64455d367bbf/go.mod h1:xLnfdiJbSp8rNqYEdIW/6eDO4mVoogml14Bh2hSiFpM=
 github.com/sagernet/nftables v0.3.0-mod.4 h1:vnOtcDYeSXv2e5RoRuGH0lrpttQFJ8iC4ICS2nhlDSo=

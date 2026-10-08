@@ -2,12 +2,14 @@ package main
 
 import (
 	"flag"
-	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
 
 	_ "github.com/sagernet/gomobile"
 	"github.com/sagernet/sing-box/cmd/internal/build_shared"
@@ -49,9 +51,21 @@ func main() {
 // writeProvenance records exactly which source revision and version string the
 // artifacts in this directory were built with. The Android client reads this
 // file, so "which core is in this APK" has one authoritative answer.
+// sortedTagVariants lists the shipped variants in a stable order for the provenance record.
+func sortedTagVariants() []string {
+	return []string{"android-main", "android-legacy", "apple"}
+}
+
 func writeProvenance() {
 	content := "commit=" + buildCommit + "\n" +
 		"version=" + buildVersion + "\n"
+	// The tags each shipped variant was compiled with. A consumer can read this to know whether
+	// an artifact contains a given capability (for example with_gvisor) without parsing the build
+	// scripts, and a CI check can assert the invariant that capability implies the matching
+	// dependency pin.
+	for _, variant := range sortedTagVariants() {
+		content += "tags." + variant + "=" + strings.Join(ResolveBuildTags(variant), ",") + "\n"
+	}
 	for _, name := range []string{"libbox.provenance", filepath.Join("..", "sing-box-for-android", "app", "libs", "libbox.provenance")} {
 		if dir := filepath.Dir(name); dir != "." {
 			if info, err := os.Stat(dir); err != nil || !info.IsDir() {
@@ -64,6 +78,52 @@ func writeProvenance() {
 		}
 		log.Info("wrote ", name, " (commit=", buildCommit, " version=", buildVersion, ")")
 	}
+}
+
+// resolvedTags are the build tags actually compiled into each shipped variant, recorded so a
+// consumer can answer "does this artifact include X" without re-deriving the composition.
+//
+// This exists because a check that reads the profile tag FILES is not the same as a check on what
+// the artifacts are built with: the libbox builder appends its own tags (Android gains
+// with_gvisor here, and it is deliberately not in the shared list). The 048 gVisor crash was found
+// exactly through that gap - a tripwire that only read the profile files reported "no profile
+// names with_gvisor" while the Android artifacts did compile it.
+var resolvedTags = map[string][]string{}
+
+// ResolveBuildTags returns the build tags for the named shipped variant. It is the single source
+// of truth for tag composition: the builders below call it, the provenance record is written from
+// it, and a test asserts the gVisor invariant against it.
+func ResolveBuildTags(variant string) []string {
+	switch variant {
+	case "android-main":
+		tags := append([]string{}, sharedTags...)
+		tags = append(tags, androidTags...)
+		if debugEnabled {
+			tags = append(tags, debugTags...)
+		}
+		return tags
+	case "android-legacy":
+		tags := filterTags(sharedTags, "with_naive_outbound")
+		tags = append(tags, androidTags...)
+		if debugEnabled {
+			tags = append(tags, debugTags...)
+		}
+		return tags
+	case "apple":
+		tags := append([]string{}, sharedTags...)
+		tags = append(tags, darwinTags...)
+		if debugEnabled {
+			tags = append(tags, debugTags...)
+		}
+		return tags
+	default:
+		return nil
+	}
+}
+
+// HasBuildTag reports whether the resolved tag set for a variant includes a tag.
+func HasBuildTag(variant, tag string) bool {
+	return slices.Contains(ResolveBuildTags(variant), tag)
 }
 
 var (
@@ -208,29 +268,17 @@ func buildAndroid() {
 	bindTarget := getAndroidBindTarget()
 
 	// Build main variant (SDK 24)
-	mainTags := append([]string{}, sharedTags...)
-	mainTags = append(mainTags, androidTags...)
-	// mainTags = append(mainTags, memcTags...)
-	if debugEnabled {
-		mainTags = append(mainTags, debugTags...)
-	}
 	buildAndroidVariant(AndroidBuildConfig{
 		AndroidAPI: 24,
 		OutputName: "libbox.aar",
-		Tags:       mainTags,
+		Tags:       ResolveBuildTags("android-main"),
 	}, bindTarget)
 
 	// Build legacy variant (SDK 21, no naive outbound)
-	legacyTags := filterTags(sharedTags, "with_naive_outbound")
-	legacyTags = append(legacyTags, androidTags...)
-	// legacyTags = append(legacyTags, memcTags...)
-	if debugEnabled {
-		legacyTags = append(legacyTags, debugTags...)
-	}
 	buildAndroidVariant(AndroidBuildConfig{
 		AndroidAPI: 21,
 		OutputName: "libbox-legacy.aar",
-		Tags:       legacyTags,
+		Tags:       ResolveBuildTags("android-legacy"),
 	}, bindTarget)
 }
 
