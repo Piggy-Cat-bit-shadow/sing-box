@@ -31,30 +31,13 @@ import (
 	"github.com/sagernet/sing/common/uot"
 )
 
-// defaultPacketSniffers is the order in which datagram payloads are attributed to a protocol.
+// defaultPacketSniffers is the plan used when a sniff action names no packet sniffer.
 //
-// Order is load-bearing, not cosmetic: PeekPacket returns on the first sniffer that claims the
-// packet, so a weak sniffer placed early steals traffic from a stronger one placed later.
-//
-// WireGuard sits immediately before UTP because UTP is the weakest check in this list - it reads
-// two nibbles out of the first byte and an extension chain that is usually empty - and it was
-// claiming WireGuard handshake initiations, which start 01 00 00 00 and are 148 bytes. WireGuard
-// is not promoted above QUIC or STUN: those match fixed multi-byte constants (QUIC's version and
-// connection-id layout, STUN's 0x2112A442 magic cookie) and cannot match a WireGuard header, so
-// moving WireGuard past them would only add ways for the two to fight. Everything after UTP is
-// untouched, and the first bytes the later sniffers require (0x00 for the UDP tracker, 0x14-0x19
-// for DTLS, and an NTP version field WireGuard's low type byte cannot produce) are disjoint from
-// WireGuard's type values, so the insertion changes nothing for them.
-var defaultPacketSniffers = []sniff.PacketSniffer{
-	sniff.DomainNameQuery,
-	sniff.QUICClientHello,
-	sniff.STUNMessage,
-	sniff.WireGuard,
-	sniff.UTP,
-	sniff.UDPTracker,
-	sniff.DTLSRecord,
-	sniff.NTP,
-}
+// The order is a correctness contract rather than a preference, and the list itself lives in
+// common/sniff so that the packet-sniff benchmarks measure the plan the router actually runs. The
+// reasoning behind the order - and behind WireGuard sitting immediately before UTP - is on the
+// list there.
+var defaultPacketSniffers = sniff.DefaultPacketSniffers
 
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
@@ -1158,18 +1141,9 @@ func (r *Router) actionSniff(
 			r.logger.DebugContext(ctx, "packet sniff skipped due to previous error: ", metadata.SniffError)
 			return
 		}
-		var streamSniffers []sniff.StreamSniffer
-		if len(action.StreamSniffers) > 0 {
-			streamSniffers = action.StreamSniffers
-		} else {
-			streamSniffers = []sniff.StreamSniffer{
-				sniff.TLSClientHello,
-				sniff.HTTPHost,
-				sniff.StreamDomainNameQuery,
-				sniff.BitTorrent,
-				sniff.SSH,
-				sniff.RDP,
-			}
+		streamSniffers := action.StreamSniffers
+		if len(streamSniffers) == 0 {
+			streamSniffers = sniff.DefaultStreamSniffers
 		}
 		sniffBuffer := buf.NewPacket()
 		err := sniff.PeekStream(
