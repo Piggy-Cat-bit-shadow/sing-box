@@ -5,8 +5,10 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -30,11 +32,14 @@ type ClientBind struct {
 	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 	connAccess          sync.Mutex
-	conn                *wireConn
-	done                chan struct{}
-	isConnect           bool
-	connectAddr         netip.AddrPort
-	reserved            [3]uint8
+	// conn is read on the connect() fast path, which deliberately does not take connAccess, and
+	// written by connect() and Close(). It is an atomic pointer so that read has a defined value
+	// rather than a torn one.
+	conn        atomic.Pointer[wireConn]
+	done        chan struct{}
+	isConnect   bool
+	connectAddr netip.AddrPort
+	reserved    [3]uint8
 }
 
 func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr netip.AddrPort, reserved [3]uint8) *ClientBind {
@@ -51,8 +56,18 @@ func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, i
 	}
 }
 
+// clientBindDialTimeout bounds how long establishing the bind's socket may take.
+//
+// Without it the dial inherits only the bind context's cancellation, and that context lives as
+// long as the endpoint: a detour outbound whose path silently drops packets parks the dial
+// indefinitely while connAccess is held. Everything that needs connAccess then queues behind a
+// dial that has no end in sight - sends, the bind's own Close, and every rebind - which is how a
+// single half-dead node froze the process's network machinery instead of failing one endpoint.
+// It is a var so a test can shrink it.
+var clientBindDialTimeout = constant.TCPTimeout
+
 func (c *ClientBind) connect() (*wireConn, error) {
-	serverConn := c.conn
+	serverConn := c.conn.Load()
 	if serverConn != nil {
 		select {
 		case <-serverConn.done:
@@ -68,7 +83,7 @@ func (c *ClientBind) connect() (*wireConn, error) {
 		return nil, net.ErrClosed
 	default:
 	}
-	serverConn = c.conn
+	serverConn = c.conn.Load()
 	if serverConn != nil {
 		select {
 		case <-serverConn.done:
@@ -77,26 +92,30 @@ func (c *ClientBind) connect() (*wireConn, error) {
 			return serverConn, nil
 		}
 	}
+	dialCtx, cancelDial := context.WithTimeout(c.bindCtx, clientBindDialTimeout)
+	defer cancelDial()
 	if c.isConnect {
-		udpConn, err := c.dialer.DialContext(c.bindCtx, N.NetworkUDP, M.SocksaddrFromNetIP(c.connectAddr))
+		udpConn, err := c.dialer.DialContext(dialCtx, N.NetworkUDP, M.SocksaddrFromNetIP(c.connectAddr))
 		if err != nil {
 			return nil, err
 		}
-		c.conn = &wireConn{
+		created := &wireConn{
 			PacketConn: bufio.NewUnbindPacketConn(udpConn),
 			done:       make(chan struct{}),
 		}
-	} else {
-		udpConn, err := c.dialer.ListenPacket(c.bindCtx, M.Socksaddr{Addr: netip.IPv4Unspecified()})
-		if err != nil {
-			return nil, err
-		}
-		c.conn = &wireConn{
-			PacketConn: bufio.NewPacketConn(udpConn),
-			done:       make(chan struct{}),
-		}
+		c.conn.Store(created)
+		return created, nil
 	}
-	return c.conn, nil
+	udpConn, err := c.dialer.ListenPacket(dialCtx, M.Socksaddr{Addr: netip.IPv4Unspecified()})
+	if err != nil {
+		return nil, err
+	}
+	created := &wireConn{
+		PacketConn: bufio.NewPacketConn(udpConn),
+		done:       make(chan struct{}),
+	}
+	c.conn.Store(created)
+	return created, nil
 }
 
 func (c *ClientBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
@@ -114,20 +133,34 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 	if err != nil {
 		select {
 		case <-c.done:
-			return
+			// The bind is closed, so this receive loop is finished - and it has to say so.
+			//
+			// Returning a nil error here left wireguard-go's receive loop calling back
+			// immediately, forever: it only exits on an error, so the loop became a hot spin at
+			// 100% of a core. Because the loop's deferred Done() is what a Close waits on, that
+			// spin also meant the device could never finish stopping - Endpoint.Close hung
+			// indefinitely while the process stayed busy.
+			return 0, net.ErrClosed
 		default:
 		}
 		c.logger.Error(E.Cause(err, "connect to server"))
-		err = nil
+		// One retry per second while the dial keeps failing, but only while the device still has
+		// a reason to be up: the sleep is not interruptible, so an unbounded number of them after
+		// the bind was closed is what the c.done check above exists to prevent.
 		c.pauseManager.WaitActive()
-		time.Sleep(time.Second)
-		return
+		if !c.sleepRetry() {
+			return 0, net.ErrClosed
+		}
+		return 0, nil
 	}
 	n, addr, err := udpConn.ReadFrom(packets[0])
 	if err != nil {
 		udpConn.Close()
 		select {
 		case <-c.done:
+			// Same reason as the connect failure above: a closed bind must end the loop with an
+			// error, not with a nil that asks wireguard-go to call straight back in.
+			return 0, net.ErrClosed
 		default:
 			c.logger.Error(E.Cause(err, "read packet"))
 			err = nil
@@ -155,8 +188,21 @@ func (c *ClientBind) Close() error {
 	}
 	c.connAccess.Lock()
 	defer c.connAccess.Unlock()
-	common.Close(common.PtrOrNil(c.conn))
+	common.Close(common.PtrOrNil(c.conn.Load()))
 	return nil
+}
+
+// sleepRetry waits a second, reporting whether the bind is still open when it wakes. The wait
+// itself is not interruptible, so callers must re-check done rather than assume the sleep proves
+// anything about the bind's state.
+func (c *ClientBind) sleepRetry() bool {
+	time.Sleep(time.Second)
+	select {
+	case <-c.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func (c *ClientBind) SetMark(mark uint32) error {
@@ -167,7 +213,9 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 	udpConn, err := c.connect()
 	if err != nil {
 		c.pauseManager.WaitActive()
-		time.Sleep(time.Second)
+		if !c.sleepRetry() {
+			return net.ErrClosed
+		}
 		return err
 	}
 	destination := netip.AddrPort(ep.(remoteEndpoint))

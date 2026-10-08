@@ -159,8 +159,10 @@ func init() {
 			serveErr := http3Server.ServeListener(quicListener)
 			udpConn.Close()
 			// A listener that stops because the server is shutting down is
-			// expected. Anything else is a real fault and stays an error.
-			if serveErr != nil && !E.IsClosedOrCanceled(serveErr) && !isExpectedH3Closure(serveErr) {
+			// expected. Anything else is a real fault and stays an error - including a
+			// QUIC protocol violation, which a plain closed/canceled test would hide
+			// because quic-go's transport errors unwrap to net.ErrClosed.
+			if serveErrorIsAFault(serveErr) {
 				logger.Error("http3 server closed: ", serveErr)
 			}
 		}()

@@ -146,6 +146,29 @@ func isExpectedH3Closure(err error) bool {
 	return IsExpectedH3Closure(err)
 }
 
+// serveErrorIsAFault reports whether a finished HTTP/3 server is worth an error line.
+//
+// # Why the generic closed test cannot come first
+//
+// quic-go's TransportError.Unwrap() returns net.ErrClosed alongside the real cause, so
+// "errors.Is(err, net.ErrClosed)" is true for EVERY transport error - a protocol violation just
+// as much as an orderly shutdown. A condition that tests closed-ness before the typed
+// classification therefore swallows the faults it was written to surface, and this file's own
+// rule (typed classification first, generic sentinels only as a fallback) is the opposite order
+// for exactly that reason.
+//
+// So an error with quic-go/HTTP/3 semantics is decided by the typed classifier alone, and an
+// error with no typed semantics falls back to the generic sentinels.
+func serveErrorIsAFault(err error) bool {
+	if err == nil {
+		return false
+	}
+	if CarriesQuicSemantics(err) {
+		return !IsExpectedH3Closure(err)
+	}
+	return !E.IsClosedOrCanceled(err)
+}
+
 // CarriesQuicSemantics reports whether the error chain contains a quic-go or HTTP/3 type.
 //
 // It exists so a caller can tell "this error has a typed meaning, so the typed classifier is

@@ -21,6 +21,19 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+// clientDialer is the dialer the SOCKS client is built with.
+//
+// Version 5 is the only version with UDP ASSOCIATE, so it is the only one whose relay address
+// can come back unspecified - and an unspecified address means the local system to Go, which
+// sends every datagram to loopback with no error. The wrapper is scoped to that version so
+// version 4 keeps its own path untouched.
+func clientDialer(outboundDialer N.Dialer, version socks.Version, serverAddr M.Socksaddr) N.Dialer {
+	if version != socks.Version5 {
+		return outboundDialer
+	}
+	return newRelayDialer(outboundDialer, serverAddr)
+}
+
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.SOCKSOutboundOptions](registry, C.TypeSOCKS, NewOutbound)
 }
@@ -89,7 +102,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Adapter:            outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
 		dnsRouter:          service.FromContext[adapter.DNSRouter](ctx),
 		logger:             logger,
-		client:             socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
+		client:             socks.NewClient(clientDialer(outboundDialer, version, options.ServerOptions.Build()), options.ServerOptions.Build(), version, options.Username, options.Password),
 		resolve:            version == socks.Version4,
 		targetQueryOptions: targetQueryOptions,
 	}
