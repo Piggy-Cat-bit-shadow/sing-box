@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -55,10 +56,9 @@ func gvisorShippedVariants() []string {
 // TestNoShippedVariantShipsGVisor is the inverted invariant: the default state is gVisor-free, and
 // any variant that names the tag fails CI.
 func TestNoShippedVariantShipsGVisor(t *testing.T) {
-	for _, variant := range sortedTagVariants() {
-		if HasBuildTag(variant, gvisorTag) {
-			t.Fatalf("%s compiles with_gvisor.\n%s", variant, gvisorReenableInstruction)
-		}
+	if shipped := gvisorShippedVariants(); len(shipped) > 0 {
+		t.Fatalf("these shipped variants compile with_gvisor again: %v\n%s",
+			shipped, gvisorReenableInstruction)
 	}
 	// And the platforms the product decision named, explicitly, so the failure text says which one
 	// regressed rather than only that something did.
@@ -110,41 +110,118 @@ func TestProfileTagFilesDoNotCarryGVisor(t *testing.T) {
 	}
 }
 
-// TestGVisorForkIsNotLoadBearing is the dependency half of the inverted invariant.
+// TestGVisorIsRetiredFromTheModuleGraph is the dependency half of the inverted invariant, and since
+// the Go TUN stack landed it is a HARD FAILURE rather than a report.
 //
-// # Why this reports the dependency edge instead of failing on it
+// # Why it used to report instead of failing, and why that is over
 //
-// The SHIPPED exposure is what made 048 a crash surface, and that is asserted above: no variant
-// compiles with_gvisor. The remaining dependency edge cannot be removed yet for a concrete reason -
-// protocol/tun still imports gVisor behind the with_gvisor build tag, so the module graph keeps
-// requiring it until the upstream Go TUN stack (a1b01b4) replaces that code path. That is
-// upstream's own ordering: ede8d9a "Remove dependency on gVisor" FOLLOWS the Go stack.
+// While the migration was in flight this branch logged PENDING: the shipped exposure was already
+// zero (asserted above), but the dependency edge could not be removed yet because the code path
+// that needed gVisor had not been replaced, so failing would have made CI red for a tree that was
+// correct and mid-migration - which trains people to ignore the check. That condition is gone. The
+// Go TUN stack is in, nothing in this module imports gVisor, and the retired fork's replace
+// directive is gone from go.mod. The edge is now removable, so it must be removed, and this test
+// says so instead of keeping a note.
 //
-// Failing here would make CI red for a correct mid-migration state, which trains people to ignore
-// the check. Passing silently would lose the fact. So the tag re-enable tripwire is the assertion
-// (it fails), and the dependency edge is recorded against a named migration.
-func TestGVisorForkIsNotLoadBearing(t *testing.T) {
-	// The tripwire: the moment a shipped variant compiles the tag again, this fails and names the
-	// reason. That is the property that matters and the one a reader must not lose.
-	if shipped := gvisorShippedVariants(); len(shipped) > 0 {
-		t.Fatalf("a shipped variant compiles with_gvisor again (%v), so the retired fork is "+
-			"load-bearing once more.\n%s", shipped, gvisorReenableInstruction)
-	}
-	// The pending half, recorded so the migration cannot be forgotten: while the fork replacement
-	// is still present, the Go TUN stack migration is what removes it.
+// # What "retired" means precisely
+//
+// `github.com/sagernet/gvisor` may still appear in go.mod as an `// indirect` requirement, because
+// sing-tun itself contains with_gvisor-tagged packages and the module graph therefore still names
+// the module. That is acceptable and is upstream's own end state. What is NOT acceptable, and what
+// this test fails on, is the dependency becoming ACTIVE again in this module:
+//
+//   - a replace directive pinning gVisor to the retired fork (or to anything else);
+//   - gVisor listed in the direct require block, which is only possible if something here imports
+//     it;
+//   - any .go file in this module importing github.com/sagernet/gvisor.
+func TestGVisorIsRetiredFromTheModuleGraph(t *testing.T) {
 	root := repoRoot(t)
-	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	modData, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const forkReplace = "replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor"
-	if strings.Contains(string(data), forkReplace) {
-		t.Log("PENDING: go.mod still replaces gVisor with the retired fork. The shipped exposure is " +
-			"already zero (asserted above); the dependency edge is removed by the Go TUN stack " +
-			"migration (upstream a1b01b4, then ede8d9a), because protocol/tun still imports gVisor " +
-			"behind the build tag. When that lands this branch must become a failure.")
+	modContent := string(modData)
+
+	const forkReplace = "replace github.com/sagernet/gvisor"
+	if strings.Contains(modContent, forkReplace) {
+		t.Fatalf("go.mod still replaces gVisor (%s...). The fork is RETIRED: gVisor no longer ships, "+
+			"so the nil-handshake guard it carried has nothing to protect.\n%s",
+			forkReplace, gvisorReenableInstruction)
+	}
+
+	// A direct require is the module graph's way of saying "a package in this module imports it".
+	// Only the block before the first `require (` ... `)` indirection marker matters, so the check
+	// walks the file rather than pattern-matching a substring anywhere.
+	for _, line := range strings.Split(modContent, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, gvisorModule) {
+			continue
+		}
+		if strings.Contains(trimmed, "// indirect") {
+			// sing-tun's with_gvisor-tagged packages keep this in the graph. Fine.
+			continue
+		}
+		t.Fatalf("go.mod lists %s as an ACTIVE requirement (%q). It must be `// indirect` or absent; "+
+			"an active requirement means something in this module imports gVisor again.\n%s",
+			gvisorModule, trimmed, gvisorReenableInstruction)
+	}
+
+	// The import scan is the assertion the go.mod shape is a proxy for, and it is the one that
+	// cannot be fooled by a hand-edited go.mod. Nested modules (clients/apple, test/) have their own
+	// graphs and are deliberately not part of this one.
+	//
+	// It matches IMPORT LINES, not the bare module path, because this file and the CI check both
+	// name the module in strings; a substring scan would flag the tripwire itself and be useless.
+	var importers []string
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			name := entry.Name()
+			if path == root {
+				return nil
+			}
+			if name == "clients" || name == "build" || name == ".git" || name == "vendor" {
+				return filepath.SkipDir
+			}
+			if _, statErr := os.Stat(filepath.Join(path, "go.mod")); statErr == nil {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if !gvisorImportLine.Match(content) {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			rel = path
+		}
+		importers = append(importers, rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(importers) > 0 {
+		slices.Sort(importers)
+		t.Fatalf("these files import %s again: %v\n%s",
+			gvisorModule, importers, gvisorReenableInstruction)
 	}
 }
+
+const gvisorModule = "github.com/sagernet/gvisor"
+
+// gvisorImportLine matches a Go import spec for the module: optional alias, then the quoted path on
+// its own line. `const x = "github.com/sagernet/gvisor"` is not an import and must not match.
+var gvisorImportLine = regexp.MustCompile(`(?m)^\s*(?:[._[:alnum:]]+\s+)?"github\.com/sagernet/gvisor(?:/[^"]*)?"\s*$`)
 
 // repoRoot walks up from the test's working directory to the module root.
 func repoRoot(t *testing.T) string {

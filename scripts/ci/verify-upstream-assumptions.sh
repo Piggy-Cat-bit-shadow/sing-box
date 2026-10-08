@@ -89,28 +89,28 @@ run_tripwire \
   "./protocol/tun/" \
   'TestDNSHijack|TestFakeIPIsNot|TestNoFakeIPTransport|TestNonDNS|TestL0'
 
-# GVISOR MUST NOT BE SHIPPED.
+# GVISOR MUST NOT BE SHIPPED, AND IT MUST NOT COME BACK THROUGH THE MODULE GRAPH EITHER.
 #
-# This block used to assert the OPPOSITE: that with_gvisor was compiled into Android and that the
-# linked gVisor was therefore our patched fork carrying the 048 nil-handshake guard. That was
-# correct at the time - 048 was a real crash surface on a shipped stack.
+# This block used to report PENDING for the dependency half. While the Go TUN stack migration was in
+# flight the shipped exposure was already zero but the dependency edge could not be removed yet, so
+# failing would have made CI red for a tree that was correct and mid-migration - which trains people
+# to ignore the check. That condition is gone: the Go TUN stack is in, nothing in this module imports
+# gVisor, and the retired fork's replace directive is gone from go.mod. The edge is therefore
+# ASSERTED rather than recorded, and every branch below is a hard failure.
 #
-# The product condition has changed. The Android UI no longer depends on "stack": "mixed"/"gvisor",
-# so gVisor is retired from shipped artifacts. The risk is gone because the EXPOSURE is gone, not
-# because 048 was never real, and the check is INVERTED rather than deleted: deleting it would
-# delete the only thing that notices the exposure coming back.
-#
-# Three parts, unchanged in shape:
-#   1. the libbox builder's own tag-policy test, which asks the same function the builders use
-#      (cmd/internal/build_libbox) - the property that made it catch the real thing;
-#   2. the profile files, still scanned, so the two tag sources cannot drift apart;
-#   3. the dependency invariant, inverted: no shipped variant names with_gvisor, so the retired
-#      fork must not still be wired into go.mod.
+# Four parts:
+#   1. the libbox builder's own tag-policy test, which asks the same function the builders use -
+#      the property that made it catch the real thing while a file scan did not;
+#   2. the profile tag files, so the two tag sources cannot drift apart;
+#   3. the module graph: no replace pinning gVisor, and no ACTIVE (non-indirect) requirement;
+#   4. the artifact: link the probe with the shipped tag set and read the provenance out of the
+#      binary. This is the check that would have caught the original gap, where the profile files
+#      said one thing and the shipped build did another.
 echo
-echo "--- gVisor: retired from shipped artifacts (inverted invariant)"
+echo "--- gVisor: retired from shipped artifacts AND from the module graph (hard invariant)"
 if ! go test -count=1 ./cmd/internal/build_libbox/ >/dev/null 2>&1; then
   echo "FAIL: the libbox tag-policy test failed. It asserts that NO shipped variant compiles" >&2
-  echo "      with_gvisor, and that the retired fork is not still wired into go.mod." >&2
+  echo "      with_gvisor AND that gVisor is retired from the module graph." >&2
   echo "      Run it directly for the detail:" >&2
   echo "          go test -v ./cmd/internal/build_libbox/" >&2
   exit 1
@@ -123,94 +123,74 @@ for tags_file in release/DEFAULT_BUILD_TAGS release/DEFAULT_BUILD_TAGS_OTHERS re
   fi
   if grep -q 'with_gvisor' "$tags_file"; then
     echo "FAIL: $tags_file names with_gvisor. gVisor was intentionally retired after the Android UI" >&2
-    echo "      stopped depending on mixed/gvisor. Re-enabling it requires a new product review and" >&2
-    echo "      restoring and re-auditing LX 048. See docs/fork/upstream-sync-2026-10.md." >&2
+    echo "      stopped depending on mixed/gvisor and the Go TUN stack replaced that code path." >&2
+    echo "      Re-enabling it requires a new product review and restoring and re-auditing LX 048." >&2
+    echo "      See docs/fork/upstream-sync-2026-10.md." >&2
     exit 1
   fi
 done
 echo "PASS: no profile tag file carries with_gvisor"
 
-# The inverted dependency half. This is the tripwire against a silent re-enable: while no shipped
-# variant compiles the tag, the retired fork must not still be the replacement for gVisor.
+# The retired fork must not still be the replacement for gVisor. This used to be a PENDING report;
+# it is a failure now because the fork was retired on the strength of the dependency edge being
+# removable, and a surviving replace would silently undo that.
 gvisor_replace="$(go list -m -f '{{if .Replace}}{{.Replace.Path}}@{{.Replace.Version}}{{end}}' github.com/sagernet/gvisor 2>/dev/null || true)"
-case "$gvisor_replace" in
+if [ -n "$gvisor_replace" ]; then
+  echo "FAIL: gVisor is replaced by '$gvisor_replace'." >&2
+  echo "      The fork github.com/Piggy-Cat-bit-shadow/gvisor is RETIRED (the remote is kept for" >&2
+  echo "      the record). gVisor no longer ships, so the nil-handshake guard it carried has" >&2
+  echo "      nothing to protect; a replace here means the retirement was reverted by hand." >&2
+  exit 1
+fi
+echo "PASS: gVisor carries no replacement; the retired fork is not wired in"
+
+# gVisor MAY remain as an `// indirect` requirement, because sing-tun still contains
+# with_gvisor-tagged packages and the module graph therefore still names the module. That is
+# upstream's own end state. What must not happen is the requirement becoming ACTIVE, which is only
+# possible if something in this module imports it.
+gvisor_require_line="$(grep -E '^[[:space:]]*github\.com/sagernet/gvisor([[:space:]]|$)' go.mod || true)"
+case "$gvisor_require_line" in
   "")
-    echo "PASS: gVisor carries no replacement; the retired fork is no longer wired in" ;;
-  github.com/Piggy-Cat-bit-shadow/gvisor@*)
-    # PENDING, not FAIL, and the distinction is the whole point.
-    #
-    # The SHIPPED exposure is already zero: the builder test above asserts that no variant compiles
-    # with_gvisor, which is the thing that made 048 a crash surface. What remains is the dependency
-    # edge, and it cannot be removed yet for a concrete reason: protocol/tun still imports gVisor
-    # behind the with_gvisor build tag, so the module graph keeps requiring it until the upstream Go
-    # TUN stack (a1b01b4) replaces that code path. That is upstream's own ordering - ede8d9a
-    # "Remove dependency on gVisor" follows the Go stack rather than preceding it.
-    #
-    # Failing here would make CI red for a state that is correct and mid-migration, which trains
-    # people to ignore the check. Passing silently would lose the fact. So it reports, and it is
-    # tied to a named migration rather than to a date.
-    echo "PENDING: gVisor is still replaced by the retired fork: $gvisor_replace"
-    echo "         The shipped exposure is already zero (no variant compiles with_gvisor, asserted)."
-    echo "         The dependency edge is removed by the Go TUN stack migration (upstream a1b01b4,"
-    echo "         then ede8d9a), because protocol/tun still imports gVisor behind the build tag."
-    echo "         When that lands, this branch must become a FAIL if the replace survives."
-    echo "         See docs/fork/upstream-sync-2026-10.md." ;;
+    echo "PASS: gVisor is not required at all in go.mod" ;;
+  *"// indirect"*)
+    echo "PASS: gVisor is only an indirect requirement (sing-tun's with_gvisor-tagged packages)" ;;
   *)
-    echo "FAIL: gvisor is replaced by '$gvisor_replace', which is neither the retired fork nor absent." >&2
-    echo "      Re-audit this before accepting a different replacement." >&2
+    echo "FAIL: go.mod lists gVisor as an ACTIVE requirement:" >&2
+    echo "      $gvisor_require_line" >&2
+    echo "      It must be '// indirect' or absent. An active requirement means something in this" >&2
+    echo "      module imports gVisor again, which is the exposure 048 was about." >&2
     exit 1 ;;
 esac
 
-# Whatever gVisor remains (upstream still supports the tag until the Go TUN stack lands), it must
-# not be reachable from a shipped artifact. The builder-level assertion above is what guarantees
-# that; this records the intent so a reader knows the guard is deliberate.
-
-# Artifact-level proof, not a module-graph claim: link the probe with the Android tag composition
-# and read the dependency out of the built binary. This is the check that would have caught the
-# original gap, where the profile files said one thing and the shipped build did another.
-probe_tags="$(cat release/DEFAULT_BUILD_TAGS),with_gvisor"
+# Artifact-level proof, not a module-graph claim: link the probe with the SHIPPED tag set and read
+# the dependency out of the built binary. The probe is deliberately NOT built with with_gvisor any
+# more: the positive control it used to be existed to check the fork pin, and keeping it would have
+# kept gVisor an active dependency purely to test a dependency that must not exist.
 probe_bin="$(mktemp -t sing-box-artifact-probe.XXXXXX)"
-if go build -tags "$probe_tags" -o "$probe_bin" ./cmd/ci-artifact-probe >/dev/null 2>&1; then
-  if go version -m "$probe_bin" 2>/dev/null | grep -q '=>[[:space:]]*github.com/Piggy-Cat-bit-shadow/gvisor'; then
-    echo "PASS: an artifact built with with_gvisor links the patched gVisor fork"
-  else
-    echo "FAIL: an artifact built with with_gvisor does not link the patched gVisor fork." >&2
-    echo "      The dependency provenance in the built binary is the release fact; fix the pin" >&2
-    echo "      before shipping, because Android compiles this tag." >&2
-    rm -f "$probe_bin"
-    exit 1
-  fi
-  if go version -m "$probe_bin" 2>/dev/null | grep -q 'with_gvisor'; then
-    echo "      probe build tags include with_gvisor"
-  fi
-else
-  echo "FAIL: could not build the artifact probe with with_gvisor." >&2
+if ! go build -tags "$tags" -o "$probe_bin" ./cmd/ci-artifact-probe >/dev/null 2>&1; then
+  echo "FAIL: could not build the artifact probe with the shipped tag set." >&2
   echo "      ./cmd/ci-artifact-probe is the release check's view of a linked artifact; if it does" >&2
   echo "      not build, the provenance cannot be verified." >&2
   rm -f "$probe_bin"
   exit 1
 fi
+probe_provenance="$(go version -m "$probe_bin" 2>/dev/null || true)"
 rm -f "$probe_bin"
-
-# Advisory only: has upstream caught up? That is the fork's removal condition.
-if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-  upstream_head="$(gh api repos/SagerNet/gvisor/commits/go --jq '.sha' 2>/dev/null || true)"
-  if [ -n "$upstream_head" ]; then
-    upstream_dispatcher="$(gh api "repos/SagerNet/gvisor/contents/pkg/tcpip/transport/tcp/dispatcher.go?ref=$upstream_head" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || true)"
-    if [ -n "$upstream_dispatcher" ]; then
-      printf '%s' "$upstream_dispatcher" > /tmp/gvisor-upstream-dispatcher.go
-      if awk '/^func handleConnecting\(/ { inFunc = 1 } inFunc { print } inFunc && /^}/ { exit }' /tmp/gvisor-upstream-dispatcher.go | grep -q 'ep\.h == nil'; then
-        echo "      NOTE: upstream go ($upstream_head) now guards the nil handshake. It may have fixed"
-        echo "      LX 048 independently - re-audit and retire this fork if so."
-      else
-        echo "      upstream go ($upstream_head) still dereferences nil; fork still required"
-      fi
-      rm -f /tmp/gvisor-upstream-dispatcher.go
-    fi
-  fi
-else
-  echo "      (upstream probe skipped: gh unavailable or not authenticated)"
+if printf '%s' "$probe_provenance" | grep -q 'github.com/sagernet/gvisor'; then
+  echo "FAIL: a linked artifact built with the shipped tag set still contains the gVisor module." >&2
+  echo "      The dependency provenance in the built binary is the release fact. Fix the build" >&2
+  echo "      composition before shipping." >&2
+  exit 1
 fi
+if printf '%s' "$probe_provenance" | grep -q 'with_gvisor'; then
+  echo "FAIL: the shipped tag set contains with_gvisor." >&2
+  exit 1
+fi
+echo "PASS: a linked artifact built with the shipped tag set carries no gVisor module and no with_gvisor tag"
+
+# The 048 removal condition is MET: gVisor is retired and the fork's remote is preserved as history,
+# so there is nothing left to probe upstream for. An advisory probe here would report "fork still
+# required", which is now the opposite of this repository's policy.
 
 # The sing-tun acceptLoop self-heal (LX 040).
 #
