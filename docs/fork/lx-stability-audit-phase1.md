@@ -176,10 +176,18 @@ stays deferred with the AWG feature itself (§2.3).
 | `6a8f1c483` | `stability: fix lifecycle and cancellation hazards` |
 | `58d53cc61` | `test: add LX-derived regression coverage` |
 | `c2e34cf6f` | `docs(fork): phase-1 LX stability audit — findings, fixes, deferred items` |
+| `38d539094` | `docs(fork): finalize phase 1 — deferral decisions, 040 tripwire, handoff` |
+| `acbe11ada` | `stability: pin the sing-tun accept-loop self-heal fork (LX 040)` |
 
-Phase-1 freeze: `aac61e522` → `c2e34cf6f` plus the finalization commit that rewrites the
-040/041 rows, adds the sing-tun `acceptLoop` tripwire and appends this handoff. No squash,
-no rebase, no history rewrite.
+Phase-1 freeze: `aac61e522` → `c2e34cf6f` plus the finalization commit that rewrote the
+040/041 rows, added the sing-tun `acceptLoop` tripwire and appended this handoff. No
+squash, no rebase, no history rewrite.
+
+**040 was then reopened** by an explicit owner decision: a defect that reaches users as a
+permanent failure state is this project's bug even when its cause sits in a pinned
+dependency, and "it is in a dependency" is not a reason to leave it deferred. `acbe11ada`
+pins the published fork; §2.3 and the dependency policy record it. 041 stays deferred to
+Phase 1.5 — 040 was a correctness bug, 041 is a recovery-policy decision.
 
 ## Dependency policy
 
