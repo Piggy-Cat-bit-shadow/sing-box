@@ -360,6 +360,16 @@ func (t *adaptiveTimer) releaseIdleMemory(sample memorySample, connections int) 
 	}
 	t.lastRelease = now
 	t.access.Unlock()
+	// Progressive pass first: release what is reusable (idle DNS/HTTP pools, idle outbound
+	// connections) and then let the runtime return the freed memory. This is NOT the aggressive
+	// ReleaseMemory path - it must not reset the network or cause a dial. Memory that is merely
+	// elevated should not cost the user a round of handshakes.
+	//
+	// It runs with t.access released, like every other callback here, because closing pools takes
+	// locks of its own and holding the timer lock across them would serialise them behind a timer.
+	if t.network != nil {
+		t.network.TrimMemory(context.Background())
+	}
 	runtimeDebug.FreeOSMemory()
 	t.access.Lock()
 	t.lastGCCycles = readGCCycles()
