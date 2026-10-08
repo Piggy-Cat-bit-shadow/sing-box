@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -59,6 +60,11 @@ type Router struct {
 	// trafficClassPolicies holds the per-outbound explicit traffic class from the configuration.
 	// It is set once during box setup and only read at flow setup.
 	trafficClassPolicies TrafficClassPolicies
+
+	// dnsHijackInFlight counts hijacked DNS packets currently being resolved. It bounds the
+	// goroutines that HijackDNSPacket hands to the DNS router, so a dead resolver cannot turn a
+	// query flood into unbounded growth. See dnsHijackConcurrency.
+	dnsHijackInFlight atomic.Int64
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
