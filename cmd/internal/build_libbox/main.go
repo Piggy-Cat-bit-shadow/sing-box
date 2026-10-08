@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,11 +30,25 @@ func init() {
 	flag.BoolVar(&debugEnabled, "debug", false, "enable debug")
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
+	// -print-resolved-tags prints the build tags a shipped variant actually compiles, one
+	// comma-separated line, and exits without building.
+	//
+	// It exists so CI can ASSERT the product decisions - that no Android variant ships gVisor and
+	// that it does ship the mobile buffer geometry - against the SAME function the builder and the
+	// provenance record use, instead of re-listing the tags in YAML. A second list is a second
+	// source of truth, and the first thing it does is drift; that is precisely how the phase-1
+	// gVisor exposure hid, when a check read the profile tag files while the builder composed its
+	// own set.
+	flag.StringVar(&printResolvedTags, "print-resolved-tags", "", "print the resolved build tags for a variant and exit")
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
 }
 
 func main() {
 	flag.Parse()
+	if printResolvedTags != "" {
+		fmt.Println(strings.Join(ResolveBuildTags(printResolvedTags), ","))
+		return
+	}
 
 	build_shared.FindMobile()
 
@@ -171,7 +186,9 @@ func HasBuildTag(variant, tag string) bool {
 var (
 	sharedFlags []string
 	debugFlags  []string
-	sharedTags  []string
+	// printResolvedTags names a variant to report the resolved tags for, then exit.
+	printResolvedTags string
+	sharedTags        []string
 	// memcTags []string
 	debugTags []string
 )

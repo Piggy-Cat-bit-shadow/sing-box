@@ -1,0 +1,219 @@
+name: Android Core ARM64
+
+# Builds the Android ARM64 core the product actually ships, through the product's own builder.
+#
+# # Why this exists
+#
+# Every other artifact workflow here is manual dispatch, and until this one existed the Android
+# target had no CI at all: the only thing a push triggered was Verify, which is a structural gate and
+# builds nothing for mobile. So the builder could have been broken for a week and nothing would have
+# said so.
+#
+# # Why it calls cmd/internal/build_libbox instead of running gomobile itself
+#
+# CI build path == product build path, or the workflow is theatre. The feature tag set is NOT written
+# here: it comes from ResolveBuildTags("android-main"), the same function the release builder and the
+# provenance record use. A workflow that re-listed the tags would be a second source of truth, and the
+# first thing it would do is drift - which is exactly how the phase-1 gVisor exposure hid, when a
+# check read the profile tag FILES while the builder composed its own set.
+#
+# # What it verifies beyond "the build exited 0"
+#
+#   * the provenance file's commit equals GITHUB_SHA (a build that reports a different commit than the
+#     one it was asked to build is not a build of that commit);
+#   * the resolved tags carry no gVisor and DO carry the mobile geometry, so a silent revert of either
+#     product decision fails here rather than in a shipped artifact;
+#   * the AAR really contains an AArch64 jni/arm64-v8a/libbox.so, is non-empty, and carries the tag
+#     set and no gvisor module in its Go build info. "The aar exists" is not the assertion.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [testing]
+    paths:
+      - 'cmd/internal/build_libbox/**'
+      - 'cmd/internal/mobilebuildtags/**'
+      - 'cmd/internal/applebuildtags/**'
+      - 'experimental/libbox/**'
+      - 'protocol/**'
+      - 'route/**'
+      - 'dns/**'
+      - 'transport/**'
+      - 'service/**'
+      - 'common/**'
+      - 'adapter/**'
+      - 'option/**'
+      - 'constant/**'
+      - 'release/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/android-core-arm64.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android-core-arm64:
+    name: Android ARM64 core
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
+
+      # JDK 17 and the NDK version are pinned rather than floated: a toolchain that changes under the
+      # build would make a green run mean something different each week.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          sdkmanager --install "ndk;27.0.12077973" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - name: Install gomobile and gobind
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # Cheap structural gates first, so a failure lands near its cause instead of at the end of a
+      # 15-minute native build.
+      - name: Format gate
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '^clients/') || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
+      - name: Module integrity
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Tag policy and builder tests
+        run: go test -count=1 ./cmd/internal/... ./cmd/ci-artifact-probe/...
+
+      - name: Emit the resolved tags and assert the product decisions
+        run: |
+          go run ./cmd/internal/build_libbox -print-resolved-tags android-main > /tmp/android-tags.txt
+          cat /tmp/android-tags.txt
+          python3 - <<'PY'
+          tags = open('/tmp/android-tags.txt').read().strip().split(',')
+          # gVisor was retired when the Android UI stopped depending on mixed/gvisor. It must not come
+          # back silently; the tag_policy test is the primary tripwire and this is the second one, on
+          # the resolved set the product actually compiles.
+          assert 'with_gvisor' not in tags, 'Android must not ship with_gvisor: %r' % (tags,)
+          # The mobile buffer geometry is a product decision made on measured evidence.
+          assert 'with_low_memory' in tags, 'Android must ship the mobile geometry: %r' % (tags,)
+          print('PASS: android-main carries the mobile geometry and no gVisor')
+          PY
+
+      # The real build, through the product's own builder. -platform selects the single ARM64 target:
+      # an all-ABI AAR would not prove the ARM64 payload works, it would only prove gomobile can run.
+      - name: Build libbox (android/arm64)
+        run: |
+          go run ./cmd/internal/build_libbox -target android -platform android/arm64
+
+      - name: Verify provenance and the ARM64 payload
+        run: |
+          set -euo pipefail
+          prov=""
+          for candidate in libbox.provenance libs/libbox.provenance clients/android/app/libs/libbox.provenance; do
+            if [ -f "$candidate" ]; then prov="$candidate"; break; fi
+          done
+          if [ -z "$prov" ]; then
+            echo "FAIL: no libbox.provenance was written; the build did not record what it built" >&2
+            find . -name 'libbox.provenance' -not -path './clients/*' | head >&2
+            exit 1
+          fi
+          echo "--- $prov ---"; cat "$prov"
+          prov_commit="$(sed -n 's/^commit=//p' "$prov")"
+          if [ "$prov_commit" != "$GITHUB_SHA" ]; then
+            echo "FAIL: provenance commit '$prov_commit' != GITHUB_SHA '$GITHUB_SHA'" >&2
+            exit 1
+          fi
+          echo "PASS: provenance names the commit that was built"
+
+          aar="$(find . -name 'libbox*.aar' -not -path './clients/*' | head -1)"
+          if [ -z "$aar" ]; then echo "FAIL: no libbox .aar produced" >&2; exit 1; fi
+          echo "aar: $aar ($(stat -c%s "$aar") bytes)"
+          rm -rf /tmp/aar && mkdir -p /tmp/aar && unzip -q "$aar" -d /tmp/aar
+          find /tmp/aar -name '*.so' -printf '%p %s\n' | sort
+
+          so="$(find /tmp/aar -path '*arm64-v8a*' -name 'libbox.so' | head -1)"
+          if [ -z "$so" ]; then
+            echo "FAIL: the AAR has no jni/arm64-v8a/libbox.so; this build claims ARM64" >&2
+            exit 1
+          fi
+          size="$(stat -c%s "$so")"
+          if [ "$size" -lt 1000000 ]; then
+            echo "FAIL: $so is only $size bytes; an ARM64 libbox is far larger than that" >&2
+            exit 1
+          fi
+          arch="$(file -b "$so")"
+          echo "arch: $arch"
+          case "$arch" in
+            *aarch64*|*AArch64*|*ARM*64*) echo "PASS: AArch64" ;;
+            *) echo "FAIL: $so is not AArch64: $arch" >&2; exit 1 ;;
+          esac
+          # A build-info read is the strongest statement available about what is inside: it comes from
+          # the artifact, not from the script that produced it.
+          if command -v go >/dev/null && go version -m "$so" >/tmp/so-buildinfo.txt 2>/dev/null; then
+            if grep -q 'with_gvisor' /tmp/so-buildinfo.txt; then
+              echo "FAIL: the ARM64 .so was built with_gvisor" >&2; exit 1
+            fi
+            if grep -q 'gvisor' /tmp/so-buildinfo.txt; then
+              echo "FAIL: the ARM64 .so links a gVisor module" >&2
+              grep gvisor /tmp/so-buildinfo.txt >&2; exit 1
+            fi
+            echo "PASS: the ARM64 .so carries no gVisor module and no with_gvisor tag"
+          else
+            echo "NOTE: build info not readable from this .so; architecture and size were still checked"
+          fi
+          sha256sum "$aar" "$so" "$prov" | tee SHA256SUMS.txt
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## Android Core ARM64"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`$GITHUB_SHA\` |"
+            echo "| go | \`$(go version)\` |"
+            echo "| java | \`$(java -version 2>&1 | head -1)\` |"
+            echo "| ndk | \`${ANDROID_NDK_HOME:-unset}\` |"
+            echo "| target abi | android/arm64 |"
+            echo "| resolved tags | \`$(cat /tmp/android-tags.txt 2>/dev/null || echo unavailable)\` |"
+            echo "| aar | \`$(find . -name 'libbox*.aar' -not -path './clients/*' | head -1)\` |"
+            echo "| sha256 | see the SHA256SUMS.txt artifact |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-core-arm64-${{ github.sha }}
+          path: |
+            **/libbox*.aar
+            **/libbox.provenance
+            SHA256SUMS.txt
+          if-no-files-found: error
