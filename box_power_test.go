@@ -108,3 +108,58 @@ func TestReleasePowerGovernorToleratesNils(t *testing.T) {
 		releasePowerGovernor(power.NewGovernor(power.DefaultPolicy()), nil, nil)
 	})
 }
+
+// TestApplyPauseEventPublishesTheReuseEdges is the mapping's second half, and the half that was
+// missing: the platform vocabulary must reach the reuse epoch as well as the state machine.
+//
+// A mis-mapping here is invisible from the outside - the tunnel still pauses and still wakes - and
+// it is exactly the shape of the shipped defect: the device axis moves, the reusable state is never
+// distrusted, and the first request after an unlock is handed a socket that the sleep killed.
+//
+// The shipping thresholds are moved rather than the clock, because the governor's clock is its own
+// and this package must not reach into it: what is under test is the mapping, and the tuning has its
+// own tests in common/power.
+func TestApplyPauseEventPublishesTheReuseEdges(t *testing.T) {
+	policy := power.DefaultPolicy()
+	policy.WakeStagger = power.WakeStagger{}
+	policy.ReuseFreshness = power.ReuseFreshness{
+		SuspectAfter: 5 * time.Second,
+		RetireAfter:  15 * time.Second,
+	}
+	// An injected clock, so the boundary is measured exactly rather than waited for: the sleep this
+	// test asserts is 30 seconds, and no test should take thirty seconds to say so.
+	now := time.Unix(1700000000, 0)
+	var elapsed time.Duration
+	clock := func() time.Time { return now.Add(elapsed) }
+	governor := power.NewGovernorWithClock(policy, clock)
+	t.Cleanup(governor.Close)
+
+	var boundaries []power.ReuseBoundary
+	governor.AddReuseObserver(func(boundary power.ReuseBoundary) {
+		boundaries = append(boundaries, boundary)
+	})
+
+	applyPauseEvent(governor, pause.EventDevicePaused)
+	require.Equal(t, power.StateQuiescent, governor.State())
+	require.Zero(t, governor.ReuseEpoch(), "a pause is not a boundary")
+
+	// A sleep long enough for the policy to act on.
+	elapsed = 30 * time.Second
+	applyPauseEvent(governor, pause.EventDeviceWake)
+
+	require.Len(t, boundaries, 1, "the device wake did not publish a reuse boundary")
+	require.Equal(t, power.ReuseRetire, boundaries[0].Action)
+	require.Equal(t, uint64(1), governor.ReuseEpoch())
+	require.Equal(t, power.StateActive, governor.State(), "the wake no longer moves the device axis")
+
+	// A network wake is neither an edge nor a level for the reuse epoch: it must not publish one, and
+	// it must not consume the next device boundary either.
+	applyPauseEvent(governor, pause.EventDevicePaused)
+	applyPauseEvent(governor, pause.EventNetworkPause)
+	applyPauseEvent(governor, pause.EventNetworkWake)
+	require.Len(t, boundaries, 1, "a network wake published a reuse boundary")
+	elapsed += 30 * time.Second
+	applyPauseEvent(governor, pause.EventDeviceWake)
+	require.Len(t, boundaries, 2, "the device boundary after the network transition was lost")
+	require.Equal(t, uint64(2), governor.ReuseEpoch())
+}

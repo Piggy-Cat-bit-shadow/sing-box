@@ -271,22 +271,51 @@ func (s *CommandServer) Pause() {
 	// from the power governor's DEEP_IDLE transition, which is reached only once the device has stayed
 	// paused with no real traffic - so a brief screen-off costs nothing and an afternoon in a pocket
 	// does not hold sockets. See common/power and the Box observer that performs it.
+	//
+	// The sleep EDGE is published as well as the level, and it is the edge that matters on this
+	// platform: the level below is idempotent and nothing on iOS ever lifts it, so the first sleep
+	// would be the only sleep the reuse epoch ever measured. See Box.DeviceSlept.
+	instance.Box().DeviceSlept()
 	instance.PauseManager().DevicePause()
 }
 
+// Wake ends the device pause on the platform whose wake signal means the device is usable.
+//
+// # Why this is not the same thing everywhere
+//
+// On Android the wake command is driven by Doze leaving, which is a statement that the device is out
+// of its low-power state and usable again: the pause ends and speculative work is released on the
+// stagger.
+//
+// On iOS the same command arrives for every push and background task, while the phone is still
+// locked and nobody is looking at it. Lifting the pause there would be wrong - it would release
+// health checks, probes and provider refreshes for a device in a pocket, which is the wake storm the
+// power policy exists to prevent. But ignoring it entirely is wrong too, and that is what this used
+// to do: a resume is proof that the sleep ended, so reusable state that predates it has not been
+// verified since, and the first flow after the unlock must not discover that by blackholing. The
+// reuse boundary is that verdict. It retires idle pools, it does not dial, and it does not touch a
+// stream that is carrying traffic or a single speculative category.
 func (s *CommandServer) Wake() {
 	recorder := s.powerManager.Recorder()
 	if recorder != nil {
 		recorder.RecordDeviceWake()
 	}
-	if !C.IsAndroid {
-		return
-	}
 	instance := s.StartedService.Instance()
-	if instance == nil || instance.PauseManager() == nil {
+	if instance == nil {
 		return
 	}
-	instance.PauseManager().DeviceWake()
+	if C.IsAndroid {
+		if instance.PauseManager() == nil {
+			return
+		}
+		instance.PauseManager().DeviceWake()
+		return
+	}
+	box := instance.Box()
+	if box == nil {
+		return
+	}
+	box.DeviceResumed()
 }
 
 func (s *CommandServer) WakeNow() {

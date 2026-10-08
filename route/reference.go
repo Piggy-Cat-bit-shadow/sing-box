@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/power"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/experimental/clashmode"
 	"github.com/sagernet/sing-box/log"
@@ -29,6 +30,15 @@ type ReferenceManager struct {
 	devicePaused           atomic.Bool
 	keepIdle               map[any]bool
 	unreferencedTransports map[string]bool
+	// powerGovernor is the sleep authority, and the source of the reuse epoch. It is nil in a build
+	// with no governor installed, in which case a resume boundary does not exist and nothing here
+	// changes - the same zero-configuration rule the rest of the power wiring follows.
+	powerGovernor *power.Governor
+	// closed makes a late reuse boundary a no-op. The governor is closed before the scope that owns
+	// this object, so a boundary can still be in flight while the pools it would retire are being
+	// torn down; retiring is idempotent, but reaching into a half-closed manager is not something to
+	// leave to chance. Close wins: after this is set, no boundary is acted on and nothing is woken.
+	closed atomic.Bool
 }
 
 func NewReferenceManager(ctx context.Context, logger log.ContextLogger, options option.Options) *ReferenceManager {
@@ -63,6 +73,9 @@ func NewReferenceManager(ctx context.Context, logger log.ContextLogger, options 
 		staticOutbounds:  staticOutbounds,
 		staticTransports: staticTransports,
 		pauseManager:     service.FromContext[pause.Manager](ctx),
+		// The governor is a service so that a component asks it instead of inventing a second epoch;
+		// the router does the same for traffic observation.
+		powerGovernor: service.FromContext[*power.Governor](ctx),
 	}
 }
 
@@ -118,7 +131,66 @@ func (m *ReferenceManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 			return nil
 		})
 	}
+	// The reuse boundary is the OTHER half of the sleep story, and it is not the pause callback above.
+	//
+	// The pause callback is about eligibility: which outbound may keep an idle connection, which
+	// on-demand tunnel is suspended. It runs for a device pause and a device wake, and on the Apple
+	// client the wake may never arrive at all. The reuse boundary is about TRUST: a sleep ended, so
+	// reusable state that predates it has not been verified since, and the first flow after the
+	// boundary must not be the thing that discovers a blackholed socket. It arrives on a platform
+	// resume even when the device wake does not.
+	if m.powerGovernor != nil {
+		m.powerGovernor.AddReuseObserver(m.onReuseBoundary)
+	}
+	// Registered last so that it is the FIRST cleanup to run: the manager must be marked closed
+	// before the pools and managers it reaches are torn down, not after.
+	scope.Add(func() error {
+		m.closed.Store(true)
+		return nil
+	})
 	return nil
+}
+
+// onReuseBoundary is the core's only reaction to a resume boundary, and it is deliberately the
+// narrowest one that satisfies the requirement.
+//
+// What it does: retires IDLE reusable resources, so the next demand dials a path that is known to be
+// new rather than one that merely looks alive. What it does NOT do, and must not be changed to do:
+//
+//   - it does not reset the network. A reset is reserved for a real network transition, which is a
+//     different epoch with a different mechanism (common/runtimecoord); doing it here would kill
+//     every active flow, dial everything at once and make the sleep boundary a reconnect storm.
+//   - it does not terminate an active stream. Every keeper it reaches only closes resources with no
+//     active user traffic: an HTTP/2 pool closes connections with no in-flight request, a mux session
+//     closes only when its last stream has gone, a QUIC transport closes only when its stream count
+//     is zero, and an in-flight response body holds its epoch open that way by design.
+//   - it does not touch the on-demand tunnels. WireGuard, MASQUE, OpenVPN, OpenConnect and the
+//     Tailscale endpoint implement SetKeepIdleConnections - a suspend/resume of the tunnel itself,
+//     which is not idle-only - and not CloseIdleConnections, so they are not reachable from this walk
+//     and are not woken by it. Resuming them here would be a dial with no demand behind it.
+//   - it does not dial. Retiring an idle pool cannot start a connection; the next demand does, and
+//     that demand was going to dial anyway.
+//
+// The suspect band retires nothing by policy: it advances the epoch so the distrust is visible and
+// monotonic, and leaves the pool alone because a mid-length sleep usually survives and churning it
+// would cost a handshake for no correctness gain. Those values live in power.Policy, not here.
+func (m *ReferenceManager) onReuseBoundary(boundary power.ReuseBoundary) {
+	if m.closed.Load() {
+		return
+	}
+	switch boundary.Action {
+	case power.ReuseRetire:
+		retired := m.retireIdleResources()
+		if m.logger != nil {
+			m.logger.Debug("reuse: epoch ", boundary.Epoch, ", sleep ", boundary.Sleep,
+				", retiring idle connections of ", retired, " reusable pool(s); active flows untouched")
+		}
+	case power.ReuseSuspect:
+		if m.logger != nil {
+			m.logger.Debug("reuse: epoch ", boundary.Epoch, ", sleep ", boundary.Sleep,
+				", reusable state suspect; pools kept by policy")
+		}
+	}
 }
 
 func (m *ReferenceManager) loop() {
@@ -335,22 +407,58 @@ func (m *ReferenceManager) applyKeepIdle(keepIdle map[any]bool, target idleTarge
 // exists so that caller has a name for the weaker pass and the stronger one is not silently reused
 // for it.
 func (m *ReferenceManager) TrimIdleResources() {
-	m.CloseIdleConnections()
+	m.retireIdleResources()
 }
 
 func (m *ReferenceManager) CloseIdleConnections() {
+	m.retireIdleResources()
+}
+
+// retireIdleResources is the one walk over every reusable pool this core owns, and it reports how
+// many it reached.
+//
+// Its contract is the reason it is safe to call from a resume boundary as well as from DEEP_IDLE and
+// from the memory pass: it can only ever close a resource that has no active user traffic, and it
+// can never dial. That is a property of the keepers, not of this function, and it is what every
+// review of a new keeper has to establish - a keeper whose CloseIdleConnections can terminate a
+// stream carrying traffic does not belong in this list.
+//
+// Endpoints are walked as well as outbounds and DNS transports, because the type assertion is the
+// only thing that decides: today none of the endpoint kinds implements CloseIdleConnections (they
+// implement SetKeepIdleConnections, which suspends the tunnel - a different and much larger action),
+// so the walk is inert for them, and a future endpoint that does implement it is covered without
+// another review of this file.
+func (m *ReferenceManager) retireIdleResources() int {
+	retired := 0
 	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
+	if outboundManager != nil {
+		for _, outbound := range outboundManager.Outbounds() {
+			keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+			if isKeeper {
+				keeper.CloseIdleConnections()
+				retired++
+			}
+		}
+	}
+	endpointManager := service.FromContext[adapter.EndpointManager](m.ctx)
+	if endpointManager != nil {
+		for _, endpoint := range endpointManager.Endpoints() {
+			keeper, isKeeper := endpoint.(adapter.IdleConnectionKeeper)
+			if isKeeper {
+				keeper.CloseIdleConnections()
+				retired++
+			}
+		}
+	}
 	transportManager := service.FromContext[adapter.DNSTransportManager](m.ctx)
-	for _, outbound := range outboundManager.Outbounds() {
-		keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
-		if isKeeper {
-			keeper.CloseIdleConnections()
+	if transportManager != nil {
+		for _, transport := range transportManager.Transports() {
+			keeper, isKeeper := transport.(adapter.IdleConnectionKeeper)
+			if isKeeper {
+				keeper.CloseIdleConnections()
+				retired++
+			}
 		}
 	}
-	for _, transport := range transportManager.Transports() {
-		keeper, isKeeper := transport.(adapter.IdleConnectionKeeper)
-		if isKeeper {
-			keeper.CloseIdleConnections()
-		}
-	}
+	return retired
 }

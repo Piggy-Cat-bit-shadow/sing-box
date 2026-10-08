@@ -62,14 +62,28 @@ func releasePowerGovernor(governor *power.Governor, manager pause.Manager, callb
 // It is a named function rather than an inline closure so the mapping can be tested without building
 // a Box: this is the only place the two vocabularies meet, and a mis-mapped event here would show up
 // as a device that never sleeps rather than as anything resembling a failure.
+//
+// Each event is mapped TWICE, to the governor's two axes, and the order is not arbitrary. A pause
+// publishes the reuse edge first and then the level, so the sleep is being measured before anything
+// reacts to it. A wake publishes the reuse verdict first and then the level, so a pool that predates
+// the sleep has already been retired by the time speculative work is released - the released work
+// dials a path that is known to be new, which is the entire point.
+//
+// The level and the edge are separate because they are separate facts. The level is "is the device
+// paused", and it is idempotent. The edge is "a sleep started / a sleep ended", and it is what the
+// reuse epoch is measured in; on the Apple client the level is entered once and never lifted while
+// the edges keep arriving, so a governor driven by levels alone would distrust exactly one sleep per
+// process.
 func applyPauseEvent(governor *power.Governor, event int) {
 	if governor == nil {
 		return
 	}
 	switch event {
 	case pause.EventDevicePaused:
+		governor.SleepStarted()
 		governor.DevicePaused()
 	case pause.EventDeviceWake:
+		governor.Resumed()
 		governor.DeviceWake()
 	case pause.EventNetworkPause:
 		governor.NetworkPaused()
@@ -889,6 +903,18 @@ func (s *Box) start() error {
 	if err != nil {
 		return err
 	}
+	// The box is not started until the network manager has observed the network it is on.
+	//
+	// Its first environment observation is a transition in the machinery - it claims an epoch, runs a
+	// reset body and commits - and on the ordinary update path it runs on a goroutine spawned during
+	// the network component's PostStart. That goroutine can land after this function has returned,
+	// while a caller's first connection is already in flight, and the connection is then refused or
+	// cancelled by a transition that describes no change at all: the box was still learning which
+	// network it is on. So the last thing Start does is establish that observation, here, where every
+	// component has finished starting and no caller has been told the box is up.
+	if s.network != nil {
+		s.network.EstablishInitialNetworkEnvironment()
+	}
 	return nil
 }
 
@@ -949,6 +975,43 @@ func (s *Box) CreatedAt() time.Time {
 
 func (s *Box) CloseIdleConnections() {
 	s.referenceManager.CloseIdleConnections()
+}
+
+// DeviceSlept publishes the Apple lifecycle's "the device is going to sleep" edge.
+//
+// It exists because the pause manager's device axis is a LEVEL and the Apple client never lifts it:
+// the client pinned to this tree has no screen-state observer, and its wake command is a resume
+// rather than a device wake, so the first sleep enters the paused level and every later sleep finds
+// it already set. A reuse epoch driven by that level would distrust the first sleep of the process
+// and trust every one after it, which is the exact opposite of the requirement.
+//
+// So the platform's own edge is published directly, and it is deliberately narrow: it starts (or
+// restarts) the sleep measurement and touches nothing else. The device stays paused, speculation
+// stays suppressed, and no pool is closed here - the verdict belongs to the resume, when the sleep
+// duration is finally known.
+func (s *Box) DeviceSlept() {
+	if s.powerGovernor != nil {
+		s.powerGovernor.SleepStarted()
+	}
+}
+
+// DeviceResumed publishes the Apple lifecycle's "the extension is running again" edge.
+//
+// It is deliberately NOT applyPauseEvent's EventDeviceWake. On iOS the platform resumes the
+// extension for every push and background task while the device is still locked, so a resume cannot
+// be allowed to lift the device pause: that would release health checks, probes, provider refreshes
+// and statistics for a phone in a pocket. What a resume does establish is that a sleep ended, so the
+// governor measures it and publishes the reuse verdict, and the owner of a reusable pool retires
+// what is idle before the next flow can be handed a socket that has not been verified since the
+// device went to sleep.
+//
+// It is a method rather than a direct call into the governor because the governor is owned by this
+// composition root: the bridge between a platform's lifecycle vocabulary and the core's belongs where
+// applyPauseEvent already is, and an embedder should reach a lifecycle fact, not a policy object.
+func (s *Box) DeviceResumed() {
+	if s.powerGovernor != nil {
+		s.powerGovernor.Resumed()
+	}
 }
 
 func (s *Box) LogFactory() log.Factory {

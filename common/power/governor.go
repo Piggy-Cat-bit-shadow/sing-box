@@ -1,4 +1,5 @@
-// Package power is the single authority for how much background work this fork is allowed to do.
+// Package power is the single authority for how much background work this fork is allowed to do,
+// and for how long reusable state may be trusted across a sleep.
 //
 // # Why one authority rather than a flag per protocol
 //
@@ -16,11 +17,30 @@
 // So this package owns the state and the thresholds, and subsystems only ask. See docs for the
 // policy.
 //
+// # The two axes, and why they are not the same axis
+//
+// The STATE machine above answers "how much background work is permitted", and it is driven by the
+// device and network pause signals. The REUSE EPOCH answers a different question - "may reusable
+// state that predates the last sleep still be handed to new work" - and it is driven by the resume
+// boundary, which is NOT the same event as a device wake.
+//
+// The distinction is forced by the platform. On iOS the extension is resumed for every push and
+// background task while the device is still locked, so a resume cannot be treated as "a person is
+// using the phone": that is what DeviceWake means and it is what releases speculative work. A resume
+// IS however proof that time passed and that the extension ran again - which is exactly the evidence
+// a NAT mapping, a pooled TCP connection or a QUIC session needs in order to stop being trusted.
+// Collapsing the two would either release probes for a locked phone (a power regression) or keep
+// handing blackholed sockets to the first request after an unlock (the correctness regression this
+// exists to remove). The network epoch in common/runtimecoord is a THIRD thing again: it is a hard
+// transition, and it resets rather than retires.
+//
 // # What this package deliberately does not do
 //
 // It does not close anything, clear anything, or reset anything. Transitions only change what is
 // ALLOWED; the owner of a connection or a cache decides what to do about that, and the brief this
-// was built from is explicit that a device going to sleep must not kill a transfer in progress.
+// was built from is explicit that a device going to sleep must not kill a transfer in progress. The
+// reuse epoch is published for the same reason: the owner of a pool decides what "suspect" means for
+// its own resources, and the only operation the core uses for it retires IDLE resources.
 package power
 
 import (
@@ -85,6 +105,61 @@ type Allow struct {
 // installed must behave exactly as it did before this package existed.
 var allowAll = Allow{HealthCheck: true, ProviderRefresh: true, NetworkProbe: true, Statistics: true}
 
+// ReuseAction is what one resume boundary means for reusable state that predates it.
+type ReuseAction uint8
+
+const (
+	// ReuseKeep is a boundary too short to have invalidated anything. The epoch does not advance and
+	// nothing is retired: this is the verdict that preserves the low-power benefit of short sleeps.
+	ReuseKeep ReuseAction = iota
+	// ReuseSuspect is a boundary long enough that pre-boundary reusable state is no longer verified,
+	// but short enough that the policy does not order it retired. The epoch advances and the verdict
+	// is published, so an owner that CAN express "not eligible for new work" does so; the owners in
+	// this tree cannot express it more finely than "retire what is idle", so at this band they leave
+	// their pools alone rather than churn them.
+	ReuseSuspect
+	// ReuseRetire is a boundary at which pre-boundary idle reusable state must be retired before it
+	// can carry new work. It is the strongest verdict a resume can reach; it is NOT a reset, it does
+	// not touch an active stream, and it does not dial.
+	ReuseRetire
+)
+
+func (a ReuseAction) String() string {
+	switch a {
+	case ReuseKeep:
+		return "keep"
+	case ReuseSuspect:
+		return "suspect"
+	case ReuseRetire:
+		return "retire"
+	default:
+		return "unknown"
+	}
+}
+
+// ReuseBoundary is one pause -> resume boundary, as measured and classified.
+type ReuseBoundary struct {
+	// Epoch is the reuse epoch AFTER this boundary. It is monotonic: it starts at zero, only ever
+	// increases, and only increases for a boundary the policy judged worth acting on. A resource that
+	// records the epoch it was established in can therefore answer "am I older than the newest
+	// distrusting boundary" without a second clock.
+	Epoch uint64
+	// Sleep is how long the device was paused, measured on the WALL clock because that is the only
+	// clock on darwin that advances while the device is asleep. It is zero when a boundary was
+	// published before any pause was recorded.
+	Sleep time.Duration
+	// Known reports whether Sleep is a real measurement. It is false when the sleep duration could
+	// not be established, in which case the verdict is strict - see ReuseFreshness.classify.
+	Known bool
+	// Action is what the policy decided for this boundary.
+	Action ReuseAction
+}
+
+// ReuseObserver is notified at every resume boundary the policy acted on, which is every boundary
+// whose action is not ReuseKeep. It must not block: it is called from whichever goroutine observed
+// the resume, with the governor's lock released.
+type ReuseObserver func(boundary ReuseBoundary)
+
 // Policy is every threshold and every permission, in one place.
 //
 // The brief is explicit that these values must not be scattered across modules, because a sleep
@@ -102,6 +177,58 @@ type Policy struct {
 	// WakeStagger is how long each category waits after a wake before it may run again. Zero means
 	// "at once", which is the pre-existing behaviour for any field left unset.
 	WakeStagger WakeStagger
+	// ReuseFreshness is the reuse-epoch policy: how long a sleep must last before sleep-survived
+	// reusable state stops being eligible for new work. Its zero value keeps every resource eligible,
+	// which is the pre-existing behaviour for a caller that does not opt in.
+	ReuseFreshness ReuseFreshness
+}
+
+// ReuseFreshness is the reuse-epoch policy, and it is deliberately a pair of durations rather than a
+// boolean.
+//
+// A sleep that is shorter than any teardown timescale - a glance at the lock screen, a notification
+// checked and dismissed - must cost nothing: the whole point of not closing pools on pause is that
+// the connection a person is about to use again is still there. A sleep long enough for a NAT
+// mapping, a Wi-Fi station entry or a server-side idle timeout to be gone is the opposite case, and
+// the first new flow after it must not be handed the pre-sleep socket. What separates the two is
+// time, measured on the only clock that advances while the device is asleep.
+//
+// The two values are provisional tuning, not measured optima, and that is why they live here and not
+// in a transport: changing the trade for the whole core is one edit, and no protocol can quietly
+// disagree with another. The asymmetry to keep in mind when tuning them is that retiring an idle
+// pool costs one handshake the next demand would have paid anyway, while keeping a dead one costs
+// the multi-second stall that no timeout in this tree is configured to detect quickly.
+type ReuseFreshness struct {
+	// SuspectAfter is the sleep duration at which pre-sleep reusable state stops being trusted. At
+	// or above it the epoch advances and the boundary is published; the state machine is untouched,
+	// so nothing is released, probed or re-dialled by the verdict itself.
+	SuspectAfter time.Duration
+	// RetireAfter is the sleep duration at which the owner of an idle reusable pool must retire it,
+	// so that the next flow dials a path that is known to be new instead of one that merely looks
+	// alive. Only IDLE resources are retired: a stream that is carrying traffic keeps its connection.
+	RetireAfter time.Duration
+}
+
+// Classify is the whole band policy, in one place: given a sleep duration, what does this policy
+// decide about reusable state that predates it.
+//
+// It is exported because it is the answer two other places need to agree with: the tests that assert
+// a boundary carries the verdict the policy would give, and any diagnostic that wants to report what
+// a boundary WOULD have been. known is false when the sleep duration could not be established - the
+// clock moved backwards, or a pause was recorded without a start. The verdict is then the strict one,
+// because the rule that matters is that a resource whose age cannot be established must not be
+// republished as current.
+func (f ReuseFreshness) Classify(sleep time.Duration, known bool) ReuseAction {
+	if !known {
+		return ReuseRetire
+	}
+	if f.RetireAfter > 0 && sleep >= f.RetireAfter {
+		return ReuseRetire
+	}
+	if f.SuspectAfter > 0 && sleep >= f.SuspectAfter {
+		return ReuseSuspect
+	}
+	return ReuseKeep
 }
 
 // WakeStagger delays the resumption of speculative work after a wake.
@@ -152,6 +279,16 @@ func DefaultPolicy() Policy {
 			NetworkProbe:    5 * time.Second,
 			Statistics:      10 * time.Second,
 		},
+		// Provisional, and deliberately conservative in the correctness direction: a pause long
+		// enough to see the screen go off and come back (five seconds) already marks reusable state
+		// suspect, and a pause of fifteen seconds - the shortest case in the device matrix that
+		// reproduces a post-wake stall - retires it. A glance at the lock screen stays free, which is
+		// the behaviour this whole stream exists to protect; everything longer pays one handshake on
+		// the next demand rather than risking a blackholed socket.
+		ReuseFreshness: ReuseFreshness{
+			SuspectAfter: 5 * time.Second,
+			RetireAfter:  15 * time.Second,
+		},
 	}
 }
 
@@ -194,6 +331,34 @@ type Governor struct {
 	wokeAt time.Time
 	closed bool
 
+	// pausedSince is the wall-clock instant of the current device pause, and the zero time when no
+	// pause is recorded. It is a WALL time on purpose: Go's monotonic clock on darwin is
+	// mach_absolute_time, which does not advance while the device is asleep, so a monotonic delta
+	// cannot measure a sleep at all - it would report a five hour sleep as a few milliseconds.
+	pausedSince time.Time
+	// resumeNoted is set once the current pause has produced its reuse boundary. It exists so that a
+	// platform which resumes the extension and THEN reports a device wake - the iOS order - produces
+	// one boundary for one sleep rather than two, and so that the many resumes of a single locked
+	// period produce one boundary rather than one per push.
+	resumeNoted bool
+	// reuseEpoch is the reuse epoch, and it is monotonic by construction: it is only ever incremented,
+	// and only by a boundary the policy judged worth acting on.
+	reuseEpoch uint64
+	// lastBoundary is the most recent published boundary, kept so a subsystem that starts late - or a
+	// diagnostic - can ask what the current distrust is without having observed the transition.
+	lastBoundary ReuseBoundary
+	// reuseObservers are notified at a boundary, and pendingReuse records that one is owed. Like the
+	// state observers, they are called with the lock released: an observer's job is to retire
+	// connections, which takes locks of its own.
+	reuseObservers []ReuseObserver
+	pendingReuse   bool
+
+	// now is the clock. It is time.Now in production and injectable so a test can move the governor
+	// through a sleep without sleeping, which is the only way the duration bands can be tested
+	// deterministically: the alternative is a test that waits fifteen seconds and still cannot say
+	// which side of the boundary it observed.
+	now func() time.Time
+
 	observers []Observer
 	// pendingNotify is set by a transition and cleared by flushNotifications, which runs after the
 	// lock is released. See setStateLocked.
@@ -219,6 +384,23 @@ func NewGovernor(policy Policy) *Governor {
 	}
 }
 
+// NewGovernorWithClock builds a governor that reads the time from now instead of the system clock.
+//
+// The reuse bands, the wake stagger and the deep-idle deadline are all durations, so anything that
+// wants to test them either waits for them - which measures the scheduler and produces a test that
+// fails under load for reasons that have nothing to do with the policy - or moves the clock. This is
+// the second option, and it is the same one the load-balance penalty ledger uses for its TTL.
+//
+// The clock is read on every measurement, so the caller's function must be safe for concurrent use.
+// A nil now means the system clock, which is exactly NewGovernor.
+func NewGovernorWithClock(policy Policy, now func() time.Time) *Governor {
+	governor := NewGovernor(policy)
+	if now != nil {
+		governor.now = now
+	}
+	return governor
+}
+
 // State reports the current state.
 func (g *Governor) State() State {
 	g.access.Lock()
@@ -239,7 +421,7 @@ func (g *Governor) allowLocked() Allow {
 		// Released one category at a time, measured from the wake rather than counted down by a timer
 		// each: a caller asking "may I run" gets the answer for its own category, and no subsystem has
 		// to own a stagger of its own.
-		elapsed := time.Since(g.wokeAt)
+		elapsed := g.clock().Sub(g.wokeAt)
 		stagger := g.policy.WakeStagger
 		return Allow{
 			HealthCheck:     elapsed >= stagger.HealthCheck,
@@ -271,7 +453,21 @@ func (g *Governor) Active() bool {
 	return g.state == StateActive
 }
 
+// clock reads the governor's clock, which is time.Now unless a test installed one.
+func (g *Governor) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}
+
 // DevicePaused records that the device went to sleep or the app was backgrounded.
+//
+// It is the DEVICE level: the state machine moves to QUIESCENT and the countdown to DEEP_IDLE starts.
+// It is idempotent, because a level is not an edge - the second report of the same pause must not
+// restart a countdown a real request already reset. The reuse measurement is refreshed as well, so a
+// platform that only ever reports the level still gets a boundary; see SleepStarted for the edge
+// form, which is what a platform that stays latched needs.
 func (g *Governor) DevicePaused() {
 	defer g.flushNotifications()
 	g.access.Lock()
@@ -280,10 +476,17 @@ func (g *Governor) DevicePaused() {
 		return
 	}
 	g.devicePaused = true
+	g.noteSleepLocked()
 	g.recomputeLocked()
 }
 
 // DeviceWake records that the device woke.
+//
+// It is the DEVICE level: the pause ends and speculative work is released on the stagger. It is
+// deliberately not a reuse edge. The two are published together by whoever owns the platform bridge
+// - see applyPauseEvent in box.go - so that the ordering that matters is explicit there: the reuse
+// verdict is published BEFORE the state moves, because the work released by the move is the work
+// that must dial a fresh path.
 func (g *Governor) DeviceWake() {
 	defer g.flushNotifications()
 	g.access.Lock()
@@ -300,6 +503,113 @@ func (g *Governor) DeviceWake() {
 	g.beginWakingLocked()
 }
 
+// SleepStarted records the platform's own sleep EDGE: the device is going to sleep now.
+//
+// # Why an edge is needed on top of DevicePaused
+//
+// The pause manager's device axis is a LEVEL, and on the Apple client nothing ever lifts it: the
+// client that is pinned to this tree has no screen-state observer, and its wake command is a resume
+// rather than a device wake. So the level is entered once, on the first sleep, and every later
+// sleep() finds it already set - which means a governor driven by the level alone would measure the
+// first sleep of the process and never another one, and the five hundredth unlock of the day would
+// be handed a pool that was last verified before the first one.
+//
+// The edge is what the platform actually reports: NEPacketTunnelProvider.sleep() is called once per
+// sleep. It touches the reuse measurement and nothing else - not the state machine, not the stagger,
+// not one speculative category - so a device that is asleep stays asleep as far as everything except
+// the epoch is concerned.
+//
+// A repeated edge while a sleep is already being measured is ignored, because that is not a new
+// sleep: it is the same fact arriving twice, and honouring it would reset a five minute measurement
+// to zero microseconds.
+func (g *Governor) SleepStarted() {
+	defer g.flushNotifications()
+	g.access.Lock()
+	defer g.access.Unlock()
+	if g.closed {
+		return
+	}
+	g.noteSleepLocked()
+}
+
+// noteSleepLocked begins a new reuse measurement unless one is already running. Caller holds the
+// lock.
+func (g *Governor) noteSleepLocked() {
+	if !g.pausedSince.IsZero() && !g.resumeNoted {
+		// A sleep is being measured and has not been resumed yet: this is the same sleep reported
+		// again, and the measurement must not move.
+		return
+	}
+	g.pausedSince = g.clock()
+	g.resumeNoted = false
+}
+
+// Resumed records the platform's own resume EDGE: this process ran again after a sleep.
+//
+// It is NOT a device wake, and on the platform this was written for it must not become one. iOS
+// resumes the extension for every push and background task while the phone is still locked, so
+// treating a resume as a wake would release health checks, probes and provider refreshes for a
+// device nobody is holding - the wake storm this package exists to prevent, and a power regression
+// on the platform whose whole lifecycle this file is tuned for.
+//
+// What a resume does carry is time. The extension ran again, so the sleep is over and its length can
+// be measured; reusable state established before it has not been verified since, and the first flow
+// to arrive after it must not be the thing that discovers a blackholed socket. That is the reuse
+// epoch, and it is the only thing this changes.
+//
+// It is idempotent for one sleep, which is what keeps the many resumes of a locked period from
+// becoming many retirements: the first resume publishes the boundary, and the rest are no-ops until
+// the platform reports another sleep.
+func (g *Governor) Resumed() {
+	defer g.flushNotifications()
+	g.access.Lock()
+	defer g.access.Unlock()
+	if g.closed || g.resumeNoted || g.pausedSince.IsZero() {
+		// No sleep on record: a resume for a sleep this process never saw is not a boundary, and
+		// inventing one would retire a pool that was never asleep.
+		return
+	}
+	g.resumeNoted = true
+	sleep, known := g.sleepDurationLocked()
+	action := g.policy.ReuseFreshness.Classify(sleep, known)
+	if action == ReuseKeep {
+		// The short-sleep case, and the reason this is a policy rather than "close on every resume":
+		// the epoch does not move, no observer runs, and the connection a person is about to use
+		// again is still pooled.
+		return
+	}
+	g.reuseEpoch++
+	g.lastBoundary = ReuseBoundary{
+		Epoch:  g.reuseEpoch,
+		Sleep:  sleep,
+		Known:  known,
+		Action: action,
+	}
+	g.pendingReuse = true
+}
+
+// sleepDurationLocked reports how long the device was paused, and whether that could be established.
+//
+// The subtraction is done on stripped times, which is not a detail: a plain Sub between two times
+// that both carry a monotonic reading uses the monotonic reading, and on darwin that clock stops
+// while the device is asleep. The stripped form asks the wall clock, which is the only clock that
+// kept running, and it is why a five hour sleep is not reported as a few milliseconds.
+//
+// A wall clock can also be stepped, by NTP or by the user. A backwards step makes the difference
+// negative, and that is reported as unknown rather than as a short sleep: the failure then costs one
+// retired pool, while guessing "short" would hand a blackholed socket to the first flow after a
+// sleep whose length nobody can vouch for.
+func (g *Governor) sleepDurationLocked() (time.Duration, bool) {
+	if g.pausedSince.IsZero() {
+		return 0, false
+	}
+	sleep := g.clock().Round(0).Sub(g.pausedSince.Round(0))
+	if sleep < 0 {
+		return 0, false
+	}
+	return sleep, true
+}
+
 // beginWakingLocked releases the business path at once and staggers the rest. Caller holds the lock.
 func (g *Governor) beginWakingLocked() {
 	if g.idleTimer != nil {
@@ -312,7 +622,7 @@ func (g *Governor) beginWakingLocked() {
 		g.setStateLocked(StateActive)
 		return
 	}
-	g.wokeAt = time.Now()
+	g.wokeAt = g.clock()
 	g.setStateLocked(StateWaking)
 	if g.wakeTimer != nil {
 		g.wakeTimer.Stop()
@@ -507,22 +817,73 @@ func (g *Governor) setStateLocked(state State) {
 	g.pendingNotify = true
 }
 
-// flushNotifications delivers any notification setStateLocked owed, and must be called with the lock
-// RELEASED. Entry points arrange that with `defer g.flushNotifications()` placed before the deferred
-// unlock, so the unlock runs first.
+// flushNotifications delivers any notification setStateLocked or noteResumeLocked owed, and must be
+// called with the lock RELEASED. Entry points arrange that with `defer g.flushNotifications()` placed
+// before the deferred unlock, so the unlock runs first.
+//
+// The state notification and the reuse notification are delivered from the same pass because a
+// resume can owe both - a device wake publishes a boundary and moves the state - and a caller must
+// never see the released state before it has been told that the pool it is about to use is stale.
+// The pool is retired here, on the boundary, and the work released here is the work that will then
+// dial a fresh path.
 func (g *Governor) flushNotifications() {
 	g.access.Lock()
-	if !g.pendingNotify {
+	if !g.pendingNotify && !g.pendingReuse {
 		g.access.Unlock()
 		return
 	}
 	g.pendingNotify = false
+	pendingReuse := g.pendingReuse
+	g.pendingReuse = false
 	state := g.state
+	boundary := g.lastBoundary
 	observers := g.observers
+	reuseObservers := g.reuseObservers
 	g.access.Unlock()
 	for _, observer := range observers {
 		observer(state)
 	}
+	if !pendingReuse {
+		return
+	}
+	for _, observer := range reuseObservers {
+		observer(boundary)
+	}
+}
+
+// ReuseEpoch reports the current reuse epoch, which is zero until a resume boundary the policy
+// judged worth acting on has been observed.
+//
+// It is monotonic: comparing two readings answers "has a distrusting boundary happened since" and
+// never the reverse. A resource that records the epoch it was established in can use it to refuse
+// new work without asking the governor anything else, which is the point of publishing a number
+// rather than a boolean - a boolean cannot tell one generation from the next.
+func (g *Governor) ReuseEpoch() uint64 {
+	g.access.Lock()
+	defer g.access.Unlock()
+	return g.reuseEpoch
+}
+
+// LastReuseBoundary reports the most recent boundary the policy acted on, and whether there was one.
+func (g *Governor) LastReuseBoundary() (ReuseBoundary, bool) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	if g.reuseEpoch == 0 {
+		return ReuseBoundary{}, false
+	}
+	return g.lastBoundary, true
+}
+
+// AddReuseObserver registers a reuse-boundary observer.
+//
+// It is called synchronously at every boundary whose verdict is not ReuseKeep, with the governor's
+// lock released and from whichever goroutine observed the resume. An observer therefore must not
+// block and must tolerate being called on a platform callback thread; the operation it exists for -
+// retiring idle connections - is exactly that kind of call.
+func (g *Governor) AddReuseObserver(observer ReuseObserver) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	g.reuseObservers = append(g.reuseObservers, observer)
 }
 
 // WaitActive blocks until the governor is ACTIVE, or the context ends. It reports whether it is
