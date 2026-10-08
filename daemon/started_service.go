@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/networkquality"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/stun"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/common/urltest"
@@ -773,7 +774,10 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 	urlTest, isURLTest := outbound.(*group.URLTest)
 	outboundGroup, isOutboundGroup := outbound.(adapter.OutboundGroup)
 	if isURLTest {
-		go urlTest.CheckOutbounds()
+		// The origin is declared here because it cannot be derived later: an automatic recheck is
+		// forced too, so `force` does not carry it. A person pressed a button.
+		foregroundCtx := runtimecoord.ContextWithProbeOrigin(context.Background(), runtimecoord.ProbeForeground)
+		go urlTest.CheckOutboundsContext(foregroundCtx)
 	} else if isOutboundGroup {
 		outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
 			itOutbound, _ := boxService.outboundManager.Outbound(it)

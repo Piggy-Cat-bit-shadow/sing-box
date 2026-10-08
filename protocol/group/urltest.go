@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -264,11 +265,24 @@ func (s *URLTest) CheckOutbounds() {
 	// No group means there is nothing to check. A no-op rather than an error: this is called from
 	// lifecycle and refresh paths that ignore the result, and there is no failure a caller could act
 	// on.
+	//
+	// The origin defaults to automatic, which is the safe direction: an automatic round does not
+	// wake an idle resource. A caller that is acting on a person's request must say so through
+	// CheckOutboundsContext.
+	s.CheckOutboundsContext(s.ctx)
+}
+
+// CheckOutboundsContext runs a health round, carrying the caller's declared measurement origin.
+//
+// The caller's context contributes VALUES only - it does not become the operation's base, which
+// stays the group's own so that Close still cancels and the Box services stay reachable; see
+// operationContext. It exists so the origin marker reaches the measurement.
+func (s *URLTest) CheckOutboundsContext(ctx context.Context) {
 	group := s.currentGroup()
 	if group == nil {
 		return
 	}
-	group.CheckOutbounds(s.ctx, true)
+	group.CheckOutbounds(ctx, true)
 }
 
 func (s *URLTest) PerformUpdateCheck() {
@@ -780,6 +794,14 @@ func (g *URLTestGroup) operationContext(caller context.Context) (context.Context
 }
 
 func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]uint16, error) {
+	// Read the caller's declared origin BEFORE the operation context is rebuilt.
+	//
+	// operationContext anchors the operation to the group's own context and drops the caller's
+	// values, keeping only its deadline and cancellation. That is deliberate, but it means a marker
+	// put on the caller's context never reaches the measurement - so the decision is taken here and
+	// re-applied below. Forgetting this is not a cosmetic bug: an automatic round would look
+	// foreground and wake an idle tunnel engine.
+	foregroundProbe := runtimecoord.ProbeOriginIsForeground(caller)
 	// Anchor to the group's own Box context before anything else.
 	//
 	// A terminal group returns here, so a closed group cannot start a health round at all - its
@@ -795,6 +817,12 @@ func (g *URLTestGroup) urlTest(caller context.Context, force bool) (map[string]u
 		return nil, contextErr
 	}
 	defer cancelOperation()
+
+	// The automatic/foreground decision travels with the round, and the DEFAULT is automatic: a
+	// caller that declares nothing is background work, so an idle endpoint will not be woken to be
+	// measured. It is applied to the OPERATION context, because that is the one the measurement runs
+	// on. See runtimecoord.ContextWithProbeOrigin.
+	ctx = runtimecoord.MeasurementContext(ctx, foregroundProbe)
 
 	if g.checking.Swap(true) {
 		// A round is already running, so this one cannot proceed.
@@ -1106,6 +1134,18 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 				measurement, testErr := b.measure(b.ctx, link, detour)
 				if testErr != nil {
 					if b.ctx.Err() != nil {
+						return nil, nil
+					}
+					if adapter.IsResourceSuspended(testErr) {
+						// The endpoint is idle and this is background work, so it refused to wake.
+						//
+						// This is NOT evidence about the node: nothing was dialled, and the node may
+						// be perfectly healthy. Removing its health history would make the group
+						// treat a deliberately idle member as unreachable and could move the
+						// selection because a timer fired. Leave the evidence alone - "not measured"
+						// is not "unhealthy" - and let real traffic wake the endpoint when there is
+						// demand for it.
+						b.logger.Debug("outbound ", tag, " skipped: resource is idle and this probe may not wake it")
 						return nil, nil
 					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testErr)

@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -119,7 +120,10 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 				render.JSON(w, r, newError("a URLTest group measures its configured target; url and expected cannot be overridden"))
 				return
 			}
-			result, err := outboundGroup.(adapter.URLTestGroup).URLTest(ctx)
+			// A person asked for this measurement through the API, which is demand: it may wake an
+			// idle endpoint, unlike a periodic round. The origin is declared here because it cannot
+			// be derived later.
+			result, err := outboundGroup.(adapter.URLTestGroup).URLTest(runtimecoord.ContextWithProbeOrigin(ctx, runtimecoord.ProbeForeground))
 			if err != nil {
 				render.Status(r, http.StatusGatewayTimeout)
 				render.JSON(w, r, newError(err.Error()))
