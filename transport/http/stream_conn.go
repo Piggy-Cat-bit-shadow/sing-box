@@ -48,11 +48,43 @@ func (c *clientStreamConn) CloseWrite() error {
 	return c.writer.Close()
 }
 
+// Close tears the tunnel down, and the order below is the difference between a teardown that is
+// bounded and one that waits for a peer that may never speak again.
+//
+// # Why the stream context is released BEFORE the response body is closed
+//
+// reader is golang.org/x/net/http2's transportResponseBody. Its Close aborts the stream and then
+// WAITS for the stream to reach its closed state; that transition is performed by the transport's
+// own request-writing goroutine in cleanupWriteRequest, which sends the stream reset while holding
+// the connection's write mutex. A peer that has stopped reading -- a closed TCP receive window --
+// leaves that goroutine parked inside a flush with the mutex held, so the reset cannot be sent and
+// the transition never happens. Waiting for it is waiting for the peer to start reading again.
+//
+// The body close's wait is a select that also watches the stream's context, so cancelling that
+// context is the escape hatch, and it has to happen FIRST. The reset is still attempted by the
+// transport on its own goroutine; a graceful RST_STREAM is a courtesy to a peer that can still
+// hear it, and is optional. Bounded teardown is not optional: Close runs on the failure path of a
+// live tunnel, and a Close that never returns leaks the tunnel, its stream and its goroutine for
+// the life of the process.
+//
+// Deliberately NOT "fixed" by closing the socket or the shared ClientConn to unblock the flush:
+// those carry every other stream on the connection, so trading one blocked tunnel for all of them
+// is worse than the bug. See TestH2TunnelCloseIsBoundedBehindABlockedWriter.
+//
+// # What is left unbounded, and why it is not fixed here
+//
+// x/net/http2's response-body Close has one earlier step that takes the same write mutex to return
+// connection-level flow control for buffered-but-unread body bytes. That step cannot be avoided
+// from this package without discarding the flow-control credit -- which would eventually stall
+// every other stream on the shared connection -- or by detaching a goroutine that waits on the
+// very mutex in question, which is exactly the leaked waiter this ordering exists to prevent. It
+// is reachable only when the peer has BOTH stopped reading and already delivered unread tunnel
+// payload, and bounding it is a change x/net/http2 must make.
 func (c *clientStreamConn) Close() error {
 	c.closed.Store(true)
+	c.cancel()
 	c.writer.Close()
 	c.reader.Close()
-	c.cancel()
 	return nil
 }
 
