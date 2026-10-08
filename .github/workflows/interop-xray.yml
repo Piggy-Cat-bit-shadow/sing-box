@@ -61,7 +61,18 @@ jobs:
         # there is no point downloading a reference to find out.
         run: |
           set -euo pipefail
-          TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          # DEFAULT_BUILD_TAGS_OTHERS, not DEFAULT_BUILD_TAGS: this stand tests protocol WIRE
+          # interop - VLESS, REALITY, the encryption layer, XHTTP, Vision - and Cronet is not one of
+          # its scenarios. DEFAULT_BUILD_TAGS carries with_naive_outbound, which drags the prebuilt
+          # libcronet.a into the test binary, and the linux_amd64 archive is incompatible with this
+          # runner's linker:
+          #     ld: skipping incompatible .../lib/linux_amd64@.../libcronet.a
+          #     ld: cannot find -l:libcronet.a
+          # so the stand could not even LINK, let alone run a scenario - which is how a transport
+          # implementation detail blocked the reference-interop debt from being paid. The OTHERS set is
+          # the desktop set without naive, it changes no scenario this stand executes, and the
+          # capability gates below still read the real tag set.
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           cd test
           go test -count=1 -tags "$TAGS" -v ./interop/
 
@@ -102,7 +113,18 @@ jobs:
           INTEROP_KEEP_ARTIFACTS: '1'
         run: |
           set -euo pipefail
-          TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+          # DEFAULT_BUILD_TAGS_OTHERS, not DEFAULT_BUILD_TAGS: this stand tests protocol WIRE
+          # interop - VLESS, REALITY, the encryption layer, XHTTP, Vision - and Cronet is not one of
+          # its scenarios. DEFAULT_BUILD_TAGS carries with_naive_outbound, which drags the prebuilt
+          # libcronet.a into the test binary, and the linux_amd64 archive is incompatible with this
+          # runner's linker:
+          #     ld: skipping incompatible .../lib/linux_amd64@.../libcronet.a
+          #     ld: cannot find -l:libcronet.a
+          # so the stand could not even LINK, let alone run a scenario - which is how a transport
+          # implementation detail blocked the reference-interop debt from being paid. The OTHERS set is
+          # the desktop set without naive, it changes no scenario this stand executes, and the
+          # capability gates below still read the real tag set.
+          TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           cd test
           go test -count=1 -timeout 30m -v \
             -tags "$TAGS,liveinterop" \
