@@ -82,8 +82,23 @@ jobs:
           set -euo pipefail
           requested="${{ inputs.xray_version }}"
           if [ "$requested" = "latest" ]; then
-            requested="$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest \
-              | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+            # Fetch to a FILE, then parse the file. Not `curl ... | grep -m1 ...`.
+            #
+            # `grep -m1` exits as soon as it matches, which closes the pipe while curl is still
+            # writing; curl reports "curl: (23) Failure writing output to destination", and under
+            # `set -o pipefail` that write error becomes the pipeline's exit status, so the step
+            # fails even though the tag was read correctly. The same early-exit-versus-pipefail
+            # interaction broke the Android NDK install in this sweep.
+            #
+            # Parsing a complete file has no such coupling: a reader that stops early cannot make
+            # the fetch look like a failure.
+            curl -fsSL -o /tmp/xray-release.json \
+              https://api.github.com/repos/XTLS/Xray-core/releases/latest
+            if [ ! -s /tmp/xray-release.json ]; then
+              echo "::error::the GitHub releases API returned nothing for XTLS/Xray-core" >&2
+              exit 1
+            fi
+            requested="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' /tmp/xray-release.json | head -1)"
           fi
           if [ -z "$requested" ]; then
             echo "::error::could not resolve an Xray-core release tag" >&2
