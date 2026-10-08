@@ -40,6 +40,36 @@ const (
 // marker to match. Deciding "not WireGuard" from the outside is therefore always a statement
 // about the header, and the reserved bytes are the only part of that header with no degrees of
 // freedom to guess at.
+//
+// # The residual, and why it is not a gap
+//
+// A 148-byte uTP ST_DATA packet whose extension byte is 0 and whose connection id is 0x0000 is
+// still claimed as WireGuard: it begins 01 00 00 00, exactly a handshake initiation's type byte
+// and mandatory zero reserved field, and it has exactly the initiation's length. That is roughly a
+// 1-in-2^16 coincidence on top of a 148-byte datagram, and it is classified
+// PROVEN-INHERENT-AMBIGUITY rather than left as an open risk; the proof is
+// TestSniffWireGuardUTPAmbiguityIsStructural, and the shape of it is worth stating here because it
+// is what rules out every proposed narrowing:
+//
+//   - WireGuard's whole check lives in bytes 0-3 and the total length. Bytes 4-147 are a random
+//     sender index, an ephemeral public key, three AEAD ciphertexts and two keyed MACs, all
+//     uniformly random from outside. There is no consistency to demand of them that a real
+//     initiation also supplies. The one candidate, mac2, is all-zero only until the responder
+//     demands a cookie, so requiring it either way drops real handshakes.
+//   - uTP's whole check lives in bytes 0-19 and the extension chain, and those bytes are what the
+//     two protocols disagree about LEAST: uTP reads bytes 1-3 as an empty extension chain and
+//     connection id 0, which is precisely WireGuard's zero reserved field. uTP imposes no
+//     cross-field invariant on bytes 4-19, and it cannot acquire one that separates the two,
+//     because a genuine initiation puts random bytes there while a genuine uTP ST_DATA sender can
+//     put anything there it likes. A rule that rejects the ambiguous packet therefore rejects real
+//     initiations too, which is the trade this sniffer must not make.
+//   - Ordering cannot help either. WireGuard must run before uTP, because every real initiation is
+//     also a legal uTP packet; the preference for the WireGuard reading is not arbitrary, it is the
+//     better explanation of the same bytes - the WireGuard reading explains all of them, while the
+//     uTP reading additionally needs the datagram to be 148 bytes with a zero connection id.
+//
+// The alternative to accepting this residual is losing WireGuard detection for a uTP false positive
+// that is two orders of magnitude rarer than the handshakes it would stop being seen.
 func WireGuard(_ context.Context, metadata *adapter.InboundContext, packet []byte) error {
 	// Four bytes are needed even to name the type; a shorter datagram cannot be WireGuard, and
 	// indexing packet[1:4] below would panic on it.

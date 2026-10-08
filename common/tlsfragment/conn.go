@@ -45,6 +45,16 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		defer func() {
 			c.firstPacketWritten = true
 		}()
+		if !c.splitPacket && !c.splitRecord {
+			// The identity configuration. Every call site in the tree already refuses to construct
+			// the wrapper without at least one switch, so this is not a live path - but the honest
+			// behaviour has to be a pass-through rather than a silent drop, and without this the
+			// function would fall through both write branches below and return len(b) for a first
+			// flight that never left the process. A test cannot assert the identity case while the
+			// identity case eats the ClientHello, and "unreachable today" is not a reason to keep a
+			// path whose failure mode is a handshake timeout with no bytes on the wire.
+			return c.Conn.Write(b)
+		}
 		serverName := IndexTLSServerName(b)
 		if serverName != nil {
 			if c.splitPacket {

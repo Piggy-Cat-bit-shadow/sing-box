@@ -82,6 +82,18 @@ func (w *wire) currentRate() float64 {
 }
 
 func (w *wire) run() {
+	// due is when the chunk currently being served must have finished. The wire models a FIXED-RATE
+	// link, so its schedule is absolute rather than relative: a host hiccup that delays the drain
+	// makes the next sleep shorter, never the link slower.
+	//
+	// Sleeping for chunk.size/rate after each chunk instead lets every scheduling delay accumulate as
+	// drift, which silently turns the modelled link into a measurement of the runner. That is not a
+	// theoretical concern: it is what let a loaded host fill the acceptance windows of a SHAPED run -
+	// measured at 52 KiB of queue mean where an idle host read 20 KiB - so that the shaper appeared
+	// not to be shaping, and the HIGH-versus-HIGH experiment failed on a property the shaper does not
+	// control. A fixed-rate link whose rate is a function of the CPU is not the link the experiment
+	// means to model.
+	var due time.Time
 	for {
 		w.mu.Lock()
 		for len(w.queue) == 0 && !w.closed {
@@ -97,7 +109,16 @@ func (w *wire) run() {
 		rate := w.rate
 		w.mu.Unlock()
 
-		time.Sleep(time.Duration(float64(time.Second) * float64(chunk.size) / rate))
+		service := time.Duration(float64(time.Second) * float64(chunk.size) / rate)
+		if due.IsZero() || time.Since(due) > time.Second {
+			// The link was idle (or so far behind that catching up would mean delivering a backlog
+			// instantly). Restart the schedule from now, exactly as a real idle link would.
+			due = time.Now()
+		}
+		due = due.Add(service)
+		if sleep := time.Until(due); sleep > 0 {
+			time.Sleep(sleep)
+		}
 
 		w.mu.Lock()
 		// Only this goroutine pops, so the head is still the chunk that was slept on.
@@ -111,6 +132,28 @@ func (w *wire) run() {
 		w.mu.Unlock()
 
 		chunk.conn.deliver(chunk.at, delivered, chunk.marker)
+	}
+}
+
+// drain waits until every accepted byte has been delivered, so that the conservation check that
+// follows is about the scheduler and not about how long the caller happened to wait.
+//
+// It is bounded rather than unbounded on purpose: a wire that never empties is a scheduler that lost
+// a grant, and reporting that as a failure is more useful than hanging the package.
+func (w *wire) drain(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		w.mu.Lock()
+		queued := w.queued
+		w.mu.Unlock()
+		if queued == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the wire did not drain %d accepted bytes within %s: a grant was lost", queued, timeout)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -152,6 +195,16 @@ type wireConn struct {
 	mu        sync.Mutex
 	accepted  int64
 	latencies []time.Duration
+	// ahead is how many bytes were already accepted and not yet delivered at the moment each
+	// high-priority write was accepted.
+	//
+	// It is the ACCOUNTING driver of the delivery latency and the reason this rig can be asserted on
+	// at all. The wire is a strict FIFO that spends chunk.size/rate seconds on every chunk it pops, so
+	// a write's delivery time is (the bytes in front of it)/rate plus its own service time. Measuring
+	// those bytes rather than the elapsed time is the difference between a quantity the mechanism
+	// controls and a quantity the host's scheduler perturbs: a loaded run in this tree showed a probe
+	// p95 of 339 ms against a 176 ms typical while the byte count in front of the probe did not move.
+	ahead []int
 }
 
 func (w *wire) newConn(name, kind string) *wireConn {
@@ -177,6 +230,9 @@ func (c *wireConn) accept(size int) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	now := time.Now()
+	// queuedAhead is read BEFORE this write's own bytes are added, so it is exactly what stands in
+	// front of it in the FIFO.
+	queuedAhead := w.queued
 	c.pending += size
 	w.pending[c] += size
 	w.queued += size
@@ -191,6 +247,9 @@ func (c *wireConn) accept(size int) (int, error) {
 
 	c.mu.Lock()
 	c.accepted += int64(size)
+	if c.kind == "high" {
+		c.ahead = append(c.ahead, queuedAhead)
+	}
 	c.mu.Unlock()
 	return size, nil
 }
@@ -209,9 +268,14 @@ func (c *wireConn) acceptedBytes() int64 {
 	return c.accepted
 }
 
+// resetLatencies discards the warm-up samples of BOTH the measured delivery times and the byte
+// counts behind them. The two are the same observation in different units, so a caller that means
+// "throw away the transient" must not keep one and drop the other: a queue-ahead percentile taken
+// over a warm-up that included an unpaced phase would describe a scheduler that no longer exists.
 func (c *wireConn) resetLatencies() {
 	c.mu.Lock()
 	c.latencies = c.latencies[:0]
+	c.ahead = c.ahead[:0]
 	c.mu.Unlock()
 }
 
@@ -229,17 +293,39 @@ func (c *wireConn) snapshot() []time.Duration {
 	return out
 }
 
+// aheadSnapshot returns the bytes queued ahead of each high-priority write, in accept order.
+func (c *wireConn) aheadSnapshot() []int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]int, len(c.ahead))
+	copy(out, c.ahead)
+	return out
+}
+
 type contentionResult struct {
 	label string
 	// highLatencies are the receiver-visible delivery times of the small high-priority messages,
-	// measured from the moment each write returned. This is the product number.
+	// measured from the moment each write returned. This is the product number, and it is LOGGED
+	// rather than gated on, because a busy host moves it.
 	highLatencies []time.Duration
+	// highQueueAhead is, for each small high-priority message, how many bytes were queued ahead of it
+	// when it was accepted. It is the same observation as highLatencies in the units the wire actually
+	// conserves - see wireConn.ahead - and it is what the assertions are allowed to fail on.
+	highQueueAhead []int
 	// bulkThroughput is what the bulk flows managed to hand to the wire during the measurement
-	// window. It is the price of the latency above.
+	// window. It is the price of the latency above, and it is logged for the same reason.
 	bulkThroughput float64
+	// bulkAccepted is the same work as bulkThroughput without the division: the bytes the bulk flows
+	// handed to the wire during the window. Comparisons between two configurations are made on this
+	// count, so that two independently measured window lengths cannot turn a real difference in
+	// admitted work into a difference in the denominator.
+	bulkAccepted   int64
 	wireThroughput float64
-	queueHigh      int
-	queueMean      int
+	// window is how long the measured interval actually lasted, as opposed to the duration that was
+	// slept for. It is the interval the shaping budget is asserted over.
+	window    time.Duration
+	queueHigh int
+	queueMean int
 }
 
 type contentionConfig struct {
@@ -400,20 +486,43 @@ func runContention(t *testing.T, config contentionConfig) contentionResult {
 	deliveredStart, _, _ := shared.snapshot()
 	acceptedAtStart := acceptedTotal(bulkConns, highBulkConns)
 
+	measureStart := time.Now()
 	time.Sleep(config.duration)
 	close(stop)
 	workers.Wait()
 	<-pingDone
+	// The window is measured rather than assumed, and it is sampled only AFTER the senders have
+	// stopped: a sleep is not exact, and a worker that was already inside a write when the stop
+	// signal arrived still lands its bytes in the count below. Measuring to the stop signal instead
+	// would exclude those bytes from the interval the shaping budget is asserted over, which is how a
+	// correct shaper reads as over-admitting by less than one write.
+	window := time.Since(measureStart)
 
 	deliveredEnd, queueHigh, queueMean := shared.snapshot()
 
 	bulkBytes := acceptedTotal(bulkConns, highBulkConns) - acceptedAtStart
 
+	// Conservation, the invariant that says the gate is a scheduler and not a lossy filter: once the
+	// senders have stopped and the wire has drained, every byte that was accepted must have been
+	// delivered, exactly once. It is checked after the measurement so that it cannot perturb it, and
+	// it is independent of the host because it counts bytes rather than time.
+	shared.drain(t, 30*time.Second)
+	deliveredFinal, _, _ := shared.snapshot()
+	acceptedFinal := acceptedTotal(bulkConns, highBulkConns, []*wireConn{highConn})
+	if deliveredFinal != acceptedFinal {
+		t.Errorf("%s: %d bytes were accepted through the gate but %d were delivered: a grant was "+
+			"lost, or bytes were delivered that were never admitted",
+			config.label, acceptedFinal, deliveredFinal)
+	}
+
 	return contentionResult{
 		label:          config.label,
 		highLatencies:  highConn.snapshot(),
+		highQueueAhead: highConn.aheadSnapshot(),
 		bulkThroughput: float64(bulkBytes) / config.duration.Seconds(),
+		bulkAccepted:   bulkBytes,
 		wireThroughput: float64(deliveredEnd-deliveredStart) / config.duration.Seconds(),
+		window:         window,
 		queueHigh:      queueHigh,
 		queueMean:      queueMean,
 	}
@@ -476,9 +585,61 @@ func summariseLatencies(latencies []time.Duration) string {
 	)
 }
 
-func runColdStart(t *testing.T, config contentionConfig, gap time.Duration, repeats int) []time.Duration {
+// The integer-percentile helpers are the accounting counterparts of the duration ones above. They
+// rank the same samples - the bytes queued ahead of each probe - and the order statistics are the
+// same, because delivery time is that byte count divided by the wire rate. What changes is that the
+// quantity being ranked is one the wire conserves rather than one the host's scheduler can move.
+
+func sortedIntsCopy(values []int) []int {
+	out := append([]int(nil), values...)
+	sort.Ints(out)
+	return out
+}
+
+func percentileInt(sorted []int, fraction float64) int {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int(float64(len(sorted)-1)*fraction)]
+}
+
+func p50Int(values []int) int { return percentileInt(sortedIntsCopy(values), 0.50) }
+func p99Int(values []int) int { return percentileInt(sortedIntsCopy(values), 0.99) }
+
+// queuedBytesAsWireTime renders a byte count as the wire time it represents, so a failure message
+// can state the accounting quantity and the product quantity together. It is presentation only and
+// is never asserted on.
+func queuedBytesAsWireTime(queued int, rate float64) time.Duration {
+	if rate <= 0 {
+		return 0
+	}
+	return time.Duration(float64(queued) / rate * float64(time.Second))
+}
+
+func summariseQueueAhead(values []int) string {
+	if len(values) == 0 {
+		return "no samples"
+	}
+	sorted := sortedIntsCopy(values)
+	return fmt.Sprintf("n=%3d p50=%7dB p95=%7dB p99=%7dB max=%7dB",
+		len(sorted),
+		percentileInt(sorted, 0.50),
+		percentileInt(sorted, 0.95),
+		percentileInt(sorted, 0.99),
+		sorted[len(sorted)-1],
+	)
+}
+
+// coldStartSample is one repetition's two views of the same first request: the delivery time the
+// product cares about, and the bytes that stood in front of it in the FIFO when it was accepted.
+type coldStartSample struct {
+	latency    time.Duration
+	queueAhead int
+}
+
+func runColdStart(t *testing.T, config contentionConfig, gap time.Duration, repeats int) []coldStartSample {
 	t.Helper()
-	latencies := make([]time.Duration, 0, repeats)
+	samples := make([]coldStartSample, 0, repeats)
 	for repeat := 0; repeat < repeats; repeat++ {
 		shared := newWire(config.wireRate, config.window)
 		scheduler := NewScheduler(config.option())
@@ -528,13 +689,31 @@ func runColdStart(t *testing.T, config contentionConfig, gap time.Duration, repe
 		for pingConn.latencyCount() == 0 && time.Now().Before(deadline) {
 			time.Sleep(200 * time.Microsecond)
 		}
-		if samples := pingConn.snapshot(); len(samples) > 0 {
-			latencies = append(latencies, samples[0])
+		latencies := pingConn.snapshot()
+		queueAhead := pingConn.aheadSnapshot()
+		if len(latencies) > 0 && len(queueAhead) > 0 {
+			samples = append(samples, coldStartSample{latency: latencies[0], queueAhead: queueAhead[0]})
 		}
 
 		close(stop)
 		workers.Wait()
 		shared.close()
 	}
-	return latencies
+	return samples
+}
+
+func coldStartLatencies(samples []coldStartSample) []time.Duration {
+	out := make([]time.Duration, len(samples))
+	for index, sample := range samples {
+		out[index] = sample.latency
+	}
+	return out
+}
+
+func coldStartAhead(samples []coldStartSample) []int {
+	out := make([]int, len(samples))
+	for index, sample := range samples {
+		out[index] = sample.queueAhead
+	}
+	return out
 }

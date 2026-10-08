@@ -12,6 +12,16 @@ import (
 //
 // It establishes the design basis: models that only change WHEN a write starts do not move the
 // receiver-visible p99, and shaping does.
+//
+// # What this test is allowed to fail on
+//
+// The delivery times are still measured and still logged - they are the product number - but the
+// GATES are now on the bytes that stood in front of the probe in the FIFO, because that is the
+// quantity the wire conserves and the mechanism actually controls. The two are the same claim: the
+// wire spends chunk.size/rate seconds on every chunk it pops, so a probe's delivery time is the
+// bytes ahead of it divided by the wire rate. Ranking the bytes rather than the elapsed time is what
+// removes the host from the verdict - a loaded run in this tree showed a probe p95 of 339 ms against
+// a 176 ms typical while the byte count in front of the probe was unchanged.
 func TestContentionSteadyState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("contention experiment runs for several seconds")
@@ -70,18 +80,29 @@ func TestContentionSteadyState(t *testing.T) {
 	t.Log("")
 	for _, result := range results {
 		t.Logf("%-46s %s", result.label, summariseLatencies(result.highLatencies))
-		t.Logf("%-46s bulk %5.2f MB/s  wire %5.2f MB/s  queue mean %3d KiB peak %3d KiB",
-			"", result.bulkThroughput/1_000_000, result.wireThroughput/1_000_000,
+		t.Logf("%-46s %s", "", summariseQueueAhead(result.highQueueAhead))
+		t.Logf("%-46s bulk %5.2f MB/s (%9d B admitted)  wire %5.2f MB/s  queue mean %3d KiB peak %3d KiB",
+			"", result.bulkThroughput/1_000_000, result.bulkAccepted, result.wireThroughput/1_000_000,
 			result.queueMean/1024, result.queueHigh/1024)
 	}
 	t.Log("")
 
-	baselineP99 := p99(baseline.result(results).highLatencies)
-	if baselineP99 < 50*time.Millisecond {
-		t.Fatalf("the rig must contend before any comparison is meaningful: baseline p99 was %s",
-			baselineP99)
+	baselineResult := baseline.result(results)
+	aggregateResult := aggregate.result(results)
+
+	// The rig must contend before any comparison is meaningful. The ordering modes are controls, not
+	// candidates, so what follows from their result is a NOTE rather than a failure.
+	requireContention(t, baselineResult, wireRate, 50*time.Millisecond)
+
+	// Every paced configuration is bounded by its own bucket, asserted in BYTES over the window that
+	// actually elapsed. This is the structural half of the design basis - the shaper is in the path
+	// and enforces the rate it was given - and unlike the latency tables above it is not a statement
+	// about the machine. The latency tables stay logged as the product number.
+	for _, config := range []contentionConfig{pacedNormalOnly, aggregate, aggregate95, aggregate70} {
+		requireWithinShapingBudget(t, config.result(results), config.rate, DefaultBurst)
 	}
 
+	baselineP99 := p99(baselineResult.highLatencies)
 	for _, name := range []string{admission.label, service.label} {
 		config := configFor(name, configs)
 		candidateP99 := p99(config.result(results).highLatencies)
@@ -100,33 +121,86 @@ func TestContentionSteadyState(t *testing.T) {
 	}
 
 	// The aggregate shaper must keep the queue out of the way at a rate the path actually sustains,
-	// and must cost throughput when it is set below that rate. Both are the price side of the
+	// and must cost admitted work when it is set below that rate. Both are the price side of the
 	// trade, and both must be visible in the table rather than argued.
-	if !(aggregate70.result(results).bulkThroughput < aggregate.result(results).bulkThroughput) {
-		t.Errorf("shaping harder must cost bulk throughput: 85%% gave %.2f MB/s and 70%% gave %.2f MB/s",
-			aggregate.result(results).bulkThroughput/1_000_000,
-			aggregate70.result(results).bulkThroughput/1_000_000)
+	//
+	// The comparison is made on ADMITTED BYTES rather than on a rate. The two configurations run for
+	// nominally the same window, but the window is a sleep and a sleep is not exact, so dividing by
+	// two independently measured durations puts host jitter into the denominator of a comparison
+	// whose whole point is that one number is 70/85 of the other. The bytes do not have that problem:
+	// shaping at 70% of a 2 MB/s wire can admit no more than 0.70 x 2 MB/s x elapsed, and 85% no more
+	// than 0.85 x 2 MB/s x elapsed, so the order is fixed by the configured rates by a margin far
+	// wider than any window-length difference.
+	aggregate70Result := aggregate70.result(results)
+	if !(aggregate70Result.bulkAccepted < aggregateResult.bulkAccepted) {
+		t.Errorf("shaping harder must cost admitted work: 85%% admitted %d B and 70%% admitted %d B "+
+			"over the same measurement window",
+			aggregateResult.bulkAccepted, aggregate70Result.bulkAccepted)
 	}
 
-	// The structural property is asserted on the QUEUE, not on the tail percentile. The tail is the
-	// product number and it is logged above, but it is also the number a busy machine perturbs: a
-	// scheduling hiccup on the host shows up as one slow sample, and a p99 over a hundred samples is
-	// two samples. The queue depth is what the mechanism actually controls, and it is stable across
-	// runs, so it is what the test is allowed to fail on.
-	baselineQueue := baseline.result(results).queueMean
-	shapedQueue := aggregate.result(results).queueMean
-	if shapedQueue >= baselineQueue/4 {
-		t.Errorf("shaping at a rate the path sustains must shrink the queue the high-priority "+
-			"message waits behind: baseline %d KiB, shaped %d KiB",
-			baselineQueue/1024, shapedQueue/1024)
+	// The structural property is asserted on what the PROBE waits behind, not on the aggregate queue
+	// the whole rig is carrying, and not on the tail percentile.
+	//
+	// The aggregate queue mean was the old gate and it is still logged above, but it is not a
+	// property of the shaper: it is the wire's accepted-but-undelivered total, and under
+	// oversubscription the host starves the drain goroutine and that total climbs whether the shaper
+	// is working or not. Measured with 64 spinners on 8 cores it read 52 KiB against a 128 KiB
+	// baseline, past the 32 KiB bound, while the probe's own median wait in the same run was 15.8 KiB
+	// against the baseline's 140 KiB. The probe's wait is the number the mechanism controls and the
+	// number the product is about; the queue mean is an emergent property of the host's scheduling.
+	//
+	// The median rather than the tail for the same reason: the 64-spinner run's aggregate p95 was
+	// 70 ms against an 8 ms p50, because a tail percentile over ~100 samples is decided by the two
+	// samples the host hiccuped on.
+	baselineAheadP50 := p50Int(baselineResult.highQueueAhead)
+	shapedAheadP50 := p50Int(aggregateResult.highQueueAhead)
+	if shapedAheadP50 >= baselineAheadP50/4 {
+		t.Errorf("shaping must collapse the median bytes the high-priority write waits behind: "+
+			"baseline %d B (%s of wire time), shaped %d B (%s)",
+			baselineAheadP50, queuedBytesAsWireTime(baselineAheadP50, wireRate),
+			shapedAheadP50, queuedBytesAsWireTime(shapedAheadP50, wireRate))
 	}
+}
 
-	// And the median, which a host hiccup does not move.
-	baselineP50 := p50(baseline.result(results).highLatencies)
-	shapedP50 := p50(aggregate.result(results).highLatencies)
-	if shapedP50 >= baselineP50/4 {
-		t.Errorf("shaping must collapse the median high-priority delivery time: baseline %s, "+
-			"shaped %s", baselineP50, shapedP50)
+// requireContention fails when the baseline never built a queue.
+//
+// The precondition used to be written on the probe's p99 delivery time, and that is the same claim
+// as "at least this much wire time stood between the probe and the head of the FIFO". Because the
+// wire spends chunk.size/rate on every chunk, the byte count that represents is the time multiplied
+// by the rate, and it is the byte count the rig is now held to: the measurement of the time is what
+// a loaded host moves, not the accounting underneath it.
+func requireContention(t *testing.T, result contentionResult, rate float64, floor time.Duration) {
+	t.Helper()
+	aheadP99 := p99Int(result.highQueueAhead)
+	required := int(floor.Seconds() * rate)
+	if aheadP99 < required {
+		t.Fatalf("the rig must contend before any comparison is meaningful: the probe had %d bytes "+
+			"queued ahead of it at p99 (%s of wire time at %.2f MB/s), and %d bytes (%s) are required",
+			aheadP99, queuedBytesAsWireTime(aheadP99, rate), rate/1_000_000, required, floor)
+	}
+}
+
+// requireWithinShapingBudget asserts the token bucket's own contract: over any interval a paced
+// scheduler may hand over at most one burst more than the configured rate times that interval.
+//
+// This is the mechanism's invariant rather than the host's. The bucket is charged min(size, burst) on
+// every grant and refilled at the configured rate against the scheduler's own clock, so the bound
+// holds whatever the machine is doing; that is what makes a configured rate a rate rather than a
+// ceiling that only applies under contention. It is also discriminating: if the gate were not in the
+// path, the unshaped flood would admit at the wire rate, which is above the configured rate by
+// exactly the fraction the configuration gave up.
+//
+// The bound is exact, so no tolerance is added. The window it is measured over is the interval that
+// actually elapsed, sampled after the senders stopped, which can only make the bound looser than the
+// scheduler's own elapsed time.
+func requireWithinShapingBudget(t *testing.T, result contentionResult, rate float64, burst int) {
+	t.Helper()
+	budget := float64(burst) + rate*result.window.Seconds()
+	if float64(result.bulkAccepted) > budget {
+		t.Errorf("%s admitted %d B over %s, above the bucket's own bound of %d B "+
+			"(burst %d B + %.2f MB/s x %s): the shaper is not in the path",
+			result.label, result.bulkAccepted, result.window, int64(budget),
+			burst, rate/1_000_000, result.window)
 	}
 }
 
@@ -158,6 +232,11 @@ func (c contentionConfig) result(results []contentionResult) contentionResult {
 // The mechanism being tested is the one that was changed for it. The ordering modes arm on
 // high-priority activity, so during the gap they are disarmed and the acceptance windows fill; the
 // paced modes shape continuously, so the windows never fill in the first place.
+//
+// The verdict is drawn from the bytes that stood in front of that first request when it was accepted,
+// not from the time it took to be delivered. A cold start contributes ONE sample per repetition, so
+// there is no distribution to rank and a single host hiccup lands directly on the statistic; the byte
+// count is the same observation with the scheduler taken out of the measurement.
 func TestContentionColdStart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("cold-start experiment runs for tens of seconds")
@@ -195,11 +274,12 @@ func TestContentionColdStart(t *testing.T) {
 		gap, repeats, wireRate/1_000_000)
 	t.Log("")
 
-	samples := make(map[string][]time.Duration, len(configs))
+	samples := make(map[string][]coldStartSample, len(configs))
 	for _, config := range configs {
-		latencies := runColdStart(t, config, gap, repeats)
-		samples[config.label] = latencies
-		t.Logf("%-46s %s", config.label, summariseLatencies(latencies))
+		configSamples := runColdStart(t, config, gap, repeats)
+		samples[config.label] = configSamples
+		t.Logf("%-46s %s", config.label, summariseLatencies(coldStartLatencies(configSamples)))
+		t.Logf("%-46s %s", "", summariseQueueAhead(coldStartAhead(configSamples)))
 	}
 	t.Log("")
 
@@ -207,29 +287,42 @@ func TestContentionColdStart(t *testing.T) {
 	if len(baselineSamples) == 0 {
 		t.Fatal("the cold-start rig produced no samples")
 	}
-	baselineP50 := p50(baselineSamples)
-	t.Logf("first-request p50 by design (baseline %s):", baselineP50.Round(time.Millisecond))
+	baselineLatency := coldStartLatencies(baselineSamples)
+	baselineAhead := coldStartAhead(baselineSamples)
+	baselineP50 := p50(baselineLatency)
+	baselineAheadP50 := p50Int(baselineAhead)
+	t.Logf("first-request p50 by design (baseline %s, %d B queued ahead = %s of wire time):",
+		baselineP50.Round(time.Millisecond), baselineAheadP50, queuedBytesAsWireTime(baselineAheadP50, wireRate))
 	for _, config := range configs {
-		t.Logf("  %-44s p50 %8s  max %8s", config.label,
-			p50(samples[config.label]).Round(time.Millisecond),
-			maxOf(samples[config.label]).Round(time.Millisecond))
+		configSamples := samples[config.label]
+		t.Logf("  %-44s p50 %8s  max %8s  queue p50 %7d B (%s)",
+			config.label,
+			p50(coldStartLatencies(configSamples)).Round(time.Millisecond),
+			maxOf(coldStartLatencies(configSamples)).Round(time.Millisecond),
+			p50Int(coldStartAhead(configSamples)),
+			queuedBytesAsWireTime(p50Int(coldStartAhead(configSamples)), wireRate))
 	}
 
 	// The finding this test exists for. An armed scheduler is disarmed during the gap, so the queue
 	// is exactly as deep as it would be with no scheduler at all, and the first interactive request
-	// pays for it in full.
-	if p50(samples[admission.label]) < baselineP50/2 {
+	// pays for it in full. Informational on purpose: the ordering modes are controls.
+	if p50(coldStartLatencies(samples[admission.label])) < baselineP50/2 {
 		t.Logf("NOTE: the arming design protected the first request after all (baseline p50 %s, "+
 			"armed %s); the continuous-shaping rationale needs revisiting",
-			baselineP50, p50(samples[admission.label]))
+			baselineP50, p50(coldStartLatencies(samples[admission.label])))
 	}
 
-	// And the mechanism that does protect it, on the first write, with no warm-up at all.
+	// And the mechanism that does protect it, on the first write, with no warm-up at all. Asserted on
+	// the bytes that stood in front of that first request, not on the time it took to deliver them:
+	// the request that arrives after a gap is exactly the one whose measured time a host hiccup most
+	// easily ruins, because there is one sample and no distribution to rank.
 	for _, config := range []contentionConfig{pacedNormalOnly, aggregate} {
-		firstP50 := p50(samples[config.label])
-		if firstP50 >= baselineP50/4 {
-			t.Errorf("%s must protect the FIRST request after the gap: baseline p50 %s, got %s",
-				config.label, baselineP50, firstP50)
+		firstAhead := p50Int(coldStartAhead(samples[config.label]))
+		if firstAhead >= baselineAheadP50/4 {
+			t.Errorf("%s must protect the FIRST request after the gap: baseline p50 had %d B queued "+
+				"ahead (%s of wire time) and this mode left %d B (%s)",
+				config.label, baselineAheadP50, queuedBytesAsWireTime(baselineAheadP50, wireRate),
+				firstAhead, queuedBytesAsWireTime(firstAhead, wireRate))
 		}
 	}
 }
@@ -281,6 +374,7 @@ func TestContentionHighVersusHigh(t *testing.T) {
 	t.Log("")
 	for _, result := range results {
 		t.Logf("%-52s %s", result.label, summariseLatencies(result.highLatencies))
+		t.Logf("%-52s %s", "", summariseQueueAhead(result.highQueueAhead))
 		t.Logf("%-52s bulk %5.2f MB/s  queue mean %3d KiB peak %3d KiB",
 			"", result.bulkThroughput/1_000_000, result.queueMean/1024, result.queueHigh/1024)
 	}
@@ -308,13 +402,21 @@ func TestContentionHighVersusHigh(t *testing.T) {
 	t.Logf("p99 aggregate shaper            %s  (bulk %.2f MB/s)",
 		p99(aggregateResult.highLatencies).Round(time.Millisecond), aggregateResult.bulkThroughput/1_000_000)
 
-	// The rig must contend before a comparison means anything. Asserted on the MEDIAN rather than on
-	// the tail: a busy host perturbs one sample and therefore the p99 of a hundred, but it does not
-	// move the median by an order of magnitude. Measured baseline medians: 70.7 ms idle, 70.5 ms on
-	// the GitHub macOS runner, 108 ms with every core of an 8-core host spinning.
-	if baselineP50 < 20*time.Millisecond {
-		t.Fatalf("the rig must contend: baseline p50 was %s", baselineP50)
-	}
+	// The rig must contend before a comparison means anything. Asserted on the MEDIAN queue ahead of
+	// the probe rather than on the median of its measured delivery time: a busy host perturbs one
+	// sample and therefore a tail percentile, and it perturbs every duration a little, but it does
+	// not change how many bytes the mechanism let pile up in front of the probe. Measured baseline
+	// medians: 70.7 ms idle, 70.5 ms on the GitHub macOS runner, 108 ms with every core of an 8-core
+	// host spinning - while the queue ahead of the probe read the same 128 KiB acceptance window in
+	// every one of those runs.
+	requireContention(t, baselineResult, wireRate, 20*time.Millisecond)
+
+	// Aggregate shaping covers the HIGH lane, so the high-priority bulk flows are inside the bucket
+	// and their admitted bytes are bounded by it. This is the deterministic statement of the finding
+	// the experiment is about: NORMAL-lane-only shaping is NOT asserted here, because it is the
+	// control that demonstrates the hole - its high-priority bulk is charged to no bucket at all -
+	// and the bucket bound is exactly what it would violate.
+	requireWithinShapingBudget(t, aggregateResult, aggregate.rate, DefaultBurst)
 
 	// The hole, if it is one. This is logged rather than asserted in the failing direction: the
 	// design decision is which shaper to ship, and a shaper that happens to cope here is a result
@@ -325,27 +427,30 @@ func TestContentionHighVersusHigh(t *testing.T) {
 			p99(normalOnlyResult.highLatencies).Round(time.Millisecond))
 	}
 
-	// The gate is on what the mechanism actually CONTROLS - the queue the probe waits behind, and
-	// the median it sees - and not on the tail percentile. Same reasoning and same ratio as
-	// TestContentionSteadyState above: a p99 over ~100 samples is decided by the last two, so a
-	// scheduling hiccup on a busy runner turns it into a failure that says nothing about the shaper.
-	// The p99 stays in the table as the product number, which is what it is.
+	// The gate is on what the mechanism actually CONTROLS - the bytes the probe waits behind - and
+	// not on the aggregate queue mean and not on the tail percentile.
 	//
-	// The 4x bound is the one the file already uses for these two statistics, and it holds on every
-	// host this has run on. Measured, aggregate against baseline: queue 15-16 KiB against 128 KiB
-	// with the host idle, 23 KiB against 128 KiB on the macOS runner; p50 6 ms against 70 ms on both.
-	// The p99 comparison that used to be here never held on the runner - it read 31 ms against a
-	// required 22 ms while the queue and the median showed the mechanism working exactly as designed.
-	if aggregateResult.queueMean >= baselineQueue/4 {
-		t.Errorf("aggregate shaping must keep the queue a small high-priority write waits behind "+
-			"out of the way: baseline queue mean %d KiB, aggregate %d KiB",
-			baselineQueue/1024, aggregateResult.queueMean/1024)
-	}
-	aggregateP50 := p50(aggregateResult.highLatencies)
-	if aggregateP50 >= baselineP50/4 {
-		t.Errorf("aggregate shaping must collapse the median high-priority delivery time: "+
-			"baseline p50 %s, aggregate %s",
-			baselineP50, aggregateP50.Round(time.Millisecond))
+	// The queue-mean comparison used to be here and it failed under load for a reason that had
+	// nothing to do with the shaper: with 64 spinners on 8 cores two runs in this file read the
+	// aggregate at 52 KiB against a 128 KiB baseline - past the 32 KiB bound - while the probe's own
+	// median wait in that same run was 15.8 KiB against the baseline's 140 KiB. The queue mean is the
+	// wire's accepted-but-undelivered total, which includes the high-priority BULK flows' bursts and
+	// climbs whenever the host starves the drain goroutine; the probe's wait is the product number and
+	// the thing the lane policy and the bucket actually decide.
+	//
+	// The 4x bound is the one the file already uses for these statistics, and it holds with margin on
+	// every host this has run on. Measured, aggregate against baseline: queue-ahead 5-6 KiB against
+	// 140 KiB with the host idle, 15.8 KiB against 140 KiB with 64 spinners on 8 cores; p50 6 ms
+	// against 70 ms on both. The p99 comparison that used to be here never held on the runner - it
+	// read 31 ms against a required 22 ms while the queue and the median showed the mechanism working
+	// exactly as designed.
+	baselineAheadP50 := p50Int(baselineResult.highQueueAhead)
+	aggregateAheadP50 := p50Int(aggregateResult.highQueueAhead)
+	if aggregateAheadP50 >= baselineAheadP50/4 {
+		t.Errorf("aggregate shaping must collapse the median bytes the high-priority write waits "+
+			"behind: baseline %d B (%s of wire time), aggregate %d B (%s)",
+			baselineAheadP50, queuedBytesAsWireTime(baselineAheadP50, wireRate),
+			aggregateAheadP50, queuedBytesAsWireTime(aggregateAheadP50, wireRate))
 	}
 }
 

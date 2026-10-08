@@ -2,6 +2,7 @@ package sniff_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"testing"
@@ -416,4 +417,119 @@ func TestSniffWireGuardDTLSRecordNotClaimed(t *testing.T) {
 	var collisionMetadata adapter.InboundContext
 	require.Error(t, sniff.WireGuard(context.Background(), &collisionMetadata, collision))
 	require.Empty(t, collisionMetadata.Protocol)
+}
+
+// ambiguousInitiation builds the shared byte string at the centre of the uTP/WireGuard collision: a
+// 148-byte WireGuard handshake initiation whose uTP reading is a valid ST_DATA packet.
+//
+// The header is the whole of the collision. WireGuard fixes the first four bytes to 01 00 00 00; uTP
+// reads the same four as version 1 / type ST_DATA, an empty extension chain and connection id
+// 0x0000. Nothing after byte 3 is constrained by uTP and everything after byte 3 is random
+// ciphertext and indices to WireGuard, so a merely deterministic filler - not a specially
+// constructed one - is enough to be legal under both readings. That is the property the test below
+// exercises: the collision is a property of the headers, not of a lucky body.
+func ambiguousInitiation(seed uint32) []byte {
+	packet := make([]byte, 148)
+	packet[0] = 1
+	copy(packet[4:], deterministicBytes(seed, 144))
+	return packet
+}
+
+// TestSniffWireGuardUTPAmbiguityIsStructural is the deterministic proof that the residual
+// WireGuard/uTP collision cannot be narrowed without giving up real WireGuard detection.
+//
+// Classification: PROVEN-INHERENT-AMBIGUITY.
+//
+// # Why every candidate narrowing fails
+//
+//   - Tightening uTP cannot help, because uTP is not the sniffer that decides. WireGuard runs first -
+//     it must, because every real initiation is a legal uTP packet - and the ambiguous packet
+//     already satisfies WireGuard's check, so a stricter uTP verdict is never consulted.
+//   - Reordering cannot help for the same reason read the other way. uTP's constraints live in bytes
+//     0-19 and the extension chain; the ambiguous packet and a genuine initiation differ only in
+//     bytes 4-147, and uTP has no cross-field invariant there. A rule strict enough to reject the
+//     ambiguous packet therefore rejects genuine initiations as well, and then a uTP-first pipeline
+//     misclassifies every WireGuard handshake as BitTorrent.
+//   - Additional WireGuard consistency cannot help, because there is no consistent field left. Bytes
+//     4-7 are a random sender index and bytes 8-147 are an ephemeral public key, three AEAD
+//     ciphertexts and two keyed MACs, all uniformly random from outside. mac2 is all-zero only until
+//     the responder demands a cookie, so requiring it either way drops real handshakes.
+//
+// The tie-break the pipeline does make - WireGuard before uTP - is therefore not arbitrary: among
+// datagrams that satisfy both, the WireGuard reading explains all of them, while the uTP reading
+// additionally requires the datagram to be exactly 148 bytes with a zero connection id. The residual
+// is two orders of magnitude rarer than the handshakes a different order would stop seeing.
+func TestSniffWireGuardUTPAmbiguityIsStructural(t *testing.T) {
+	t.Parallel()
+
+	// More than one filler, because a single lucky byte string would be an anecdote. The claim is
+	// that any body legal under one reading is legal under the other, so the loop has to show it for
+	// a spread of bodies and not only for the one that was hand-picked.
+	for seed := uint32(1); seed <= 64; seed++ {
+		packet := ambiguousInitiation(seed)
+		require.Len(t, packet, 148)
+		require.Equal(t, []byte{0x01, 0x00, 0x00, 0x00}, packet[:4])
+
+		// The WireGuard reading, which is the one the pipeline acts on.
+		var wireGuardMetadata adapter.InboundContext
+		require.NoError(t, sniff.WireGuard(context.Background(), &wireGuardMetadata, packet), "seed %d", seed)
+		require.Equal(t, C.ProtocolWireGuard, wireGuardMetadata.Protocol)
+
+		// The uTP reading of the SAME bytes, spelled out field by field so that "this is a genuine
+		// uTP packet" is checked rather than asserted. These are the only constraints uTP has.
+		require.GreaterOrEqual(t, len(packet), 20, "uTP header")
+		require.Equal(t, byte(1), packet[0]&0x0F, "uTP version")
+		require.Equal(t, byte(0), packet[0]>>4, "uTP ST_DATA type")
+		require.Equal(t, byte(0), packet[1], "uTP empty extension chain")
+		require.Equal(t, uint16(0), binary.BigEndian.Uint16(packet[2:4]), "uTP connection id")
+
+		var utpMetadata adapter.InboundContext
+		require.NoError(t, sniff.UTP(context.Background(), &utpMetadata, packet), "seed %d", seed)
+		require.Equal(t, C.ProtocolBitTorrent, utpMetadata.Protocol)
+	}
+
+	// The pipeline resolves the ambiguity by ORDER, not by structure. Both orders are given the
+	// identical bytes here, so the two results together are the proof: if structure could separate
+	// the readings, one of the sniffers would have to refuse.
+	packet := ambiguousInitiation(1)
+
+	var wireGuardFirst adapter.InboundContext
+	require.NoError(t, sniff.PeekPacket(
+		context.Background(), &wireGuardFirst, packet,
+		sniff.WireGuard, sniff.UTP, sniff.UDPTracker,
+	))
+	require.Equal(t, C.ProtocolWireGuard, wireGuardFirst.Protocol)
+
+	var utpFirst adapter.InboundContext
+	require.NoError(t, sniff.PeekPacket(
+		context.Background(), &utpFirst, packet,
+		sniff.UTP, sniff.WireGuard, sniff.UDPTracker,
+	))
+	require.Equal(t, C.ProtocolBitTorrent, utpFirst.Protocol)
+
+	// The residual is exactly the two connection-id bytes, and nothing else. Every other value turns
+	// the uTP reading into a packet WireGuard must refuse, because WireGuard requires all three
+	// bytes after the type to be zero; this is what makes the collision a 1-in-2^16 event on a
+	// 148-byte ST_DATA and pins it to a specific field rather than to "some overlap somewhere".
+	for _, connectionID := range []uint16{0, 1, 2, 0xff, 0xffff} {
+		candidate := ambiguousInitiation(1)
+		binary.BigEndian.PutUint16(candidate[2:4], connectionID)
+
+		var metadata adapter.InboundContext
+		require.NoError(t, sniff.PeekPacket(
+			context.Background(), &metadata, candidate,
+			sniff.WireGuard, sniff.UTP, sniff.UDPTracker,
+		))
+		if connectionID == 0 {
+			require.Equal(t, C.ProtocolWireGuard, metadata.Protocol,
+				"a zero connection id is what makes the uTP reading agree with WireGuard's mandatory zero reserved bytes")
+		} else {
+			require.Equal(t, C.ProtocolBitTorrent, metadata.Protocol,
+				"any non-zero connection id breaks a reserved byte and must fall through to uTP (id %#04x)", connectionID)
+		}
+	}
+
+	t.Log("classification: PROVEN-INHERENT-AMBIGUITY - a zero uTP connection id and an empty " +
+		"extension chain are byte-identical to a WireGuard type-1 header, and no structural rule can " +
+		"separate them without also rejecting genuine handshake initiations")
 }
