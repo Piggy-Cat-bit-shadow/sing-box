@@ -1,6 +1,8 @@
 package build_shared
 
 import (
+	"os"
+
 	"github.com/sagernet/sing-box/common/badversion"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
@@ -8,8 +10,19 @@ import (
 )
 
 func ReadTag() (string, error) {
+	// CI may inject the exact version (a shallow clone cannot describe a tag).
+	if injected := os.Getenv("SING_BOX_BUILD_VERSION"); injected != "" {
+		return injected, nil
+	}
 	currentTag, err := shell.Exec("git", "describe", "--tags").ReadOutput()
 	if err != nil {
+		// Shallow / tag-less checkouts (CI clones with --depth 1, or a branch
+		// tip that sits past the newest release tag) cannot be described by a
+		// tag. Fall back to the short commit so the build version stays
+		// identifiable instead of reading "unknown".
+		if commit, commitErr := shell.Exec("git", "rev-parse", "--short", "HEAD").ReadOutput(); commitErr == nil {
+			return commit, nil
+		}
 		return currentTag, err
 	}
 	currentTagRev, _ := shell.Exec("git", "describe", "--tags", "--abbrev=0").ReadOutput()

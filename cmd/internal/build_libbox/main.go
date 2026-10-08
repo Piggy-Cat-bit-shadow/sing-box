@@ -48,6 +48,7 @@ var (
 	sharedFlags []string
 	debugFlags  []string
 	sharedTags  []string
+	androidTags []string
 	darwinTags  []string
 	// memcTags    []string
 	notMemcTags []string
@@ -69,6 +70,13 @@ func init() {
 	// supposed to agree eventually do not, and the failure is silent: the tests keep
 	// passing against a tag set nothing ships.
 	sharedTags = append(sharedTags, applebuildtags.CommonTags()...)
+
+	// Android-only tags. with_gvisor selects sing-tun's gVisor netstack, which is
+	// the stack the Android client asks for ("stack": "mixed"/"gvisor"); without
+	// this tag sing-tun compiles stack_gvisor_stub.go and starting a tun fails with
+	// "gVisor is not included in this build". It is deliberately NOT in the shared
+	// Apple list, so the Apple artifacts keep their existing stack choices.
+	androidTags = append(androidTags, "with_gvisor")
 	notMemcTags = append(notMemcTags, applebuildtags.LowMemoryMobileTags()...)
 	debugTags = append(debugTags, "debug")
 }
@@ -167,6 +175,7 @@ func buildAndroid() {
 
 	// Build main variant (SDK 24)
 	mainTags := append([]string{}, sharedTags...)
+	mainTags = append(mainTags, androidTags...)
 	// mainTags = append(mainTags, memcTags...)
 	if debugEnabled {
 		mainTags = append(mainTags, debugTags...)
@@ -179,6 +188,7 @@ func buildAndroid() {
 
 	// Build legacy variant (SDK 21, no naive outbound)
 	legacyTags := filterTags(sharedTags, "with_naive_outbound")
+	legacyTags = append(legacyTags, androidTags...)
 	// legacyTags = append(legacyTags, memcTags...)
 	if debugEnabled {
 		legacyTags = append(legacyTags, debugTags...)
