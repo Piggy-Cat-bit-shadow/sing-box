@@ -345,13 +345,6 @@ func (c *Client) networkTransitionStable() bool {
 // The cost is one uncached answer while the environment is still unknown, which is the safe
 // direction: a cache MISS costs a lookup, a wrong HIT returns an answer about a different network.
 func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey) (dnsCacheKey, bool) {
-	// A transport that does not participate in environments has 0 as its REAL, stable identity.
-	// Distinguishing this from "participates, but nothing is known yet" is what keeps caching
-	// enabled for such transports while refusing to guess for the others.
-	if _, withEnvironment := transport.(adapter.DNSTransportWithEnvironment); !withEnvironment {
-		return key, true
-	}
-
 	environment := c.environmentHash(transport)
 	if environment != key.environment {
 		// The environment the query was issued under is not the one that holds now.
@@ -368,8 +361,9 @@ func (c *Client) finishCacheKey(transport adapter.DNSTransport, key dnsCacheKey)
 		//
 		// # Why a zero fingerprint is not automatically "unknown"
 		//
-		// A transport that participates in environments, advertises none, and runs on a platform
-		// reporting NetworkEnvironment() == 0 has 0 as its real and permanent identity. Refusing it
+		// A transport on a platform reporting NetworkEnvironment() == 0 has 0 as its real and
+		// permanent identity for as long as that holds - an offline device, or one with no
+		// default interface. Refusing it
 		// disabled caching for the whole process lifetime - every query went upstream - which is a
 		// silent behaviour change rather than a safety property. When the captured value and the
 		// current value are both zero they ARE the same environment, so the answer is correctly
@@ -428,12 +422,35 @@ func (c *Client) knownTransports() []string {
 	return tags
 }
 
+// environmentHash is the cache namespace of one transport: the network it serves, plus the
+// environment list it publishes when it has one.
+//
+// # Why EVERY transport is namespaced by the network, not only the local ones
+//
+// The local, mDNS and DHCP transports publish an environment list (resolver addresses, search
+// domains), so they were the only ones the fingerprint used to cover. Every other transport -
+// UDP, TCP, TLS, HTTPS, QUIC, H3, and the platform transports - returned 0 here, and 0 is not a
+// namespace: the exact cache entry, the NXDOMAIN verdict, the RDRC key and the persistent key
+// were then the same on every network, so an answer, a negative verdict or a rejection learned
+// on one network was served on the next one.
+//
+// A remote transport's answers are not network-independent either. Its socket is dialled
+// through the device's current network, and split-horizon, captive-portal and per-carrier
+// answers are exactly the case the boundary machinery exists for. The manager already
+// recomputes the network environment on every real transition, and ResetNetwork already
+// re-pins every transport to the new value; this is what makes those two facts visible to the
+// cache.
+//
+// The value used is the PINNED environment, not the manager's current one, so a query cannot be
+// stamped with a network its transport does not serve yet - the pin only moves when the
+// transports are reset, which is the same boundary.
 func (c *Client) environmentHash(transport adapter.DNSTransport) uint64 {
+	networkEnvironment := c.transportEnvironment(transport)
 	environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
 	if !withEnvironment {
-		return 0
+		// No list of its own: the network the socket is dialled through IS its environment.
+		return networkEnvironment
 	}
-	networkEnvironment := c.transportEnvironment(transport)
 	environment := environmentTransport.Environment()
 	if len(environment) == 0 {
 		return networkEnvironment

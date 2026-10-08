@@ -255,45 +255,127 @@ func TestClosedGroupDoesNotQueueWork(t *testing.T) {
 	require.False(t, worker, "and must not start a worker")
 }
 
-// TestForcedRoundQueuesWhenGuardHeldOutsideAWorker is the precise isolation of urlTest's handoff.
+// TestForcedRoundQueuesWhenAGuardIsHeldByARealRound is the precise isolation of urlTest's
+// handoff.
 //
 // The end-to-end test above cannot isolate it, because the drain worker also serves the debt and
-// would mask a dropped request. Here the checking guard is held WITHOUT any worker being involved,
-// which is the situation a direct forced refresh is in - a native "test this URLTest group" call,
-// or PostStart, both of which invoke CheckOutbounds directly.
+// would mask a dropped request. The guard must therefore be held by something that is NOT the
+// drain worker.
 //
-// With the guard held by something that is not the drain worker, the only thing that can preserve
-// the request is urlTest's own queueing branch.
-func TestForcedRoundQueuesWhenGuardHeldOutsideAWorker(t *testing.T) {
-	node := &barrierOutbound{tag: "node-a"}
+// The guard is held by a REAL round here, not by the test writing the flag: the periodic round runs
+// through the production entry point and is parked inside the member's probe, which is exactly the
+// state a forced refresh finds in the field. An earlier revision of this test set `checking` itself
+// and released it by hand, which verified the queueing branch against a state the test invented
+// rather than against the one the product creates - and it would have kept passing if the release
+// path were broken, because the release was the test's own line.
+//
+// Nothing here touches the guard. The round claims it, parks, and gives it up when the gate opens.
+func TestForcedRoundQueuesWhenAGuardIsHeldByARealRound(t *testing.T) {
+	node := &barrierOutbound{
+		tag:     "node-a",
+		gate:    make(chan struct{}),
+		entered: make(chan struct{}),
+	}
 	group, _ := newGroupFixture(t, "https://probe.example/generate_204", node)
 	group.selected.Store(&selectedState{tcp: node, udp: node})
 
-	// Hold the guard as a foreign round would, with no drain worker in existence.
-	require.False(t, group.checking.Swap(true))
-
-	group.recheckAccess.Lock()
-	require.False(t, group.recheckWorker, "no worker must exist for this test to isolate the branch")
-	group.recheckAccess.Unlock()
-
-	done := make(chan struct{})
+	// A real periodic round claims the guard and parks inside the probe.
+	roundDone := make(chan struct{})
 	go func() {
-		defer close(done)
-		group.CheckOutbounds(group.ctx, true)
+		defer close(roundDone)
+		group.CheckOutbounds(group.ctx, false)
 	}()
 
 	select {
-	case <-done:
+	case <-node.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the periodic round never reached the member")
+	}
+	require.True(t, group.checking.Load(),
+		"a round parked inside a probe must hold the guard")
+
+	// The forced refresh arrives while that round is still running.
+	forcedDone := make(chan struct{})
+	go func() {
+		defer close(forcedDone)
+		group.CheckOutbounds(group.ctx, true)
+	}()
+	select {
+	case <-forcedDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("a forced round must return rather than block while the guard is held")
 	}
 
-	// Release the guard so the queued work can proceed.
-	group.checking.Store(false)
+	// The request must have been remembered.
+	group.recheckAccess.Lock()
+	queued := group.recheckRequested > group.recheckServed
+	worker := group.recheckWorker
+	group.recheckAccess.Unlock()
+	require.True(t, queued, "the forced round must be remembered rather than dropped")
+	require.True(t, worker, "and a worker must be responsible for draining it")
 
-	// The request must have been remembered AND a worker must now serve it.
-	require.Eventually(t, func() bool { return node.probes.Load() >= 1 },
+	// Opening the gate lets the parked round finish and release the guard through production code,
+	// after which the queued round runs.
+	close(node.gate)
+	select {
+	case <-roundDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the periodic round did not finish")
+	}
+	require.Eventually(t, func() bool { return !group.checking.Load() },
+		5*time.Second, 5*time.Millisecond,
+		"the round that owned the guard must release it; nothing outside the product may")
+	require.Eventually(t, func() bool { return node.probes.Load() >= 2 },
+		5*time.Second, 5*time.Millisecond,
+		"the queued forced round was never served: a direct forced refresh silently did nothing")
+	require.GreaterOrEqual(t, group.recheckRuns.Load(), int32(1))
+}
+
+// TestALosingPeriodicRoundDoesNotReleaseTheWinnersGuard is the direct refutation of the TD-005
+// mechanism as originally reported: "the losing caller releases the guard".
+//
+// The claim cannot hold with the code as written, because the release is registered only on the
+// winning path - the loser returns before `defer g.checking.Store(false)` exists. This test pins
+// that as behaviour rather than as an argument: a parked real round holds the guard, a second
+// periodic round loses the claim, and the guard must still be held afterwards.
+func TestALosingPeriodicRoundDoesNotReleaseTheWinnersGuard(t *testing.T) {
+	node := &barrierOutbound{
+		tag:     "node-a",
+		gate:    make(chan struct{}),
+		entered: make(chan struct{}),
+	}
+	group, _ := newGroupFixture(t, "https://probe.example/generate_204", node)
+	group.selected.Store(&selectedState{tcp: node, udp: node})
+
+	roundDone := make(chan struct{})
+	go func() {
+		defer close(roundDone)
+		group.CheckOutbounds(group.ctx, false)
+	}()
+	select {
+	case <-node.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first round never reached the member")
+	}
+
+	// The losing round: a periodic check that finds the guard held and returns at once.
+	group.CheckOutbounds(group.ctx, false)
+	require.True(t, group.checking.Load(),
+		"the losing round released the winning round's guard")
+
+	close(node.gate)
+	select {
+	case <-roundDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the winning round did not finish")
+	}
+	require.False(t, group.checking.Load(),
+		"the winning round must release the guard it claimed")
+
+	// And the group is usable again: the guard is a hand-off, not a latch.
+	probesBefore := node.probes.Load()
+	group.CheckOutbounds(group.ctx, false)
+	require.Eventually(t, func() bool { return node.probes.Load() > probesBefore },
 		3*time.Second, 5*time.Millisecond,
-		"a forced round arriving while the guard is held by something other than a worker was "+
-			"dropped: nothing re-ran it, so a direct forced refresh silently did nothing")
+		"the group must be able to run another round after the guard is released")
 }

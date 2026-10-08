@@ -218,14 +218,34 @@ func jumpHash(key uint64, buckets int32) int32 {
 // surgery, so a write is a map store and an append. The strategies that use this cache
 // re-pin a key when they read a dead member, so the entries that matter are refreshed by
 // use; the ones evicted are the ones nothing has read for longest.
+//
+// # Why the queue is stamped and compacted
+//
+// The bound on the map is not a bound on the queue, and the queue is what holds the
+// memory. Two things are needed to make it one:
+//
+//   - Every queue node carries the insertion sequence of the pin it was appended for,
+//     and the entry carries the same stamp. A node may only evict the key it still owns.
+//     Without that, a key that expired (leaving its node behind) and was then pinned
+//     again (appending a new node) would be evicted by its OWN stale node the moment the
+//     head reached it -- the fresh pin would be dropped while an older key survived,
+//     which is the opposite of FIFO.
+//   - The queue is compacted to its live nodes once it has grown past twice the bound.
+//     Pins that expire before the head ever reaches them would otherwise accumulate one
+//     node per key ever seen, for ever, while the map stayed at its limit. The
+//     compaction is amortized O(1): it only runs after at least `limit` further appends,
+//     because it leaves at most `limit` live nodes behind.
 type loadBalanceAffinity struct {
 	access sync.Mutex
 
 	entries map[string]loadBalanceAffinityEntry
-	// order is the insertion queue, addressed by head. It is only compacted when the
-	// queue outgrows its useful length, so the common case is two appends.
-	order []string
+	// order is the insertion queue, addressed by head. A node whose pin is gone is
+	// skipped when the head reaches it, and dropped in bulk by compactLocked.
+	order []loadBalanceOrderNode
 	head  int
+	// sequence stamps each appended node. It is monotonic and never reused, which is
+	// what lets a node prove it still owns its key.
+	sequence uint64
 
 	ttl   time.Duration
 	limit int
@@ -234,9 +254,17 @@ type loadBalanceAffinity struct {
 	now func() time.Time
 }
 
+// loadBalanceOrderNode is one position in the insertion queue.
+type loadBalanceOrderNode struct {
+	key      string
+	sequence uint64
+}
+
 type loadBalanceAffinityEntry struct {
 	memberTag string
 	expiresAt time.Time
+	// sequence is the stamp of the queue node that owns this pin.
+	sequence uint64
 }
 
 func newLoadBalanceAffinity(ttl time.Duration, limit int) *loadBalanceAffinity {
@@ -281,29 +309,54 @@ func (a *loadBalanceAffinity) pin(key string, memberTag string) {
 	defer a.access.Unlock()
 
 	now := a.now()
-	if _, loaded := a.entries[key]; loaded {
-		// Re-pinning an existing key refreshes it in place; the queue keeps its original
-		// position so a hot key cannot extend the queue for ever.
-		a.entries[key] = loadBalanceAffinityEntry{memberTag: memberTag, expiresAt: now.Add(a.ttl)}
+	if entry, loaded := a.entries[key]; loaded {
+		// Re-pinning an existing key refreshes it in place, and keeps the node that
+		// already owns the key: the queue keeps its original position so a hot key
+		// cannot extend the queue for ever, and the node that will eventually evict
+		// this key is the one it was inserted with.
+		entry.memberTag = memberTag
+		entry.expiresAt = now.Add(a.ttl)
+		a.entries[key] = entry
 		return
 	}
 	if len(a.entries) >= a.limit {
 		a.sweepLocked(now)
 	}
 	for len(a.entries) >= a.limit && a.head < len(a.order) {
-		oldest := a.order[a.head]
+		node := a.order[a.head]
 		a.head++
-		if entry, loaded := a.entries[oldest]; loaded {
-			delete(a.entries, oldest)
-			_ = entry
+		entry, loaded := a.entries[node.key]
+		if !loaded || entry.sequence != node.sequence {
+			// The pin this node was appended for is gone -- expired, evicted, or
+			// replaced by a later insertion. A stale node must not evict whatever
+			// holds the key now.
+			continue
+		}
+		delete(a.entries, node.key)
+	}
+	a.sequence++
+	a.entries[key] = loadBalanceAffinityEntry{memberTag: memberTag, expiresAt: now.Add(a.ttl), sequence: a.sequence}
+	a.order = append(a.order, loadBalanceOrderNode{key: key, sequence: a.sequence})
+	if len(a.order) >= 2*a.limit {
+		a.compactLocked()
+	}
+}
+
+// compactLocked drops every node that no longer owns a live pin, preserving the relative
+// order of the nodes that remain. The caller holds the lock.
+//
+// The filter is in place: a kept node is always written at an index no greater than the
+// one it is read from, so no node is overwritten before it has been examined.
+func (a *loadBalanceAffinity) compactLocked() {
+	live := a.order[:0]
+	for _, node := range a.order[a.head:] {
+		entry, loaded := a.entries[node.key]
+		if loaded && entry.sequence == node.sequence {
+			live = append(live, node)
 		}
 	}
-	if a.head > 0 && a.head >= len(a.order) {
-		a.order = a.order[:0]
-		a.head = 0
-	}
-	a.entries[key] = loadBalanceAffinityEntry{memberTag: memberTag, expiresAt: now.Add(a.ttl)}
-	a.order = append(a.order, key)
+	a.order = live
+	a.head = 0
 }
 
 // sweepLocked drops every expired entry. The caller holds the lock.
@@ -324,4 +377,26 @@ func (a *loadBalanceAffinity) size() int {
 	a.access.Lock()
 	defer a.access.Unlock()
 	return len(a.entries)
+}
+
+// queueRetained reports how many queue nodes are still held, consumed or not: it is the
+// memory the insertion queue occupies. Like size, it exists for tests and diagnostics.
+func (a *loadBalanceAffinity) queueRetained() int {
+	if a == nil {
+		return 0
+	}
+	a.access.Lock()
+	defer a.access.Unlock()
+	return len(a.order)
+}
+
+// queuePending reports how many nodes the head has still to walk. Like size, it exists
+// for tests and diagnostics.
+func (a *loadBalanceAffinity) queuePending() int {
+	if a == nil {
+		return 0
+	}
+	a.access.Lock()
+	defer a.access.Unlock()
+	return len(a.order) - a.head
 }

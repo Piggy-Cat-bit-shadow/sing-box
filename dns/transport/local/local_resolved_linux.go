@@ -66,6 +66,20 @@ type DBusResolvedResolver struct {
 	updateCancel      context.CancelFunc
 	updateRunAccess   sync.Mutex
 	closed            bool
+
+	// signalLoopStop is closed by Close to end the D-Bus signal loop, and
+	// signalLoopDone is closed by the loop when it has returned.
+	//
+	// The loop cannot be ended by closing its signal channel: the dbus library is
+	// the sender, and a send on a closed channel panics. It is ended by a stop
+	// signal the loop selects on, and joined so Close does not return while a
+	// callback can still run. An earlier revision ranged over the signal channel
+	// and never closed it, so the goroutine and everything it referenced lived
+	// until the process exited - one per resolver instance, on a path that runs
+	// whenever systemd-resolved is present.
+	signalLoopStop chan struct{}
+	signalLoopDone chan struct{}
+	signalLoopOnce sync.Once
 }
 
 type resolvedServerSet struct {
@@ -189,6 +203,8 @@ func (t *DBusResolvedResolver) Start() error {
 	if err != nil {
 		return E.Cause(err, "configure resolved properties listener")
 	}
+	t.signalLoopStop = make(chan struct{})
+	t.signalLoopDone = make(chan struct{})
 	go t.loopUpdateStatus()
 	return nil
 }
@@ -212,6 +228,17 @@ func (t *DBusResolvedResolver) Close() error {
 	t.interfaceMonitor.UnregisterCallback(t.interfaceCallback)
 	if t.networkCallback != nil {
 		t.networkMonitor.UnregisterCallback(t.networkCallback)
+	}
+	// End the D-Bus signal loop and wait for it.
+	//
+	// The loop deregisters its own signal channel on the way out (RemoveSignal), so
+	// the library stops delivering to it before the bus is closed underneath it.
+	// The join is what makes "closed" mean the resolver has no running callback:
+	// returning while a PropertiesChanged handler was still inside updateStatus
+	// would let a background refresh outlive the thing that owned it.
+	if t.signalLoopStop != nil {
+		t.signalLoopOnce.Do(func() { close(t.signalLoopStop) })
+		<-t.signalLoopDone
 	}
 	_ = t.systemBus.Close()
 	return closeErr
@@ -344,9 +371,20 @@ func (s *resolvedScope) match(name string) int {
 }
 
 func (t *DBusResolvedResolver) loopUpdateStatus() {
+	defer close(t.signalLoopDone)
 	signalChan := make(chan *dbus.Signal, 1)
 	t.systemBus.Signal(signalChan)
-	for signal := range signalChan {
+	// Deregister on the way out, and NOT by closing signalChan: the library is the
+	// sender, so a close would turn the next delivery into a panic on a channel
+	// nobody owns any more.
+	defer t.systemBus.RemoveSignal(signalChan)
+	for {
+		var signal *dbus.Signal
+		select {
+		case signal = <-signalChan:
+		case <-t.signalLoopStop:
+			return
+		}
 		switch signal.Name {
 		case "org.freedesktop.DBus.NameOwnerChanged":
 			if len(signal.Body) != 3 {
