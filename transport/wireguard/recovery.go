@@ -100,7 +100,20 @@ func (e *Endpoint) sessionStateChanged(peer device.NoisePublicKey, state device.
 		session.stale = true
 	}
 	session.state = state
-	needWorker := session.stale && session.state != device.PeerSessionEstablished
+	// The worker is needed for BOTH triggers, not only the give-up one.
+	//
+	// A handshake entering its series is NOT stale - it becomes stale only when the settle window
+	// expires, and the code that makes that decision (`anyStale`) lives inside the worker. Starting
+	// the worker only on `stale` therefore made the early trigger unreachable: nobody was left to
+	// notice that the handshake was still running at the window, so it could fire only as a side
+	// effect of some OTHER peer having given up first and started the worker. The symptom is the one
+	// the trigger exists to remove - a node wakes, retries into the dead 5-tuple, and the user waits
+	// for the full give-up cycle.
+	//
+	// Starting it here does not make it resident: the loop returns as soon as nothing is stale AND
+	// nothing is handshaking, so a handshake that completes before the window costs one goroutine
+	// for its duration and nothing afterwards.
+	needWorker := session.stale || session.state == device.PeerSessionHandshake
 	recovery.access.Unlock()
 
 	if needWorker {
@@ -178,14 +191,19 @@ func (e *Endpoint) recoveryLoop() {
 		if e.staleFromGiveUp() {
 			reason = adapter.RebindHandshakeGiveUp
 		}
-		if !e.registration.ScheduleRebind(reason) {
+		lease, granted := e.registration.BeginRebind(reason)
+		if !granted {
 			// Coalesced: a rebind for this generation already ran or is in flight.
 			return
 		}
-		rebindCtx, cancel := context.WithTimeout(e.options.Context, e.rebindTimeout())
+		// The rebind runs under the LEASE's context, derived from the lease's deadline, so a
+		// generation change or a close reaches a rebind that is already blocked in a dial. Running
+		// under the endpoint's own context would only observe the core shutting down, which is a
+		// different and much later event.
+		rebindCtx, cancel := context.WithTimeout(lease.Context(), e.rebindTimeout())
 		err := e.RebindStale(rebindCtx, reason)
 		cancel()
-		e.registration.CompleteRebind()
+		lease.Complete()
 		if err != nil && !E.IsClosedOrCanceled(err) && !errors.Is(err, errRebindNotPossible) {
 			e.options.Logger.Warn("wireguard[", e.options.Tag, "] rebind failed: ", err)
 		}
@@ -385,14 +403,15 @@ func (e *Endpoint) rebindOnWake() {
 	if !e.registration.WakeAllowsRebind() {
 		return
 	}
-	if !e.registration.ScheduleRebind(adapter.RebindDeviceWake) {
+	lease, granted := e.registration.BeginRebind(adapter.RebindDeviceWake)
+	if !granted {
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(e.options.Context, e.rebindTimeout())
+		ctx, cancel := context.WithTimeout(lease.Context(), e.rebindTimeout())
 		defer cancel()
 		err := e.RebindStale(ctx, adapter.RebindDeviceWake)
-		e.registration.CompleteRebind()
+		lease.Complete()
 		if err != nil && !errors.Is(err, errRebindNotPossible) && !E.IsClosedOrCanceled(err) {
 			e.options.Logger.Debug("wireguard[", e.options.Tag, "] wake rebind skipped: ", err)
 		}
