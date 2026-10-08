@@ -61,6 +61,19 @@ jobs:
         run: |
           set -euo pipefail
           tags="$(cat release/DEFAULT_BUILD_TAGS)"
+          # The geometry tag is read from the same source of truth the iOS build uses rather than
+          # spelled again here. This step previously built with `-tags "$tags,low_memory"`, which is
+          # not a build tag anywhere: the sing fork selects its 16 KiB geometry on with_low_memory,
+          # so bare low_memory did nothing and this "low_memory" step compiled the standard 32 KiB
+          # buffers. Reading it from cmd/internal/appletags means the name cannot drift again, and
+          # an empty answer fails the step instead of silently testing the default geometry.
+          mobile_tags="$(go run ./cmd/internal/appletags -mobile-only)"
+          if [ -z "$mobile_tags" ]; then
+            echo "FAIL: could not read the mobile geometry tag from cmd/internal/appletags." >&2
+            echo "      Refusing to fall back to a guess: this step would compile the default" >&2
+            echo "      geometry while claiming to exercise the low-memory one." >&2
+            exit 1
+          fi
           packages="./common/trafficclass/... ./common/trafficsched/... ./common/dialer/... ./protocol/direct/... ./protocol/tun/... ./protocol/group/... ./route/... ./option/..."
           for target in linux/amd64 windows/amd64 freebsd/amd64; do
             goos="${target%%/*}"
@@ -68,8 +81,8 @@ jobs:
             echo "--- ${goos}/${goarch}"
             GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build -tags "$tags" $packages
           done
-          echo "--- darwin/arm64 low_memory"
-          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -tags "$tags,low_memory" ./common/trafficsched/... ./protocol/tun/... ./route/...
+          echo "--- darwin/arm64 ${mobile_tags}"
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -tags "$tags,$mobile_tags" ./common/trafficsched/... ./protocol/tun/... ./route/...
           echo "PASS: build matrix"
 
       # The loadbalance box-level tests (test/loadbalance_group_test.go) are NOT run here.

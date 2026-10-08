@@ -44,6 +44,11 @@ cd "$root"
 #     receives mobile geometry it must never have in a mixed ios,macos build;
 #   - the mobile-only set passed via -tags-not-macos MUST contain it, or iOS silently loses
 #     the 16 KiB buffers this gate exists to test.
+#
+# The common set is the MOBILE shared feature set: it is owned by cmd/internal/mobilebuildtags and
+# the Apple layer adds no tag of its own (with_dhcp and grpcnotrace are platform-independent and
+# Android ships them too). appletags prints that set through the Apple view, so "the common Apple
+# set" and "the mobile shared set" are one definition rather than two that must be kept in step.
 common_tags="$(go run ./cmd/internal/appletags -common 2>&1)"
 mobile_tags="$(go run ./cmd/internal/appletags -mobile-only 2>&1)"
 if [ -z "$common_tags" ] || [ -z "$mobile_tags" ]; then

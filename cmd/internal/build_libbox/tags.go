@@ -19,17 +19,28 @@ import (
 //
 // # What the sets mean
 //
-//	AppleSharedTags    every Apple target, including macOS
-//	AppleDarwinTags    added on top of the shared set for Apple targets
-//	AppleNonMacOSTags  shared + darwin + the memory geometry the phones actually ship
+//	mobile shared set   every mobile platform, Android and Apple alike; owned by
+//	                    cmd/internal/mobilebuildtags
+//	Apple common set    the -tags set gomobile receives for EVERY Apple target: the mobile shared
+//	                    set plus any genuinely Darwin-only tags (none today)
+//	Apple mobile-only   with_low_memory, passed via -tags-not-macos so ONLY iOS/tvOS get it
 //
 // The distinction that matters most is the last one. with_low_memory halves buf.BufferSize
 // from 32 KiB to 16 KiB, which moves the in-place framing boundary in the Shadowsocks
 // writer - the boundary a production crash came out of. iOS and tvOS are built with it;
 // macOS is NOT, and adding it there would make macOS tests exercise a geometry macOS does
 // not ship.
-
-// The Apple tag lists live in cmd/internal/applebuildtags and are imported, not repeated.
+//
+// # Where the tags come from
+//
+// The feature tags every mobile platform ships, and the with_low_memory geometry tag, live in
+// cmd/internal/mobilebuildtags; Android composes its set from that package and never reads an
+// Apple one. This file is the Apple-facing layer: it re-exports the Apple view from
+// cmd/internal/applebuildtags, which owns the gomobile target table, the per-target composition
+// rule and any Apple-only tags. Keeping the Apple import here rather than in main.go is what lets
+// a layering test assert that the Android composition path cannot reach the Apple package.
+//
+// The Apple tag lists are imported from cmd/internal/applebuildtags, not repeated.
 //
 // They used to be defined here AND in cmd/internal/appletags, kept in agreement by a test that
 // parsed this file's source. That caught a tag added to one copy but not the other; it could
@@ -37,6 +48,15 @@ import (
 // both lists identical, contract test green, defect in how the shared set was derived.
 //
 // See applebuildtags.CommonTags for why a mobile-only tag must never enter the common set.
+
+// appleCommonTags is the Apple variant's -tags set: the COMMON set every Apple target receives.
+//
+// It is the Apple composition, not the mobile shared set spelled out again, so an Apple-only tag
+// added in cmd/internal/applebuildtags reaches the Apple variant's built artifact and provenance
+// record without a second edit here.
+func appleCommonTags() []string {
+	return applebuildtags.CommonTags()
+}
 
 // AppleDeploymentTags is the full tag set a single Apple platform ships.
 //

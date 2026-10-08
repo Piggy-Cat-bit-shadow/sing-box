@@ -9,10 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sagernet/sing-box/cmd/internal/applebuildtags"
-
 	_ "github.com/sagernet/gomobile"
 	"github.com/sagernet/sing-box/cmd/internal/build_shared"
+	"github.com/sagernet/sing-box/cmd/internal/mobilebuildtags"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/rw"
@@ -94,23 +93,67 @@ var resolvedTags = map[string][]string{}
 // ResolveBuildTags returns the build tags for the named shipped variant. It is the single source
 // of truth for tag composition: the builders below call it, the provenance record is written from
 // it, and a test asserts the gVisor invariant against it.
+//
+// # Why both Android variants carry the mobile geometry
+//
+// Every Android variant appends mobilebuildtags.LowMemoryTags(), so the shipped artifacts compile
+// buf.BufferSize 16 KiB and UDPBufferSize 8 KiB instead of 32 KiB and 16 KiB. The geometry is a
+// MOBILE concern in the layering - mobilebuildtags owns it, not applebuildtags - and Android is a
+// mobile platform, so it reads the same layer iOS receives through gomobile's -tags-not-macos.
+// This is not a fold into sharedTags: sharedTags is also what the Apple common set is built from,
+// and a tag there would reach macOS in the real ios,macos build where -tags-not-macos cannot
+// remove it.
+//
+// The decision was made from measurement (common/bufgeom, HOST BENCHMARK on darwin/arm64), not
+// from "phones have less memory":
+//
+//   - Live heap per flow, GC-observed: 65664 bytes at 32 KiB against 32896 at 16 KiB, two buffers
+//     per flow, identical at 32, 128 and 512 concurrent flows. At 512 flows that is 32.8 MiB
+//     against 16.4 MiB - 16.4 MiB of resident heap at a concurrency this host can hold.
+//   - Bulk TCP is NOT bounded by the geometry. copyExtended grows the read buffer past
+//     IncreaseBufferAfter (512 KiB) to 65535 bytes: for an 8 MiB transfer both geometries hand
+//     over a largest buffer of 65535 (155 WriteBuffer calls at 32 KiB against 173 at 16 KiB), so
+//     the extra work is confined to a flow's first 512 KiB rather than charged to every byte.
+//   - Short flows pay exactly that prefix: 16 reads of 16 KiB instead of 8 of 32 KiB per 256 KiB,
+//     with 15 against 22 allocations per transfer. Measured loopback throughput at 32/128/512
+//     concurrent flows and at 256 KiB and 4 MiB transfers had overlapping sample ranges in both
+//     directions, so no regression or improvement is resolvable above this host's noise; the
+//     deterministic cost is the doubled read count.
+//   - UDP is geometry-independent per datagram: a datagram is bounded by the MTU (well under
+//     8192), the packet copy loop's allocations per datagram are identical (2067 per 2048
+//     datagrams in both geometries) and only the pooled capacity differs.
+//
+// The 50 MiB NetworkExtension budget is deliberately NOT part of this reasoning. It is an Apple
+// extension limit, not a cross-platform truth, and half of the heap saving above would still not
+// be a claim about fitting inside it.
+//
+// The risk this geometry was believed to carry - the in-place framing boundary in the Shadowsocks
+// writer, which a production crash came out of - is tested at this geometry rather than argued
+// away. The default suite cannot reach the combination that panicked, which is why
+// scripts/ci/test-low-memory.sh exists; the Android variants now build the geometry that gate
+// covers.
 func ResolveBuildTags(variant string) []string {
 	switch variant {
 	case "android-main":
 		tags := append([]string{}, sharedTags...)
+		tags = append(tags, mobilebuildtags.LowMemoryTags()...)
 		if debugEnabled {
 			tags = append(tags, debugTags...)
 		}
 		return tags
 	case "android-legacy":
 		tags := filterTags(sharedTags, "with_naive_outbound")
+		tags = append(tags, mobilebuildtags.LowMemoryTags()...)
 		if debugEnabled {
 			tags = append(tags, debugTags...)
 		}
 		return tags
 	case "apple":
-		tags := append([]string{}, sharedTags...)
-		tags = append(tags, darwinTags...)
+		// The Apple variant's shared set is read from the APPLE source of truth, not from the
+		// mobile shared set directly: if Apple ever gains a Darwin-only tag, the provenance record
+		// and the built artifact must both see it. That composition lives in tags.go so this file -
+		// which owns the Android composition - does not import the Apple package at all.
+		tags := appleCommonTags()
 		if debugEnabled {
 			tags = append(tags, debugTags...)
 		}
@@ -129,10 +172,8 @@ var (
 	sharedFlags []string
 	debugFlags  []string
 	sharedTags  []string
-	darwinTags  []string
-	// memcTags    []string
-	notMemcTags []string
-	debugTags   []string
+	// memcTags []string
+	debugTags []string
 )
 
 // buildVersion is the value baked into constant.Version, and buildCommit is the
@@ -157,11 +198,12 @@ func init() {
 	sharedFlags = append(sharedFlags, "-ldflags", build_shared.LinkerFlags(currentTag, false))
 	debugFlags = append(debugFlags, "-ldflags", build_shared.LinkerFlags(currentTag, true))
 
-	// The Apple tag content lives in tags.go so the builder, the low-memory CI gate and
-	// the memory benchmark all read ONE definition. Three hand-maintained lists that are
-	// supposed to agree eventually do not, and the failure is silent: the tests keep
-	// passing against a tag set nothing ships.
-	sharedTags = append(sharedTags, applebuildtags.CommonTags()...)
+	// The shared feature set lives in cmd/internal/mobilebuildtags because Android and Apple both
+	// ship it, and it is not Apple's to define. Reading it from an Apple-named package - which is
+	// what this builder did - meant the natural way to add an Apple-only tag was to append to that
+	// package's common list, and Android silently acquired it. One definition, owned by the layer
+	// both platforms share, is what makes that mistake impossible rather than merely detectable.
+	sharedTags = append(sharedTags, mobilebuildtags.SharedTags()...)
 
 	// Android no longer ships with_gvisor.
 	//
@@ -176,7 +218,10 @@ func init() {
 	// TestNoShippedVariantShipsGVisor fails if one does. See docs/fork/lx-stability-audit-phase1.md
 	// for why 048 was a real risk when it shipped, and docs/fork/upstream-sync-2026-10.md for the
 	// retirement.
-	notMemcTags = append(notMemcTags, applebuildtags.LowMemoryMobileTags()...)
+	// The mobile geometry tag is NOT appended to sharedTags above. It is a mobile concern Apple
+	// delivers per platform through gomobile's -tags-not-macos flag, and it is read from
+	// mobilebuildtags by the Apple composition in tags.go. Folding it in here would enable it on
+	// macOS in gomobile's mixed -target build, where -tags-not-macos cannot remove it.
 	debugTags = append(debugTags, "debug")
 }
 
@@ -302,9 +347,11 @@ func buildApple() {
 		"-v",
 		"-target", bindTarget,
 		"-libname=box",
-		// The mobile-only geometry, applied per platform. This is the ONLY channel that can
-		// express "iOS gets it, macOS does not": -tags below is common to every target, so a
-		// mobile-only tag placed there would reach macOS regardless of this flag.
+		// The mobile-only geometry, applied per platform. The tag itself is defined in
+		// cmd/internal/mobilebuildtags and reaches gomobile through the Apple view in tags.go. This
+		// is the ONLY channel that can express "iOS gets it, macOS does not": -tags below is common
+		// to every target, so a mobile-only tag placed there would reach macOS regardless of this
+		// flag.
 		"-tags-not-macos=" + LowMemoryTagString(),
 		"-iosversion=15.0",
 		"-macosversion=13.0",

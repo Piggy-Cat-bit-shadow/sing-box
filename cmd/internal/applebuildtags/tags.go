@@ -1,5 +1,5 @@
 // Package applebuildtags is the single source of truth for the build tags the Apple
-// (iOS, tvOS, macOS) targets ship with.
+// (iOS, tvOS, macOS) targets ship with, and for which Apple targets ship low-memory geometry.
 //
 // # Why this package exists
 //
@@ -16,6 +16,19 @@
 //
 // A real import makes the duplication impossible rather than merely detected.
 //
+// # What this package owns, now that the feature set has its own home
+//
+// The feature tags every mobile platform ships - and the mobile low-memory tag itself - live in
+// cmd/internal/mobilebuildtags, because they are not Apple's to define. Android composes its set
+// from that package and must never read this one. What remains here is genuinely Apple:
+//
+//   - the gomobile target table and which targets get low-memory geometry;
+//   - the per-target composition rules, including the `ios,macos` mixed-target case;
+//   - Apple-only tags, of which there are currently none (see CommonTags).
+//
+// This package depends on mobilebuildtags. The reverse dependency would restore the defect this
+// refactor removed - an Apple-named package deciding what Android ships.
+//
 // # The distinction that matters
 //
 // with_low_memory halves buf.BufferSize from 32 KiB to 16 KiB, which moves the in-place framing
@@ -27,57 +40,17 @@ package applebuildtags
 import (
 	"sort"
 	"strings"
+
+	"github.com/sagernet/sing-box/cmd/internal/mobilebuildtags"
 )
 
 // LowMemoryTag is the tag that selects the smaller buffer geometry.
 //
-// It is mobile-only. See TargetTags and CommonTags for why it must never appear in a tag set
-// shared with macOS.
-const LowMemoryTag = "with_low_memory"
-
-// sharedTags apply to every Apple target, macOS included.
-var sharedTags = []string{
-	"with_quic",
-	"with_wireguard",
-	"with_utls",
-	"with_naive_outbound",
-	// XHTTP is a mainstream VLESS transport in current Xray deployments, so the shipped clients
-	// carry it rather than leaving it opt-in: a node configured with it must work in the app. It
-	// needs with_quic for its HTTP/3 path, which this set already has.
-	"with_xhttp",
-	"with_clash_api",
-	"with_usbip",
-	"with_openvpn",
-	"with_openconnect",
-	"badlinkname",
-	"tfogo_checklinkname0",
-	"with_tailscale",
-	"ts_omit_logtail",
-	"ts_omit_ssh",
-	"ts_omit_drive",
-	"ts_omit_taildrop",
-	"ts_omit_webclient",
-	"ts_omit_doctor",
-	"ts_omit_capture",
-	"ts_omit_kube",
-	"ts_omit_aws",
-	"ts_omit_synology",
-	"ts_omit_bird",
-}
-
-// darwinTags apply to every Apple target as well: these are Darwin-wide, not per-platform.
-var darwinTags = []string{
-	"with_dhcp",
-	"grpcnotrace",
-}
-
-// LowMemoryMobileTags is the per-platform tag set gomobile applies to iOS and tvOS ONLY.
-//
-// This is the set that must be passed as -tags-not-macos=<these> rather than being folded into
-// the common -tags. See CommonTags.
-func LowMemoryMobileTags() []string {
-	return []string{LowMemoryTag}
-}
+// It is an alias for the definition in mobilebuildtags rather than a second constant: the tag is
+// a mobile concern, and two declarations of the same name in two packages is the duplication this
+// package was created to end, one level up. See CommonTags for why it must never appear in a tag
+// set shared with macOS.
+const LowMemoryTag = mobilebuildtags.LowMemoryTag
 
 // CommonTags returns the tags that apply to EVERY Apple target in the build.
 //
@@ -93,16 +66,31 @@ func LowMemoryMobileTags() []string {
 //
 // The rule this function encodes: the common set contains only what every target shares.
 // Mobile-only geometry travels exclusively through LowMemoryMobileTags.
+//
+// # Why this is a delegation and not a list
+//
+// The set is the mobile shared set, imported rather than repeated. Apple adds no tag of its own
+// today, and that is a finding rather than an omission: the two candidates that used to sit in a
+// "darwin" list, with_dhcp and grpcnotrace, are both platform-independent (include/dhcp.go and
+// grpc-go's trace switch), and Android already compiled them. Genuinely Darwin-meaningful tags
+// would be appended HERE - not in mobilebuildtags - because a tag added here is invisible to
+// Android, which is the property the layering exists to provide. An empty darwinTags slice would
+// say none of that, so the absence is recorded in this comment and asserted by the tests instead.
 func CommonTags() []string {
-	tags := make([]string, 0, len(sharedTags)+len(darwinTags))
-	tags = append(tags, sharedTags...)
-	tags = append(tags, darwinTags...)
-	return tags
+	return mobilebuildtags.SharedTags()
 }
 
 // CommonTagString is CommonTags joined for gomobile's -tags flag.
 func CommonTagString() string {
 	return strings.Join(CommonTags(), ",")
+}
+
+// LowMemoryMobileTags is the per-platform tag set gomobile applies to iOS and tvOS ONLY.
+//
+// This is the set that must be passed as -tags-not-macos=<these> rather than being folded into
+// the common -tags. See CommonTags.
+func LowMemoryMobileTags() []string {
+	return mobilebuildtags.LowMemoryTags()
 }
 
 // LowMemoryTagString is the mobile-only set joined for gomobile's -tags-not-macos flag.

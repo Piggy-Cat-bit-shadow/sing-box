@@ -99,8 +99,9 @@ run_tripwire \
 # ASSERTED rather than recorded, and every branch below is a hard failure.
 #
 # Four parts:
-#   1. the libbox builder's own tag-policy test, which asks the same function the builders use -
-#      the property that made it catch the real thing while a file scan did not;
+#   1. the libbox builder's own tag tests, which ask the same functions the builders use - the
+#      property that made them catch the real thing while a file scan did not. That package now also
+#      carries the tag-layering contract and the frozen pre-refactor resolved sets;
 #   2. the profile tag files, so the two tag sources cannot drift apart;
 #   3. the module graph: no replace pinning gVisor, and no ACTIVE (non-indirect) requirement;
 #   4. the artifact: link the probe with the shipped tag set and read the provenance out of the
@@ -109,9 +110,10 @@ run_tripwire \
 echo
 echo "--- gVisor: retired from shipped artifacts AND from the module graph (hard invariant)"
 if ! go test -count=1 ./cmd/internal/build_libbox/ >/dev/null 2>&1; then
-  echo "FAIL: the libbox tag-policy test failed. It asserts that NO shipped variant compiles" >&2
-  echo "      with_gvisor AND that gVisor is retired from the module graph." >&2
-  echo "      Run it directly for the detail:" >&2
+  echo "FAIL: the libbox tag tests failed. They assert that NO shipped variant compiles" >&2
+  echo "      with_gvisor, that gVisor is retired from the module graph, that the mobile/Apple tag" >&2
+  echo "      layers are respected, and that every resolved tag set still matches its pre-refactor" >&2
+  echo "      value. Run them directly for the detail:" >&2
   echo "          go test -v ./cmd/internal/build_libbox/" >&2
   exit 1
 fi
@@ -191,6 +193,26 @@ echo "PASS: a linked artifact built with the shipped tag set carries no gVisor m
 # The 048 removal condition is MET: gVisor is retired and the fork's remote is preserved as history,
 # so there is nothing left to probe upstream for. An advisory probe here would report "fork still
 # required", which is now the opposite of this repository's policy.
+
+# The build-tag source of truth is layered, and the layering is a property no behavioural test can
+# observe: the mobile shared feature set, the mobile low-memory geometry and the Apple view live in
+# separate packages, and Android composes its set from the MOBILE package rather than from an
+# Apple-named one. cmd/internal/build_libbox asserts that dependency direction against the source
+# and freezes every resolved tag set, so a re-pointing that changes no tag still fails there. These
+# two leaf packages are run here because the builder's package only imports them; their own tests
+# assert that with_low_memory never enters the common set and that the accessors cannot be used to
+# mutate the shared definition.
+echo
+echo "--- build tags: mobile/Apple layers and the geometry tag"
+if ! go test -count=1 ./cmd/internal/mobilebuildtags/ ./cmd/internal/applebuildtags/ >/dev/null 2>&1; then
+  echo "FAIL: the mobile/Apple tag-layer tests failed. They assert that the shared set is owned by" >&2
+  echo "      cmd/internal/mobilebuildtags, that it never contains with_low_memory, and that the" >&2
+  echo "      geometry travels only through the per-platform set - the invariant that keeps 16 KiB" >&2
+  echo "      buffers out of the macOS artifact. Run them directly for the detail:" >&2
+  echo "          go test -v ./cmd/internal/mobilebuildtags/ ./cmd/internal/applebuildtags/" >&2
+  exit 1
+fi
+echo "PASS: mobile/Apple tag layers hold (shared set owned by mobilebuildtags; low memory never common)"
 
 # The sing-tun acceptLoop self-heal (LX 040).
 #
