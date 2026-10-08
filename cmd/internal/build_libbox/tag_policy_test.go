@@ -124,3 +124,40 @@ func repoRoot(t *testing.T) string {
 		dir = parent
 	}
 }
+
+// XHTTP must be in the shipped compositions, not merely available behind a tag.
+//
+// # The Phase-1 lesson, applied again
+//
+// The gVisor invariant exists because a profile looked correct while the Android builder injected a
+// tag that no profile file named. The same class of mistake in the other direction is worse for a
+// transport: the code compiles, the tests pass, and the feature simply is not in the artifact the
+// user installed. These tests assert against ResolveBuildTags - the composition the builders
+// actually use and the provenance record is written from - not against the profile text.
+func TestShippedVariantsCarryXHTTP(t *testing.T) {
+	for _, variant := range []string{"android-main", "android-legacy", "apple"} {
+		t.Run(variant, func(t *testing.T) {
+			if !HasBuildTag(variant, "with_xhttp") {
+				t.Fatalf("variant %s must ship the XHTTP transport", variant)
+			}
+			if !HasBuildTag(variant, "with_quic") {
+				t.Fatalf("variant %s needs with_quic for the XHTTP HTTP/3 path", variant)
+			}
+		})
+	}
+}
+
+// The profile tag files must name with_xhttp too. Two sources of truth that disagree is exactly how
+// the gVisor invariant was silently broken, so they are asserted to agree rather than assumed to.
+func TestProfileTagFilesCarryXHTTP(t *testing.T) {
+	root := repoRoot(t)
+	for _, name := range []string{"DEFAULT_BUILD_TAGS", "DEFAULT_BUILD_TAGS_OTHERS", "DEFAULT_BUILD_TAGS_WINDOWS"} {
+		content, err := os.ReadFile(filepath.Join(root, "release", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(content), "with_xhttp") {
+			t.Fatalf("release/%s must name with_xhttp, or the profile and the builder disagree", name)
+		}
+	}
+}

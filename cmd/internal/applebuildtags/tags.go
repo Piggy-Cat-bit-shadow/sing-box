@@ -41,6 +41,10 @@ var sharedTags = []string{
 	"with_wireguard",
 	"with_utls",
 	"with_naive_outbound",
+	// XHTTP is a mainstream VLESS transport in current Xray deployments, so the shipped clients
+	// carry it rather than leaving it opt-in: a node configured with it must work in the app. It
+	// needs with_quic for its HTTP/3 path, which this set already has.
+	"with_xhttp",
 	"with_clash_api",
 	"with_usbip",
 	"with_openvpn",
