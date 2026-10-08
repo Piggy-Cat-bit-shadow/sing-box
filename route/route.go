@@ -174,7 +174,13 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	if selectedRule == nil {
 		selectedOutbound = r.outbound.Default()
 	}
-	chain, err := resolveOutbound(selectedOutbound, &metadata, N.NetworkTCP, true)
+	// A group that implements the failover capability owns this flow's dial, and therefore
+	// the selection the dial commits. routeDialDecision does both halves of that: it resolves
+	// the chain as a preview when the group owns the dial - which the preview answers with
+	// the member the committed choice would use, so the chain the trackers see is still the
+	// chain the flow takes - and it commits the walk for every other outbound, exactly as
+	// before.
+	chain, dialOwner, err := routeDialDecision(selectedOutbound, &metadata, N.NetworkTCP)
 	if err != nil {
 		buf.ReleaseMulti(buffers)
 		return err
@@ -200,9 +206,12 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	onClose = registerInterrupt(chain, conn, onClose)
 	outbound := chain[len(chain)-1]
 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
+		// A member that owns the whole connection never returns one to this layer, so there
+		// is no attempt to replace and the capability does not apply. Falling through keeps
+		// such a member's behaviour exactly as it was.
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
-		r.connection.NewConnection(ctx, outbound, conn, metadata, onClose)
+		r.connection.NewConnection(ctx, routeDialer(outbound, dialOwner, &metadata), conn, metadata, onClose)
 	}
 	return nil
 }

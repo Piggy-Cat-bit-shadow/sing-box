@@ -45,6 +45,10 @@ type routeRecordingOutbound struct {
 	dials    int
 	packets  int
 	bytes    int
+	// dialErr, when set, is what DialContext reports instead of opening a connection. It
+	// exists so the failover path can be driven through the same stub the other route tests
+	// use rather than through a parallel set of doubles.
+	dialErr error
 }
 
 func newRouteRecordingOutbound(tag string, networks ...string) *routeRecordingOutbound {
@@ -61,8 +65,18 @@ func (o *routeRecordingOutbound) Network() []string { return o.networks }
 func (o *routeRecordingOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	o.access.Lock()
 	o.dials++
+	err := o.dialErr
 	o.access.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return &routeStubConn{}, nil
+}
+
+func (o *routeRecordingOutbound) setDialError(err error) {
+	o.access.Lock()
+	o.dialErr = err
+	o.access.Unlock()
 }
 
 func (o *routeRecordingOutbound) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
