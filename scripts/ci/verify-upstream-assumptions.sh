@@ -113,6 +113,56 @@ for tags_file in release/DEFAULT_BUILD_TAGS release/DEFAULT_BUILD_TAGS_OTHERS re
 done
 echo "PASS: no profile names with_gvisor"
 
+# The sing-tun acceptLoop deferred (LX 040).
+#
+# The pinned sing-tun still ends the system stack's TCP accept loop on ANY listener error:
+#
+#     conn, err := listener.Accept()
+#     if err != nil {
+#         return
+#     }
+#
+# with no log and no re-listen, while s.tcpPort stays the port every new SYN is NAT-rewritten onto.
+# One foreign close of that listener fd (the observed trigger is a fast restart sharing the process
+# fd space) therefore turns into permanent failure for all new TCP until the tunnel is rebuilt,
+# with QUIC/UDP unaffected - which is what makes it look like "the browser is dead but Telegram
+# works". It cannot be fixed from this repository: acceptLoop and tcpPort are unexported and
+# ResetNetwork does not re-listen, so a wrapper or a retry goroutine would be a fake fix. The
+# phase-1 decision is to hold it as a dependency-owned deferral.
+#
+# This tripwire is that decision's expiry condition: if a future pin changes the shape, the check
+# fails and the deferral must be re-audited (upstream may have fixed it, in which case the deferral
+# is simply deleted) instead of being carried forward unexamined. See
+# docs/fork/lx-stability-audit-phase1.md section 2.3.
+echo
+echo "--- sing-tun acceptLoop is still the pinned, vulnerable shape (LX 040 deferral)"
+sing_tun_dir="$(go list -m -f '{{.Dir}}' github.com/sagernet/sing-tun 2>/dev/null || true)"
+if [ -z "$sing_tun_dir" ] || [ ! -f "$sing_tun_dir/stack_system.go" ]; then
+  echo "FAIL: cannot locate the pinned sing-tun source to check its acceptLoop." >&2
+  echo "      Install the module (go mod download) or update this check; do not skip it silently." >&2
+  exit 1
+fi
+if ! grep -q 'func (s \*System) acceptLoop' "$sing_tun_dir/stack_system.go"; then
+  echo "FAIL: the pinned sing-tun no longer defines System.acceptLoop in stack_system.go." >&2
+  echo "      The LX 040 deferral was recorded against that function; re-audit it, then either" >&2
+  echo "      delete the deferral (upstream fixed it) or update this tripwire with the new shape." >&2
+  exit 1
+fi
+# The predicate is "the statement right after `if err != nil {` inside acceptLoop is a bare
+# return". Checking for the `if` line alone would pass for a fixed version too, because that line
+# survives any fix; the body is what says whether the loop gives up or recovers.
+sing_tun_accept_loop_returns_bare() {
+  awk '/func \(s \*System\) acceptLoop/ { inLoop = 1 } inLoop { print } inLoop && /^}/ { exit }' "$1" \
+    | awk '/if err != nil \{/ { getline nextLine; gsub(/^[ \t]+|[ \t]+$/, "", nextLine); if (nextLine == "return") { vulnerable = 1 } } END { exit (vulnerable ? 0 : 1) }'
+}
+if ! sing_tun_accept_loop_returns_bare "$sing_tun_dir/stack_system.go"; then
+  echo "FAIL: the pinned sing-tun acceptLoop no longer returns bare on an Accept error." >&2
+  echo "      Upstream may have made it self-healing: re-audit the LX 040 deferral and remove it" >&2
+  echo "      if so. Do not carry the deferral forward without re-reading it." >&2
+  exit 1
+fi
+echo "PASS: acceptLoop still returns on any Accept error; LX 040 deferral stands"
+
 echo
 echo "== the compile-time half =="
 # Assumptions the compiler already enforces, listed so an audit knows they are covered: if upstream

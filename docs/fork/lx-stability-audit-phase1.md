@@ -70,8 +70,9 @@ this fork does not have · **N/A** = the architecture does not involve it ·
 
 | LX | Why deferred | Exact requirement |
 | --- | --- | --- |
-| 040 (sing-tun acceptLoop self-heal) | The bug is real in the pin: `stack_system.go` `acceptLoop` still `return`s on **any** `Accept` error, with no log and no re-listen, while `tcpPort` stays authoritative for new SYNs → instant RST for all new TCP until restart, QUIC/UDP alive. No local wrapper is possible (`acceptLoop`/`tcpPort` are unexported, `ResetNetwork` does not re-listen) | Fork + `replace` `github.com/sagernet/sing-tun@v0.9.7-0.20261006124248-d769a7080ca2`, or an upstream fix. **This is the highest-severity deferred item** |
-| 041 (WG give-up rebind) | No equivalent recovery here. It is implementable **in-tree** using hooks the pin already exports (`SetSessionStateFunc`, UAPI `listen_port=0`), and this fork already routes `Wake()/WakeNow()` → `PauseManager().DeviceWake()` → the endpoint callback, so no new API is needed. Not done in phase 1: it adds a lazily-started worker, a debounce and a wake-trigger branch — a behavioural change that deserves its own phase and field validation | In-tree, but needs its own commit + tests |
+| 040 (sing-tun acceptLoop self-heal) — **DEFER · P0 severity · dependency-owned** | Real in the pin, and the worst failure shape recorded here: `stack_system.go` `acceptLoop` does `conn, err := listener.Accept(); if err != nil { return }` — no log, no flag, no re-listen — while `s.tcpPort` stays the port every new SYN is NAT-rewritten onto. So one unexpected `Accept` error (the observed trigger is a foreign close of the listener fd during a fast restart that shares the process fd space) makes **all new TCP fail until the TUN/VPN is rebuilt**, with QUIC/UDP unaffected, which is why it presents as "the browser is dead but Telegram works" | **Decision: no sing-tun fork is introduced in this phase.** `acceptLoop`/`tcpPort` are unexported and `ResetNetwork` does not re-listen, so a wrapper, a retry goroutine or a `ResetNetwork` hack would be a fake fix. Reopens only if (a) upstream fixes it — the tripwire below then fails and the deferral is deleted, or (b) we reproduce it on a target client and decide to maintain a fork. Pin: `github.com/sagernet/sing-tun@v0.9.7-0.20261006124248-d769a7080ca2` |
+| ↑ tripwire | The deferral must not be carried forward unexamined | `scripts/ci/verify-upstream-assumptions.sh` locates the pinned sing-tun source and fails if `System.acceptLoop` stops ending on a bare `return` after an `Accept` error (predicate validated against a simulated upstream fix: real pin → PASS, patched copy → FAIL) |
+| 041 (WG give-up rebind) — **DEFER → PHASE 1.5** | No equivalent recovery here. It is not a bug fix but a lifecycle mechanism: a lazily-started worker, a shared debounce, a stale-endpoint predicate, a wake trigger, a rebind via `listen_port`, and its interaction with network transitions and shutdown cancellation. Those pieces belong with this fork's existing `NetworkResetGeneration`, `NetworkTransitionSnapshot`, `OnDemandEndpoint`, `Wake()` and `Scope` cancellation, so bolting them on in phase 1 would design them twice | **Priority P0/P1 · implementation feasibility: in-tree, no fork required.** Hooks the pin already exports: `device.SetSessionStateFunc`, UAPI `listen_port=0` for a fresh ephemeral port. This fork already routes `Wake()`/`WakeNow()` → `PauseManager().DeviceWake()` → the endpoint callback, so no new API is needed. **Do not write the implementation before Phase 1.5.** See the handoff section |
 | 048 (gvisor handshake nil deref) | Real panic class, **unreachable in every profile this fork ships**: no tag file names `with_gvisor`, and without it `tun.NewStack("gvisor"/"mixed")` returns `ErrGVisorNotIncluded` as a clean configuration error. The pinned gvisor still has the window (`accept.go` nils `ep.h` then unlocks; `dispatcher.go` `handleConnecting` gates on state but not `h`) | A third module fork. Instead, a CI tripwire now fails if any profile names `with_gvisor` (`scripts/ci/verify-upstream-assumptions.sh`) |
 | 069 root cause | The module still clobbers the surviving v4 port to 0 after a per-family failure, and still closes the sibling socket | `wireguard-go` fork/bump, or the already-owned `Piggy-Cat-bit-shadow/sing` fork (`common/control/bind_windows.go` is byte-identical to upstream and carries the `""` vs `"[::]"` asymmetry) |
 | 101 (GSO retry log noise) | Cosmetic, module-only | `wireguard-go/device/send.go` — fold into the next pin bump |
@@ -124,6 +125,20 @@ Run on macOS arm64 with `GOTOOLCHAIN=go1.25.5`. Tags unless noted:
 | `common/trafficsched` `TestContentionHighVersusHigh` | failed once in the full run (timing-sensitive), passes in isolation and on re-run — pre-existing flake, unrelated files |
 | `git status` | clean except two pre-existing untracked files (`build-screens-doc.py`, `capture-screens.sh`) that predate this phase and are not touched |
 
+Phase-1 finalization re-check (targeted, not a second full run): every phase-1 test
+re-ran green — panic/config guards (trojan, vless, tuic, common/tls), DNS hijack
+isolation (`-race`, `-count=2`), reset-before-start, the WireGuard recovery and
+lifecycle set, the socks relay set, `Box.Close`, the H3 and H2 guards, the selector
+interrupt guard, the tailscale knob, and the init-error naming test in the `test`
+module. The `-race` exclusion for
+`TestStackDeviceConcurrentStartAndCloseDoNotPanic` is deliberate and documented in that
+file: running it under `-race` reliably reports the **pinned sing-tun Go stack's own**
+Start/Close race (`stack_go.go`), not this fork's code. The package is otherwise run
+under `-race` in full. The three known unrelated failures were re-confirmed as unchanged:
+`common/tlsfragment` needs external network, `experimental/libbox` links only without
+`badlinkname` (test binary only; the release binary links), and the `trafficsched`
+contention test is timing-sensitive and passes in isolation.
+
 ## 5. Risk — what unit tests cannot prove here
 
 - **046 (DNS isolation)**: the cap and the isolation are unit-proven; the field symptom
@@ -144,15 +159,13 @@ Run on macOS arm64 with `GOTOOLCHAIN=go1.25.5`. Tags unless noted:
   process-wide. Changing that is a `sing`-fork behavioural change, not a phase-1 fix; it
   is recorded here so the next phase decides.
 
-## 6. If the next phase ports XHTTP / VLESS Encryption / AWG / Chain
+## 6. Carry-forward list
 
-Carry these with the feature, not after it: **077** (dial-context contract: after
-`DialContext` returns, an expired dial deadline must not kill the live conn; and the dial
-must wait until the HTTP layer has accepted the request body), **061** (packet-up dial
-must not wait on the download answer), **094** (a local close is not a transport
-failure), **076** (xmux reconnect storm → per-conn breaker and backoff), **082's
-`v2rayxhttp` half** (`HideStreamError`), **105 + the cancelable encryption handshake**
-(from 050), and every AWG row in §2.3.
+See **Next-stage handoff** at the end of this file: it is the authoritative list of
+what the XHTTP, VLESS Encryption and REALITY stages must carry with them. In short —
+XHTTP: 050, 061, 076, 077, 082, 094, 104; VLESS Encryption: handshake cancellation,
+Vision integration (105); REALITY: keep 090 and continue 053/083/086–089. Every AWG row
+stays deferred with the AWG feature itself (§2.3).
 
 ## 7. Commits
 
@@ -163,3 +176,46 @@ failure), **076** (xmux reconnect storm → per-conn breaker and backoff), **082
 | `808ab6c83` | `stability: harden network endpoint recovery` |
 | `6a8f1c483` | `stability: fix lifecycle and cancellation hazards` |
 | `58d53cc61` | `test: add LX-derived regression coverage` |
+| `c2e34cf6f` | `docs(fork): phase-1 LX stability audit — findings, fixes, deferred items` |
+
+Phase-1 freeze: `aac61e522` → `c2e34cf6f` plus the finalization commit that rewrites the
+040/041 rows, adds the sing-tun `acceptLoop` tripwire and appends this handoff. No squash,
+no rebase, no history rewrite.
+
+## Next-stage handoff
+
+Constraints the next stages inherit. This is a handoff, not a design document.
+
+### Runtime Lifecycle / Network Recovery (Phase 1.5)
+
+- **041 WG give-up rebind** — the first item of the stage, not a standalone patch: lazy worker, shared debounce, stale-endpoint predicate, wake trigger, rebind, `listen_port` policy, network transition, shutdown cancellation. Priority P0/P1; in-tree, no fork.
+- The mechanism must be designed against the generation/transition primitives that already exist here (`NetworkResetGeneration`, `NetworkTransitionSnapshot`), not beside them: a rebind is a state mutation and must obey the same ownership checks a DNS answer does.
+- **Wake ≠ rebind.** A wake with a healthy session must cost nothing; only a stale predicate (no keypair, or handshake older than the reject window) justifies a rebind.
+- **An idle/suspended endpoint must not be woken by background recovery.** No timers or goroutines while the endpoint is idle, asleep or closed; recovery is demand-driven or event-driven.
+- **Close must cancel the worker**, and a worker must never outlive the endpoint's generation (the phase-1 `closing` flag pattern is the minimum).
+- **Debounce and bounded retry.** One rebind per logical failure series, exponential or fixed backoff, never an unbounded reconnect loop; a pinned `listen_port` must not silently move.
+- **Stale socket recovery must be lazy.** Do not add a background prober. The same semantics should later be reused by MASQUE session recovery and the DNS transport pool rather than re-implemented per transport.
+
+### Protocol phase — XHTTP
+
+Porting XHTTP must not move the feature body alone. Re-audit and carry these with it:
+
+- **050** — URLTest zombie half is already fixed at the group layer here; the transport half (conn deadlines, a cancelable handshake, a `Close` that can interrupt an in-flight round) is what arrives with XHTTP.
+- **061** — a packet-up dial must not wait on the download answer.
+- **076** — xmux reconnect storm: per-connection breaker plus backoff.
+- **077** — dial-context contract: after `DialContext` returns, an expired dial deadline must not kill the live connection; and the dial must wait until the HTTP layer has accepted the request body.
+- **082** — this fork already guards the H2 leak with `baderror.WrapH2`; XHTTP's own `HideStreamError` half must be re-derived for the new code, and the guard test extended rather than assumed to cover it.
+- **094** — a local close is not a transport failure (do not count it toward a breaker).
+- **104** — HTTP-version parity between the client's expectations and the transport it actually negotiates.
+
+### Protocol phase — VLESS Encryption
+
+- **Handshake cancellation** — the handshake must be cancelable and bounded; LX's `guardHandshake` is the shape to re-audit, not to copy blindly.
+- **Vision integration** — Vision's flow over the encryption layer was its own defect (**105**); re-verify the conn-type expectations end to end rather than only that it compiles.
+- Note that 050's root cause lived in exactly this handshake; treat the two as one audit.
+
+### Protocol phase — REALITY
+
+- **Keep the phase-1 guard**: `090`'s pre-decode `short_id` length check in both `common/tls/reality_client.go` and `reality_server.go`. It is panic-class and independent of any REALITY feature work; do not let a REALITY rewrite drop it.
+- Continue the deferred research: **ML-KEM / hybrid key share** (LX 083 — feasible here without an extra utls fork on `metacubex/utls v1.8.7`; note LX's own caveat that only chrome-family fingerprints carry the hybrid), **Xray version compatibility** (LX 053 — the stale `1.8.1` client version, silent fallback to the camouflage site), and **fingerprint differences** (LX 086–089).
+- None of the REALITY items are panic-class; all need field validation against a real Xray server, so they cannot be closed by unit tests alone.
