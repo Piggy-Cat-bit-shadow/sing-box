@@ -96,6 +96,22 @@ type memberRecord struct {
 	wins   []time.Time
 }
 
+// electionToken identifies one fastest election. The zero value means "no
+// election is held".
+//
+// The generation stamp is the reason this is a token and not a bool: Reset drops
+// every other trace of the old network, and stamping the election the same way
+// makes a running election invalid by construction rather than by a clear that
+// would have to race its collector. The id then distinguishes this election from
+// every other one the transport has ever run, so the release at the end of the
+// fan can be scoped to its owner instead of to the shared field.
+type electionToken struct {
+	generation int
+	id         uint64
+}
+
+func (token electionToken) held() bool { return token.id != 0 }
+
 type Transport struct {
 	dns.TransportAdapter
 	ctx        context.Context
@@ -111,11 +127,20 @@ type Transport struct {
 	current string // sticky target (stable/fastest); "" = not chosen yet
 	// election is the single-flight lock for the fastest election. It is held
 	// from the moment a query decides to elect until that fan has consumed
-	// every participant result, so concurrent queries cannot each start an
-	// election fan. collectFan clears it on every exit path, including the
-	// abandoned one, which is what keeps a caller's cancellation from leaking
-	// the flag forever.
-	election bool
+	// every participant result, so concurrent queries in the same generation
+	// cannot each start an election fan. collectFan releases only its own token
+	// on every exit path, including the abandoned one, which is what keeps a
+	// caller's cancellation from leaking the lock forever.
+	//
+	// Ownership is checked against gen rather than a separate flag, so Reset -
+	// which bumps gen - invalidates a running election the same instant it
+	// amnesties the records: the new generation may elect immediately even
+	// while the old collector is still unwinding.
+	election electionToken
+	// electionSeq is the monotonic id source for electionToken. It is never
+	// reset, so no two elections ever compare equal, across generations or
+	// within one.
+	electionSeq uint64
 	// gen is bumped by Reset (and by a fresh Start) so a probe that began
 	// before the amnesty cannot write into the tables that replaced it.
 	gen int
@@ -241,7 +266,7 @@ func (t *Transport) resolveMembers(scope *adapter.Scope) error {
 	t.members = members
 	t.records = make(map[string]*memberRecord)
 	t.current = ""
-	t.election = false
+	t.election = electionToken{}
 	t.gen++
 	if t.cancelRun != nil {
 		t.cancelRun()
@@ -277,17 +302,50 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-// Reset is the network-change amnesty: both record tables, the sticky target
-// and the generation drop. Members are reset by the manager's own loop, so the
-// group must not fan Reset out to them; the in-flight `election` flag is left
-// alone because its fan still owns it and will clear it on completion, while
-// its state writes are dropped by the generation check.
+// Reset is the network-change amnesty: both record tables and the sticky target
+// drop, and the generation is bumped. Members are reset by the manager's own
+// loop, so the group must not fan Reset out to them.
+//
+// The election token is deliberately left in place instead of being cleared. It
+// is stamped with the generation that minted it, the bump above has already made
+// it stale, and leaving it is what makes the old collector's eventual release
+// harmless: releaseElection matches on the whole token, so a collector from the
+// previous generation can only ever end its own election and can never clear the
+// new generation's.
 func (t *Transport) Reset() {
 	t.access.Lock()
 	defer t.access.Unlock()
 	t.records = make(map[string]*memberRecord)
 	t.current = ""
 	t.gen++
+}
+
+// electionHeldLocked reports whether the CURRENT generation owns a live
+// election.
+//
+// The generation comparison is the entire point of the token: a fan that began
+// before Reset still owns its token value, but that token can never match the
+// new generation, so it neither blocks the new generation's election nor
+// entitles its collector to release the new one. Asking only whether a token is
+// set would reintroduce the permanent lockout the token exists to remove.
+func (t *Transport) electionHeldLocked() bool {
+	return t.election.held() && t.election.generation == t.gen
+}
+
+// releaseElection ends one election, but only if the token is still its own.
+//
+// The comparison is on the whole token on purpose. By the time a slow collector
+// finishes, Reset may have bumped the generation and a new query may already
+// hold a fresh token; clearing unconditionally would delete the NEW election's
+// ownership while the stale token still refuses to let another one start, which
+// is a permanent election lockout. Releasing only what we own keeps the
+// property one-way: a collector can end its own election and nothing else.
+func (t *Transport) releaseElection(token electionToken) {
+	t.access.Lock()
+	defer t.access.Unlock()
+	if t.election == token {
+		t.election = electionToken{}
+	}
 }
 
 // --- record operations (all under access) ------------------------------------
@@ -408,9 +466,11 @@ func (t *Transport) setCurrent(tag string, gen int) (previous string, changed bo
 type selection struct {
 	target *member   // single-exchange target (nil when fan is set)
 	fan    []*member // fan participants (parallel / fastest election)
-	// election marks the query that owns the fastest single-flight flag; it is
-	// the only query allowed to mint a win and re-elect current.
-	election bool
+	// election, when held, is the token minted for this query by the fastest
+	// single-flight lock; it is the only query allowed to mint a win and
+	// re-elect current. It carries the generation and id that collectFan must
+	// present to release the lock, so the release can be scoped to its owner.
+	election electionToken
 	// survival marks the no-clean-member path: exactly one attempt, never a fan.
 	survival bool
 	// provisional marks an election-window concurrent. It serves the query but
@@ -457,11 +517,14 @@ func (t *Transport) selectTarget() (selection, error) {
 			return selection{target: t.stickyPickLocked(best), gen: t.gen}, nil
 		}
 		// Nobody has a live win, so there is nothing to rank on and the group
-		// must measure. Exactly one query fans; the rest of the window goes to a
-		// random clean member and is barred from writing current.
-		if !t.election {
-			t.election = true
-			return selection{fan: append([]*member(nil), clean...), election: true, gen: t.gen}, nil
+		// must measure. Exactly one query per generation fans; the rest of the
+		// window goes to a random clean member and is barred from writing
+		// current.
+		if !t.electionHeldLocked() {
+			t.electionSeq++
+			token := electionToken{generation: t.gen, id: t.electionSeq}
+			t.election = token
+			return selection{fan: append([]*member(nil), clean...), election: token, gen: t.gen}, nil
 		}
 		return selection{target: clean[rand.IntN(len(clean))], provisional: true, gen: t.gen}, nil
 	default: // ModeStable
@@ -545,8 +608,57 @@ func (t *Transport) leastDirtyLocked(now time.Time) *member {
 
 // --- exchange ----------------------------------------------------------------
 
+// requestLifetime is the pair of LOCAL contexts whose ending must never be
+// recorded as a member failure: the caller's request context and the
+// transport's run context.
+//
+// They are captured together when Exchange derives the request context, because
+// Close clears the run-context field; an exchange already in flight must still
+// be able to ask the run context it was actually tied to. The group's own
+// per-target sub-deadline is deliberately NOT part of this pair - see local.
+type requestLifetime struct {
+	caller context.Context
+	run    context.Context
+}
+
+// local reports whether a failed exchange carries no evidence about the member
+// because a lifetime the group does not own ended it.
+//
+// The three lifetimes that can end an exchange under the group, and what each
+// entitles the group to conclude:
+//
+//   - the caller's request context ending: the client hung up, or its own
+//     deadline expired. LOCAL - the member was never given a fair chance to
+//     answer, so an error record here would let one cancelled client mark a
+//     healthy server dirty and shrink the clean set.
+//   - the transport's run context ending: Close is tearing the box down. LOCAL
+//     for the same reason; nothing about the upstream changed.
+//   - the per-target sub-deadline exchangeSingle derived from HALF the remaining
+//     request budget: the target consumed its budget without answering.
+//     GROUP-OWNED - that expiry is exactly the mechanism by which the group
+//     decides a target is a blackhole, so it MUST be recorded. Exempting it
+//     would delete the detection that makes the half-budget split worth having.
+//
+// This is why the decision cannot be made on the error value: a target that ate
+// its sub-deadline and a caller whose own deadline fired both surface as
+// context.DeadlineExceeded, and the two demand opposite treatment. The only
+// honest question is WHICH context is done, so that is the only thing asked
+// here. The sub-deadline is not one of them: it is a child of the request
+// context and is cancelled by exchangeSingle on the way out, so consulting it
+// would classify every single-target failure as local and silently disable the
+// blackhole detector.
+//
+// A nil run context (before Start, after Close) proves nothing and is not read
+// as local; the caller check above already covers those exchanges.
+func (lifetime requestLifetime) local() bool {
+	if lifetime.caller.Err() != nil {
+		return true
+	}
+	return lifetime.run != nil && lifetime.run.Err() != nil
+}
+
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	ctx, cancel := t.mergedContext(ctx)
+	requestCtx, lifetime, cancel := t.mergedContext(ctx)
 	defer cancel()
 
 	sel, err := t.selectTarget()
@@ -555,12 +667,12 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 	}
 
 	if sel.fan != nil {
-		return t.fan(ctx, message, sel.fan, sel.gen, sel.election)
+		return t.fan(requestCtx, message, sel.fan, sel.gen, sel.election)
 	}
 	if sel.survival {
-		return t.exchangeSurvival(ctx, message, sel)
+		return t.exchangeSurvival(requestCtx, lifetime, message, sel)
 	}
-	return t.exchangeSingle(ctx, message, sel)
+	return t.exchangeSingle(requestCtx, lifetime, message, sel)
 }
 
 func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
@@ -570,21 +682,29 @@ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callba
 }
 
 // mergedContext derives a request context that is also cancelled when Close
-// tears the transport down. Only the transport's own cancellation is added; the
-// caller's deadline, values and cancellation pass through unchanged. A transport
-// that used the scope context directly instead would make a single query
+// tears the transport down, and reports the two local lifetimes that context is
+// the union of so the exchange paths can tell a local failure from a member
+// failure. Only the transport's own cancellation is added; the caller's
+// deadline, values and cancellation pass through unchanged. A transport that
+// used the scope context directly instead would make a single query
 // uncancellable by its caller, and one that ignored the scope context could not
 // be stopped at shutdown - so both are needed.
-func (t *Transport) mergedContext(ctx context.Context) (context.Context, context.CancelFunc) {
+//
+// The run context is returned alongside the merged one rather than re-read by
+// the caller: Close clears the field, and an exchange that is already in flight
+// must keep the context it was actually tied to so it can still recognise its
+// own shutdown.
+func (t *Transport) mergedContext(ctx context.Context) (context.Context, requestLifetime, context.CancelFunc) {
 	t.access.Lock()
 	runCtx := t.runCtx
 	t.access.Unlock()
+	lifetime := requestLifetime{caller: ctx, run: runCtx}
 	if runCtx == nil {
-		return ctx, func() {}
+		return ctx, lifetime, func() {}
 	}
 	merged, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(runCtx, cancel)
-	return merged, func() {
+	return merged, lifetime, func() {
 		stop()
 		cancel()
 	}
@@ -596,8 +716,11 @@ func (t *Transport) mergedContext(ctx context.Context) (context.Context, context
 // The half is the whole point of the split. A blackholed target otherwise eats
 // the entire request budget, and the rescue fan is then started with a dead
 // deadline, so the group reports failure without ever having asked the members
-// that might still be alive.
-func (t *Transport) exchangeSingle(ctx context.Context, message *mDNS.Msg, sel selection) (*mDNS.Msg, error) {
+// that might still be alive. That split is also what makes THIS sub-deadline the
+// group's own blackhole detector: its expiry is a member failure and is
+// recorded, while the caller's or the run context's expiry is not. lifetime
+// draws that line without looking at the error value.
+func (t *Transport) exchangeSingle(ctx context.Context, lifetime requestLifetime, message *mDNS.Msg, sel selection) (*mDNS.Msg, error) {
 	// An election-window concurrent serves the query but must not trash the
 	// sticky target: current changes only via a sticky pick or a fan winner.
 	if !sel.provisional {
@@ -607,12 +730,25 @@ func (t *Transport) exchangeSingle(ctx context.Context, message *mDNS.Msg, sel s
 	}
 	targetCtx, cancel := context.WithTimeout(ctx, t.targetBudget(ctx))
 	response, err := sel.target.transport.Exchange(targetCtx, message)
+	// Cancelled before classifying so the sub-deadline cannot fire again while
+	// the result is being interpreted; the cancellation is not observable on the
+	// already-returned result and does not affect lifetime.local, which asks the
+	// caller's context and the run context, never this one.
 	cancel()
 	if !isFailure(response, err) {
 		t.noteSuccess(sel.target.tag, sel.gen)
 		return response, err
 	}
-	// The target's sub-deadline was honest, so its failure is always recorded.
+	if lifetime.local() {
+		// The failure is explained by the caller hanging up or by Close, so it
+		// says nothing about the member. Return it without a record and without
+		// a rescue: there is no caller left to answer, and recording here would
+		// let a shutdown mark a perfectly reachable server dirty.
+		return response, err
+	}
+	// Neither local lifetime is done, so the only deadline that can have expired
+	// is the group's own sub-deadline above: the target ate half the budget
+	// without answering. That is exactly the failure this path must record.
 	t.noteError(sel.target.tag, sel.gen)
 	t.logProbeFailure(ctx, sel.target.tag, response, err)
 
@@ -623,13 +759,19 @@ func (t *Transport) exchangeSingle(ctx context.Context, message *mDNS.Msg, sel s
 		// member and take the single attempt of the survival path.
 		return response, err
 	}
-	return t.fan(ctx, message, rescuers, sel.gen, false)
+	return t.fan(ctx, message, rescuers, sel.gen, electionToken{})
 }
 
 // exchangeSurvival is the no-clean-member path: exactly one attempt against the
 // least dirty member, never a fan, in every mode. It gets the FULL remaining
 // budget because there is no fan to reserve a half for.
-func (t *Transport) exchangeSurvival(ctx context.Context, message *mDNS.Msg, sel selection) (*mDNS.Msg, error) {
+//
+// It has no group-owned sub-deadline of its own - the attempt runs under the
+// request context directly - so the only failures that count here are the ones
+// that reach it with both local lifetimes alive: a transport error or a
+// SERVFAIL. A caller cancellation or Close is neutral for the same reason as in
+// exchangeSingle.
+func (t *Transport) exchangeSurvival(ctx context.Context, lifetime requestLifetime, message *mDNS.Msg, sel selection) (*mDNS.Msg, error) {
 	target := sel.target
 	t.logger.WarnContext(ctx, "group[", t.Tag(), "]: no clean servers, survival attempt via ", target.tag)
 	response, err := target.transport.Exchange(ctx, message)
@@ -637,6 +779,9 @@ func (t *Transport) exchangeSurvival(ctx context.Context, message *mDNS.Msg, sel
 		// Erasing its errors returns it to the clean set and stickiness holds
 		// it there, which is the intended reward for being the survivor.
 		t.noteSuccess(target.tag, sel.gen)
+		return response, err
+	}
+	if lifetime.local() {
 		return response, err
 	}
 	t.noteError(target.tag, sel.gen)

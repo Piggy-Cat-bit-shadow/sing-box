@@ -242,6 +242,7 @@ func (h *groupHarness) wire() {
 	h.transport.runCtx = runCtx
 	h.transport.cancelRun = cancelRun
 	h.transport.closed = false
+	h.transport.election = electionToken{}
 	h.transport.gen++
 	h.transport.access.Unlock()
 }
@@ -345,10 +346,40 @@ func (h *groupHarness) recordCount() int {
 	return len(h.transport.records)
 }
 
+// electionInFlight reports whether ANY election token is set, including one left
+// over from a generation Reset has already amnestied. It is the raw "a collector
+// still owns a token" predicate, so it stays true until the old collector has
+// unwound; whether that token still blocks selection is a different question,
+// answered by electionOwned.
 func (h *groupHarness) electionInFlight() bool {
 	h.transport.access.Lock()
 	defer h.transport.access.Unlock()
+	return h.transport.election.held()
+}
+
+// electionOwned reports whether the CURRENT generation owns the election. This
+// is the predicate selection actually uses, so it is false for a stale token
+// even while electionInFlight is still true.
+func (h *groupHarness) electionOwned() bool {
+	h.transport.access.Lock()
+	defer h.transport.access.Unlock()
+	return h.transport.electionHeldLocked()
+}
+
+func (h *groupHarness) electionToken() electionToken {
+	h.transport.access.Lock()
+	defer h.transport.access.Unlock()
 	return h.transport.election
+}
+
+// electionCount is the number of elections the transport has ever minted. It is
+// bumped synchronously under access when a query takes the single-flight lock,
+// so a test can assert "exactly one fan" without depending on when the fan's
+// participant goroutines happen to be scheduled.
+func (h *groupHarness) electionCount() uint64 {
+	h.transport.access.Lock()
+	defer h.transport.access.Unlock()
+	return h.transport.electionSeq
 }
 
 // setSurvivalRecords installs records with explicit ages so the least-dirty

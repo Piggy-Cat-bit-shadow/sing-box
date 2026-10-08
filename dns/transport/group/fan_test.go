@@ -80,7 +80,14 @@ func TestFastestColdStartElectsOnceUnderConcurrency(t *testing.T) {
 
 	require.Equal(t, int64(expectedCalls), harness.totalCalls(),
 		"a burst must run exactly ONE election fan: three calls for the fan plus one for each other query")
-	require.False(t, harness.electionInFlight(), "the election flag must be released")
+	// The collector releases the token only after it has drained every
+	// participant, and the winning query returns as soon as the winner is
+	// delivered - those two are not the same instant, so the release is an
+	// asynchronous effect the assertion has to wait for rather than assume.
+	waitFor(t, "the election token to be released after the burst", func() bool {
+		return !harness.electionInFlight()
+	})
+	require.False(t, harness.electionInFlight(), "the election token must be released")
 	require.NotEmpty(t, harness.current(), "the election winner must become current")
 }
 
