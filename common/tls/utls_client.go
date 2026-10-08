@@ -82,11 +82,26 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 	return nil, E.New("unsupported usage for uTLS")
 }
 
-func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+// wrapClientConn applies the first-flight transforms - ClientHello fragmentation and TLS spoofing -
+// to a connection before uTLS is built on top of it.
+//
+// # Why this is a shared helper rather than four lines inside Client
+//
+// REALITY has its own handshake (it has to build the greeting, rewrite session_id and re-marshal),
+// so it never went through Client and therefore never got this wrapper. The consequence was a silent
+// no-op: `fragment` and `record_fragment` were accepted by the config parser on a REALITY node and
+// did nothing, and the automatic record-fragment default for a detoured dial never reached the
+// handshake - in the case where an unsplit ClientHello is the whole problem. Both paths must apply
+// the same transforms, and a second copy of them is how they drift apart again.
+func (c *UTLSClientConfig) wrapClientConn(conn net.Conn) (net.Conn, error) {
 	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
-	conn, err := applyTLSSpoof(conn, c.spoof, c.spoofMethod)
+	return applyTLSSpoof(conn, c.spoof, c.spoofMethod)
+}
+
+func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
+	conn, err := c.wrapClientConn(conn)
 	if err != nil {
 		return nil, err
 	}
