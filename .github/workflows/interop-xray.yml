@@ -92,7 +92,15 @@ jobs:
             #
             # Parsing a complete file has no such coupling: a reader that stops early cannot make
             # the fetch look like a failure.
+            # Authenticated: the unauthenticated GitHub API allows 60 requests per hour PER IP, and
+            # hosted runners share IPs, so this step failed with
+            #     curl: (22) The requested URL returned error: 403
+            # from rate limiting rather than from anything about Xray. The run's own token raises the
+            # limit enough that the failure stops being a coin flip, and reading a public release is
+            # within the read-only permission this workflow already declares.
             curl -fsSL -o /tmp/xray-release.json \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/XTLS/Xray-core/releases/latest
             if [ ! -s /tmp/xray-release.json ]; then
               echo "::error::the GitHub releases API returned nothing for XTLS/Xray-core" >&2
