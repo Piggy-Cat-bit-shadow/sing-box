@@ -112,6 +112,58 @@ member, which is the degeneration this feature exists to avoid.
 When every member is unhealthy the group still answers with a member that can carry the flow.
 Refusing would turn a slow or misconfigured probe into an outage.
 
+## Live dial failure feedback and failover
+
+A probe result is evidence about a node; it is not the only evidence. A member a check marked
+healthy that then times out on real traffic is fed back into selection, and the flow that
+failed it is retried against one alternate.
+
+A dial failure is classified before it concludes anything:
+
+| Failure | Classification | What the group does |
+| --- | --- | --- |
+| target refused (`ECONNREFUSED`), remote reset (`ECONNRESET`) | neutral | reports the error, no penalty, no retry |
+| caller cancelled (`context.Canceled`) | neutral | reports the error, no penalty, no retry |
+| timeout (`context.DeadlineExceeded`, `os.ErrDeadlineExceeded`, any `net.Error` with `Timeout()`) | **path dead** | one penalty, one alternate |
+| unreachable (`EHOSTUNREACH`, `ENETUNREACH`, `ETIMEDOUT`) | **path dead** | one penalty, one alternate |
+
+Only a path-dead failure earns a penalty, because only that proves the attempt never reached an
+answer — which is also the only condition under which a second attempt cannot have been observed
+by the destination. A node that carried the connection perfectly can produce every neutral
+failure, so none of them says anything about the node.
+
+**Penalty.** One counter per member. At `3` the member is *demoted*: it leaves the primary
+rotation. Demotion never deletes health evidence and never interrupts an existing connection. A
+demoted member is still an alternate, which is how it earns proof of life: **a successful dial
+clears its count to zero**, and nothing else does.
+
+**Failure filter.** While a member is at or above the threshold, candidates are ranked by penalty
+count and then by measured latency, and the demoted member is skipped. Below the threshold the
+order is configuration order and latency is not consulted, so a group that has not failed a dial
+distributes exactly as it always did. With `consistent_hashing` the bucket space is never
+reordered — a demoted member only takes its own keys out, via the existing key-stepping, so one
+member failing does not re-map every destination.
+
+**Two corrections over the reference implementation.** First, the ledger is scoped to the
+**network generation** published by the runtime coordinator: a penalty recorded in generation N
+does not demote a member in generation N+1. On a Wi-Fi→cellular handover every member dialled
+during the transition can return an unreachable error, and a permanent penalty would demote the
+whole group afterwards. Second, a record **expires** after a short TTL, evaluated lazily at
+selection time — no timer, no sweeper goroutine. This is safe because demotion is not exclusion:
+an expired record makes the member a candidate again, and it can only clear itself for real by
+carrying a connection.
+
+**Bounded retry.** On a path-dead failure the group re-runs its own selection with the failed
+member excluded and dials **one** alternate — two dial attempts per call, never a scan of the
+member list. The retry runs on the caller's context, so it shares the remaining deadline. If the
+alternate also fails, the **original** error is returned: that is the failure of the member the
+group chose. A successful fallback moves the selection (the rotation, or the sticky pin) and is
+logged.
+
+The retry lives behind the optional `adapter.FailoverOutboundGroup` capability, which the route
+path asks the matched outbound for. A group that does not implement it — every other group type —
+resolves and dials exactly as before.
+
 ## Network compatibility
 
 A member is only ever given a flow it can carry. A TCP-only member never receives a UDP flow,
@@ -175,12 +227,21 @@ requires a single-element chain. Nothing about this feature loosens that.
 
 ## Known limitations
 
-- **No failover on a failed dial.** The route path dials the chosen leaf itself, so this group
-  never sees that dial and cannot know whether the failure happened before any application byte
-  was delivered — the only point at which a retry is safe. The group therefore returns the error
-  the member returned. (Clash-derived clients achieve their implicit failover from a generic
-  retry wrapper above the group, which sing-box does not have; a retry here would be reachable on
-  the detour path and silently absent on the route path.)
+- **Failover is TCP only, and only on the route path.** `ListenPacket` is never retried: a
+  packet connection is one session, and re-opening it on another member would change the source
+  address underneath NAT, QUIC and DNS. A packet-capable member that owns the whole connection
+  (`adapter.ConnectionHandler`) is also not retried, because it never returns a connection to
+  this layer. A group reached through another group — a selector over a loadbalance group — is
+  not the matched outbound, so the capability is not consulted for it.
+- **A flow that fails over has already been described.** Trackers receive the resolved chain,
+  which names the attempt that was made. A successful fallback is logged and moves the group's
+  selection, but the chain recorded for that flow is not rewritten.
+- **A flow with more than one candidate address is not failed over and is not re-selected.**
+  The connection manager dials each candidate address through the same dialer, so a group that
+  owned the dial would make a fresh choice per address and one flow could take two members. Such
+  a flow keeps the old single-member behaviour. A member that itself races addresses (`direct`)
+  is likewise dialled serially per address through this group, because the group owns the
+  attempt sequence.
 - **No weights.** A member listed twice receives a proportional share and is warned about at
   start; there is no weight field.
 - **No `hash-key: in-user`.** The reference implementation's optional key decorator, which hashes

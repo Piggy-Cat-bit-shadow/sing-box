@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -31,6 +32,7 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 var (
 	_ adapter.OutboundGroup          = (*LoadBalance)(nil)
 	_ adapter.FlowAwareOutboundGroup = (*LoadBalance)(nil)
+	_ adapter.FailoverOutboundGroup  = (*LoadBalance)(nil)
 	_ adapter.Referrer               = (*LoadBalance)(nil)
 )
 
@@ -104,6 +106,33 @@ type LoadBalance struct {
 	health      atomic.Pointer[URLTestGroup]
 	healthScope urltest.MeasurementScope
 
+	// runtime is the network-generation coordinator, or nil in a build or a test with none.
+	//
+	// The failure ledger below is scoped to the generation this reports. It is the SAME
+	// coordinator the rest of the core uses, deliberately: a second epoch would eventually
+	// disagree with the first, and a penalty would then be judged current against a network
+	// it does not describe.
+	runtime *runtimecoord.Coordinator
+
+	// penalties is the live-dial failure ledger: how many times a member has failed a real
+	// connection in a way that implicates the path, and when.
+	//
+	// It is one atomic pointer to an immutable table so the selection path reads it without
+	// a lock, and a writer publishes a new table rather than mutating a shared map. The
+	// table carries the generation it was recorded in, so a penalty earned on one network
+	// is not carried into the next; see recordPenalty.
+	penalties    atomic.Pointer[loadBalancePenaltyTable]
+	penaltyWrite sync.Mutex
+
+	// retest is the valve that throttles the forced health round a path-dead failure asks
+	// for: one round per window, measured from the end of the previous one.
+	retest loadBalanceRetestValve
+
+	// now is injectable so a test can move the clock past the penalty TTL without sleeping.
+	// It is read only where a penalty is recorded or evaluated, never on the read path of a
+	// group that has never recorded one.
+	now func() time.Time
+
 	interruptGroup *interrupt.Group
 	lifecycle      sync.Mutex
 	closed         bool
@@ -163,6 +192,8 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		tolerance:      options.Tolerance,
 		idleTimeout:    idleTimeout,
 		history:        service.PtrFromContext[urltest.HistoryStorage](ctx),
+		runtime:        service.FromContext[*runtimecoord.Coordinator](ctx),
+		now:            time.Now,
 		interruptGroup: interrupt.NewGroup(),
 	}
 	if strategy == loadBalanceStrategyStickySessions {
@@ -224,13 +255,41 @@ func (g *LoadBalance) SelectForFlow(metadata *adapter.InboundContext, network st
 	if len(members) == 0 {
 		return nil
 	}
+	return g.selectForFlow(members, metadata, network, commit, g.attempt(members, network, nil))
+}
+
+// selectForFlow dispatches to the configured strategy over one prepared attempt.
+//
+// # Why the attempt is prepared by the caller
+//
+// Health, the failure ledger and the retry's exclusion set are properties of THIS call, and
+// all three have to agree with each other: the candidate count a strategy reduces modulo,
+// the walk that follows it, and the member the retry must not pick again are answers to the
+// same question. Recomputing any of them inside the strategies would let a frozen view of
+// one and a fresh view of another disagree, which is how a member is counted as a candidate
+// and then skipped, or excluded and then returned.
+func (g *LoadBalance) selectForFlow(members []adapter.Outbound, metadata *adapter.InboundContext, network string, commit bool, attempt loadBalanceAttempt) adapter.Outbound {
 	switch g.strategy {
 	case loadBalanceStrategyConsistentHash:
-		return g.selectByHash(members, loadBalanceDestinationKey(metadata), network, commit)
+		return g.selectByHash(members, loadBalanceDestinationKey(metadata), network, commit, attempt)
 	case loadBalanceStrategyStickySessions:
-		return g.selectByAffinity(members, metadata, network, commit)
+		return g.selectByAffinity(members, metadata, network, commit, attempt)
 	default:
-		return g.selectRoundRobin(members, network, commit)
+		return g.selectRoundRobin(members, network, commit, attempt)
+	}
+}
+
+// attempt freezes everything a strategy and its retry must agree on for one selection.
+//
+// exclude is the member a retry may not choose again. It is a member of the group, NOT a
+// health or penalty fact: one path-dead failure is well below the demotion threshold, and
+// the retry must move off the failed member anyway, or it would dial the same node twice.
+func (g *LoadBalance) attempt(members []adapter.Outbound, network string, exclude adapter.Outbound) loadBalanceAttempt {
+	ignoreHealth := g.noHealthyCandidate(members, network, exclude)
+	return loadBalanceAttempt{
+		ignoreHealth: ignoreHealth,
+		penalties:    g.penaltySelection(members, network, ignoreHealth, exclude),
+		exclude:      exclude,
 	}
 }
 
@@ -244,9 +303,20 @@ func (g *LoadBalance) SelectForFlow(metadata *adapter.InboundContext, network st
 // cursor therefore counts committed choices and is reduced modulo the candidate count of
 // THIS call, and the walk that follows visits only candidates, which is also what keeps a
 // dead member from consuming a rotation slot.
-func (g *LoadBalance) selectRoundRobin(members []adapter.Outbound, network string, commit bool) adapter.Outbound {
-	ignoreHealth := g.noHealthyCandidate(members, network)
-	candidates := g.candidateCount(members, network, ignoreHealth)
+//
+// # Where the failure filter enters
+//
+// The walk order is the member list, in configuration order, EXCEPT while the failure filter
+// is engaged: then it is the same candidates ranked by penalty count and then by measured
+// latency. That is deliberately the only thing the ledger changes here - below the threshold
+// the order and the count are exactly what they were, so a group that has never failed a
+// dial rotates precisely as before.
+func (g *LoadBalance) selectRoundRobin(members []adapter.Outbound, network string, commit bool, attempt loadBalanceAttempt) adapter.Outbound {
+	order := members
+	if emergency := g.emergencyOrder(members, network, attempt); emergency != nil {
+		order = emergency
+	}
+	candidates := g.candidateCount(order, network, attempt)
 	if candidates == 0 {
 		// No member can carry this network at all. The route path reports that as an
 		// error; answering with a member that cannot carry the flow would be a false hit.
@@ -259,8 +329,8 @@ func (g *LoadBalance) selectRoundRobin(members []adapter.Outbound, network strin
 		slot = g.cursor.Load()
 	}
 	target := slot % uint64(candidates)
-	for _, member := range members {
-		if !g.isCandidate(member, network, ignoreHealth) {
+	for _, member := range order {
+		if !g.isCandidate(member, network, attempt) {
 			continue
 		}
 		if target == 0 {
@@ -285,11 +355,18 @@ func (g *LoadBalance) selectRoundRobin(members []adapter.Outbound, network strin
 //
 // The decision is recomputed for every selection, so a member recovering becomes a candidate
 // on the next flow rather than at the end of some window.
-func (g *LoadBalance) noHealthyCandidate(members []adapter.Outbound, network string) bool {
+//
+// An excluded member does not count as the known-good member that keeps filtering on: the
+// retry is asking a different question, and letting the member it just failed keep it from
+// considering the healthy ones would leave the retry with nothing.
+func (g *LoadBalance) noHealthyCandidate(members []adapter.Outbound, network string, exclude adapter.Outbound) bool {
 	if g.url == "" {
 		return false
 	}
 	for _, member := range members {
+		if member == exclude {
+			continue
+		}
 		if !common.Contains(member.Network(), network) {
 			continue
 		}
@@ -306,7 +383,16 @@ func (g *LoadBalance) noHealthyCandidate(members []adapter.Outbound, network str
 // unhealthy does not re-map the flows that were not pointing at it. When the hashed member
 // is not currently a candidate the key is stepped - the same key plus one, up to a few
 // times - and only then does the search become a scan.
-func (g *LoadBalance) selectByHash(members []adapter.Outbound, key string, network string, commit bool) adapter.Outbound {
+//
+// # Why the failure filter is not allowed to reorder the buckets
+//
+// The same rule the health filter follows applies to the penalty ledger: it may take a member
+// OUT of candidacy, and the key-stepping below already handles exactly that, but it may not
+// reorder the bucket space. Reordering would re-map every key, so one member timing out would
+// move every destination that had nothing to do with it - the opposite of what this strategy
+// exists to provide. The emergency ranking therefore affects the rotation and the fallback
+// scan, never the bucket space.
+func (g *LoadBalance) selectByHash(members []adapter.Outbound, key string, network string, commit bool, attempt loadBalanceAttempt) adapter.Outbound {
 	if key == "" {
 		// No destination identity to hash. Hashing nothing would put every such flow on
 		// one member, which is the failure this guard exists to prevent; round-robin is
@@ -314,34 +400,34 @@ func (g *LoadBalance) selectByHash(members []adapter.Outbound, key string, netwo
 		//
 		// The caller's commit flag travels with the fallback: this is now a stateful
 		// choice, and a preview that took it must not advance the rotation.
-		return g.selectRoundRobin(members, network, commit)
+		return g.selectRoundRobin(members, network, commit, attempt)
 	}
 	hash := loadBalanceHash(key)
 	buckets := int32(len(members))
-	ignoreHealth := g.noHealthyCandidate(members, network)
 	for i := 0; i < loadBalanceHashRetries; i++ {
 		member := members[jumpHash(hash+uint64(i), buckets)]
-		if g.isCandidate(member, network, ignoreHealth) {
+		if g.isCandidate(member, network, attempt) {
 			return member
 		}
 	}
-	return g.firstCandidateOrCompatible(members, network, ignoreHealth)
+	return g.firstCandidateOrCompatible(members, network, attempt)
 }
 
 // selectByAffinity pins a source and destination pair to a member for a bounded time.
 //
 // Health outranks affinity: a pin that points at a member which is no longer a candidate is
 // not honoured, it is replaced. Otherwise a member that died would keep receiving the flows
-// its pin covers until the entry expired.
-func (g *LoadBalance) selectByAffinity(members []adapter.Outbound, metadata *adapter.InboundContext, network string, commit bool) adapter.Outbound {
+// its pin covers until the entry expired. The failure ledger outranks it the same way, and
+// for the same reason: a pin is a preference, and a member that fails at or above the
+// demotion threshold is not a candidate.
+func (g *LoadBalance) selectByAffinity(members []adapter.Outbound, metadata *adapter.InboundContext, network string, commit bool, attempt loadBalanceAttempt) adapter.Outbound {
 	key := loadBalanceSessionKey(metadata)
 	if key == "" {
-		return g.selectRoundRobin(members, network, commit)
+		return g.selectRoundRobin(members, network, commit, attempt)
 	}
-	ignoreHealth := g.noHealthyCandidate(members, network)
 	if tag, pinned := g.affinity.member(key); pinned {
 		for _, member := range members {
-			if member.Tag() == tag && g.isCandidate(member, network, ignoreHealth) {
+			if member.Tag() == tag && g.isCandidate(member, network, attempt) {
 				return member
 			}
 		}
@@ -349,7 +435,7 @@ func (g *LoadBalance) selectByAffinity(members []adapter.Outbound, metadata *ada
 	// A cold key, or a pin whose member is gone or unhealthy. The replacement is the
 	// round-robin choice, so a group whose keys are all cold still distributes evenly
 	// instead of leaning on whichever member the hash happened to name.
-	member := g.selectRoundRobin(members, network, commit)
+	member := g.selectRoundRobin(members, network, commit, attempt)
 	if commit && member != nil {
 		g.affinity.pin(key, member.Tag())
 	}
@@ -357,11 +443,19 @@ func (g *LoadBalance) selectByAffinity(members []adapter.Outbound, metadata *ada
 }
 
 // isCandidate reports whether a member may serve a flow on this network right now.
-func (g *LoadBalance) isCandidate(member adapter.Outbound, network string, ignoreHealth bool) bool {
+func (g *LoadBalance) isCandidate(member adapter.Outbound, network string, attempt loadBalanceAttempt) bool {
+	if member == attempt.exclude {
+		// The retry: the member that just failed path-dead must not be chosen again, even
+		// though one failure is below the demotion threshold.
+		return false
+	}
 	if !common.Contains(member.Network(), network) {
 		return false
 	}
-	if g.url == "" || ignoreHealth {
+	if attempt.penalties.demotes(member) {
+		return false
+	}
+	if g.url == "" || attempt.ignoreHealth {
 		// Nothing measures the members, or nothing measured is known-good: in both cases
 		// the absence of a health entry cannot mean "dead" and must not be read as one.
 		return true
@@ -389,10 +483,10 @@ func (g *LoadBalance) healthy(member adapter.Outbound, network string) bool {
 // candidateCount counts the members that may serve this network right now, in one pass and
 // without allocating a candidate slice: the selection path runs once per flow and this
 // group must not add an allocation to every connection.
-func (g *LoadBalance) candidateCount(members []adapter.Outbound, network string, ignoreHealth bool) int {
+func (g *LoadBalance) candidateCount(members []adapter.Outbound, network string, attempt loadBalanceAttempt) int {
 	count := 0
 	for _, member := range members {
-		if g.isCandidate(member, network, ignoreHealth) {
+		if g.isCandidate(member, network, attempt) {
 			count++
 		}
 	}
@@ -401,9 +495,17 @@ func (g *LoadBalance) candidateCount(members []adapter.Outbound, network string,
 
 // firstCandidateOrCompatible prefers any candidate, then any member that can carry the
 // network at all, then nothing.
-func (g *LoadBalance) firstCandidateOrCompatible(members []adapter.Outbound, network string, ignoreHealth bool) adapter.Outbound {
+func (g *LoadBalance) firstCandidateOrCompatible(members []adapter.Outbound, network string, attempt loadBalanceAttempt) adapter.Outbound {
+	if emergency := g.emergencyOrder(members, network, attempt); emergency != nil {
+		for _, member := range emergency {
+			if g.isCandidate(member, network, attempt) {
+				return member
+			}
+		}
+		return g.firstCompatible(members, network)
+	}
 	for _, member := range members {
-		if g.isCandidate(member, network, ignoreHealth) {
+		if g.isCandidate(member, network, attempt) {
 			return member
 		}
 	}
@@ -569,6 +671,14 @@ func (g *LoadBalance) AttachConnection(closer io.Closer) func() {
 // group is used as a detour - a DNS transport, a nested member of another group - where the
 // flow metadata travels in the context. The choice made here is committed: the connection
 // is what the choice is for.
+//
+// # Why this is still a single attempt
+//
+// The failover retry lives in DialWithFailover, which the route path asks for through the
+// optional capability. It is NOT folded in here because this is the path a MEASUREMENT takes
+// when the group is a member of a urltest group: a probe that fails would otherwise write
+// live-traffic penalties, and a probe's job is to observe, not to move the group. A config
+// that does not route through the capability keeps exactly the behaviour it had.
 func (g *LoadBalance) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	member := g.SelectForFlow(adapter.ContextFrom(ctx), network, true)
 	if member == nil {
@@ -587,6 +697,11 @@ func (g *LoadBalance) DialContext(ctx context.Context, network string, destinati
 // One call, one member: the returned packet connection is the member's own, so every
 // datagram of this session leaves through it. Selecting per datagram would change the
 // source address underneath a session that NAT, QUIC and DNS are all tracking.
+//
+// There is deliberately no failover here, and the capability does not cover it either: a
+// packet connection is one session, and re-opening it on another member would change the
+// source address underneath NAT, QUIC and DNS - the same property this method exists to
+// preserve.
 func (g *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	member := g.SelectForFlow(adapter.ContextFrom(ctx), N.NetworkUDP, true)
 	if member == nil {

@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"net"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
 )
 
@@ -192,4 +194,54 @@ type FlowAwareOutboundGroup interface {
 	// It returns nil only when the group cannot serve the network at all, which the
 	// caller reports as an error rather than falling through to another outbound.
 	SelectForFlow(metadata *InboundContext, network string, commit bool) Outbound
+}
+
+// FailoverOutboundGroup is an OPTIONAL capability of a group that can own the DIAL of a
+// flow it has selected, not only the choice of member.
+//
+// # Why the dial has to move into the group
+//
+// The route path walks a group chain down to a leaf and dials that leaf itself, which is
+// what keeps a group a control-plane object: it never wraps a connection and never sees a
+// byte. The cost of that split is that the group never learns that its choice failed, so a
+// member a probe marked healthy that then times out on live traffic is simply reported to
+// the caller.
+//
+// Retrying above the group is not equivalent and not safe here: a caller that reconnects
+// cannot know how far the first attempt got, so it cannot know whether a second attempt
+// would replay a request the destination already received. A retry that runs INSIDE the
+// group, immediately after a failure that proves nothing was delivered, does not have that
+// problem - and that is why the capability owns the dial rather than handing the error
+// back.
+type FailoverOutboundGroup interface {
+	OutboundGroup
+
+	// DialWithFailover dials this flow through the group's own selection.
+	//
+	// A group that implements this MUST own the whole decision: it resolves the chain to a
+	// leaf for each attempt, and on a failure that proves the PATH to the chosen member is
+	// dead it re-runs its own selection with that member excluded and dials ONE alternate.
+	// It MUST NOT simply index to the next member, because that would bypass the strategy,
+	// the health filter and the failure filter at once.
+	//
+	// The contract the caller depends on:
+	//
+	//   - At most two dial attempts per call. A third would turn a bounded replacement into
+	//     a scan of the member list on every outage.
+	//   - The caller's context is used unchanged, so the retry shares the remaining
+	//     deadline instead of extending it. The retry is worth having only while the caller
+	//     is still waiting.
+	//   - A failure that does not implicate the path - the destination refused, the caller
+	//     cancelled - is returned without a retry. A second member cannot fix a target that
+	//     answered.
+	//   - Existing connections are never interrupted. The failure being replaced belongs to
+	//     the attempt that has not produced a connection yet; a connection already handed to
+	//     a caller is a different object.
+	//   - ListenPacket is NOT covered. A packet connection is one session, and replacing it
+	//     would change the source address underneath NAT, QUIC and DNS.
+	//
+	// The implementation is free to fail OPEN: if it has no alternate to offer, or if the
+	// dial fails in a way that is not about the path, it returns the error the first member
+	// produced.
+	DialWithFailover(ctx context.Context, metadata *InboundContext, network string, destination M.Socksaddr) (net.Conn, error)
 }

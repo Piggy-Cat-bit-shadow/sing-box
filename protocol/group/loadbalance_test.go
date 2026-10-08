@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -123,17 +124,31 @@ func (m *loadBalanceManager) Outbound(tag string) (adapter.Outbound, bool) {
 }
 
 type loadBalanceFixture struct {
-	group   *LoadBalance
-	manager *loadBalanceManager
-	storage *urltest.HistoryStorage
-	members []*recordingOutbound
-	ctx     context.Context
+	group       *LoadBalance
+	manager     *loadBalanceManager
+	storage     *urltest.HistoryStorage
+	members     []*recordingOutbound
+	coordinator *runtimecoord.Coordinator
+	ctx         context.Context
 }
 
 // newLoadBalanceFixture builds a started group over the given members.
 func newLoadBalanceFixture(t *testing.T, options option.LoadBalanceOutboundOptions, members ...*recordingOutbound) *loadBalanceFixture {
 	t.Helper()
+	return newLoadBalanceFixtureLogger(t, nil, options, members...)
+}
+
+// newLoadBalanceFixtureLogger is the same fixture with a caller-supplied logger, and is how a
+// test observes what the group reported rather than only what it did.
+//
+// The context always carries a real network-generation coordinator. It starts at generation
+// zero and stays there unless a test advances it, so a test that does not care about
+// generations sees exactly the behaviour a core with no reset would produce.
+func newLoadBalanceFixtureLogger(t *testing.T, groupLogger log.ContextLogger, options option.LoadBalanceOutboundOptions, members ...*recordingOutbound) *loadBalanceFixture {
+	t.Helper()
+	coordinator := runtimecoord.New()
 	ctx := pause.WithDefaultManager(service.ContextWithPtr(context.Background(), urltest.NewHistoryStorage()))
+	ctx = service.ContextWith[*runtimecoord.Coordinator](ctx, coordinator)
 	manager := &loadBalanceManager{members: make(map[string]adapter.Outbound, len(members))}
 	tags := make([]string, 0, len(members))
 	for _, member := range members {
@@ -145,7 +160,10 @@ func newLoadBalanceFixture(t *testing.T, options option.LoadBalanceOutboundOptio
 	}
 	ctx = service.ContextWith[adapter.OutboundManager](ctx, manager)
 
-	created, err := NewLoadBalance(ctx, nil, log.NewNOPFactory().NewLogger("loadbalance"), "lb", options)
+	if groupLogger == nil {
+		groupLogger = log.NewNOPFactory().NewLogger("loadbalance")
+	}
+	created, err := NewLoadBalance(ctx, nil, groupLogger, "lb", options)
 	require.NoError(t, err)
 	group, isGroup := created.(*LoadBalance)
 	require.True(t, isGroup)
@@ -156,11 +174,12 @@ func newLoadBalanceFixture(t *testing.T, options option.LoadBalanceOutboundOptio
 		require.NoError(t, group.Close())
 	})
 	return &loadBalanceFixture{
-		group:   group,
-		manager: manager,
-		storage: service.PtrFromContext[urltest.HistoryStorage](ctx),
-		members: members,
-		ctx:     ctx,
+		group:       group,
+		manager:     manager,
+		storage:     service.PtrFromContext[urltest.HistoryStorage](ctx),
+		members:     members,
+		coordinator: coordinator,
+		ctx:         ctx,
 	}
 }
 

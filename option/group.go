@@ -61,11 +61,16 @@ type LoadBalanceOutboundOptions struct {
 	// IdleTimeout stops the health checker after the group has been idle this long.
 	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
 	//
-	// There is deliberately no failover option. Retrying another member is only safe
-	// before any application byte has been delivered to a destination, and the route path
-	// hands the flow to the chosen leaf's own DialContext - this group never sees that
-	// dial, so it cannot know whether the connection was established when it failed. A
-	// retry implemented here would be reachable on the detour path and silently absent on
-	// the route path, which is worse than no retry: the option would appear to work and
-	// would not, and on the path where it did work it could replay a request.
+	// There is deliberately no failover option, and the always-on policy is narrow enough
+	// not to need one: a failed attempt is replaced only when the failure proves the PATH to
+	// the member is dead - a timeout or an unreachable network - which is exactly the case
+	// in which no application byte can have reached the destination and a second member is
+	// safe to try. A refusal, a reset or the caller's own cancellation is reported
+	// unchanged. Bounding the retry to one alternate and reusing the caller's remaining
+	// deadline is what keeps it a replacement for a dead path rather than a second attempt
+	// at a live one.
+	//
+	// There is no knob because there is nothing to tune that a configuration could express
+	// better than the code: the threshold, the alternate bound and the evidence that clears
+	// a penalty are properties of the failure, not preferences.
 }
