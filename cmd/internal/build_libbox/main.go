@@ -84,10 +84,11 @@ func writeProvenance() {
 // consumer can answer "does this artifact include X" without re-deriving the composition.
 //
 // This exists because a check that reads the profile tag FILES is not the same as a check on what
-// the artifacts are built with: the libbox builder appends its own tags (Android gains
-// with_gvisor here, and it is deliberately not in the shared list). The 048 gVisor crash was found
-// exactly through that gap - a tripwire that only read the profile files reported "no profile
-// names with_gvisor" while the Android artifacts did compile it.
+// the artifacts are built with: the libbox builder composes its own tag sets. The 048 gVisor crash
+// was found exactly through that gap - a tripwire that only read the profile files reported "no
+// profile names with_gvisor" while the Android artifacts did compile it. The gap is still real
+// even though this particular tag is gone, which is why the resolution is still recorded here and
+// why the inverse invariant is asserted against the RESOLVED tags rather than the files.
 var resolvedTags = map[string][]string{}
 
 // ResolveBuildTags returns the build tags for the named shipped variant. It is the single source
@@ -97,14 +98,12 @@ func ResolveBuildTags(variant string) []string {
 	switch variant {
 	case "android-main":
 		tags := append([]string{}, sharedTags...)
-		tags = append(tags, androidTags...)
 		if debugEnabled {
 			tags = append(tags, debugTags...)
 		}
 		return tags
 	case "android-legacy":
 		tags := filterTags(sharedTags, "with_naive_outbound")
-		tags = append(tags, androidTags...)
 		if debugEnabled {
 			tags = append(tags, debugTags...)
 		}
@@ -130,7 +129,6 @@ var (
 	sharedFlags []string
 	debugFlags  []string
 	sharedTags  []string
-	androidTags []string
 	darwinTags  []string
 	// memcTags    []string
 	notMemcTags []string
@@ -165,12 +163,19 @@ func init() {
 	// passing against a tag set nothing ships.
 	sharedTags = append(sharedTags, applebuildtags.CommonTags()...)
 
-	// Android-only tags. with_gvisor selects sing-tun's gVisor netstack, which is
-	// the stack the Android client asks for ("stack": "mixed"/"gvisor"); without
-	// this tag sing-tun compiles stack_gvisor_stub.go and starting a tun fails with
-	// "gVisor is not included in this build". It is deliberately NOT in the shared
-	// Apple list, so the Apple artifacts keep their existing stack choices.
-	androidTags = append(androidTags, "with_gvisor")
+	// Android no longer ships with_gvisor.
+	//
+	// It did: the Android UI asked for "stack": "mixed"/"gvisor" and sing-tun therefore had to be
+	// compiled with gVisor's netstack, so this builder appended with_gvisor to both Android
+	// variants. That product decision has been reversed - the Android UI no longer depends on
+	// mixed/gvisor - and gVisor is retired from shipped artifacts.
+	//
+	// The retirement is deliberately NOT "delete the line and move on". Going back to shipping
+	// gVisor would re-expose the 048 crash surface and re-require the patched fork, so the
+	// invariant is now inverted and asserted: no shipped variant may name with_gvisor, and
+	// TestNoShippedVariantShipsGVisor fails if one does. See docs/fork/lx-stability-audit-phase1.md
+	// for why 048 was a real risk when it shipped, and docs/fork/upstream-sync-2026-10.md for the
+	// retirement.
 	notMemcTags = append(notMemcTags, applebuildtags.LowMemoryMobileTags()...)
 	debugTags = append(debugTags, "debug")
 }

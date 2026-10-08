@@ -8,28 +8,38 @@ import (
 	"testing"
 )
 
-// The gVisor invariant, checked against the REAL build-tag composition.
+// GVISOR MUST NOT BE SHIPPED.
 //
-// # Why this test exists instead of a file scan
+// # Why this is an inverted invariant rather than a deleted test
+//
+// Phase 1 found that shipping with_gvisor meant shipping gVisor's TCP stack, and the pinned
+// upstream gVisor dereferences a nil handshake in handleConnecting (LX 048) - an unrecoverable
+// crash inside gVisor's own goroutine. That finding was correct, and the patched fork was the
+// correct response to it while gVisor shipped.
+//
+// The product condition has since changed: the Android UI no longer depends on
+// "stack": "mixed"/"gvisor", so gVisor is retired from shipped artifacts and the fork is no longer
+// load-bearing. The risk is gone because the exposure is gone, NOT because 048 was never real.
+//
+// Deleting this test would delete the only thing that notices the exposure coming back. It is
+// therefore INVERTED: no shipped variant may name with_gvisor, and re-adding it to the Android
+// builder fails CI with an instruction to re-run the product review and restore/re-audit 048.
+//
+// # Why it asks the builder instead of scanning files
 //
 // The phase-1 tripwire read the profile tag files and concluded "no profile names with_gvisor",
-// while the Android libbox artifacts were compiled WITH with_gvisor: the libbox builder appends
-// its own tags, and Android gains the gVisor tag there. A scan of text files is not a check on
-// what ships. This test asks the same function the builders use.
-//
-// # The invariant
-//
-// Shipping with_gvisor means shipping gVisor's TCP stack, and the pinned upstream gVisor
-// dereferences a nil handshake in handleConnecting (LX 048) - an unrecoverable crash inside
-// gVisor's own goroutine. So:
-//
-//	if a variant compiles with_gvisor, the gVisor dependency must be our patched fork;
-//	if no variant compiles it, the patch must not be silently assumed necessary.
-//
-// If upstream fixes 048, the module assertion below is the tripwire that says "re-audit and
-// retire the fork".
+// while the Android libbox artifacts were compiled WITH with_gvisor: the libbox builder composes
+// its own tag sets. A scan of text files is not a check on what ships. This test asks the same
+// function the builders use, which is the property that made it catch the real thing.
 
 const gvisorTag = "with_gvisor"
+
+// gvisorReenableInstruction is the message every failure here shares, so a future maintainer who
+// trips it is told what to do rather than merely told they broke a test.
+const gvisorReenableInstruction = "gVisor was intentionally retired after the Android UI stopped " +
+	"depending on mixed/gvisor. Re-enabling it requires a new product review and restoring and " +
+	"re-auditing LX 048 (the nil-handshake crash in handleConnecting), including the patched " +
+	"dependency fork and the artifact tripwire. See docs/fork/upstream-sync-2026-10.md."
 
 // gvisorShippedVariants reports which shipped variants compile the gVisor netstack.
 func gvisorShippedVariants() []string {
@@ -42,20 +52,36 @@ func gvisorShippedVariants() []string {
 	return variants
 }
 
-// TestAndroidShipsGVisorAndAppleDoesNot pins the intentional difference recorded by the commit
-// that enabled gVisor for Android, so a change in either direction is noticed rather than inferred.
-func TestAndroidShipsGVisorAndAppleDoesNot(t *testing.T) {
-	android := gvisorShippedVariants()
-	if !slices.Contains(android, "android-main") {
-		t.Fatal("android-main no longer compiles with_gvisor; the Android client asks for " +
-			"stack mixed/gvisor and would fail to start a tun, and the 048 exposure changes")
+// TestNoShippedVariantShipsGVisor is the inverted invariant: the default state is gVisor-free, and
+// any variant that names the tag fails CI.
+func TestNoShippedVariantShipsGVisor(t *testing.T) {
+	for _, variant := range sortedTagVariants() {
+		if HasBuildTag(variant, gvisorTag) {
+			t.Fatalf("%s compiles with_gvisor.\n%s", variant, gvisorReenableInstruction)
+		}
 	}
-	if !slices.Contains(android, "android-legacy") {
-		t.Fatal("android-legacy no longer compiles with_gvisor")
+	// And the platforms the product decision named, explicitly, so the failure text says which one
+	// regressed rather than only that something did.
+	for _, variant := range []string{"android-main", "android-legacy", "apple"} {
+		if HasBuildTag(variant, gvisorTag) {
+			t.Fatalf("%s ships with_gvisor; the Android UI no longer requires mixed/gvisor and no "+
+				"Apple product ever did.\n%s", variant, gvisorReenableInstruction)
+		}
 	}
-	if HasBuildTag("apple", gvisorTag) {
-		t.Fatal("the apple variant now compiles with_gvisor; the Apple products deliberately keep " +
-			"their existing stack choices and adding gVisor there needs the 048 audit repeated")
+}
+
+// TestAndroidShipsWithoutGVisor states the product outcome positively: Android is a shipped
+// variant, it resolves tags, and gVisor is not among them. This is what proves the default Android
+// path does not need gVisor to start a tun.
+func TestAndroidShipsWithoutGVisor(t *testing.T) {
+	for _, variant := range []string{"android-main", "android-legacy"} {
+		tags := ResolveBuildTags(variant)
+		if len(tags) == 0 {
+			t.Fatalf("%s resolves to no tags at all; the assertion below would be vacuous", variant)
+		}
+		if slices.Contains(tags, gvisorTag) {
+			t.Fatalf("%s still ships with_gvisor.\n%s", variant, gvisorReenableInstruction)
+		}
 	}
 }
 
@@ -84,25 +110,39 @@ func TestProfileTagFilesDoNotCarryGVisor(t *testing.T) {
 	}
 }
 
-// TestGVisorPinIsThePatchedFork is the dependency half of the invariant: with gVisor shipped, the
-// linked module must be our fork, and the fork must still carry the guard.
+// TestGVisorForkIsNotLoadBearing is the dependency half of the inverted invariant.
 //
-// It reads go.mod the way the module system does, rather than trusting a comment.
-func TestGVisorPinIsThePatchedFork(t *testing.T) {
-	if len(gvisorShippedVariants()) == 0 {
-		t.Skip("no shipped variant compiles with_gvisor; the pin is not load-bearing here")
+// # Why this reports the dependency edge instead of failing on it
+//
+// The SHIPPED exposure is what made 048 a crash surface, and that is asserted above: no variant
+// compiles with_gvisor. The remaining dependency edge cannot be removed yet for a concrete reason -
+// protocol/tun still imports gVisor behind the with_gvisor build tag, so the module graph keeps
+// requiring it until the upstream Go TUN stack (a1b01b4) replaces that code path. That is
+// upstream's own ordering: ede8d9a "Remove dependency on gVisor" FOLLOWS the Go stack.
+//
+// Failing here would make CI red for a correct mid-migration state, which trains people to ignore
+// the check. Passing silently would lose the fact. So the tag re-enable tripwire is the assertion
+// (it fails), and the dependency edge is recorded against a named migration.
+func TestGVisorForkIsNotLoadBearing(t *testing.T) {
+	// The tripwire: the moment a shipped variant compiles the tag again, this fails and names the
+	// reason. That is the property that matters and the one a reader must not lose.
+	if shipped := gvisorShippedVariants(); len(shipped) > 0 {
+		t.Fatalf("a shipped variant compiles with_gvisor again (%v), so the retired fork is "+
+			"load-bearing once more.\n%s", shipped, gvisorReenableInstruction)
 	}
+	// The pending half, recorded so the migration cannot be forgotten: while the fork replacement
+	// is still present, the Go TUN stack migration is what removes it.
 	root := repoRoot(t)
 	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	goMod := string(data)
-	const wantReplace = "replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor"
-	if !strings.Contains(goMod, wantReplace) {
-		t.Fatalf("with_gvisor is shipped but go.mod does not replace the gVisor module with the "+
-			"patched fork.\nwant a line starting: %s\n"+
-			"Without it, the nil-handshake crash (LX 048) is back in the Android artifacts.", wantReplace)
+	const forkReplace = "replace github.com/sagernet/gvisor => github.com/Piggy-Cat-bit-shadow/gvisor"
+	if strings.Contains(string(data), forkReplace) {
+		t.Log("PENDING: go.mod still replaces gVisor with the retired fork. The shipped exposure is " +
+			"already zero (asserted above); the dependency edge is removed by the Go TUN stack " +
+			"migration (upstream a1b01b4, then ede8d9a), because protocol/tun still imports gVisor " +
+			"behind the build tag. When that lands this branch must become a failure.")
 	}
 }
 
