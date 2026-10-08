@@ -61,6 +61,24 @@ func (m *TransportManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 	transports := m.transports
 	m.access.Unlock()
 	if stage == adapter.StartStateStart {
+		// Refuse a cross-kind cycle BEFORE anything is started.
+		//
+		// This manager owns the DNS half of the graph - its transports declare a detour into an
+		// outbound through References() - and it holds an outbound manager, so it is the one place
+		// that can see both ends of the closing edge. The per-kind sorts cannot: transport_adapter.go
+		// puts `detour` in References() (which no sort reads) and the outbound sort only walks
+		// outbound tags, while an outbound's `domain_resolver` names a DNS transport.
+		//
+		// The failure this prevents is not a bad connection but an unbounded dial loop that starts
+		// successfully and then never returns; see adapter/outbound/cross_kind_cycle.go for the
+		// measured reproducer. The capability is optional so a test double or a manager built
+		// without a DNS-aware outbound manager behaves exactly as before.
+		if validator, isValidator := m.outbound.(crossKindCycleValidator); isValidator {
+			err := validator.ValidateCrossKindCycles(transports)
+			if err != nil {
+				return err
+			}
+		}
 		return m.startTransports(scope, transports)
 	}
 	for _, transport := range transports {
@@ -71,6 +89,14 @@ func (m *TransportManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 		}
 	}
 	return nil
+}
+
+// crossKindCycleValidator is the optional capability the outbound manager implements to validate
+// the combined DNS-transport/outbound graph. It is asked for directly rather than added to
+// adapter.OutboundManager so that every implementation that has no DNS-aware validation keeps
+// working unchanged. See adapter/outbound/cross_kind_cycle.go.
+type crossKindCycleValidator interface {
+	ValidateCrossKindCycles(transports []adapter.DNSTransport) error
 }
 
 func (m *TransportManager) startTransports(scope *adapter.Scope, transports []adapter.DNSTransport) error {

@@ -60,6 +60,11 @@ type ConnectionManager struct {
 	// dialGovernor bounds concurrent outbound dials in the window after a transition. Inert unless a
 	// transition opened it; see dial_governor.go.
 	dialGovernor dialGovernor
+	// dialSetups gates the setup context of every dial this manager starts, so a transition can
+	// cancel a dial that has not produced a connection yet. It is the half of a transition the
+	// connection list cannot reach: a blackholed dial is not in the list until it returns. See
+	// dial_setup.go for the ownership rule and the Close ordering.
+	dialSetups dialSetupGate
 	// Transition and drain diagnostics. One atomic add per transition and per reclaim pass,
 	// never per byte. See transition_diagnostics.go for what these numbers can and cannot say.
 	transitions transitionDiagnostics
@@ -116,6 +121,13 @@ func (m *ConnectionManager) Count() int {
 }
 
 func (m *ConnectionManager) CloseAll() {
+	// Cancel in-flight dials first. "Close all" has to include a connection that does not exist
+	// yet: a blackholed dial is owned by this manager from the moment it starts, and leaving it
+	// running would let it install a connection after every socket this manager owned was closed -
+	// on a network the caller has already declared gone. The gate re-arms rather than closing, so
+	// a later dial (a reconnect on the new path, a control-plane CloseAllConnections that is not a
+	// shutdown) is unaffected.
+	m.dialSetups.advance()
 	// Release the flows first. A flow parked in the shaper is not inside a write, so closing its
 	// socket does not wake it, and it can be parked for as long as the period its own last write is
 	// worth at the configured rate. See trafficsched.Scheduler.ReleaseAll.
@@ -167,10 +179,12 @@ func (m *ConnectionManager) UploadRate() int64 {
 }
 
 func (m *ConnectionManager) Close() error {
-	// Order matters: mark closed so a sweep in flight will not reschedule itself, stop the timer,
-	// and only then tear the connections down. A timer that fired after this returned would be
-	// reclaiming connections on behalf of a manager whose lifecycle has ended.
+	// Order matters: mark closed so a sweep in flight will not reschedule itself, then close the
+	// dial setup gate so no in-flight dial can still establish and no later dial can start, then
+	// stop the timer, and only then tear the connections down. A timer that fired after this
+	// returned would be reclaiming connections on behalf of a manager whose lifecycle has ended.
 	m.closed.Store(true)
+	m.dialSetups.close()
 	m.stopDrainSweep()
 	m.CloseAll()
 	// Releasing the scheduler here is what unblocks a copy goroutine parked in the gate. Closing
@@ -258,11 +272,26 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// The dial gate. Inert unless a transition opened its window in the last few seconds, and it
 	// never delays a flow whose class says a person is waiting on it; see dial_governor.go.
 	releaseDial := m.enterDialGate(ctx, metadata.TrafficClass)
+	// The setup context, and nothing else, owns the dial.
+	//
+	// It is the caller's context with one addition: a network transition cancels it for a dial that
+	// belongs to the generation the device has left. The scope is deliberately narrow - the two
+	// dial calls below, and no further - because the ownership rule is that setup authority ends at
+	// establishment. Everything after the dial (the handshake report, the splice, the copy loops)
+	// uses the caller's own ctx, so a transition that arrives after the dial returned cannot reach
+	// the connection through any context this layer created. See dial_setup.go.
+	setupCtx, finishSetup := m.dialSetups.begin(ctx)
 	if len(metadata.DestinationAddresses) > 0 || metadata.Destination.IsIP() {
-		remoteConn, err = dialer.DialSerialNetwork(ctx, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
+		remoteConn, err = dialer.DialSerialNetwork(setupCtx, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 	} else {
-		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
+		remoteConn, err = this.DialContext(setupCtx, N.NetworkTCP, metadata.Destination)
 	}
+	// Establishment, or failure: either way the setup is over. On success this is the ownership
+	// transfer - the generation watch is stopped before the setup is released, so a later
+	// transition has no handle on the connection that now exists. On failure it releases the
+	// context so a long-lived caller context does not accumulate one dead registration per failed
+	// dial.
+	finishSetup()
 	releaseDial()
 	if err != nil {
 		var remoteString string
@@ -487,22 +516,26 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		// The dial gate, as for a stream. Establishing a UDP session is a dial too, and an app
 		// opening a burst of them after a transition is the same herd.
 		releaseDial := m.enterDialGate(ctx, metadata.TrafficClass)
+		// The setup context, for the same reason as in NewConnection: a UDP "connect" to a peer
+		// that never answers is a dial the connection list cannot reach until it returns.
+		setupCtx, finishSetup := m.dialSetups.begin(ctx)
 		parallelDialer, isParallelDialer := this.(dialer.ParallelInterfaceDialer)
 		if len(metadata.DestinationAddresses) > 0 {
 			if isParallelDialer {
-				remoteConn, err = dialer.DialSerialNetwork(ctx, parallelDialer, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
+				remoteConn, err = dialer.DialSerialNetwork(setupCtx, parallelDialer, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 			} else {
-				remoteConn, err = N.DialSerial(ctx, this, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses)
+				remoteConn, err = N.DialSerial(setupCtx, this, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses)
 			}
 		} else if metadata.Destination.IsIP() {
 			if isParallelDialer {
-				remoteConn, err = dialer.DialSerialNetwork(ctx, parallelDialer, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
+				remoteConn, err = dialer.DialSerialNetwork(setupCtx, parallelDialer, N.NetworkUDP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 			} else {
-				remoteConn, err = this.DialContext(ctx, N.NetworkUDP, metadata.Destination)
+				remoteConn, err = this.DialContext(setupCtx, N.NetworkUDP, metadata.Destination)
 			}
 		} else {
-			remoteConn, err = this.DialContext(ctx, N.NetworkUDP, metadata.Destination)
+			remoteConn, err = this.DialContext(setupCtx, N.NetworkUDP, metadata.Destination)
 		}
+		finishSetup()
 		releaseDial()
 		if err != nil {
 			var remoteString string

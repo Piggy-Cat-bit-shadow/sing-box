@@ -371,12 +371,17 @@ func TestBlackholeConnectAbandonedFlowLeavesNoStackInitiatedRetry(t *testing.T) 
 //
 // WHAT THIS TEST DOES NOT CLAIM, AND WHY: ResetNetwork does not abort a half-open TCP flow that the
 // route layer is still dialling - measured directly, the stack re-emits that flow's SYN-ACK across
-// the reset rather than closing it. The route layer's own transition path drains tracked
-// connections, but a dial that has not completed yet is not tracked, so nothing cancels it: the
-// dial runs to its configured connect_timeout, or, for an outbound configured without one, until
-// the caller cancels or the tunnel closes. That is a real gap in the "a network transition can
-// invalidate it" requirement and is reported rather than papered over with an assertion that the
-// current behaviour happens to satisfy.
+// the reset rather than closing it. That is a property of the stack, not of the route layer: the
+// stack knows only that it accepted a flow and handed it to a Handler, so it has no dial of its own
+// to cancel here.
+//
+// The route layer's half of the gap is closed one layer up and pinned elsewhere. The dial a Handler
+// starts for an accepted flow used to be untracked until it returned, so a transition could not
+// cancel a blackholed dial; it now runs under a setup context that the transition cancels for the
+// generation being left, while an established flow's ownership transfers out of that context. See
+// route/dial_setup.go and route/dial_setup_test.go for the rule and its regression tests. This test
+// deliberately keeps driving a fake Handler, so its observation stays about the stack and cannot be
+// satisfied by the route layer's fix.
 func TestBlackholeConnectNetworkTransitionKeepsServingNewFlows(t *testing.T) {
 	harness := newBlackholeStack(t, context.Background())
 

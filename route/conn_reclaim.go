@@ -255,6 +255,14 @@ func (m *ConnectionManager) Reclaim(reason ReclaimReason) int {
 	var staleGeneration uint64
 	if policy.drain {
 		staleGeneration = m.generation.Add(1)
+		// The other half of the transition, and the half the connection list cannot see.
+		//
+		// Everything in m.connections exists because a dial already returned; a dial still waiting
+		// on a peer that never answers is not there yet, so the scan below cannot reach it. The
+		// gate cancels exactly those setups that began before this generation, and leaves alone
+		// both the ones already established (their setup was detached at establishment) and the
+		// ones that begin after this point (they derive from the new generation's context).
+		m.dialSetups.advance()
 	}
 
 	m.access.Lock()
