@@ -1,0 +1,21 @@
+diff --git a/Library/Network/ExtensionPlatformInterface.swift b/Library/Network/ExtensionPlatformInterface.swift
+index c9a4c61..c1654f9 100644
+--- a/Library/Network/ExtensionPlatformInterface.swift
++++ b/Library/Network/ExtensionPlatformInterface.swift
+@@ -848,8 +848,14 @@
+                 tunFileDescriptor
+             }
+ 
+-            func name() -> String {
+-                tunName
++            // LibboxBridgeSessionProtocol requires the boxed result: Go declares
++            // BridgeSession.Name as returning *StringBox so the value does not travel in
++            // gomobile's packed result frame. The AIDL handshake still carries a plain
++            // String, so it is wrapped here rather than changing that contract.
++            func name() -> LibboxStringBox? {
++                let nameBox = LibboxStringBox()
++                nameBox.value = tunName
++                return nameBox
+             }
+ 
+             func inet6Active() -> Bool {

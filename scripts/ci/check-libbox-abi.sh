@@ -36,6 +36,16 @@
 #                      contract reads the result through a migrated accessor (Kotlin `.value`
 #                      or the `StringBox?.unwrap` extension; Swift/ObjC `.value`). A call that
 #                      reads it any other way is an old-ABI call site.
+#   4b. IMPLEMENTERS - every PLATFORM type that conforms to a bound Go interface named in the
+#                      contract re-declares the migrated method with the boxed result. A method
+#                      on a bound Go interface is implemented by the platform as well as by Go,
+#                      and an implementation is a DECLARATION, so the call-site scan above cannot
+#                      see it. Both clients shipped this defect: Android's
+#                      RootBridgeSessionWrapper and Apple's BridgeServiceSession each declared
+#                      `name(): String` against a Go `BridgeSession.Name() *StringBox`. The
+#                      compiler catches it only in a configuration the release build does not
+#                      always compile (Apple's is `#if os(macOS) || JAILBREAK`), which is why it
+#                      is scanned here rather than left to a build that never sees the file.
 #   5. CLIENT PIN    - the client gitlinks are the revisions the contract was verified against.
 #
 # # Usage
@@ -67,6 +77,17 @@ PROJECT_GOMOBILE_VERSION="$(cd "$repo_root" && go list -m -f '{{.Version}}' gith
 #          Upstream SagerNet/sing-box-for-android does NOT carry them.
 # Apple:   Piggy-Cat-bit-shadow/sing-box-for-apple. The migration is carried as
 #          docs/fork/apple-stringbox-callsites.patch; see docs/fork/apple-client-fork.md.
+#
+# THE APPLE VALUE BELOW IS STALE, and layer 4 says so on every run. 5911580a is the revision the
+# superproject gitlink pins and it carries NONE of the migration: sweeping it finds all 18
+# unmigrated call sites. The fork branch head 8599039f6cd41dad6bdf975066b300725da08668 carries
+# them (0 call-site violations, 347 sources scanned), and one more change is required before it
+# can be named here: docs/fork/apple-bridge-session-implementer.patch, because Go declares
+# BridgeSession.Name as returning *StringBox and the client's own implementer
+# (ExtensionPlatformInterface.swift's BridgeServiceSession, under `#if os(macOS) || JAILBREAK`)
+# still returns String. Update this constant and the gitlink TOGETHER, to a fork head that
+# contains both, once that commit exists. Leaving it at 5911580a makes layer 5 PASS while layer
+# 4 FAILS, which is the intended reading: the pin is not the thing that was verified.
 VERIFIED_ANDROID_SHA="ec61030d3df74f3e7c39ab848c8996008ecd386a"
 VERIFIED_APPLE_SHA="5911580a6366da78e6b4b5b4459596e5a2cf1eb4"
 
@@ -286,6 +307,27 @@ import sys
 
 data = json.loads(sys.argv[1])
 for v in data.get("violations") or []:
+    if v.get("kind") == "implementer":
+        # A platform type that conforms to a bound Go interface and re-declares the migrated
+        # method with the old result type. The call-site scan cannot see this: an implementation
+        # is a declaration, not a call.
+        print(f"FAIL: {v['file'].rsplit('/', 1)[-1]} implements a bound libbox interface but does not")
+        print("      return the migrated StringBox:")
+        print(f"      {v['file']}:{v['line']}  (conformance at line {v['conformance_line']})")
+        print(f"        {v['text']}")
+        print(f"      {v['owner']}.{v['method']} is declared on a bound Go INTERFACE, so the platform")
+        print("      implements it as well as Go, and its override must return the box too - it")
+        print(f"      currently returns {v['return_type']!r}.")
+        print("      The fix is to return the box: Kotlin `StringBox().apply { value = ... }`, Swift")
+        print("      `LibboxStringBox()` with its `value` set. This is a COMPILE ERROR, not a silent")
+        print("      one: the Kotlin compiler reports")
+        print("        Return type of 'fun name(): String' is not a subtype of the return type of")
+        print("        the overridden member 'fun name(): StringBox!'")
+        print("      and the Swift compiler reports")
+        print("        type '...' does not conform to protocol 'Libbox...Protocol'")
+        print("        note: protocol requires function 'name()' with type '() -> LibboxStringBox?'")
+        print("        note: candidate has non-matching type '() -> String'")
+        continue
     print(f"FAIL: {v['file'].rsplit('/', 1)[-1]} call site does not read the migrated StringBox:")
     print(f"      {v['file']}:{v['line']}")
     print(f"        {v['text']}")
@@ -312,15 +354,15 @@ PYEOF
     skipped_client_layers=$((skipped_client_layers + 1))
   }
   if [ "${iface:-0}" -gt 0 ]; then
-    # Be explicit about the limit of a call-site scan. A method on a bound Go interface is also
-    # implemented BY the platform, and that override must return StringBox too - the call-site
-    # scan cannot see it. BridgeSession.Name is exactly this case in clients/android
-    # (PlatformInterfaceWrapper.kt's RootBridgeSessionWrapper).
+    # A method on a bound Go interface is also implemented BY the platform, and that override
+    # must return StringBox too. Both halves of that are now checked: the call-site scan above
+    # for the calls, and the implementer scan inside probe-accessors.py for the declarations.
+    # The compiler agreement is still recorded per method in the contract's check column, and it
+    # is still the thing that makes the defect impossible to ship silently - Apple's
+    # BridgeServiceSession lives under `#if os(macOS) || JAILBREAK`, so an iOS-only build never
+    # compiles it and only this scan or a macOS/JAILBREAK build will say so.
     info "$iface of the contract's methods are declared on a bound Go interface, so the"
-    info "platform implements them as well and those overrides must return StringBox too."
-    info "A call-site scan cannot see an implementation; that side is verified by the client"
-    info "build (the Kotlin compiler rejects a String return) and is recorded per method in"
-    info "the contract's check column."
+    info "platform implements them as well; those declarations are scanned for the boxed result."
   fi
 }
 
