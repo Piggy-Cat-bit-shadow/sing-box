@@ -128,3 +128,31 @@ frozen SHA** — the existing Actions evidence spans several, and stitching it i
 the work order forbids.
 
 Nothing here was signed, tagged, released, or forced.
+
+## Addendum: an intermittent failure found during final verification
+
+The final full-suite run reported failures in `common/trafficsched` — the rate shaper:
+`TestNeitherLaneStarvesWhenBothAreBusy`, `TestPacedModeShapesFromTheFirstWrite`,
+`TestOversizedWriteIsChargedNotExempted`, `TestAdmittedRateMatchesTheConfiguredRate`.
+
+They are **not** reported as green and **not** reported as a regression, because neither claim is
+supported yet:
+
+- **In isolation they pass 3/3**, 107s each, at load 13.
+- They failed inside `go test ./...` at **load 56**, where the suite runs packages in parallel.
+
+So the honest statement is: these are **timing-sensitive tests that fail under full-suite parallelism
+on a loaded host**. That is a real flaky-gate problem — the project's own rule is that a wall-clock
+assertion measures the machine and not the algorithm — and it needs the same treatment the rest of
+this package got earlier: assert conserved accounting quantities rather than elapsed time.
+
+It is recorded here rather than filed away because a suite that is green only when nothing else is
+running is not a gate. It was **not** introduced by this round's changes: nothing in this round
+touches `common/trafficsched`, and its only relationship to this round is that the round's own builds
+made the host busy enough to expose it.
+
+A second contamination source is worth recording with it: an earlier run counted 74 ok instead of 76
+because a `build/` directory of gomobile-generated Go had been left in the repository root by the
+Android artifact build, and `go test ./...` walks it. Removing it restored 76. The tracked tree was
+never modified, and the same trap was hit and reported independently by the Android agent — which is
+why it is written down instead of silently cleaned.
