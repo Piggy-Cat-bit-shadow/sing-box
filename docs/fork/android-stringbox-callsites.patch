@@ -1,0 +1,64 @@
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt b/app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt
+index 92e2a2e..7ee8016 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt
+@@ -252,7 +252,7 @@ class RootServer : RootService() {
+ 
+         override fun getFileDescriptor(): ParcelFileDescriptor = ParcelFileDescriptor.fromFd(session.fileDescriptor())
+ 
+-        override fun getName(): String = session.name()
++        override fun getName(): String = session.name().value
+ 
+         override fun isInet6Active(): Boolean = session.inet6Active()
+ 
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+index fad2b8f..06460c4 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+@@ -74,13 +74,13 @@ class VPNService :
+         val inet4Address = options.inet4Address
+         while (inet4Address.hasNext()) {
+             val address = inet4Address.next()
+-            builder.addAddress(address.address(), address.prefix())
++            builder.addAddress(address.address().value, address.prefix())
+         }
+ 
+         val inet6Address = options.inet6Address
+         while (inet6Address.hasNext()) {
+             val address = inet6Address.next()
+-            builder.addAddress(address.address(), address.prefix())
++            builder.addAddress(address.address().value, address.prefix())
+         }
+ 
+         if (options.autoRoute) {
+@@ -124,7 +124,7 @@ class VPNService :
+                 if (inet4RouteAddress.hasNext()) {
+                     while (inet4RouteAddress.hasNext()) {
+                         val address = inet4RouteAddress.next()
+-                        builder.addRoute(address.address(), address.prefix())
++                        builder.addRoute(address.address().value, address.prefix())
+                     }
+                 }
+ 
+@@ -132,7 +132,7 @@ class VPNService :
+                 if (inet6RouteAddress.hasNext()) {
+                     while (inet6RouteAddress.hasNext()) {
+                         val address = inet6RouteAddress.next()
+-                        builder.addRoute(address.address(), address.prefix())
++                        builder.addRoute(address.address().value, address.prefix())
+                     }
+                 }
+             }
+diff --git a/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt b/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
+index 5ce325e..d0ad651 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
+@@ -219,7 +219,7 @@ class DashboardViewModel :
+                         val note = notes.next()
+                         notesList.add(
+                             DashboardUiState.DeprecatedNote(
+-                                message = note.message(),
++                                message = note.message().value,
+                                 migrationLink = note.migrationLink,
+                             ),
+                         )

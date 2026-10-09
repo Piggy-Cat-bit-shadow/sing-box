@@ -1,0 +1,145 @@
+diff --git a/ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift b/ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift
+index ef87115..7d8e45b 100644
+--- a/ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift
++++ b/ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift
+@@ -204,7 +204,7 @@ public struct GlobalChecksModifier: ViewModifier {
+         #if os(tvOS)
+             var state = AlertState(
+                 title: String(localized: "Deprecated Warning"),
+-                message: report.message(),
++                message: report.message()!.value,
+                 dismissButton: .cancel(String(localized: "Ok"))
+             )
+             state.onDismiss = continueChain
+@@ -213,7 +213,7 @@ public struct GlobalChecksModifier: ViewModifier {
+             if report.migrationLink.isEmpty {
+                 var state = AlertState(
+                     title: String(localized: "Deprecated Warning"),
+-                    message: report.message(),
++                    message: report.message()!.value,
+                     dismissButton: .cancel(String(localized: "Ok"))
+                 )
+                 state.onDismiss = continueChain
+@@ -221,7 +221,7 @@ public struct GlobalChecksModifier: ViewModifier {
+             } else {
+                 alert = AlertState(
+                     title: String(localized: "Deprecated Warning"),
+-                    message: report.message(),
++                    message: report.message()!.value,
+                     primaryButton: .default(String(localized: "Documentation")) {
+                         openURL(URL(string: report.migrationLink)!)
+                     },
+diff --git a/HelperService/RootHelperService.swift b/HelperService/RootHelperService.swift
+index 3bf8d59..83e32db 100644
+--- a/HelperService/RootHelperService.swift
++++ b/HelperService/RootHelperService.swift
+@@ -331,9 +331,9 @@ extension RootHelperService: RootHelperProtocol {
+         options.interface = interfaceName
+         do {
+             let (handle, session) = try bridgeSessionManager.create(owner: ObjectIdentifier(currentConnection), options: options)
+-            logger.info("createBridgeService: \(session.name(), privacy: .public)")
++            logger.info("createBridgeService: \(session.name()!.value, privacy: .public)")
+             let fileHandle = FileHandle(fileDescriptor: session.fileDescriptor(), closeOnDealloc: false)
+-            reply(fileHandle, session.name() as NSString, session.inet6Active(), handle as NSString, nil)
++            reply(fileHandle, session.name()!.value as NSString, session.inet6Active(), handle as NSString, nil)
+         } catch {
+             logger.error("createBridgeService: \(error.localizedDescription, privacy: .public)")
+             reply(nil, nil, false, nil, error as NSError)
+diff --git a/JailbreakDaemon/IOSRootHelperService.swift b/JailbreakDaemon/IOSRootHelperService.swift
+index f314cbb..7d94600 100644
+--- a/JailbreakDaemon/IOSRootHelperService.swift
++++ b/JailbreakDaemon/IOSRootHelperService.swift
+@@ -185,9 +185,9 @@ extension IOSRootHelperService: ShellHelperProtocol {
+         options.interface = interfaceName
+         do {
+             let (handle, session) = try bridgeSessionManager.create(owner: ObjectIdentifier(currentConnection), options: options)
+-            logger.info("createBridgeService: \(session.name(), privacy: .public)")
++            logger.info("createBridgeService: \(session.name()!.value, privacy: .public)")
+             let fileHandle = FileHandle(fileDescriptor: session.fileDescriptor(), closeOnDealloc: false)
+-            reply(fileHandle, session.name() as NSString, session.inet6Active(), handle as NSString, nil)
++            reply(fileHandle, session.name()!.value as NSString, session.inet6Active(), handle as NSString, nil)
+         } catch {
+             logger.error("createBridgeService: \(error.localizedDescription, privacy: .public)")
+             reply(nil, nil, false, nil, error as NSError)
+diff --git a/Library/Network/BridgeTunTracker.swift b/Library/Network/BridgeTunTracker.swift
+index 228716d..f026db6 100644
+--- a/Library/Network/BridgeTunTracker.swift
++++ b/Library/Network/BridgeTunTracker.swift
+@@ -49,7 +49,7 @@
+             let sessions = handles.compactMap { sessionsByHandle.removeValue(forKey: $0) }
+             access.unlock()
+             for session in sessions {
+-                logger.info("closing bridge \(session.name(), privacy: .public)")
++                logger.info("closing bridge \(session.name()!.value, privacy: .public)")
+                 try? session.close()
+             }
+         }
+diff --git a/Library/Network/ExtensionPlatformInterface.swift b/Library/Network/ExtensionPlatformInterface.swift
+index c9a4c61..211583d 100644
+--- a/Library/Network/ExtensionPlatformInterface.swift
++++ b/Library/Network/ExtensionPlatformInterface.swift
+@@ -62,8 +62,8 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             let ipv4AddressIterator = options.getInet4Address()!
+             while ipv4AddressIterator.hasNext() {
+                 let ipv4Prefix = ipv4AddressIterator.next()!
+-                ipv4Address.append(ipv4Prefix.address())
+-                ipv4Mask.append(ipv4Prefix.mask())
++                ipv4Address.append(ipv4Prefix.address()!.value)
++                ipv4Mask.append(ipv4Prefix.mask()!.value)
+             }
+ 
+             let ipv4Settings = NEIPv4Settings(addresses: ipv4Address, subnetMasks: ipv4Mask)
+@@ -74,7 +74,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             if inet4RouteAddressIterator.hasNext() {
+                 while inet4RouteAddressIterator.hasNext() {
+                     let ipv4RoutePrefix = inet4RouteAddressIterator.next()!
+-                    ipv4Routes.append(NEIPv4Route(destinationAddress: ipv4RoutePrefix.address(), subnetMask: ipv4RoutePrefix.mask()))
++                    ipv4Routes.append(NEIPv4Route(destinationAddress: ipv4RoutePrefix.address()!.value, subnetMask: ipv4RoutePrefix.mask()!.value))
+                 }
+             } else if autoRouteUseSubRangesByDefault {
+                 ipv4Routes.append(NEIPv4Route(destinationAddress: "1.0.0.0", subnetMask: "255.0.0.0"))
+@@ -92,7 +92,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             let inet4RouteExcludeAddressIterator = options.getInet4RouteExcludeAddress()!
+             while inet4RouteExcludeAddressIterator.hasNext() {
+                 let ipv4RoutePrefix = inet4RouteExcludeAddressIterator.next()!
+-                ipv4ExcludeRoutes.append(NEIPv4Route(destinationAddress: ipv4RoutePrefix.address(), subnetMask: ipv4RoutePrefix.mask()))
++                ipv4ExcludeRoutes.append(NEIPv4Route(destinationAddress: ipv4RoutePrefix.address()!.value, subnetMask: ipv4RoutePrefix.mask()!.value))
+             }
+             if excludeDefaultRoute, !ipv4Routes.isEmpty {
+                 if !ipv4ExcludeRoutes.contains(where: { it in
+@@ -118,7 +118,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             let ipv6AddressIterator = options.getInet6Address()!
+             while ipv6AddressIterator.hasNext() {
+                 let ipv6Prefix = ipv6AddressIterator.next()!
+-                ipv6Address.append(ipv6Prefix.address())
++                ipv6Address.append(ipv6Prefix.address()!.value)
+                 ipv6Prefixes.append(NSNumber(value: ipv6Prefix.prefix()))
+             }
+             let ipv6Settings = NEIPv6Settings(addresses: ipv6Address, networkPrefixLengths: ipv6Prefixes)
+@@ -129,7 +129,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             if inet6RouteAddressIterator.hasNext() {
+                 while inet6RouteAddressIterator.hasNext() {
+                     let ipv6RoutePrefix = inet6RouteAddressIterator.next()!
+-                    ipv6Routes.append(NEIPv6Route(destinationAddress: ipv6RoutePrefix.address(), networkPrefixLength: NSNumber(value: ipv6RoutePrefix.prefix())))
++                    ipv6Routes.append(NEIPv6Route(destinationAddress: ipv6RoutePrefix.address()!.value, networkPrefixLength: NSNumber(value: ipv6RoutePrefix.prefix())))
+                 }
+             } else if autoRouteUseSubRangesByDefault {
+                 ipv6Routes.append(NEIPv6Route(destinationAddress: "100::", networkPrefixLength: 8))
+@@ -147,7 +147,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+             let inet6RouteExcludeAddressIterator = options.getInet6RouteExcludeAddress()!
+             while inet6RouteExcludeAddressIterator.hasNext() {
+                 let ipv6RoutePrefix = inet6RouteExcludeAddressIterator.next()!
+-                ipv6ExcludeRoutes.append(NEIPv6Route(destinationAddress: ipv6RoutePrefix.address(), networkPrefixLength: NSNumber(value: ipv6RoutePrefix.prefix())))
++                ipv6ExcludeRoutes.append(NEIPv6Route(destinationAddress: ipv6RoutePrefix.address()!.value, networkPrefixLength: NSNumber(value: ipv6RoutePrefix.prefix())))
+             }
+ 
+             if excludeDefaultRoute, !ipv6Routes.isEmpty {
+@@ -173,7 +173,7 @@ public class ExtensionPlatformInterface: NSObject, LibboxPlatformInterfaceProtoc
+ 
+         if options.isHTTPProxyEnabled() {
+             let proxySettings = NEProxySettings()
+-            let proxyServer = NEProxyServer(address: options.getHTTPProxyServer(), port: Int(options.getHTTPProxyServerPort()))
++            let proxyServer = NEProxyServer(address: options.getHTTPProxyServer()!.value, port: Int(options.getHTTPProxyServerPort()))
+             proxySettings.httpServer = proxyServer
+             proxySettings.httpsServer = proxyServer
+             if systemProxyEnabled {
