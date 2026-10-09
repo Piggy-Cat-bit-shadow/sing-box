@@ -20,6 +20,39 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
+// takePacketBytes returns the next n bytes of the datagram the reader was built over as a slice of
+// that datagram, rather than as a copy, and reports the error io.ReadFull would have reported.
+//
+// The reader is a bytes.Reader over packet, so the bytes it reads are already in memory and the copy
+// io.ReadFull made was the only reason these two fields existed separately. Neither outlives this
+// function - the destination connection id is consumed by hkdf.Extract, which writes it into an
+// HMAC, and the packet-number sample by a single block encryption - and both are read from the
+// caller's datagram, which outlives every use made of them here.
+//
+// The error semantics are io.ReadFull's, not bytes.Reader.Seek's, down to the partial read: a short
+// read consumes what is there and reports io.ErrUnexpectedEOF, and a read with nothing left reports
+// io.EOF. Both call sites return on the error and never look at the bytes, but reproducing the whole
+// contract keeps this substitutable for the call it replaced.
+func takePacketBytes(reader *bytes.Reader, packet []byte, n int) ([]byte, error) {
+	offset := int(reader.Size()) - reader.Len()
+	available := reader.Len()
+	if available < n {
+		_, err := reader.Seek(int64(available), io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		if available == 0 {
+			return packet[offset:offset], io.EOF
+		}
+		return packet[offset : offset+available], io.ErrUnexpectedEOF
+	}
+	_, err := reader.Seek(int64(n), io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+	return packet[offset : offset+n], nil
+}
+
 func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, packet []byte) error {
 	reader := bytes.NewReader(packet)
 	typeByte, err := reader.ReadByte()
@@ -51,8 +84,7 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 		return E.New("bad destination connection id length")
 	}
 
-	destConnID := make([]byte, destConnIDLen)
-	_, err = io.ReadFull(reader, destConnID)
+	destConnID, err := takePacketBytes(reader, packet, int(destConnIDLen))
 	if err != nil {
 		return err
 	}
@@ -92,8 +124,7 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 		return err
 	}
 
-	pnBytes := make([]byte, aes.BlockSize)
-	_, err = io.ReadFull(reader, pnBytes)
+	pnBytes, err := takePacketBytes(reader, packet, aes.BlockSize)
 	if err != nil {
 		return err
 	}
@@ -121,6 +152,16 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 	if err != nil {
 		return err
 	}
+	// mask and nonce are the two allocations here that look like they could be stack arrays and
+	// cannot be. block is a cipher.Block and cipher is a cipher.AEAD, and handing a slice of a local
+	// array to an interface method makes the compiler move that array to the heap, so
+	// `var mask [aes.BlockSize]byte` allocates exactly what this line allocates while reading as
+	// though it did not. Measured with -gcflags=-m on this shape: "moved to heap: mask" and
+	// "moved to heap: nonce".
+	//
+	// nonce is sized from the AEAD rather than from QUIC's 12-byte nonce: qtls.AEADAESGCMTLS13
+	// wraps GCM in an xorNonceAEAD whose NonceSize is the 8-byte packet number. Either constant
+	// written out here would be wrong.
 	mask := make([]byte, aes.BlockSize)
 	block.Encrypt(mask, pnBytes)
 	newPacket := make([]byte, len(packet))
@@ -173,21 +214,18 @@ func QUICClientHello(ctx context.Context, metadata *adapter.InboundContext, pack
 	var frameType byte
 	var fragments []qCryptoFragment
 	decryptedReader := bytes.NewReader(decrypted)
-	const (
-		frameTypePadding         = 0x00
-		frameTypePing            = 0x01
-		frameTypeAck             = 0x02
-		frameTypeAck2            = 0x03
-		frameTypeCrypto          = 0x06
-		frameTypeConnectionClose = 0x1c
-	)
-	var frameTypeList []uint8
+	// The client classification below asks six questions about the frame sequence, so six facts are
+	// what gets recorded. Building the sequence itself cost a growing []uint8 and one append per
+	// frame - and a padded Initial is mostly padding, so the common packet appended more than a
+	// thousand times to answer questions about a hundredth of that - and the answers were then
+	// recovered by scanning the result twice. See frameSummary for what each field means.
+	var frames frameSummary
 	for {
 		frameType, err = decryptedReader.ReadByte()
 		if err == io.EOF {
 			break
 		}
-		frameTypeList = append(frameTypeList, frameType)
+		frames.observe(frameType)
 		switch frameType {
 		case frameTypePadding:
 			continue
@@ -311,11 +349,11 @@ find:
 	}
 	metadata.Domain = fingerprint.ServerName
 	for metadata.Client == "" {
-		if len(frameTypeList) == 1 {
+		if frames.count == 1 {
 			metadata.Client = C.ClientFirefox
 			break
 		}
-		if frameTypeList[0] == frameTypeCrypto && isZero(frameTypeList[1:]) {
+		if frames.first == frameTypeCrypto && !frames.nonZeroAfterFirst {
 			if len(fingerprint.Versions) == 2 && fingerprint.Versions[0]&ja3.GreaseBitmask == 0x0A0A &&
 				len(fingerprint.EllipticCurves) == 5 && fingerprint.EllipticCurves[0]&ja3.GreaseBitmask == 0x0A0A {
 				metadata.Client = C.ClientSafari
@@ -329,12 +367,12 @@ find:
 			}
 		}
 
-		if frameTypeList[len(frameTypeList)-1] == frameTypeCrypto && isZero(frameTypeList[:len(frameTypeList)-1]) {
+		if frames.last == frameTypeCrypto && !frames.nonZeroBeforeLast {
 			metadata.Client = C.ClientQUICGo
 			break
 		}
 
-		if count(frameTypeList, frameTypeCrypto) > 1 || count(frameTypeList, frameTypePing) > 0 {
+		if frames.cryptoCount > 1 || frames.pingCount > 0 {
 			if isQUICGo(fingerprint) {
 				metadata.Client = C.ClientQUICGo
 			} else {
@@ -350,23 +388,69 @@ find:
 	return nil
 }
 
-func isZero(slices []uint8) bool {
-	for _, slice := range slices {
-		if slice != 0 {
-			return false
-		}
-	}
-	return true
+// The QUIC frame types this sniffer distinguishes while walking an Initial packet's plaintext.
+const (
+	frameTypePadding         = 0x00
+	frameTypePing            = 0x01
+	frameTypeAck             = 0x02
+	frameTypeAck2            = 0x03
+	frameTypeCrypto          = 0x06
+	frameTypeConnectionClose = 0x1c
+)
+
+// frameSummary is everything the client classification below asks about the sequence of frame types
+// in a decrypted Initial packet, and nothing else. The sequence itself is not kept: a ClientHello
+// that padded its Initial to the datagram size arrives as one CRYPTO frame followed by a thousand
+// padding bytes, so retaining every frame type costs an allocation that grows to a kilobyte and a
+// thousand appends in order to answer six fixed questions.
+//
+// The six facts, and the questions they answer:
+//
+//	count              - whether the packet held exactly one frame;
+//	first              - whether the first frame was CRYPTO;
+//	last               - whether the last frame was CRYPTO;
+//	cryptoCount        - how many CRYPTO frames there were;
+//	pingCount          - how many PING frames there were;
+//	nonZeroAfterFirst  - whether any frame after the first was not padding;
+//	nonZeroBeforeLast  - whether any frame before the last was not padding.
+//
+// The two range facts match the isZero scans they replace, including on the degenerate ranges: with
+// a single frame there is nothing after the first or before the last, and both scans were empty and
+// therefore true.
+type frameSummary struct {
+	count             int
+	first             byte
+	last              byte
+	cryptoCount       int
+	pingCount         int
+	sawNonZero        bool
+	nonZeroAfterFirst bool
+	nonZeroBeforeLast bool
 }
 
-func count(slices []uint8, value uint8) int {
-	var times int
-	for _, slice := range slices {
-		if slice == value {
-			times++
+// observe records one frame of the sequence, in the order the frames arrived.
+func (s *frameSummary) observe(frameType byte) {
+	s.count++
+	if s.count == 1 {
+		s.first = frameType
+	} else if s.sawNonZero {
+		// A frame that was not padding has already been followed by this one, so it sits before
+		// the last frame whatever the rest of the sequence turns out to be.
+		s.nonZeroBeforeLast = true
+	}
+	if frameType != 0 {
+		s.sawNonZero = true
+		if s.count > 1 {
+			s.nonZeroAfterFirst = true
 		}
 	}
-	return times
+	s.last = frameType
+	switch frameType {
+	case frameTypeCrypto:
+		s.cryptoCount++
+	case frameTypePing:
+		s.pingCount++
+	}
 }
 
 type qCryptoFragment struct {
