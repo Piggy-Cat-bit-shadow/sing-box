@@ -61,6 +61,29 @@ jobs:
         # that the gate is broken.
         run: ./scripts/ci/test-release-artifacts.sh
 
+      - name: release ACCEPTANCE gate self-test
+        # The other half of the release question, and the half that has no network
+        # dependency at all: verify-fork-handoff.sh proves the documents agree with
+        # each other and that their coordinates resolve, which every release
+        # precondition can satisfy by writing strings. verify-release-acceptance.sh
+        # is the strict layer - it requires a completed successful run AT the frozen
+        # candidate SHA, with every required job successful and every declared
+        # artifact present with its recorded digest, and it fails CLOSED.
+        #
+        # The self-test builds 18 API snapshots: one genuinely complete one that must
+        # be ACCEPTED, and fifteen broken ones that must be REJECTED (wrong SHA,
+        # queued, in progress, failure, cancelled, a similar-looking workflow name, a
+        # skipped required job, a missing required job, a wrong artifact digest, an
+        # artifact with no digest recorded, a declared artifact that is absent, a jobs
+        # snapshot belonging to another run, a missing runs snapshot, a missing jobs
+        # snapshot, no snapshot directory) plus two proving the escape hatches are not
+        # a way through.
+        #
+        # It runs on every push for the same reason the step above does, and it needs
+        # no network and no Go: a gate that has stopped refusing bad evidence must be
+        # discovered before a release is attempted, not during one.
+        run: ./scripts/ci/verify-release-acceptance-test.sh
+
       - name: gomobile single-source check
         # `github.com/sagernet/gomobile/cmd/gomobile@v0.1.13` used to be written out
         # three times: twice in the Apple workflow and once in the Makefile. Nothing
