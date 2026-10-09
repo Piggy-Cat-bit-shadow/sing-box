@@ -3,7 +3,12 @@
 	url = https://github.com/Piggy-Cat-bit-shadow/sing-box-for-apple.git
 [submodule "clients/android"]
 	path = clients/android
-	url = https://github.com/SagerNet/sing-box-for-android.git
+	# The libbox ABI migration changes the generated Java signatures, so the client's call
+	# sites have to move with the core (see docs/fork/android-stringbox-callsites.patch). The
+	# upstream repository is not writable from here, so this points at the maintainable fork
+	# that carries them; without it a clean checkout would call the old ABI against a rebuilt
+	# libbox and fail to compile.
+	url = https://github.com/Piggy-Cat-bit-shadow/sing-box-for-android.git
 [submodule "clients/desktop"]
 	path = clients/desktop
 	url = https://github.com/SagerNet/sing-box-for-desktop.git
