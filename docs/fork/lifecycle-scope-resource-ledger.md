@@ -15,7 +15,7 @@ one that is not a false positive.
 
 | # | Allocation site | Resource | First error edge | Owner | Release | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `protocol/tun/inbound.go` `Start(StartStateStart)` — `routeRuleSet.RegisterCallback` | rule-set observer registration, per route and per exclude rule-set | `tun.New` / `NewStack` / `tunIf.Start` after registration | **was: none** → `Scope` | `releaseRouteSetCallbacks` (idempotent), registered via `scope.Add` at acquisition | **DEFECT, FIXED** (`53a3f97e8`, `f2c728d10`) |
+| 1 | `protocol/tun/inbound.go` `Start(StartStateStart)` — `routeRuleSet.RegisterCallback` | rule-set observer registration, per route and per exclude rule-set | `tun.New` / `NewStack` / `tunIf.Start` after registration | **was: none** → `Scope` | `releaseRouteSetCallbacks` (idempotent), registered via `scope.Add` at acquisition | **DEFECT, FIXED** (`53a3f97e8`, `f2c728d10`) — *callback-ownership axis only; see §5.1. The rule-set `IncRef`/`DecRef` lifetime is a **separate, still-open** finding, §5.2* |
 | 2 | `protocol/masque/server.go` `Start(StartStateInitialize)` — `device.New` | userspace/system TUN device | `tlsConfig.Start`, `device.Start`, `listener.Start`, `ListenHTTP3` in `StartStateStart` | **was: none** → `Scope` | `ServerEndpoint.Close` (now `sync.Once`-guarded), registered via `scope.Add` at acquisition | **DEFECT, FIXED** (`e3349044a`) |
 | 3 | `protocol/bridge/backend.go` `allocateIndex` | one of `bridgeMaxInstances` process-global slots | `allocateBridgeIndex` itself; later Start steps | `Scope` | `releaseIndex` (idempotent) via `scope.Add` | already correct — **tested proof added** (`6019786ae`) |
 | 4 | `protocol/tun/inbound.go` `NewInbound` — `networkManager.RegisterAutoRedirectOutputMark` | process-wide fwmark that `common/dialer` consults for every outbound socket | none — the call is the last statement of `NewInbound` | `route.NetworkManager`, which is per-Box | none needed | **NOT-APPLICABLE** — see §2 |
@@ -83,7 +83,98 @@ none.
    `releaseRouteSetCallbacks` takes the elements under the inbound's lock and calls
    `UnregisterCallback` outside it (pre-existing, preserved).
 
-## 5. S07 — the completion boundary of `Scope.Close()` (main order §5.3)
+---
+
+## 5. P0-L01 split into two sub-conclusions
+
+Item 1 in §1 was one entry covering one callback-ownership defect. The supplemental order's S01 raises
+a **second, different** question about the same code — the rule-set reference count — so `P0-L01` is
+recorded here as two sub-conclusions with their own evidence and their own status. The original defect
+text in §1, §2, §3 and §4 is **kept unchanged**; nothing below replaces it.
+
+### 5.1 `P0-L01a` — callback ownership — **FIXED (Stage A)**
+
+| | |
+| --- | --- |
+| Status | **FIXED**, tested |
+| `code_status` | `exact` |
+| `behavior_status` | `tested` |
+| `observed_at_sha` | `ef83b86819c97cbe58b0397dc74af6aca5f1859d` (integration tip) |
+| Defect (unchanged, §1 item 1) | `releaseRouteSetCallbacks` had exactly one caller, `Inbound.Close()`, which the product never calls; `Scope.Close` runs `scope.Add` entries only, so the rule-set kept an observer pointed at a torn-down `*Inbound` |
+| Fix | `scope.Add(t.releaseRouteSetCallbacksCleanup)` at the acquisition (`protocol/tun/inbound.go:457`), plus `closeAutoRedirect` so the release precedes the auto-redirect teardown |
+| Evidence pointer | `protocol/tun/inbound.go:457`, `:611`, `:626-630`, `:640-646`; tests `protocol/tun/scope_ownership_test.go`; commits `53a3f97e8`, `f2c728d10` |
+| Reverse-break proof | `TestStartRegistersReleaseBeforeAutoRedirectTeardown` fails if the ordering is reverted (3 reverse breaks recorded in the handoff) |
+| Still open on this axis | nothing at the Scope level; the device-only half is `DEVICE-ONLY-1`/`DEVICE-ONLY-4` in `upstream-sync-handoff.md` |
+
+### 5.2 `P0-L01b` — RuleSet reference lifetime (`IncRef`/`DecRef`) — **S01, FIXED in this integration**
+
+| | |
+| --- | --- |
+| Status | **FIXED and tested** — the Stage A observation below is kept verbatim as the historical record |
+| `code_status` | `exact` |
+| `behavior_status` | `tested` (old-red + new-green + 3 reverse-break controls) |
+| `artifact_status` | `n/a` |
+| `observed_at_sha` | `ef83b86819c97cbe58b0397dc74af6aca5f1859d` (the tree the defect was observed in) |
+| `fixed_in` | branch `fix/tun-ruleset-refs` @ `b361df879e557f701139d89cd62fbf2b57c31345` |
+| `integration_sha` | see `docs/fork/v016-release-candidate-manifest.md` |
+| Source | supplemental order **§S01** (external order; not committed in this tree). The finding was re-verified here against the code, and the pointers below are the in-tree evidence |
+
+**The imbalance, verified by reading the production code:**
+
+- `protocol/tun/inbound.go:422` calls `routeRuleSet.IncRef()` for every `route_address_set`
+  rule-set, and `:430` does the same for every `route_exclude_address_set` rule-set. These calls sit
+  **before** the `if t.autoRedirect != nil` branch, so they happen on every `Start`, including the
+  path where no callback is registered at all.
+- `protocol/tun/inbound.go:652-675` (`releaseRouteSetCallbacks`) unregisters the callbacks and clears
+  the stored elements — it **never calls `DecRef`**.
+- `grep -rn 'DecRef' protocol/tun/ | grep -v _test.go` returns **nothing**: the package contains no
+  production `DecRef` call at all.
+- The referenced rule-sets free their parsed rules only at refcount zero:
+  `route/rule/rule_set_remote.go:163-167` and `route/rule/rule_set_local.go:177-181` both implement
+  `Cleanup()` as `if s.refs.Load() == 0 { s.rules = nil }`, and the only caller is
+  `route/router.go:253`. A ref that is never released therefore keeps `refs > 0`.
+- The balanced shape exists elsewhere in the tree, which is what makes this an omission rather than a
+  design choice: `route/rule/rule_item_rule_set.go:31-43` (`Start`) pairs `IncRef` at `:39` with
+  `DecRef` at `:47` inside `Close` (`:45-52`), and `route/rule/rule_item_rule_set_test.go` asserts it
+  with a counting double (`TestRuleSetItemCloseReleasesRefs`).
+
+**Why the existing tests cannot see it:** the TUN package's rule-set double is
+`trackingRuleSet` in `protocol/tun/callback_lifecycle_test.go:65-66`, whose `IncRef` and `DecRef` are
+**empty function bodies**. The callback tests are therefore structurally unable to observe a
+refcount imbalance, and their passing is not evidence about this axis.
+
+**What the fix does.** `Start` no longer calls `IncRef` directly: `acquireRouteSetRef` takes the
+reference and records it in `routeRuleSetRefs` under `routeAddressSetAccess`, so a Scope that is
+already closing cannot drain a reference that was not recorded yet (or miss one that was). One
+`scope.Add(t.releaseRouteSetsCleanup)` now sits **outside** the `if t.autoRedirect != nil` branch,
+because the reference is taken on the no-auto-redirect branch too. The release is two responsibilities
+in a load-bearing order: `releaseRouteSetCallbacks` first (a registered callback reads the rules that
+the decrement is about to let the rule-set drop), then `releaseRouteSetRefs`, which drains and clears
+the record so an explicit `Inbound.Close()`, `closeAutoRedirect` and the Scope cleanup can each run
+without double-decrementing. The record is a **slice, not a set**: one rule-set configured as both a
+route and a route-exclude set is two acquisitions and needs two releases.
+
+**Evidence.**
+- Old red: the seven pairing assertions in `protocol/tun/ruleset_refs_test.go` all fail against
+  `ef83b8681` (counters stay at 1; 2 for a shared rule-set) — reference run kept at
+  `/tmp/jb/reports/S01-fullsuite.log` and the red run reproduced in a pristine worktree.
+- New green: `go test -count=1 -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...` → 76 ok / 0 FAIL;
+  `-race` over `./protocol/tun/... ./route/... ./adapter/...` ok.
+- Reverse break, three controls: dropping `releaseRouteSetRefs()` from `releaseRouteSets()` → 7 tests
+  red; moving `scope.Add` back inside the auto-redirect branch → the no-auto-redirect test red;
+  removing the record clear → the idempotency tests red (negative refs panic).
+- Real objects, not a double: `route/rule/rule_set_ref_cleanup_test.go` drives the real
+  `LocalRuleSet` (through `NewLocalRuleSet` and `Match`) and the real `RemoteRuleSet` `Cleanup()` and
+  shows the rules survive while a reference is held and are dropped once it is released.
+- The double is no longer blind: `trackingRuleSet.IncRef/DecRef` in
+  `protocol/tun/callback_lifecycle_test.go` are real counters that panic on a negative count.
+
+**Still not claimed.** Device-level behaviour is unchanged and unmeasured: no TUN was opened and no
+real rule-set refresh was driven against a live network. The `DEVICE-ONLY` rows in
+`upstream-sync-handoff.md` remain the authority for that axis.
+
+
+## 6. S07 — the completion boundary of `Scope.Close()` (main order §5.3)
 
 Stage A pinned *what* the Scope owns. This section pins *when* the owner is done, because a report
 that says "after `Box.Close()` every in-flight `Start` has terminated" is stronger than the code.
