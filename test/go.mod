@@ -214,7 +214,18 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261004070536-dc9f4ea02e02
+// Same fork revision as the root module. The nested module does NOT inherit the root's
+// replaces, and this pin used to lag one commit behind (dc9f4ea02e02, which lacks the
+// WriteOwnedBuffer first-payload ownership handoff the socks early-data path uses). A test module
+// pinned to a different revision of the code under test verifies a different object, so the two
+// are kept identical and scripts/ci/check-go-module-integrity.sh fails when they drift.
+replace github.com/sagernet/sing => github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261008194531-3af46fe99d3b
+
+// Adds the accept-loop recovery (040) and the Go stack's Start/Close handshake. Same fork
+// revision as the root module: the test module runs integration tests against the TUN stack, so
+// without this replace it linked UPSTREAM sing-tun and the Start/Close race fix under test was not
+// the code being tested. See the root go.mod for the fork's base and branch.
+replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008172655-8dde9c8cbe27
 
 replace github.com/sagernet/quic-go => github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94
 
