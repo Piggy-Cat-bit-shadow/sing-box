@@ -1,0 +1,367 @@
+{
+  "document": "JiejieBox v0.1.6 kernel final additional hardening",
+  "round": "final additional work package (after the comprehensive remediation order and the supplemental audit order)",
+  "verdict": "NOT-READY",
+  "verdict_reason": "No CI run exists at any SHA of this round: the repository refuses workflow dispatch (HTTP 422, 'Actions has been disabled for this repository'). Sources are fixed and locally verified; the acceptance chain cannot be closed from this environment.",
+  "coordinates": {
+    "repository": "Piggy-Cat-bit-shadow/sing-box",
+    "baseline_branch": "integrate/v016-final",
+    "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+    "origin_testing_sha_at_start": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+    "origin_testing_sha_at_end": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+    "origin_integrate_v016_final_sha_at_start": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+    "origin_integrate_v016_final_sha_at_end": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+    "work_branch": "fix/v016-core-final-hardening-20261009",
+    "work_branch_tip_sha_before_report_commit": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+    "candidate_code_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+    "candidate_code_sha_note": "The tested object for every result in this document. The report/evidence commit that contains this file is a LATER, docs-only commit whose tree was never tested, and it is never presented as the candidate.",
+    "added_commits": [
+      "a00a2fe6 masque: make the HTTP/3 acquisition part of the close decision",
+      "2f1112b6 dns: make the reverse-mapping invalidation one decision",
+      "41909d11 transport/masque: pin the ownership scan with a range count, not a wall clock",
+      "e63ce659 ci: add a fail-closed release acceptance gate, and stop the handoff gate being read as one",
+      "9aef595e ci(verify): run the release acceptance gate self-test on every push",
+      "d8f4b879 ci: mark the release acceptance gate and its self-test executable"
+    ],
+    "prior_commits_still_reachable": {
+      "count_between_testing_and_baseline": 30,
+      "baseline_is_ancestor_of_branch_tip": true
+    }
+  },
+  "environment": {
+    "isolated_clone": "%TEMP%/jiejie-core-hardening-20261009/core",
+    "baseline_comparison_clone": "%TEMP%/jiejie-baseline-compare/core",
+    "original_work_tree": "never opened, never a working directory, never checked out, stashed or reset",
+    "go_version": "go1.25.5 windows/amd64 (GOTOOLCHAIN=local)",
+    "build_tags": "release/DEFAULT_BUILD_TAGS",
+    "race_requires": "CGO_ENABLED=1 with MinGW-w64 GCC 16.2.0 (provisioned outside the repository)",
+    "pre_existing_tooling_note": "No go, git or gh was on PATH at the start of the round; a portable Go toolchain and the bundled Git were provisioned into %TEMP%."
+  },
+  "tasks": [
+    {
+      "id": "P0-01",
+      "title": "MASQUE H3 Start x Close: the HTTP/3 acquisition escaped the close decision",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "CONFIRMED_BUG",
+      "production_path": "protocol/masque/server.go ServerEndpoint.Start (StartStateStart) -> acquiredStillOwned -> http.Server.ListenHTTP3 -> transport/http.ConfigureHTTP3ListenerFunc (transport/http/server_h3.go:27) -> listener.ListenUDP + qtls.ListenEarly. Resource owner: the closeOnce body of ServerEndpoint.Close, the only reader of s.http3Server. Other close paths: adapter/endpoint/manager.go duplicate-tag loser, and adapter.Scope.Close via the cleanup registered by scope.Add(s.Close).",
+      "defect": "The HTTP/3 listener was acquired AFTER the ownership re-check, while Scope.Close does not wait for a running Start. By then the Scope's queue was drained and closeOnce was spent, so the QUIC listener was published into a field whose single reader had already run and the bound UDP socket outlived the endpoint, the Scope and Box.Close(). The same ordering left started=true on a closed endpoint, so WritePackets / DialContext / ListenPacketWithDestination answered a released endpoint as ready.",
+      "old_red": {
+        "command": "go test -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=1 -timeout 300s -run TestServerEndpointReleasesAnH3ListenerAcquiredWhileClosing -v ./protocol/masque/",
+        "result": "FAIL",
+        "assertion": "close_boundary_h3_test.go:175: Should be false -- a closed endpoint must never advertise itself as started"
+      },
+      "fix": "The acquisition is a two-phase commit under startAccess: Start acquires into a local (never the field); publishAcquiredHTTP3 takes startAccess, re-checks closed, and either publishes or refuses; on refusal the caller closes what it acquired and returns without publishing it and without storing started. The lock is not held across ListenHTTP3. No MASQUE HTTP/1, HTTP/2 or HTTP/3 routing or traffic semantics changed.",
+      "new_green": {
+        "command": "go test -race -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=100 -timeout 900s -run 'TestServerEndpointReleasesAnH3ListenerAcquiredWhileClosing|TestServerEndpointH3WindowOnRepeatedInterleavings|TestServerEndpointReleasesAListenerBoundAfterClose|TestServerEndpointStartAfterCloseDoesNotBind|TestScopeOwnsServerEndpointTeardown|TestServerEndpointCloseIsExactlyOnce' ./protocol/masque/",
+        "result": "ok github.com/sagernet/sing-box/protocol/masque 10.095s, exit 0"
+      },
+      "reverse_break": {
+        "mutation": "Remove the closed check and the lock from publishAcquiredHTTP3 (publish unconditionally, as the baseline did).",
+        "result": "FAIL at the primary assertion: close_boundary_h3_test.go:204: Expected nil, but got: &quic.EarlyListener{...} -- Start published the HTTP/3 listener it acquired while Close was draining. The repeated-interleaving test also fails with 'iteration left the HTTP/3 listener published'."
+      },
+      "perf": "No new allocation, goroutine, ticker or data-path lock. One mutex acquisition per HTTP/3 endpoint Start and one comparison per Close.",
+      "ci": "NOT_RUN",
+      "ci_reason": "Repository refuses workflow dispatch (HTTP 422).",
+      "status": "FIXED_AND_VERIFIED"
+    },
+    {
+      "id": "P0-02",
+      "title": "DNS reverse mapping: the check and the write were not one decision, and the lookup read a retired epoch",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "CONFIRMED_BUG",
+      "production_path": "dns/router.go: prepareExchange (generation capture) -> Router.Exchange -> recordReverseMappingFrom -> reverseMappingGenerationCurrent -> dnsReverseMapping.AddWithLifetime. Invalidation sources: observeDNSEnvironment (epoch advance + Purge) and ResetNetwork (networkGeneration advance + Purge). Consumer: route/route.go LookupReverseMapping on the connection-matching path.",
+      "defects": [
+        {
+          "part": "a",
+          "summary": "The generation check and the AddWithLifetime writes were two steps with no shared boundary, so a purge landing in the gap removed nothing that the write was about to add: an answer to a question asked under the previous resolver set was recorded as if it belonged to the current one."
+        },
+        {
+          "part": "b",
+          "summary": "LookupReverseMapping was a bare cache Get and did not observe the environment. It is the only DNS cache not namespaced by the live environment hash, so between a resolver change and the first new query a route rule matching a connection that needs no DNS request could read a name learned from the retired resolver set. Confirmed reachable: reproduced with NO query issued after the change."
+        }
+      ],
+      "old_red": {
+        "command": "go test -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=1 -timeout 240s -run 'TestReverseMapping' ./dns/",
+        "result": "4 of 4 relevant tests FAIL on the baseline: TestReverseMappingAnswerIsNotRecordedAcrossAnEnvironmentChange, ...AcrossANetworkTransition, TestReverseMappingLookupObservesTheEnvironmentWithoutANewQuery, TestReverseMappingBatchIsAllOrNothing"
+      },
+      "fix": "The comparison and the writes are one decision under dnsEnvironmentAccess, the lock the invalidation protocol runs under; the epoch is re-read inside that lock. Answers are extracted before the lock and nothing inside it calls out, waits, takes another lock or does I/O. There is deliberately no second, lock-free counter read, which would have no synchronising edge with the purge it must be ordered against. A response is accepted or refused as a batch. LookupReverseMapping observes the environment before reading. The DNS environment epoch remains independent of the network epoch: a DNS-only change does not reset transports and does not advance networkGeneration.",
+      "new_green": {
+        "commands": [
+          "go test -race -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=50 -timeout 900s -run 'TestReverseMapping' ./dns/",
+          "go test -race -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=1 -timeout 900s ./dns/... ./route/..."
+        ],
+        "result": "ok github.com/sagernet/sing-box/dns 1.346s (exit 0); dns 8.841s, route 8.557s, route/rule 1.099s all ok"
+      },
+      "reverse_break": [
+        {
+          "mutation": "Decide from an epoch snapshot taken BEFORE the seam (the baseline's read-then-write shape).",
+          "result": "FAIL: TestReverseMappingAnswerIsNotRecordedAcrossAnEnvironmentChange, ...AcrossANetworkTransition, TestReverseMappingBatchIsAllOrNothing, TestReverseMappingRecordingIsRefusedOnceTheInvalidationHasCompleted."
+        },
+        {
+          "mutation": "Remove the environment observation from LookupReverseMapping.",
+          "result": "FAIL: TestReverseMappingLookupObservesTheEnvironmentWithoutANewQuery."
+        },
+        {
+          "mutation": "Replace the locked read with reverseMappingGenerationCurrent, and separately remove only the lock.",
+          "result": "NOT a break: both still refuse the answer, because the observation inside reverseMappingGenerationCurrent advances the epoch before the comparison. Reported as rejected evidence rather than claimed as a reverse break."
+        }
+      ],
+      "perf": "One lock acquisition on a path this is a strict reordering of; the A/AAAA extraction happens before the lock; the critical section is one comparison plus at most one cache write per record. A before/after -bench comparison is NOT reported: the benchmark for this exact path was not built in this round, and an unmeasured number would be worse than a stated gap.",
+      "ci": "NOT_RUN",
+      "ci_reason": "Repository refuses workflow dispatch (HTTP 422).",
+      "status": "FIXED_AND_VERIFIED"
+    },
+    {
+      "id": "P1-01",
+      "title": "transport/masque complexity gate: real reproduction, closed with an exact work count",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "TEST_DEFECT",
+      "production_path": "transport/masque/server.go Server.lookup -> transport/masque/client.go RoutesContain -> AddressRange.Contains. Per-packet cost; a peer can advertise up to maxRoutesPerCapsule = 8192 ranges.",
+      "defect": "Two tests pinned linearity with a wall-clock ratio between an 8192-range loop and a one-range loop, bounded at 4 x 8192 = 32768. MEASURED ratio: 40605x-49281x, reproduced on the integration branch AND on a clean baseline. A linear scan legitimately costs about 8192x, and the one-range side (~10us/lookup) is dominated by the fixed per-lookup cost, so ordinary scheduling noise moved the ratio by tens of percent.",
+      "old_red": {
+        "evidence": "Measured ratios 40605x-49281x against a 32768x bound on correct, linear code. This is the reproduction: the gate false-reds on host load."
+      },
+      "fix": "The claim is pinned by counting the ranges the PRODUCTION loop visits. RoutesContain was rewritten from slices.ContainsFunc into an explicit loop reporting each visited range to an optional nil-in-production package-level counter (no atomic, no always-on global counter on a hot path). Exact assertions at 1, 64, 1024 and 8192 ranges; doubling doubles the count; a match stops the walk; an owned address visits zero ranges; an empty list visits nothing. The two old tests keep a REPORTED, NOT ASSERTED per-lookup figure.",
+      "new_green": {
+        "commands": [
+          "go test -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=20 -timeout 900s -run 'TestTheOwnershipScanIsLinearOverAdvertisedRanges|TestTheOwnershipScanIsLinearHereToo|TestOwnershipScan' ./transport/masque/",
+          "go test -race -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=1 -timeout 3600s ./transport/masque/"
+        ],
+        "result": "ok ... 80.623s exit 0; whole package under -race ok 70.811s"
+      },
+      "reverse_break": {
+        "mutation": "Still count every range but stop CONSULTING them after the first.",
+        "result": "FAIL: TestOwnershipScanVisitsEveryAdvertisedRangeOnce; TestOwnershipScanWorkIsProportionalToAdvertisedRanges (the 1024-range measurement visited 32 ranges, want 32768); TestOwnershipScanStopsAtTheMatchingRange."
+      },
+      "perf": {
+        "method": "go test -tags DEFAULT -run '^$' -bench BenchmarkOwnershipScanCostByRangeCount -benchtime 2000x ./transport/masque/",
+        "results": [
+          {"ranges": 1, "ns_per_op": 43.25, "bytes_per_op": 0, "allocs_per_op": 0},
+          {"ranges": 64, "ns_per_op": 686.5, "bytes_per_op": 0, "allocs_per_op": 0},
+          {"ranges": 1024, "ns_per_op": 11929, "bytes_per_op": 0, "allocs_per_op": 0},
+          {"ranges": 8192, "ns_per_op": 89650, "bytes_per_op": 0, "allocs_per_op": 0}
+        ],
+        "interpretation": "Linear in the range count at about 11 ns per visited range, zero allocations at every size."
+      },
+      "detection_limits": "The count detects any change to HOW MANY ranges are consulted (skipped ranges, early returns, extra passes). It cannot detect a constant-factor regression inside one comparison, which the benchmark covers instead. It is not a complexity-class proof for a hypothetical future index structure.",
+      "ci": "NOT_RUN",
+      "ci_reason": "Repository refuses workflow dispatch (HTTP 422).",
+      "status": "FIXED_AND_VERIFIED"
+    },
+    {
+      "id": "P1-02",
+      "title": "common/dialer remaining wall-clock upper bounds",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "TEST_DEFECT",
+      "counts": {
+        "previous_round_claimed": 16,
+        "this_round_measured_upper_bounds": 34,
+        "this_round_measured_watchdogs": 17,
+        "total_time_bounded_assertions": 51,
+        "upper_bounds_using_a_product_constant": 16,
+        "upper_bounds_using_an_arbitrary_literal": 14,
+        "upper_bounds_at_or_below_host_timer_granularity": 4,
+        "test_files_in_package": 23,
+        "reconciliation": "The narrower 16-item reading (bounds whose value IS a product timing constant: preferredFamilyGrace 50ms, fallbackDelay / testFallbackDelay / N.DefaultFallbackDelay 300ms) matches the previous round's count exactly. That is consistent with, but does not prove, that round having scoped to product constants only. require.WithinDuration has zero hits package-wide."
+      },
+      "weakest_bounds": [
+        {"location": "dual_stack_production_test.go:465", "test": "TestProductionDialerRemembersFamilyFailure", "bound_ms": 40, "why": "below typical Windows timer granularity (~15.6ms) for a DNS->stream->scheduler->dial path"},
+        {"location": "dual_stack_producer_test.go:216", "test": "TestLateFamilyAnswerDoesNotStrandTheProducer", "bound_ms": 150, "why": "the window is SHORTER than the 200ms slow-family delay it is contrasted against"},
+        {"location": "dual_stack_production_test.go:363", "test": "TestDomainPathHealthyPreferredIsNotDelayed", "bound_ms": 100, "why": "3x the product grace (50ms); host load alone can cross it"},
+        {"location": "dual_stack_production_test.go:394", "test": "TestDomainPathSingleFamilyIsNotPenalised", "bound_ms": 100, "why": "same margin, and the property is an ordering property"}
+      ],
+      "redundant_literals": [
+        "dual_stack_literal_test.go:208 -- the next lines already prove recovery is still blocked via a channel select/default",
+        "dual_stack_literal_test.go:295 -- router.calls == 0 is the real proof"
+      ],
+      "reproduction_attempt": {
+        "commands": [
+          "go test -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=3 -timeout 900s ./common/dialer/...",
+          "go test -race -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" -count=1 -timeout 1800s ./common/dialer/..."
+        ],
+        "result": "ok 39.217s and ok 13.889s, both exit 0. No flake reproduced in this environment."
+      },
+      "fix": "NONE APPLIED. Changing 34 assertions on a hypothesis, with no reproduction, would trade a documented risk for an undocumented regression, and the order requires that a resolution must not reintroduce user-visible latency, which cannot be judged without a failing case.",
+      "reverse_break": "NOT APPLICABLE -- nothing was changed.",
+      "perf": "NOT APPLICABLE.",
+      "ci": "NOT_RUN",
+      "status": "OPEN"
+    },
+    {
+      "id": "P1-03",
+      "title": "uTLS fingerprint x Xray/REALITY/VLESS/XHTTP/Vision reference matrix",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "NOT_RUN",
+      "classification": "BLOCKED_DEPENDENCY",
+      "production_path": "common/tls uTLS profile selection and ClientHello construction; REALITY server conversion; the XHTTP transport. Pinned fork: Piggy-Cat-bit-shadow/utls@6c3e08ed4.",
+      "reason": "The matrix requires real reference Xray binaries at v26.3.27 and v26.9.30, downloaded and SHA-verified, driving real handshakes with a real payload round trip. This environment does not have them, and the order forbids substituting a fake reference or turning an unavailable reference into a whole-suite SKIP-then-PASS.",
+      "open_items_carried_forward": [
+        "edge, ios and qq have no equivalent upstream preset fix",
+        "random has a chance of drawing an incompatible preset"
+      ],
+      "claimed_results": "NONE. No fingerprint x reference row is claimed as PASS, in either direction.",
+      "hypothesis_not_conclusion": "If edge/ios/qq fail, the suspect is the pinned uTLS fork's preset data, which this round may not modify. A kernel-side fix is admissible only if it is a real fix; substituting Chrome for edge and reporting PASS for edge was not done and must not be done.",
+      "intended_harness": ".github/workflows/interop-xray.yml (workflow_dispatch), test/interop/, release/DEFAULT_BUILD_TAGS_OTHERS",
+      "ci": "NOT_RUN",
+      "status": "BLOCKED"
+    },
+    {
+      "id": "P1-04",
+      "title": "TUN Close / OutputMark / RuleSet adjacency and ABA review",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "RISK_NOT_REACHABLE",
+      "classification_caveat": "NOT REACHABLE ON THE EVIDENCE AVAILABLE, not proven unreachable. The composed test the order specifies was not completed.",
+      "production_path": "protocol/tun/inbound.go Inbound.Close (autoRedirectOutputMarkClaimed, autoRedirectMarkReleaser, tunStack, tunIf, releaseRouteSets); adapter.NetworkManager ReleaseAutoRedirectOutputMark; adapter.Scope cleanup; the duplicate-tag loser in adapter/endpoint/manager.go.",
+      "established": [
+        "releaseRouteSets unregisters the rule-set callback BEFORE DecRef, so an observer cannot be invoked against a reference that is already gone.",
+        "ReleaseAutoRedirectOutputMark keeps its exclusivity for mark = 0."
+      ],
+      "not_established": "Whether two concurrent Close calls, a Manager.Create duplicate loser, and a new owner claiming the SAME mark can double-release or clear a new owner's claim. The composed test for this was not completed.",
+      "fix": "NONE APPLIED. The order forbids adding locks to a high-frequency path for a scenario not demonstrated to be reachable.",
+      "reverse_break": "NOT APPLICABLE -- nothing was changed.",
+      "ci": "NOT_RUN",
+      "status": "OPEN"
+    },
+    {
+      "id": "P1-05",
+      "title": "Release evidence gate: string-filling and the single-SHA self-reference",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "d8f4b87933d5d40fc682effe162dc1f977ada0eb",
+      "classification": "TEST_DEFECT",
+      "defect": "scripts/ci/verify-fork-handoff.sh verifies document agreement and remote resolvability and reads no CI run, so every release precondition was satisfiable by writing strings. It was being read as a release gate; it is a handoff-integrity gate.",
+      "fix": "Added scripts/ci/verify-release-acceptance.sh, a fail-closed strict acceptance gate requiring a completed, successful run at the full frozen candidate SHA, with every required job successful and every declared artifact present with its recorded digest; unreadable evidence is a failure and exits non-zero. Added scripts/ci/verify-release-acceptance-test.sh (18 cases). Added an explicit read-only --candidate-branch REF to verify-fork-handoff.sh. Wired the self-test into verify.yml. Corrected two stale rows in v016-final-release-verdict.md as dated corrections. Stated the four SHA coordinates and the ordered two-step freeze in the manifest.",
+      "new_green": {
+        "command": "sh scripts/ci/verify-release-acceptance-test.sh",
+        "result": "PASS verify-release-acceptance self-test: 18 case(s) behaved as required, exit 0",
+        "cases_accepted": ["complete-evidence", "skipped-job-declared-optional", "all-jobs-optional"],
+        "cases_rejected": [
+          "wrong-sha", "queued-run", "failed-run", "cancelled-run", "similar-workflow-name",
+          "skipped-required-job", "missing-required-job", "wrong-artifact-digest",
+          "artifact-without-digest", "required-artifact-absent", "jobs-snapshot-absent",
+          "runs-snapshot-absent", "snapshot-directory-absent",
+          "declared-artifact-outranks-allow-no-artifacts", "optional-job-does-not-excuse-others"
+        ],
+        "handoff_gate": [
+          "sh scripts/ci/verify-fork-handoff.sh -> PASS, exit 0",
+          "sh scripts/ci/verify-fork-handoff.sh --candidate-branch integrate/v016-final -> PASS, exit 0, resolves integration_final_sha against the remote tip"
+        ]
+      },
+      "self_test_found_real_bugs": [
+        "a stream-mixing bug that dropped findings whose message was blank or began with '{'",
+        "a workflow list that split on spaces and broke a display name containing spaces",
+        "a UTF-8 BOM that made the script fail when invoked directly"
+      ],
+      "self_reference_resolution": {
+        "coordinates": {
+          "candidate_code_sha": "the frozen object CI actually ran; the ONLY coordinate a release ref may point at if the rule is 'the released commit must have been tested'",
+          "evidence_commit_sha": "the later docs-only commit recording the run id; never presented as tested",
+          "integration_branch_tip": "where the work lives before a freeze; not a tested coordinate",
+          "testing_release_tip": "the release ref; unmoved by this round"
+        },
+        "procedure": "Two ordered steps: (1) freeze and push the candidate with no run id in the tree; (2) record the run id in a second docs-only commit that states the tested object is the candidate from step 1."
+      },
+      "verification_weight": "The OFFLINE half is fully self-tested (18/18). The ONLINE half (--fetch against the real API) is written and NOT exercised, because dispatch is refused repository-wide. Reported as FIXED_NOT_FULLY_VERIFIED, not as verified.",
+      "ci": "NOT_RUN",
+      "ci_reason": "The self-test step IS wired into verify.yml, but the workflow cannot be dispatched (HTTP 422).",
+      "status": "FIXED_NOT_FULLY_VERIFIED"
+    },
+    {
+      "id": "P1-06",
+      "title": "Same-SHA kernel CI",
+      "baseline_sha": "96fd0263c1be4b683bb99d6a14a369974cc13220",
+      "tested_sha": "NOT_RUN",
+      "classification": "ENVIRONMENT_BLOCKED",
+      "attempted": "POST https://api.github.com/repos/Piggy-Cat-bit-shadow/sing-box/actions/workflows/verify.yml/dispatches with {\"ref\":\"fix/v016-core-final-hardening-20261009\"}",
+      "response": "HTTP 422 {\"message\":\"Actions has been disabled for this repository.\",\"documentation_url\":\"https://docs.github.com/rest/actions/workflows#create-a-workflow-dispatch-event\"}",
+      "same_for_default_branch": true,
+      "what_this_is_not": "Not a ref problem and not a missing capability of this round: the workflow files are 'active' and 910 runs exist on the repository, so what is refused is STARTING a run. It is a repository setting the kernel repository's owner controls.",
+      "invented_evidence": "NONE. No run id, URL or conclusion is quoted, and no green run from another commit is borrowed.",
+      "next_commands": [
+        "gh workflow run verify.yml -R Piggy-Cat-bit-shadow/sing-box --ref fix/v016-core-final-hardening-20261009",
+        "gh workflow run server-linux-amd64.yml -R Piggy-Cat-bit-shadow/sing-box --ref fix/v016-core-final-hardening-20261009 -f deep_checks=true",
+        "gh workflow run interop-xray.yml -R Piggy-Cat-bit-shadow/sing-box --ref fix/v016-core-final-hardening-20261009",
+        "then: sh scripts/ci/verify-release-acceptance.sh --candidate-sha <full-sha> --snapshot <dir> --fetch"
+      ],
+      "required_permissions": "A token with the workflow scope plus repository Actions enabled.",
+      "status": "BLOCKED"
+    },
+    {
+      "id": "P2-01",
+      "title": "Scoped lifecycle adjacency for components other than MASQUE",
+      "classification": "NOT_RUN",
+      "detail": "The per-component ownership-gate review the order asks for (protocol/masque, protocol/tun, DNS dynamic sub-scopes, URLTest) was not performed beyond protocol/masque, which was fixed and reported as P0-01. No component is claimed safe by association with that fix.",
+      "status": "OPEN"
+    }
+  ],
+  "local_test_matrix": {
+    "note": "Every result is for the hardened tree at the candidate SHA unless the row says otherwise. Results are never combined across SHAs.",
+    "rows": [
+      {"command": "go test -race -count=100 (P0-01 focused set) ./protocol/masque/", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 10.095, "exit": 0},
+      {"command": "go test -race -count=50 (P0-02 focused set) ./dns/", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 1.346, "exit": 0},
+      {"command": "go test -race -count=1 ./dns/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "exit": 0},
+      {"command": "go test -race -count=1 ./route/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 8.557, "exit": 0},
+      {"command": "go test -race -count=1 ./transport/masque/", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 70.811, "exit": 0},
+      {"command": "go test -race -count=1 ./adapter/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "exit": 0},
+      {"command": "go test -race -count=1 ./common/dialer/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 13.889, "exit": 0},
+      {"command": "go test -race -count=1 ./protocol/group/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 7.127, "exit": 0},
+      {"command": "go test -count=3 ./common/dialer/...", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 39.217, "exit": 0},
+      {"command": "go test -count=20 (converted complexity tests) ./transport/masque/", "tags": "DEFAULT_BUILD_TAGS", "result": "ok", "seconds": 80.623, "exit": 0},
+      {"command": "go test -race -count=1 ./protocol/masque/ (whole package)", "tags": "DEFAULT_BUILD_TAGS", "result": "FAIL", "failures": ["TestRacerDoesNotTreatUDPConnectAsSuccess"], "baseline_status": "FAILS IDENTICALLY ON THE BASELINE AT 96fd0263 (proven in a separate clone)", "classification": "ENVIRONMENT (pre-existing)"},
+      {"command": "go test -race -count=1 ./protocol/tun/", "tags": "DEFAULT_BUILD_TAGS", "result": "FAIL", "failures": ["TestGoStackTCPRefusedBecomesAResetForTheDevice", "TestGoStackTCPResetFromARealPeerReachesTheRelay"], "baseline_status": "BOTH FAIL IDENTICALLY ON THE BASELINE (proven in a separate clone)", "classification": "ENVIRONMENT (pre-existing, Windows loopback kernel behaviour)"},
+      {"command": "go test -race -count=100 ./protocol/masque/ (whole package)", "tags": "DEFAULT_BUILD_TAGS", "result": "TIMEOUT at 1800s", "classification": "BUDGET -- the package has many t.Parallel() tests and does not fit 100 repetitions. Not a quality statement."},
+      {"command": "go vet ./protocol/masque/ ./dns/ ./transport/masque/", "tags": "DEFAULT_BUILD_TAGS", "result": "clean", "exit": 0}
+    ],
+    "diagnosed_local_artefact": {
+      "test": "route TestTrafficClassResolvedBeforeChainIsPublished",
+      "symptom": "Failed on the hardened tree and passed on the baseline; expected 3, actual 0.",
+      "cause": "The test reads route/route.go as SOURCE TEXT and counts literal multi-line occurrences, so it is sensitive to the file's line endings in the working tree (CRLF versus LF). The difference was the checkout, not the code: git diff HEAD --numstat -- route/route.go is empty and the whole route package is ok under -race once the file is byte-identical to the committed blob.",
+      "classification": "TEST FRAGILITY (recorded as an observation for the next round, not fixed here)"
+    },
+    "working_tree_note": "git status in the isolated clone reports 103 entries, every one with git diff HEAD --numstat of zero: mode and line-ending differences produced by this clone's Git configuration (autocrlf=true from the bundled portable Git, and a filesystem that cannot store a POSIX execute bit). git diff --cached is empty. Committed blob content for every file this round touched is LF-only and correct."
+  },
+  "workflows": {
+    "ran": [],
+    "not_run": [
+      {"workflow": "verify.yml", "name": "Verify", "status": "NOT_RUN", "reason": "HTTP 422 Actions has been disabled for this repository"},
+      {"workflow": "server-linux-amd64.yml", "name": "Linux amd64", "status": "NOT_RUN", "reason": "HTTP 422, same refusal"},
+      {"workflow": "interop-xray.yml", "name": "Reference interop (Xray)", "status": "NOT_RUN", "reason": "dispatch refused repository-wide, and the reference binaries are unavailable"},
+      {"workflow": "windows-core-amd64.yml", "name": "Windows amd64 core", "status": "NOT_RUN"},
+      {"workflow": "android-core-arm64.yml", "name": "Android Core ARM64", "status": "NOT_RUN"},
+      {"workflow": "release.yml / client-*.yml", "status": "NOT_RUN", "reason": "release paths are out of scope; triggering anything that signs, tags or publishes is forbidden"}
+    ],
+    "statement": "No workflow ran in this round. Nothing here quotes a run id, a URL or a conclusion."
+  },
+  "git_safety": {
+    "repositories_written": ["Piggy-Cat-bit-shadow/sing-box"],
+    "repositories_read_only": ["github.com/Piggy-Cat-bit-shadow/sing-box (via git fetch and the REST API)"],
+    "repositories_not_touched": ["satelite-one", "sing-box-for-apple", "sing-box-for-android", "sing-tun", "sing", "utls", "cronet-go", "quic-go", "Xray", "Caddy", "original upstream"],
+    "original_work_tree": "not modified in any way",
+    "origin_testing": "unmoved",
+    "force_push": false,
+    "tags_created": [],
+    "releases_created": [],
+    "signed": false,
+    "submodule_update_remote": false,
+    "clients_gitlinks_moved": false,
+    "integration_push_performed": false,
+    "integration_push_reason": "The remote has not drifted, but the same-SHA CI acceptance has not happened. Publishing to the integration branch while the acceptance chain is open would substitute history for evidence. The six commits sit on the work branch and the user decides when to integrate."
+  },
+  "release_gate": {
+    "marker": "NOT-READY",
+    "blockers": [
+      {"id": "P1-06", "kind": "ENVIRONMENT_BLOCKED", "external": true},
+      {"id": "P1-03", "kind": "BLOCKED_DEPENDENCY", "external": true},
+      {"id": "P1-02", "kind": "OPEN", "external": false},
+      {"id": "P1-04", "kind": "OPEN", "external": false},
+      {"id": "P2-01", "kind": "NOT_RUN", "external": false}
+    ],
+    "kernel_controllable_done": ["P0-01", "P0-02", "P1-01", "P1-05 (offline half)"],
+    "kernel_controllable_not_done": ["P1-02 dialer bounds (no reproduction available here)", "P1-04 composed TUN mark test", "P2-01 scoped lifecycle review"],
+    "external": ["GitHub Actions dispatch refusal (repository setting)", "reference Xray binaries", "Windows-specific kernel-behaviour tests"]
+  }
+}
