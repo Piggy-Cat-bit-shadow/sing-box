@@ -2,6 +2,8 @@ package box
 
 import (
 	"context"
+	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -77,15 +79,64 @@ func TestBoxCloseIsIdempotentAndRaceFree(t *testing.T) {
 
 // The first Close's error is reported to every caller, so a repeated Close does not look like a
 // clean shutdown when teardown actually failed.
+//
+// The injected error is a real teardown failure rather than a cancellation. The two are not
+// interchangeable here: Scope.Close deliberately does NOT report an already-closed or cancelled
+// cleanup as a failure, because that is the expected outcome of closing during a network transition
+// and reporting it makes an orderly shutdown look like a fault. A value chosen merely to be "some
+// error" therefore has to be one the close path is supposed to report, or the test would be
+// asserting the opposite of the contract. The cancellation case is pinned explicitly below.
 func TestBoxCloseRepeatsTheFirstResult(t *testing.T) {
+	teardownErr := errors.New("remove route: operation not permitted")
+
 	ctx := context.Background()
 	scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
 	scope.Add(func() error {
-		return context.Canceled
+		return teardownErr
 	})
 	box := &Box{ctx: ctx, scope: scope}
 
 	firstErr := box.Close()
-	require.ErrorIs(t, firstErr, context.Canceled)
-	require.ErrorIs(t, box.Close(), context.Canceled)
+	require.ErrorIs(t, firstErr, teardownErr)
+	require.ErrorIs(t, box.Close(), teardownErr)
+}
+
+// A close path that a network transition already tore down is not a failure, and a real failure
+// travelling with it still is.
+//
+// Scope.Close is a declared close context: "already closed" and "cancelled" are what closing is
+// supposed to produce, so they are filtered from the result - which is what stops an orderly
+// shutdown from reporting a fault. The filter is narrow, and this pins both halves at the Box level:
+// it must not swallow a real teardown failure, and it must not let a cancellation masquerade as one.
+func TestBoxCloseDistinguishesCancellationFromTeardownFailure(t *testing.T) {
+	t.Run("cancellation alone is not a failure", func(t *testing.T) {
+		ctx := context.Background()
+		scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
+		scope.Add(func() error { return context.Canceled })
+		scope.Add(func() error { return net.ErrClosed })
+		box := &Box{ctx: ctx, scope: scope}
+
+		require.NoError(t, box.Close(),
+			"a teardown that only observed cancellation and already-closed resources must not be "+
+				"reported as a failure")
+		require.NoError(t, box.Close(), "and the repeated result is the same")
+	})
+
+	t.Run("a real failure survives alongside a cancellation", func(t *testing.T) {
+		teardownErr := errors.New("flush cache: no space left on device")
+
+		ctx := context.Background()
+		scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
+		scope.Add(func() error { return teardownErr })
+		scope.Add(func() error { return net.ErrClosed })
+		scope.Add(func() error { return context.Canceled })
+		box := &Box{ctx: ctx, scope: scope}
+
+		closeErr := box.Close()
+		require.ErrorIs(t, closeErr, teardownErr,
+			"filtering the expected cancellation must not hide a real teardown failure")
+		require.NotErrorIs(t, closeErr, context.Canceled)
+		require.NotErrorIs(t, closeErr, net.ErrClosed)
+		require.ErrorIs(t, box.Close(), teardownErr, "and every caller sees that failure")
+	})
 }
