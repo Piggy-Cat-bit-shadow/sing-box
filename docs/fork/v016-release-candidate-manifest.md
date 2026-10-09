@@ -54,6 +54,33 @@ recorded. Writing one in advance would be inventing a fact.
    `RELEASE-READY` while a single row above is `not frozen yet`.
 4. **A freeze is reversible only by a new freeze.** Superseded values are kept in a dated history table
    below; they are never overwritten in place.
+5. **The handoff gate is a consistency gate, not an acceptance.** It proves the documents agree with
+   each other and that the coordinates resolve from the remote. It reads no CI run, so on its own it
+   cannot distinguish a real run from a written-down one. The acceptance gate is
+   `scripts/ci/verify-release-acceptance.sh`, which requires a completed successful run at the frozen
+   candidate SHA, with every required job successful and every declared artifact present with its
+   recorded digest, and which fails closed when it cannot read that evidence.
+
+## The four SHAs, and why a run id cannot live in the commit it describes
+
+| Coordinate | What it is | May it be the released commit? |
+| --- | --- | --- |
+| **candidate code SHA** | the frozen code object that CI actually ran | **yes** — and if the rule is "the released commit must have been tested", it is the only one that may |
+| **evidence commit SHA** | the later, docs-only commit that records the run id, URL and conclusion | **no** — its tree was never tested. It must never be presented as tested, and no acceptance may be stitched from it |
+| **integration branch tip SHA** | where the work lives before a freeze | no — a build coordinate, not a tested one |
+| **`testing` release tip SHA** | what a release is cut from | it is the release ref; it is not moved by this round |
+
+A run id cannot be committed into the commit it describes: the run only exists after the commit does,
+and writing the id produces a new commit with a new SHA. The resolution is the table above — freeze the
+candidate, run CI **at that SHA**, record the run id in a **later** evidence commit, and cut from the
+frozen candidate. The manifest therefore records the candidate SHA and the evidence commit separately
+and never claims they are the same object.
+
+Concretely, the freeze has two steps and they are ordered:
+
+1. freeze `release_candidate_core_sha` and push it (no run id in the tree yet);
+2. record `acceptance_ci_run` in a **second, docs-only** commit, and state in that commit that the
+   tested object is the candidate from step 1, not this commit.
 
 ## Freeze history
 

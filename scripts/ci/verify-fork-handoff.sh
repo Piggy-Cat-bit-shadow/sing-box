@@ -13,7 +13,7 @@
 #   4. a RELEASE-READY verdict is recorded in docs/fork/v016-final-release-verdict.md while any
 #      check above fails, or while the release-candidate manifest is still "not frozen yet".
 #
-# Exit codes: 0 = every check passed · 1 = at least one check failed · 2 = usage or environment error.
+# Exit codes: 0 = every check passed ? 1 = at least one check failed ? 2 = usage or environment error.
 #
 # The paths are overridable so the validator itself can be exercised against a deliberately broken
 # copy without touching the real documents:
@@ -44,6 +44,45 @@ VERDICT_MD=${VERDICT_MD:-$ROOT/docs/fork/v016-final-release-verdict.md}
 RC_MANIFEST=${RC_MANIFEST:-$ROOT/docs/fork/v016-release-candidate-manifest.md}
 REMOTE=${REMOTE:-origin}
 BRANCH=${BRANCH:-testing}
+
+# --candidate-branch <ref> is for VERIFICATION ONLY.
+#
+# The ancestry checks below resolve a recorded coordinate against the branch being verified, and the
+# default is `testing` because `testing` is the branch a release is cut from. A candidate that is
+# still on an integration branch therefore cannot be checked at all without either pushing `testing`,
+# which is never a thing to do to make a validator green, or being able to name the branch the
+# candidate actually lives on.
+#
+# It is an explicit, separate, read-only coordinate. It does NOT change the default, it does NOT
+# relax any check, and it does NOT make a release claim: the RELEASE-READY gate below still applies
+# to whatever BRANCH resolved, and it is documented in the verdict file that a passing run on an
+# integration branch is not a release acceptance.
+CANDIDATE_BRANCH=${CANDIDATE_BRANCH:-}
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--candidate-branch)
+			[ $# -ge 2 ] || die "--candidate-branch needs a ref"
+			CANDIDATE_BRANCH=$2
+			shift 2
+			;;
+		--help|-h)
+			printf 'usage: sh scripts/ci/verify-fork-handoff.sh [--candidate-branch REF]\n'
+			printf '\n'
+			printf 'Verifies the handoff twins and the remote resolvability of every recorded coordinate\n'
+			printf 'against $BRANCH (default: testing). --candidate-branch additionally resolves the\n'
+			printf 'recorded candidate and integration tip against REF, for a candidate that is still on\n'
+			printf 'an integration branch. It is read-only and relaxes nothing.\n'
+			exit 0
+			;;
+		*)
+			die "unknown argument: $1 (see --help)"
+			;;
+	esac
+done
+
+if [ -n "$CANDIDATE_BRANCH" ] && [ "$CANDIDATE_BRANCH" = "$BRANCH" ]; then
+	note "--candidate-branch is the same as BRANCH ($BRANCH); it adds nothing"
+fi
 
 [ -f "$HANDOFF_JSON" ] || die "handoff JSON not found: $HANDOFF_JSON"
 [ -f "$HANDOFF_MD" ] || die "handoff Markdown not found: $HANDOFF_MD"
@@ -199,6 +238,39 @@ if [ -n "$CANDIDATE" ]; then
 	verify_remote_sha "current_candidate_core_sha" "$CANDIDATE" "${REMOTE_TIP:-}"
 else
 	note "current_candidate_core_sha is null - no release candidate is frozen"
+fi
+
+# --- check 2b: the candidate branch, when one was named ---------------------------------------
+# A candidate that is still on an integration branch is not an ancestor of testing, so the checks
+# above cannot resolve it there. Naming the branch it lives on answers that question without touching
+# testing and without weakening anything: the coordinate still has to be a full SHA that is a real,
+# remotely-published commit, and the branch it is checked against has to exist on the remote.
+if [ -n "$CANDIDATE_BRANCH" ]; then
+	printf '\n-- candidate branch %s --\n' "$CANDIDATE_BRANCH"
+	CANDIDATE_TIP=""
+	CB_ATTEMPTS=0
+	while [ "$CB_ATTEMPTS" -lt 3 ]; do
+		CB_ATTEMPTS=$((CB_ATTEMPTS + 1))
+		if git fetch --quiet "$REMOTE" "$CANDIDATE_BRANCH" 2>/dev/null; then
+			CANDIDATE_TIP=$(git rev-parse FETCH_HEAD)
+			break
+		fi
+		if [ "$CB_ATTEMPTS" -lt 3 ]; then
+			sleep 2
+		fi
+	done
+	if [ -n "$CANDIDATE_TIP" ]; then
+		ok "git fetch $REMOTE $CANDIDATE_BRANCH -> $CANDIDATE_TIP (attempt $CB_ATTEMPTS)"
+		verify_remote_sha "integration_final_sha (on $CANDIDATE_BRANCH)" "$INTEGRATION_FINAL" "$CANDIDATE_TIP"
+		if [ -n "$CANDIDATE" ]; then
+			verify_remote_sha "current_candidate_core_sha (on $CANDIDATE_BRANCH)" "$CANDIDATE" "$CANDIDATE_TIP"
+		fi
+		note "a passing run against $CANDIDATE_BRANCH is a CANDIDATE verification. It is not a"
+		note "release acceptance: that requires scripts/ci/verify-release-acceptance.sh against the"
+		note "frozen SHA, with a completed successful run at that exact SHA."
+	else
+		fail "cannot fetch $REMOTE $CANDIDATE_BRANCH after $CB_ATTEMPTS attempts, so the candidate's remote resolvability is unproven"
+	fi
 fi
 
 # --- check 3: the twins must agree -----------------------------------------------------------
