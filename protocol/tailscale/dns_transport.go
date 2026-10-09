@@ -115,6 +115,43 @@ func (t *DNSTransport) Start(stage adapter.StartStage, scope *adapter.Scope) err
 	return nil
 }
 
+// CloseIdleConnections retires the idle reusable state of every resolver this transport owns.
+//
+// # Why this transport forwards
+//
+// The runtime resource walk reaches the owners it can enumerate: outbounds, endpoints, DNS transports
+// and the HTTP client service. This transport IS one of those - it is created through the DNS
+// transport manager's registry - but the resolvers it builds for the configuration the far end pushed
+// are created privately and are not in the manager's list. So the walk reached the wrapper and stopped
+// there, and every pooled connection a pushed DoH/DoT resolver held was skipped by the reuse boundary,
+// the memory trim and the DEEP_IDLE release. That is the same omission the HTTP client manager had.
+//
+// Forwarding is the shape protocol/vless already documents for its own transport: the walk sees the
+// owner, so an owner that wants its inner pool to participate has to hand the action down.
+//
+// # Why the retire ACTION and not the eligibility axis
+//
+// This transport has no keep-idle policy of its own - the resolvers exist because the far end pushed
+// them, and whether to hold them open is not a routing question here - so it implements
+// adapter.IdleConnectionRetirer and NOT adapter.IdleConnectionKeeper. Requiring the wider interface
+// would mean implementing a method this type has no meaning for, and that requirement is exactly how
+// the HTTP client manager stayed unreachable in every real build.
+//
+// The action is idle-only by the resolvers' own contract, and no lock is held while they are called:
+// the snapshot is taken under the read lock and released first, which is the same discipline Reset
+// already follows.
+func (t *DNSTransport) CloseIdleConnections() {
+	t.access.RLock()
+	resolvers := t.collectResolversLocked()
+	t.access.RUnlock()
+	for _, resolver := range resolvers {
+		retirer, isRetirer := resolver.(adapter.IdleConnectionRetirer)
+		if isRetirer {
+			retirer.CloseIdleConnections()
+		}
+	}
+}
+
 func (t *DNSTransport) Reset() {
 	t.access.RLock()
 	transports := t.collectResolversLocked()
