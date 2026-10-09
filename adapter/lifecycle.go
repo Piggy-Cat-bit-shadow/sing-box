@@ -58,13 +58,41 @@ type LifecycleService interface {
 	Lifecycle
 }
 
+// scopeState is the Scope's lifecycle state. It exists because Start, Add and Close are called from
+// different goroutines and the product relies on the outcome of every interleaving:
+//
+//   - A component's Start runs OUTSIDE the Scope's lock, so Close can take the cleanup queue and
+//     finish while that Start is still running. Anything the component registers afterwards would be
+//     appended to a queue nobody walks again, so Add has to know the queue is gone.
+//   - Close is exported and, as box.go notes, an embedder may call it from any goroutine while Start
+//     is still running - which the daemon deliberately allows. A second Close must therefore join the
+//     first instead of reporting SUCCESS for a teardown that has not finished.
+type scopeState uint8
+
+const (
+	// scopeOpen accepts new cleanups and new starts.
+	scopeOpen scopeState = iota
+	// scopeClosing has taken the cleanup queue and is running it. New cleanups are released
+	// immediately and new starts are refused.
+	scopeClosing
+	// scopeClosed has finished. closeErr is final.
+	scopeClosed
+)
+
 type Scope struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	logger   log.ContextLogger
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger log.ContextLogger
+
 	access   sync.Mutex
+	state    scopeState
 	cleanups []func() error
-	children map[Lifecycle]*Scope
+	// closeDone is closed when the drain the first Close started has finished. A later Close waits
+	// on it rather than returning before the result is known. It is a channel, not a goroutine: no
+	// goroutine is created to wait and none can be abandoned.
+	closeDone chan struct{}
+	closeErr  error
+	children  map[Lifecycle]*Scope
 }
 
 func NewScope(ctx context.Context, logger log.ContextLogger) *Scope {
@@ -81,10 +109,32 @@ func (s *Scope) Context() context.Context {
 	return s.ctx
 }
 
+// Add hands a cleanup to the Scope.
+//
+// While the Scope is open the cleanup is queued and runs when Close drains the queue in reverse
+// registration order.
+//
+// Once the Scope has begun closing the queue has been taken and nothing will walk it again, so the
+// cleanup runs HERE, on the caller's goroutine, before Add returns. Dropping it would leak the
+// resource it owns permanently and without a diagnostic - and the case is reachable rather than
+// theoretical: box.go allows Close to run while Start is still in flight, and every dynamic
+// sub-scope in this tree (the DNS resolvers of openvpn/openconnect/tailscale, the systemd-resolved
+// and DHCP server scopes) starts transports into a scope that another goroutine may be replacing.
+//
+// The cleanup is never run while the lock is held: it is an external Close and may take locks of its
+// own, which is a reentrancy the original code was careful to avoid as well.
 func (s *Scope) Add(cleanup func() error) {
 	s.access.Lock()
-	s.cleanups = append(s.cleanups, cleanup)
+	if s.state == scopeOpen {
+		s.cleanups = append(s.cleanups, cleanup)
+		s.access.Unlock()
+		return
+	}
 	s.access.Unlock()
+	err := cleanup()
+	if err != nil && s.logger != nil {
+		s.logger.Error("cleanup registered after close: ", err)
+	}
 }
 
 func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error {
@@ -121,20 +171,63 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 	if err != nil {
 		return E.Cause(err, stage, " ", name)
 	}
+	// The component must not report success for a Scope that was cancelled while it was starting.
+	//
+	// Close does not wait for an in-flight Start, because nothing bounds how long a component's
+	// Start may take. Whatever that component registered has already been released - Add on a
+	// closing Scope runs the cleanup immediately - so a nil return here would tell the caller a live
+	// component exists when none does, and the caller would go on to use it.
+	if ctxErr := child.Context().Err(); ctxErr != nil {
+		return E.Cause(ctxErr, stage, " ", name)
+	}
 	return nil
 }
 
+// Close releases everything the Scope owns and marks it closed.
+//
+// It is safe to call concurrently and repeatedly. The first caller cancels the context, takes the
+// cleanup queue and runs it in reverse registration order; every later caller waits for that drain
+// and returns its result. That is what makes two concurrent Closes agree: a closer that returned
+// early would report SUCCESS for a teardown that had not happened and might still fail, leaving the
+// caller unable to tell a clean close from a broken one.
+//
+// The wait is bounded by the drain itself and creates no goroutine, so there is nothing to abandon if
+// a cleanup blocks. Close is NOT reentrant from a cleanup running on the SAME Scope: such a call
+// would be waiting for the drain it is itself inside. Closing a nested Scope from a parent's cleanup
+// is the supported direction and is what every dynamic sub-scope in this tree does.
 func (s *Scope) Close() error {
 	s.access.Lock()
+	switch s.state {
+	case scopeClosed:
+		err := s.closeErr
+		s.access.Unlock()
+		return err
+	case scopeClosing:
+		done := s.closeDone
+		s.access.Unlock()
+		<-done
+		s.access.Lock()
+		err := s.closeErr
+		s.access.Unlock()
+		return err
+	}
+	s.state = scopeClosing
 	s.cancel()
 	cleanups := s.cleanups
 	s.cleanups = nil
 	s.children = nil
+	s.closeDone = make(chan struct{})
+	done := s.closeDone
 	s.access.Unlock()
 	var err error
 	for _, cleanup := range slices.Backward(cleanups) {
 		err = E.Errors(err, cleanup())
 	}
+	s.access.Lock()
+	s.closeErr = err
+	s.state = scopeClosed
+	s.access.Unlock()
+	close(done)
 	return err
 }
 
