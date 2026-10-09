@@ -102,6 +102,20 @@ func newHTTP1TestClient(t *testing.T, server *http1Server, mode string) *Client 
 
 // TestHTTP1PacketUp: the download GET goes with Connection: close, the upload
 // POSTs reuse one keep-alive connection (SPEC 104 §5.2).
+//
+// The GET is waited for before the first uplink write, and that is not
+// decoration. The dial dispatches the download GET from its own goroutine, and
+// the first Write races it into the pool: on some schedules the POST reaches an
+// idle connection first and the GET then reuses THAT connection — and because
+// the GET is correctly sent with Connection: close, the transport retires that
+// connection once the GET is on it, so the remaining POSTs legitimately need a
+// second one. Measured: `-count=200` failed, and an instrumented run caught the
+// schedule as [POST@A, GET@A(close), POST@B, POST@B]. Both outcomes are correct
+// HTTP; only one of them says anything about POST reuse, and it is the one a
+// reference produces — the reference withholds the GET response until the first
+// uplink packet, so the GET is already on its own connection by the time the
+// first POST is written. Waiting for the server to see the GET makes this test
+// measure reuse instead of the order two goroutines reached the pool.
 func TestHTTP1PacketUp(t *testing.T) {
 	server := newHTTP1Server(t)
 	client := newHTTP1TestClient(t, server, modePacketUp)
@@ -110,6 +124,7 @@ func TestHTTP1PacketUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	server.waitRequests(t, 1)
 	for range 3 {
 		if _, err := conn.Write([]byte("up")); err != nil {
 			t.Fatal(err)

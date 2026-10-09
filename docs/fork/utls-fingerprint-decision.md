@@ -81,6 +81,49 @@ This is what makes the attribution a measurement rather than a hypothesis: the F
 Safari 16.0 greetings are *not* broken in themselves, and nothing else about those scenarios
 differs between the two runs. What changed is the reference's requirement.
 
+### The gap is wider than the two names in the brief
+
+The three upstream commits add Firefox 148 and Safari 26.3. They do **not** touch Edge, iOS or
+QQBrowser, and no newer preset for those exists upstream — `refraction-networking/utls` at
+`aa6edf4` *and* at `master` both still say:
+
+```go
+HelloEdge_Auto = HelloEdge_85 // HelloEdge_106 seems to be incompatible with this library
+HelloIOS_Auto  = HelloIOS_14
+HelloQQ_Auto   = HelloQQ_11_1
+```
+
+So the exposure was measured for every name the register says lacks the hybrid share, not only for
+the two §13 names. Running the same scenario with the fingerprint swapped (a temporary edit, not a
+committed scenario) against the same Xray v26.9.30:
+
+```
+fp=edge -> --- FAIL: TestLiveInteropRealityFirefox (20.22s)   79 server REALITY rejections
+fp=ios  -> --- FAIL: TestLiveInteropRealityFirefox (20.24s)   79 server REALITY rejections
+fp=qq   -> --- FAIL: TestLiveInteropRealityFirefox (20.09s)   79 server REALITY rejections
+```
+
+with `REALITY: processed invalid connection … authentication failed or validation criteria not met`
+in the reference's log for each. The affected set is therefore
+
+| fingerprint | pinned | with the three-commit fork |
+| --- | --- | --- |
+| `firefox` | broken | **fixed** (Firefox 148) |
+| `safari` | broken | **fixed** (Safari 26.3) |
+| `edge` | broken | **still broken** — no newer preset exists upstream |
+| `ios` | broken | **still broken** — no newer preset exists upstream |
+| `qq` | broken | **still broken** — no newer preset exists upstream |
+| `random` | broken on 4 of 5 draws | broken on 2 of 5 draws |
+| `android`, `360` | cannot carry REALITY at all (no TLS 1.3 key share) | unchanged |
+| `chrome` (and its aliases, and the default) | works | works |
+| `randomized` | works (measured over a process) | works |
+
+That table is the honest scope of "GO": the fork closes the two fingerprints the brief named and
+leaves three that no available upstream preset can fix. Those three cannot be repaired by taking
+more commits, so they are not a reason to refuse the fork — they are a reason for the release notes
+to name the workaround (`fingerprint: chrome`), which is what the register test exists to keep
+true.
+
 ---
 
 ## Step 2 — confirm the dependency difference
@@ -314,3 +357,9 @@ protocol check, and it remains unperformed here.
 reference at or after Xray v26.9.8, and `chrome` or `randomized` is the workaround. That sentence,
 with this document as its evidence, is what the release notes owe a user; the register test keeps it
 from being forgotten the moment the dependency does change.
+
+**And even after the fork lands, three of them stay broken.** `edge`, `ios` and `qq` have no
+post-ML-KEM preset in any refraction revision checked (`aa6edf4`, `master`), so no amount of
+dependency pinning repairs them. For those the release note is the remedy, and the only alternative
+would be substituting a different ClientHello for the one the user asked for — which §30 forbids,
+and which would be a worse defect than the one it hides.
