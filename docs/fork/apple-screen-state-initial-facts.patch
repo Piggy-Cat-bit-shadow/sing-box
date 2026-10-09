@@ -1,0 +1,42 @@
+diff --git a/Library/Network/ScreenStateObserver.swift b/Library/Network/ScreenStateObserver.swift
+index d3e8035..e37d734 100644
+--- a/Library/Network/ScreenStateObserver.swift
++++ b/Library/Network/ScreenStateObserver.swift
+@@ -21,2 +21,37 @@
+             }
++            // The tunnel can start while the device is already locked and the display already off,
++            // and registration does not deliver a state that already exists: a Darwin dispatch
++            // registration fires on the NEXT post only, so without this read the core considers the
++            // device active until the next lock, unlock or display transition. It then permits
++            // health checks, URLTests and provider refreshes on a phone in a pocket for the whole of
++            // that period - the wake storm the device axis exists to prevent.
++            //
++            // notify_get_state DOES have the answer at registration time, so the initial facts are
++            // read once here. The read is submitted to the observer's own queue so it cannot
++            // interleave with a handler, and it re-reads the CURRENT state rather than the state at
++            // registration, so a transition that arrives first is published first and this publish
++            // simply repeats it - the governor coalesces both into one measurement.
++            //
++            // The lock fact is published first and the display fact second, which decides the one
++            // state where they disagree: a display that is off on a device that is not locked (no
++            // passcode, or the passcode-grace window) ends up PAUSED, because the display fact is
++            // applied last. That is the conservative direction and it matches the design's own
++            // residual - a display that goes off without the device locking leaves the level paused
++            // until the next unlock - rather than releasing speculation for a screen nobody is
++            // looking at.
++            //
++            // Neither publish can invent a sleep boundary. A lock with no measured sleep starts the
++            // measurement and enters the level, and its later release is the boundary; an unlock with
++            // no sleep on record publishes nothing and lifts a pause that was never entered
++            // (TestAFactWithoutASleepPublishesNothing, box_lifecycle_test.go:347).
++            queue.async {
++                var lockState: UInt64 = 0
++                if notify_get_state(self.lockToken, &lockState) == NOTIFY_STATUS_OK {
++                    commandServer.recordLockState(lockState == 1)
++                }
++                var displayState: UInt64 = 0
++                if notify_get_state(self.displayToken, &displayState) == NOTIFY_STATUS_OK {
++                    commandServer.recordScreenState(displayState == 1)
++                }
++            }
+         }
