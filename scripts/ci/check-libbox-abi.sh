@@ -89,7 +89,7 @@ PROJECT_GOMOBILE_VERSION="$(cd "$repo_root" && go list -m -f '{{.Version}}' gith
 # contains both, once that commit exists. Leaving it at 5911580a makes layer 5 PASS while layer
 # 4 FAILS, which is the intended reading: the pin is not the thing that was verified.
 VERIFIED_ANDROID_SHA="ec61030d3df74f3e7c39ab848c8996008ecd386a"
-VERIFIED_APPLE_SHA="5911580a6366da78e6b4b5b4459596e5a2cf1eb4"
+VERIFIED_APPLE_SHA="2b23330d489b9f6b45e98f903f458842e8961594"
 
 client_root=""
 skip_client=0
