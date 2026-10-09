@@ -136,9 +136,10 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
 	newestSegment := len(segments)
 	segments = append(segments, nil)
 	var payload payloadReader
-	// Held across rounds and resliced, so the aggregation is one allocation per call instead of
-	// one slice per failure per round. E.Errors may keep a reference to the slice it is handed,
-	// which is why the slice is private to this call and is not read again once returned.
+	// Held across rounds and resliced, so the failures of the round that ends the sniff cost one
+	// allocation per call instead of one slice per failure per round. E.Errors may keep a
+	// reference to the slice it is handed, which is why the slice is private to this call and is
+	// not read again once returned.
 	roundErrors := make([]error, 0, len(sniffers))
 	var sniffError error
 	for i := 0; ; i++ {
@@ -150,12 +151,35 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
 		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			if i > 0 {
+				// roundErrors still holds the last completed round's failures - this iteration
+				// has not reset it - so the aggregate the loop used to keep in sniffError is
+				// rebuilt here, once, instead of on every round.
+				sniffError = E.Errors(roundErrors...)
 				break
 			}
 			return E.Cause(err, "read payload")
 		}
 		segments[newestSegment] = buffer.Bytes()
 		roundErrors = roundErrors[:0]
+		// The retry decision is read off the round's failures directly, and E.Errors is called
+		// only on the round that ends the sniff. Intermediate rounds used to build an aggregate
+		// they immediately threw away; a fragmented ClientHello that takes eight reads paid for
+		// seven of them.
+		//
+		// The substitution is sound in the direction that matters. E.Errors drops nil arguments,
+		// flattens anything with an Unwrap() []error, de-duplicates by message and wraps what is
+		// left in a multiError, so every element it keeps is either one of these errors or a
+		// child of one: an aggregate that matches ErrNeedMoreData always has a constituent that
+		// matches too, and answering "need more data" therefore never outlives the round that
+		// produced it. The converse - a constituent that matches means the aggregate would have
+		// - holds for every error these sniffers can return, because "need more data" is a
+		// message only ErrNeedMoreData itself writes, and it is checked exhaustively in
+		// TestErrorsNeedMoreDataAgreesWithTheOrOfItsConstituents. The single shape that
+		// disagrees is an error that mimics the sentinel's message without wrapping the
+		// sentinel, which de-duplication can prefer over the real one; that case is pinned by
+		// TestPeekStreamNeedMoreDataImpostorReadsMoreRatherThanStopping, and it diverges by
+		// reading again rather than by stopping early.
+		needMore := false
 		for _, sniffer := range sniffers {
 			// Rewind rather than rebuild: every sniffer starts at offset zero of the same
 			// payload, and a sniffer that fails leaves the next one a clean cursor.
@@ -165,12 +189,12 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
 				return nil
 			}
 			roundErrors = append(roundErrors, err)
+			if errors.Is(err, ErrNeedMoreData) {
+				needMore = true
+			}
 		}
-		// Aggregated once per round instead of once per sniffer. E.Errors flattens and
-		// de-duplicates its arguments, so growing the aggregate incrementally and building it in
-		// one call produce the same error; only the intermediate allocations differ.
-		sniffError = E.Errors(roundErrors...)
-		if !errors.Is(sniffError, ErrNeedMoreData) {
+		if !needMore {
+			sniffError = E.Errors(roundErrors...)
 			break
 		}
 	}
