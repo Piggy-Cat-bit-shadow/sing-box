@@ -78,6 +78,26 @@ type Inbound struct {
 	// slice rather than a set on purpose - the same rule-set may be configured as both a route and
 	// a route-exclude set, and each acquisition needs its own release.
 	routeRuleSetRefs []adapter.RuleSet
+	// autoRedirectOutputMark is the mark this inbound claimed from the network manager, and
+	// autoRedirectOutputMarkClaimed records that it holds a claim. The claim is a resource of the
+	// manager rather than of the tun stack, so it is handed back from Close: the one path that
+	// discards an inbound without ever starting it is adapter/inbound.Manager.Create's duplicate-tag
+	// loser, which closes what the constructor built, and a mark left behind there is applied to every
+	// dial the surviving box makes.
+	autoRedirectOutputMarkClaimed bool
+	autoRedirectOutputMark        uint32
+}
+
+// autoRedirectMarkReleaser is the release half of the claim protocol, implemented by
+// route.NetworkManager.
+//
+// It is asserted rather than declared in adapter.NetworkManager on purpose: the claim is held by the
+// single implementation that owns the mark, and widening the interface would oblige every other
+// implementation - the platform ones included - to carry a method for a resource they never take. An
+// implementation that grants claims through RegisterAutoRedirectOutputMark has to provide this method
+// as well; one that never grants a claim never needs it, and the assertion is silent.
+type autoRedirectMarkReleaser interface {
+	ReleaseAutoRedirectOutputMark(mark uint32)
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -306,10 +326,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.dnsHijackByPort = inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack
 		if !usePlatformAutoRedirect && options.NetNs == "" {
-			err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMarkOrDefault())
+			mark := inbound.tunOptions.AutoRedirectOutputMarkOrDefault()
+			err = networkManager.RegisterAutoRedirectOutputMark(mark)
 			if err != nil {
 				return nil, err
 			}
+			inbound.autoRedirectOutputMark = mark
+			inbound.autoRedirectOutputMarkClaimed = true
 		}
 	}
 	return inbound, nil
@@ -624,11 +647,27 @@ func (t *Inbound) Close() error {
 	// Releasing first also means the rule-set can never fire between the teardown and the release.
 	t.releaseRouteSets()
 
-	return common.Close(
+	closeErr := common.Close(
 		t.tunStack,
 		t.tunIf,
 		t.autoRedirect,
 	)
+	// Hand the auto-redirect output mark back LAST, after the redirect that needed it is stopped.
+	//
+	// The claim is taken by the constructor and the object carrying it can be discarded before it is
+	// ever started: Manager.Create closes the inbound it built when a concurrent Create installed the
+	// same tag first. Without this the manager keeps a mark for a redirect that no longer exists and
+	// stamps it on every later dial, including the dials of the box that won the tag.
+	//
+	// The flag is cleared before the release so a second Close cannot hand the same claim back twice
+	// and clear a mark that has since been taken by a new owner.
+	if t.autoRedirectOutputMarkClaimed {
+		t.autoRedirectOutputMarkClaimed = false
+		if releaser, isReleaser := t.networkManager.(autoRedirectMarkReleaser); isReleaser {
+			releaser.ReleaseAutoRedirectOutputMark(t.autoRedirectOutputMark)
+		}
+	}
+	return closeErr
 }
 
 // acquireRouteSetRef takes one reference on ruleSet and records it for release.

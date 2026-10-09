@@ -36,26 +36,39 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
-	ctx                    context.Context
-	logger                 logger.ContextLogger
-	router                 adapter.Router
-	interfaceFinder        *control.DefaultInterfaceFinder
-	networkInterfaces      common.TypedValue[[]adapter.NetworkInterface]
-	autoDetectInterface    bool
-	defaultOptions         adapter.NetworkOptions
-	autoRedirectOutputMark uint32
-	bridgeInterfaceAccess  sync.Mutex
-	bridgeInterfaces       []string
-	networkMonitor         tun.NetworkUpdateMonitor
-	interfaceMonitor       tun.DefaultInterfaceMonitor
-	packageManager         tun.PackageManager
-	powerListener          winpowrprof.EventListener
-	pauseManager           pause.Manager
-	platformInterface      adapter.PlatformInterface
-	connectionManager      adapter.ConnectionManager
-	endpoint               adapter.EndpointManager
-	inbound                adapter.InboundManager
-	outbound               adapter.OutboundManager
+	ctx                 context.Context
+	logger              logger.ContextLogger
+	router              adapter.Router
+	interfaceFinder     *control.DefaultInterfaceFinder
+	networkInterfaces   common.TypedValue[[]adapter.NetworkInterface]
+	autoDetectInterface bool
+	defaultOptions      adapter.NetworkOptions
+	// autoRedirectOutputMark is the routing mark sing-box puts on its own egress while a TUN redirects
+	// traffic, claimed once by the inbound that owns the redirect and read on every dial.
+	//
+	// The claim is recorded separately from the value instead of being read out of it. The guard used
+	// to be "the field is non-zero", which makes a claim of zero indistinguishable from no claim at
+	// all: a second auto-redirect inbound was then admitted on top of the first, and the mark the
+	// first one's routing depends on was overwritten by whatever the second one asked for.
+	//
+	// It is read on the dial path, so it is atomic: the read has to be valid on its own rather than
+	// valid because of where in the lifecycle the writer happens to run, and a claim taken while
+	// another box in the same process dials must not be a race for the detector to find.
+	autoRedirectMarkAccess  sync.Mutex
+	autoRedirectMarkClaimed bool
+	autoRedirectOutputMark  atomic.Uint32
+	bridgeInterfaceAccess   sync.Mutex
+	bridgeInterfaces        []string
+	networkMonitor          tun.NetworkUpdateMonitor
+	interfaceMonitor        tun.DefaultInterfaceMonitor
+	packageManager          tun.PackageManager
+	powerListener           winpowrprof.EventListener
+	pauseManager            pause.Manager
+	platformInterface       adapter.PlatformInterface
+	connectionManager       adapter.ConnectionManager
+	endpoint                adapter.EndpointManager
+	inbound                 adapter.InboundManager
+	outbound                adapter.OutboundManager
 	// networkPausedSince is when the device was last seen without a default interface, in Unix
 	// nanoseconds, or 0 while it has one. See networkIsConfirmedOffline.
 	networkPausedSince      atomic.Int64
@@ -458,16 +471,47 @@ func (r *NetworkManager) DefaultOptions() adapter.NetworkOptions {
 	return r.defaultOptions
 }
 
+// RegisterAutoRedirectOutputMark claims the mark for the caller, which becomes its owner.
+//
+// Exactly one claim can exist at a time. The check and the store are one critical section: two
+// constructors running concurrently - adapter/inbound.Manager.Create runs the constructor outside the
+// lock that installs the tag, and the registry lock that happens to serialise them today is not part
+// of this contract - must not both read "unclaimed" and both store.
 func (r *NetworkManager) RegisterAutoRedirectOutputMark(mark uint32) error {
-	if r.autoRedirectOutputMark > 0 {
+	r.autoRedirectMarkAccess.Lock()
+	defer r.autoRedirectMarkAccess.Unlock()
+	if r.autoRedirectMarkClaimed {
 		return E.New("only one auto-redirect can be configured")
 	}
-	r.autoRedirectOutputMark = mark
+	r.autoRedirectMarkClaimed = true
+	r.autoRedirectOutputMark.Store(mark)
 	return nil
 }
 
+// ReleaseAutoRedirectOutputMark hands back a claim taken by RegisterAutoRedirectOutputMark.
+//
+// The owner releases when the object that made the claim is discarded. That is not a hypothetical
+// owner: adapter/inbound.Manager.Create closes the inbound it just built when another goroutine
+// installed the same tag first, and the auto-redirect inbound claims this mark as the last side
+// effect of its constructor - before the manager gets the chance to reject it. Releasing here is what
+// stops the discarded inbound's mark from being applied to every dial the surviving box makes.
+//
+// The release is matched against the claim so a stale owner cannot clear a mark that has since been
+// handed to someone else. It is deliberately NOT part of adapter.NetworkManager: the claim is held by
+// this one implementation, and an owner that only ever sees the interface must keep working without
+// the method.
+func (r *NetworkManager) ReleaseAutoRedirectOutputMark(mark uint32) {
+	r.autoRedirectMarkAccess.Lock()
+	defer r.autoRedirectMarkAccess.Unlock()
+	if !r.autoRedirectMarkClaimed || r.autoRedirectOutputMark.Load() != mark {
+		return
+	}
+	r.autoRedirectMarkClaimed = false
+	r.autoRedirectOutputMark.Store(0)
+}
+
 func (r *NetworkManager) AutoRedirectOutputMark() uint32 {
-	return r.autoRedirectOutputMark
+	return r.autoRedirectOutputMark.Load()
 }
 
 func (r *NetworkManager) RegisterBridgeInterface(interfaceName string) {
@@ -486,10 +530,11 @@ func (r *NetworkManager) BridgeInterfaces() []string {
 
 func (r *NetworkManager) AutoRedirectOutputMarkFunc() control.Func {
 	return func(network, address string, conn syscall.RawConn) error {
-		if r.autoRedirectOutputMark == 0 {
+		mark := r.autoRedirectOutputMark.Load()
+		if mark == 0 {
 			return nil
 		}
-		return control.RoutingMark(r.autoRedirectOutputMark)(network, address, conn)
+		return control.RoutingMark(mark)(network, address, conn)
 	}
 }
 
