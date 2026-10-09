@@ -5,21 +5,69 @@ touching anything it lists**, so that no commit is cherry-picked twice and no li
 rearranged a second time.
 
 A JSON twin with the same per-commit fields lives beside this file:
-`docs/fork/upstream-sync-handoff.json`.
+`docs/fork/upstream-sync-handoff.json`. **Both files are generated from the same facts**; the phase-A
+SHA they record is compared mechanically by `scripts/ci/verify-fork-handoff.sh`.
 
-## 0. Coordinates
+## 0. Fact model — orthogonal axes, not one status
+
+This document used to carry one status per row, which let "the code is present" and "the behaviour was
+tested" collapse into a single word. They are now separate fields everywhere in this file and in the
+JSON twin:
+
+| Field | Meaning |
+| --- | --- |
+| `observed_at_sha` / `observed_at_time` | the historical revision and UTC instant at which a fact was measured |
+| `integration_final_sha` | what Stage A actually pushed |
+| `current_candidate_core_sha` | the frozen release candidate; **null until the integrator genuinely freezes one** |
+| `code_status` | `exact` / `semantic` / `missing` / `adapted` / `n/a` |
+| `behavior_status` | `tested` / `fail` / `blocked` / `not_tested` |
+| `artifact_status` | an actual `sha256`, or `absent`, or `blocked` — never an intention |
+
+**Orthogonality rule.** `code_status` and `behavior_status` are independent, and a row may be
+`code_status=semantic` **and** `behavior_status=not_tested` at the same time. That combination is
+neither "done" nor "missing". A row is release-ready only when `code_status ∈ {exact, n/a}` **and**
+`behavior_status = tested` **and**, where an artifact is required, `artifact_status` is a real digest.
+
+### 0.1 Verified integration coordinates (added by the reconciliation)
+
+Three different, real, remote-fetchable coordinates. Immutable for the record — do not re-point them.
+
+```
+PHASE_A_START=912ed1efad265d8a8f56aaabcabc8f7b171c2baa
+INTEGRATION_FINAL_SHA=ef83b86819c97cbe58b0397dc74af6aca5f1859d
+PHASE_B_START=<pinned by the bookkeeping commit of docs/handoff-reconciliation; see the table below>
+```
+
+| Field | Value | Verified by |
+| --- | --- | --- |
+| `PHASE_A_START` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` | ancestor of the integration tip; `git rev-list --count` = 10 |
+| `INTEGRATION_FINAL_SHA` | `ef83b86819c97cbe58b0397dc74af6aca5f1859d` | `git ls-remote origin refs/heads/testing`; `git fetch origin testing`; `git cat-file -t` → `commit` |
+| `PHASE_B_START` | the reconciliation tree tip (the last content commit of `docs/handoff-reconciliation`; its child adds only this coordinate) | `git rev-parse`, `git ls-remote origin refs/heads/handoff-reconciliation` after the push |
+| `upstream_comparison_head` | `6afeff4c0f7123b5782f888812e96b8c82c7b699` | `git ls-remote upstream refs/heads/testing` |
+| `merge_base` | `7a3d4e4a8e71bd7fa824959efdb57b4f39738802` | `git merge-base origin/testing upstream/testing` |
+| Divergence at reconciliation | fork **1479** ahead, upstream **53** ahead | `git rev-list --left-right --count origin/testing...upstream/testing` |
+| CI runs at `INTEGRATION_FINAL_SHA` | **0** | `gh run list --commit ef83b8681…` returned `[]`; the newest run on the repo is at `e2d7ac1be`, **59 commits** behind |
+
+**No CI PASS is claimed for the integration tip.** The Actions evidence that exists is historical and
+belongs to older SHAs; `docs/fork/v016-next-round-baseline.json` lists it with its real conclusions.
+
+## 0.2 Coordinates as PHASE_A recorded them — historical, not current remote state
+
+Everything in this table is the PHASE_A working record. `fork_origin_testing`, `pushed` and
+`final_phase_a_sha` describe the state **before** integration; the verified post-integration values are
+in §0.1 and in the JSON twin's `integrated_remote_state`.
 
 | Field | Value |
 | --- | --- |
 | `PHASE_A_START` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` = `origin/testing` at the time of the work |
-| `FINAL_PHASE_A_SHA` | see §7 — the tip of `fix/lifecycle-stage1`; the integrator sets it when cherry-picking |
+| `FINAL_PHASE_A_SHA` | see §7 — the tip of `fix/lifecycle-stage1`; the integrator sets it when cherry-picking. **Now verified as `ef83b86819c97cbe58b0397dc74af6aca5f1859d`; the historical value was `null`** |
 | `PHASE_A_BASE` (last commit of A before the branch) | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` |
-| Fork `origin/testing` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` — **not moved by PHASE_A** |
+| Fork `origin/testing` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` — **not moved by PHASE_A** (historical; `origin/testing` is now `ef83b8681`) |
 | Upstream comparison HEAD | `upstream/testing` = `6afeff4c0f7123b5782f888812e96b8c82c7b699` |
 | Merge base | `7a3d4e4a8e71bd7fa824959efdb57b4f39738802` |
-| Divergence | origin 1469 ahead, upstream 53 ahead |
+| Divergence | origin 1469 ahead, upstream 53 ahead (historical; at reconciliation: fork 1479, upstream 53 — see §0.1) |
 | Branch | `fix/lifecycle-stage1` in worktree `/tmp/s1-life` |
-| Pushed | no — integrator cherry-picks with `-x` |
+| Pushed | no — integrator cherry-picks with `-x` (**re-verified at reconciliation: still true** — `refs/heads/fix/lifecycle-stage1` does not exist on `origin`; the fork had exactly one remote branch, `testing`) |
 | Build tags | `release/DEFAULT_BUILD_TAGS` (with_quic, with_dhcp, with_wireguard, with_utls, with_acme, with_clash_api, with_tailscale, with_ccm, with_ocm, with_cloudflared, with_naive_outbound, with_usbip, with_openvpn, with_openconnect, with_xhttp, badlinkname) |
 | Toolchain | `GOTOOLCHAIN=go1.25.5`, `go version go1.25.5 darwin/arm64` |
 | Submodule / gitlink changes | **none** |
@@ -41,9 +89,27 @@ changed · **DEFERRED** = a real item, explicitly handed to PHASE_B · **BLOCKED
 | `P0-L03` `Scope.Start × Close × Add` contract | **FIXED** | PHASE_A | `ffdbfa334` |
 | `P1-L05` close-path error semantics (`69601481f`) | **FIXED** | PHASE_A | `f2ea18240` |
 | `P1-L04` callbacks / watchers / DBus / background loops | **PARTIAL → PHASE_B** | PHASE_B | — |
-| `P1-L06` idle/reuse ownership (`efe4db9332`, `17e950e74c`) | **DEFERRED** | PHASE_B | — |
-| `P1-L07` on-demand resume + Apple device events (`c6d5bafa36`) | **DEFERRED / DEVICE-ONLY** | PHASE_B | — |
+| `P1-L06` idle/reuse ownership (`efe4db9332`, `17e950e74c`) | **DEFERRED** (behaviour axis; see §1.1) | PHASE_B | — |
+| `P1-L07` on-demand resume + Apple device events (`c6d5bafa36`) | **DEFERRED / DEVICE-ONLY** (behaviour axis; see §1.1) | PHASE_B | — |
 | `P2-L08` layered dynamic Scope and restart boundaries | **PARTIAL** | PHASE_A (contract) / PHASE_B (mapping) | `ffdbfa334` |
+
+### 1.1 Rows 22, 23 and 45 — the one-status reading reconciled
+
+`docs/fork/upstream-53-ledger.md` classifies rows 22 (`efe4db9332`), 23 (`17e950e74c`) and 45
+(`c6d5bafa36`) as **PATCH-EQUIVALENT / SEMANTIC-EQUIVALENT**, while the table above lists them as
+**DEFERRED**. Both are correct: they answer different questions. The ledger measured **code presence
+at the fork tip**; PHASE_A recorded **who owns validating the behaviour**. The rows are therefore
+split along the fact model of §0, and neither document's original verdict is deleted:
+
+| Row | SHA | `code_status` (presence) | `behavior_status` | Derived release status | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| 22 | `efe4db9332` | `semantic` — patch-id `fbf7738a92` reachable; the only absent line is a compile-time interface assertion the fork does not need | `not_tested` | **NOT-READY** | ledger row 22 |
+| 23 | `17e950e74c` | `semantic` — patch-id `4aaa2372cb`; 466/481 lines; the fork threads `devicePaused` + `SetKeepIdleConnections` instead of upstream's `idleFlushed` | `not_tested` | **NOT-READY** | ledger rows 23, §5.23 |
+| 45 | `c6d5bafa36` | `exact` — patch-id `dd19d1cb6c`; 19/19 lines; reverse-apply 5/5 PRESENT | `blocked` | **BLOCKED** (device-only) | ledger row 45 |
+
+So "the fork already has this code" and "nobody has validated this behaviour" are both true, and
+neither statement is allowed to overwrite the other. The same split is in the JSON twin under
+`upstream_commits[].code_presence` / `.behavior_status`.
 
 ## 2. Files touched by PHASE_A — do not re-litigate these
 
@@ -84,9 +150,9 @@ without it, listed in `docs/fork/lifecycle-scope-test-matrix.md`.
 | `69601481fd` | Ignore closed and canceled errors in scope cleanup | `adapter` | yes | yes | **ABSORBED** | `f2ea18240` | `adapter/lifecycle_error_semantics_test.go` (6 tests) | low — filter is close-scoped and expands before judging | PHASE_A |
 | `02537831e1` | Move auto-redirect and bridge index allocation out of constructors | `protocol/bridge`, `protocol/tun` | bridge: yes / tun: no | bridge: yes / tun: n/a | **PARTIAL** — bridge already present + coverage; auto-redirect `NOT-APPLICABLE`; Linux-only gate **not** absorbed | `6019786ae` (tests) | `protocol/bridge/scope_ownership_test.go` (4 tests) | none | PHASE_A |
 | `a364ff4794` | Remove unimplemented hot reload from managers | `adapter` | unknown | unknown | **NOT-APPLICABLE** to the lifecycle P0 set | — | — | — | PHASE_B |
-| `efe4db9332` | Close idle connections of unreferenced outbounds and DNS servers | `route`, `common/httpclient`, DNS transports | no | no | **DEFERRED** — real gap, deliberately not attempted | — | — | high if rushed: misclassifying an active multiplexed stream as idle | PHASE_B |
-| `17e950e74c` | Improve idle connection management | `route`, `common/httpclient` | no | no | **DEFERRED** | — | — | as above | PHASE_B |
-| `c6d5bafa36` | Fix on-demand endpoint resume | endpoints (MASQUE/OpenVPN/OpenConnect/Tailscale/WG) | not verified | not verified | **DEFERRED** | — | — | needs the endpoint suspend/resume matrix | PHASE_B |
+| `efe4db9332` | Close idle connections of unreferenced outbounds and DNS servers | `route`, `common/httpclient`, DNS transports | no | no | **DEFERRED** — real gap, deliberately not attempted · *`code_status`: `semantic` (ledger row 22, patch-id `fbf7738a92`) · `behavior_status`: `not_tested`* | — | — | high if rushed: misclassifying an active multiplexed stream as idle | PHASE_B |
+| `17e950e74c` | Improve idle connection management | `route`, `common/httpclient` | no | no | **DEFERRED** · *`code_status`: `semantic` (ledger row 23, patch-id `4aaa2372cb`) · `behavior_status`: `not_tested`* | — | — | as above | PHASE_B |
+| `c6d5bafa36` | Fix on-demand endpoint resume | endpoints (MASQUE/OpenVPN/OpenConnect/Tailscale/WG) | not verified | not verified | **DEFERRED** · *`code_status`: `exact` (ledger row 45, patch-id `dd19d1cb6c`) · `behavior_status`: `blocked` (device-only)* | — | — | needs the endpoint suspend/resume matrix | PHASE_B |
 | `6e3c86f518`, `fd26ea8578` | Use screen state to end device pause on iOS | Apple platform | n/a | already handled by the Fork's own chain | **NOT-APPLICABLE** | — | — | `screen-on != unlocked` must be preserved | PHASE_B (do not touch) |
 | `78d44d52d9` | Reset network on DNS server changes | `route`, `dns` | no | no | **OWNER: PHASE_B** (feature correctness, not lifecycle) | — | — | — | PHASE_B |
 | `df8e2edfd5` | Rework forward NAT with UDP mapping and fragment support | `route` | no | no | **OWNER: PHASE_B** | — | — | — | PHASE_B |
@@ -159,6 +225,13 @@ its message. Cherry-picking #1 alone leaves a broken ordering that
 `FINAL_PHASE_A_SHA` is the branch tip after the seven commits above **plus** the documentation commit;
 the integrator records the exact value when it cherry-picks. PHASE_B must work from the real current
 HEAD of `testing` after integration, not from any SHA written in a planning document.
+
+**Resolved (added by the reconciliation):** the integrator did cherry-pick and push. The measured
+values are `PHASE_A_START=912ed1efad265d8a8f56aaabcabc8f7b171c2baa`,
+`INTEGRATION_FINAL_SHA=ef83b86819c97cbe58b0397dc74af6aca5f1859d` (10 commits integrated) and
+`PHASE_B_START` as pinned in §0.1. The seven cherry-picks above landed as `75bba3d65`, `b6f1a0c8a`,
+`9235f90ab`, `2d475ecd4`, `9dd91d51b`, `482e4d3a8`, `1490efc57` on top of `912ed1efa`, followed by
+three documentation commits (`1331e8567`, `2aecf64eb`, `ef83b8681`).
 
 ## 8. Device-only runbook (Chinese, as required)
 
