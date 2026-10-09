@@ -141,10 +141,16 @@ func RetryThisFlow(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+	if adapter.IsCallerCancellation(err) || adapter.IsOwnTeardown(err) {
 		// The caller withdrew, or this process did. A second member cannot fix either, and
 		// retrying on a cancelled context would turn one cancelled flow into two attempts on
 		// a context that is already done.
+		//
+		// The two facts come from adapter rather than from two inline errors.Is tests so that
+		// "who ended this operation" has one answer in the tree. The policy below is unchanged and
+		// deliberately treats them the same today; they are separate facts so that they CAN be
+		// told apart - see adapter.IsCallerCancellation for why that matters to a network
+		// transition.
 		return false
 	}
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF) {

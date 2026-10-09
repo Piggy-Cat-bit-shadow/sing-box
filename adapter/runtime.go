@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"net"
 	"time"
 
 	E "github.com/sagernet/sing/common/exceptions"
@@ -29,6 +30,45 @@ var ErrResourceSuspended = E.New("resource is suspended and this caller may not 
 // not allowed to wake it".
 func IsResourceSuspended(err error) bool {
 	return E.IsMulti(err, ErrResourceSuspended)
+}
+
+// IsCallerCancellation reports whether an error means the CALLER withdrew.
+//
+// # Why this is a named fact and not an inline errors.Is
+//
+// Several subsystems need it and each one needs it for a different decision - the failover retry
+// refuses to spend the flow's alternate on it, the load-balance ledger refuses to blame a member for
+// it, a measurement refuses to record it as a result, the family scheduler refuses to call a broken
+// address family for it - and every one of those decisions has to agree about the fact or they
+// contradict each other. The decision stays with the caller; only the fact is here.
+//
+// It is deliberately NOT the same fact as IsOwnTeardown, even though several callers currently treat
+// the two the same way. A caller can stop waiting for a flow that the process did not touch, and the
+// process can tear down a flow nobody withdrew. route/dialSetupGate is the case that proves they come
+// apart: it cancels an in-flight dial because the NETWORK GENERATION moved, which reports the same
+// context.Canceled a caller cancellation does, and the failover path needs to tell them apart to
+// satisfy both "no retry after caller cancellation" and "the new generation's demand continues".
+// Merging them into one predicate would make that impossible to express later. See
+// docs/fork/v0.1.6-architecture-closure.md, known limitations.
+func IsCallerCancellation(err error) bool {
+	return E.IsMulti(err, context.Canceled)
+}
+
+// IsOwnTeardown reports whether an error means THIS PROCESS ended the operation rather than the far
+// end failing it.
+//
+// net.ErrClosed is defined as "an operation on a closed network connection", so it is a statement
+// about this side by construction: a remote close arrives as io.EOF or ECONNRESET. The transports
+// that could carry a spurious one have already normalised it away - see
+// transport/http/stream_error.go, where a quic-go fault is deliberately kept from unwrapping to
+// net.ErrClosed so a protocol violation is not reported as an ordinary teardown - so what reaches
+// here is an orderly close, a network transition closing a transport, or a group being torn down.
+//
+// On a network transition this is the fact that matters: the transition closes the members'
+// transports, so every in-flight probe fails with net.ErrClosed, and reading that as a node failure
+// deletes the health evidence of a member that was never given a chance to answer.
+func IsOwnTeardown(err error) bool {
+	return E.IsMulti(err, net.ErrClosed)
 }
 
 type backgroundProbeKey struct{}

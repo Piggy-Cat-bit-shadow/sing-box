@@ -1148,6 +1148,24 @@ func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval 
 						b.logger.Debug("outbound ", tag, " skipped: resource is idle and this probe may not wake it")
 						return nil, nil
 					}
+					if adapter.IsOwnTeardown(testErr) || adapter.IsCallerCancellation(testErr) {
+						// The measurement never happened, and not because of the node.
+						//
+						// net.ErrClosed is THIS process ending the operation: a network transition
+						// closes the members' transports, so every probe in flight across the
+						// transition fails with it, and a group close or a manual reset does the
+						// same. context.Canceled is the caller going away. Neither is a fact about
+						// the member, and both used to fall through to the branch below and DELETE
+						// its health evidence - so a device that changed networks could move the
+						// selection. That is the same mistake as waking an idle tunnel to measure
+						// it: a fact about the core read as a fact about the node.
+						//
+						// The two are kept as separate facts rather than merged into one
+						// "not measured" predicate because the failover retry has to be able to
+						// tell them apart later; see adapter.IsCallerCancellation.
+						b.logger.Debug("outbound ", tag, " not measured: ", testErr)
+						return nil, nil
+					}
 					b.logger.Debug("outbound ", tag, " unavailable: ", testErr)
 					if b.mode == TestHistoryHealth {
 						// Only this target's health result is removed. The display entry is left
