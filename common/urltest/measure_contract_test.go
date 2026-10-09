@@ -179,14 +179,15 @@ func TestLazyHandshakeDelayStaysInTheWarmUp(t *testing.T) {
 	// and it must hold without any protocol-specific branch.
 	server := newStatusServer(t, http.StatusNoContent)
 
-	conn := newDelayedFirstWriteDialer(150 * time.Millisecond)
-	delay, err := URLTest(context.Background(), server.URL+"/generate_204", conn)
-	require.NoError(t, err)
+	const firstWriteDelay = 150 * time.Millisecond
+	conn := newDelayedFirstWriteDialer(firstWriteDelay)
+	result, phases := measureWithPhases(t, context.Background(), server.URL+"/generate_204", conn)
 
-	require.Less(t, int(delay), 120,
-		"the %v first-write delay must be absorbed by the warm-up; reported %dms",
-		150*time.Millisecond, delay)
-	require.GreaterOrEqual(t, delay, uint16(1))
+	// The injected first-write delay lands in the dial and the warm-up, so the warm-up phase's own
+	// measured duration is the bound - relative to the host, not a flat constant; see
+	// measureWithPhases. The old form was `delay < 120ms` against a 150ms injected cost.
+	requireColdPathAbsorbedByTheWarmUp(t, result, phases, firstWriteDelay, "first-write")
+	require.GreaterOrEqual(t, result.Delay, uint16(1))
 }
 
 // --- fixtures --------------------------------------------------------------------------

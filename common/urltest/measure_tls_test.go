@@ -102,12 +102,12 @@ func TestHTTPSTLSColdPathStaysInTheWarmUp(t *testing.T) {
 	})
 	ctx := tlsContext(t, target.server)
 
-	result, err := Measure(ctx, MeasureOptions{Link: target.server.URL + "/generate_204"}, directDialer{})
-	require.NoError(t, err)
+	result, phases := measureWithPhases(t, ctx, target.server.URL+"/generate_204", directDialer{})
 
-	require.Less(t, int(result.Delay), int(coldPath/time.Millisecond),
-		"the reported delay must be the warm request's, not the cold TLS path's; got %dms against "+
-			"a %dms cold request", result.Delay, coldPath/time.Millisecond)
+	// The bound is the warm-up phase's own measured duration, which contains the injected cold
+	// path, rather than a flat millisecond constant: see measureWithPhases. A slow host moves the
+	// bound with the measurement instead of turning a correct decomposition red.
+	requireColdPathAbsorbedByTheWarmUp(t, result, phases, coldPath, "cold TLS response")
 	require.GreaterOrEqual(t, result.Delay, uint16(1))
 }
 

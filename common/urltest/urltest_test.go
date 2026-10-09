@@ -44,6 +44,53 @@ func measureForTest(ctx context.Context, link string, detour N.Dialer) (uint16, 
 	return result.Delay, nil
 }
 
+// measureWithPhases runs one measurement and returns it together with the phase timings the
+// measurement itself reports.
+//
+// # Why the cold-path assertions use this instead of a flat millisecond bound
+//
+// The claim "the warm-up is not counted" was written as `delay < 100ms` against a warm-up the
+// fixture holds open for 120ms. That is a wall-clock comparison between two quantities the HOST
+// also moves: on a loaded machine the measured request's own duration grows, and it can cross a
+// flat 100ms bound while the production decomposition is exactly right. Fault-injected and
+// confirmed on this tree: with `warmElapsed` changed to `time.Since(measurementStart)` all four
+// flat-bound tests go red, and so does a fixture that merely makes the MEASURED request slow
+// (150ms) with the production code untouched. A red light that a slow machine can produce is not
+// a statement about the code.
+//
+// The phase timings make the same claim as a RELATIVE comparison, and the relative form is what
+// the property actually is: the reported delay must be below the WARM-UP phase's own duration.
+// Both quantities are measured by the same clock inside the same measurement, so a slow host
+// moves them together and the margin grows with the load instead of shrinking. It is not weaker:
+// the warm-up is held open by the fixture for an injected cost, the test asserts that cost really
+// was paid, and a reported delay that absorbed it is at or above the warm-up and fails.
+func measureWithPhases(t *testing.T, ctx context.Context, link string, detour N.Dialer) (Measurement, MeasureDebug) {
+	t.Helper()
+	var phases MeasureDebug
+	result, err := Measure(ctx, MeasureOptions{
+		Link:  link,
+		Debug: func(debug MeasureDebug) { phases = debug },
+	}, detour)
+	require.NoError(t, err)
+	return result, phases
+}
+
+// requireColdPathAbsorbedByTheWarmUp asserts the relative form above.
+//
+// injected is the cost the fixture deliberately placed on the warm-up (a handler sleep, or a
+// dialer that stalls its first write); it must actually have been paid, or "the reported delay is
+// below the warm-up" would hold trivially.
+func requireColdPathAbsorbedByTheWarmUp(t *testing.T, result Measurement, phases MeasureDebug, injected time.Duration, what string) {
+	t.Helper()
+	require.GreaterOrEqual(t, int(phases.Warmup/time.Millisecond), int(injected/time.Millisecond),
+		"the fixture's %s cost (%s) must really have been paid during the warm-up phase, or the "+
+			"comparison below is vacuous; the warm-up phase measured %s", what, injected, phases.Warmup)
+	require.Less(t, int(result.Delay), int(phases.Warmup/time.Millisecond),
+		"the reported delay must be the TIMED request's time, not the warm-up's: the warm-up phase "+
+			"measured %s (including the fixture's %s %s cost) and the reported delay was %dms, which "+
+			"is at or above it", phases.Warmup, injected, what, result.Delay)
+}
+
 // requestRecord captures one observed request.
 type requestRecord struct {
 	method string
@@ -143,20 +190,19 @@ func (directDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (
 func TestFirstRequestIsWarmUpAndIsNotTimed(t *testing.T) {
 	// The first request is deliberately slow (120ms), the second fast (~0).
 	// If the warm-up leaked into the measurement the result would be at least 120ms.
+	const coldPath = 120 * time.Millisecond
 	server := newDelayServer(t, func(index int) time.Duration {
 		if index == 0 {
-			return 120 * time.Millisecond
+			return coldPath
 		}
 		return 0
 	})
 
-	delay, err := measureForTest(context.Background(), server.url(), directDialer{})
-	require.NoError(t, err)
+	result, phases := measureWithPhases(t, context.Background(), server.url(), directDialer{})
 
-	// Generous bound so CI load cannot make this flaky, while still proving the 120ms warm-up
-	// was not counted.
-	require.Less(t, int(delay), 100,
-		"the reported delay must be the SECOND request's time, not dial+warm+measure; got %dms", delay)
+	// The bound is the warm-up phase's own measured duration, not a flat constant: see
+	// measureWithPhases. A slow host moves both quantities together.
+	requireColdPathAbsorbedByTheWarmUp(t, result, phases, coldPath, "120ms cold request")
 
 	require.Equal(t, 2, server.count(),
 		"a successful measurement is exactly two requests")
@@ -165,19 +211,18 @@ func TestFirstRequestIsWarmUpAndIsNotTimed(t *testing.T) {
 func TestDelayTracksSecondRequestNotTheSum(t *testing.T) {
 	// First 80ms, second 40ms. The sum would be >=120ms; the unified result must follow the
 	// second request.
+	const coldPath = 80 * time.Millisecond
 	server := newDelayServer(t, func(index int) time.Duration {
 		if index == 0 {
-			return 80 * time.Millisecond
+			return coldPath
 		}
 		return 40 * time.Millisecond
 	})
 
-	delay, err := measureForTest(context.Background(), server.url(), directDialer{})
-	require.NoError(t, err)
+	result, phases := measureWithPhases(t, context.Background(), server.url(), directDialer{})
 
-	require.GreaterOrEqual(t, int(delay), 35, "the second request's own cost must be included")
-	require.Less(t, int(delay), 100,
-		"warm-up must not accumulate into the result; got %dms, which is near the 120ms sum", delay)
+	require.GreaterOrEqual(t, int(result.Delay), 35, "the second request's own cost must be included")
+	requireColdPathAbsorbedByTheWarmUp(t, result, phases, coldPath, "80ms cold request")
 }
 
 // --- B. both requests must share one transport (§12B) ---------------------------------
