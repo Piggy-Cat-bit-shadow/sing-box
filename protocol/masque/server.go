@@ -66,6 +66,13 @@ type ServerEndpoint struct {
 	closed      bool
 	closeOnce   sync.Once
 	closeErr    error
+	// testPublishStartedHook, when set, runs inside publishStarted after the readiness decision has
+	// been committed and startAccess has been released.
+	//
+	// It exists so a test can hold the Start side at the exact boundary the readiness window lives on
+	// and run Close to completion from the other side, which turns "the store used to happen outside
+	// the lock" from an argument into an observation. It is nil in production.
+	testPublishStartedHook func()
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEServerEndpointOptions) (adapter.Endpoint, error) {
@@ -216,15 +223,12 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 			if err != nil {
 				return err
 			}
-			if err = s.publishAcquiredHTTP3(http3Server); err != nil {
+			if err = s.publishStarted(http3Server); err != nil {
 				return E.Errors(err, http3Server.Close())
 			}
+		} else if err = s.publishStarted(nil); err != nil {
+			return err
 		}
-		// `started` is what WritePackets, DialContext and ListenPacketWithDestination gate the data
-		// path on, so it may only become true for an endpoint that still has an owner. A Start that
-		// was rejected above returns before this line: an endpoint released while it was starting must
-		// never advertise itself as ready afterwards.
-		s.started.Store(true)
 	}
 	return nil
 }
@@ -236,6 +240,10 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 // the release that follows Close's critical section is ordered after the acquisition and therefore
 // sees it, or it returns an error and Start releases what it just acquired on the spot. Neither
 // branch can leave a bound socket behind, and neither waits for anything but the lock.
+//
+// It is the cheap pre-acquisition check: it lets Start avoid acquiring at all when Close has already
+// finished. The authoritative decision is publishStarted, which makes the same comparison together
+// with the state it protects.
 func (s *ServerEndpoint) acquiredStillOwned() error {
 	s.startAccess.Lock()
 	closed := s.closed
@@ -246,29 +254,70 @@ func (s *ServerEndpoint) acquiredStillOwned() error {
 	return E.Cause(net.ErrClosed, "endpoint closed while starting")
 }
 
-// publishAcquiredHTTP3 hands a freshly acquired HTTP/3 listener to the closeOnce teardown, or refuses
-// it.
+// publishStarted is the endpoint's single readiness decision, and the last step of StartStateStart.
 //
-// This is the commit half of the acquire/commit protocol for the one resource Start acquires after
-// Close has already consumed its release list. The decision and the publication happen together under
-// startAccess, which is the same lock Close takes before it publishes `closed` and reads the field, so
-// there are exactly two possible interleavings and neither loses the resource:
+// # What it decides, in one critical section
 //
-//   - Close ran first. `closed` is visible here, nothing is published, and the caller closes the
-//     listener it just acquired. Close cannot see a value it never read.
-//   - This ran first. The value is in the field before Close reads it, and Close's release list, which
-//     is built after the publication, contains it. Start then stores `started` and reports success
-//     only from here on, and if it is not reached, the endpoint never advertises itself as ready.
+//   - the ownership check: `closed` was published by Close before it released anything, and it is
+//     read here under the same lock;
+//   - the publication of what Start acquired, if anything (the HTTP/3 listener, or nil for the
+//     H1/H2-only endpoint, which acquires nothing at this point);
+//   - the readiness flag the data path gates on: `s.started`.
 //
-// The error is net.ErrClosed-wrapped for the same reason acquiredStillOwned's is: the endpoint is
-// gone, and the caller is not being told that binding failed.
-func (s *ServerEndpoint) publishAcquiredHTTP3(http3Server io.Closer) error {
+// # Why `started` may not be stored by the caller afterwards
+//
+// It could, briefly, and that was a real defect. The previous shape was:
+//
+//	if err = s.publishAcquiredHTTP3(http3Server); err != nil { ... }   // releases the lock
+//	s.started.Store(true)                                             // OUTSIDE it
+//
+// Close takes the same lock to publish `closed` and then runs `s.started.Store(false)` outside it, so
+// the interleaving "publish, release, Close runs to completion, store true" was reachable: the
+// endpoint closed, its HTTP/3 listener released, its port free - and `started` true again afterwards.
+// `WritePackets`, `DialContext` and `ListenPacketWithDestination` gate on exactly that flag, so a
+// released endpoint answered them as if it were ready and the data path ran into a released device.
+//
+// With the store inside the critical section the two outcomes are the only ones:
+//
+//   - Close first. `closed` is visible, nothing is published, `started` stays false, the caller
+//     releases what it acquired on the spot, and it never advertises itself as ready.
+//   - This first. The publication and `started = true` are both visible before Close reads anything,
+//     and Close's own `started.Store(false)` is ordered after them, so the endpoint ends up closed.
+//
+// Restarting an already-started endpoint is refused for the same reason: the endpoint owns resources
+// whose only release is the spent closeOnce body, so a second Start that overwrote `s.http3Server`
+// would orphan the first listener. The product never does this - a component's StartStateStart runs
+// once per Scope - and a refusal makes that contract observable instead of silently destructive.
+func (s *ServerEndpoint) publishStarted(http3Server io.Closer) error {
 	s.startAccess.Lock()
-	defer s.startAccess.Unlock()
 	if s.closed {
+		s.startAccess.Unlock()
 		return E.Cause(net.ErrClosed, "endpoint closed while starting")
 	}
-	s.http3Server = http3Server
+	if s.started.Load() {
+		s.startAccess.Unlock()
+		return E.New("endpoint is already started")
+	}
+	if http3Server != nil {
+		s.http3Server = http3Server
+	}
+	s.started.Store(true)
+	s.startAccess.Unlock()
+	// The seam sits AFTER the decision has been committed and the lock has been released, which is the
+	// only place a test can hold this side open while Close runs: everything the readiness publication
+	// excludes - publishing `closed`, releasing the listener and the HTTP/3 server - takes
+	// startAccess, so a seam inside the critical section would deadlock the invalidation rather than
+	// interleave with it.
+	//
+	// It is what makes the readiness window a fact instead of a race. The window it exposes is exactly
+	// the one the baseline had: the decision is committed and the lock is free, and the statement that
+	// used to follow here - `s.started.Store(true)`, outside the lock - has not run yet. A test that
+	// stops here, runs Close to completion, and then continues observes whether the remaining work can
+	// resurrect the readiness of an endpoint that is already closed. Nil in production, where it costs
+	// one comparison per endpoint start.
+	if hook := s.testPublishStartedHook; hook != nil {
+		hook()
+	}
 	return nil
 }
 

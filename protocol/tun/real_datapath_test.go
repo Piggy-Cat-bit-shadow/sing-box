@@ -3,14 +3,12 @@ package tun
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -643,7 +641,7 @@ func TestGoStackTCPRefusedBecomesAResetForTheDevice(t *testing.T) {
 
 	dialErr := fixture.waitForDialError(t, closedPort, 3*time.Second)
 	require.Error(t, dialErr)
-	require.True(t, errors.Is(dialErr, syscall.ECONNREFUSED),
+	require.True(t, isConnectionRefused(dialErr),
 		"a connect to a closed loopback port must be refused by the kernel, got %v", dialErr)
 
 	// The reset is the whole assertion. Its acknowledgement bit is NOT asserted: a reset generated in
@@ -702,7 +700,7 @@ func TestGoStackTCPResetFromARealPeerReachesTheRelay(t *testing.T) {
 
 	downloadErr := fixture.waitForDownloadError(t, listenPort, 3*time.Second)
 	require.Error(t, downloadErr)
-	require.True(t, errors.Is(downloadErr, syscall.ECONNRESET),
+	require.True(t, isConnectionReset(downloadErr),
 		"a peer that closes with SO_LINGER 0 must produce a kernel RST, got %v", downloadErr)
 }
 

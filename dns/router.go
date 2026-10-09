@@ -100,6 +100,14 @@ type Router struct {
 	// a test drives the invalidation through the router's own entry points rather than through a
 	// reimplementation of them.
 	testReverseMappingRecordHook func(answers []reverseMappingAnswer, generation uint64)
+	// testReverseMappingComparisonHook, when set, runs inside commitReverseMappingAnswers immediately
+	// after the epoch comparison has been evaluated and while dnsEnvironmentAccess is still held.
+	//
+	// It exists so a test can hold the commit side open at the exact point where the counter could be
+	// read in two pieces - the network epoch advanced, the purge not yet run - and drive a real
+	// ResetNetwork from the other side, which turns that window from an argument into an observation.
+	// Nil in production, where it costs one nil comparison per recorded response.
+	testReverseMappingComparisonHook func(captured, current uint64)
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -1561,13 +1569,32 @@ func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, gen
 		hook(answers, generation)
 	}
 	r.dnsEnvironmentAccess.Lock()
-	defer r.dnsEnvironmentAccess.Unlock()
-	if generation != r.dnsGenerationLocked() {
+	comparison := r.dnsGenerationLocked()
+	// The second seam sits AFTER the comparison has been evaluated and while the critical section is
+	// still held, which is the only way to hold open the window that ResetNetwork's generation bump
+	// used to leave.
+	//
+	// The window was not between two lock acquisitions - the comparison and the writes were already
+	// one critical section - it was inside the counter itself: ResetNetwork advanced
+	// networkGeneration with a plain atomic add that took no lock, so a comparison could read the NEW
+	// value while the purge that belongs to it had not run yet. A capture evaluated there matched, and
+	// its answer - asked for under the network being left - was written after a purge that had not
+	// happened yet and before the one that would remove it. A seam that stops after the comparison
+	// therefore observes exactly the state that combination produced.
+	//
+	// It is a test seam, not a model: it reports the value the comparison produced and lets a test run
+	// a real ResetNetwork from the other side. Nil in production.
+	if hook := r.testReverseMappingComparisonHook; hook != nil {
+		hook(generation, comparison)
+	}
+	if generation != comparison {
+		r.dnsEnvironmentAccess.Unlock()
 		return
 	}
 	for _, answer := range answers {
 		r.dnsReverseMapping.AddWithLifetime(answer.address, answer.domain, answer.lifetime)
 	}
+	r.dnsEnvironmentAccess.Unlock()
 }
 
 func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeContext, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, adapter.DNSTransport, error) {
@@ -1808,13 +1835,28 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 	}
 }
 
+// ClearCache drops every cached DNS answer, including the reverse mapping.
+//
+// The reverse-mapping purge is performed under dnsEnvironmentAccess, which is the third invalidation
+// source and the only one that advances no epoch at all. It therefore has nothing else to order it
+// against a concurrent commit: the commit holds this lock across its epoch comparison and its writes,
+// so a purge taken outside it can land in the middle of that critical section and be undone by the
+// write that follows - an entry surviving a completed ClearCache. Taking the lock makes the two
+// mutually exclusive, so either the purge runs first and the commit's own comparison decides (it
+// still matches, so the answer is written and stays: a cache clear is not an epoch change and does not
+// retire an in-flight answer), or the commit completes first and this purge removes what it wrote.
+//
+// The lock covers the purge only. Nothing else in this function touches the reverse mapping, and no
+// platform call is made while it is held.
 func (r *Router) ClearCache() {
 	r.client.ClearCache()
 	if r.platformInterface != nil {
 		r.platformInterface.ClearDNSCache()
 	}
 	if r.dnsReverseMapping != nil {
+		r.dnsEnvironmentAccess.Lock()
 		r.dnsReverseMapping.Purge()
+		r.dnsEnvironmentAccess.Unlock()
 	}
 }
 
@@ -1847,24 +1889,71 @@ func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
 	if r.dnsReverseMapping == nil {
 		return "", false
 	}
-	r.observeDNSEnvironment()
+	// The observation and the read are ONE critical section.
+	//
+	// Observing first and reading afterwards is not the same guarantee: an invalidation that completes
+	// between the two - observeDNSEnvironment's advance and purge, or ResetNetwork's - leaves this
+	// read looking at a cache the invalidation has already retired, and the caller cannot tell. Holding
+	// dnsEnvironmentAccess across both makes the pair atomic against exactly those steps, because they
+	// are the ones that perform their advance and their purge under this same lock.
+	//
+	// The lock covers the observation and one cache read and nothing else: no transport reset, no DNS
+	// query, no I/O, no callback, and nothing that can re-enter this router.
+	r.dnsEnvironmentAccess.Lock()
+	defer r.dnsEnvironmentAccess.Unlock()
+	r.observeDNSEnvironmentLocked()
 	domain, loaded := r.dnsReverseMapping.Get(ip)
 	return domain, loaded
 }
 
 func (r *Router) ResetNetwork() {
-	// The generation advances FIRST, making this a barrier from its very first instruction.
+	// The epoch and the reverse mapping's retirement are ONE step, and that is the ordering this
+	// function's barrier semantics require.
 	//
-	// It used to advance last, after the transports were reset and the reverse mapping purged. That
-	// left the window this ordering exists to close: a request issued before the reset still carried
-	// the pre-reset generation, still compared equal to the still-current pre-reset value, and was
-	// therefore accepted - refilling the cache the purge had just cleared with a name learned on the
-	// network being left.
+	// # Why the advance and the purge belong together
 	//
-	// Advancing first means every capture taken before the reset is stale the moment it begins, and
-	// the purge below then removes whatever those captures had already written. The two steps are one
-	// barrier rather than two independent operations.
+	// Advancing first is what makes every capture taken before the reset stale - a request in flight
+	// compared its captured generation against the still-current value and was accepted, refilling the
+	// cache the purge had just cleared. But advancing first is only half of it: the purge is the other
+	// half, and while the two were separate steps a capture taken between them was accepted into a
+	// cache whose purge was still pending.
+	//
+	// That interleaving is real and the commit cannot defend against it on its own. The commit holds
+	// dnsEnvironmentAccess across its comparison and its writes, so an invalidation either completes
+	// before the comparison (nothing is written) or starts after the writes (the purge removes them).
+	// The gap's generation bump, however, is a plain atomic add that takes no lock, so a capture read
+	// between the bump and the purge saw the NEW counter value and matched it - and its answer, asked
+	// for under the network being left, landed in the cache after the purge that was supposed to retire
+	// it. Moving the purge next to the advance, under dnsEnvironmentAccess, closes that: the commit's
+	// comparison and this pair are now mutually exclusive, so a capture that matched before the pair
+	// has its write purged by it, and a capture that reads after the pair belongs to the new network.
+	//
+	// # What deliberately did NOT change
+	//
+	// The observable order the reset promises is preserved: the epoch advances FIRST, so the barrier
+	// holds from its first instruction; the transports are reset AFTER it; the environment is re-pinned
+	// after that. The purge moved from the end of the function to sit with the advance, which is still
+	// after the barrier and still before any query can be answered on the new network - and it cannot
+	// discard anything the reset was going to keep, because nothing in this function writes to the
+	// reverse mapping.
+	//
+	// The lock is held for the two steps only. It is NOT held across transport.Reset(), across
+	// refreshTransportEnvironments(), or across anything else that leaves this file: those are exactly
+	// the calls the lock must never cover.
+	r.dnsEnvironmentAccess.Lock()
 	r.networkGeneration.Add(1)
+	if r.dnsReverseMapping != nil {
+		// The reverse mapping is a cache of what previous answers said an address meant, and a network
+		// change is exactly when that may no longer hold: with split-horizon or captive-portal DNS the
+		// same address can mean a different name on the new network. Leaving entries behind lets a
+		// stale name participate in route rule matching until its DNS TTL expires.
+		//
+		// Nothing depends on the mapping surviving a network change - it is a cache, and every entry
+		// is re-learned from the next answer - so purging it here is strictly a reduction in stale
+		// state rather than a behaviour change for any correct configuration.
+		r.dnsReverseMapping.Purge()
+	}
+	r.dnsEnvironmentAccess.Unlock()
 
 	for _, transport := range r.transport.Transports() {
 		transport.Reset()
@@ -1882,18 +1971,6 @@ func (r *Router) ResetNetwork() {
 	// premature.
 	if r.concreteClient != nil {
 		r.concreteClient.refreshTransportEnvironments()
-	}
-
-	// The reverse mapping is a cache of what previous answers said an address meant, and a network
-	// change is exactly when that may no longer hold: with split-horizon or captive-portal DNS the
-	// same address can mean a different name on the new network. Leaving entries behind lets a
-	// stale name participate in route rule matching until its DNS TTL expires.
-	//
-	// Nothing depends on the mapping surviving a network change - it is a cache, and every entry
-	// is re-learned from the next answer - so purging it here is strictly a reduction in stale
-	// state rather than a behaviour change for any correct configuration.
-	if r.dnsReverseMapping != nil {
-		r.dnsReverseMapping.Purge()
 	}
 }
 

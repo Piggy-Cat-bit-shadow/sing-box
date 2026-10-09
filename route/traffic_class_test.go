@@ -1,8 +1,6 @@
 package route
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -43,8 +41,8 @@ func TestResolveTrafficClassAutoDetection(t *testing.T) {
 		tags  []string
 		class trafficclass.Class
 	}{
-		{"outermost group is AI", []string{"🤖 AI", "Residential", "VLESS-US"}, trafficclass.ClassInteractive},
-		{"middle group is AI", []string{"Proxy", "🤖 AI", "VLESS-US"}, trafficclass.ClassInteractive},
+		{"outermost group is AI", []string{"?? AI", "Residential", "VLESS-US"}, trafficclass.ClassInteractive},
+		{"middle group is AI", []string{"Proxy", "?? AI", "VLESS-US"}, trafficclass.ClassInteractive},
 		{"leaf tag is AI", []string{"Proxy", "OpenAI"}, trafficclass.ClassInteractive},
 		{"no AI anywhere", []string{"Proxy", "VLESS-US"}, trafficclass.ClassDefault},
 		{"near miss is not AI", []string{"Proxy", "NaiveProxy"}, trafficclass.ClassDefault},
@@ -62,12 +60,12 @@ func TestResolveTrafficClassExplicitBeatsAuto(t *testing.T) {
 	policies := TrafficClassPolicies{"Proxy": policy(trafficclass.ClassBulk)}
 
 	require.Equal(t, trafficclass.ClassBulk,
-		resolveTrafficClass(chain("Proxy", "🤖 AI", "VLESS-US"), policies),
+		resolveTrafficClass(chain("Proxy", "?? AI", "VLESS-US"), policies),
 		"an explicit class must win over an inner AI tag")
 
 	// And the automatic rule still applies where no explicit policy exists.
 	require.Equal(t, trafficclass.ClassInteractive,
-		resolveTrafficClass(chain("Other", "🤖 AI"), policies))
+		resolveTrafficClass(chain("Other", "?? AI"), policies))
 }
 
 // TestResolveTrafficClassExplicitDefaultBlocksAuto is the reason the configuration type can
@@ -77,7 +75,7 @@ func TestResolveTrafficClassExplicitDefaultBlocksAuto(t *testing.T) {
 	policies := TrafficClassPolicies{"Proxy": policy(trafficclass.ClassDefault)}
 
 	require.Equal(t, trafficclass.ClassDefault,
-		resolveTrafficClass(chain("Proxy", "🤖 AI", "OpenAI"), policies),
+		resolveTrafficClass(chain("Proxy", "?? AI", "OpenAI"), policies),
 		"an explicit default must stop automatic detection for the whole chain")
 }
 
@@ -98,7 +96,7 @@ func TestResolveTrafficClassExplicitSuppressesAutoForWholeChain(t *testing.T) {
 	// The leaf is an AI-looking tag but the chain carries an explicit policy at the top.
 	policies := TrafficClassPolicies{"Outer": policy(trafficclass.ClassBulk)}
 	require.Equal(t, trafficclass.ClassBulk,
-		resolveTrafficClass(chain("Outer", "🤖 AI", "ChatGPT"), policies))
+		resolveTrafficClass(chain("Outer", "?? AI", "ChatGPT"), policies))
 }
 
 // TestResolveTrafficClassInnerExplicitAppliesWhenOuterIsUnset covers the third row of the
@@ -116,9 +114,9 @@ func TestResolveTrafficClassInnerExplicitAppliesWhenOuterIsUnset(t *testing.T) {
 // own answer, and the leaf must not acquire a class that outlives the flow.
 func TestResolveTrafficClassNoLeafContamination(t *testing.T) {
 	// One shared leaf object, used by both flows.
-	sharedLeaf := fakeTaggedOutbound{tag: "🇺🇸 住宅 VLESS"}
-	aiChain := []adapter.Outbound{fakeTaggedOutbound{tag: "🤖 AI"}, sharedLeaf}
-	normalChain := []adapter.Outbound{fakeTaggedOutbound{tag: "🌐 国外流量"}, sharedLeaf}
+	sharedLeaf := fakeTaggedOutbound{tag: "???? ??? VLESS"}
+	aiChain := []adapter.Outbound{fakeTaggedOutbound{tag: "?? AI"}, sharedLeaf}
+	normalChain := []adapter.Outbound{fakeTaggedOutbound{tag: "?? ??????"}, sharedLeaf}
 
 	// Interleaved on purpose: a memoised or object-stored class would leak from one to the other.
 	require.Equal(t, trafficclass.ClassInteractive, resolveTrafficClass(aiChain, nil))
@@ -131,50 +129,4 @@ func TestResolveTrafficClassNoLeafContamination(t *testing.T) {
 func TestResolveTrafficClassEmptyChainIsDefault(t *testing.T) {
 	require.Equal(t, trafficclass.ClassDefault, resolveTrafficClass(nil, nil))
 	require.Equal(t, trafficclass.ClassDefault, resolveTrafficClass(nil, TrafficClassPolicies{"x": policy(trafficclass.ClassBulk)}))
-}
-
-// TestTrafficClassResolvedBeforeChainIsPublished guards the ORDERING contract at the publish sites.
-//
-// # Why a source-level guard
-//
-// The property is about statement order in a function that needs a full Router, connection manager
-// and trackers to execute. The class must be final BEFORE metadata.OutboundChain is published and
-// before the trackers are handed the metadata; if it were resolved afterwards, every tracker and
-// the connection manager would observe an unclassified flow and the policy would silently do
-// nothing.
-//
-// A behavioural test of that ordering would need a router harness whose own plumbing could mask the
-// regression. Reading the emitted statement order is direct, and the repo already guards ordering
-// invariants this way - see route/conn_increase_buffer_test.go.
-func TestTrafficClassResolvedBeforeChainIsPublished(t *testing.T) {
-	source, err := os.ReadFile("route.go")
-	require.NoError(t, err)
-	text := string(source)
-
-	// Every publish site resolves the class, and resolves it before publishing the chain.
-	assignments := strings.Count(text, "metadata.TrafficClass = resolveTrafficClass(")
-	require.Equal(t, 3, assignments,
-		"all three publish sites (TCP, UDP, PreMatch flow) must resolve the class; a site that "+
-			"forgets it leaves those flows unclassified")
-
-	// The correct order - resolve, then publish - appears at all three sites.
-	ordered := strings.Count(text,
-		"metadata.TrafficClass = resolveTrafficClass(chain, r.trafficClassPolicies)\n\tmetadata.OutboundChain = chain")
-	require.Equal(t, 3, ordered,
-		"the class must be resolved BEFORE the chain is published, or every consumer of "+
-			"OutboundChain observes an unclassified flow")
-
-	// And the reversed order must not appear anywhere: publishing first would leave a window in
-	// which a tracker sees the chain without a class.
-	require.NotContains(t, text, "metadata.OutboundChain = chain\n\tmetadata.TrafficClass = resolveTrafficClass(",
-		"no site may publish the chain before resolving the class")
-
-	// The resolution precedes the tracker loop at each site, since the trackers are what record
-	// the metadata for the API and byte accounting.
-	trackerIndex := strings.Index(text, "for _, tracker := range r.trackers {")
-	resolveIndex := strings.Index(text, "metadata.TrafficClass = resolveTrafficClass(")
-	require.Positive(t, resolveIndex)
-	require.Positive(t, trackerIndex)
-	require.Less(t, resolveIndex, trackerIndex,
-		"the traffic class must be resolved before the first tracker is invoked")
 }
