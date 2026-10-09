@@ -292,3 +292,5 @@ replace github.com/sagernet/cronet-go/lib/tvos_arm64_simulator => github.com/Pig
 replace github.com/sagernet/cronet-go/lib/windows_amd64 => github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_amd64 v0.0.0-20260929202119-8c68ce89873c
 
 replace github.com/sagernet/cronet-go/lib/windows_arm64 => github.com/Piggy-Cat-bit-shadow/cronet-go/lib/windows_arm64 v0.0.0-20260929202119-8c68ce89873c
+
+replace github.com/metacubex/utls => github.com/Piggy-Cat-bit-shadow/utls v1.8.8-0.20261009084700-6c3e08ed4c4d

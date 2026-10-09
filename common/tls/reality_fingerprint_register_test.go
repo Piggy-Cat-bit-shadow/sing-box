@@ -94,15 +94,16 @@ var realityFingerprintRegister = map[string]fingerprintRegisterEntry{
 	"chrome_pq":                  {preset: "Chrome/133", hybrid: fingerprintCarriesHybrid, tls13: true},
 	"chrome_pq_psk":              {preset: "Chrome/133", hybrid: fingerprintCarriesHybrid, tls13: true},
 	"firefox": {
-		preset: "Firefox/120", hybrid: fingerprintLacksHybrid, tls13: true,
-		note: "Firefox 120 predates ML-KEM. Upstream adds Firefox 148 in fc716b2+ddebe39; " +
-			"the pin does not carry it and neither does metacubex/utls v1.8.8, the newest " +
-			"released version of the module",
+		preset: "Firefox/148", hybrid: fingerprintCarriesHybrid, tls13: true,
+		note: "Firefox 148 is the spec upstream adds in fc716b2+ddebe39. The pinned fork " +
+			"carries it; metacubex/utls v1.8.7 and v1.8.8 both still build Firefox/120, " +
+			"which a current reference rejects, so a version bump is not an alternative " +
+			"to the fork",
 	},
 	"safari": {
-		preset: "Safari/16.0", hybrid: fingerprintLacksHybrid, tls13: true,
-		note: "Safari 16.0 predates ML-KEM. Upstream adds Safari 26.3 in aa6edf4; the pin " +
-			"does not carry it",
+		preset: "Safari/26.3", hybrid: fingerprintCarriesHybrid, tls13: true,
+		note: "Safari 26.3 is the spec upstream adds in aa6edf4, carried by the pinned " +
+			"fork; the released module builds Safari/16.0",
 	},
 	"edge": {
 		preset: "Edge/85", hybrid: fingerprintLacksHybrid, tls13: true,
@@ -130,9 +131,11 @@ var realityFingerprintRegister = map[string]fingerprintRegisterEntry{
 	},
 	"random": {
 		preset: "one of the modern pool", hybrid: fingerprintVaries, tls13: true,
-		note: "resolved once per process from modernFingerprints, four of whose five " +
-			"members lack the hybrid share — so a `random` REALITY client can only " +
-			"complete a handshake against a current reference when the draw was Chrome",
+		note: "resolved once per process from modernFingerprints. Chrome, Firefox and " +
+			"Safari now carry the hybrid share; edge, ios and qq still do not, so a " +
+			"`random` REALITY client can still lose the draw against a current reference. " +
+			"No upstream preset fixes those three in any revision, so this is a named gap " +
+			"rather than a missing backport",
 	},
 	"randomized": {
 		preset: "Randomized/0", hybrid: fingerprintVaries, tls13: true,
@@ -245,7 +248,7 @@ func TestRealityFingerprintIncompatibleSetIsDeclared(t *testing.T) {
 	// change to it is a change to what the release claims about REALITY, and it must
 	// be made deliberately rather than by a dependency bump.
 	require.Equal(t,
-		[]string{"edge", "firefox", "ios", "qq", "random", "randomized", "safari"},
+		[]string{"edge", "ios", "qq", "random", "randomized"},
 		incompatible,
 		"the set of accepted fingerprints that cannot present X25519MLKEM768, and therefore "+
 			"cannot complete a REALITY handshake against a reference at or after %s, changed. "+
@@ -262,9 +265,15 @@ func TestRealityFingerprintIncompatibleSetIsDeclared(t *testing.T) {
 			hybridlessModern++
 		}
 	}
-	require.Equal(t, 4, hybridlessModern,
-		"modernFingerprints must still contain exactly one preset that carries the hybrid share, "+
-			"or the `random` entry's note is wrong")
+	// Chrome, Firefox and Safari carry the hybrid share; edge and ios do not. This is
+	// asserted as a count rather than left as prose because `random` is a probability,
+	// and the count IS that probability: a `random` draw loses to a current reference
+	// two times in five. It moved from 4 to 2 when the fork added Firefox 148 and
+	// Safari 26.3, and it is the number that has to fall again if edge/ios are ever
+	// fixed - no upstream preset does so in any revision today.
+	require.Equal(t, 2, hybridlessModern,
+		"modernFingerprints' hybrid-less count changed, so the `random` entry's stated "+
+			"odds and the exposure it describes are both wrong")
 }
 
 // fingerprintGreeting is the measured shape of a built greeting.

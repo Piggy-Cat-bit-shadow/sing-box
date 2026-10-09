@@ -335,3 +335,5 @@ replace github.com/sagernet/sing-tun => github.com/Piggy-Cat-bit-shadow/sing-tun
 // scripts/ci/verify-upstream-assumptions.sh.
 //
 // See docs/fork/lx-stability-audit-phase1.md (048) and docs/fork/upstream-sync-2026-10.md.
+
+replace github.com/metacubex/utls => github.com/Piggy-Cat-bit-shadow/utls v1.8.8-0.20261009084700-6c3e08ed4c4d
