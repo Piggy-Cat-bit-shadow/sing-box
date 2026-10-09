@@ -78,16 +78,20 @@ PROJECT_GOMOBILE_VERSION="$(cd "$repo_root" && go list -m -f '{{.Version}}' gith
 # Apple:   Piggy-Cat-bit-shadow/sing-box-for-apple. The migration is carried as
 #          docs/fork/apple-stringbox-callsites.patch; see docs/fork/apple-client-fork.md.
 #
-# THE APPLE VALUE BELOW IS STALE, and layer 4 says so on every run. 5911580a is the revision the
-# superproject gitlink pins and it carries NONE of the migration: sweeping it finds all 18
-# unmigrated call sites. The fork branch head 8599039f6cd41dad6bdf975066b300725da08668 carries
-# them (0 call-site violations, 347 sources scanned), and one more change is required before it
-# can be named here: docs/fork/apple-bridge-session-implementer.patch, because Go declares
-# BridgeSession.Name as returning *StringBox and the client's own implementer
-# (ExtensionPlatformInterface.swift's BridgeServiceSession, under `#if os(macOS) || JAILBREAK`)
-# still returns String. Update this constant and the gitlink TOGETHER, to a fork head that
-# contains both, once that commit exists. Leaving it at 5911580a makes layer 5 PASS while layer
-# 4 FAILS, which is the intended reading: the pin is not the thing that was verified.
+# THE APPLE VALUE IS NO LONGER STALE. It is the revision the superproject gitlink pins
+# (`git ls-tree HEAD clients/apple`), and it is the fork head the v0.1.6 integration reports as
+# carrying the call-site migration, the BridgeServiceSession implementer and the screen-state
+# observer in one commit. This paragraph used to say the value was stale at 5911580a, which
+# carried none of the migration, and described the move that had to happen; that move has
+# happened, so the text is replaced rather than left to tell the next reader the opposite of what
+# the constant says.
+#
+# Naming a revision here is a statement about it, not a verification of it, and the report above
+# is not a substitute for layer 4. Layer 4 is the verification and it needs a client checkout to
+# sweep. A host that cannot check one out - the submodule is unpopulated and github.com is
+# unreachable, which is how the v0.1.6 Apple artifact run was performed - can establish layer 5
+# (this constant and the gitlink agree) and nothing more, and must not report layer 4 as passed
+# on that basis. See docs/fork/apple-artifact-verification.md §9.1.
 VERIFIED_ANDROID_SHA="ec61030d3df74f3e7c39ab848c8996008ecd386a"
 VERIFIED_APPLE_SHA="2b23330d489b9f6b45e98f903f458842e8961594"
 
