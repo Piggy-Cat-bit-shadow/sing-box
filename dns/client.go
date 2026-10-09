@@ -47,6 +47,8 @@ type Client struct {
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	networkManager    adapter.NetworkManager
 	networkGeneration func() uint64
+	// policyGeneration reports the routing-policy epoch; nil means the caller has no policy concept.
+	policyGeneration func() uint64
 	// environmentPins holds the network environment each transport was LAST reset in.
 	//
 	// # Why the environment is pinned rather than read live
@@ -104,6 +106,31 @@ type ClientOptions struct {
 	//
 	// nil means the caller has no generation concept, and only the fingerprint applies.
 	NetworkGeneration func() uint64
+	// PolicyGeneration reports the current routing-policy epoch.
+	//
+	// # Why the network generation is not enough
+	//
+	// A `clash_mode` DNS rule (option/rule_dns.go:164) routes the same question to a DIFFERENT DNS
+	// server depending on the active Clash mode, and `clashmode.Manager.SetMode` invalidates the cache
+	// for exactly that reason. None of the other guards can see it:
+	//
+	//   - the environment fingerprint is a property of the network and the transports, and a mode
+	//     switch changes neither;
+	//   - the transport tag in the cache key is the same when both modes route to the same server,
+	//     which is the common shape;
+	//   - the network generation does not move, because no network changed.
+	//
+	// So a query issued under mode A whose answer arrives after the switch to mode B was stored under
+	// a key mode B also reads, and mode B served the old mode's answer - measured, not reasoned, in
+	// TestAnInFlightAnswerFromTheOldModeIsNotServedUnderTheNewMode.
+	//
+	// This is the OWNERSHIP guard for a policy change: it says whether the answer still belongs to the
+	// policy its request was issued under. Like the network generation it is deliberately NOT part of
+	// the persistent key - a process-local counter would make persisted entries meaningless to the next
+	// process - so it rejects the STORE rather than renaming the entry.
+	//
+	// nil means the caller has no policy-epoch concept, and the previous behaviour applies.
+	PolicyGeneration func() uint64
 }
 
 func NewClient(options ClientOptions) *Client {
@@ -120,6 +147,7 @@ func NewClient(options ClientOptions) *Client {
 		initDNSCacheFunc:  options.DNSCache,
 		logger:            options.Logger,
 		networkGeneration: options.NetworkGeneration,
+		policyGeneration:  options.PolicyGeneration,
 	}
 	if client.timeout == 0 {
 		client.timeout = C.DNSTimeout
@@ -206,11 +234,32 @@ func (c *Client) newCacheKey(transport adapter.DNSTransport, question dns.Questi
 // arrives. Reading it at store time would compare the current value against itself and therefore
 // never reject anything.
 func (c *Client) captureGeneration(operation *exchangeOperation) {
-	if c.networkGeneration == nil {
-		return
+	if c.networkGeneration != nil {
+		operation.generation = c.networkGeneration()
+		operation.hasGenerationGuard = true
 	}
-	operation.generation = c.networkGeneration()
-	operation.hasGenerationGuard = true
+	// The policy epoch is captured in the same place and for the same reason: at the moment the
+	// question is asked, so it describes the policy the question was asked under rather than the one
+	// current when the answer arrives.
+	if c.policyGeneration != nil {
+		operation.policyGeneration = c.policyGeneration()
+		operation.hasPolicyGuard = true
+	}
+}
+
+// policyStillCurrent reports whether a captured policy epoch still describes the live routing policy.
+//
+// This is what stops a `clash_mode` switch from being undone by an answer that was already in flight:
+// the switch bumps the epoch, and an answer captured under the previous one may be delivered to the
+// caller that asked for it but may not be RECORDED, because the server that produced it is the one the
+// switch moved away from.
+//
+// A caller with no policy concept is always current, so this degrades to the previous behaviour.
+func (c *Client) policyStillCurrent(operation *exchangeOperation) bool {
+	if !operation.hasPolicyGuard || c.policyGeneration == nil {
+		return true
+	}
+	return operation.policyGeneration == c.policyGeneration()
 }
 
 // generationStillCurrent reports whether a captured generation still describes the live network.
@@ -284,6 +333,11 @@ func (c *Client) responseDeliverable(operation *exchangeOperation) bool {
 // settled.
 func (c *Client) stateMutationAllowed(operation *exchangeOperation) bool {
 	if !c.responseDeliverable(operation) {
+		return false
+	}
+	// A policy change since the question was asked retires the answer's right to be recorded, for the
+	// same reason a network change does: it describes a routing decision that no longer holds.
+	if !c.policyStillCurrent(operation) {
 		return false
 	}
 	if operation.hasOwnershipGuard && !c.networkTransitionStable() {
@@ -558,11 +612,16 @@ type exchangeOperation struct {
 	// generation is the network generation this query was issued on. Captured when the operation is
 	// built, which is BEFORE the round trip, and compared before anything is stored.
 	generation uint64
+	// policyGeneration is the routing-policy epoch this query was issued under, captured at the same
+	// moment and for the same reason. A `clash_mode` switch bumps the epoch, so an answer that was in
+	// flight across it is delivered but not recorded.
+	policyGeneration uint64
 	// startedStable is the network's settled state when the query was issued. A query that began
 	// during a transition is not a stable-network result, however the network looks when it finishes.
 	startedStable      bool
 	hasOwnershipGuard  bool
 	hasGenerationGuard bool
+	hasPolicyGuard     bool
 }
 
 func (o *exchangeOperation) release() {

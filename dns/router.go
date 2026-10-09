@@ -58,6 +58,14 @@ type Router struct {
 	// networkGeneration advances on every ResetNetwork so a DNS response can be attributed to the
 	// network its request was issued on.
 	networkGeneration atomic.Uint64
+	// policyGeneration advances on every ClearCache so a DNS response can be attributed to the ROUTING
+	// POLICY its request was issued under.
+	//
+	// It exists because a `clash_mode` switch is not a network change: a `clash_mode` DNS rule routes
+	// the same question to a different server per mode, while the network fingerprint, the transport
+	// tag and the network generation all stay exactly as they were. Without this epoch, an answer that
+	// was already in flight when the switch happened was stored under a key the new mode also reads.
+	policyGeneration atomic.Uint64
 	// dnsEnvironmentAccess guards the DNS environment observation pair
 	// (dnsEnvironmentObserved, dnsEnvironmentFingerprint) together with the advance of
 	// dnsEnvironmentGeneration, so "the fingerprint I compared" and "the epoch I produced" are one
@@ -159,6 +167,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		// The SAME generation the reverse mapping uses. One network reset advances one counter, so
 		// the two caches cannot disagree about which epoch an answer belongs to.
 		NetworkGeneration: router.dnsGeneration,
+		// The routing-policy epoch, advanced by every ClearCache. It is a guard separate from the
+		// network generation because a `clash_mode` switch is not a network change: the fingerprint and
+		// the generation both stay put, and only the policy epoch moves.
+		PolicyGeneration: router.policyEpoch,
 		DNSCache: func() adapter.DNSCacheStore {
 			cacheFile := service.FromContext[adapter.CacheFile](ctx)
 			if cacheFile == nil {
@@ -1842,13 +1854,33 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 // against a concurrent commit: the commit holds this lock across its epoch comparison and its writes,
 // so a purge taken outside it can land in the middle of that critical section and be undone by the
 // write that follows - an entry surviving a completed ClearCache. Taking the lock makes the two
-// mutually exclusive, so either the purge runs first and the commit's own comparison decides (it
-// still matches, so the answer is written and stays: a cache clear is not an epoch change and does not
-// retire an in-flight answer), or the commit completes first and this purge removes what it wrote.
+// mutually exclusive, so either the purge runs first and the commit's own comparison decides, or the
+// commit completes first and this purge removes what it wrote.
 //
-// The lock covers the purge only. Nothing else in this function touches the reverse mapping, and no
-// platform call is made while it is held.
+// # Why this also advances the policy epoch
+//
+// `clashmode.Manager.SetMode` calls this precisely because a `clash_mode` DNS rule routes the same
+// question to a different DNS server per mode. The purge alone was not enough for that caller: a query
+// already in flight when the switch happened finishes AFTER the purge, and its answer - produced by
+// the server the switch moved away from - was then stored under a key the new mode also reads, so the
+// new mode served it. Measured in TestAnInFlightAnswerFromTheOldModeIsNotServedUnderTheNewMode, not
+// reasoned about.
+//
+// The epoch is what makes "asked under the old policy" observable to the store path. It does NOT make
+// a clear a request barrier: nothing is cancelled, nothing waits, no in-flight exchange is disturbed.
+// The answer is still delivered to the caller that asked for it - a DNS answer is a dated observation
+// about a name, and the caller's question was legitimate. Only its RECORDING is declined, because the
+// routing decision behind it no longer holds.
+//
+// A manual `POST /dns/flush` with no mode change keeps its best-effort meaning: it still empties the
+// cache and still refuses to be a barrier, and the only thing that changes for it is that an answer
+// arriving from a query that was already in flight is not re-inserted after the flush the user asked
+// for - which is what the user asked for.
+//
+// The advance happens BEFORE the purge, so a query that captures the new epoch necessarily starts
+// after the invalidation and its answer describes the new policy.
 func (r *Router) ClearCache() {
+	r.policyGeneration.Add(1)
 	r.client.ClearCache()
 	if r.platformInterface != nil {
 		r.platformInterface.ClearDNSCache()
@@ -1858,6 +1890,11 @@ func (r *Router) ClearCache() {
 		r.dnsReverseMapping.Purge()
 		r.dnsEnvironmentAccess.Unlock()
 	}
+}
+
+// policyEpoch is the current routing-policy epoch, exposed to the client.
+func (r *Router) policyEpoch() uint64 {
+	return r.policyGeneration.Load()
 }
 
 // LookupReverseMapping answers "what name does this address mean".
