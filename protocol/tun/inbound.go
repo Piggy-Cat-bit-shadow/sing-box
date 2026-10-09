@@ -638,12 +638,11 @@ func (t *Inbound) releaseRouteSetCallbacksCleanup() error {
 // first means a notification that races the teardown finds no observer left, and the window between
 // "auto-redirect closed" and "callbacks released" does not exist.
 func (t *Inbound) closeAutoRedirect() error {
+	t.releaseRouteSetCallbacks()
 	if t.autoRedirect == nil {
 		return nil
 	}
-	err := t.autoRedirect.Close()
-	t.releaseRouteSetCallbacks()
-	return err
+	return t.autoRedirect.Close()
 }
 
 // releaseRouteSetCallbacks unregisters everything Start registered and clears the stored elements.
