@@ -8,10 +8,24 @@
 # `features.o` references `base::MessagePumpKqueue::InitializeFeatures()` while
 # `message_pump_kqueue.o` - the only member that defines it - is a macOS-only object and
 # is not in the iOS archive at all. The reference therefore survives into the shipped
-# Libbox.framework for iOS as an unresolved `U`, and the real app link fails:
+# Libbox.framework for iOS as an unresolved `U`. A link WITHOUT dead stripping fails on it:
 #
 #   "base::MessagePumpKqueue::InitializeFeatures()", referenced from:
 #       base::features::Init() in Libbox[arm64][119](features.o)
+#
+# # Why it is still tracked even though the product currently builds
+#
+# The real Apple client does link today: `project.pbxproj` sets `DEAD_CODE_STRIPPING = YES`
+# and the real link lines carry `-dead_strip`, so `features.o` is never extracted and the
+# linked `sing-box.debug.dylib` contains zero `MessagePumpKqueue` symbols. The product is
+# green BY ACCIDENT, and the accident is load-bearing: it stops the moment anything makes
+# `base::features::Init()` live - one of the 769 symbols `features.o` defines, an
+# `-all_load`/`-force_load`, an ObjC `+load`, a target that does not dead-strip, or a
+# third-party consumer of the framework.
+#
+# So the correct verdict is DEAD_CODE_ONLY, not "the archive is unusable": a proven
+# incomplete artifact that is currently masked by the linker. That is exactly the kind of
+# thing this gate exists to keep visible.
 #
 # It is the ONLY such hole in the iOS archive: every other intra-`base::` symbol is
 # either defined in the archive or absent from it entirely. The macOS archive has zero.
@@ -184,15 +198,21 @@ Cause:   features.o is compiled with an Apple-wide guard that still names
          base::MessagePumpKqueue, while message_pump_kqueue.cc - the only
          definition - is compiled for macOS only, so the member is absent from
          the iOS archive. The reference therefore reaches the shipped iOS
-         Libbox static archive as an unresolved `U`, and the real app link
-         fails there.
+         Libbox static archive as an unresolved `U`.
+Verdict: DEAD_CODE_ONLY - the real client links because DEAD_CODE_STRIPPING=YES
+         drops features.o entirely (verified: the linked sing-box.debug.dylib
+         has 0 MessagePumpKqueue symbols). The green build is an accident of
+         dead stripping, and it is load-bearing: it breaks as soon as anything
+         makes base::features::Init() live, or a consumer links without
+         -dead_strip.
 Fix:     guard the MessagePumpKqueue::InitializeFeatures() call to the same
          macOS-only condition, rebuild the iOS archives, re-pin. Runbook:
          reports/S03-apple-abi-cronet.md, item 5.
 Status:  BLOCKED_TOOLCHAIN - the archive rebuild needs the Chromium/cronet
          build pipeline, which is not available in this environment.
 Do NOT:  adopt -dead_strip as the fix. It hides the symbol per consumer while
-         the framework still ships the dangling reference.
+         the framework still ships the dangling reference; the archive must be
+         rebuilt self-contained instead.
 EOF
 
 if [ "$tracked" = "1" ]; then
