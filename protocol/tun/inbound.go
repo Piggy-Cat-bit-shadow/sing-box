@@ -441,6 +441,20 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
 					t.routeExcludeRuleSetCallback = append(t.routeExcludeRuleSetCallback, routeExcludeRuleSet.RegisterCallback(t.updateRouteAddressSet))
 				}
+				// Hand the release to the Scope in the same breath as the registration.
+				//
+				// The product closes a Box by closing its Scope, and Scope.Close() runs the entries
+				// handed to it through scope.Add - it never calls a component's Close() method. Storing
+				// the elements here and releasing them from Close() left the Scope with no knowledge of
+				// a resource Start had acquired, so on a real Box.Close() the callbacks were never
+				// unregistered: every rule-set kept an observer pointed at a torn-down inbound for the
+				// lifetime of the process.
+				//
+				// Registering here rather than at the end of the start sequence is deliberate. The
+				// registration is the acquisition, and every later step in Start and PostStart can fail;
+				// an owner established at the acquisition covers all of those failures with the Box's
+				// existing rollback (Box.Start closes the Scope when start() returns an error).
+				scope.Add(t.releaseRouteSetCallbacksCleanup)
 			}
 		}
 		var (
@@ -535,7 +549,12 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return E.Cause(err, "starting TUN interface")
 		}
 		if t.autoRedirect != nil {
-			scope.Add(t.autoRedirect.Close)
+			// Closing the auto-redirect is the last cleanup registered and therefore the first to run,
+			// and it releases the route-set callbacks before it tears anything down. Ordering the
+			// release by position alone would put it last (the Scope runs cleanups in reverse
+			// registration order) - after this Close - which is exactly the window the release exists
+			// to close.
+			scope.Add(t.closeAutoRedirect)
 			monitor.Start("initialize auto-redirect")
 			err = t.autoRedirect.Start()
 			monitor.Finish()
@@ -596,6 +615,35 @@ func (t *Inbound) Close() error {
 		t.tunIf,
 		t.autoRedirect,
 	)
+}
+
+// releaseRouteSetCallbacksCleanup is the Scope-cleanup form of releaseRouteSetCallbacks.
+//
+// Start hands this to the Scope immediately after it registers the callbacks, so the Scope - not a
+// later Inbound.Close() that the product never calls - is the owner. The release itself stays the
+// single idempotent implementation, so the Scope path and an explicit Close() cannot release the
+// same element twice.
+func (t *Inbound) releaseRouteSetCallbacksCleanup() error {
+	t.releaseRouteSetCallbacks()
+	return nil
+}
+
+// closeAutoRedirect stops new route-set notifications before it releases the auto-redirect those
+// notifications would be delivered to.
+//
+// The two are one cleanup because the order between them is load-bearing and cannot be expressed by
+// where they sit in the Scope's list. Scope.Close() runs cleanups in reverse registration order, so
+// a release registered when the callbacks were acquired runs LAST - after the auto-redirect is
+// already closed, which is precisely the state updateRouteAddressSet must never observe. Releasing
+// first means a notification that races the teardown finds no observer left, and the window between
+// "auto-redirect closed" and "callbacks released" does not exist.
+func (t *Inbound) closeAutoRedirect() error {
+	if t.autoRedirect == nil {
+		return nil
+	}
+	err := t.autoRedirect.Close()
+	t.releaseRouteSetCallbacks()
+	return err
 }
 
 // releaseRouteSetCallbacks unregisters everything Start registered and clears the stored elements.
