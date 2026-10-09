@@ -199,11 +199,31 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 			return E.Errors(err, s.listener.Close())
 		}
 		if s.http3 {
-			s.http3Server, err = s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions)
+			// The HTTP/3 listener is acquired, but NOT published yet.
+			//
+			// `s.http3Server` is released by exactly one thing: the closeOnce body in Close, which is
+			// already spent by the time this line runs (that is what the check above detects). A
+			// listener published here would therefore have no owner at all - not Close, which has
+			// returned, and not the Scope, whose queue was drained before the bind - and the UDP
+			// socket it bound would outlive the endpoint, the Scope and Box.Close().
+			//
+			// So the acquisition is handed to the ownership decision first: either nothing is closed,
+			// or this is not published, and it is rolled back here on the spot. The lock is held for
+			// the decision only - never across ListenHTTP3, which binds a socket and starts the QUIC
+			// accept loop - because Close must not be made to wait behind an acquisition.
+			var http3Server io.Closer
+			http3Server, err = s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions)
 			if err != nil {
 				return err
 			}
+			if err = s.publishAcquiredHTTP3(http3Server); err != nil {
+				return E.Errors(err, http3Server.Close())
+			}
 		}
+		// `started` is what WritePackets, DialContext and ListenPacketWithDestination gate the data
+		// path on, so it may only become true for an endpoint that still has an owner. A Start that
+		// was rejected above returns before this line: an endpoint released while it was starting must
+		// never advertise itself as ready afterwards.
 		s.started.Store(true)
 	}
 	return nil
@@ -224,6 +244,32 @@ func (s *ServerEndpoint) acquiredStillOwned() error {
 		return nil
 	}
 	return E.Cause(net.ErrClosed, "endpoint closed while starting")
+}
+
+// publishAcquiredHTTP3 hands a freshly acquired HTTP/3 listener to the closeOnce teardown, or refuses
+// it.
+//
+// This is the commit half of the acquire/commit protocol for the one resource Start acquires after
+// Close has already consumed its release list. The decision and the publication happen together under
+// startAccess, which is the same lock Close takes before it publishes `closed` and reads the field, so
+// there are exactly two possible interleavings and neither loses the resource:
+//
+//   - Close ran first. `closed` is visible here, nothing is published, and the caller closes the
+//     listener it just acquired. Close cannot see a value it never read.
+//   - This ran first. The value is in the field before Close reads it, and Close's release list, which
+//     is built after the publication, contains it. Start then stores `started` and reports success
+//     only from here on, and if it is not reached, the endpoint never advertises itself as ready.
+//
+// The error is net.ErrClosed-wrapped for the same reason acquiredStillOwned's is: the endpoint is
+// gone, and the caller is not being told that binding failed.
+func (s *ServerEndpoint) publishAcquiredHTTP3(http3Server io.Closer) error {
+	s.startAccess.Lock()
+	defer s.startAccess.Unlock()
+	if s.closed {
+		return E.Cause(net.ErrClosed, "endpoint closed while starting")
+	}
+	s.http3Server = http3Server
+	return nil
 }
 
 // Close releases the endpoint's running resources.
