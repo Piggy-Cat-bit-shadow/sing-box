@@ -3,7 +3,6 @@
   "generated_at_utc": "2026-10-09T14:30:00Z",
   "authority": "docs/fork/v016-supplemental-closure-report.md",
   "note": "Human-readable twin is v016-supplemental-closure-report.md. This file records the same facts in machine-readable form. No value here is a CI result: this environment executed no GitHub Actions run, so no run id is recorded anywhere.",
-
   "policy_compliance": {
     "created_tag": false,
     "created_github_release": false,
@@ -19,7 +18,6 @@
     "used_isolated_worktrees": true,
     "changed_dependency_pins": false
   },
-
   "baseline": {
     "core_fork": {
       "repo": "Piggy-Cat-bit-shadow/sing-box",
@@ -41,11 +39,18 @@
       "hako_ui": "24bd463a9ec581314f692459ca75efb638f0c524",
       "ipad_upstream_ui": "816600ab3f2823ab5de1da66e36433ef3a21fc10",
       "clients_apple_gitlink": "2b23330d489b9f6b45e98f903f458842e8961594",
-      "gitlink_remote_refs": ["refs/heads/fix/libbox-stringbox-callsites", "refs/tags/libbox-stringbox-abi-2"]
+      "gitlink_remote_refs": [
+        "refs/heads/fix/libbox-stringbox-callsites",
+        "refs/tags/libbox-stringbox-abi-2"
+      ]
     },
     "android_repo": {
       "repo": "Piggy-Cat-bit-shadow/satelite-one",
-      "main_observed_sequence": ["fb5a3615aa780f1d49cf7ac1498f11905d7241ba", "4d15e3bdec3e88bbdfa297120268b5e0cf131bf6", "fcafdd540089a21487e363d5c3e3b32e27f9e9d2"],
+      "main_observed_sequence": [
+        "fb5a3615aa780f1d49cf7ac1498f11905d7241ba",
+        "4d15e3bdec3e88bbdfa297120268b5e0cf131bf6",
+        "fcafdd540089a21487e363d5c3e3b32e27f9e9d2"
+      ],
       "note": "main advanced several times DURING this session from parallel work; S04 was rebased onto 4d15e3b and pushed as a new branch rather than force-pushing the stale one"
     },
     "sing_tun": {
@@ -54,61 +59,142 @@
       "core_pin_unchanged": true,
       "pin": "v0.0.0-20261008172655-8dde9c8cbe27"
     },
-    "utls": { "repo": "Piggy-Cat-bit-shadow/utls", "ref": "v1.7.0-mod-meta", "sha": "449a38f8780006758205a60661a0bc374a182ca5" },
-    "toolchain": { "go": "go1.25.5 darwin/arm64", "xcode": "27.0", "jdk": "17", "android_ndk": "28.0.13004108" }
+    "utls": {
+      "repo": "Piggy-Cat-bit-shadow/utls",
+      "ref": "v1.7.0-mod-meta",
+      "sha": "449a38f8780006758205a60661a0bc374a182ca5"
+    },
+    "toolchain": {
+      "go": "go1.25.5 darwin/arm64",
+      "xcode": "27.0",
+      "jdk": "17",
+      "android_ndk": "28.0.13004108"
+    }
   },
-
   "user_tree_protection": {
     "path": "/Users/jie/Desktop/其他文件/sing-box",
     "head_before": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
     "head_after": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
     "branch": "testing",
-    "porcelain_v1_uall_before_and_after": [" M clients/android", " M clients/apple", "?? build-screens-doc.py", "?? capture-screens.sh"],
+    "porcelain_v1_uall_before_and_after": [
+      " M clients/android",
+      " M clients/apple",
+      "?? build-screens-doc.py",
+      "?? capture-screens.sh"
+    ],
     "submodule_worktree_sha_android": "fc21909df7a3f0fc9435f3866fb6a4960711aa5f",
     "submodule_worktree_sha_apple": "816600ab3f2823ab5de1da66e36433ef3a21fc10",
-    "untracked_file_bytes": { "build-screens-doc.py": 11839, "capture-screens.sh": 4007 },
+    "untracked_file_bytes": {
+      "build-screens-doc.py": 11839,
+      "capture-screens.sh": 4007
+    },
     "incident": {
       "what": "A failed `git worktree add -b <b> --detach <sha>` (mutually exclusive options) was followed by commands with no directory-existence guard, so a cherry-pick rehearsal ran in the default working directory, the user's original tree.",
       "effect": "refs/heads/testing advanced to a new commit 6396ceb26 and a conflicted cherry-pick was left in progress.",
-      "recovery": ["git cherry-pick --abort", "git reset --mixed ef83b8681 (branch pointer only, working tree untouched)", "git checkout -- <the two modified files>", "removed the three files I had added"],
+      "recovery": [
+        "git cherry-pick --abort",
+        "git reset --mixed ef83b8681 (branch pointer only, working tree untouched)",
+        "git checkout -- <the two modified files>",
+        "removed the three files I had added"
+      ],
       "destructive_commands_used": false,
       "verified_restored": true,
       "residual": "commit object 6396ceb26 remains unreachable in the object store (deliberately not pruned)",
       "prevention_added": "every later worktree creation is guarded with [ -d \"$path\" ] || exit 1"
     }
   },
-
   "items": [
     {
-      "id": "S01", "title": "TUN RuleSet IncRef/DecRef pairing", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "fix/tun-ruleset-refs", "sha": "b361df879e557f701139d89cd62fbf2b57c31345",
+      "id": "S01",
+      "title": "TUN RuleSet IncRef/DecRef pairing",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "fix/tun-ruleset-refs",
+      "sha": "b361df879e557f701139d89cd62fbf2b57c31345",
       "old_red": "7 pairing assertions fail deterministically against pristine ef83b8681 in a separate worktree (counters stay at 1; 2 for a shared rule-set)",
       "new_green": "go test -count=1 -tags $(cat release/DEFAULT_BUILD_TAGS) ./... -> 76 ok / 0 FAIL; -race over ./protocol/tun/... ./route/... ./adapter/... ok",
-      "reverse_break": ["drop releaseRouteSetRefs() from releaseRouteSets() -> 7 tests red", "move scope.Add back inside the auto-redirect branch -> no-auto-redirect test red", "remove the record clear -> idempotency tests red (negative refs panic)"],
+      "reverse_break": [
+        "drop releaseRouteSetRefs() from releaseRouteSets() -> 7 tests red",
+        "move scope.Add back inside the auto-redirect branch -> no-auto-redirect test red",
+        "remove the record clear -> idempotency tests red (negative refs panic)"
+      ],
       "real_object_evidence": "route/rule/rule_set_ref_cleanup_test.go drives the real LocalRuleSet (NewLocalRuleSet + Match) and the real RemoteRuleSet Cleanup()",
       "test_double_fixed": "trackingRuleSet.IncRef/DecRef are now real atomic counters that panic on a negative count"
     },
     {
-      "id": "S02", "title": "Apple ScreenStateObserver notify failure paths", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "repo": "Piggy-Cat-bit-shadow/sing-box-for-apple", "branch": "fix/apple-notify-unknown",
+      "id": "S02",
+      "title": "Apple ScreenStateObserver notify failure paths",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "repo": "Piggy-Cat-bit-shadow/sing-box-for-apple",
+      "branch": "fix/apple-notify-unknown",
       "sha": "dd9114d9a20d1b252f20c4003f75e29974cb9c05",
       "unknown_semantics": "the bridge is (BOOL) all the way to Box.LockStateChanged, so unknown is encoded as publish-nothing; no second state machine was added in Swift",
       "second_defect_fixed": "display-on no longer calls wakeNow(); the publisher protocol no longer has it",
-      "evidence": ["harness against the real source file: 76/76 checks, exit 0", "swiftc -typecheck vs real v0.1.6 Libbox + real notify: exit 0; logic file exit 0 on 4 SDKs", "real probe: a failed notify_get_state returns status 2 and does NOT touch the out-param (0xDEADBEEF survived)"],
-      "device_only": ["delivery of the two undocumented names to a sandboxed NEPacketTunnelProvider", "payload semantics", "end-to-end lock/unlock axis", "ExtensionProvider entry points at runtime"]
+      "evidence": [
+        "harness against the real source file: 76/76 checks, exit 0",
+        "swiftc -typecheck vs real v0.1.6 Libbox + real notify: exit 0; logic file exit 0 on 4 SDKs",
+        "real probe: a failed notify_get_state returns status 2 and does NOT touch the out-param (0xDEADBEEF survived)"
+      ],
+      "device_only": [
+        "delivery of the two undocumented names to a sandboxed NEPacketTunnelProvider",
+        "payload semantics",
+        "end-to-end lock/unlock axis",
+        "ExtensionProvider entry points at runtime"
+      ]
     },
     {
-      "id": "S03", "title": "Apple ABI probe provenance, real product build, cronet link", "status": "FIXED_PLUS_BLOCKED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "actual_sha256",
-      "branch": "ci/apple-abi-provenance", "sha": "73462a4cd21b0b9a3dd243c91970a12181382514",
+      "id": "S03",
+      "title": "Apple ABI probe provenance, real product build, cronet link",
+      "status": "FIXED_PLUS_BLOCKED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "actual_sha256",
+      "branch": "ci/apple-abi-provenance",
+      "sha": "73462a4cd21b0b9a3dd243c91970a12181382514",
       "provenance_verdict": "CONFIRMED_SOURCE_GAP; observer.swift byte-exact; 6/7 patch index lines match; two ExtensionPlatformInterface patches are pre-image drafts against c9a4c61 (hako-ui lineage), not dev; one callsites anchor misattributed",
-      "pinned_revision_sweep": { "pinned": "19 migrated / 0 unmigrated", "stale_checkout": "1 migrated / 18 unmigrated" },
+      "pinned_revision_sweep": {
+        "pinned": "19 migrated / 0 unmigrated",
+        "stale_checkout": "1 migrated / 18 unmigrated"
+      },
       "product_build": {
-        "stale_checkout_816600ab": { "scheme": "SFI", "sdk": "iphoneos", "configuration": "Debug", "code_signing_allowed": false, "result": "BUILD FAILED", "exit_code": 65, "errors": 10, "error_shape": "cannot convert value of type 'LibboxStringBox?' to expected argument type 'String'", "file": "Library/Network/ExtensionPlatformInterface.swift", "duration": "10m39s" },
-        "pinned_gitlink_2b23330d4": { "SFI": { "result": "BUILD SUCCEEDED", "exit_code": 0, "errors": 0, "duration": "21m37s" }, "SFM": { "result": "BUILD SUCCEEDED", "exit_code": 0, "duration": "21m38s" } },
-        "delta": { "errors_disappeared": 10, "errors_remaining": 0, "errors_introduced": 0, "source_changed": false, "build_settings_changed": false, "dead_strip_added_by_hand": false },
+        "stale_checkout_816600ab": {
+          "scheme": "SFI",
+          "sdk": "iphoneos",
+          "configuration": "Debug",
+          "code_signing_allowed": false,
+          "result": "BUILD FAILED",
+          "exit_code": 65,
+          "errors": 10,
+          "error_shape": "cannot convert value of type 'LibboxStringBox?' to expected argument type 'String'",
+          "file": "Library/Network/ExtensionPlatformInterface.swift",
+          "duration": "10m39s"
+        },
+        "pinned_gitlink_2b23330d4": {
+          "SFI": {
+            "result": "BUILD SUCCEEDED",
+            "exit_code": 0,
+            "errors": 0,
+            "duration": "21m37s"
+          },
+          "SFM": {
+            "result": "BUILD SUCCEEDED",
+            "exit_code": 0,
+            "duration": "21m38s"
+          }
+        },
+        "delta": {
+          "errors_disappeared": 10,
+          "errors_remaining": 0,
+          "errors_introduced": 0,
+          "source_changed": false,
+          "build_settings_changed": false,
+          "dead_strip_added_by_hand": false
+        },
         "conclusion": "The Apple client is not broken; the local clients/apple checkout was stale relative to the Core gitlink."
       },
       "version_string": {
@@ -117,7 +203,8 @@
         "this_build": "0.0.0-v0.1-ef83b8681"
       },
       "cronet": {
-        "verdict": "DEAD_CODE_ONLY", "root_cause": "INCOMPLETE_ARCHIVE",
+        "verdict": "DEAD_CODE_ONLY",
+        "root_cause": "INCOMPLETE_ARCHIVE",
         "module": "github.com/Piggy-Cat-bit-shadow/cronet-go/lib/ios_arm64",
         "pin": "v0.0.0-20260929202119-8c68ce89873c",
         "archive_sha256": "6863693a72d461855ea0de58492af110fc2087cfb5a3f7db33e060eef6a13980",
@@ -129,54 +216,203 @@
         "why_product_still_links": "project.pbxproj sets DEAD_CODE_STRIPPING = YES (6 occurrences) and real link lines carry -dead_strip (15); features.o is never extracted and the linked sing-box.debug.dylib has 0 MessagePumpKqueue symbols",
         "why_still_tracked": "the green build is load-bearing luck: any live reference to one of the 769 symbols features.o defines, an -all_load/-force_load, an ObjC +load, a non-dead-stripping target or a third-party consumer ends it",
         "gate": "scripts/ci/verify-cronet-ios-archive.sh (fails today by design; CRONET_IOS_ARCHIVE_TRACKED_DEFECT=1 records while still printing the symbol list)",
-        "status": "BLOCKED_TOOLCHAIN", "unblock": "guard MessagePumpKqueue::InitializeFeatures() to the same macOS-only condition, rebuild the iOS archives, re-pin root + all lib/* replaces in go.mod and test/go.mod"
+        "status": "BLOCKED_TOOLCHAIN",
+        "unblock": "guard MessagePumpKqueue::InitializeFeatures() to the same macOS-only condition, rebuild the iOS archives, re-pin root + all lib/* replaces in go.mod and test/go.mod"
       }
     },
     {
-      "id": "S04", "title": "Android release workflow cloud-signing path and least privilege", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "actual_sha256",
+      "id": "S04",
+      "title": "Android release workflow cloud-signing path and least privilege",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "actual_sha256",
       "repo": "Piggy-Cat-bit-shadow/satelite-one",
-      "branch": "ci/unsigned-dryrun-min-permissions-rebased", "sha": "2334badb8b449970cf1e48160e933c71fc864cce",
+      "branch": "ci/unsigned-dryrun-min-permissions-rebased",
+      "sha": "2334badb8b449970cf1e48160e933c71fc864cce",
       "stale_branch_kept_as_history": "ci/unsigned-dryrun-min-permissions @ e0fe96285570f9b0638027417c5ff94bb24dfb8a",
       "base_sha": "4d15e3bdec3e88bbdfa297120268b5e0cf131bf6",
       "real_defect": "the Restore signing config step had NO if: at all (parsed if=None) while the workflow held global permissions: contents: write, so workflow_dispatch(dry_run=true) resolved all four INTERSTELLAR_* secrets and wrote interstellar.jks + signing.properties",
-      "fix": ["permissions: contents: read globally and on the build job", "the only contents: write is in a separate publish job gated on github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true", "signing restore carries the same gate plus a complementary no-signing-material assertion on the read-only path", "signature state is MEASURED with apksigner verify --verbose --print-certs, never declared by the step that installed the keystore", "the inaccurate debug-signing fallback text was removed from the workflow, README and app/build.gradle.kts"],
-      "signature_state_semantics": { "unsigned": "apksigner DOES NOT VERIFY", "debug-signed": "verifies and signer DN contains CN=Android Debug", "signed-by-user": "verifies with a non-debug signer" },
+      "fix": [
+        "permissions: contents: read globally and on the build job",
+        "the only contents: write is in a separate publish job gated on github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true",
+        "signing restore carries the same gate plus a complementary no-signing-material assertion on the read-only path",
+        "signature state is MEASURED with apksigner verify --verbose --print-certs, never declared by the step that installed the keystore",
+        "the inaccurate debug-signing fallback text was removed from the workflow, README and app/build.gradle.kts"
+      ],
+      "signature_state_semantics": {
+        "unsigned": "apksigner DOES NOT VERIFY",
+        "debug-signed": "verifies and signer DN contains CN=Android Debug",
+        "signed-by-user": "verifies with a non-debug signer"
+      },
       "measured": {
         "gradle": "./gradlew :app:assembleRelease :app:verifyCoreProvenance --no-daemon --console=plain -> exit 0, verifyCoreProvenance OK for c35faabf402a4da93b8c31cdfad941b8b1528ffc",
         "apksigner": "DOES NOT VERIFY / ERROR: Missing META-INF/MANIFEST.MF, exit 1",
-        "apk_arm64_v8a": { "bytes": 29525843, "sha256": "8e6dd3e57992cd7fc1f143c518e075b56c4536f575065f3b72308fda66e6f5ec", "signature_state": "unsigned" },
-        "apk_x86_64": { "bytes": 31408898, "sha256": "1c123b8dc0942ea530afbc0feb043f08a5fd8284888a8d493dbcf076f88ee161", "signature_state": "unsigned" },
-        "aar": { "bytes": 58396617, "sha256": "e3b6084b1caff5edc63d59e63ce38c9ab9094abb310620552844f97016cfc3c9", "core_commit": "c35faabf402a4da93b8c31cdfad941b8b1528ffc" },
-        "packed_libbox_so_arm64": { "bytes": 80129776, "sha256": "277d76bb088f08fe95a3410eb48133abbeb25db4830dac73d4e40753b41f4a8e", "byte_identical_to_aar": true },
-        "packed_libbox_so_x86_64": { "bytes": 84472800, "sha256": "80448f061c5bb818b7b5f882410a058c1c6901beb791ed8454eae304696f38dd", "byte_identical_to_aar": true },
+        "apk_arm64_v8a": {
+          "bytes": 29525843,
+          "sha256": "8e6dd3e57992cd7fc1f143c518e075b56c4536f575065f3b72308fda66e6f5ec",
+          "signature_state": "unsigned"
+        },
+        "apk_x86_64": {
+          "bytes": 31408898,
+          "sha256": "1c123b8dc0942ea530afbc0feb043f08a5fd8284888a8d493dbcf076f88ee161",
+          "signature_state": "unsigned"
+        },
+        "aar": {
+          "bytes": 58396617,
+          "sha256": "e3b6084b1caff5edc63d59e63ce38c9ab9094abb310620552844f97016cfc3c9",
+          "core_commit": "c35faabf402a4da93b8c31cdfad941b8b1528ffc"
+        },
+        "packed_libbox_so_arm64": {
+          "bytes": 80129776,
+          "sha256": "277d76bb088f08fe95a3410eb48133abbeb25db4830dac73d4e40753b41f4a8e",
+          "byte_identical_to_aar": true
+        },
+        "packed_libbox_so_x86_64": {
+          "bytes": 84472800,
+          "sha256": "80448f061c5bb818b7b5f882410a058c1c6901beb791ed8454eae304696f38dd",
+          "byte_identical_to_aar": true
+        },
         "integrator_independent_recheck": "APK sizes and SHA256 reproduced exactly; apksigner run independently"
       },
-      "blocked": ["no real GitHub Actions execution, so artifact upload/download and action-gh-release are unverified by execution", "inputs.dry_run != true on a push event is expression-simulation only", "no signed release artifact (policy)"]
+      "blocked": [
+        "no real GitHub Actions execution, so artifact upload/download and action-gh-release are unverified by execution",
+        "inputs.dry_run != true on a push event is expression-simulation only",
+        "no signed release artifact (policy)"
+      ]
     },
     {
-      "id": "S05", "title": "Constructor-time AutoRedirect OutputMark race and rollback", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "fix/autoredirect-output-mark", "sha": "8139f01d7758cbfba4cf6a36183b13bc9b635568",
+      "id": "S05",
+      "title": "Constructor-time AutoRedirect OutputMark race and rollback",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "fix/autoredirect-output-mark",
+      "sha": "8139f01d7758cbfba4cf6a36183b13bc9b635568",
       "verdicts": {
-        "concurrent_registration": { "product": "NOT_REACHABLE", "method": "REPRODUCED_AND_FIXED", "proof": "adapter/inbound/registry.go:65-73 holds the registry lock across the constructor; box.New is a sequential loop" },
-        "concurrent_read": { "product": "NOT_REACHABLE", "reason": "one writer in box.New; all 8 read sites are lazy at dial time or run in Box.Start" },
-        "duplicate_tag_loser": { "product_from_config": "NOT_REACHABLE", "method": "REPRODUCED_AND_FIXED", "measured": "200/200 the claiming constructor is the one discarded" },
-        "mark_zero_sentinel": { "method": "REPRODUCED_AND_FIXED" },
+        "concurrent_registration": {
+          "product": "NOT_REACHABLE",
+          "method": "REPRODUCED_AND_FIXED",
+          "proof": "adapter/inbound/registry.go:65-73 holds the registry lock across the constructor; box.New is a sequential loop"
+        },
+        "concurrent_read": {
+          "product": "NOT_REACHABLE",
+          "reason": "one writer in box.New; all 8 read sites are lazy at dial time or run in Box.Start"
+        },
+        "duplicate_tag_loser": {
+          "product_from_config": "NOT_REACHABLE",
+          "method": "REPRODUCED_AND_FIXED",
+          "measured": "200/200 the claiming constructor is the one discarded"
+        },
+        "mark_zero_sentinel": {
+          "method": "REPRODUCED_AND_FIXED"
+        },
         "abi_expansion": "none; git diff --stat adapter/ is empty"
       },
       "old_red": "DATA RACE route/network.go:462 read vs :465 write; FAIL TestAutoRedirectOutputMarkClaimIsExclusiveUnderConcurrency (race detected); TestAutoRedirectOutputMarkClaimIsSingleShotIncludingZero 'An error is expected but got nil'",
-      "reverse_break": ["guard back to Load() > 0 -> exclusivity expected int(1) actual int32(2)", "release disabled -> discard test red 20/20 (Should be zero, but was 8228)"]
+      "reverse_break": [
+        "guard back to Load() > 0 -> exclusivity expected int(1) actual int32(2)",
+        "release disabled -> discard test red 20/20 (Should be zero, but was 8228)"
+      ]
     },
     {
-      "id": "S06", "title": "urltest / trafficsched wall-clock flakes and generated build/ pollution", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "test/urltest-deterministic-gate", "sha": "827eb52587f9880a3396ec42cafd16b0be9e6227",
-      "common_urltest": { "verdict": "NOT_REPRODUCED", "hardened": true, "production_changed": false, "attempts": "540 targeted executions under load up to 335 plus a parallel -count=20 run over 44 ./common/... packages at load 430-446, all green", "timing_sensitivity_proved_by": "re-introducing the production regression turns all six assertions red; a fixture-only injection with production untouched also turns the original red", "fix": "relative bound Delay < durationToDelay(Warmup) using the existing MeasureOptions.Debug phase timings" },
-      "common_trafficsched": { "verdict": "REPRODUCED_AND_FIXED", "reproduced_at": "iteration 5, load 381.02/328.22/244.95", "failure": "\"1.6677772703837964e+06\" is not greater than \"1.7825792e+06\" (79.6% of configured)", "root_cause": "achieved period = chunk/rate + paceTick + host wake-up latency; the excess is ~1.4-1.6 ms/write at both idle and load (19% at 16 KiB, 4.9% at 64 KiB); the old derivation counted only paceTick (~13%)", "fix": "measure the excess with the same rig at 64 KiB and judge 16 KiB against the pacer's reachable rate; the exact safety bound (<=1.02x) is untouched", "proof": "25/25 green at load up to 473; counter-proof red at iteration 3 at load 471" },
-      "third_flake_found": { "id": "S06b", "package": "dns", "test": "TestDNSLogicalRace", "assertion": "router_race_test.go:582 require.Less(t, time.Since(startTime), 240*time.Millisecond) with fixture delays 100ms/10ms/250ms", "observed": "\"258.404ms\" is not less than \"240ms\" during a full parallel run at load ~150", "enumerated": { "host_sensitive_upper_bounds": 9, "safe_lower_bounds": 8, "genuine_timeout_budgets_left_untouched": 2, "incidental_liveness_guards": "untouched" }, "verdict": "NOT_REPRODUCED in this environment (200 targeted iterations at load 368-451, 40 whole-package iterations at load up to 1006, and the same ./... command on a pristine git archive HEAD snapshot under 88 spinners all passed dns); the reporter's log stands as a real reproduction", "timing_sensitivity_reproduced_on_demand": "a scratch copy adds one 160ms sleep on the way back from a correct decision: the original bound gives \"261.577ms\" is not less than \"240ms\", the hardened test passes", "fix": "all 9 upper bounds become the EVENT they approximated, using release/queried instrumentation on the existing fake transports - strictly stronger, no window remains in which waiting for the loser passes", "counter_proof": "4 independent production regressions each turn the hardened tests red", "author_mistakes_recorded": ["the first version awaited the exchange synchronously on the held transport, which LOST detection entirely (the injected regression blocked to the context deadline and the walk committed the right answer late, so it passed)", "an assertion raced the measured transport's own goroutine and failed 2 runs in 5"], "branch": "test/dns-race-deterministic-gate", "sha": "6abe49165d3bc8bdae5fc04283eaeaa589d3b775", "production_files_changed": 0 },
-      "fourth_flake_pre_existing": { "id": "MASQUE-SCAN", "package": "transport/masque", "test": "TestTheOwnershipScanIsLinearHereToo", "status": "PRE_EXISTING_LOAD_SENSITIVE", "fixed_this_round": false, "why_not": "outside the S01-S08 scope and the construction order explicitly forbids unbounded extension", "observed": "5000 lookups, best of 5: 8192 ranges -> 4.82s, 1 range -> 110.7us, ratio 43554.7x against a 32768x bound, during a full run at load ~710", "pristine_reproduction": "2/2 on a pristine ef83b8681 worktree with ratios 40605 and 47268; 3/3 on the integration with 43469-49281", "quiet_machine": "transport/masque ok 11.106s at load 17 versus 62.368s at load 710", "verdict": "pre-existing complexity gate that degrades with host load/thermal state; unrelated to any change in this round (transport/masque is not protocol/masque)", "reproduce": "go test -count=1 -run TestTheOwnershipScanIsLinearHereToo -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" ./transport/masque/", "recommended_fix": "replace the wall-clock ratio with a deterministic operation-count/complexity assertion, or make both N and the bound relative to a measured machine baseline" },
-      "fifth_flake": { "id": "DIALER-GRACE", "package": "common/dialer", "test": "TestPreferredFamilyArrivingWithinGraceIsDialledFirst", "file": "family_grace_order_test.go:205", "status": "REPRODUCED_PENDING_FINAL_FIX", "reproductions": ["iteration 44 at load 632", "iteration 97 at load 229-243"], "signature": "expected true, actual false; got 192.0.2.1 first out of [192.0.2.1 2001:db8::1]", "mechanism": "not a bound on one duration but a race between two timers: preferredFamilyGrace=50ms, the preferred family answers at grace/5=10ms, the fixture's fallbackDelay=2*grace=100ms, so the host must win a 90ms window", "candidate_fix": "set fallbackDelay to time.Hour; the test's own comment already states that the grace release is the only mechanism under test", "candidate_validated": "300/300 at load 220-280, the same band the baseline failed in", "no_production_file_changed": true },
+      "id": "S06",
+      "title": "urltest / trafficsched wall-clock flakes and generated build/ pollution",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "test/urltest-deterministic-gate",
+      "sha": "827eb52587f9880a3396ec42cafd16b0be9e6227",
+      "common_urltest": {
+        "verdict": "NOT_REPRODUCED",
+        "hardened": true,
+        "production_changed": false,
+        "attempts": "540 targeted executions under load up to 335 plus a parallel -count=20 run over 44 ./common/... packages at load 430-446, all green",
+        "timing_sensitivity_proved_by": "re-introducing the production regression turns all six assertions red; a fixture-only injection with production untouched also turns the original red",
+        "fix": "relative bound Delay < durationToDelay(Warmup) using the existing MeasureOptions.Debug phase timings"
+      },
+      "common_trafficsched": {
+        "verdict": "REPRODUCED_AND_FIXED",
+        "reproduced_at": "iteration 5, load 381.02/328.22/244.95",
+        "failure": "\"1.6677772703837964e+06\" is not greater than \"1.7825792e+06\" (79.6% of configured)",
+        "root_cause": "achieved period = chunk/rate + paceTick + host wake-up latency; the excess is ~1.4-1.6 ms/write at both idle and load (19% at 16 KiB, 4.9% at 64 KiB); the old derivation counted only paceTick (~13%)",
+        "fix": "measure the excess with the same rig at 64 KiB and judge 16 KiB against the pacer's reachable rate; the exact safety bound (<=1.02x) is untouched",
+        "proof": "25/25 green at load up to 473; counter-proof red at iteration 3 at load 471"
+      },
+      "third_flake_found": {
+        "id": "S06b",
+        "package": "dns",
+        "test": "TestDNSLogicalRace",
+        "assertion": "router_race_test.go:582 require.Less(t, time.Since(startTime), 240*time.Millisecond) with fixture delays 100ms/10ms/250ms",
+        "observed": "\"258.404ms\" is not less than \"240ms\" during a full parallel run at load ~150",
+        "enumerated": {
+          "host_sensitive_upper_bounds": 9,
+          "safe_lower_bounds": 8,
+          "genuine_timeout_budgets_left_untouched": 2,
+          "incidental_liveness_guards": "untouched"
+        },
+        "verdict": "NOT_REPRODUCED in this environment (200 targeted iterations at load 368-451, 40 whole-package iterations at load up to 1006, and the same ./... command on a pristine git archive HEAD snapshot under 88 spinners all passed dns); the reporter's log stands as a real reproduction",
+        "timing_sensitivity_reproduced_on_demand": "a scratch copy adds one 160ms sleep on the way back from a correct decision: the original bound gives \"261.577ms\" is not less than \"240ms\", the hardened test passes",
+        "fix": "all 9 upper bounds become the EVENT they approximated, using release/queried instrumentation on the existing fake transports - strictly stronger, no window remains in which waiting for the loser passes",
+        "counter_proof": "4 independent production regressions each turn the hardened tests red",
+        "author_mistakes_recorded": [
+          "the first version awaited the exchange synchronously on the held transport, which LOST detection entirely (the injected regression blocked to the context deadline and the walk committed the right answer late, so it passed)",
+          "an assertion raced the measured transport's own goroutine and failed 2 runs in 5"
+        ],
+        "branch": "test/dns-race-deterministic-gate",
+        "sha": "6abe49165d3bc8bdae5fc04283eaeaa589d3b775",
+        "production_files_changed": 0
+      },
+      "fourth_flake_pre_existing": {
+        "id": "MASQUE-SCAN",
+        "package": "transport/masque",
+        "test": "TestTheOwnershipScanIsLinearHereToo",
+        "status": "PRE_EXISTING_LOAD_SENSITIVE",
+        "fixed_this_round": false,
+        "why_not": "outside the S01-S08 scope and the construction order explicitly forbids unbounded extension",
+        "observed": "5000 lookups, best of 5: 8192 ranges -> 4.82s, 1 range -> 110.7us, ratio 43554.7x against a 32768x bound, during a full run at load ~710",
+        "pristine_reproduction": "2/2 on a pristine ef83b8681 worktree with ratios 40605 and 47268; 3/3 on the integration with 43469-49281",
+        "quiet_machine": "transport/masque ok 11.106s at load 17 versus 62.368s at load 710",
+        "verdict": "pre-existing complexity gate that degrades with host load/thermal state; unrelated to any change in this round (transport/masque is not protocol/masque)",
+        "reproduce": "go test -count=1 -run TestTheOwnershipScanIsLinearHereToo -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" ./transport/masque/",
+        "recommended_fix": "replace the wall-clock ratio with a deterministic operation-count/complexity assertion, or make both N and the bound relative to a measured machine baseline",
+        "author_recommendation": "the estimator's two sides are not comparable in wall time (wide runs for seconds, narrow for about a millisecond), and a best-of-5 minimum is robust to spikes only if some sample escapes the interference; under sustained throttling every wide sample is inflated while the ~1ms narrow sample is already at its floor, so the ratio reports the machine. Either make the two sides comparable in wall time, or assert the complexity claim by COUNTING range comparisons. Neither applied nor verified."
+      },
+      "fifth_flake": {
+        "id": "DIALER-GRACE",
+        "package": "common/dialer",
+        "test": "TestPreferredFamilyArrivingWithinGraceIsDialledFirst",
+        "file": "family_grace_order_test.go:205",
+        "status": "REPRODUCED_AND_FIXED",
+        "reproductions": [
+          "iteration 44 at load 632",
+          "iteration 97 at load 229-243"
+        ],
+        "signature": "expected true, actual false; got 192.0.2.1 first out of [192.0.2.1 2001:db8::1]",
+        "mechanism": "not a bound on one duration but a race between two timers: preferredFamilyGrace=50ms, the preferred family answers at grace/5=10ms, the fixture's fallbackDelay=2*grace=100ms, so the host must win a 90ms window",
+        "candidate_fix": "set fallbackDelay to time.Hour; the test's own comment already states that the grace release is the only mechanism under test",
+        "candidate_validated": "300/300 at load 220-280, the same band the baseline failed in",
+        "no_production_file_changed": true,
+        "enumerated_groups": {
+          "G1_structural_races_deciding_the_answer": 2,
+          "G2_host_sensitive_upper_bounds_not_fixed": 16,
+          "G3_liveness_with_ge_1s_headroom": 15,
+          "G4_safe_lower_bounds": 4,
+          "G5_genuine_timeout_budgets_left_untouched": 3
+        },
+        "why_the_candidate_was_insufficient": "with the fallback cadence already out of reach the fixed binary still failed 2/200 at load ~450, and the failure showed a SINGLE dialled candidate - so the grace timer itself (50ms) was beating the fixture's 10ms sleep; at that point the product is correct and the test was reporting a false failure. There were TWO competitors, not one.",
+        "final_fix": [
+          "cadence moved out of reach: graceOrderOutOfReachCadence = 10 * graceOrderDeadline",
+          "the fixture publishes the non-preferred family then the preferred one back to back from one goroutine with no sleep, so 'the preferred family answered within the grace window' holds however slow the host is"
+        ],
+        "assertions_changed": false,
+        "counter_proof": "removing the grace hold from resolve.go turns both tests and both subtests red; a first injection (grace timer = 0) was DISCARDED as unusable because Go's select picks randomly between a ready timer and a ready channel, so it reddened only one test",
+        "load_evidence": "interleaved baseline vs fixed in the same window: at load 423-434 the baseline failed 4/150 and the final fix failed 0/150; -race ./common/dialer/... exit 0",
+        "branch": "test/dialer-race-deterministic-gate",
+        "sha": "beb1b9e724d85672d6fc07b7f7c9ec48ea57502e"
+      },
       "build_pollution": {
         "cause": "gomobile@v0.1.12 cmd/gomobile/bind_iosapp.go:106 and bind_androidapp.go:373 use filepath.Abs(filepath.Join(\".\", \"build\", ...)) - CWD-relative with no flag or env override - and build_libbox passed no Dir",
         "fix": "gomobile now runs in <root>/_libbox_build (leading underscore is never matched by ./...) with absolute -o, absolute package dir and absolute copy destinations",
@@ -185,83 +421,238 @@
       }
     },
     {
-      "id": "S07", "title": "Scope.Close completion boundary", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "test/scope-close-boundary", "sha": "3c5c84b08bd8f65a4439365f0b472175e1b64d0b",
-      "confirmed_semantics": ["Close joins the cleanup drain and nothing else", "it does not wait for a Start already running that has not reached Add()", "a late Add runs the cleanup synchronously, after Close returned", "a late cleanup's error is only logged and never folded into the already-returned closeErr, which is final", "a Start on a closed Scope cannot report success"],
-      "reentrancy": { "verdict": "NOT_REACHABLE", "evidence": "of 219 production scope.Add sites exactly 5 close any *Scope, all nested child scopes created by the component (supported parent->child direction); the 35 scope-closing call sites are all field-qualified" },
-      "masque": { "verdict": "REPRODUCED_AND_FIXED", "witness_check": "with the guard disabled the test fails with listen tcp 127.0.0.1:54649: bind: address already in use" },
-      "tun": { "verdict": "WINDOW_IDENTIFIED", "fix": "non-blocking startupGate with sync.Once; a lock-across-activation design DEADLOCKED close (the -race run wedged to the 600s timeout) and was rejected" },
-      "not_guaranteed": ["Box.Close() does not imply every in-flight Start has terminated", "a late cleanup's failure is invisible to Close's caller", "a Start that registers nothing is invisible to the Scope", "Close is not reentrant on the same Scope"]
+      "id": "S07",
+      "title": "Scope.Close completion boundary",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "test/scope-close-boundary",
+      "sha": "3c5c84b08bd8f65a4439365f0b472175e1b64d0b",
+      "confirmed_semantics": [
+        "Close joins the cleanup drain and nothing else",
+        "it does not wait for a Start already running that has not reached Add()",
+        "a late Add runs the cleanup synchronously, after Close returned",
+        "a late cleanup's error is only logged and never folded into the already-returned closeErr, which is final",
+        "a Start on a closed Scope cannot report success"
+      ],
+      "reentrancy": {
+        "verdict": "NOT_REACHABLE",
+        "evidence": "of 219 production scope.Add sites exactly 5 close any *Scope, all nested child scopes created by the component (supported parent->child direction); the 35 scope-closing call sites are all field-qualified"
+      },
+      "masque": {
+        "verdict": "REPRODUCED_AND_FIXED",
+        "witness_check": "with the guard disabled the test fails with listen tcp 127.0.0.1:54649: bind: address already in use"
+      },
+      "tun": {
+        "verdict": "WINDOW_IDENTIFIED",
+        "fix": "non-blocking startupGate with sync.Once; a lock-across-activation design DEADLOCKED close (the -race run wedged to the 600s timeout) and was rejected"
+      },
+      "not_guaranteed": [
+        "Box.Close() does not imply every in-flight Start has terminated",
+        "a late cleanup's failure is invisible to Close's caller",
+        "a Start that registers nothing is invisible to the Scope",
+        "Close is not reentrant on the same Scope"
+      ]
     },
     {
-      "id": "S08", "title": "Handoff MD/JSON reconciliation and a single frozen manifest", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "docs/handoff-reconciliation", "sha": "47f49fcd7ebcc3538ac15263fa4568b2f6592db4",
+      "id": "S08",
+      "title": "Handoff MD/JSON reconciliation and a single frozen manifest",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "docs/handoff-reconciliation",
+      "sha": "47f49fcd7ebcc3538ac15263fa4568b2f6592db4",
       "coordinates": {
         "PHASE_A_START": "912ed1efad265d8a8f56aaabcabc8f7b171c2baa",
         "INTEGRATION_FINAL_SHA": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
         "PHASE_B_START": "98ea14181ca62f7632791aca12eceef8fbb8b3e3"
       },
-      "fact_model": ["observed_at_sha", "observed_at_time", "integration_final_sha", "current_candidate_core_sha", "code_status", "behavior_status", "artifact_status"],
+      "fact_model": [
+        "observed_at_sha",
+        "observed_at_time",
+        "integration_final_sha",
+        "current_candidate_core_sha",
+        "code_status",
+        "behavior_status",
+        "artifact_status"
+      ],
       "rows_22_23_45": "split into orthogonal code_presence/code_status and behavior_status; the two documents were measuring different axes, not contradicting each other",
-      "validator": { "path": "scripts/ci/verify-fork-handoff.sh", "real_result": "PASS exit 0 against the real remote", "failure_proofs": ["a locally-only commit is rejected: 'is NOT reachable from 47f49fcd7...: it exists only as a local object'", "a nonexistent sha is rejected", "an MD/JSON twin disagreement is rejected", "a RELEASE-READY claim with an unfrozen manifest is rejected"], "defects_it_found_and_fixed": ["a failed git fetch silently degraded to a local ok", "the verdict grep matched its own explanatory prose"] },
-      "not_claimed": ["no CI run exists at the integration tip (newest is e2d7ac1be, 59 commits behind)", "no artifact exists at the tip", "no device verification"]
+      "validator": {
+        "path": "scripts/ci/verify-fork-handoff.sh",
+        "real_result": "PASS exit 0 against the real remote",
+        "failure_proofs": [
+          "a locally-only commit is rejected: 'is NOT reachable from 47f49fcd7...: it exists only as a local object'",
+          "a nonexistent sha is rejected",
+          "an MD/JSON twin disagreement is rejected",
+          "a RELEASE-READY claim with an unfrozen manifest is rejected"
+        ],
+        "defects_it_found_and_fixed": [
+          "a failed git fetch silently degraded to a local ok",
+          "the verdict grep matched its own explanatory prose"
+        ]
+      },
+      "not_claimed": [
+        "no CI run exists at the integration tip (newest is e2d7ac1be, 59 commits behind)",
+        "no artifact exists at the tip",
+        "no device verification"
+      ]
     },
     {
-      "id": "ROW39", "title": "Nested outbound group resolution and interruption (upstream 41ef639b548f)", "status": "SEMANTIC_EQUIVALENT_PLUS_ONE_FIX",
-      "code_status": "semantic", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "fix/row39-nested-groups", "sha": "b51c6a00c082f68c71323730596642eb691bb045",
-      "verdicts": { "upstream_invariant_as_a_whole": "SEMANTIC-EQUIVALENT (fork already absorbed it and is stricter in two places)", "shapes_and_levels": "SEMANTIC-EQUIVALENT", "naming_and_attribution_layers": "SEMANTIC-EQUIVALENT", "tcp_udp_ownership_and_interruption": "SEMANTIC-EQUIVALENT", "degenerate_paths_except_cycles": "SEMANTIC-EQUIVALENT", "cycles_on_the_route_resolution_walk": "REPRODUCED_AND_FIXED" },
+      "id": "ROW39",
+      "title": "Nested outbound group resolution and interruption (upstream 41ef639b548f)",
+      "status": "SEMANTIC_EQUIVALENT_PLUS_ONE_FIX",
+      "code_status": "semantic",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "fix/row39-nested-groups",
+      "sha": "b51c6a00c082f68c71323730596642eb691bb045",
+      "verdicts": {
+        "upstream_invariant_as_a_whole": "SEMANTIC-EQUIVALENT (fork already absorbed it and is stricter in two places)",
+        "shapes_and_levels": "SEMANTIC-EQUIVALENT",
+        "naming_and_attribution_layers": "SEMANTIC-EQUIVALENT",
+        "tcp_udp_ownership_and_interruption": "SEMANTIC-EQUIVALENT",
+        "degenerate_paths_except_cycles": "SEMANTIC-EQUIVALENT",
+        "cycles_on_the_route_resolution_walk": "REPRODUCED_AND_FIXED"
+      },
       "fix": "resolveOutbound had no visited control; the guard is common.Contains(chain, outbound) using the chain under construction as the visited set - zero allocation, no hard-coded depth",
       "reachability_stated_honestly": "defence in depth, not a live user-visible regression: the start-up sort in adapter/outbound/manager.go refuses circular graphs first and Selected() is a subset of Dependencies() today",
       "old_red": "TestResolveOutboundReportsACycleRatherThanLooping hung (5.01s guard): 20 pass / 1 fail",
-      "reverse_break": ["resolution stops at the first level -> 7 tests red across both packages", "history keyed on the outer tag -> exactly 1 red, expected \"inner-ut\" actual \"leaf-other\"", "inner interruption registration removed -> 6 tests red"],
+      "reverse_break": [
+        "resolution stops at the first level -> 7 tests red across both packages",
+        "history keyed on the outer tag -> exactly 1 red, expected \"inner-ut\" actual \"leaf-other\"",
+        "inner interruption registration removed -> 6 tests red"
+      ],
       "concurrency": "-race -count=20 on all 12 new tests ok; -race -count=100 on the headline subset ok"
     },
     {
-      "id": "ROW15", "title": "Darwin DNS-only environment change and the sing-tun decision (upstream 78d44d52d959)", "status": "FIXED",
-      "code_status": "exact", "behavior_status": "tested", "artifact_status": "n/a",
-      "branch": "fix/row15-dns-generation", "sha": "bcf2e1c49559dfec4a62fdbfb50fd520efa3b294",
-      "before": { "network_environment_fingerprint": "does not advance (hashes gateway/ssid/gateway_mac only)", "reset_epoch": "does not advance (Darwin monitor never fires for a dnsinfo change)", "dns_router_network_generation": "does not advance (only ResetNetwork reaches it)" },
+      "id": "ROW15",
+      "title": "Darwin DNS-only environment change and the sing-tun decision (upstream 78d44d52d959)",
+      "status": "FIXED",
+      "code_status": "exact",
+      "behavior_status": "tested",
+      "artifact_status": "n/a",
+      "branch": "fix/row15-dns-generation",
+      "sha": "bcf2e1c49559dfec4a62fdbfb50fd520efa3b294",
+      "before": {
+        "network_environment_fingerprint": "does not advance (hashes gateway/ssid/gateway_mac only)",
+        "reset_epoch": "does not advance (Darwin monitor never fires for a dnsinfo change)",
+        "dns_router_network_generation": "does not advance (only ResetNetwork reaches it)"
+      },
       "already_correct": "Client.environmentHash mixes each transport's live Environment() into the cache namespace, so the exact cache, NXDOMAIN verdicts, RDRC and the persistent key already separated; the REVERSE MAPPING was the lone exception",
       "fix": "an independent dnsEnvironmentGeneration in dns/router.go, advanced by observeDNSEnvironment when the aggregate DNS-environment fingerprint changes; first observation pins without advancing; dnsGeneration observes before it reads; a change purges only the reverse mapping",
-      "case_verdicts": { "A_interface_gateway_ssid_change": "fingerprint moves, epoch +1, reset body runs", "B_dns_servers_same_interface": "route layer nothing; DNS layer +1; no reset; QUIC/H2/MASQUE/voice survive", "C_search_domains": "same as B; a reordered list advances once then de-bounces", "D_duplicate_or_reordered_notification": "zero advances after the first; no reset storm", "E_empty_then_recovery": "exactly one advance each way; a failed read is not a change", "F_background_push_while_locked": "no movement, no device event, no fabricated unlock" },
+      "case_verdicts": {
+        "A_interface_gateway_ssid_change": "fingerprint moves, epoch +1, reset body runs",
+        "B_dns_servers_same_interface": "route layer nothing; DNS layer +1; no reset; QUIC/H2/MASQUE/voice survive",
+        "C_search_domains": "same as B; a reordered list advances once then de-bounces",
+        "D_duplicate_or_reordered_notification": "zero advances after the first; no reset storm",
+        "E_empty_then_recovery": "exactly one advance each way; a failed read is not a change",
+        "F_background_push_while_locked": "no movement, no device event, no fabricated unlock"
+      },
       "old_red": "7 assertion failures against the unfixed tree (expected: int(1) actual: uint64(0x0))",
-      "reverse_break": ["resolver addresses dropped from the fingerprint -> (B) red, (C) green (discriminating)", "de-bounce removed -> duplicate-burst, reorder and empty/recovery red"],
+      "reverse_break": [
+        "resolver addresses dropped from the fingerprint -> (B) red, (C) green (discriminating)",
+        "de-bounce removed -> duplicate-burst, reorder and empty/recovery red"
+      ],
       "notable": "the race test caught a real defect in the author's own first draft: the snapshot was read outside the lock, allowing a stale overwrite and unbounded advance",
-      "sing_tun_decision": { "verdict": "KEEP_FORK_READER", "why": "sing-tun/dnsinfo is byte-identical to the fork's reader in its C preamble, DNSINFO_VERSION 20170629 struct layout and parseSockaddr; the only real API difference is a push watch, unnecessary because dnsGeneration observes before it reads; adopting it would add a third registration for one notify key and route DNS changes into the network-transition machinery this row forbids; upstream dev has deleted stack_go.go so the fork's four features would be a re-port", "pin_changed": false },
-      "device_only": ["a real resolver switch on a live macOS interface", "whether configd delivers a notify for a DNS-only change", "link-local IPv6 resolver zones", "a live QUIC/H2/MASQUE/voice session surviving", "screen-lock behaviour on a device"]
+      "sing_tun_decision": {
+        "verdict": "KEEP_FORK_READER",
+        "why": "sing-tun/dnsinfo is byte-identical to the fork's reader in its C preamble, DNSINFO_VERSION 20170629 struct layout and parseSockaddr; the only real API difference is a push watch, unnecessary because dnsGeneration observes before it reads; adopting it would add a third registration for one notify key and route DNS changes into the network-transition machinery this row forbids; upstream dev has deleted stack_go.go so the fork's four features would be a re-port",
+        "pin_changed": false
+      },
+      "device_only": [
+        "a real resolver switch on a live macOS interface",
+        "whether configd delivers a notify for a DNS-only change",
+        "link-local IPv6 resolver zones",
+        "a live QUIC/H2/MASQUE/voice session surviving",
+        "screen-lock behaviour on a device"
+      ]
     },
     {
-      "id": "SCHEMA", "title": "docs/schema.json debt (main order 6.3)", "status": "FIXED",
-      "verified_additions": ["the fork's DNS group server (traffic_class/servers/mode/error_ttl/win_ttl)", "XHTTP xmux options (V2RayXHTTPXmuxOptions/XmuxRange and their fields)", "the TLS encryption field"],
+      "id": "SCHEMA",
+      "title": "docs/schema.json debt (main order 6.3)",
+      "status": "FIXED",
+      "verified_additions": [
+        "the fork's DNS group server (traffic_class/servers/mode/error_ttl/win_ttl)",
+        "XHTTP xmux options (V2RayXHTTPXmuxOptions/XmuxRange and their fields)",
+        "the TLS encryption field"
+      ],
       "command": "go run -tags \"$(cat release/DEFAULT_BUILD_TAGS)\" ./cmd/sing-box schema -o docs/schema.json",
       "diff": "+195 lines, 0 changed; valid JSON with 105 $defs",
       "backward_compat": "go test -count=1 -tags $(cat release/DEFAULT_BUILD_TAGS) ./option/... ./config/... ./route/rule/... ok"
     }
   ],
-
   "artifacts": [
-    { "name": "Libbox-ef83b8681.xcframework/ios-arm64/Libbox.framework/Libbox", "sha256": "c40e1b8ea1baa79c1820e202401e379d0d5483a6949b3818c5391000badb36c5", "signed": false, "core_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d" },
-    { "name": "Libbox-ef83b8681.xcframework/macos-arm64_x86_64/Libbox.framework/Libbox", "sha256": "4d57471884d495b6ca938ddb77bc2c24fe2c13e79f2f9ef7deb5858dee652939", "signed": false, "core_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d" },
-    { "name": "sing-box.app/sing-box (SFI Debug, iphoneos, arm64)", "sha256": "735d38ac1017dbb77ad63f3b343c60c0ac2caeea0bbd1339503557a2ff52dc9b", "signed": false, "codesign": "code object is not signed at all" },
-    { "name": "sing-box.debug.dylib", "sha256": "963fc53102b83fef91fecb5b758b98101ca9c9d27567db869a2daae1f56fbf98", "signed": false },
-    { "name": "sing-box.app/Contents/MacOS/sing-box (SFM Debug, x86_64+arm64)", "sha256": "e603377205737012108cba205fae2c68dd6e58aebf3756fdb345f67fa4759f5f", "signed": "linker ad-hoc stamp only; TeamIdentifier not set" },
-    { "name": "satelite-one-0.5.10-arm64-v8a-release.apk", "sha256": "8e6dd3e57992cd7fc1f143c518e075b56c4536f575065f3b72308fda66e6f5ec", "bytes": 29525843, "signature_state": "unsigned" },
-    { "name": "satelite-one-0.5.10-x86_64-release.apk", "sha256": "1c123b8dc0942ea530afbc0feb043f08a5fd8284888a8d493dbcf076f88ee161", "bytes": 31408898, "signature_state": "unsigned" },
-    { "name": "libbox.aar", "sha256": "e3b6084b1caff5edc63d59e63ce38c9ab9094abb310620552844f97016cfc3c9", "bytes": 58396617, "core_commit": "c35faabf402a4da93b8c31cdfad941b8b1528ffc" },
-    { "name": "lib/arm64-v8a/libbox.so (from the APK)", "sha256": "277d76bb088f08fe95a3410eb48133abbeb25db4830dac73d4e40753b41f4a8e", "bytes": 80129776, "byte_identical_to_aar": true },
-    { "name": "lib/x86_64/libbox.so (from the APK)", "sha256": "80448f061c5bb818b7b5f882410a058c1c6901beb791ed8454eae304696f38dd", "bytes": 84472800, "byte_identical_to_aar": true },
-    { "name": "cronet-go lib/ios_arm64 libcronet.a", "sha256": "6863693a72d461855ea0de58492af110fc2087cfb5a3f7db33e060eef6a13980", "bytes": 46280672 }
+    {
+      "name": "Libbox-ef83b8681.xcframework/ios-arm64/Libbox.framework/Libbox",
+      "sha256": "c40e1b8ea1baa79c1820e202401e379d0d5483a6949b3818c5391000badb36c5",
+      "signed": false,
+      "core_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d"
+    },
+    {
+      "name": "Libbox-ef83b8681.xcframework/macos-arm64_x86_64/Libbox.framework/Libbox",
+      "sha256": "4d57471884d495b6ca938ddb77bc2c24fe2c13e79f2f9ef7deb5858dee652939",
+      "signed": false,
+      "core_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d"
+    },
+    {
+      "name": "sing-box.app/sing-box (SFI Debug, iphoneos, arm64)",
+      "sha256": "735d38ac1017dbb77ad63f3b343c60c0ac2caeea0bbd1339503557a2ff52dc9b",
+      "signed": false,
+      "codesign": "code object is not signed at all"
+    },
+    {
+      "name": "sing-box.debug.dylib",
+      "sha256": "963fc53102b83fef91fecb5b758b98101ca9c9d27567db869a2daae1f56fbf98",
+      "signed": false
+    },
+    {
+      "name": "sing-box.app/Contents/MacOS/sing-box (SFM Debug, x86_64+arm64)",
+      "sha256": "e603377205737012108cba205fae2c68dd6e58aebf3756fdb345f67fa4759f5f",
+      "signed": "linker ad-hoc stamp only; TeamIdentifier not set"
+    },
+    {
+      "name": "satelite-one-0.5.10-arm64-v8a-release.apk",
+      "sha256": "8e6dd3e57992cd7fc1f143c518e075b56c4536f575065f3b72308fda66e6f5ec",
+      "bytes": 29525843,
+      "signature_state": "unsigned"
+    },
+    {
+      "name": "satelite-one-0.5.10-x86_64-release.apk",
+      "sha256": "1c123b8dc0942ea530afbc0feb043f08a5fd8284888a8d493dbcf076f88ee161",
+      "bytes": 31408898,
+      "signature_state": "unsigned"
+    },
+    {
+      "name": "libbox.aar",
+      "sha256": "e3b6084b1caff5edc63d59e63ce38c9ab9094abb310620552844f97016cfc3c9",
+      "bytes": 58396617,
+      "core_commit": "c35faabf402a4da93b8c31cdfad941b8b1528ffc"
+    },
+    {
+      "name": "lib/arm64-v8a/libbox.so (from the APK)",
+      "sha256": "277d76bb088f08fe95a3410eb48133abbeb25db4830dac73d4e40753b41f4a8e",
+      "bytes": 80129776,
+      "byte_identical_to_aar": true
+    },
+    {
+      "name": "lib/x86_64/libbox.so (from the APK)",
+      "sha256": "80448f061c5bb818b7b5f882410a058c1c6901beb791ed8454eae304696f38dd",
+      "bytes": 84472800,
+      "byte_identical_to_aar": true
+    },
+    {
+      "name": "cronet-go lib/ios_arm64 libcronet.a",
+      "sha256": "6863693a72d461855ea0de58492af110fc2087cfb5a3f7db33e060eef6a13980",
+      "bytes": 46280672
+    }
   ],
-
   "ci": {
     "github_actions_runs_executed": 0,
     "run_ids": [],
     "reason": "no GitHub Actions execution was available in this environment; no run id is invented"
   },
-
   "not_ready": {
     "verdict": "NOT-READY",
     "software_controllable_items_all_passed": true,
@@ -273,7 +664,7 @@
       "no real GitHub Actions execution, so no CI green exists at any of these SHAs",
       "no tag, Release or signature, which by policy is a local user action",
       "the Android version.properties coreCommit still points at c35faabf4 and must only be updated AFTER the Core freeze, which is why it was deliberately not touched",
-      "transport/masque TestTheOwnershipScanIsLinearHereToo is a PRE-EXISTING load/thermal-sensitive complexity gate, reproduced on the pristine baseline, and deliberately not fixed in this round",
+      "transport/masque TestTheOwnershipScanIsLinearHereToo is a PRE-EXISTING load/thermal-sensitive complexity gate, reproduced on the pristine baseline, and deliberately not fixed in this round; common/dialer's G2 group (16 host-sensitive upper bounds) is likewise recorded OPEN",
       "there is no full-suite 0-FAIL run at a single SHA on a quiet machine: run 1 was 76 ok / 0 FAIL at load 17-24 (S01 tree), run 2 was 74 ok / 2 FAIL at load 28 (integration tree, both since fixed), run 3 was 77 ok / 1 FAIL at load 710 (the pre-existing masque gate)"
     ],
     "shortest_remaining_steps": [
