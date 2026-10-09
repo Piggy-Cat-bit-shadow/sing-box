@@ -246,13 +246,31 @@ go test -count=1 -run TestTheOwnershipScanIsLinearHereToo -tags "$(cat release/D
 
 建议的收口方向与 S06 同族：把“比率上界”换成**确定性的操作计数/复杂度断言**（例如统计 ownership 扫描的比较次数），而不是 5000 次查询的墙钟比值；若保留墙钟，则应把 `best of N` 的 N 与界都改为相对机器基线而非固定 32768。
 
-### G.3c 第五处：`common/dialer` 的双定时器竞态（已复现，候选修复已验证）
+### G.3c 第五处：`common/dialer` 的双定时器竞态（已复现并已修）
 
 `TestPreferredFamilyArrivingWithinGraceIsDialledFirst`（`family_grace_order_test.go:205`）在负载下**真实失败两次**（load 632 第 44 次迭代；load 229→243 第 97 次迭代），签名一致：`expected true, actual false; got 192.0.2.1 first out of [192.0.2.1 2001:db8::1]`。
 
-机制与前三处**形状不同**：不是“对某个时长设界”，而是**两个定时器之间的竞速**——`preferredFamilyGrace=50ms`，首选族在 `grace/5=10ms` 应答，fixture 的 `fallbackDelay=2*grace=100ms`，于是首选候选必须在 grace 释放时被拨号、抢在 fallback 节奏启动另一个之前，即主机必须赢下一个 90ms 窗口。
+**这一处与前三处形状不同，也正是最有价值的一条**：它不是“对某个时长设界”，而是**“由错误的机制决定答案”**——测试保证了竞争者会开火，所以主机只需要**输掉一场竞速**，而不是超过某个界；调界宽毫无意义。
 
-候选修复一行，且**测试自己的注释已经写明意图**（“That leaves the grace release as the only mechanism under test”）：把 `fallbackDelay` 设为 `time.Hour`。在同一 fixture 与同一断言上验证：**load 220–280 下 300/300 通过**，而基线的失败正落在此负载带内。已按同一方法论交回同一工作包做枚举 + 反向破坏 + `-race` 后收口。
+**枚举（`common/dialer`，23 个测试文件，40 处含时长的断言，分 5 组）**：
+- G1 **结构性竞速**（竞争者决定答案）2 处 → **已修**；
+- G2 **主机敏感上界**（慢主机让正确操作变晚）16 处 → **未修**，其中数处的界**就等于注入的延迟本身**，因此“修”它先要决定断言的主张是什么，必须逐个判定；
+- G3 有 ≥1s 余量的活性断言 15 处 → 不属于 flake 类；
+- G4 安全下界 4 处 → 负载只会使其增大；
+- G5 **真实超时/取消预算** 3 处 → **原样保留**。
+
+**候选修复不够，是负载运行把它否掉的**：停掉 fallback cadence 之后，修复版**在 load ~450 下仍然 200 次里失败 2 次**，且失败信息显示**只拨了一个候选**——在 cadence 已不可能开火的前提下，那只可能是 **grace 定时器本身（50ms）跑赢了 fixture 里首选族的 10ms sleep**。此时**产品是对的**（静默 50ms 的 resolver 就是慢），是**测试在报假故障**。也就是说有**两个**竞争者，不是一个。
+
+**最终修复（测试专用，生产文件零改动，断言未动）**：
+- cadence 移出可达范围（`graceOrderOutOfReachCadence = 10 * graceOrderDeadline`，4s vs 400ms context，两个名字成对以免失步）；
+- fixture 改为从**同一个 goroutine、无 sleep、背靠背**发布非首选族与首选族，于是“首选族在 grace 窗口内应答”在任何慢主机上都成立。
+
+**反向破坏**：把 `resolve.go` 里的 grace hold 去掉（第一个应答的族拿走槽位——正是这两个测试存在的理由）→ **两个测试、两个子测试全红**。作者先做的一次注入（把 grace 定时器设为 0）被**判定为不可用而丢弃**：Go 的 `select` 在就绪的 timer 与 channel 之间随机选择，导致只有一个测试变红、另一个靠抛硬币通过——**结果随机的反向破坏不是反向破坏**。
+
+**负载证据（基线与修复交替、同一负载窗口内逐次对比）**：决定性一轮 load 423–434，**基线 150 次里失败 4 次，修复版 0 次**；`-race ./common/dialer/...` exit 0。
+
+**作者另给出（未应用、未验证）**：`transport/masque` 那个比率估计器的根因读法——宽用例跑数秒、窄用例只跑约 1 毫秒，两侧 Wall time 不可比，`best-of-5` 在**持续节流**下每个宽样本都被抬高而 ~1ms 的窄样本已到自身下限，于是比率其实在报告机器状态。建议把两侧做成可比 wall time，或直接改成**统计 range 比较次数**的复杂度断言。按指示记为 `OPEN`。
+
 
 
 ### G.4 生成 `build/` 污染包枚举
@@ -329,6 +347,7 @@ go test -count=1 -run TestTheOwnershipScanIsLinearHereToo -tags "$(cat release/D
 | S05 | `-race` DATA RACE + 独占性/sentinel 断言失败 | `-race` 全绿；`-count=20` 绿 | 守卫回退 → 双重 claim；禁用释放 → 20/20 红 |
 | S06 | `trafficsched` 第 5 次迭代真实失败（79.6%） | 25/25 绿（load ≤473） | 平坦界重新注入 → 第 3 次迭代红 |
 | S06b | `dns` 9 处上界在负载下可越界（本轮全量真实失败一次） | `-count=25 ./dns/` ok（load ≤1006）；`-race` exit 0 | 4 个生产回归各自致红（见 G.3） |
+| S06c | `common/dialer` 首选族竞速在负载下真实失败（load 632 第 44 次、229–243 第 97 次） | 交替对比 load 423–434：基线 4/150 失败、修复 0/150；`-race` exit 0 | 去掉生产里的 grace hold → 两测试两子测试全红（见 G.3c） |
 | S07 | MASQUE 守卫禁用时真实 `bind: address already in use` | `-race` 全绿；`-count=20 -race ./adapter/` ok 79s | 禁用守卫 → 端口泄漏复现 |
 | S08 | 校验器四类破坏各自 exit 1 | 对真实远端 PASS（exit 0） | 见 I 节 |
 | Row39 | 环状 group 图上 `resolveOutbound` 不返回（5.01s 守卫） | `-race` 全绿；`-count=20` 与 `-count=100` 绿 | 3 个控制（停在第一层 7 红 / 历史用外层 tag 1 红 / 去掉内层中断 6 红） |
@@ -370,7 +389,7 @@ go test -count=1 -run TestTheOwnershipScanIsLinearHereToo -tags "$(cat release/D
 5. **Apple IPA/DMG**：`BLOCKED`（需要打包与签名决策，签名按政策属于用户本地操作）。**未签名 `.app` 已真实产出**，IPA/DMG 未产出，也未声称产出。
 6. **真机/AVD 运行验证**：按用户指示不做模拟器；真机不可用 → `DEVICE-ONLY`。
 7. **`transport/masque` 的复杂度墙钟门禁**：`PRE_EXISTING_LOAD_SENSITIVE`，在纯净基线即可复现，本轮**未修**（见 G.3b）。
-8. **`common/dialer` 的双定时器竞态**：已复现、候选修复已验证，正在同一工作包内收口（见 G.3c）；若未在本轮冻结前落地，则记为 `PRE_EXISTING_LOAD_SENSITIVE`。
+8. ~~**`common/dialer` 的双定时器竞态**~~ → **已修**（`test/dialer-race-deterministic-gate` @ `beb1b9e724d85672d6fc07b7f7c9ec48ea57502e`）。同类中**仍有 16 处主机敏感上界（G2）未修**，需逐个判定断言主张后才可动，记为 `OPEN`。
 9. 本报告与 `docs/fork/` 中文档的提交会**改变 `HEAD`**；单一 RC 冻结 SHA 记录在 `docs/fork/v016-release-candidate-manifest.md`，本报告不自行宣布 FINAL。
 
 **关于“全量 0 FAIL”的准确措辞**：本轮共跑了 3 次带 tag 的全量 `./...`。
