@@ -67,7 +67,7 @@ PROJECT_GOMOBILE_VERSION="$(cd "$repo_root" && go list -m -f '{{.Version}}' gith
 #          Upstream SagerNet/sing-box-for-android does NOT carry them.
 # Apple:   Piggy-Cat-bit-shadow/sing-box-for-apple. The migration is carried as
 #          docs/fork/apple-stringbox-callsites.patch; see docs/fork/apple-client-fork.md.
-VERIFIED_ANDROID_SHA="8e1c3ff49e38b43b6e317138ea7a4a75eeae78fb"
+VERIFIED_ANDROID_SHA="ec61030d3df74f3e7c39ab848c8996008ecd386a"
 VERIFIED_APPLE_SHA="5911580a6366da78e6b4b5b4459596e5a2cf1eb4"
 
 client_root=""
