@@ -1,0 +1,36 @@
+From a966aca4978c5c0795f5754e239d7c221edb0b91 Mon Sep 17 00:00:00 2001
+From: satelite-one release pin <noreply@example.invalid>
+Date: Fri, 9 Oct 2026 17:01:08 +0800
+Subject: [PATCH] fix(release): pin the core to the frozen v0.1.6 revision
+
+version.properties still pinned coreCommit=c35faabf4, which is the core the
+0.5.10 release was cut from. That revision predates this round's ABI migration
+and the uTLS hybrid-share pin, so a rebuild of the release tag would have
+produced a different core than the one this round froze -- exactly the
+non-reproducible-tag failure the pin exists to prevent.
+
+c35faabf4 is 40 commits behind the frozen revision. Move the pin to the frozen
+core commit and change nothing else: versionCode and versionName keep the
+existing 0.5.10 release strategy, and no app tag is created here.
+
+The release workflow resolves this value, fetches that exact commit from
+Piggy-Cat-bit-shadow/sing-box, and builds libbox.aar from it, so the pin is
+only effective once the frozen core commit is itself pushed to that
+repository.
+---
+ version.properties | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/version.properties b/version.properties
+index 4d9dc04..7fbb302 100644
+--- a/version.properties
++++ b/version.properties
+@@ -13,4 +13,4 @@ versionName=0.5.10
+ # 开发用 CI(.github/workflows/android-ci.yml) 仍然跟随 testing HEAD。
+ #
+ # 发版前把这个值更新为要发布的内核 commit, 并与 app 一起提交。
+-coreCommit=c35faabf402a4da93b8c31cdfad941b8b1528ffc
++coreCommit=0fbca85462689c1ea72f7f1af511540ff873aeba
+-- 
+2.54.0 (Apple Git-157)
+
