@@ -3,6 +3,7 @@ package socks
 import (
 	"context"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,7 +46,19 @@ type Outbound struct {
 	dnsRouter adapter.DNSRouter
 	logger    logger.ContextLogger
 	client    *socks.Client
-	resolve   bool
+	// clientDialer is the dialer the SOCKS client was built with, kept so a caller can observe the
+	// request-building seam: the dial the client makes with the target it DECIDED on is the only place
+	// "what did the client actually send" is visible without a live peer. Production never reads it.
+	clientDialer N.Dialer
+	resolve      bool
+	// destinationDNSOwnership is the declared downstream-hop position: this outbound is a proxy the
+	// user's traffic reaches after leaving the device, so the destination domain must be resolved by
+	// this fork's DNS policy plane rather than by the proxy.
+	//
+	// See option.DialerOptions.DestinationDNSOwnership for why it is a declaration and not the
+	// default. `resolve` is the narrower, older reason to resolve locally (SOCKS4 cannot carry a
+	// domain at all); this is the product reason.
+	destinationDNSOwnership bool
 	// targetQueryOptions is the resolver policy for a TARGET domain, as opposed to the proxy
 	// server's hostname.
 	//
@@ -62,6 +75,49 @@ type Outbound struct {
 	// earlyBufferGrowth is reported through the copy-tuning capability so the route
 	// layer can size its buffers for a chained hop. Off unless opted in.
 	earlyBufferGrowth bool
+}
+
+// lookupDestinationAddresses resolves a destination domain for the wire.
+//
+// It is a package-level variable so a test can substitute a resolver without a DNS transport, the
+// same seam TestSOCKS4LookupCarriesTheTargetPolicy uses through the router interface. Production
+// always takes the default.
+var lookupDestinationAddresses = func(ctx context.Context, router adapter.DNSRouter, options adapter.DNSQueryOptions, domain string) ([]netip.Addr, error) {
+	return router.Lookup(ctx, domain, options)
+}
+
+// resolveDestinationForDownstream returns the addresses to dial when this outbound owns destination
+// DNS, or ok=false when it must leave the destination as it is.
+//
+// # The three answers, and why "no answer" is not one of them
+//
+//   - not declared: ok=false, and the destination travels unchanged. This is every ordinary
+//     single-hop proxy, where the proxy's own resolver is the better one.
+//   - declared, the destination is already an address: ok=false. There is nothing to own, and a
+//     reverse lookup would be inventing a name.
+//   - declared, the destination is a domain: the addresses are returned, or the error is returned.
+//     A failed lookup does NOT fall through to sending the domain. Falling through would hand the
+//     name to the peer after the configuration said not to, which is the silent remote resolution
+//     this option exists to forbid; failing closed is the only answer that keeps the contract
+//     readable from the failure.
+func (h *Outbound) resolveDestinationForDownstream(ctx context.Context, destination M.Socksaddr) ([]netip.Addr, bool, error) {
+	if !h.destinationDNSOwnership || !destination.IsDomain() {
+		return nil, false, nil
+	}
+	if h.dnsRouter == nil {
+		return nil, false, E.New("socks: destination_dns_ownership is enabled but no DNS router is available to resolve ", destination.Fqdn)
+	}
+	addresses, err := lookupDestinationAddresses(ctx, h.dnsRouter, h.targetQueryOptions, destination.Fqdn)
+	if err != nil {
+		return nil, false, E.Cause(err, "socks: resolve destination ", destination.Fqdn,
+			" locally, as destination_dns_ownership requires; the name is deliberately NOT sent to ",
+			"the proxy")
+	}
+	if len(addresses) == 0 {
+		return nil, false, E.New("socks: no address for destination ", destination.Fqdn,
+			"; destination_dns_ownership forbids forwarding the unresolved name to the proxy")
+	}
+	return addresses, true, nil
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SOCKSOutboundOptions) (adapter.Outbound, error) {
@@ -98,13 +154,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	dialClientDialer := clientDialer(outboundDialer, version, options.ServerOptions.Build())
 	outbound := &Outbound{
-		Adapter:            outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
-		dnsRouter:          service.FromContext[adapter.DNSRouter](ctx),
-		logger:             logger,
-		client:             socks.NewClient(clientDialer(outboundDialer, version, options.ServerOptions.Build()), options.ServerOptions.Build(), version, options.Username, options.Password),
-		resolve:            version == socks.Version4,
-		targetQueryOptions: targetQueryOptions,
+		Adapter:                 outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
+		dnsRouter:               service.FromContext[adapter.DNSRouter](ctx),
+		logger:                  logger,
+		client:                  socks.NewClient(dialClientDialer, options.ServerOptions.Build(), version, options.Username, options.Password),
+		clientDialer:            dialClientDialer,
+		resolve:                 version == socks.Version4,
+		destinationDNSOwnership: options.DialerOptions.DestinationDNSOwnership,
+		targetQueryOptions:      targetQueryOptions,
 	}
 
 	if preconnect := options.TCPPreconnect; preconnect != nil && preconnect.Enabled {
@@ -164,6 +223,39 @@ func (h *Outbound) Close() error {
 	return h.client.Close()
 }
 
+// dialDownstreamOwnedDestination performs the dial when this outbound owns destination DNS.
+//
+// # Why the domain stays in the metadata
+//
+// The wire target is an address, because that is the contract: the proxy must not resolve the user's
+// destination. The DOMAIN is still the thing the user asked for, and everything downstream of the
+// dial that is not the wire - TLS SNI, an HTTP Host header, sniffing, the tracker, a log line - reads
+// it from the context. Losing it here would turn "we resolved this locally" into "we forgot what the
+// user asked for", and the second is a worse outcome than the first.
+//
+// `Destination` is left as the domain and `OriginDestination` records it, which is the same pairing the
+// inbound side already uses for a destination that was rewritten: the domain is what the user meant,
+// and the address actually dialled is whatever the dialer was handed.
+//
+// The extension is scoped to the downstream dial and its nested dials, so the caller's own metadata
+// is untouched.
+func (h *Outbound) dialDownstreamOwnedDestination(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr) (net.Conn, error) {
+	_, metadata := adapter.ExtendContext(ctx)
+	metadata.OriginDestination = destination
+	metadata.DestinationAddresses = addresses
+	return N.DialSerial(adapter.WithContext(ctx, metadata), h.client, network, destination, addresses)
+}
+
+// listenDownstreamOwnedDestination is the packet-connection form of
+// dialDownstreamOwnedDestination, with the same metadata rule.
+func (h *Outbound) listenDownstreamOwnedDestination(ctx context.Context, destination M.Socksaddr, addresses []netip.Addr) (net.PacketConn, error) {
+	_, metadata := adapter.ExtendContext(ctx)
+	metadata.OriginDestination = destination
+	metadata.DestinationAddresses = addresses
+	packetConn, _, err := N.ListenSerial(adapter.WithContext(ctx, metadata), h.client, destination, addresses)
+	return packetConn, err
+}
+
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
@@ -180,6 +272,16 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
+	// Destination DNS ownership is checked BEFORE the SOCKS4 workaround, because it is the broader
+	// rule: SOCKS4's reason is a protocol limitation, this one is a product contract, and when both
+	// apply the answer is the same.
+	downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
+	if ownErr != nil {
+		return nil, ownErr
+	}
+	if owned {
+		return h.dialDownstreamOwnedDestination(ctx, network, destination, downstreamAddresses)
+	}
 	if h.resolve && destination.IsDomain() {
 		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, h.targetQueryOptions)
 		if err != nil {
@@ -195,8 +297,31 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	if h.uotClient != nil {
+		// UoT carries the target inside the tunnelled request, so the same ownership rule applies to
+		// it as to a plain SOCKS UDP ASSOCIATE: what must not reach the peer is the NAME. A UoT client
+		// takes one destination for the session, so a name that must be owned is resolved here and the
+		// session is opened to the address.
+		downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
+		if ownErr != nil {
+			return nil, ownErr
+		}
+		if owned {
+			h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination, " via ", downstreamAddresses)
+			_, ownedMetadata := adapter.ExtendContext(ctx)
+			ownedMetadata.OriginDestination = destination
+			ownedMetadata.DestinationAddresses = downstreamAddresses
+			return h.uotClient.ListenPacket(adapter.WithContext(ctx, ownedMetadata),
+				M.SocksaddrFrom(downstreamAddresses[0], destination.Port))
+		}
 		h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
 		return h.uotClient.ListenPacket(ctx, destination)
+	}
+	downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
+	if ownErr != nil {
+		return nil, ownErr
+	}
+	if owned {
+		return h.listenDownstreamOwnedDestination(ctx, destination, downstreamAddresses)
 	}
 	if h.resolve && destination.IsDomain() {
 		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, h.targetQueryOptions)

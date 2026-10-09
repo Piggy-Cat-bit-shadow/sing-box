@@ -436,4 +436,11 @@ var dialerOptionClassification = map[string]optionClassification{
 	"FallbackDelay":       {BlockerNetworkStrategy, scopeAlways},
 	"DomainResolver":      {BlockerDomainResolution, scopeResolutionOnly},
 	"DomainStrategy":      {BlockerDomainResolution, scopeResolutionOnly},
+
+	// DestinationDNSOwnership changes what the outbound sends to its peer - an address instead of a
+	// name - which is a behaviour a platform connect has no equivalent of. It is also unreachable for
+	// a direct outbound in practice, but the table has to cover the struct: the failure mode of
+	// forgetting a field is a bypass that silently discards it, and this field is precisely about NOT
+	// handing a name to a peer.
+	"DestinationDNSOwnership": {BlockerDomainResolution, scopeResolutionOnly},
 }

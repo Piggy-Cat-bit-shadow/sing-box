@@ -103,6 +103,31 @@ type DialerOptionsWrapper interface {
 type DialerOptions struct {
 	Detour string `json:"detour,omitempty" reference:"outbound"`
 	AbstractDialerOptions
+	// DestinationDNSOwnership declares that this outbound is a DOWNSTREAM physical hop - a proxy the
+	// user's traffic reaches after leaving the device - and that the destination domain must
+	// therefore be resolved by this fork's DNS policy plane before the request is written to it.
+	//
+	// # What it changes on the wire
+	//
+	// With it enabled, a domain destination reaching this outbound is resolved locally and the
+	// outbound sends the resulting IPv4 or IPv6 ADDRESS to the proxy, never the domain. SOCKS5 gets
+	// ATYP=IPv4/IPv6 instead of ATYP=DOMAIN, and HTTP CONNECT gets an `IP:port` authority instead of
+	// a hostname. The original domain stays in the connection metadata, so routing, SNI, the Host
+	// header, tracking and diagnostics are unaffected.
+	//
+	// # Why it is not the default
+	//
+	// It is false by default, and that default is deliberate. For a single-hop SOCKS5 or HTTP proxy
+	// the downstream resolver is usually the BETTER resolver - it is in the destination's region, so
+	// it picks the right CDN edge, while resolving locally picks whichever edge is nearest to the
+	// device and then asks the proxy to reach it. Turning this on for such a configuration is a
+	// deliberate loss of that property, which is why it is an operator's declaration rather than an
+	// automatic behaviour.
+	//
+	// The names this applies to are the DESTINATION's. The proxy SERVER's own hostname keeps using
+	// `domain_resolver` and the ordinary dial path, because a node address and a destination address
+	// are different questions with different answers.
+	DestinationDNSOwnership bool `json:"destination_dns_ownership,omitempty"`
 }
 
 type AbstractDialerOptions struct {
