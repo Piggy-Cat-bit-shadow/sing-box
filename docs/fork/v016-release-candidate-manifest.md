@@ -18,7 +18,12 @@ is a release candidate, because:
 - no CI run exists at the integration tip (`ef83b8681`) or at the phase-A start (`912ed1efa`); the
   newest run on the fork is at `e2d7ac1be`, **59 commits** behind;
 - no artifact exists at the integration tip; the recorded digests were produced at `0fbca8546`;
-- the Apple product builds (IPA/DMG) are `absent` — blocked on the client source tree at `2b23330d4`;
+- **corrected in the supplemental round:** the Apple product **does** build at the pinned client
+  revision (`2b23330d4`) — `xcodebuild -scheme SFI -sdk iphoneos … CODE_SIGNING_ALLOWED=NO` and
+  `-scheme SFM -sdk macosx …` both return `BUILD SUCCEEDED`, exit 0. The earlier note in this file said
+  IPA/DMG were blocked on the client source tree; that was wrong. They are `absent` because no
+  packaging or signing decision has been taken — signing is by policy a local user action — not because
+  the source does not compile. See `v016-supplemental-closure-report.md` §D;
 - no acceptance pass has been run against a single frozen SHA.
 
 Freezing a candidate is an **act**, not an edit: it requires a real SHA that has been built, tested and
@@ -55,3 +60,26 @@ recorded. Writing one in advance would be inventing a fact.
 | # | `release_candidate_core_sha` | `frozen_at_utc` | acceptance CI run | outcome |
 | --- | --- | --- | --- | --- |
 | — | *(none — never frozen)* | — | — | — |
+
+---
+
+## Post-supplemental integration tip — **not a release candidate**
+
+The supplemental round (S01–S08, Row 15, Row 39, plus the `docs/schema.json` debt) is integrated on
+branch `integrate/v016-final`. Its tip is recorded here for traceability **only**, and deliberately
+**not** as `release_candidate_core_sha`:
+
+| Field | Value |
+| --- | --- |
+| `post_supplemental_integration_tip` | branch `integrate/v016-final` on `Piggy-Cat-bit-shadow/sing-box`; the tip is whatever `git rev-parse origin/integrate/v016-final` returns — a branch tip can move, so no literal SHA is written here |
+| `is_release_candidate` | **no** |
+| `acceptance_ci_run` | **none** — no GitHub Actions run exists at this tip, so the manifest's own admission rule is not satisfied |
+| `device_status` | not run; the user explicitly directed that no simulator testing be performed |
+| `artifact_status` | `absent` at this tip. The measured digests in `v016-supplemental-closure.json` were produced at `ef83b8681` (Apple framework) and `c35faabf4` (Android); the Android `version.properties` `coreCommit` has deliberately **not** been moved to this tip, because the order requires that update to happen only after the Core freeze |
+| `local_verification` | 21+ integrated commits; `-race` green over `./protocol/tun/... ./protocol/masque/... ./protocol/group/... ./route/... ./adapter/...`; tagged full-suite runs 76 ok/0 FAIL (S01 tree, load 17–24) and 77 ok/1 FAIL (integration, load 710, the one failure being the pre-existing `transport/masque` complexity gate) |
+| `known_open` | the uTLS fingerprint matrix and the Xray/REALITY reference matrix were not started; the cronet iOS archive rebuild is `BLOCKED_TOOLCHAIN`; `transport/masque TestTheOwnershipScanIsLinearHereToo` is a pre-existing load-sensitive gate |
+
+**Verdict: `NOT-READY`.** The software-controllable items of both orders that were reachable in this
+environment are done and evidenced; what remains is external (CI execution, device runs, the cronet
+build pipeline) or explicitly out of this round's scope (uTLS/reference matrices). No tag, Release or
+signature was created.
