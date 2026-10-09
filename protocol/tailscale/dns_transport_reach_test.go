@@ -1,3 +1,19 @@
+//go:build with_tailscale
+
+// Gated on with_tailscale because it asserts on `*DNSTransport`, and that type only exists in
+// dns_transport.go, which is itself gated on the same tag. Without this line the package's TEST binary
+// fails to build in the untagged configuration:
+//
+//	protocol/tailscale/dns_transport_reach_test.go:47:20: undefined: DNSTransport
+//	protocol/tailscale/dns_transport_reach_test.go:62:12: undefined: DNSTransport
+//
+// MEASURED at the baseline 96fd0263 and still true at the start of this round: `go test -run '^$' ./...`
+// failed on exactly this package. The sibling test files in this directory carry the tag for the same
+// reason (control_https_test.go, endpoint_detour_dependency_test.go), and the Verify workflow gates the
+// untagged configuration on test binaries LINKING, so a package whose test binary does not build is a
+// red on every push that reaches it. `go build ./...` was unaffected, because it does not compile test
+// files - which is why this survived.
+
 package tailscale
 
 import (
