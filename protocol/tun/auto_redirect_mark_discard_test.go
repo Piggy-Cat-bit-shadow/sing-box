@@ -79,12 +79,7 @@ func TestDiscardedInboundReleasesTheAutoRedirectOutputMark(t *testing.T) {
 			return nil, err
 		}
 		loserClaimed.Add(1)
-		return &Inbound{
-			tag:                           tag,
-			networkManager:                networkManager,
-			autoRedirectOutputMark:        mark,
-			autoRedirectOutputMarkClaimed: true,
-		}, nil
+		return newMarkClaimedInbound(tag, networkManager, mark), nil
 	})
 	manager := inbound.NewManager(&blockingRegistry{
 		InboundRegistry: registry,

@@ -1,4 +1,4 @@
-package tun
+﻿package tun
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -84,8 +85,21 @@ type Inbound struct {
 	// discards an inbound without ever starting it is adapter/inbound.Manager.Create's duplicate-tag
 	// loser, which closes what the constructor built, and a mark left behind there is applied to every
 	// dial the surviving box makes.
-	autoRedirectOutputMarkClaimed bool
+	//
+	// It is an ATOMIC bool rather than a plain one because Close is reachable concurrently - the
+	// Scope's cleanup drain and the manager's duplicate-tag loser are two independent callers - and
+	// the release must happen exactly once. `if claimed { claimed = false; release() }` is not that:
+	// two concurrent Closes can both read true, both release, and the second release is the one that
+	// can hand back a claim a NEW owner has since taken. CompareAndSwap makes the flag the
+	// exactly-once token, so exactly one caller reaches the releaser and the loser does nothing.
+	autoRedirectOutputMarkClaimed atomic.Bool
 	autoRedirectOutputMark        uint32
+	// testCloseObserver, when set, runs at the start of Close.
+	//
+	// It exists so a test can observe that a Close really happened to a particular inbound - the
+	// duplicate-tag loser is closed by adapter/inbound/manager.go and nothing else announces it. Nil in
+	// production.
+	testCloseObserver func()
 	// The two objects StartStatePostStart ACTIVATES are owned through a startupGate, because
 	// Scope.Close does not wait for a Start that is already running: the Scope's release of them can
 	// run while that activation is in flight, and NativeTun.Start programmes the platform routing
@@ -445,10 +459,20 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			mark := inbound.tunOptions.AutoRedirectOutputMarkOrDefault()
 			err = networkManager.RegisterAutoRedirectOutputMark(mark)
 			if err != nil {
-				return nil, err
+				// The redirect was built before the claim was attempted, and this constructor is
+				// returning an error: nobody will ever receive the *Inbound, so nobody will ever call
+				// Close on it and nobody else can release what the redirect holds. Without this the
+				// already-created redirect - its nftables/iptables rules, its network monitor and its
+				// goroutines - outlives the failed construction with no owner at all.
+				//
+				// The field is cleared so the object being abandoned cannot be closed twice if a
+				// caller ever did reach it.
+				redirect := inbound.autoRedirect
+				inbound.autoRedirect = nil
+				return nil, E.Errors(err, common.Close(redirect))
 			}
 			inbound.autoRedirectOutputMark = mark
-			inbound.autoRedirectOutputMarkClaimed = true
+			inbound.autoRedirectOutputMarkClaimed.Store(true)
 		}
 	}
 	return inbound, nil
@@ -754,6 +778,9 @@ func (t *Inbound) InterfaceUpdated(ctx context.Context) {
 }
 
 func (t *Inbound) Close() error {
+	if t.testCloseObserver != nil {
+		t.testCloseObserver()
+	}
 	// Release the route-set callbacks and references BEFORE tearing anything down.
 	//
 	// Start registers t.updateRouteAddressSet on every route and exclude rule-set and stores the
@@ -788,10 +815,11 @@ func (t *Inbound) Close() error {
 	// same tag first. Without this the manager keeps a mark for a redirect that no longer exists and
 	// stamps it on every later dial, including the dials of the box that won the tag.
 	//
-	// The flag is cleared before the release so a second Close cannot hand the same claim back twice
-	// and clear a mark that has since been taken by a new owner.
-	if t.autoRedirectOutputMarkClaimed {
-		t.autoRedirectOutputMarkClaimed = false
+	// The claim flag is consumed with a CompareAndSwap, so exactly one Close can reach the releaser
+	// even when two of them run at once - the Scope's drain and the duplicate-tag loser are
+	// independent callers - and a second Close cannot hand the same claim back twice and clear a mark
+	// that has since been taken by a new owner.
+	if t.autoRedirectOutputMarkClaimed.CompareAndSwap(true, false) {
 		if releaser, isReleaser := t.networkManager.(autoRedirectMarkReleaser); isReleaser {
 			releaser.ReleaseAutoRedirectOutputMark(t.autoRedirectOutputMark)
 		}

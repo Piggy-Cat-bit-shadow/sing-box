@@ -33,12 +33,7 @@ func TestInboundCloseReleasesAutoRedirectOutputMark(t *testing.T) {
 
 	// The fields NewInbound sets on the claim path, and nothing else: no stack, no interface and no
 	// redirect were built, so Close only has this claim to release.
-	inbound := &Inbound{
-		tag:                           "tun-in",
-		networkManager:                networkManager,
-		autoRedirectOutputMark:        mark,
-		autoRedirectOutputMarkClaimed: true,
-	}
+	inbound := newMarkClaimedInbound("tun-in", networkManager, mark)
 
 	require.NoError(t, inbound.Close())
 	require.Zero(t, networkManager.AutoRedirectOutputMark(), "a closed inbound must not keep the mark alive")
