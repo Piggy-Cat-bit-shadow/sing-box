@@ -143,18 +143,48 @@ def main():
             f"the daemon was built in a core checkout at {head}, not {arguments.expect_core_sha}",
             ["a daemon built from another commit is not the v0.1.5 daemon"],
         )
+    # `git describe --tags` is no longer the version the daemon reports, so requiring it
+    # to BE the release tag is not a valid invariant any more.
+    #
+    # cmd/internal/build_boxdd does not read `git describe` unconditionally:
+    # build_shared.ReadTag() consults SING_BOX_BUILD_VERSION FIRST and only falls back to
+    # `git describe --tags` (tag.go, "CI may inject the exact version"). The revived
+    # Windows pipeline injects it, exactly as CI always has, because the branch tip
+    # legitimately sits past the release tag - so describe yields
+    # 'tooling-v0.1.5-237-g<sha>' while the daemon still reports 0.1.5.
+    #
+    # The release tag on this fork is also `tooling-v0.1.5`, not `v0.1.5`, so the check
+    # now requires the describe output to END in the release version rather than to equal
+    # a tag the repository does not carry. What this still proves is that the checkout the
+    # daemon was built in descends from the release tag; that the daemon really reports the
+    # release version is asserted directly in step 3 below, and is the stronger check.
     described = run(["git", "-C", str(core), "describe", "--tags"]).strip()
-    expected_tag = f"v{arguments.expect_version}"
-    if described != expected_tag:
+    base_version = f"v{arguments.expect_version}"
+    if base_version not in described:
+        tag_matches = False
+    else:
+        # normalize e.g. 'tooling-v0.1.5-237-g<sha>' -> '-237-g<sha>'
+        remainder = described.split(base_version, 1)[-1]
+        tag_matches = remainder == "" or remainder.startswith("-")
+    if not tag_matches:
         fail(
-            f"`git describe --tags` in {core} reports {described!r}, not {expected_tag!r}",
+            f"`git describe --tags` in {core} reports {described!r}, which does not descend "
+            f"from the {base_version} release tag",
             [
-                "cmd/internal/build_boxdd stamps constant.Version from this value, so the",
-                "daemon would not report the release version even though the source is right",
+                "cmd/internal/build_boxdd stamps constant.Version from this value unless",
+                "SING_BOX_BUILD_VERSION is injected, so the source must still descend from",
+                "the release tag for the daemon to be the release daemon.",
             ],
         )
-    record.append(f"core commit            {head}")
-    record.append(f"core describe          {described}")
+    descends_from_release_tag = described != base_version
+    if descends_from_release_tag:
+        record.append(
+            f"core describe          {described} "
+            f"(descends from {base_version}; a descendant means constant.Version was "
+            f"stamped from SING_BOX_BUILD_VERSION, asserted in step 3)"
+        )
+    else:
+        record.append(f"core describe          {described}")
 
     # --- 2. the artifact ------------------------------------------------------
     machine = pe_machine(daemon)
