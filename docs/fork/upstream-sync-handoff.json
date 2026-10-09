@@ -1,0 +1,436 @@
+{
+  "schema": "jiejiebox.upstream-sync-handoff/v1",
+  "phase": "PHASE_A",
+  "stage": "lifecycle-scoped-cleanup",
+  "generated_by": "PHASE_A lifecycle remediation, fix/lifecycle-stage1",
+  "coordinates": {
+    "phase_a_base_sha": "912ed1efad265d8a8f56aaabcabc8f7b171c2baa",
+    "phase_a_base_is_origin_testing": true,
+    "fork_origin_testing": "912ed1efad265d8a8f56aaabcabc8f7b171c2baa",
+    "upstream_comparison_head": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+    "upstream_remote": "upstream",
+    "upstream_branch": "testing",
+    "merge_base": "7a3d4e4a8e71bd7fa824959efdb57b4f39738802",
+    "ahead_origin": 1469,
+    "ahead_upstream": 53,
+    "branch": "fix/lifecycle-stage1",
+    "worktree": "/tmp/s1-life",
+    "pushed": false,
+    "integration": "cherry-pick -x, in the order listed in commits[]",
+    "final_phase_a_sha": null,
+    "final_phase_a_sha_note": "the integrator records the branch tip after cherry-picking; PHASE_B must work from the real current testing HEAD, never from a planning-document SHA",
+    "build_tags_source": "release/DEFAULT_BUILD_TAGS",
+    "gotoolchain": "go1.25.5",
+    "go_version": "go1.25.5 darwin/arm64",
+    "submodule_or_gitlink_changes": [],
+    "dependency_or_replace_changes": [],
+    "apple_android_api_or_abi_impact": "none; adapter.NetworkManager was deliberately left unextended to avoid one"
+  },
+  "commits": [
+    {
+      "order": 1,
+      "sha": "53a3f97e8",
+      "subject": "fix(tun): give the rule-set callbacks to the Scope that closes them",
+      "subsystem": "protocol/tun",
+      "item": "P0-L01",
+      "must_be_taken_with": "f2c728d10",
+      "warning": "its closeAutoRedirect body was captured mid-mutation; the ordering is inverted and f2c728d10 restores it"
+    },
+    {
+      "order": 2,
+      "sha": "f2c728d10",
+      "subject": "fix(tun): release rule-set callbacks before closing the auto-redirect",
+      "subsystem": "protocol/tun",
+      "item": "P0-L01"
+    },
+    {
+      "order": 3,
+      "sha": "e3349044a",
+      "subject": "fix(masque): give the server endpoint's teardown to the Scope that closes it",
+      "subsystem": "protocol/masque",
+      "item": "P0-L01b"
+    },
+    {
+      "order": 4,
+      "sha": "6019786ae",
+      "subject": "test(bridge): pin the Scope ownership of the bridge instance index",
+      "subsystem": "protocol/bridge",
+      "item": "P0-L02",
+      "production_change": false
+    },
+    {
+      "order": 5,
+      "sha": "ffdbfa334",
+      "subject": "fix(adapter): define the Scope Start x Close x Add contract",
+      "subsystem": "adapter",
+      "item": "P0-L03"
+    },
+    {
+      "order": 6,
+      "sha": "f2ea18240",
+      "subject": "fix(adapter): stop reporting already-closed and cancelled cleanup as failure",
+      "subsystem": "adapter",
+      "item": "P1-L05",
+      "absorbs_upstream": "69601481fd36a3a8a96e199c647132dab819184b"
+    }
+  ],
+  "files_touched_by_phase_a": [
+    "adapter/lifecycle.go",
+    "adapter/lifecycle_scope_test.go",
+    "adapter/lifecycle_error_semantics_test.go",
+    "protocol/tun/inbound.go",
+    "protocol/tun/scope_ownership_test.go",
+    "protocol/masque/server.go",
+    "protocol/masque/scope_ownership_test.go",
+    "protocol/bridge/scope_ownership_test.go",
+    "docs/fork/lifecycle-scope-upstream-sync-report.md",
+    "docs/fork/lifecycle-scope-resource-ledger.md",
+    "docs/fork/lifecycle-scope-test-matrix.md",
+    "docs/fork/upstream-sync-handoff.md",
+    "docs/fork/upstream-sync-handoff.json"
+  ],
+  "do_not_touch": [
+    "the scope.Add(t.releaseRouteSetCallbacksCleanup) placement in protocol/tun/inbound.go",
+    "the scope.Add(t.closeAutoRedirect) registration and the release-before-teardown order inside closeAutoRedirect",
+    "the scope.Add(s.Close) placement and the sync.Once in ServerEndpoint.Close",
+    "the scope.Add inside backendBase.allocateIndex",
+    "the open/closing/closed state machine and the closeDone join in Scope.Close",
+    "E.Expand before the closed/cancelled filter in Scope.Close",
+    "runtimecoord.Coordinator and its environment/reset epoch semantics",
+    "ReferenceManager reuse and idle draining",
+    "the Power Governor and the Apple Sleep/Wake/Lock axes",
+    "DNS/Fake-IP/RDRC network isolation",
+    "the TUN Direct Fast Path",
+    "the low-memory iOS target and local-only signing",
+    "the screen-on != unlocked rule in the Apple lock-state chain"
+  ],
+  "upstream_commits": [
+    {
+      "sha": "a691a4402375535f0329eb9026ab904cfdc1b2eb",
+      "subject": "Refactor lifecycle to scoped cleanup",
+      "subsystem": "adapter",
+      "patch_equivalent": true,
+      "semantic_equivalent": true,
+      "decision": "ALREADY-PRESENT",
+      "implemented_by_commit": null,
+      "tests": "existing",
+      "risk": "none",
+      "owner": "PHASE_A",
+      "note": "git diff a691a440 HEAD -- adapter/lifecycle.go was empty at the baseline; no mechanical port of the 115 files was performed. protocol/tun/inbound.go had diverged and lost the callback registration - absorbed in 53a3f97e8"
+    },
+    {
+      "sha": "69601481fd36a3a8a96e199c647132dab819184b",
+      "subject": "Ignore closed and canceled errors in scope cleanup",
+      "subsystem": "adapter",
+      "patch_equivalent": true,
+      "semantic_equivalent": true,
+      "decision": "ABSORBED",
+      "implemented_by_commit": "f2ea18240",
+      "tests": [
+        "adapter/lifecycle_error_semantics_test.go"
+      ],
+      "risk": "low",
+      "owner": "PHASE_A",
+      "note": "the only upstream commit to adapter/lifecycle.go since a691a440. Expanded before filtered so a real failure travelling with a cancelled error is not hidden. One deliberate difference: filtered errors are reported through the Scope logger before being dropped"
+    },
+    {
+      "sha": "02537831e188",
+      "subject": "Move auto-redirect and bridge index allocation out of constructors",
+      "subsystem": "protocol/bridge, protocol/tun",
+      "patch_equivalent": "bridge: true, tun: false",
+      "semantic_equivalent": "bridge: true, tun: not applicable",
+      "decision": "PARTIAL",
+      "implemented_by_commit": "6019786ae",
+      "tests": [
+        "protocol/bridge/scope_ownership_test.go"
+      ],
+      "risk": "none",
+      "owner": "PHASE_A",
+      "note": "bridge half already present and stricter than upstream (idempotent acquire and release); only the Scope wiring was untested and is now covered. Auto-redirect half NOT-APPLICABLE: tun.NewAutoRedirect acquires nothing in the pinned sing-tun fork and the output-mark claim is bounded by the per-Box NetworkManager. The upstream Linux-only restriction was NOT absorbed"
+    },
+    {
+      "sha": "a364ff4794",
+      "subject": "Remove unimplemented hot reload from managers",
+      "subsystem": "adapter",
+      "patch_equivalent": "unknown",
+      "semantic_equivalent": "unknown",
+      "decision": "NOT-APPLICABLE",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "unknown",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "efe4db9332",
+      "subject": "Close idle connections of unreferenced outbounds and DNS servers",
+      "subsystem": "route, common/httpclient, dns transports",
+      "patch_equivalent": false,
+      "semantic_equivalent": false,
+      "decision": "DEFERRED",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "high if rushed: misclassifying an active multiplexed stream as idle",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "17e950e74c",
+      "subject": "Improve idle connection management",
+      "subsystem": "route, common/httpclient",
+      "patch_equivalent": false,
+      "semantic_equivalent": false,
+      "decision": "DEFERRED",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "as above",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "c6d5bafa36",
+      "subject": "Fix on-demand endpoint resume",
+      "subsystem": "endpoints",
+      "patch_equivalent": false,
+      "semantic_equivalent": "not verified",
+      "decision": "DEFERRED",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "needs the endpoint suspend/resume matrix",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "6e3c86f518",
+      "subject": "Use screen state to end device pause on iOS",
+      "subsystem": "apple platform",
+      "patch_equivalent": false,
+      "semantic_equivalent": "handled by the Fork's own lock-state chain",
+      "decision": "NOT-APPLICABLE",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "screen-on != unlocked must be preserved; clients/apple was out of bounds for PHASE_A",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "fd26ea8578",
+      "subject": "Use screen state to end device pause on iOS",
+      "subsystem": "apple platform",
+      "patch_equivalent": false,
+      "semantic_equivalent": "handled by the Fork's own lock-state chain",
+      "decision": "NOT-APPLICABLE",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "as above",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "78d44d52d9",
+      "subject": "Reset network on DNS server changes",
+      "subsystem": "route, dns",
+      "patch_equivalent": false,
+      "semantic_equivalent": false,
+      "decision": "OWNER_PHASE_B",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "feature correctness, not lifecycle",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "df8e2edfd5",
+      "subject": "Rework forward NAT with UDP mapping and fragment support",
+      "subsystem": "route",
+      "patch_equivalent": false,
+      "semantic_equivalent": false,
+      "decision": "OWNER_PHASE_B",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "feature correctness",
+      "owner": "PHASE_B"
+    },
+    {
+      "sha": "FakeIP persistence, protocol sniff, Xray, Xcode cache",
+      "subject": "assorted feature correctness",
+      "subsystem": "various",
+      "patch_equivalent": false,
+      "semantic_equivalent": false,
+      "decision": "OWNER_PHASE_B",
+      "implemented_by_commit": null,
+      "tests": [],
+      "risk": "feature correctness",
+      "owner": "PHASE_B"
+    }
+  ],
+  "items": [
+    {
+      "id": "P0-L01",
+      "title": "TUN RuleSet callback Scope ownership",
+      "status": "FIXED",
+      "owner": "PHASE_A",
+      "commits": ["53a3f97e8", "f2c728d10"],
+      "defect": "releaseRouteSetCallbacks had exactly one caller, Inbound.Close(), and the product close path never calls Inbound.Close(); Scope.Close runs scope.Add entries only. The rule-set kept an observer pointed at a torn-down *Inbound for the lifetime of the process",
+      "why_it_was_invisible": "protocol/tun/callback_lifecycle_test.go called Inbound.Close() directly, which the product never does - a test that verified the wrong object",
+      "fix": "scope.Add(t.releaseRouteSetCallbacksCleanup) at the acquisition, plus closeAutoRedirect so the release precedes the auto-redirect teardown instead of following it",
+      "files": ["protocol/tun/inbound.go", "protocol/tun/scope_ownership_test.go"],
+      "tests_green_after": true,
+      "reverse_breaks": 3
+    },
+    {
+      "id": "P0-L01b",
+      "title": "MASQUE server endpoint teardown ownership",
+      "status": "FIXED",
+      "owner": "PHASE_A",
+      "commits": ["e3349044a"],
+      "defect": "ServerEndpoint.Start acquired a device, a TLS config, a listener and an HTTP/3 server; Close released all of them and nothing handed Close to the Scope. A real Box.Close() left the device and the listening socket open",
+      "found_by": "the ownership sweep P0-L01 called for; it returned exactly two hits on the baseline",
+      "fix": "scope.Add(s.Close) at the acquisition in StartStateInitialize, and Close made idempotent with a sync.Once because the Scope and the duplicate-tag loser path in adapter/endpoint/manager.go can both reach it",
+      "files": ["protocol/masque/server.go", "protocol/masque/scope_ownership_test.go"],
+      "tests_green_after": true,
+      "reverse_breaks": 2
+    },
+    {
+      "id": "P0-L02",
+      "title": "constructor-phase system side effects",
+      "status": "PARTIAL",
+      "owner": "PHASE_A",
+      "commits": ["6019786ae"],
+      "bridge_index": {
+        "status": "COVERAGE",
+        "verdict": "already correct and stricter than upstream; the Scope wiring was untested and is now covered by four tests that all fail when the scope.Add inside allocateIndex is removed",
+        "production_change": false
+      },
+      "auto_redirect": {
+        "status": "NOT-APPLICABLE",
+        "verdict": "RegisterAutoRedirectOutputMark is called at the end of NewInbound with no later error edge, and route.NetworkManager is created per-Box in box.go so the claim cannot outlive the Box or collide across Boxes. tun.NewAutoRedirect acquires nothing in the pinned sing-tun fork",
+        "production_change": false,
+        "linux_only_gate_absorbed": false
+      },
+      "constructor_scan": "24 candidates, all judged; false positives and reasoning in docs/fork/lifecycle-scope-resource-ledger.md"
+    },
+    {
+      "id": "P0-L03",
+      "title": "Scope.Start x Scope.Close x Scope.Add contract and failure rollback",
+      "status": "FIXED",
+      "owner": "PHASE_A",
+      "commits": ["ffdbfa334"],
+      "defects": [
+        "Add after Close appended to a queue nobody walks again: permanent silent leak",
+        "Start returned success for a Scope that closed while the component was starting",
+        "a second concurrent Close returned SUCCESS immediately for a teardown that had not finished"
+      ],
+      "reachability_proof": "box.go:97-100 states Close is exported and an embedder may call it from any goroutine including while Start is still running, which the daemon deliberately allows; and the dynamic sub-scopes in dns/transport/local, service/resolved and the openvpn/openconnect/tailscale resolvers start transports into a scope another goroutine may be replacing",
+      "fix": "open/closing/closed state under the existing mutex plus a closeDone channel; Add on a closing Scope runs the cleanup on the caller's goroutine outside the lock; Start reports the cancellation; Close records the drain result and later callers join it",
+      "no_goroutine_added": true,
+      "files": ["adapter/lifecycle.go", "adapter/lifecycle_scope_test.go"],
+      "tests_green_after": true,
+      "reverse_breaks": 3
+    },
+    {
+      "id": "P1-L05",
+      "title": "close-path error semantics",
+      "status": "FIXED",
+      "owner": "PHASE_A",
+      "commits": ["f2ea18240"],
+      "fix": "expand each cleanup's result, then filter E.IsClosed/E.IsCanceled per error; real failures still returned; filtered errors reported through the Scope logger so the observation is not lost",
+      "files": ["adapter/lifecycle.go", "adapter/lifecycle_error_semantics_test.go"],
+      "tests_green_after": true,
+      "reverse_breaks": 2
+    },
+    {
+      "id": "P1-L04",
+      "title": "callbacks, watchers, DBus, event observers and background loops",
+      "status": "PARTIAL",
+      "owner": "PHASE_B",
+      "commits": [],
+      "done": "the Scope-level contract is defined and tested, and the two components in the tree whose Close the Scope could not reach are fixed",
+      "open": "per-component async exit proofs for route/network.go monitors, the systemd-resolved D-Bus transport, protocol/tailscale global hooks, and the openvpn/openconnect read loops"
+    },
+    {
+      "id": "P1-L06",
+      "title": "idle/reuse ownership rather than unconditional Close",
+      "status": "DEFERRED",
+      "owner": "PHASE_B",
+      "commits": [],
+      "reason": "a real gap, deliberately not attempted: mistaking an active multiplexed stream for idle is worse than the leak, and the work order requires ReferenceManager reuse and idle draining to be left intact"
+    },
+    {
+      "id": "P1-L07",
+      "title": "on-demand and Apple device events do not misuse Scope",
+      "status": "DEFERRED",
+      "owner": "PHASE_B",
+      "commits": [],
+      "device_only": true
+    },
+    {
+      "id": "P2-L08",
+      "title": "layered dynamic Scope and restart boundaries",
+      "status": "PARTIAL",
+      "owner": "PHASE_A / PHASE_B",
+      "note": "the Scope contract now supports dynamic replacement safely; the mapping between resource generation and logical network generation in dns/transport/local and URLTest rounds is untouched"
+    }
+  ],
+  "transferred_ownership": [
+    "P1-L05 / upstream 69601481fd - consumed by PHASE_A, PHASE_B must not re-apply",
+    "the Scope.Start x Close x Add contract - committed, tested and documented in adapter/lifecycle.go",
+    "the bridge half of upstream 02537831e1 - done",
+    "TUN rule-set callback ownership - done",
+    "MASQUE server endpoint teardown - done"
+  ],
+  "verification": {
+    "go_test_tagged_full": {
+      "command": "go test -count=1 -tags \"$TAGS\" ./...",
+      "result": "76 ok / 0 FAIL",
+      "exit_code": 0
+    },
+    "go_build_tagged": {"command": "go build -tags \"$TAGS\" ./...", "exit_code": 0},
+    "go_build_untagged": {"command": "go build ./...", "exit_code": 0},
+    "gofmt": {"command": "gofmt -l .", "result": "empty"},
+    "go_mod_tidy": {"command": "go mod tidy -diff", "result": "empty", "exit_code": 0},
+    "race_touched_packages": {
+      "command": "go test -count=1 -race -tags \"$TAGS\" ./adapter/... ./protocol/tun/ ./protocol/masque/ ./protocol/bridge/",
+      "result": "all ok"
+    },
+    "race_count20_new_tests": {
+      "command": "go test -count=20 -race -tags \"$TAGS\" -run '<all new tests>' ./adapter/ ./protocol/tun/ ./protocol/masque/ ./protocol/bridge/",
+      "result": "all ok"
+    },
+    "build_dir_present": false,
+    "build_dir_note": "no gomobile-generated build/ directory exists in the tree, so go test ./... does not walk one and the 76-package count is not inflated",
+    "known_flake": {
+      "package": "common/trafficsched",
+      "classification": "known load-sensitive flake",
+      "observed": "did not reproduce: passed inside go test ./... in 106.8 s",
+      "load_at_start": 8.56,
+      "load_at_end": 16.82,
+      "reported_as": "not a pass of the underlying issue and not a regression"
+    },
+    "ci": {
+      "ran": false,
+      "reason": "the branch was not pushed, so no head_sha, job ID or artifact provenance can exist",
+      "device_verification_claimed": false
+    }
+  },
+  "device_only": [
+    {
+      "id": "DEVICE-ONLY-1",
+      "title": "real TUN route teardown and auto_redirect programming (nftables/pf)",
+      "status": "BLOCKED",
+      "runbook_language": "zh"
+    },
+    {
+      "id": "DEVICE-ONLY-2",
+      "title": "NetworkExtension memory pressure, idle trim vs active flows, jetsam",
+      "status": "BLOCKED",
+      "runbook_language": "zh"
+    },
+    {
+      "id": "DEVICE-ONLY-3",
+      "title": "Apple lock/screen/device-wake event ordering; screen-on != unlocked",
+      "status": "BLOCKED",
+      "runbook_language": "zh"
+    },
+    {
+      "id": "DEVICE-ONLY-4",
+      "title": "MASQUE server endpoint close: port released, device gone, no stray goroutine",
+      "status": "BLOCKED",
+      "runbook_language": "zh"
+    }
+  ],
+  "secrets_included": false
+}
