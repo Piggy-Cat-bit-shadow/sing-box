@@ -134,9 +134,44 @@ type OutboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) error
 }
 
-type IdleConnectionKeeper interface {
-	SetKeepIdleConnections(keep bool)
+// IdleConnectionReleaser is the half of IdleConnectionKeeper that a RETIRE walk actually needs:
+// drop the resources nobody is using.
+//
+// # Why the two halves are separate types
+//
+// IdleConnectionKeeper bundles two questions and the reference manager asks them in two different
+// places: the eligibility pass asks "may this owner keep idle connections while nothing references
+// it" (SetKeepIdleConnections), and the retire walks - DEEP_IDLE, memory pressure, teardown and the
+// reuse boundary - ask "drop what nobody is using" (CloseIdleConnections). A walk that asserts the
+// BUNDLED interface is asking for a capability it never calls, and it silently excludes any owner
+// that can only answer the second question.
+//
+// That is not hypothetical, it is the bug this interface exists to fix. `common/httpclient.Manager`
+// owns the fourth set of reusable resources in the core - the pools behind provider refresh, remote
+// rule sets, the dashboard and the API - and it implements CloseIdleConnections and not
+// SetKeepIdleConnections. The reference manager's walk asserted IdleConnectionKeeper, so the
+// assertion failed at run time, on every boundary, with no compile error and no test failure: the
+// boundary retired every pool except those, which is exactly the gap the walk was extended to close.
+// See docs/fork/post-wake-reuse.md's residual risk 4.
+//
+// The contract a releaser must satisfy is the same one, and it is checked by review rather than by
+// the type system: CloseIdleConnections may only close a resource with no active user traffic, and
+// it must never dial. A releaser that can terminate a stream carrying traffic does not belong in the
+// walks, which is why the on-demand tunnels deliberately implement SetKeepIdleConnections (a
+// suspend/resume of the tunnel itself, a much larger action) and not this.
+type IdleConnectionReleaser interface {
 	CloseIdleConnections()
+}
+
+// IdleConnectionKeeper is a reusable owner that participates in the idle policy fully: it can be
+// told whether to keep idle connections AND it can drop the ones nobody is using.
+//
+// The eligibility pass requires this whole interface, because a keeper's answer to "should this
+// owner be holding an idle connection at all" is what gates the release. The retire walks require
+// only IdleConnectionReleaser; embedding it here keeps every existing implementer valid.
+type IdleConnectionKeeper interface {
+	IdleConnectionReleaser
+	SetKeepIdleConnections(keep bool)
 }
 
 // ReuseSuspect is implemented by a reusable pool that can refuse NEW work on the resources it holds

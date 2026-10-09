@@ -905,18 +905,23 @@ func (r *NetworkManager) resetNetworkLocked(ctx context.Context) {
 // A trim must only reduce memory. Everything here closes a pool that has no active user traffic;
 // nothing dials, nothing wakes, and nothing rebuilds. If a trim could cause a connection it would be
 // a reconnect trigger wearing a memory-management name.
+//
+// The assertions are adapter.IdleConnectionReleaser rather than adapter.IdleConnectionKeeper, by the
+// same argument as the reference manager's walks: both call CloseIdleConnections and nothing else,
+// and requiring SetKeepIdleConnections as well would silently skip any owner that can only drop what
+// is idle. See adapter.IdleConnectionReleaser.
 func (r *NetworkManager) TrimMemory(ctx context.Context) {
 	if r.router != nil {
 		r.router.TrimIdleResources()
 	}
 	for _, endpoint := range r.endpoint.Endpoints() {
-		keeper, isKeeper := endpoint.(adapter.IdleConnectionKeeper)
+		keeper, isKeeper := endpoint.(adapter.IdleConnectionReleaser)
 		if isKeeper {
 			keeper.CloseIdleConnections()
 		}
 	}
 	for _, outbound := range r.outbound.Outbounds() {
-		keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+		keeper, isKeeper := outbound.(adapter.IdleConnectionReleaser)
 		if isKeeper {
 			keeper.CloseIdleConnections()
 		}
@@ -926,7 +931,7 @@ func (r *NetworkManager) TrimMemory(ctx context.Context) {
 func (r *NetworkManager) ReleaseMemory(ctx context.Context) {
 	r.ResetNetwork(ctx)
 	for _, outbound := range r.outbound.Outbounds() {
-		keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+		keeper, isKeeper := outbound.(adapter.IdleConnectionReleaser)
 		if isKeeper {
 			keeper.CloseIdleConnections()
 		}

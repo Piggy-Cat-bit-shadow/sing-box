@@ -70,7 +70,7 @@ The owners, as they exist in the tree. Every one of these was read rather than a
 
 | owner | what it holds | boundary action |
 |---|---|---|
-| `common/httpclient.Manager` | every pooled transport behind provider refresh, remote rule sets, the dashboard and the API: `http1Transport`, `http2Transport`, `http2FallbackTransport`, `http3Transport`, `http3FallbackTransport`, and `appleTransport` (URLSession) | idle-only release per transport (`Manager.CloseIdleConnections`). The Apple one retires the old `NSURLSession` and installs a new one, so an in-flight request finishes on the session it started on. |
+| `common/httpclient.Manager` | every pooled transport behind provider refresh, remote rule sets, the dashboard and the API: `http1Transport`, `http2Transport`, `http2FallbackTransport`, `http3Transport`, `http3FallbackTransport`, and `appleTransport` (URLSession) | idle-only release per transport (`Manager.CloseIdleConnections`), reached by the walk's `adapter.IdleConnectionReleaser` assertion — NOT by `adapter.IdleConnectionKeeper`, which it does not implement; see residual risk 4. The Apple one retires the old `NSURLSession` and installs a new one, so an in-flight request finishes on the session it started on. |
 | `transport/v2rayxhttp` (XMUX) | one pooled HTTP connection per session | `RetireSuspect`: idle connections closed, busy ones refused new streams and torn down on the last release. Also `CloseIdleConnections` for the trim. |
 | `protocol/vless` | the transport above, plus the optional `sing-mux` dialer | forwards `RetireSuspect` to a transport that has it; forwards `CloseIdleConnections` to both. |
 | `transport/v2raygrpclite`, `v2rayhttp`, `v2rayquic` | their own connection pools | idle-only release. They have no session that mixes active and new work, so the idle release is the whole answer. |
@@ -270,12 +270,34 @@ callback thread - so the locking has to be stated rather than assumed.
    outbound is one CONNECT per flow. So naive is deliberately not a keeper: the only two actions
    available are "retire everything including live requests" (forbidden) and "do nothing" (what
    happens today, and the safe one). A fix needs an idle-only API from `cronet-go`.
-4. **The HTTP client service pools now participate.** This was the third residual risk and it is
-   closed: `common/httpclient.Manager.CloseIdleConnections` releases the idle connections of every
-   transport it owns without replacing any of them (that distinction is what separates it from
-   `ResetNetwork`, and it is pinned by a test), and the reference manager's walk reaches the manager
-   through `adapter.HTTPClientManager`. The pools behind provider refresh, remote rule sets, the
-   dashboard and the API are therefore retired at a boundary, and the gap is latency no longer.
+4. **The HTTP client service pools now participate — but they did not, for one commit.** The intent
+   was right and the implementation was wrong in a way nothing could see.
+   `common/httpclient.Manager.CloseIdleConnections` releases the idle connections of every transport
+   it owns without replacing any of them (that distinction is what separates it from `ResetNetwork`,
+   and it is pinned by a test), and the reference manager's walk reaches the manager through
+   `adapter.HTTPClientManager`. What the walk then did was assert
+   `httpClientManager.(adapter.IdleConnectionKeeper)` — the BUNDLED capability, whose other half is
+   `SetKeepIdleConnections` — and `*httpclient.Manager` has never implemented
+   `SetKeepIdleConnections`. The assertion therefore failed at run time, on every boundary and on
+   every walk, and the fourth owner of reusable state stayed exactly as unreachable as it had been
+   before the method was written. Nothing said so: there is no compile error for a failed type
+   assertion, the walk reported `retired` without it, and `TestTheBoundaryReachesTheHTTPClientService`
+   passed against a fake that implemented both halves, so it could not distinguish the real manager
+   from the fake standing in for it.
+
+   Closed by splitting the capability rather than by widening the manager:
+   `adapter.IdleConnectionReleaser` is `CloseIdleConnections` on its own, `IdleConnectionKeeper`
+   embeds it, and the retire walks assert the releaser because releasing idle resources is the only
+   thing they call. `route/reusable_owner_inventory_test.go` pins both directions — the reflection
+   assertion that `*httpclient.Manager` is a releaser and is NOT a keeper, and
+   `TestTheWalkReachesTheRealHTTPClientManager`, which drives the real manager through both walks and
+   returns 0 instead of 1 on the old assertion. That second test is the one that would have caught
+   this; it did not exist because the fake was written first.
+
+   The general lesson is worth keeping, because this file has now recorded two closures that were not
+   closures: **an interface assertion in a walk is an untested claim unless the walk is driven with
+   the real type.** `common/httpclient` is the only owner reached that way; the other three are
+   reached through manager lists, which the fakes do exercise.
 5. **A client that reports no lock fact keeps its pause.** The core releases the device level on an
    unlock and on an explicit host event only; it does not guess. See
    `docs/fork/apple-screen-state-observer.md` for the patch, the public-API fallback if the Darwin

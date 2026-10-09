@@ -442,7 +442,7 @@ func (m *ReferenceManager) retireIdleResources() int {
 	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
 	if outboundManager != nil {
 		for _, outbound := range outboundManager.Outbounds() {
-			keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+			keeper, isKeeper := outbound.(adapter.IdleConnectionReleaser)
 			if isKeeper {
 				keeper.CloseIdleConnections()
 				retired++
@@ -452,7 +452,7 @@ func (m *ReferenceManager) retireIdleResources() int {
 	endpointManager := service.FromContext[adapter.EndpointManager](m.ctx)
 	if endpointManager != nil {
 		for _, endpoint := range endpointManager.Endpoints() {
-			keeper, isKeeper := endpoint.(adapter.IdleConnectionKeeper)
+			keeper, isKeeper := endpoint.(adapter.IdleConnectionReleaser)
 			if isKeeper {
 				keeper.CloseIdleConnections()
 				retired++
@@ -462,7 +462,7 @@ func (m *ReferenceManager) retireIdleResources() int {
 	transportManager := service.FromContext[adapter.DNSTransportManager](m.ctx)
 	if transportManager != nil {
 		for _, transport := range transportManager.Transports() {
-			keeper, isKeeper := transport.(adapter.IdleConnectionKeeper)
+			keeper, isKeeper := transport.(adapter.IdleConnectionReleaser)
 			if isKeeper {
 				keeper.CloseIdleConnections()
 				retired++
@@ -475,9 +475,16 @@ func (m *ReferenceManager) retireIdleResources() int {
 	// dashboard and the API. It was the one pool this walk could not reach, so a boundary retired
 	// everything except it - see Manager.CloseIdleConnections for why its idle-only pass is the
 	// right action and why it is not ResetNetwork.
+	//
+	// The assertion is adapter.IdleConnectionReleaser, NOT adapter.IdleConnectionKeeper, and the
+	// difference is the whole reason this step works. Manager implements CloseIdleConnections and
+	// deliberately not SetKeepIdleConnections - nothing has an eligibility answer to ask it, and its
+	// transports are shared and refcounted rather than owned - so asserting the BUNDLED interface
+	// failed here at run time on every walk. The walk only ever calls CloseIdleConnections, so it
+	// asks for only that. See adapter.IdleConnectionReleaser for the full account.
 	httpClientManager := service.FromContext[adapter.HTTPClientManager](m.ctx)
 	if httpClientManager != nil {
-		keeper, isKeeper := httpClientManager.(adapter.IdleConnectionKeeper)
+		keeper, isKeeper := httpClientManager.(adapter.IdleConnectionReleaser)
 		if isKeeper {
 			keeper.CloseIdleConnections()
 			retired++
@@ -531,11 +538,17 @@ func (m *ReferenceManager) retireSuspectResources() int {
 
 // retireSuspectTarget applies the strongest action a reusable owner can express: refuse new work on
 // what it holds, drop what is idle, and report whether it owns anything reusable at all.
+//
+// The assertion is the RELEASE half of the keeper capability, not the bundled interface, and the
+// reason is at adapter.IdleConnectionReleaser: the walk calls CloseIdleConnections and nothing else,
+// and asking for SetKeepIdleConnections as well silently excluded every owner that can only drop
+// what is idle - which is how the HTTP client pools stayed unreachable through four passes of this
+// code being read as correct.
 func (m *ReferenceManager) retireSuspectTarget(retired int, target any) int {
 	if drainer, isDrainer := target.(adapter.ReuseSuspect); isDrainer {
 		drainer.RetireSuspect()
 	}
-	keeper, isKeeper := target.(adapter.IdleConnectionKeeper)
+	keeper, isKeeper := target.(adapter.IdleConnectionReleaser)
 	if isKeeper {
 		keeper.CloseIdleConnections()
 		retired++

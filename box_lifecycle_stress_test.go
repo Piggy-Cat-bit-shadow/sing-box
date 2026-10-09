@@ -226,4 +226,10 @@ func requireGoroutinesReturnTo(t *testing.T, baseline int, phase string) {
 		return runtime.NumGoroutine() <= baseline+2
 	}, 10*time.Second, 25*time.Millisecond,
 		"%s left goroutines behind: %d before, %d after", phase, baseline, runtime.NumGoroutine())
+	// Logged rather than only asserted, so a run of this file reports the baseline it measured
+	// against instead of a bare PASS. A leak assertion whose numbers are invisible cannot be
+	// compared across runs, and "the count did not move" is the evidence for the claim that the
+	// bridge owns no goroutine.
+	runtime.GC()
+	t.Logf("goroutines: %d before %s, %d after", baseline, phase, runtime.NumGoroutine())
 }
