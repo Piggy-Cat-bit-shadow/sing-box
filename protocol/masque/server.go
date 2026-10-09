@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,8 @@ type ServerEndpoint struct {
 	device         device.Device
 	localAddresses []netip.Prefix
 	started        atomic.Bool
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEServerEndpointOptions) (adapter.Endpoint, error) {
@@ -156,6 +159,15 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 		tunnelDevice.SetPacketWriter(s.writePacketBuffers)
 		s.device = tunnelDevice
 		s.deviceOptions = nil
+		// Hand the teardown to the Scope in the same breath as the acquisition.
+		//
+		// The product closes a Box by closing its Scope, and Scope.Close() runs the entries handed
+		// to it through scope.Add - it never calls a component's Close() method. Close released the
+		// device, the listener, the TLS config, the server and the HTTP/3 server, but nothing had
+		// given it to the Scope, so on a real Box.Close() the listening socket and the device stayed
+		// open. Registering here also covers a failure in StartStateStart, which runs after this and
+		// can fail at any of its four steps: the Box rolls a failed start back by closing the Scope.
+		scope.Add(s.Close)
 	case adapter.StartStateStart:
 		if s.tlsConfig != nil {
 			err := s.tlsConfig.Start()
@@ -182,15 +194,24 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 	return nil
 }
 
+// Close releases the endpoint's running resources.
+//
+// It is idempotent because two paths can reach it: the Scope owns it, and adapter/endpoint/manager.go
+// closes an endpoint that lost a duplicate-tag race. Releasing the same listener and device twice is
+// not something the underlying objects have to tolerate, so the release is guarded here rather than
+// assumed safe. A concurrent second Close waits for the first and returns its result.
 func (s *ServerEndpoint) Close() error {
-	s.started.Store(false)
-	return common.Close(
-		s.listener,
-		s.http3Server,
-		s.server,
-		s.device,
-		s.tlsConfig,
-	)
+	s.closeOnce.Do(func() {
+		s.started.Store(false)
+		s.closeErr = common.Close(
+			s.listener,
+			s.http3Server,
+			s.server,
+			s.device,
+			s.tlsConfig,
+		)
+	})
+	return s.closeErr
 }
 
 type serverConnectionHandler ServerEndpoint
