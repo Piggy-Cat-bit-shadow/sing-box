@@ -20,9 +20,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# Keep in step with release/DEFAULT_BUILD_TAGS: the suite exercises the
-# Naive outbound, so it needs the client profile's tags.
-TAGS="with_quic,with_naive_outbound,badlinkname,tfogo_checklinkname0"
+# Derived from the project's own pin, NOT restated here.
+#
+# This line used to be hand-written and to carry the comment "Keep in step with
+# release/DEFAULT_BUILD_TAGS". It had drifted: the profile names sixteen tags and this
+# named four. Thirteen were therefore never exercised, while test/jiejie documents that
+# every test in the package must pass under a release profile - so the suite was
+# verifying something other than what it claimed. A value that exists in the repository
+# is read from the repository; nothing here is typed a second time.
+TAGS="$(cat release/DEFAULT_BUILD_TAGS)"
+
+# tfogo_checklinkname0 is deliberately NOT appended.
+#
+# It records that -checklinkname=0 IS passed, and `go test` cannot carry per-package
+# -ldflags: cmd/go applies -ldflags to a whole run or not at all. Naming it on a
+# `go test` command line is the exact "a tag claims a flag the command cannot carry"
+# mistake that was fixed for the profile files, and it is enforced there by
+# cmd/internal/build_libbox/tag_checklinkname_test.go. The jiejie package does not
+# import experimental/libbox, so the tag was also inert - it bought nothing and
+# claimed something.
+export TAGS
 
 # Comfortably above the measured 699s, so exceeding it means something really is stuck.
 TIMEOUT="${JIEJIE_TIMEOUT:-1200s}"
