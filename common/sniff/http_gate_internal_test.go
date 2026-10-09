@@ -324,6 +324,71 @@ func TestHTTPHostIsUnchangedByTheGate(t *testing.T) {
 	}
 }
 
+// TestHTTPHostClassificationIsUnchangedByTheGate is the complete statement of what the gate is
+// allowed to do, over a corpus assembled to exercise all three answers rather than to be small: the
+// accept corpus, every prefix of every request in it - which is the "has not finished arriving"
+// shape, 361 of these - the reject corpus, and an exhaustive one- and two-byte head sweep paired
+// with the continuations that could repair each head.
+//
+// For every payload the gate may change the text of a rejection and nothing else. Accepted still
+// means accepted, io.ErrUnexpectedEOF still becomes ErrNeedMoreData, and a definite verdict stays a
+// definite verdict; the counts of each are asserted to be non-zero so that a corpus which stopped
+// exercising one of them cannot pass this quietly.
+func TestHTTPHostClassificationIsUnchangedByTheGate(t *testing.T) {
+	t.Parallel()
+	classify := func(err error, needMore error) string {
+		switch {
+		case err == nil:
+			return "accepted"
+		case errors.Is(err, needMore):
+			return "needs-more-data"
+		default:
+			return "rejected"
+		}
+	}
+	var corpus [][]byte
+	for _, request := range httpAcceptedRequests {
+		corpus = append(corpus, []byte(request))
+		for length := 1; length < len(request); length++ {
+			corpus = append(corpus, []byte(request[:length]))
+		}
+	}
+	for _, testCase := range httpRejectedPayloads {
+		corpus = append(corpus, []byte(testCase.payload))
+	}
+	// Every head up to two bytes, against every continuation that could have saved it.
+	repairs := []string{"", "\r\n", "T / HTTP/1.1\r\nHost: h\r\n\r\n", " / HTTP/1.1\r\nHost: h\r\n\r\n", "OD / HTTP/1.1\r\n\r\n"}
+	alphabet := []byte{'A', ' ', '/', '\r', '\n', 0x00, 0xFF, 'G', ':', '?'}
+	for value := 0; value < 256; value++ {
+		for _, repair := range repairs {
+			corpus = append(corpus, append([]byte{byte(value)}, repair...))
+		}
+	}
+	for _, first := range alphabet {
+		for _, second := range alphabet {
+			for _, repair := range repairs {
+				corpus = append(corpus, append([]byte{first, second}, repair...))
+			}
+		}
+	}
+	counts := make(map[string]int)
+	for _, payload := range corpus {
+		var metadata adapter.InboundContext
+		sniffErr := HTTPHost(context.Background(), &metadata, bytes.NewReader(payload))
+		_, parseErr := badhttp.ReadRequest(std_bufio.NewReader(bytes.NewReader(payload)))
+		sniffKind := classify(sniffErr, ErrNeedMoreData)
+		parseKind := classify(parseErr, io.ErrUnexpectedEOF)
+		require.Equal(t, parseKind, sniffKind,
+			"payload %q: the parser said %s and this sniffer said %s (sniffer %v, parser %v)",
+			payload, parseKind, sniffKind, sniffErr, parseErr)
+		counts[sniffKind]++
+	}
+	require.Greater(t, len(corpus), 2000)
+	for _, kind := range []string{"accepted", "needs-more-data", "rejected"} {
+		require.NotZero(t, counts[kind], "the corpus stopped exercising %q: %v", kind, counts)
+	}
+}
+
 // TestHTTPHostReadsNoMoreThanTheParserWouldHave checks the cost claim in the direction that is
 // observable: the gate reads one chunk and the parser reads the rest, so the stream is read exactly
 // as often as the parser alone would have read it - never twice for the same bytes. A gate that
