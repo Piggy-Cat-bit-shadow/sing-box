@@ -188,8 +188,58 @@ reason is the mapping above: every unique change has a corresponding commit in t
 named here by SHA. The ledger is the record of that correspondence, and it is committed BEFORE any
 deletion.
 
-## Ledger status at the time of writing
+## Ledger status
 
-Branch mapping: **complete, 34/34 mapped**. Remote deletions: **not yet performed** - they require
-`origin/testing == SOURCE_SHA`, which the fast-forward in
-[`v016-core-final-closure.md`](v016-core-final-closure.md) establishes.
+Branch mapping: **complete, 34/34 mapped.**
+
+### Executed
+
+`origin/testing` was fast-forwarded from `ef83b86819c97cbe58b0397dc74af6aca5f1859d` to
+`fdd56c0e0edd6ee4026124c4755be06e04e4b62f` - a fast-forward, verified with
+`git merge-base --is-ancestor` against the LIVE remote immediately before the push, with 42 commits
+gained and none lost. The remote reported `ef83b868..fdd56c0e` (not a forced update).
+
+Each branch was then re-checked against the live remote and deleted one at a time. All ten live HEADs
+equalled the values recorded above, so there was no drift. Result:
+
+| # | Branch | Live HEAD at deletion | Outcome |
+| --- | --- | --- | --- |
+| 1 | `ci/apple-abi-provenance` | `73462a4cd21b` | DELETED |
+| 2 | `docs/handoff-reconciliation` | `47f49fcd7ebc` | DELETED |
+| 3 | `fix/autoredirect-output-mark` | `8139f01d7758` | DELETED (the manual case above) |
+| 4 | `fix/row15-dns-generation` | `bcf2e1c49559` | DELETED |
+| 5 | `fix/row39-nested-groups` | `b51c6a00c082` | DELETED |
+| 6 | `fix/tun-ruleset-refs` | `b361df879e55` | DELETED |
+| 7 | `test/dialer-race-deterministic-gate` | `beb1b9e724d8` | DELETED |
+| 8 | `test/dns-race-deterministic-gate` | `6abe49165d3b` | DELETED |
+| 9 | `test/scope-close-boundary` | `3c5c84b08bd8` | DELETED |
+| 10 | `test/urltest-deterministic-gate` | `827eb52587f9` | DELETED |
+
+`deleted=10 skipped=0 refused=0`. Nothing was skipped for drift and nothing was refused, so no branch
+had to be kept for either reason.
+
+`integrate/v016-final` was deleted as well, after its own precondition was checked the same way:
+`git rev-list --count testing..integrate/v016-final` was **0** and `integrate/v016-final..testing` was
+**0** - it was not merely superseded, it was exactly contained - and its live SHA was the recorded
+`96fd0263c1be4b683bb99d6a14a369974cc13220`.
+
+### After
+
+```
+fdd56c0e0edd6ee4026124c4755be06e04e4b62f  refs/heads/testing
+fdd56c0e0edd6ee4026124c4755be06e04e4b62f  refs/heads/fix/v016-core-final-hardening-20261009
+```
+
+Thirteen remote branches became two, and there is exactly one long-term development line. The
+`fix/...` branch is kept, at the same commit, as the named landing point for this round's candidate -
+deleting it is a cosmetic step the user can take at any time, and keeping it costs nothing.
+
+**No permission, branch-protection or repository setting was changed to make any deletion succeed.** A
+refused deletion would have been kept and reported.
+
+### What deleting them does and does not lose
+
+The original commits remain reachable through this repository's reflog and through GitHub's retention
+of dangling objects for a period, but that is not why deletion was safe. The reason is the mapping in
+this document: every unique change has a corresponding commit in the integration line, named here by
+SHA, and this ledger was committed **before** the first deletion.

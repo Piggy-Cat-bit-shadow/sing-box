@@ -9,6 +9,7 @@
     "integration_final_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
     "phase_b_start_sha": "98ea14181ca62f7632791aca12eceef8fbb8b3e3",
     "phase_b_start_branch": "docs/handoff-reconciliation",
+    "phase_b_start_note": "SUPERSEDED VALUE, kept as the measurement this file recorded. The branch docs/handoff-reconciliation was deleted in the v0.1.6 closure round after all 7 of its commits were proven integrated; the authoritative coordinate is now 7e3d0c2ad30b in docs/fork/upstream-sync-handoff.json, resolved against `testing`. See docs/fork/v016-branch-cleanup-ledger.md.",
     "upstream_comparison_head": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
     "current_candidate_core_sha": null,
     "current_candidate_core_sha_note": "not frozen; a release SHA may only be declared in docs/fork/v016-release-candidate-manifest.md",

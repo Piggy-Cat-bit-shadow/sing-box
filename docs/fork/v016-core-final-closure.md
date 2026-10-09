@@ -5,10 +5,15 @@
 branch's tip, and the ten published theme branches proven integrated and removed.
 
 **Status: `DEV-CONSOLIDATED / RELEASE-NOT-READY`.** Every software-controllable gate this round set out
-to close is closed and evidenced below. The release gates that remain are the two the repository's own
-state blocks, and the verdict in [`v016-final-release-verdict.md`](v016-final-release-verdict.md) stays
-`NOT-READY` for exactly those: **no CI run exists at any SHA of this round** (GitHub Actions refuses
-dispatch, see §7) and **no Xray reference interop evidence exists** (no reference binaries, see §6).
+to close is closed and evidenced below: the two P0 windows, the composed TUN mark test that the previous
+round left `OPEN`, the reproducibility question about the dialer bounds, the release acceptance gate's
+self-test, and the branch consolidation. `testing` now carries all 42 commits and the remote went from
+thirteen branches to two.
+
+The release gates that remain are the two the repository's own state blocks, and the verdict in
+[`v016-final-release-verdict.md`](v016-final-release-verdict.md) stays `NOT-READY` for exactly those:
+**no CI run exists at any SHA of this round** (GitHub Actions refuses dispatch, see §7) and **no Xray
+reference interop evidence exists** (no reference binaries, see §6).
 
 The distinction this round was built on, and it holds: entering `testing` is a DEVELOPMENT
 consolidation, not a release. Nothing was tagged, signed, released or deployed.
@@ -306,15 +311,43 @@ commit as unmapped.
 
 ### The fast-forward and the deletions
 
-Recorded by the commands themselves in §8. The constraints that governed it:
+Both were executed, and the constraints that governed them were enforced by the scripts rather than by
+intention:
 
-- `testing` was fast-forwarded only after every local gate in §5 passed, and it was a **fast-forward**:
-  `git merge-base --is-ancestor origin/testing SOURCE_SHA` had to pass first, and no force push, no
-  reset, no rebase was used anywhere.
-- Each theme branch's remote HEAD was re-read with `git ls-remote` immediately before its deletion and
-  had to equal the value in the ledger. Any drift would have stopped the sequence.
-- No permission, branch-protection or repository setting was changed to make a deletion succeed. A
-  refused deletion would have been kept and reported.
+**Fast-forward.** Preconditions checked against the LIVE remote immediately before the push: the
+remote `testing` had to equal the expected pre-round SHA (`ef83b868…` - it did), the target had to be
+the remote work branch (`fdd56c0e…` - it was), the working tree had to be clean, and
+`git merge-base --is-ancestor <live testing> <target>` had to pass. It did, and the remote reported
+`ef83b868..fdd56c0e` - a fast-forward of **42 commits gained, 0 lost**. No force push, no reset, no
+rebase was used anywhere in this round.
+
+**Deletions.** Eleven branches removed, one at a time, each with three gates re-evaluated against the
+live remote at that moment:
+
+1. `origin/testing` still at `fdd56c0e` (the fast-forward landed);
+2. the branch's live HEAD still equal to the SHA the ledger recorded - **all ten matched, so there was
+   no drift and nothing was skipped**;
+3. every commit the branch has that `ef83b8681` does not, mapped by ancestor, trailer or patch-id. A
+   single unmapped commit would have skipped that branch; none did, including the manual case, which is
+   allowed through only by the recorded `8139f01d → cc0bc577` resolution.
+
+Result: `deleted=10 skipped=0 refused=0` for the theme branches, plus `integrate/v016-final`, which was
+deleted after `git rev-list --count testing..integrate/v016-final` and its reverse both returned **0** -
+exactly contained, not merely superseded.
+
+**Thirteen remote branches became two:**
+
+```
+fdd56c0e0edd6ee4026124c4755be06e04e4b62f  refs/heads/testing
+fdd56c0e0edd6ee4026124c4755be06e04e4b62f  refs/heads/fix/v016-core-final-hardening-20261009
+```
+
+There is now exactly one long-term development line. The `fix/...` branch is kept at the same commit as
+the named landing point for this round's candidate; removing it is cosmetic and the user can do it at
+any time.
+
+No permission, branch-protection or repository setting was changed to make any deletion succeed, and no
+refused deletion was worked around - there were none to work around.
 
 ## 7. What could not be done, and why - `CI_NOT_RUN`
 

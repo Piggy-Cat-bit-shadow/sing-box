@@ -35,14 +35,19 @@ Three different, real, remote-fetchable coordinates. Immutable for the record �
 ```
 PHASE_A_START=912ed1efad265d8a8f56aaabcabc8f7b171c2baa
 INTEGRATION_FINAL_SHA=ef83b86819c97cbe58b0397dc74af6aca5f1859d
-PHASE_B_START=98ea14181ca62f7632791aca12eceef8fbb8b3e3
+PHASE_B_START=7e3d0c2ad30b8e5daaba4c7c38c2c8240e5c813e
 ```
+
+> `PHASE_B_START` was `98ea1418…` on the topic branch `docs/handoff-reconciliation`. That branch's 7
+> commits were integrated by cherry-pick and it was deleted in the v0.1.6 closure round, so the
+> coordinate above names the commit that carries the change in the integration line. Every affected
+> theme branch is mapped commit-by-commit in [`v016-branch-cleanup-ledger.md`](v016-branch-cleanup-ledger.md).
 
 | Field | Value | Verified by |
 | --- | --- | --- |
 | `PHASE_A_START` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` | ancestor of the integration tip; `git rev-list --count` = 10 |
 | `INTEGRATION_FINAL_SHA` | `ef83b86819c97cbe58b0397dc74af6aca5f1859d` | `git ls-remote origin refs/heads/testing`; `git fetch origin testing`; `git cat-file -t` → `commit` |
-| `PHASE_B_START` | `98ea14181ca62f7632791aca12eceef8fbb8b3e3` — the reconciliation tree tip: the last **content** commit of `docs/handoff-reconciliation`. Its child adds only this coordinate, so both carry the same tree | `git rev-parse`, and after the push `git ls-remote origin refs/heads/handoff-reconciliation` + ancestry against it |
+| `PHASE_B_START` | `7e3d0c2ad30b8e5daaba4c7c38c2c8240e5c813e` — the bookkeeping commit that pins `PHASE_B_START`, as it exists in the **integration line**. On the topic branch `docs/handoff-reconciliation` this coordinate was `98ea1418…` (the reconciliation tree tip: the last **content** commit, whose child adds only this coordinate, so both carried the same tree). That branch's 7 commits were integrated by cherry-pick and it was **deleted** in the v0.1.6 closure round — see [`v016-branch-cleanup-ledger.md`](v016-branch-cleanup-ledger.md), which maps all seven by the `cherry picked from commit` trailer. The pre-cherry-pick SHA has no remote ref any more and is kept here for traceability only | `git ls-remote origin refs/heads/testing` + ancestry against it, per the validator's own rule; the deleted branch cannot be fetched |
 | `upstream_comparison_head` | `6afeff4c0f7123b5782f888812e96b8c82c7b699` | `git ls-remote upstream refs/heads/testing` |
 | `merge_base` | `7a3d4e4a8e71bd7fa824959efdb57b4f39738802` | `git merge-base origin/testing upstream/testing` |
 | Divergence at reconciliation | fork **1479** ahead, upstream **53** ahead | `git rev-list --left-right --count origin/testing...upstream/testing` |
