@@ -58,6 +58,42 @@ type SavedBinary struct {
 	URLHash     []byte
 }
 
+// PolicyStoreGuard makes a policy-guarded state commit one step.
+//
+// # The window it closes
+//
+// A DNS answer that was in flight across a routing-policy change may be DELIVERED to the caller that
+// asked for it, but it may not be RECORDED: it was produced by the server the policy moved away from.
+// Checking an epoch before the write is not enough to enforce that, because the check and the write are
+// two steps:
+//
+//	old exchange captures policy epoch E
+//	old response returns and passes the E check          <- guard says yes
+//	                                                      <- ClearCache runs to completion: E+1, purge
+//	old response stores its answer                        <- E's answer is now live under E+1
+//
+// The next query under the new policy reads that entry and is served an answer about the policy the
+// user left. Re-checking E immediately before the write does not close it either - the re-check and the
+// write are still two steps, and the purge can land between them.
+//
+// # What this interface requires
+//
+// StoreUnderPolicy must run the epoch check AND the state mutation as one step with respect to whatever
+// advances the epoch: every invalidation of that state must be serialised against it, so that the store
+// either happens entirely before an invalidation - and is then removed by it - or entirely after it, in
+// which case its own epoch check fails and it writes nothing. There is no third ordering.
+//
+// The implementer is a reader/writer lock held for the duration of the commit and taken exclusively by
+// the invalidation. It is deliberately NOT a lock the query path takes: it must not create a barrier
+// between a DNS exchange and the cache clear that would make the clear wait for in-flight queries.
+type PolicyStoreGuard interface {
+	// PolicyStoreEpoch reports the current policy epoch.
+	PolicyStoreEpoch() uint64
+	// StoreUnderPolicy runs commit while the epoch cannot advance and no invalidation can interleave.
+	// commit must read the epoch itself, through PolicyStoreEpoch, and decide whether to write.
+	StoreUnderPolicy(commit func())
+}
+
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 	var buffer bytes.Buffer
 	err := binary.Write(&buffer, binary.BigEndian, uint8(2))

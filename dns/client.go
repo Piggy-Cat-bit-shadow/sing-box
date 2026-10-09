@@ -49,6 +49,18 @@ type Client struct {
 	networkGeneration func() uint64
 	// policyGeneration reports the routing-policy epoch; nil means the caller has no policy concept.
 	policyGeneration func() uint64
+	// policyStoreGuard, when set, is what makes the policy epoch a GUARD rather than a hint.
+	//
+	// The epoch alone can say "this answer was captured under a policy that no longer holds", but it
+	// cannot make that statement and the cache write one step: an invalidation can run to completion in
+	// the gap between the check and the store, and the answer is then live under the epoch it was
+	// rejected by. The guard supplies the missing mutual exclusion - the commit runs inside
+	// StoreUnderPolicy, which the invalidation takes exclusively. See adapter.PolicyStoreGuard for the
+	// interleaving this closes.
+	//
+	// nil means the caller has no policy concept, and the check-then-write behaviour is preserved
+	// exactly as it was.
+	policyStoreGuard adapter.PolicyStoreGuard
 	// environmentPins holds the network environment each transport was LAST reset in.
 	//
 	// # Why the environment is pinned rather than read live
@@ -76,6 +88,9 @@ type Client struct {
 	nxdomainCache     *freelru.Cache[nxdomainCacheKey, *nxdomainCacheEntry]
 	cacheLock         compatible.Map[dnsExchangeKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
+	// storePreCommitHook is the test seam described on ClientOptions.TestStorePreCommitHook. Nil in
+	// production.
+	storePreCommitHook func()
 }
 
 type ClientOptions struct {
@@ -131,23 +146,41 @@ type ClientOptions struct {
 	//
 	// nil means the caller has no policy-epoch concept, and the previous behaviour applies.
 	PolicyGeneration func() uint64
+	// PolicyStoreGuard makes the policy epoch a commit guard rather than a pre-write check.
+	//
+	// When it is set, every policy-guarded cache commit runs inside StoreUnderPolicy, so an
+	// invalidation - ClearCache, and with it the epoch advance and the purge - cannot interleave between
+	// the epoch check and the write. nil preserves the check-then-write behaviour.
+	PolicyStoreGuard adapter.PolicyStoreGuard
+	// TestStorePreCommitHook, when set, runs at exactly one seam: after a response has passed every
+	// ownership and policy guard, immediately BEFORE the cache write.
+	//
+	// It exists because that gap is the defect. A commit is a check and then a write, and an
+	// invalidation that lands between them is what the guard exists to exclude - so a test has to be able
+	// to hold the gap open and run a real ClearCache inside it. A seam placed before the check would
+	// exercise the guards, which are not in question; a seam placed after the write would be too late to
+	// change anything. It must be nil outside tests, and the production path costs one nil comparison
+	// per cache commit.
+	TestStorePreCommitHook func()
 }
 
 func NewClient(options ClientOptions) *Client {
 	cacheCapacity := max(options.CacheCapacity, 1024)
 	client := &Client{
-		ctx:               options.Context,
-		timeout:           options.Timeout,
-		disableCache:      options.DisableCache,
-		disableExpire:     options.DisableExpire,
-		optimisticTimeout: options.OptimisticTimeout,
-		cacheCapacity:     cacheCapacity,
-		clientSubnet:      options.ClientSubnet,
-		initRDRCFunc:      options.RDRC,
-		initDNSCacheFunc:  options.DNSCache,
-		logger:            options.Logger,
-		networkGeneration: options.NetworkGeneration,
-		policyGeneration:  options.PolicyGeneration,
+		ctx:                options.Context,
+		timeout:            options.Timeout,
+		disableCache:       options.DisableCache,
+		disableExpire:      options.DisableExpire,
+		optimisticTimeout:  options.OptimisticTimeout,
+		cacheCapacity:      cacheCapacity,
+		clientSubnet:       options.ClientSubnet,
+		initRDRCFunc:       options.RDRC,
+		initDNSCacheFunc:   options.DNSCache,
+		logger:             options.Logger,
+		networkGeneration:  options.NetworkGeneration,
+		policyGeneration:   options.PolicyGeneration,
+		policyStoreGuard:   options.PolicyStoreGuard,
+		storePreCommitHook: options.TestStorePreCommitHook,
 	}
 	if client.timeout == 0 {
 		client.timeout = C.DNSTimeout
@@ -822,23 +855,8 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 	// Storing an exact entry or an NXDOMAIN verdict is a state mutation, so it takes the stricter
 	// predicate: a dated answer may be delivered, but it may not be recorded as describing the
 	// network that is current now.
-	if !disableCache && c.stateMutationAllowed(operation) {
-		cacheKey, storable := c.finishCacheKey(transport, operation.cacheKey)
-		if storable {
-			c.storeCache(cacheKey, response, timeToLive)
-			// A validated NXDOMAIN is a statement about the NAME, so record it once
-			// and let every other record type for that name reuse it. Reaching here
-			// means the response already passed the checker above, the exchange
-			// succeeded, and caching is enabled.
-			//
-			// storeNXDomain re-checks the conditions that make widening safe:
-			// RcodeNameError, a usable SOA TTL, and a single question. NODATA and the
-			// error rcodes never reach it, because disableCache already excludes them
-			// above.
-			if response.Rcode == dns.RcodeNameError {
-				c.storeNXDomain(cacheKey, response, timeToLive)
-			}
-		}
+	if !disableCache {
+		c.commitCacheState(transport, operation, response, timeToLive)
 	}
 	response.Id = operation.messageId
 	requestEDNSOpt := operation.message.IsEdns0()
@@ -853,6 +871,70 @@ func (c *Client) finishExchange(transport adapter.DNSTransport, operation *excha
 	}
 	logExchangedResponse(c.logger, ctx, response, timeToLive)
 	return response, nil
+}
+
+// commitCacheState records a completed exchange, with the policy check and the write made one step.
+//
+// # The ordering this establishes
+//
+// Without a guard the two are separate statements, and the invalidation can run to completion between
+// them:
+//
+//	passes the epoch check for E                 <- the check
+//	ClearCache() runs: E -> E+1, cache purged    <- the gap
+//	writes the E answer into the E+1 cache       <- the write
+//
+// The next query under E+1 then reads an answer produced by the policy the user left, which is exactly
+// what the epoch exists to prevent. Re-checking the epoch immediately before the write does not close
+// it: the re-check and the write are still two steps away from each other.
+//
+// With a guard, the check and the write both run inside StoreUnderPolicy, which ClearCache takes
+// exclusively for the whole of "advance the epoch and purge". So the commit is either entirely before
+// the invalidation - and what it wrote is purged - or entirely after it, in which case its epoch check
+// (re-read INSIDE the guard) fails and it writes nothing. There is no third ordering.
+//
+// # What the guard deliberately does not do
+//
+// It does not wait for in-flight queries, cancel them, or make ClearCache a barrier they must pass. A
+// lock a query path takes must never be one a purge waits on: the commit takes the guard only for the
+// duration of a cache insert, and a query that never commits - a cache hit, an error, a disabled cache -
+// never takes it at all.
+func (c *Client) commitCacheState(transport adapter.DNSTransport, operation *exchangeOperation, response *dns.Msg, timeToLive uint32) {
+	commit := func() {
+		if !c.stateMutationAllowed(operation) {
+			return
+		}
+		// The test seam sits at the last point at which a commit is still reversible: the epoch and
+		// every other guard have been evaluated, and nothing has been written. A seam any earlier would
+		// test the guards rather than the atomicity of the commit. See
+		// ClientOptions.TestStorePreCommitHook.
+		if c.storePreCommitHook != nil {
+			c.storePreCommitHook()
+		}
+		cacheKey, storable := c.finishCacheKey(transport, operation.cacheKey)
+		if !storable {
+			return
+		}
+		c.storeCache(cacheKey, response, timeToLive)
+		// A validated NXDOMAIN is a statement about the NAME, so record it once
+		// and let every other record type for that name reuse it. Reaching here
+		// means the response already passed the checker above, the exchange
+		// succeeded, and caching is enabled.
+		//
+		// storeNXDomain re-checks the conditions that make widening safe:
+		// RcodeNameError, a usable SOA TTL, and a single question. NODATA and the
+		// error rcodes never reach it, because disableCache already excludes them
+		// above.
+		if response.Rcode == dns.RcodeNameError {
+			c.storeNXDomain(cacheKey, response, timeToLive)
+		}
+	}
+	if c.policyStoreGuard == nil {
+		// No policy concept on this client: the check-then-write behaviour is unchanged.
+		commit()
+		return
+	}
+	c.policyStoreGuard.StoreUnderPolicy(commit)
 }
 
 func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, options adapter.DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error) {
@@ -1277,10 +1359,16 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		// Without hasOwnershipGuard the ownership predicates short-circuit to "allowed", which is
 		// exactly the hole this closes: the refresh previously set only the generation guard, so
 		// responseAcceptable returned true unconditionally.
-		refreshOperation := &exchangeOperation{}
+		refreshOperation := &exchangeOperation{cacheKey: key, options: options}
 		if c.networkGeneration != nil {
 			refreshOperation.generation = c.networkGeneration()
 			refreshOperation.hasGenerationGuard = true
+		}
+		// The policy epoch is captured here too, for the same reason and at the same moment: this
+		// refresh makes its own round trip, so it belongs to the policy that is current when it starts.
+		if c.policyGeneration != nil {
+			refreshOperation.policyGeneration = c.policyGeneration()
+			refreshOperation.hasPolicyGuard = true
 		}
 		refreshOperation.startedStable = c.networkTransitionStable()
 		refreshOperation.hasOwnershipGuard = true
@@ -1325,15 +1413,12 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, key dnsCac
 		// refresh may only record a result if the network it was issued on is still the network that
 		// holds. A refresh that started settled and whose network moved underneath it must not seed a
 		// namespace that now belongs to a different network.
-		if !c.stateMutationAllowed(refreshOperation) {
-			return
-		}
-		storeKey, storable := c.finishCacheKey(transport, key)
-		if !storable {
-			return
-		}
+		//
+		// It goes through the same commit path as an ordinary exchange, so the policy check and the
+		// write are one step here too. A refresh is a cache WRITE like any other, and the epoch check
+		// that authorises it is worth exactly as much as the atomicity around it.
 		timeToLive := applyResponseOptions(key.Question, response, options)
-		c.storeCache(storeKey, response, timeToLive)
+		c.commitCacheState(transport, refreshOperation, response, timeToLive)
 		logRefreshedResponse(c.logger, ctx, response, timeToLive)
 	}()
 }

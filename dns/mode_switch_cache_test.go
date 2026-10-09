@@ -14,6 +14,9 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	R "github.com/sagernet/sing-box/route/rule"
+	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/contrab/freelru"
+	"github.com/sagernet/sing/contrab/maphash"
 	"github.com/sagernet/sing/service"
 
 	mDNS "github.com/miekg/dns"
@@ -126,6 +129,15 @@ func newModeSwitchHarness(t *testing.T, tag string, withGate bool) *modeSwitchHa
 			defaultTransport: harness.transport,
 		},
 	}
+	// The same wiring NewRouter performs. A harness that skipped it would fail loudly on the first
+	// guarded commit rather than silently measuring an inert guard.
+	harness.router.policyStoreGuard.router = harness.router
+	// And the reverse-mapping cache, which NewRouter builds when `reverse_mapping` is enabled. The
+	// policy window on that cache is closed by a comparison inside its own guarded commit, so the
+	// harness that exercises it needs the cache to exist.
+	harness.router.dnsReverseMapping = common.Must1(
+		freelru.New[netip.Addr, string](1024, maphash.NewHasher[netip.Addr]().Hash32, true),
+	)
 
 	// The manager must be reachable from the context the DNS rules are built and STARTED with, because
 	// ClashModeItem.Start resolves it with service.PtrFromContext - the same wiring box.go:412 uses. The
@@ -138,10 +150,12 @@ func newModeSwitchHarness(t *testing.T, tag string, withGate bool) *modeSwitchHa
 		// The CACHE IS ON. The whole question is what the cache does across a mode switch, so a router
 		// with DisableCache would measure nothing.
 		Logger: log.NewNOPFactory().Logger(),
-		// Wired exactly as the production constructor does it (dns/router.go, PolicyGeneration). Without
-		// it the client has no policy concept and the guard under test is inert - which is how the first
-		// run of this test reported a "failure to fix" that was really a harness gap.
+		// Wired exactly as the production constructor does it (dns/router.go, PolicyGeneration /
+		// PolicyStoreGuard). Without them the client has no policy concept and the guard under test is
+		// inert - which is how the first run of this test reported a "failure to fix" that was really a
+		// harness gap.
 		PolicyGeneration: harness.router.policyEpoch,
+		PolicyStoreGuard: &harness.router.policyStoreGuard,
 	})
 	harness.manager = clashmode.NewManager(ctx, log.NewNOPFactory().Logger(), "Rule", []string{"Global", "Direct"})
 	service.MustRegisterPtr(ctx, harness.manager)

@@ -1,4 +1,4 @@
-﻿package dns
+package dns
 
 import (
 	"context"
@@ -65,6 +65,31 @@ type Router struct {
 	// tag and the network generation all stay exactly as they were. Without this epoch, an answer that
 	// was already in flight when the switch happened was stored under a key the new mode also reads.
 	policyGeneration atomic.Uint64
+	// policyStoreGuard is the commit guard that makes the epoch above an ORDERING fact and not only a
+	// value to compare. It is passed to the client, which runs every policy-guarded cache write inside
+	// it, and ClearCache takes it exclusively for the whole of "advance the epoch and purge".
+	//
+	// # Why the epoch alone was not enough
+	//
+	// The epoch answers "was this answer captured under the policy that holds now". It cannot make that
+	// question and the cache write one step, and the invalidation does not need to be inside the
+	// exchange to be harmful - it only needs to land between the check and the write:
+	//
+	//	old exchange captures policy epoch E
+	//	old response passes the E check                    <- authorised
+	//	ClearCache runs to completion: E -> E+1, purge     <- the whole invalidation
+	//	old response stores its answer                     <- live under E+1
+	//
+	// The next query under the new policy reads that entry and is answered by the server the switch
+	// moved away from, which is the outcome the epoch was introduced to prevent. MEASURED, not reasoned:
+	// TestAnAnswerAuthorisedBeforeTheClearIsNotRecordedAfterIt drives exactly this interleaving.
+	//
+	// # Lock order
+	//
+	// It is a leaf lock: it is taken by the cache-commit path (which holds no other DNS lock while it
+	// runs) and by ClearCache as its outermost acquisition, so the client's cache internals, the DNS
+	// cache backend and dnsEnvironmentAccess are all acquired UNDER it and never the other way round.
+	policyStoreGuard policyStoreGuard
 	// dnsEnvironmentAccess guards the DNS environment observation pair
 	// (dnsEnvironmentObserved, dnsEnvironmentFingerprint) together with the advance of
 	// dnsEnvironmentGeneration, so "the fingerprint I compared" and "the epoch I produced" are one
@@ -128,6 +153,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
 		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
 	}
+	router.policyStoreGuard.router = router
 	if options.DNSClientOptions.IndependentCache {
 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
 	}
@@ -170,6 +196,10 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		// network generation because a `clash_mode` switch is not a network change: the fingerprint and
 		// the generation both stay put, and only the policy epoch moves.
 		PolicyGeneration: router.policyEpoch,
+		// The SAME epoch, wired as a commit guard rather than only as a value to compare. An epoch
+		// tells a store whether it is stale; it cannot make that question and the store one step, and
+		// ClearCache's purge otherwise lands in the gap between them. See adapter.PolicyStoreGuard.
+		PolicyStoreGuard: &router.policyStoreGuard,
 		DNSCache: func() adapter.DNSCacheStore {
 			cacheFile := service.FromContext[adapter.CacheFile](ctx)
 			if cacheFile == nil {
@@ -1651,10 +1681,10 @@ func (r *Router) recordReverseMappingFrom(message *mDNS.Msg, response *mDNS.Msg,
 	if len(answers) == 0 {
 		return
 	}
-	r.commitReverseMappingAnswers(answers, generation)
+	r.commitReverseMappingAnswers(answers, generation, r.policyEpoch())
 }
 
-// commitReverseMappingAnswers publishes a response's answers if, and only if, the captured epoch is
+// commitReverseMappingAnswers publishes a response's answers if, and only if, BOTH captured epochs are
 // still current at the moment of publication.
 //
 // The comparison and the writes are one decision because they are made while holding
@@ -1662,10 +1692,24 @@ func (r *Router) recordReverseMappingFrom(message *mDNS.Msg, response *mDNS.Msg,
 // and Purge, and ResetNetwork's - is performed under, so no invalidation can be interleaved between
 // this check and these writes. See recordReverseMappingFrom for why that matters.
 //
-// The lock covers the two things it may cover here and nothing else: reading the counter and
+// # Why the policy epoch is checked here as well
+//
+// dnsEnvironmentAccess serialises the NETWORK invalidation protocol. `Router.ClearCache` - the
+// `clash_mode` switch and `POST /dns/flush` - purges this same cache, but it advances policyGeneration
+// rather than the network generation, and it is the policy epoch that says which resolver set produced
+// an answer. Without the comparison below, an answer that was already authorised under the retired
+// policy could be published after ClearCache's purge had completed, so route matching would read a name
+// learned from the resolvers the switch moved away from - the same defect class as the cache-commit
+// window, on the cache whose only purpose is to feed route rules.
+//
+// This IS atomic, unlike the DNS client cache's, because ClearCache purges this cache under the same
+// dnsEnvironmentAccess this critical section holds. So one comparison inside the section is enough
+// here; the client needs the store guard because its purge is not on this lock's critical path.
+//
+// The lock covers the two things it may cover here and nothing else: reading the counters and
 // publishing already-extracted answers into the cache. Nothing inside the critical section calls out,
 // waits, or takes another lock.
-func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, generation uint64) {
+func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, generation uint64, policy uint64) {
 	// The seam sits at the START of the commit protocol, and that is the only place it can sit.
 	//
 	// Everything this protocol excludes - purging the cache, advancing an epoch - has to happen while
@@ -1679,6 +1723,7 @@ func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, gen
 	}
 	r.dnsEnvironmentAccess.Lock()
 	comparison := r.dnsGenerationLocked()
+	policyComparison := r.policyEpoch()
 	// The second seam sits AFTER the comparison has been evaluated and while the critical section is
 	// still held, which is the only way to hold open the window that ResetNetwork's generation bump
 	// used to leave.
@@ -1697,6 +1742,14 @@ func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, gen
 		hook(generation, comparison)
 	}
 	if generation != comparison {
+		r.dnsEnvironmentAccess.Unlock()
+		return
+	}
+	// The routing policy that produced these answers must still be the one in force. ClearCache advances
+	// this counter and purges this cache under the same lock, so the comparison and the purge cannot
+	// interleave: either the purge ran first, the counter moved, and nothing is written here, or this
+	// write happened first and that purge removes it.
+	if policy != policyComparison {
 		r.dnsEnvironmentAccess.Unlock()
 		return
 	}
@@ -1977,6 +2030,20 @@ func addressLimitResponseCheck(rule adapter.DNSRule, metadata *adapter.InboundCo
 // The advance happens BEFORE the purge, so a query that captures the new epoch necessarily starts
 // after the invalidation and its answer describes the new policy.
 func (r *Router) ClearCache() {
+	// The epoch advance and the purge are ONE step with respect to a policy-guarded cache commit.
+	//
+	// Without the write access below, a commit that had already passed its epoch check could write
+	// between the advance and the purge - or after both - and the entry it wrote would be live under the
+	// epoch that rejected it. With it, the commit is either entirely before this section, in which case
+	// the purge below removes what it wrote, or entirely after it, in which case its own epoch check
+	// (re-read inside the guard) fails and it writes nothing.
+	//
+	// What this deliberately does NOT do: it does not wait for in-flight exchanges, cancel them, or
+	// make the clear a barrier they must pass. Only a commit takes the read side, and only for the
+	// duration of one cache insert, so no DNS query waits on a clear and no clear waits on a query that
+	// is not committing.
+	r.policyStoreGuard.Lock()
+	defer r.policyStoreGuard.Unlock()
 	r.policyGeneration.Add(1)
 	r.client.ClearCache()
 	if r.platformInterface != nil {
@@ -1987,6 +2054,46 @@ func (r *Router) ClearCache() {
 		r.dnsReverseMapping.Purge()
 		r.dnsEnvironmentAccess.Unlock()
 	}
+}
+
+// policyStoreGuard implements adapter.PolicyStoreGuard over the router's policy epoch.
+//
+// It is a reader/writer lock rather than a plain mutex because a DNS cache commit happens once per
+// upstream exchange, while a clear is a control-plane event: many commits may hold the read side at the
+// same time, and a clear waits only for the ones already inside a cache insert.
+//
+// # Why the epoch is read through a pointer rather than through the guard's own copy
+//
+// The guard must compare against the counter ClearCache advances. A copy taken when the guard was built
+// would be a fixed epoch, and every comparison against it would be a comparison against the past. The
+// pointer is wired at construction (`NewRouter` assigns `policyStoreGuard.router`, and the harnesses
+// that build a Router literal do the same). A nil router is a construction error rather than a state
+// the query path has to survive: PolicyStoreEpoch panics with that sentence instead of faulting.
+type policyStoreGuard struct {
+	router *Router
+	access sync.RWMutex
+}
+
+func (g *policyStoreGuard) PolicyStoreEpoch() uint64 {
+	// Read while the read side is held, so the value cannot be withdrawn between the check and the
+	// write it authorises.
+	return g.router.policyEpoch()
+}
+
+func (g *policyStoreGuard) StoreUnderPolicy(commit func()) {
+	g.access.RLock()
+	defer g.access.RUnlock()
+	commit()
+}
+
+// Lock and Unlock are the invalidation side: the whole of "advance the policy epoch and purge every
+// cache that epoch namespaces" runs between them, so no guarded commit can be in flight across it.
+func (g *policyStoreGuard) Lock() {
+	g.access.Lock()
+}
+
+func (g *policyStoreGuard) Unlock() {
+	g.access.Unlock()
 }
 
 // policyEpoch is the current routing-policy epoch, exposed to the client.
