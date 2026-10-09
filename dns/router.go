@@ -88,6 +88,18 @@ type Router struct {
 	rulesAccess              sync.RWMutex
 	started                  bool
 	closing                  bool
+	// testReverseMappingRecordHook, when set, runs inside commitReverseMappingAnswers at the start of
+	// the commit protocol - after every step that runs outside the critical section, and before the
+	// epoch comparison and the writes it guards.
+	//
+	// It exists so a test can prove that comparison is atomic with the invalidation rather than assume
+	// it: the test stops the recording there and completes a real invalidation from the other side. It
+	// is nil in production, where it costs one nil comparison per recorded response.
+	//
+	// It is a decision seam, not a model of the cache: it passes the answers and the captured epoch, so
+	// a test drives the invalidation through the router's own entry points rather than through a
+	// reimplementation of them.
+	testReverseMappingRecordHook func(answers []reverseMappingAnswer, generation uint64)
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -1255,6 +1267,17 @@ func (r *Router) dnsGeneration() uint64 {
 	return r.networkGeneration.Load() + r.observeDNSEnvironment()
 }
 
+// dnsGenerationLocked is dnsGeneration for a caller that already holds dnsEnvironmentAccess.
+//
+// The lock is NOT reentrant, so the two-phase commit in commitReverseMappingAnswers - the one place
+// that has to read the epoch and publish under the same acquisition - cannot call dnsGeneration. This
+// is the same expression with that one acquisition removed, and it exists so the commit path has no
+// second lock to order: the epoch it compares against is read from the counter the invalidation
+// advances, while the invalidation cannot run.
+func (r *Router) dnsGenerationLocked() uint64 {
+	return r.networkGeneration.Load() + r.observeDNSEnvironmentLocked()
+}
+
 // observeDNSEnvironment refreshes the aggregate DNS environment fingerprint and returns the DNS
 // environment epoch that is current as a result.
 //
@@ -1282,6 +1305,22 @@ func (r *Router) observeDNSEnvironment() uint64 {
 	// environment is one notify_check per transport.
 	r.dnsEnvironmentAccess.Lock()
 	defer r.dnsEnvironmentAccess.Unlock()
+	return r.observeDNSEnvironmentLocked()
+}
+
+// observeDNSEnvironmentLocked is the body of observeDNSEnvironment, for callers that already hold
+// dnsEnvironmentAccess.
+//
+// Holding the lock is what makes "the fingerprint I compared" and "the epoch I produced" one atomic
+// mutation, and it is also what makes the two-phase commit in commitReverseMappingAnswers a single
+// decision: while the commit holds this lock, an invalidation cannot advance the epoch or purge
+// between its check and its writes.
+func (r *Router) observeDNSEnvironmentLocked() uint64 {
+	if r.transport == nil {
+		// A Router built without a transport manager has no DNS environment to observe, and
+		// nothing to attribute an answer to either. Degrade to the network epoch alone.
+		return r.dnsEnvironmentGeneration.Load()
+	}
 	fingerprint, description, pinned := r.dnsEnvironmentFingerprintNow()
 	if !r.dnsEnvironmentObserved {
 		// The FIRST observation pins without advancing.
@@ -1423,27 +1462,111 @@ type reverseMappingAnswer struct {
 	lifetime time.Duration
 }
 
-// recordReverseMappingFrom records a mapping only if the response belongs to the given network
-// generation.
+// reverseMappingAnswersFrom extracts the address-to-name pairs a response carries.
 //
-// The generation is captured when the REQUEST is issued and compared here, when the response
-// arrives. A request that spans a network change therefore cannot write into the cache the change
-// just cleared: its answer describes the network it was asked on, not the one that is current now.
+// Fake-IP answers are excluded HERE rather than at the write: a fake address is a local stand-in for
+// a name, not something a resolver said the name means, so it must never enter the one cache route
+// policy reads as "what this address really is".
+func reverseMappingAnswersFrom(response *mDNS.Msg, transport adapter.DNSTransport) []reverseMappingAnswer {
+	if response == nil || len(response.Answer) == 0 {
+		return nil
+	}
+	if transport != nil && transport.Type() == C.DNSTypeFakeIP {
+		return nil
+	}
+	var answers []reverseMappingAnswer
+	for _, answer := range response.Answer {
+		switch record := answer.(type) {
+		case *mDNS.A:
+			answers = append(answers, reverseMappingAnswer{
+				address:  M.AddrFromIP(record.A),
+				domain:   FqdnToDomain(record.Hdr.Name),
+				lifetime: time.Duration(record.Hdr.Ttl) * time.Second,
+			})
+		case *mDNS.AAAA:
+			answers = append(answers, reverseMappingAnswer{
+				address:  M.AddrFromIP(record.AAAA),
+				domain:   FqdnToDomain(record.Hdr.Name),
+				lifetime: time.Duration(record.Hdr.Ttl) * time.Second,
+			})
+		}
+	}
+	return answers
+}
+
+// recordReverseMappingFrom records a mapping only if the response still belongs to the resolver set it
+// was asked on.
+//
+// The generation is captured when the REQUEST is issued and re-checked here, but the check alone is
+// not the guard: it is the check TOGETHER WITH the write, under one lock, that makes this atomic
+// against the invalidation protocol.
+//
+// # Why the check and the write cannot be two steps
+//
+// Everything that retires this cache - observeDNSEnvironment for a resolver/search-domain change,
+// ResetNetwork for a network transition - advances an epoch and then purges, and both do it under
+// dnsEnvironmentAccess. Read-then-write with nothing in between is not a guard against them: the
+// purge lands in the gap, clears a cache the write has not filled yet, and the write then adds the
+// answer it was supposed to retire. What route-rule matching reads afterwards is a name learned from
+// resolvers the device is no longer using, which is the exact outcome ResetNetwork's purge exists to
+// prevent.
+//
+// # What the locked section establishes
+//
+// The epoch is re-read from the same counter the invalidation advances, inside the lock that
+// invalidation holds while it advances it and purges. So either the invalidation happened first - the
+// epoch moved, the answers are refused, nothing is written - or the write happened first, and the
+// purge that follows removes exactly what it wrote. There is no third ordering.
+//
+// # Cost
+//
+// One acquisition of the lock this path already takes for its observation. The answers are extracted
+// before the lock, so only the comparison and the writes are inside it, and the writes are bounded by
+// the number of A/AAAA records in one response.
 func (r *Router) recordReverseMappingFrom(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport, generation uint64) {
-	if !r.reverseMappingGenerationCurrent(generation) {
+	if r.dnsReverseMapping == nil {
 		return
 	}
-	if len(message.Question) > 0 && response != nil && len(response.Answer) > 0 {
-		if transport == nil || transport.Type() != C.DNSTypeFakeIP {
-			for _, answer := range response.Answer {
-				switch record := answer.(type) {
-				case *mDNS.A:
-					r.dnsReverseMapping.AddWithLifetime(M.AddrFromIP(record.A), FqdnToDomain(record.Hdr.Name), time.Duration(record.Hdr.Ttl)*time.Second)
-				case *mDNS.AAAA:
-					r.dnsReverseMapping.AddWithLifetime(M.AddrFromIP(record.AAAA), FqdnToDomain(record.Hdr.Name), time.Duration(record.Hdr.Ttl)*time.Second)
-				}
-			}
-		}
+	if len(message.Question) == 0 {
+		return
+	}
+	answers := reverseMappingAnswersFrom(response, transport)
+	if len(answers) == 0 {
+		return
+	}
+	r.commitReverseMappingAnswers(answers, generation)
+}
+
+// commitReverseMappingAnswers publishes a response's answers if, and only if, the captured epoch is
+// still current at the moment of publication.
+//
+// The comparison and the writes are one decision because they are made while holding
+// dnsEnvironmentAccess: that is the lock the invalidation protocol - observeDNSEnvironment's advance
+// and Purge, and ResetNetwork's - is performed under, so no invalidation can be interleaved between
+// this check and these writes. See recordReverseMappingFrom for why that matters.
+//
+// The lock covers the two things it may cover here and nothing else: reading the counter and
+// publishing already-extracted answers into the cache. Nothing inside the critical section calls out,
+// waits, or takes another lock.
+func (r *Router) commitReverseMappingAnswers(answers []reverseMappingAnswer, generation uint64) {
+	// The seam sits at the START of the commit protocol, and that is the only place it can sit.
+	//
+	// Everything this protocol excludes - purging the cache, advancing an epoch - has to happen while
+	// this side is stopped, and every one of those operations takes dnsEnvironmentAccess itself. A
+	// seam held INSIDE the critical section would deadlock the invalidation instead of interleaving
+	// with it, and would prove nothing about the ordering. Held here, a test establishes the exact
+	// ordering the protocol is a claim about: the recording side has passed every pre-lock step, and
+	// the invalidation runs to completion before the guarded comparison is made.
+	if hook := r.testReverseMappingRecordHook; hook != nil {
+		hook(answers, generation)
+	}
+	r.dnsEnvironmentAccess.Lock()
+	defer r.dnsEnvironmentAccess.Unlock()
+	if generation != r.dnsGenerationLocked() {
+		return
+	}
+	for _, answer := range answers {
+		r.dnsReverseMapping.AddWithLifetime(answer.address, answer.domain, answer.lifetime)
 	}
 }
 
@@ -1695,10 +1818,36 @@ func (r *Router) ClearCache() {
 	}
 }
 
+// LookupReverseMapping answers "what name does this address mean".
+//
+// # Why it observes the DNS environment before it reads
+//
+// This is the only reader of a DNS cache that is not namespaced by the live environment: the exact
+// entry, the NXDOMAIN verdict, the RDRC namespace and the persistent key all mix
+// Client.environmentHash in, so a resolver change separates them by construction. This cache is
+// guarded by the generation alone, and the generation only moves when SOMETHING observes the
+// environment.
+//
+// observeDNSEnvironment is called from the query path - prepareExchange, the response ownership check
+// and the reverse mapping commit - so a resolver change is noticed at the next DNS request. That is
+// not good enough for this caller: route/route.go reads this mapping while matching a connection that
+// needs no DNS request at all (a literal destination address, or a name already known), so between
+// the change and the first new query a route rule could match on a name learned from the previous
+// resolver set. Reading without observing is a read of the retired epoch.
+//
+// # Cost
+//
+// One observation, which is a mutex, a loop over the transports and an FNV hash over the entries they
+// publish. The transports cache their own platform reads, so an unchanged environment is a cached
+// value per transport; a change advances the epoch and purges here rather than at the next query.
+// This is the same observation dnsGeneration already performs several times per DNS exchange, moved
+// onto the connection path, and it is what makes the epoch a property of the environment rather than
+// of who happened to ask.
 func (r *Router) LookupReverseMapping(ip netip.Addr) (string, bool) {
 	if r.dnsReverseMapping == nil {
 		return "", false
 	}
+	r.observeDNSEnvironment()
 	domain, loaded := r.dnsReverseMapping.Get(ip)
 	return domain, loaded
 }
