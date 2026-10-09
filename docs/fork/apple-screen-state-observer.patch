@@ -1,0 +1,70 @@
+diff --git a/Library/Network/ExtensionProvider.swift b/Library/Network/ExtensionProvider.swift
+index 388c935..0071384 100644
+--- a/Library/Network/ExtensionProvider.swift
++++ b/Library/Network/ExtensionProvider.swift
+@@ -26,6 +26,9 @@ open class ExtensionProvider: NEPacketTunnelProvider {
+     }
+ 
+     public var overridePreferences: OverridePreferences?
++    #if os(iOS)
++        private var screenStateObserver: ScreenStateObserver?
++    #endif
+ 
+     private func applyStartOptions(_ options: [String: NSObject]) throws {
+         try ApplicationLocale.apply(options["locale"] as? String)
+@@ -211,6 +214,11 @@ open class ExtensionProvider: NEPacketTunnelProvider {
+             throw error
+         }
+         writeMessage("(packet-tunnel): Here I stand")
++        #if os(iOS)
++            if let commandServer {
++                screenStateObserver = ScreenStateObserver(commandServer: commandServer)
++            }
++        #endif
+         #if os(macOS)
+             if Variant.useSystemExtension {
+                 xpcService.markServiceReady()
+@@ -303,6 +311,8 @@ open class ExtensionProvider: NEPacketTunnelProvider {
+             locationDelegate = nil
+         #endif
+         #if os(iOS)
++            screenStateObserver?.cancel()
++            screenStateObserver = nil
+             if #available(iOS 18.0, *) {
+                 ControlCenter.shared.reloadControls(ofKind: ExtensionProfile.controlKind)
+             }
+diff --git a/Library/Network/ScreenStateObserver.swift b/Library/Network/ScreenStateObserver.swift
+new file mode 100644
+index 0000000..d3e8035
+--- /dev/null
++++ b/Library/Network/ScreenStateObserver.swift
+@@ -0,0 +1,29 @@
++#if os(iOS)
++    import Foundation
++    import Libbox
++    import notify
++
++    final class ScreenStateObserver {
++        private let queue = DispatchQueue(label: "io.nekohasekai.sfamt.screen-state")
++        private var displayToken: Int32 = -1
++        private var lockToken: Int32 = -1
++
++        init(commandServer: LibboxCommandServer) {
++            notify_register_dispatch("com.apple.iokit.hid.displayStatus", &displayToken, queue) { token in
++                var state: UInt64 = 0
++                notify_get_state(token, &state)
++                commandServer.recordScreenState(state == 1)
++            }
++            notify_register_dispatch("com.apple.springboard.lockstate", &lockToken, queue) { token in
++                var state: UInt64 = 0
++                notify_get_state(token, &state)
++                commandServer.recordLockState(state == 1)
++            }
++        }
++
++        func cancel() {
++            notify_cancel(displayToken)
++            notify_cancel(lockToken)
++        }
++    }
++#endif

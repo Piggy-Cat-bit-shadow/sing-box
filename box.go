@@ -977,41 +977,65 @@ func (s *Box) CloseIdleConnections() {
 	s.referenceManager.CloseIdleConnections()
 }
 
-// DeviceSlept publishes the Apple lifecycle's "the device is going to sleep" edge.
+// DeviceSlept publishes the Apple lifecycle's "the device is going to sleep" fact.
 //
-// It exists because the pause manager's device axis is a LEVEL and the Apple client never lifts it:
-// the client pinned to this tree has no screen-state observer, and its wake command is a resume
-// rather than a device wake, so the first sleep enters the paused level and every later sleep finds
-// it already set. A reuse epoch driven by that level would distrust the first sleep of the process
-// and trust every one after it, which is the exact opposite of the requirement.
+// It is the sleep EDGE and the device LEVEL pause together, in that order; see box_lifecycle.go for
+// why the order is not arbitrary and for what each Apple fact means. It exists because the pause
+// manager's device axis is a LEVEL, and on a platform whose resume is not a wake a level with no
+// lift would be entered once and held for the life of the process.
 //
-// So the platform's own edge is published directly, and it is deliberately narrow: it starts (or
-// restarts) the sleep measurement and touches nothing else. The device stays paused, speculation
-// stays suppressed, and no pool is closed here - the verdict belongs to the resume, when the sleep
-// duration is finally known.
+// No pool is closed here. The verdict belongs to the resume, when the sleep duration is finally
+// known, and the policy's short-sleep band deliberately keeps everything.
 func (s *Box) DeviceSlept() {
-	if s.powerGovernor != nil {
-		s.powerGovernor.SleepStarted()
-	}
+	s.lifecycle().slept()
 }
 
 // DeviceResumed publishes the Apple lifecycle's "the extension is running again" edge.
 //
-// It is deliberately NOT applyPauseEvent's EventDeviceWake. On iOS the platform resumes the
-// extension for every push and background task while the device is still locked, so a resume cannot
-// be allowed to lift the device pause: that would release health checks, probes, provider refreshes
-// and statistics for a phone in a pocket. What a resume does establish is that a sleep ended, so the
-// governor measures it and publishes the reuse verdict, and the owner of a reusable pool retires
-// what is idle before the next flow can be handed a socket that has not been verified since the
-// device went to sleep.
+// It is deliberately NOT a device wake. On iOS the platform resumes the extension for every push and
+// background task while the device is still locked, so a resume cannot be allowed to lift the device
+// pause: that would release health checks, probes, provider refreshes and statistics for a phone in
+// a pocket - and a push notification lights the lock screen, so "the display is on" cannot be used
+// as a proxy for it either. What a resume does establish is that a sleep ended, so the governor
+// measures it and publishes the reuse verdict, and the owner of a reusable pool retires what is idle
+// before the next flow can be handed a socket that has not been verified since the device went to
+// sleep.
 //
 // It is a method rather than a direct call into the governor because the governor is owned by this
 // composition root: the bridge between a platform's lifecycle vocabulary and the core's belongs where
 // applyPauseEvent already is, and an embedder should reach a lifecycle fact, not a policy object.
 func (s *Box) DeviceResumed() {
-	if s.powerGovernor != nil {
-		s.powerGovernor.Resumed()
-	}
+	s.lifecycle().resumed()
+}
+
+// DeviceWoke publishes the dedicated device-wake host event: the device just became usable.
+//
+// It is the only Apple fact that lifts the device pause, and on iOS it is delivered by an unlock
+// (`lockstate == 0`) or by the embedder's own explicit call. It publishes the reuse verdict and then
+// releases the level, so the work the release permits dials a path that is known to be new.
+//
+// A platform that reports no such event keeps its pause. That is a stated limitation and not
+// something to be worked around with a timer: no timer can tell a locked phone from an unlocked one,
+// and guessing releases speculative work for a phone in a pocket.
+func (s *Box) DeviceWoke() {
+	s.lifecycle().woke()
+}
+
+// ScreenStateChanged applies the Apple display fact.
+//
+// Off pauses and starts a measurement; on publishes the resume edge and nothing else. The asymmetry
+// is the point - see box_lifecycle.go - because a display lights up for a push notification and for
+// raise-to-wake, neither of which is a person using the device.
+func (s *Box) ScreenStateChanged(on bool) {
+	s.lifecycle().screenState(on)
+}
+
+// LockStateChanged applies the Apple lock fact.
+//
+// Locking pauses and starts a measurement; UNLOCKING is the device wake, and it is the only fact
+// that releases the level.
+func (s *Box) LockStateChanged(locked bool) {
+	s.lifecycle().lockState(locked)
 }
 
 func (s *Box) LogFactory() log.Factory {
