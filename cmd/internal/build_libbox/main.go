@@ -43,12 +43,80 @@ func init() {
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
 }
 
+// gomobileWorkDirName is the directory gomobile is run in, relative to the module root.
+//
+// # Why gomobile does not run in the module root
+//
+// `gomobile bind` writes the Go source it generates into its CURRENT WORKING DIRECTORY, and it
+// has no flag and no environment variable that moves it:
+//
+//	github.com/sagernet/gomobile cmd/gomobile/bind_iosapp.go:106
+//	    filepath.Abs(filepath.Join(".", "build", platform+"-"+arch, "Libbox"))
+//	github.com/sagernet/gomobile cmd/gomobile/bind_androidapp.go:373
+//	    filepath.Abs(filepath.Join(".", "build", arch, "lib"+libName))
+//
+// Run from the module root, as this builder used to run it, that leaves a generated Go tree under
+// <module root>/build, which the next `go test ./...` enumerates as if it were source: the package
+// count moves and the extra "packages" are not source at all. Deleting the tree and re-running
+// makes the count right and fixes nothing, because the next build recreates it.
+//
+// So the subprocess is given a working directory of its own. The name begins with an underscore,
+// which is a directory name the go tool never matches with "./...", and it is also listed in
+// cmd/internal/modlayout's GeneratedRoots, which fails the build if a generated directory is ever
+// enumerated anyway.
+//
+// Everything the subprocess is asked to produce is therefore named by ABSOLUTE path: its `-o`
+// output, the package it binds, and the destination this builder copies the artifact to. Nothing
+// depends on the working directory any more.
+const gomobileWorkDirName = "_libbox_build"
+
+// rootDir is the module root this builder was started in. It is captured once so no path below is
+// relative to the (now isolated) gomobile working directory.
+var rootDir string
+
+// gomobileWorkDir is the isolated working directory for the gomobile subprocess.
+func gomobileWorkDir(root string) string {
+	return filepath.Join(root, gomobileWorkDirName)
+}
+
+// libboxPackageDir is the package gomobile binds, named by absolute path so it resolves from the
+// isolated working directory.
+//
+// An absolute directory is used rather than the module import path so the module path is not
+// written down a second time here.
+func libboxPackageDir(root string) string {
+	return filepath.Join(root, "experimental", "libbox")
+}
+
+// newGomobileCommand builds the gomobile invocation with the isolated working directory already
+// set. The directory is created on demand, so a run that fails before reaching gomobile leaves
+// nothing behind.
+func newGomobileCommand(root string, args ...string) (*exec.Cmd, error) {
+	workDir := gomobileWorkDir(root)
+	err := os.MkdirAll(workDir, 0o755)
+	if err != nil {
+		return nil, E.Cause(err, "create the isolated gomobile working directory ", workDir)
+	}
+
+	command := exec.Command(build_shared.GoBinPath+"/gomobile", args...)
+	command.Dir = workDir
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command, nil
+}
+
 func main() {
 	flag.Parse()
 	if printResolvedTags != "" {
 		fmt.Println(strings.Join(ResolveBuildTags(printResolvedTags), ","))
 		return
 	}
+
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		log.Fatal(E.Cause(err, "resolve the module root"))
+	}
+	rootDir = workingDirectory
 
 	build_shared.FindMobile()
 
@@ -289,11 +357,17 @@ func getAndroidBindTarget() string {
 	return "android"
 }
 
-func buildAndroidVariant(config AndroidBuildConfig, bindTarget string) {
+// androidBindArguments is the gomobile invocation for one Android variant.
+//
+// The output path and the bound package are both absolute, and that is the point rather than a
+// detail: gomobile runs in the isolated working directory, so a relative path here would name a
+// file inside that directory (or fail to resolve) instead of the module's artifact or package.
+// TestAndroidBindArgumentsAreAbsolute and TestAppleBindArgumentsAreAbsolute hold that.
+func androidBindArguments(config AndroidBuildConfig, bindTarget, outputPath string) []string {
 	args := []string{
 		"bind",
 		"-v",
-		"-o", config.OutputName,
+		"-o", outputPath,
 		"-target", bindTarget,
 		"-androidapi", strconv.Itoa(config.AndroidAPI),
 		"-javapkg=io.nekohasekai",
@@ -307,20 +381,27 @@ func buildAndroidVariant(config AndroidBuildConfig, bindTarget string) {
 	}
 
 	args = append(args, "-tags", strings.Join(config.Tags, ","))
-	args = append(args, "./experimental/libbox")
+	return append(args, libboxPackageDir(rootDir))
+}
 
-	command := exec.Command(build_shared.GoBinPath+"/gomobile", args...)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	err := command.Run()
+func buildAndroidVariant(config AndroidBuildConfig, bindTarget string) {
+	// The artifact is named by absolute path inside the isolated working directory, so the
+	// generated tree gomobile leaves behind is never part of the module.
+	outputPath := filepath.Join(gomobileWorkDir(rootDir), config.OutputName)
+
+	command, err := newGomobileCommand(rootDir, androidBindArguments(config, bindTarget, outputPath)...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = command.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	copyPath := filepath.Join("..", "sing-box-for-android", "app", "libs")
+	copyPath := filepath.Join(rootDir, "..", "sing-box-for-android", "app", "libs")
 	if rw.IsDir(copyPath) {
 		copyPath, _ = filepath.Abs(copyPath)
-		err = rw.CopyFile(config.OutputName, filepath.Join(copyPath, config.OutputName))
+		err = rw.CopyFile(outputPath, filepath.Join(copyPath, config.OutputName))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -349,19 +430,16 @@ func buildAndroid() {
 	}, bindTarget)
 }
 
-func buildApple() {
-	var bindTarget string
-	if platform != "" {
-		bindTarget = platform
-	} else if debugEnabled {
-		bindTarget = "ios"
-	} else {
-		bindTarget = "ios,iossimulator,tvos,tvossimulator,macos"
-	}
-
+// appleBindArguments is the gomobile invocation for the Apple frameworks.
+//
+// Like the Android builder's, the output path and the bound package are absolute because gomobile
+// runs in the isolated working directory. gomobile's own default output name is relative to that
+// directory, so `-o` is passed explicitly rather than relied on.
+func appleBindArguments(bindTarget, frameworkPath string) []string {
 	args := []string{
 		"bind",
 		"-v",
+		"-o", frameworkPath,
 		"-target", bindTarget,
 		"-libname=box",
 		// The mobile-only geometry, applied per platform. The tag itself is defined in
@@ -396,22 +474,40 @@ func buildApple() {
 	}
 
 	args = append(args, "-tags", strings.Join(tags, ","))
-	args = append(args, "./experimental/libbox")
+	return append(args, libboxPackageDir(rootDir))
+}
 
-	command := exec.Command(build_shared.GoBinPath+"/gomobile", args...)
-	command.Stdout = os.Stdout
-	command.Stderr = os.Stderr
-	err := command.Run()
+func buildApple() {
+	var bindTarget string
+	if platform != "" {
+		bindTarget = platform
+	} else if debugEnabled {
+		bindTarget = "ios"
+	} else {
+		bindTarget = "ios,iossimulator,tvos,tvossimulator,macos"
+	}
+
+	// The framework is named explicitly by absolute path: gomobile's default output name is
+	// relative to its working directory, which is now the isolated one rather than the module
+	// root, so relying on the default would leave the artifact somewhere this builder does not
+	// look.
+	frameworkPath := filepath.Join(gomobileWorkDir(rootDir), "Libbox.xcframework")
+
+	command, err := newGomobileCommand(rootDir, appleBindArguments(bindTarget, frameworkPath)...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = command.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	copyPath := filepath.Join("..", "sing-box-for-apple")
+	copyPath := filepath.Join(rootDir, "..", "sing-box-for-apple")
 	if rw.IsDir(copyPath) {
 		targetDir := filepath.Join(copyPath, "Libbox.xcframework")
 		targetDir, _ = filepath.Abs(targetDir)
 		os.RemoveAll(targetDir)
-		os.Rename("Libbox.xcframework", targetDir)
+		os.Rename(frameworkPath, targetDir)
 		log.Info("copied to ", targetDir)
 	}
 }

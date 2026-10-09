@@ -12,7 +12,16 @@
 # (their default output name is the package directory).
 /build_libbox
 /ci-artifact-probe
+# Generated Go written by `gomobile bind` into its working directory, which is why
+# cmd/internal/build_libbox gives the subprocess a working directory of its own
+# (_libbox_build, below) instead of running it here. Kept ignored so a build run by an
+# older checkout, or by hand, cannot be committed by accident.
 /build/
+# The isolated working directory cmd/internal/build_libbox runs gomobile in. Everything
+# gomobile generates lands here rather than under /build/, and the leading underscore is
+# why `go list ./...` never matches it; cmd/internal/modlayout fails the build if a
+# generated directory is enumerated anyway.
+/_libbox_build/
 /*.jar
 /*.aar
 /*.xcframework/
