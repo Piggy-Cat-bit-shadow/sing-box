@@ -1,0 +1,13 @@
+=== clients/apple ===
+origin	https://github.com/Piggy-Cat-bit-shadow/sing-box-for-apple.git (fetch)
+origin	https://github.com/Piggy-Cat-bit-shadow/sing-box-for-apple.git (push)
+checked-out: 6b1e54a92c6d6632fb79eca583a12b7ca000927d
+describe: iphone-hako-ui-freeze-v1-9-g6b1e54a
+recorded gitlink: 5911580a6366da78e6b4b5b4459596e5a2cf1eb4
+status:
+ M scripts/dev/check-iphone-hako-freeze.sh
+?? scripts/dev/test-iphone-hako-freeze.sh
+?? scripts/github-connect-proxy.py
+--- wake wiring present? ---
+ScreenStateObserver.swift: ABSENT
+(no output above = not wired)

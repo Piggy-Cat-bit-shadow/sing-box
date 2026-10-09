@@ -1,0 +1,41 @@
+=== MAIN REPO ===
+pwd: /Users/jie/Desktop/其他文件/sing-box
+origin	https://github.com/Piggy-Cat-bit-shadow/sing-box.git (fetch)
+origin	https://github.com/Piggy-Cat-bit-shadow/sing-box.git (push)
+upstream	https://github.com/SagerNet/sing-box.git (fetch)
+upstream	https://github.com/SagerNet/sing-box.git (push)
+branch: testing
+HEAD: c35faabf402a4da93b8c31cdfad941b8b1528ffc
+origin/testing: c35faabf402a4da93b8c31cdfad941b8b1528ffc
+--- status ---
+ M clients/android
+ M clients/apple
+?? build-screens-doc.py
+?? capture-screens.sh
+?? docs/fork/final-closure-evidence/
+--- diff --stat ---
+ clients/android | 0
+ clients/apple   | 2 +-
+ 2 files changed, 1 insertion(+), 1 deletion(-)
+--- submodules ---
+ fc21909df7a3f0fc9435f3866fb6a4960711aa5f clients/android (v1.3.1-rc.1-448-gfc21909)
++6b1e54a92c6d6632fb79eca583a12b7ca000927d clients/apple (iphone-hako-ui-freeze-v1-9-g6b1e54a)
+ baeb3cbf8332d26b4f7b4c175a01f288ebbf3e7f clients/apple/Frameworks/Runestone (heads/main)
+ 32f915ba595601dbc2dd346c33fe9fedd3e72979 clients/desktop (32f915b)
+ 9c498355c9973187b04c09991e2aca8100fd00ec clients/desktop/dashboard (9c49835)
+ 8c84dd1a859f36ec8601b082bd97b4ec888f0f4d clients/desktop/dashboard/vendor/iterm2-color-schemes (release-20251002-142451-4a5043e-108-g8c84dd1a8)
+--- worktrees ---
+"/Users/jie/Desktop/\345\205\266\344\273\226\346\226\207\344\273\266/sing-box" c35faabf4 [testing]
+--- log ---
+c35faabf4 (HEAD -> testing, origin/testing, origin/HEAD) docs(fork): keep the Apple and Android ABI call-site patches in the repository
+e2d7ac1be docs(fork): record the overnight hardening run
+d017b5bb4 fix(route): establish the initial network environment before Start returns
+4d7b7c169 fix(power,route): give a resume a reuse boundary, and publish the sleep edge
+8fb4083a3 fix(ci): stop the release workflow deleting its own tooling
+8b2b765be test(e2e): drive the real traffic chain end to end
+53464bfc5 ci: make the release gate fail fast, and derive the Apple toolchain from one place
+6b495134c fix(protocol,dns): early-data ownership, SOCKS identity, and network-scoped DNS cache
+e053cc733 perf(sniff): stop TLS sniffing from running a server handshake
+2aa9e9329 deps(sing): pin the fork that publishes the SOCKS lazy reply exactly once
+6927861bf docs(fork): REALITY interop acceptance report and release-candidate ledger
+63942d260 test(masque): make the ownership-scan linearity gate measure the algorithm

@@ -1,7 +1,12 @@
 # Overnight hardening run — consolidated report
 
-Baseline `6927861bf` → **FINAL `d017b5bb4`**, `local == origin/testing`, ordinary pushes only, no
-tag, no Release, no force. Eight commits. The user's four files (`clients/apple`, `clients/android`,
+Baseline `6927861bf` → **stage FINAL `e2d7ac1be`**, `local == origin/testing`, ordinary pushes only,
+no tag, no Release, no force. Eight commits.
+
+> **Version note.** This file originally stamped `d017b5bb4` as FINAL because that was HEAD when it
+> was written; the documentation commits that followed it (`e2d7ac1be`, then the ABI call-site
+> commit) are part of the same stage. `d017b5bb4` is the last *code* commit of the stage, not the
+> stage's final SHA. Corrected here so the record does not disagree with the branch. The user's four files (`clients/apple`, `clients/android`,
 `build-screens-doc.py`, `capture-screens.sh`) are untouched and were never staged, stashed, reset or
 cleaned.
 

@@ -1,0 +1,10 @@
+=== clients/android ===
+recorded gitlink: 8e1c3ff49e38b43b6e317138ea7a4a75eeae78fb
+gitmodules url: https://github.com/Piggy-Cat-bit-shadow/sing-box-for-android.git
+worktree HEAD: fc21909df7a3f0fc9435f3866fb6a4960711aa5f
+worktree status:
+ M app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt
+ M app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+ M app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt
+--- fork branch ---
+Piggy-Cat-bit-shadow/sing-box-for-android fix/libbox-stringbox-callsites = 8e1c3ff49e38b43b6e317138ea7a4a75eeae78fb
