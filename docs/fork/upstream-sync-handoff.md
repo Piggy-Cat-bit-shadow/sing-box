@@ -35,14 +35,14 @@ Three different, real, remote-fetchable coordinates. Immutable for the record �
 ```
 PHASE_A_START=912ed1efad265d8a8f56aaabcabc8f7b171c2baa
 INTEGRATION_FINAL_SHA=ef83b86819c97cbe58b0397dc74af6aca5f1859d
-PHASE_B_START=<pinned by the bookkeeping commit of docs/handoff-reconciliation; see the table below>
+PHASE_B_START=98ea14181ca62f7632791aca12eceef8fbb8b3e3
 ```
 
 | Field | Value | Verified by |
 | --- | --- | --- |
 | `PHASE_A_START` | `912ed1efad265d8a8f56aaabcabc8f7b171c2baa` | ancestor of the integration tip; `git rev-list --count` = 10 |
 | `INTEGRATION_FINAL_SHA` | `ef83b86819c97cbe58b0397dc74af6aca5f1859d` | `git ls-remote origin refs/heads/testing`; `git fetch origin testing`; `git cat-file -t` → `commit` |
-| `PHASE_B_START` | the reconciliation tree tip (the last content commit of `docs/handoff-reconciliation`; its child adds only this coordinate) | `git rev-parse`, `git ls-remote origin refs/heads/handoff-reconciliation` after the push |
+| `PHASE_B_START` | `98ea14181ca62f7632791aca12eceef8fbb8b3e3` — the reconciliation tree tip: the last **content** commit of `docs/handoff-reconciliation`. Its child adds only this coordinate, so both carry the same tree | `git rev-parse`, and after the push `git ls-remote origin refs/heads/handoff-reconciliation` + ancestry against it |
 | `upstream_comparison_head` | `6afeff4c0f7123b5782f888812e96b8c82c7b699` | `git ls-remote upstream refs/heads/testing` |
 | `merge_base` | `7a3d4e4a8e71bd7fa824959efdb57b4f39738802` | `git merge-base origin/testing upstream/testing` |
 | Divergence at reconciliation | fork **1479** ahead, upstream **53** ahead | `git rev-list --left-right --count origin/testing...upstream/testing` |

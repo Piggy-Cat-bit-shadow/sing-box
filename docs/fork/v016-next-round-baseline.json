@@ -4,6 +4,16 @@
   "generated_at_utc": "2026-10-09T12:51:21Z",
   "observed_at_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
   "observed_at_note": "core fork origin/testing at the moment of measurement; nothing in this file is copied from a planning document",
+  "integration_coordinates": {
+    "phase_a_start_sha": "912ed1efad265d8a8f56aaabcabc8f7b171c2baa",
+    "integration_final_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+    "phase_b_start_sha": "98ea14181ca62f7632791aca12eceef8fbb8b3e3",
+    "phase_b_start_branch": "docs/handoff-reconciliation",
+    "upstream_comparison_head": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+    "current_candidate_core_sha": null,
+    "current_candidate_core_sha_note": "not frozen; a release SHA may only be declared in docs/fork/v016-release-candidate-manifest.md",
+    "canonical_source": "docs/fork/upstream-sync-handoff.json - this block is a copy for convenience and the handoff is authoritative"
+  },
   "will_not_claim": [
     "no CI run exists at observed_at_sha or at the phase-A start SHA, so no CI PASS is claimed for either",
     "no artifact exists at observed_at_sha; every recorded digest was produced at 0fbca8546, 18 commits earlier",
