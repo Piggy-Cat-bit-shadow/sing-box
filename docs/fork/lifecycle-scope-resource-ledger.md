@@ -82,3 +82,70 @@ none.
 4. **No lock is held across an external `Close`.** `Scope.Add` runs a late cleanup outside its mutex;
    `releaseRouteSetCallbacks` takes the elements under the inbound's lock and calls
    `UnregisterCallback` outside it (pre-existing, preserved).
+
+## 5. S07 — the completion boundary of `Scope.Close()` (main order §5.3)
+
+Stage A pinned *what* the Scope owns. This section pins *when* the owner is done, because a report
+that says "after `Box.Close()` every in-flight `Start` has terminated" is stronger than the code.
+
+**The exact boundary.** `Scope.Close()` waits for the cleanup drain and for nothing else
+(`adapter/lifecycle.go`, the `scopeClosing` branch on `closeDone` and the drain itself):
+
+- when it returns, every cleanup that was in the queue has run and `closeErr` is final;
+- it does **not** wait for a `component.Start()` that is already running and has not reached `Add()`
+  yet. Nothing bounds how long a `Start` may take, so waiting would make `Close` unbounded;
+- a cleanup registered after that point runs synchronously inside `Add()`, on the registering
+  goroutine — after `Close` returned. That prevents a permanent leak, it does not make the late
+  resource part of the teardown `Close` reported;
+- an error from such a late cleanup is logged by `Add()` and nowhere else. It is not aggregated into
+  the already-returned `closeErr`, and because `closeErr` is final a later `Close` does not pick it
+  up either;
+- a `Start` that was in flight must report failure, not success — `Scope.Start` re-reads the child
+  scope's context after the component returns and returns `E.Cause(ctxErr, ...)`.
+
+Pinned by `adapter/lifecycle_close_boundary_test.go`
+(`TestScopeCloseDoesNotWaitForAnInFlightStart`, `TestScopeCloseDoesNotFoldInALateCleanupError`,
+`TestScopeCloseJoinsAnAlreadyStartedDrain`, `TestScopeCloseDoesNotWaitForAStartThatNeverRegistered`)
+and by the report `S07-scope-close-boundary.md`.
+
+**Registration inventory (219 production `scope.Add` sites).** A cleanup can only deadlock by
+re-entering the *same* Scope's `Close()`. A mechanical scan of every production `scope.Add(...)`
+argument found exactly five registrations that close a `*Scope` at all:
+
+| Registration | Scope it closes | Direction |
+|---|---|---|
+| `protocol/openvpn/dns_transport.go:85` | `t.resolverScope` (`adapter.NewScope` at :132) | parent → nested child |
+| `protocol/openconnect/dns_transport.go:84` | `t.resolverScope` (`adapter.NewScope` at :209) | parent → nested child |
+| `protocol/tailscale/dns_transport.go:99` | `t.resolverScope` (`adapter.NewScope` at :177) | parent → nested child |
+| `service/resolved/transport.go:106` | `servers.serverScope` (`adapter.NewScope` at :268) | parent → nested child |
+| `dns/transport/local/local.go:94` | `serverSet.serverScope` (`adapter.NewScope` at :103 area) | parent → nested child |
+
+Every one of them closes a scope the component created for itself, from a cleanup registered on the
+scope it was *handed*. That is the supported direction the `Scope.Close` comment names, and it is
+what every dynamic sub-scope in the tree does. None of the five closes the scope it was registered
+on, and no production cleanup calls `Close()` on a variable named `scope` at all (the 35
+scope-closing call sites in the tree are all field-qualified: `s.scope` (the Box root, closed by
+`Box.close()`, never registered as a cleanup), `p.scope` (a scope the certificate provider creates
+in its own `Start`, never registered through `scope.Add`), and the nested `resolverScope` /
+`serverScope` / `storeScope` / `serverSet.serverScope` values above). Verdict: **NOT_REACHABLE**.
+
+**Two components that acquire after the drain (S07 §4).**
+
+- `protocol/masque/server.go` — **reachable, fixed.** `StartStateInitialize` registers `s.Close` at
+  the device acquisition, but `StartStateStart` binds the listening socket *later*. A drain that runs
+  while that start is in flight closes a listener that has not been started yet (a no-op), and the
+  bind then opens a port that `Scope.Close()` has already returned over. `common/listener` has no
+  Start-after-Close guard (`Listener.Start` binds unconditionally), unlike the two in-tree devices.
+  Fix: `ServerEndpoint` publishes `closed` under `startAccess` before releasing, and re-checks it
+  after the bind (`acquiredStillOwned`); if the endpoint was closed meanwhile, `Start` releases the
+  socket it just bound itself.
+- `protocol/tun/inbound.go` — **window identified, handoff added.** `StartStateStart` registers both
+  releases at acquisition, but `StartStatePostStart` *activates* them: `tunStack.Start()` and
+  `tunIf.Start()`, and the latter is where `NativeTun.Start` programs the platform routing table.
+  `NativeTun.Start` has no closed check, so an activation that lands after the drain would add routes
+  whose cleanup has already run. A guard that simply held a lock across the activation was rejected:
+  it makes the drain wait for an in-flight `Start`, which is exactly the unbounded wait `Close` must
+  not have. The fix is a non-blocking handoff (`startupGate`): the Scope's cleanup releases the
+  resource directly when no activation is in flight, and otherwise records the decision and leaves
+  the release to the activation, which performs it as soon as the platform call returns. Exactly one
+  release reaches the platform layer (`sync.Once`), and neither side waits for the other.

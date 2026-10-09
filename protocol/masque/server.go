@@ -58,8 +58,14 @@ type ServerEndpoint struct {
 	device         device.Device
 	localAddresses []netip.Prefix
 	started        atomic.Bool
-	closeOnce      sync.Once
-	closeErr       error
+	// startAccess orders the externally visible acquisitions in StartStateStart against the
+	// closeOnce teardown. Close publishes `closed` under it before it releases anything, and Start
+	// reads it under the same lock after it has bound the listener, so a socket that was bound while
+	// Close was running cannot be left without an owner.
+	startAccess sync.Mutex
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEServerEndpointOptions) (adapter.Endpoint, error) {
@@ -183,6 +189,15 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 		if err != nil {
 			return err
 		}
+		// Binds happen after the Scope's teardown is already registered, and Scope.Close does not
+		// wait for a Start that is already running: it runs the cleanup queue and returns, while this
+		// goroutine is still between device.Start and the bind above. The cleanup registered in
+		// StartStateInitialize has therefore already run by the time the listener binds, and the
+		// listener it released was the not-yet-started one, so nothing would ever close this socket.
+		// The device is guarded by its own Start-after-Close contract; common/listener has none.
+		if err = s.acquiredStillOwned(); err != nil {
+			return E.Errors(err, s.listener.Close())
+		}
 		if s.http3 {
 			s.http3Server, err = s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions)
 			if err != nil {
@@ -194,14 +209,41 @@ func (s *ServerEndpoint) Start(stage adapter.StartStage, scope *adapter.Scope) e
 	return nil
 }
 
+// acquiredStillOwned reports whether what a running Start has just acquired still has an owner.
+//
+// `closed` is published under startAccess before Close releases anything, and read under the same
+// lock after the acquisition, so exactly one side owns the resource: either this returns nil, and
+// the release that follows Close's critical section is ordered after the acquisition and therefore
+// sees it, or it returns an error and Start releases what it just acquired on the spot. Neither
+// branch can leave a bound socket behind, and neither waits for anything but the lock.
+func (s *ServerEndpoint) acquiredStillOwned() error {
+	s.startAccess.Lock()
+	closed := s.closed
+	s.startAccess.Unlock()
+	if !closed {
+		return nil
+	}
+	return E.Cause(net.ErrClosed, "endpoint closed while starting")
+}
+
 // Close releases the endpoint's running resources.
 //
 // It is idempotent because two paths can reach it: the Scope owns it, and adapter/endpoint/manager.go
 // closes an endpoint that lost a duplicate-tag race. Releasing the same listener and device twice is
 // not something the underlying objects have to tolerate, so the release is guarded here rather than
 // assumed safe. A concurrent second Close waits for the first and returns its result.
+//
+// Close also has to survive a Scope.Close() that runs while StartStateStart is in flight: the parts
+// of the teardown that Start acquires AFTER that drain - the listener in particular - are released
+// by Start itself, which is why `closed` is published first and re-checked after the bind.
 func (s *ServerEndpoint) Close() error {
 	s.closeOnce.Do(func() {
+		// Publish the decision before releasing anything, under the lock Start re-checks after an
+		// acquisition. A Start that is already running cannot be waited for - nothing bounds it - so
+		// this is what lets it discover that its acquisition has no owner left.
+		s.startAccess.Lock()
+		s.closed = true
+		s.startAccess.Unlock()
 		s.started.Store(false)
 		s.closeErr = common.Close(
 			s.listener,

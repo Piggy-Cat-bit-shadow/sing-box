@@ -86,6 +86,12 @@ type Inbound struct {
 	// dial the surviving box makes.
 	autoRedirectOutputMarkClaimed bool
 	autoRedirectOutputMark        uint32
+	// The two objects StartStatePostStart ACTIVATES are owned through a startupGate, because
+	// Scope.Close does not wait for a Start that is already running: the Scope's release of them can
+	// run while that activation is in flight, and NativeTun.Start programmes the platform routing
+	// table with no closed check of its own.
+	stackStartup     startupGate
+	interfaceStartup startupGate
 }
 
 // autoRedirectMarkReleaser is the release half of the claim protocol, implemented by
@@ -98,6 +104,116 @@ type Inbound struct {
 // as well; one that never grants a claim never needs it, and the assertion is silent.
 type autoRedirectMarkReleaser interface {
 	ReleaseAutoRedirectOutputMark(mark uint32)
+}
+
+// startupGate owns one resource whose activation in StartStatePostStart can run concurrently with
+// the Scope's release of it.
+//
+// The two must not be allowed to interleave, and the Scope must not be made to wait for the Start:
+// nothing bounds how long a component's Start may take, so Close waits only for the cleanup drain it
+// already joined. The handoff therefore goes to whichever side is not already busy - the Scope's
+// cleanup releases the resource directly, or, when an activation is in flight, the activation
+// releases it as soon as the platform call returns. `once` is what makes that exactly-once even when
+// both sides reach for it, which matters because closing an already closed interface fd is not
+// something the platform layer has to tolerate.
+type startupGate struct {
+	access     sync.Mutex
+	closing    bool
+	activating bool
+	once       *sync.Once
+	release    func() error
+	releaseErr error
+}
+
+// acquire arms the gate for one lifecycle: it records what that lifecycle releases and installs a
+// fresh exactly-once guard. A start that failed and was rolled back can be retried on a new Scope
+// with a new interface, and the previous lifecycle's guard would otherwise already be spent.
+func (g *startupGate) acquire(release func() error) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	g.release = release
+	g.once = new(sync.Once)
+	g.releaseErr = nil
+	g.closing = false
+	g.activating = false
+}
+
+// activate starts the owned resource, or refuses when the Scope has already claimed the release.
+func (g *startupGate) activate(start func() error) error {
+	g.access.Lock()
+	if g.closing {
+		// Nothing is activated here: the resource has already been released, and a start that ran
+		// anyway would add routes that no cleanup is left to remove.
+		g.access.Unlock()
+		return E.Cause(os.ErrClosed, "tun inbound is closed")
+	}
+	g.activating = true
+	g.access.Unlock()
+	err := start()
+	g.access.Lock()
+	g.activating = false
+	releaseNow := g.closing
+	g.access.Unlock()
+	if !releaseNow {
+		return err
+	}
+	// The Scope ran this resource's cleanup while the activation was in flight; it left the release
+	// here rather than closing an object that was being started. The activation is reported as
+	// failed: it ran, but the owner that would have kept it is gone.
+	return E.Errors(
+		E.Cause(os.ErrClosed, "tun inbound is closed while starting"),
+		err,
+		g.releaseOnce(),
+	)
+}
+
+// bind records what this gate releases, if nothing has recorded it yet.
+//
+// StartStateStart binds each gate at the acquisition. Inbound.Close can be reached before that - the
+// duplicate-tag loser in adapter/inbound/manager.go, or a caller that assembled the inbound around
+// an already-started stack - and it must still release whatever the fields hold.
+func (g *startupGate) bind(release func() error) {
+	g.access.Lock()
+	defer g.access.Unlock()
+	if g.release == nil {
+		g.release = release
+	}
+	if g.once == nil {
+		g.once = new(sync.Once)
+	}
+}
+
+// releaseByScope is the cleanup handed to the Scope, and the path Inbound.Close uses.
+//
+// It never waits for an in-flight activation: it records the decision and, if the activation owns
+// the release, returns without releasing anything. The resource is then released by
+// [startupGate.activate] the moment its platform call returns, so the exposure is bounded by that
+// call alone.
+func (g *startupGate) releaseByScope() error {
+	g.access.Lock()
+	g.closing = true
+	if g.activating {
+		g.access.Unlock()
+		return nil
+	}
+	g.access.Unlock()
+	return g.releaseOnce()
+}
+
+// releaseOnce performs the release at most once across every path that can reach it.
+func (g *startupGate) releaseOnce() error {
+	g.access.Lock()
+	once := g.once
+	release := g.release
+	g.access.Unlock()
+	if once == nil || release == nil {
+		// Nothing was ever registered on this gate: Inbound.Close can be reached before Start.
+		return nil
+	}
+	once.Do(func() { g.releaseErr = release() })
+	g.access.Lock()
+	defer g.access.Unlock()
+	return g.releaseErr
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -531,7 +647,8 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if err != nil {
 			return E.Cause(err, "configure tun interface")
 		}
-		scope.Add(tunInterface.Close)
+		t.interfaceStartup.acquire(tunInterface.Close)
+		scope.Add(t.interfaceStartup.releaseByScope)
 		t.logger.Trace("creating stack")
 		t.tunIf = tunInterface
 		if t.platformInterface != nil {
@@ -568,19 +685,20 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if err != nil {
 			return err
 		}
-		scope.Add(tunStack.Close)
+		t.stackStartup.acquire(tunStack.Close)
+		scope.Add(t.stackStartup.releaseByScope)
 		t.tunStack = tunStack
 		t.logger.Info("started at ", t.tunOptions.Name)
 	case adapter.StartStatePostStart:
 		monitor := taskmonitor.New(t.logger, C.StartTimeout)
 		monitor.Start("starting tun stack")
-		err := t.tunStack.Start()
+		err := t.stackStartup.activate(t.tunStack.Start)
 		monitor.Finish()
 		if err != nil {
 			return E.Cause(err, "starting tun stack")
 		}
 		monitor.Start("starting tun interface")
-		err = t.tunIf.Start()
+		err = t.interfaceStartup.activate(t.tunIf.Start)
 		monitor.Finish()
 		if err != nil {
 			return E.Cause(err, "starting TUN interface")
@@ -647,10 +765,21 @@ func (t *Inbound) Close() error {
 	// Releasing first also means the rule-set can never fire between the teardown and the release.
 	t.releaseRouteSets()
 
-	closeErr := common.Close(
-		t.tunStack,
-		t.tunIf,
-		t.autoRedirect,
+	// The two activated objects go through their startupGate: this path can also be reached while
+	// StartStatePostStart is activating them (the duplicate-tag loser in adapter/inbound/manager.go
+	// closes an inbound whose start is in flight), and the gate is what keeps the release
+	// exactly-once and stops a late activation from re-arming what this is releasing. A caller that
+	// assembled the inbound around an already-started stack binds the gates here instead of in Start.
+	if t.tunIf != nil {
+		t.interfaceStartup.bind(t.tunIf.Close)
+	}
+	if t.tunStack != nil {
+		t.stackStartup.bind(t.tunStack.Close)
+	}
+	closeErr := E.Errors(
+		t.stackStartup.releaseByScope(),
+		t.interfaceStartup.releaseByScope(),
+		common.Close(t.autoRedirect),
 	)
 	// Hand the auto-redirect output mark back LAST, after the redirect that needed it is stopped.
 	//
