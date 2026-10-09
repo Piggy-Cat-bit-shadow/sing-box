@@ -83,21 +83,25 @@ them shows a multi-second stall that the same row shows without the sleep.
 
 Check this before interpreting anything else, because it changes what the other readings mean.
 
-- Evidence in-tree: `CommandServer.Wake()` lifts the pause only for Android
-  (`experimental/libbox/command_server.go`), and the pinned Apple client
-  (`clients/apple` @ `ddf444e`, branch `ipad-upstream-ui`) never calls `wakeNow()`. The screen-state
-  observer that did call it exists only on the client's `dev` branch (`f8ad6d0`,
-  `Library/Network/ScreenStateObserver.swift`), while `clients/apple/docs/HAKO-OWNERSHIP.md` lists it
-  as owned.
-- Observe: after the first screen-off, does a health check / URLTest / provider refresh ever run
-  again while the phone is being used? If the answer is never, the device pause is latched.
-- Consequence: speculative work stays off for the life of the process, and the DEEP_IDLE pool release
-  fires again every time real traffic lifts the state to QUIESCENT and two minutes pass - "close the
-  pool while the phone is in use", which is the behaviour the power work set out to remove.
-- Fix belongs in the Apple client: restore the twelve-line display-status observer (record the screen
-  fact and call `wakeNow()`), or report the screen fact through `PlatformEvents.SetScreenOn`. Then
-  re-check that a health check runs after an unlock and that the app does not sleep the device's
-  speculative work permanently.
+CLOSED in the core; the client half is now a patch in this repository.
+
+- The core maps every Apple fact onto the two axes in `box_lifecycle.go`, and
+  `experimental/libbox/command_server.go` routes `RecordScreenState`/`RecordLockState` into it on iOS.
+  Locking and a display going off pause the axis and start a sleep measurement; a display turning on
+  and a resume publish the reuse edge only; an UNLOCK is the one fact that lifts the pause.
+- The client half is `docs/fork/apple-screen-state-observer.patch`: the screen-state observer that
+  exists on the same repository's `dev` branch and is absent from the pinned iOS revision, ported
+  verbatim except for one deviation (the display-on `wakeNow()` call, which this fork's mapping
+  replaces with the unlock fact). See `docs/fork/apple-screen-state-observer.md`.
+- Observe: after the first screen-off, does a health check / URLTest / provider refresh run again
+  while the phone is being used? If the answer is never, the level is still latched - which now means
+  the client patch is not applied, not that the core has no publisher.
+- Before the fix the consequence was: speculative work stays off for the life of the process, and the
+  DEEP_IDLE pool release fires again every time real traffic lifts the state to QUIESCENT and two
+  minutes pass - "close the pool while the phone is in use", which is the behaviour the power work set
+  out to remove. The deterministic tests for the fixed behaviour are listed in
+  `docs/fork/post-wake-reuse.md` under "The Apple device axis, and the draining capability"; what
+  still needs a device is whether iOS delivers the two Darwin notifications at all.
 
 ## 6. Device-only items that stay device-only
 

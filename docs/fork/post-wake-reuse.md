@@ -53,13 +53,39 @@ an untested assumption.
 
 A hard reset stays reserved for a real network transition.
 
-## The three lifecycles
+## The four kinds of reusable state, and who owns each
 
-| lifecycle | examples | what a resume may do to it |
+The action a boundary may take is decided by what a resource IS, not by which protocol it belongs to,
+so the classification comes first and the owners are then listed against it.
+
+| state | how it is identified | what a resume boundary may do |
 |---|---|---|
-| **active flow** | a TCP stream with bytes in flight, a call, an upload, a hotspot client | nothing. It keeps its connection. Every keeper closes only what has no active user. |
-| **idle reusable connection** | an HTTP/2 pool entry with no request, a mux session whose last stream ended, a QUIC session with `streams == 0`, a DNS transport's parked socket | retired once the policy says the sleep was long enough. The next demand dials a fresh path; nothing dials on its own. |
-| **network-bound transport** | WireGuard, MASQUE, OpenVPN, OpenConnect, the Tailscale endpoint, the Cronet engine | untouched by the reuse boundary. These are tunnels, not pools: their keep-idle method suspends the tunnel itself, and their liveness belongs to their own protocol (the WireGuard rebind nudge, MASQUE's keepalive). |
+| **active flow** | a stream/request with bytes in flight: a call, an upload, a hotspot client, a response body mid-read | nothing. It keeps its connection, on every path. |
+| **active session** | a multiplexed connection that has work on it but may also be handed MORE work: a mux session with a live stream, an XHTTP pooled connection with `openUsage > 0` | refuse NEW work on it, keep the work already on it, tear it down when the last stream leaves. This is `adapter.ReuseSuspect`, and it exists because an open stream is not proof of liveness - it can be open and silent across a sleep. |
+| **idle reusable resource** | a pooled connection or session with no user at all: an HTTP pool entry with no in-flight request, a mux session whose last stream ended, a QUIC session with `streams == 0`, a DNS transport's parked socket, an XHTTP connection with `openUsage == 0` | retired, once the policy says the sleep was long enough. The next demand dials a fresh path; nothing dials on its own. |
+| **network-bound transport** | WireGuard, MASQUE, OpenVPN, OpenConnect, the Tailscale endpoint, the Cronet engine | untouched by the reuse boundary, and not reachable from it. These are tunnels, not pools: their keep-idle method suspends the tunnel itself, which is a much larger action than dropping a socket, and resuming one would be a dial with no demand behind it. Their liveness belongs to their own protocol (the WireGuard rebind nudge, MASQUE's keepalive). |
+
+The owners, as they exist in the tree. Every one of these was read rather than assumed, and the
+"boundary action" column is what the reference manager's walk actually calls on it:
+
+| owner | what it holds | boundary action |
+|---|---|---|
+| `common/httpclient.Manager` | every pooled transport behind provider refresh, remote rule sets, the dashboard and the API: `http1Transport`, `http2Transport`, `http2FallbackTransport`, `http3Transport`, `http3FallbackTransport`, and `appleTransport` (URLSession) | idle-only release per transport (`Manager.CloseIdleConnections`). The Apple one retires the old `NSURLSession` and installs a new one, so an in-flight request finishes on the session it started on. |
+| `transport/v2rayxhttp` (XMUX) | one pooled HTTP connection per session | `RetireSuspect`: idle connections closed, busy ones refused new streams and torn down on the last release. Also `CloseIdleConnections` for the trim. |
+| `protocol/vless` | the transport above, plus the optional `sing-mux` dialer | forwards `RetireSuspect` to a transport that has it; forwards `CloseIdleConnections` to both. |
+| `transport/v2raygrpclite`, `v2rayhttp`, `v2rayquic` | their own connection pools | idle-only release. They have no session that mixes active and new work, so the idle release is the whole answer. |
+| `dns/transport` (`tcp`, `tls`, `https`, `quic`, `udp`, `multiplexer`) | parked sockets and QUIC sessions | idle-only release, plus `SetKeepIdleConnections` for eligibility. |
+| `protocol/anytls`, `hysteria`, `hysteria2`, `tuic`, `trojan`, `vmess`, `shadowsocks`, `snell`, `ssh` | their protocol sessions | idle-only release. |
+| `protocol/tailscale` | the tailcat node | idle-only release, which waits for the goroutine it cancels - under its own lock and with no lock of the walk held. |
+| `sing-mux` (dependency) | sessions, each with a stream count | idle-only release. It has no no-new-stream state, so a session with a live stream still takes new streams: **KNOWN LIMITATION**, see the residual risks. |
+| `protocol/naive` (Cronet) | Chromium's socket pool, not this tree's | none available. `CloseAllConnections` is all-or-nothing and is reserved for a real network change. **KNOWN LIMITATION**, see the residual risks. |
+| the on-demand endpoints: `protocol/wireguard`, `masque`, `openvpn`, `openconnect`, `tailscale/endpoint.go` | the tunnel itself | `SetKeepIdleConnections` only, reached from the eligibility pass (the device level) and not from the boundary walk. They implement no `CloseIdleConnections`, so the boundary cannot suspend or resume them. |
+
+`Box.CloseIdleConnections` and the DEEP_IDLE transition both use the idle-only walk
+(`ReferenceManager.retireIdleResources`); the resume boundary uses the stronger walk
+(`retireSuspectResources`), which applies the idle release AND the drain. The trim path deliberately
+never drains: a memory pass that made the next request dial a different connection would be a
+reconnect trigger.
 
 ## The two epochs, and why they are not one
 
@@ -90,47 +116,69 @@ On iOS the platform resumes the extension for every push and background task whi
 still locked, so a resume must not release health checks, probes or provider refreshes. It does
 however prove that time passed, which is all the reuse epoch needs.
 
+The four Apple facts that carry those two axes, and the one asymmetry in the mapping - a display
+turning on publishes the edge and NOT the level, while an unlock publishes both - are in
+`box_lifecycle.go`, which is also where the reasoning for it lives.
+`docs/fork/apple-screen-state-observer.md` covers the client half: the patch that reports the two
+facts, and what it deliberately does not do.
+
 ## The pause/wake chain, with the file each step lives in
 
 ```
 NEPacketTunnelProvider.sleep()            clients/apple/Library/Network/ExtensionProvider.swift
   -> commandServer.pause()                experimental/libbox/command_server.go  Pause()
-     -> Box.DeviceSlept()                 box.go                                (the reuse EDGE)
+     -> Box.DeviceSlept()                 box.go -> box_lifecycle.go  slept()
         -> Governor.SleepStarted()        common/power/governor.go              (records the instant)
-     -> PauseManager.DevicePause()        github.com/sagernet/sing/service/pause
-        -> pause.EventDevicePaused
-           -> applyPauseEvent             box.go
-              -> Governor.SleepStarted()  (idempotent: the same sleep is not measured twice)
-              -> Governor.DevicePaused()  (the LEVEL: QUIESCENT, DeepIdle timer armed)
-           -> ReferenceManager callback   route/reference.go Start()
-              -> SetKeepIdleConnections(false) on on-demand endpoints only
+        -> PauseManager.DevicePause()     github.com/sagernet/sing/service/pause (the LEVEL)
+           -> pause.EventDevicePaused
+              -> applyPauseEvent          box.go
+                 -> Governor.SleepStarted()  (idempotent: the same sleep is not measured twice)
+                 -> Governor.DevicePaused()  (the LEVEL: QUIESCENT, DeepIdle timer armed)
+              -> ReferenceManager callback   route/reference.go Start()
+                 -> SetKeepIdleConnections(false) on on-demand endpoints only
 
 NEPacketTunnelProvider.wake()             clients/apple/Library/Network/ExtensionProvider.swift
   -> commandServer.wake()                 experimental/libbox/command_server.go  Wake()
-     -> Box.DeviceResumed()               box.go                                (the reuse EDGE)
-        -> Governor.Resumed()             common/power/governor.go
+     -> Box.DeviceResumed()               box.go -> box_lifecycle.go  resumed()
+        -> Governor.Resumed()             common/power/governor.go   (the EDGE and nothing else)
            -> measures the sleep on the WALL clock
            -> advances the reuse epoch and publishes the verdict
-              -> ReferenceManager.onReuseBoundary  route/reference.go
-                 -> retireIdleResources()           route/reference.go
-                    -> CloseIdleConnections() on every keeper reachable from the
-                       outbound manager and the DNS transport manager
+              -> ReferenceManager.onReuseBoundary   route/reference.go
+                 -> retireSuspectResources()          route/reference.go
+                    -> adapter.ReuseSuspect.RetireSuspect() where a pool has it
+                       (transport/v2rayxhttp: refuse new streams, keep live ones)
+                    -> CloseIdleConnections() on every other keeper reachable from the
+                       outbound manager, the DNS transports and the HTTP client service
 
-commandServer.wakeNow()                   (the screen-state observer on the client's dev branch,
-                                           and every Android wake)
-  -> PauseManager.DeviceWake() -> pause.EventDeviceWake
-     -> applyPauseEvent -> Governor.Resumed() + Governor.DeviceWake()
+displayStatus / lockstate                 Library/Network/ScreenStateObserver.swift (client patch)
+  -> commandServer.recordScreenState(on)  experimental/libbox/command_server.go
+     -> Box.ScreenStateChanged(on)        box.go -> box_lifecycle.go  screenState()
+        off -> slept()   (edge + level, as above)
+        on  -> resumed() (the EDGE only: a push notification lights the lock screen)
+  -> commandServer.recordLockState(locked)
+     -> Box.LockStateChanged(locked)      box.go -> box_lifecycle.go  lockState()
+        locked   -> slept()              (edge + level)
+        unlocked -> woke()               (the EDGE, then the LEVEL: the only release)
+
+commandServer.wakeNow()                   the dedicated host event (Android's Doze exit, an
+                                          explicit user-present fact, an embedder)
+  -> Box.DeviceWoke() -> box_lifecycle.go  woke()
+     -> Governor.Resumed() then PauseManager.DeviceWake()
+        -> pause.EventDeviceWake -> applyPauseEvent -> Governor.Resumed (no-op) + DeviceWake
 ```
 
-Two properties of that chain are load-bearing and were both missing before this change:
+Three properties of that chain are load-bearing, and all three were missing before this work:
 
-1. **The level is latched and the edge is not.** On the shipped Apple client nothing lifts the
-   device pause, so `PauseManager.DevicePause()` is a no-op after the first sleep. A governor driven
-   by the level would measure the first sleep of the process and trust every later one; that is why
-   `SleepStarted`/`Resumed` exist as edges and why `Pause()` publishes the edge directly.
-2. **The verdict is published before the release.** `applyPauseEvent` publishes the reuse edge and
-   then the level, so a pool that predates the sleep has already been retired when speculative work
-   is released.
+1. **The level is latched and the edge is not.** On Apple nothing but an unlock lifts the device
+   pause, so `PauseManager.DevicePause()` is a no-op after the first sleep. A governor driven by the
+   level would measure the first sleep of the process and trust every later one; that is why
+   `SleepStarted`/`Resumed` exist as edges, and why every Apple fact publishes one.
+2. **The verdict is published before the release.** `woke` publishes the reuse edge and then moves the
+   level, so a pool that predates the sleep has already been retired when the speculative work it
+   releases starts to dial.
+3. **A display turning on is not an unlock, and an unlock is not a resume.** The two are separate facts
+   with separate consequences; collapsing them either runs URLTests for a pocketed phone or leaves the
+   tunnel without liveness for the life of the process.
 
 ## The policy
 
@@ -196,24 +244,43 @@ callback thread - so the locking has to be stated rather than assumed.
 
 ## Residual risks, stated rather than assumed away
 
-1. **A multiplexed session with a live stream still accepts new streams.** sing-mux and the XHTTP
-   XMUX pool both expose only `CloseIdleConnections` and `Close`; neither has a draining or
-   no-new-stream state, and forking the module is out of scope for this work. So a session that
-   carries an active stream survives the boundary - it must, or the stream would lose its transport -
-   and a new stream may still be multiplexed onto it. The case that was reported and reproduced (an
-   idle session handed to the first flow after a wake) is closed. Both facts are pinned by tests, so
-   a future draining API cannot be adopted silently: `TestASessionWithALiveStreamStillAcceptsNewStreams_KnownLimitation`.
-2. **The Cronet engine cannot participate.** `protocol/naive` drives a Cronet engine whose only
-   connection operation is `CloseAllConnections`, which tears down in-flight requests as well. Using
-   it at a resume would break an active flow, so naive is deliberately not a keeper. A fix needs an
-   idle-only API from `cronet-go`, which the pinned module does not expose.
-3. **The HTTP client service pools are not retired at a resume.** `common/httpclient.Manager` exposes
-   `ResetNetwork` (the reset-shaped pass, reached from a real transition) and each transport has
-   `CloseIdleConnections`, but the manager is not reachable from the reference walk. These pools serve
-   provider refresh, the dashboard, remote rule sets and the like - speculative work that is staggered
-   after a wake anyway - so the gap is latency rather than correctness. Closing it needs one method on
-   `adapter.HTTPClientManager`.
-4. **macOS never enters the device axis.** `CommandServer.Pause` returns for anything that is not
+1. **A multiplexed session is DRAINED, not closed.** This was the first residual risk and it is now
+   closed where it can be. `adapter.ReuseSuspect` is the capability "no new work on what you hold now,
+   while the work already on you finishes"; the reference manager's boundary walk calls it in addition
+   to the idle release, and `transport/v2rayxhttp` implements it: a pooled XHTTP connection that
+   predates the boundary is refused new streams, keeps the streams already on it, and is torn down
+   when the last one leaves. An open stream is deliberately not treated as proof that the path
+   survived - it can be open and silent across a sleep - which is why draining rather than reuse is
+   the boundary's answer. The limits of the claim are exact: `sing-mux` is an external module with no
+   no-new-stream state (below), and a stream that was handed a connection in the window between the
+   boundary and the drain is unaffected, because killing it is the thing this must never do.
+2. **The sing-mux pool cannot drain.** `github.com/sagernet/sing-mux` (root `go.mod`) exposes
+   `SetKeepIdleConnections` and `CloseIdleConnections`; the latter releases only sessions whose
+   stream count is zero (`client.go`, `releaseStream` keeps a session while `streams > 0`), and
+   `selectSession` hands out any session still in the list. There is no no-new-stream state and no
+   hook that would let this tree express one from outside, so a mux session carrying a live stream can
+   still take a new stream. Closing it instead would break the live stream, and forking the module for
+   one method is out of scope for this work. Recorded as a KNOWN LIMITATION with the code path above.
+3. **The Cronet engine cannot participate.** `protocol/naive` drives a Cronet engine whose only
+   connection operation is `CloseAllConnections` (`cronet-go`, `engine_cgo.go`), which tears down
+   in-flight requests as well; `InterfaceUpdated` already uses it for a real network change, which is
+   the action it is correct for. There is no idle-only or no-new-stream API in the pinned module, the
+   isolation key that selects Chromium's pool is written per request from the configured concurrency
+   and is not mutable after construction, and this tree has no pool of its own to drain - the naive
+   outbound is one CONNECT per flow. So naive is deliberately not a keeper: the only two actions
+   available are "retire everything including live requests" (forbidden) and "do nothing" (what
+   happens today, and the safe one). A fix needs an idle-only API from `cronet-go`.
+4. **The HTTP client service pools now participate.** This was the third residual risk and it is
+   closed: `common/httpclient.Manager.CloseIdleConnections` releases the idle connections of every
+   transport it owns without replacing any of them (that distinction is what separates it from
+   `ResetNetwork`, and it is pinned by a test), and the reference manager's walk reaches the manager
+   through `adapter.HTTPClientManager`. The pools behind provider refresh, remote rule sets, the
+   dashboard and the API are therefore retired at a boundary, and the gap is latency no longer.
+5. **A client that reports no lock fact keeps its pause.** The core releases the device level on an
+   unlock and on an explicit host event only; it does not guess. See
+   `docs/fork/apple-screen-state-observer.md` for the patch, the public-API fallback if the Darwin
+   notifications ever stop being posted, and the reasoning for not using a timer.
+6. **macOS never enters the device axis.** `CommandServer.Pause` returns for anything that is not
    Android or iOS, so a Mac that sleeps has no pause and therefore no reuse boundary. The mechanism
    here is platform-agnostic; what is missing is a Darwin client that reports the sleep and a wake
    that lifts it.
@@ -266,30 +333,47 @@ real middle of the path:
 | hotspot | screen off | Wi-Fi/cellular | forwarding does not stop because a pool was cleared |
 | cold start after first sleep | — | — | health checks, provider refresh and statistics resume (see the device-axis note below) |
 
-### 4. Known device-axis item: nothing lifts the device pause on the shipped iOS client
+### 4. The device axis: the latch is closed in the core, and the client patch is in this repository
 
-Evidence, all in-tree:
+The device axis used to be a latch: the pause manager's device axis is a LEVEL, `Wake()` never moved
+it on iOS (correctly - a resume is not a wake), and the only method that lifted it (`wakeNow()`) had
+no caller in the pinned client. That is fixed on both sides now, and the two halves are separate
+concerns:
 
-- `experimental/libbox/command_server.go`: `Wake()` lifts the pause only for Android; for every other
-  platform it publishes the reuse edge and returns.
-- The Apple client pinned by this repository (`clients/apple` at `ddf444e`, branch `ipad-upstream-ui`)
-  has no caller of `wakeNow()`. The screen-state observer that used to call it exists only on the
-  client's `dev` branch (commit `f8ad6d0`, `Library/Network/ScreenStateObserver.swift`), and
-  `clients/apple/docs/HAKO-OWNERSHIP.md` still lists it as owned.
+- **The core** owns the mapping from every Apple fact to the two axes, in `box_lifecycle.go`. A
+  display turning off and a device locking pause the axis and start a sleep measurement; a display
+  turning on and a resume publish the reuse edge and move NOTHING else; an UNLOCK is the one fact that
+  lifts the pause. `experimental/libbox/command_server.go` routes `RecordScreenState` and
+  `RecordLockState` into it on iOS, so the facts the client already reports are sufficient and the
+  client decides nothing.
+- **The client** needs one file to report those facts at all. `ScreenStateObserver.swift` exists on
+  the same repository's `dev` branch and is absent from the pinned iOS revision, so the patch that
+  ports it is `docs/fork/apple-screen-state-observer.patch`, together with the install sites and the
+  one deliberate deviation from the `dev` copy: see `docs/fork/apple-screen-state-observer.md`.
 
-Consequence: `PauseManager.DevicePause()` is entered once and never left, so
-`Governor.State()` stays QUIESCENT and then DEEP_IDLE for the life of the process. Speculative work
-(health checks, URLTest, provider refresh, statistics) never resumes, and the DEEP_IDLE pool release
-can fire again every time real traffic lifts the state back to QUIESCENT and the deadline expires -
-which is "close the pool every two minutes while the phone is being used", the behaviour the power
-work set out to remove.
+Why a display turning on must NOT be treated as an unlock is the point of the whole discrimination:
+on iOS a push notification lights the lock screen, so a display-on that released the pause would run
+health checks, URLTests and provider refreshes for a phone in a pocket - §3.3's wake storm - while an
+unlock that did not release it would leave the tunnel without liveness for the rest of the process's
+life. There is no timer that can tell those two apart, and none is used: a platform that reports no
+unlock fact keeps its pause, and that is stated as a limitation rather than papered over.
 
-The reuse fix does not depend on this (it is edge-driven, which is the point of `SleepStarted`), but
-the two interact: on this client the pause is a latch, and the pool release is then driven by
-traffic gaps rather than by sleep. The client-side fix is the twelve-line observer from `f8ad6d0`
-(display-on -> `recordScreenState(true)` + `wakeNow()`), and it belongs in the Apple client, which
-this work stream does not own. Validate it by observing `power: device wake`-shaped log lines and by
-checking that a health check runs after an unlock.
+What is still a device item: whether iOS delivers those two Darwin notifications on a given build,
+and what the user-visible effect is. See the runbook entry below.
+
+### 5. Device validation for the device axis
+
+Observable at a real unlock, and none of it can be established without a device:
+
+- the client logs neither of the two notification names, so the check is on the core's own line:
+  `reuse: epoch N, sleep <duration>, retiring idle connections of N reusable pool(s)` must appear once
+  per unlock after a long lock, and the `sleep` must be the real screen-off duration.
+- a health check must run after an unlock and must NOT run at a push that only lit the lock screen.
+  The control for the second half is a phone left locked with notifications arriving: no
+  `reuse:` line and no maintenance while the display keeps coming back on.
+- the level itself: `Governor.State()` must leave QUIESCENT after an unlock, which is observable as
+  remote rule sets updating again and as the statistics cache being written again - both were
+  permanently suppressed by the latch, and both are silent failures rather than errors.
 
 ## Tests that pin this
 
@@ -306,3 +390,28 @@ checking that a health check runs after an unlock.
 | a live flow is not killed by the boundary | `route.TestReuseBoundaryRetiresIdlePoolsAndPreservesLiveStreams`, `v2rayxhttp.TestWakeRetireKeepsALiveStreamAndItsConnection` |
 | a boundary with no demand dials nothing | `route.TestAShortSleepDoesNotTouchThePool`, `v2rayxhttp.TestWakeRetireWithNoDemandOpensNothing` |
 | Close wins, and a late boundary is a no-op | `route.TestAClosedManagerIgnoresALateBoundary`, `common/power.TestCloseMakesResumeAResurrectionSafeNoOp` |
+
+### The Apple device axis, and the draining capability
+
+| claim | test |
+|---|---|
+| a sleep/resume pair is one boundary, and the level is held | `box.TestASleepAndResumePairIsOneBoundaryAndTheLevelIsHeld` |
+| a display-on publishes the edge and does NOT release the level; an unlock does | `box.TestTheDeviceAxisIsReleasedByAnUnlockAndNotByADisplayTurningOn` |
+| one sleep is one measurement and one level transition, however many facts report it | `box.TestOneSleepProducesOneLevelTransitionHoweverManyFactsReportIt` |
+| every cycle is paired, over a hundred of them | `box.TestEverySleepCycleIsPairedAcrossOneHundredCycles` |
+| the bands are the policy's, and an unknown sleep is the strict verdict | `box.TestTheBridgeUsesThePolicyBandsAndNothingElse` |
+| a fact with no sleep on record publishes nothing | `box.TestAFactWithoutASleepPublishesNothing` |
+| Close wins over a late Apple fact | `box.TestCloseWinsOverALateAppleFact` |
+| the bridge is safe under concurrent facts | `box.TestTheBridgeIsSafeUnderConcurrentFacts` |
+| a hundred cycles leak nothing and leave no boundary unpaired | `box.TestOneHundredSleepWakeCyclesLeakNothingAndLeaveNoBoundaryUnpaired` |
+| a hundred network transitions neither publish nor consume a device boundary | `box.TestOneHundredNetworkTransitionsDoNotConsumeOrPublishADeviceBoundary` |
+| no resurrection after Close, under facts and under load | `box.TestNoResurrectionAfterClose`, `box.TestTheBridgeUnderConcurrentLifecyclesAndTeardown` |
+| the walk asks a drainable pool for the stronger action | `route.TestTheBoundaryDrainsAPoolThatCanRefuseNewWork` |
+| a pool that cannot drain still gets the idle release | `route.TestTheBoundaryStillRetiresAPoolThatCannotDrain` |
+| the HTTP client service is reachable by every pass | `route.TestTheBoundaryReachesTheHTTPClientService` |
+| the suspect band drains nothing | `route.TestTheSuspectBandDrainsNothing` |
+| a drained session keeps its stream and refuses new ones | `v2rayxhttp.TestRetireSuspectDrainsABusyConnectionAndKeepsItsStream` |
+| a trim is still not a reconnect trigger | `v2rayxhttp.TestATrimStillLeavesABusyConnectionPooled` |
+| the transport's capability reaches the pool | `v2rayxhttp.TestTheAdapterCapabilitiesReachThePool` |
+| the manager's idle release does not replace a transport | `httpclient.TestCloseIdleConnectionsRetiresEveryManagedTransportWithoutReplacingIt` |
+| every Apple fact maps to the right axis | `box_lifecycle.go` (the table in the file header), pinned by the four tests above |

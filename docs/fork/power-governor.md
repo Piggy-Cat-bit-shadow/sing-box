@@ -17,14 +17,25 @@ ACTIVE ──pause──▶ QUIESCENT ──no traffic for DeepIdleAfter──�
    └──── wake ──── WAKING ◀──────────── real traffic ─────────────┘
 ```
 
-It is driven from the platform's own lifecycle, already present before this work:
+It is driven from the platform's own lifecycle through the bridge in `box_lifecycle.go`, which maps
+each Apple fact onto the governor's two axes:
 
 ```
-NEPacketTunnelProvider.sleep() -> commandServer.pause() -> PauseManager.DevicePause()
-NEPacketTunnelProvider.wake()  -> commandServer.wake()  -> PauseManager.DeviceWake()
-                                     ↓ applyPauseEvent
+NEPacketTunnelProvider.sleep() -> commandServer.pause() -> Box.DeviceSlept()
+     edge: Governor.SleepStarted()      level: PauseManager.DevicePause()
+displayStatus off / lockstate locked     the same two calls
+NEPacketTunnelProvider.wake()  -> commandServer.wake() -> Box.DeviceResumed()
+     edge only: a resume is not a wake, and a push lights the lock screen
+displayStatus on                          the edge only, for the same reason
+lockstate unlocked            -> commandServer.recordLockState(false) -> Box.DeviceWoke()
+     edge, then level: the one platform fact that means a person is using the device
+                                     ↓ PauseManager events → applyPauseEvent
                                   Governor
 ```
+
+The level and the edge are separate facts and the table is the whole policy: a resume and a display
+turning on publish the reuse verdict and move nothing else, and only an unlock releases speculative
+work. `docs/fork/apple-screen-state-observer.md` is the client half.
 
 ## The decisions worth knowing
 
