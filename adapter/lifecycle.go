@@ -219,9 +219,40 @@ func (s *Scope) Close() error {
 	s.closeDone = make(chan struct{})
 	done := s.closeDone
 	s.access.Unlock()
-	var err error
+	// Expand each cleanup's result before judging it.
+	//
+	// A single cleanup can return an aggregate. Judging that aggregate as a unit would discard a
+	// real failure merely because a closed or cancelled error travelled with it, which is the one
+	// way a filter this narrow is able to hide a fault.
+	var (
+		cleanupErrors []error
+		err           error
+	)
 	for _, cleanup := range slices.Backward(cleanups) {
-		err = E.Errors(err, cleanup())
+		cleanupErrors = append(cleanupErrors, E.Expand(cleanup())...)
+	}
+	for _, cleanupErr := range cleanupErrors {
+		if cleanupErr == nil {
+			continue
+		}
+		// Scope.Close is a DECLARED close context. A resource that is already gone, or one whose
+		// context was cancelled, reports the expected outcome of closing rather than a failure of
+		// it; aggregating those into the result makes an orderly shutdown look like a fault, which
+		// is the same rule this project applies elsewhere - a local cancellation is not a remote
+		// failure.
+		//
+		// The filter is narrow and local on purpose. The same errors on a business I/O path are not
+		// harmless, and nothing outside this function filters them.
+		if E.IsClosed(cleanupErr) || E.IsCanceled(cleanupErr) {
+			// Removing an error from the RESULT is a decision about what the caller can act on, not
+			// a reason to lose the observation: the record of what the close saw is what makes a
+			// double release or an unexpected cancellation visible at all.
+			if s.logger != nil {
+				s.logger.Debug("cleanup observed during close: ", cleanupErr)
+			}
+			continue
+		}
+		err = E.Errors(err, cleanupErr)
 	}
 	s.access.Lock()
 	s.closeErr = err
