@@ -139,6 +139,40 @@ type IdleConnectionKeeper interface {
 	CloseIdleConnections()
 }
 
+// ReuseSuspect is implemented by a reusable pool that can refuse NEW work on the resources it holds
+// now while the work already on them finishes.
+//
+// # Why this is not a method on IdleConnectionKeeper
+//
+// The two answer different questions, and the difference is real rather than a matter of taste, so a
+// pool is allowed to implement either without the other:
+//
+//   - CloseIdleConnections is the TRIM action: drop what nobody is using. It must not be able to
+//     make the next demand dial a different connection, or a memory pass becomes a reconnect
+//     trigger, which is the shape the lifecycle model forbids.
+//   - RetireSuspect is the REUSE BOUNDARY action. A resource that predates the last sleep is no
+//     longer trusted, so new work must not be multiplexed onto it - and work already on it must not
+//     be disturbed either, because the boundary exists to stop new stalls, not to break running
+//     transfers.
+//
+// For an ordinary HTTP pool the two coincide, and its CloseIdleConnections is already the boundary
+// action. The case that separates them is a MULTIPLEXED session with a stream still open on it. The
+// pool cannot close that session - the stream would lose its transport - and it must not keep handing
+// it new streams, because an open stream is not proof that the path survived the sleep: a stream can
+// be open and silent across one (a paused response body, a UDP-over-TCP session between packets), so
+// the session is unverified whatever its stream count says. Draining is the only action that is
+// neither of those two wrong things. See transport/v2rayxhttp for the implementation.
+//
+// A pool that does not implement this is not thereby broken: the reference manager's boundary walk
+// falls back to CloseIdleConnections for it, which is what every pool did before this interface
+// existed.
+type ReuseSuspect interface {
+	// RetireSuspect refuses new work on every resource the pool holds at the call, and closes the
+	// ones that are carrying nothing. A resource still carrying work keeps it and is torn down when
+	// that work finishes. It must not dial and must not terminate work in progress.
+	RetireSuspect()
+}
+
 type Referrer interface {
 	References() []string
 }

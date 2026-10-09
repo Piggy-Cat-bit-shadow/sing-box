@@ -60,6 +60,17 @@ type xmuxClient struct {
 	consecFails atomic.Int32
 	failing     atomic.Bool
 
+	// draining marks a connection that must not carry any NEW stream. It is set
+	// by RetireSuspect, which is the reuse-boundary action: a connection that
+	// existed before a sleep is no longer trusted, so new work must dial a fresh
+	// path, while a stream already on it keeps its transport until it finishes.
+	//
+	// It is a separate flag from closed (the pool no longer holds it) and from
+	// failing (the breaker retired it), because the reason shows up in the
+	// eviction log and because a draining connection is deliberately still
+	// reachable by the stream that is on it.
+	draining atomic.Bool
+
 	closed bool
 	access sync.Mutex
 }
@@ -382,6 +393,69 @@ func (m *xmuxManager) Close() {
 	}
 }
 
+// RetireSuspect is the reuse-boundary action: no pooled connection may carry a NEW stream, and a
+// connection that is carrying nothing is closed now.
+//
+// # Why this is not CloseIdleConnections
+//
+// CloseIdleConnections is the trim, and it is deliberately unable to make the next stream dial a
+// different connection - that is what keeps a memory pass from becoming a reconnect trigger. This is
+// the opposite trade and it is correct at exactly one place: the sleep boundary, where a connection
+// that predates the sleep is no longer trusted, and adding a new stream to it is what produces the
+// reported stall when the middle of the path forgot it.
+//
+// # Why the busy connections are drained rather than closed
+//
+// A connection with streams on it cannot be closed - those streams would lose their transport, and
+// the boundary exists to prevent stalls, not to cause them. It must not be left in the pool either,
+// because an OPEN stream is not evidence that the path survived: a stream can be open and silent
+// across a sleep (a paused response body, a packet-up session between packets), and the sleep is
+// exactly the interval in which a NAT mapping or a server-side idle timer can expire. Draining is
+// the only action that is neither wrong: the pool stops handing the connection out, the streams on
+// it finish on the connection they started on, and the teardown happens when the last one leaves.
+//
+// # Why the removal happens here rather than on the next lookup
+//
+// The mechanism is the pool's own: the clients are detached from the list and `close()` is called on
+// each, which is what Close (the reset-shaped call) already does - the teardown is deferred by
+// openUsage, so a busy connection survives its streams. Detaching under m.access is what makes the
+// refusal atomic with respect to get(): an earlier version only marked the clients and left them in
+// the list for the next lookup to evict, which left a window in which a concurrent get() held the
+// lock, saw no reason to evict, and handed a pre-boundary connection to a stream the boundary had
+// just refused it. The draining flag is kept as the record of WHY, and evictCause still reports it,
+// so a client that ever found its way back into the list could not be handed out again.
+//
+// Nothing here dials, and nothing here waits.
+//
+// # The first stream after a boundary
+//
+// It dials a fresh connection, and that is the requirement. Note the interaction with the breaker's
+// backoff (SPEC 076): if the pool is emptied by a boundary while the new-transport backoff window is
+// armed - which is the state a path that was dying as the device slept can leave - the fresh dial
+// waits out the remainder of the window, bounded by xmuxBackoffCap. That is deliberate: the window
+// exists to damp a dial storm, a boundary is not a reason to bypass it, and the wait is bounded at
+// three seconds.
+func (m *xmuxManager) RetireSuspect() {
+	m.access.Lock()
+	clients := m.clients
+	m.clients = nil
+	idle := 0
+	draining := 0
+	for _, client := range clients {
+		if client.getOpenUsage() == 0 {
+			idle++
+			continue
+		}
+		client.draining.Store(true)
+		draining++
+	}
+	m.access.Unlock()
+	for _, client := range clients {
+		client.close()
+	}
+	m.logf("xmux: reuse boundary, closed %d idle connection(s) and draining %d busy one(s)", idle, draining)
+}
+
 // newClientLocked opens a connection and rolls its per-connection limits. Each
 // range is rolled ONCE, here — not per request.
 //
@@ -414,6 +488,13 @@ func (c *xmuxClient) evictCause() string {
 	switch {
 	case c.conn.IsClosed():
 		return "closed"
+	// lx: REUSE BOUNDARY — the connection predates the last sleep and must not
+	// carry new streams. Eviction here is the DRAIN: the pool stops handing it
+	// out, and close() defers the teardown until the last stream on it leaves,
+	// so the stream in flight loses nothing. Checked before the breaker and the
+	// configured limits so that a boundary is reported as what it is.
+	case c.draining.Load():
+		return "draining"
 	// lx: SPEC 076 — the breaker tripped on this connection: it failed
 	// xmuxBreakerThreshold streams in a row and must not carry new ones.
 	case c.failing.Load():

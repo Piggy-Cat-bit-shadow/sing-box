@@ -191,7 +191,7 @@ func (m *reuseTestNetworkManager) DefaultOptions() adapter.NetworkOptions {
 //
 // Nothing here dials: the only path under test is the one a resume boundary takes, and the fakes make
 // every step of it observable.
-func newReuseTestManager(t *testing.T, outboundKeeper, dnsKeeper *reuseTestKeeper) (*ReferenceManager, *power.Governor) {
+func newReuseTestManager(t *testing.T, outboundKeeper, dnsKeeper *reuseTestKeeper, decorate ...func(context.Context) context.Context) (*ReferenceManager, *power.Governor) {
 	t.Helper()
 	governor := power.NewGovernor(power.DefaultPolicy())
 	ctx := service.ContextWith[*power.Governor](context.Background(), governor)
@@ -209,6 +209,13 @@ func newReuseTestManager(t *testing.T, outboundKeeper, dnsKeeper *reuseTestKeepe
 	ctx = service.ContextWith[adapter.ServiceManager](ctx, &reuseTestServiceManager{})
 	ctx = service.ContextWith[adapter.DNSTransportManager](ctx, transportManager)
 	ctx = service.ContextWith[adapter.NetworkManager](ctx, &reuseTestNetworkManager{})
+	// The optional decorators exist for the fourth owner of reusable state - the HTTP client service -
+	// which is neither an outbound, an endpoint nor a DNS transport and therefore needs its own
+	// registration. A caller that does not register one leaves the walk's step for it inert, which is
+	// also what a build with no http clients configured looks like.
+	for _, apply := range decorate {
+		ctx = apply(ctx)
+	}
 	logger := log.NewNOPFactory().NewLogger("reference")
 	manager := NewReferenceManager(ctx, logger, option.Options{})
 	scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())

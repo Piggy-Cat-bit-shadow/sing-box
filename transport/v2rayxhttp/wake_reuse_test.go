@@ -6,17 +6,18 @@ import (
 	"testing"
 )
 
-// The wake boundary reaches this pool as one call - CloseIdleConnections - and these tests pin what
-// that call must do to a pool of real connections, because it is the operation the post-wake policy
-// is built on:
+// The reuse boundary reaches this pool as two calls - RetireSuspect (the boundary action, see
+// wake_drain_test.go) and CloseIdleConnections (the trim action) - and this file pins the idle half
+// of both, because it is the half the post-wake policy was originally built on:
 //
 //	a stale pooled connection is not handed to the next stream,
 //	a stream that is still running keeps its connection,
 //	and a boundary with no demand behind it opens nothing.
 //
-// The idle-only half is already covered by trim_test.go (a trim and a wake retire are the same
-// operation on this pool, deliberately: both release what has no user and neither may dial). What is
-// added here is the freshness consequence, which is what a post-wake stall is made of.
+// An idle connection is treated identically by the two calls, deliberately: both release what has no
+// user and neither may dial. What they do NOT treat identically is a connection that still carries a
+// stream - the trim leaves it pooled and usable, the boundary refuses it new work - and that
+// difference is asserted in wake_drain_test.go rather than here.
 
 // TestWakeRetireHandsTheNextStreamAFreshConnection is the defect this work exists for, in miniature:
 // a connection that was pooled before the sleep must not carry the first stream after it.
@@ -103,8 +104,9 @@ func TestWakeRetireKeepsALiveStreamAndItsConnection(t *testing.T) {
 	}
 
 	// The stream finishes on its own schedule, and the connection is then simply pooled again: the
-	// boundary did not arm a teardown for it, because it was never idle. Whether the next stream may
-	// use it is the residual risk pinned by the limitation test below.
+	// trim did not arm a teardown for it, because it was never idle. Whether the next stream may use it
+	// is the trim's own contract - it may, and it must not be able to do anything else - while the
+	// boundary's answer to the same question is asserted in wake_drain_test.go.
 	busy.addOpenUsage(-1)
 	if got := busy.getOpenUsage(); got != 0 {
 		t.Fatalf("openUsage = %d after the stream ended, want 0", got)
@@ -117,13 +119,16 @@ func TestWakeRetireKeepsALiveStreamAndItsConnection(t *testing.T) {
 // TestASessionWithALiveStreamStillAcceptsNewStreams_KnownLimitation pins the residual risk the fix
 // cannot remove, so that it is visible rather than assumed away.
 //
-// A connection carrying a live stream is not idle, so the boundary leaves it pooled - it must, or the
-// live stream would lose its transport. This pool has no draining or no-new-stream operation to offer
-// (the module exposes CloseIdleConnections and Close, and Close is the reset-shaped one), so a new
-// stream can still be placed on a connection that predates the sleep. What the fix guarantees is the
-// case that was reported: a connection with nothing running on it is retired before it can carry the
-// first flow after a wake. When this pool grows a draining state this test must be rewritten, and the
-// boundary should use it.
+// The residual risk is on the TRIM path, and it is a deliberate part of the trim's contract rather
+// than a defect: CloseIdleConnections must not be able to make the next request dial, so a connection
+// carrying a live stream stays pooled and may still be picked up by the next stream. That is exactly
+// the trade the trim is supposed to make.
+//
+// The BOUNDARY no longer has this limitation. It calls RetireSuspect, which marks a busy connection as
+// refusing new work and tears it down when its last stream leaves; see wake_drain_test.go. This test
+// is kept, with its assertions unchanged, because it is what proves the two entry points stayed
+// distinct - if a future change made CloseIdleConnections drain as well, the trim would have become a
+// reconnect trigger and this test would fail.
 func TestASessionWithALiveStreamStillAcceptsNewStreams_KnownLimitation(t *testing.T) {
 	t.Parallel()
 	manager, conns := poolOf(t, xmuxConfig{maxConcurrency: intRange{4, 4}})

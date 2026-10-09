@@ -32,6 +32,7 @@ var (
 	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
 	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
 	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+	_ adapter.ReuseSuspect            = (*Outbound)(nil)
 )
 
 type Outbound struct {
@@ -188,6 +189,36 @@ func (h *Outbound) CloseIdleConnections() {
 	}
 	if h.multiplexDialer != nil {
 		h.multiplexDialer.CloseIdleConnections()
+	}
+}
+
+// RetireSuspect forwards the reuse boundary to a transport that can refuse new work on the
+// connections it already holds, and does nothing for one that cannot.
+//
+// # Why the outbound carries this and the boundary walk does not reach the transport
+//
+// The walk sees outbounds, endpoints, DNS transports and the HTTP client service, so an outbound that
+// wants its transport's pool to participate has to forward. This is the same shape CloseIdleConnections
+// already has, and for the same reason: the VLESS outbound owns the transport, and which transport it
+// is - XHTTP, gRPC, HTTP, WebSocket - is a configuration detail the walk must not have to know.
+//
+// # Why the no-op for other transports is correct rather than a silent downgrade
+//
+// The walk applies BOTH actions and applies the idle one unconditionally, so an outbound whose
+// transport cannot drain still has its idle connections retired at the boundary - exactly the
+// behaviour it had before this method existed. What it does not get is the stronger action, because
+// the transport cannot express it; the transport modules that can are the ones with a session pool
+// (see transport/v2rayxhttp) and the ones that cannot are the ones whose CloseIdleConnections is
+// already the whole story.
+//
+// The multiplex dialer is deliberately not forwarded to. Its pool is `sing-mux`, an external module
+// with no no-new-stream state: the only operations it offers are CloseIdleConnections (streams == 0
+// only) and Close, and the second would break live streams. Forwarding a no-op would claim a
+// capability that does not exist; see docs/fork/post-wake-reuse.md for the recorded limitation.
+func (h *Outbound) RetireSuspect() {
+	transportDrainer, isTransportDrainer := h.transport.(adapter.ReuseSuspect)
+	if isTransportDrainer {
+		transportDrainer.RetireSuspect()
 	}
 }
 

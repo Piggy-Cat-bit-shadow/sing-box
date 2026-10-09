@@ -306,8 +306,23 @@ func (c *Client) Close() error {
 // lifecycle: the VLESS outbound forwards the call, the reference manager forwards that, and the
 // memory-trim pass ends here. A network change does NOT come through this - it calls Close and
 // retires everything.
+//
+// This is the TRIM action and it is deliberately weaker than RetireSuspect: it must not be able to
+// make the next stream dial a different connection, because a memory pass that did would be a
+// reconnect trigger. The reuse boundary uses RetireSuspect.
 func (c *Client) CloseIdleConnections() {
 	c.xmux.CloseIdleConnections()
+}
+
+// RetireSuspect refuses new streams on every pooled connection, closing the ones that carry nothing.
+//
+// It implements adapter.ReuseSuspect, which is the one capability a pool can have that an idle-only
+// release cannot express, and it is reached only by the reuse boundary: the VLESS outbound forwards
+// it, and the reference manager calls it instead of CloseIdleConnections for the pools that have it.
+// See xmuxManager.RetireSuspect for why a connection with a live stream is drained rather than closed
+// and why that is the only action that is neither wrong nor a stall.
+func (c *Client) RetireSuspect() {
+	c.xmux.RetireSuspect()
 }
 
 // SetKeepIdleConnections honours the idle policy.

@@ -164,6 +164,41 @@ func (m *Manager) ResetNetwork() {
 	}
 }
 
+// CloseIdleConnections retires the idle connections of every transport this manager owns.
+//
+// # Why the manager needs this, and why it is not ResetNetwork
+//
+// These pools serve provider refresh, remote rule sets, dashboard and API traffic - work that is
+// speculative and that an idle-only release cannot harm. They were the one reusable resource the
+// reference manager's walk could not reach, so a resume boundary retired every pool except these,
+// and the first provider refresh after an unlock could be handed a connection that had been dead
+// since the device went to sleep. The gap was latency rather than correctness, because those fetches
+// are staggered after a wake anyway, but it was a real gap and the only thing it needed was a method
+// here: the walk decides WHEN, this decides WHAT, and every transport already knows how to drop a
+// connection that has no request on it.
+//
+// The distinction from ResetNetwork is the same one ManagedTransport.CloseIdleConnections documents
+// at length: a reset swaps the inner transport out, which is right for a network change - the old
+// transport belongs to the network being left - and wrong for a resume, where the network is
+// unchanged and replacing the transport would discard verdicts that are still true and race a live
+// stream on the old epoch. So this walks the managed transports, not the shared refs: the ref count
+// answers "is a CONSUMER holding this", which is the trim's question, while the question here is "is
+// a REQUEST on this connection", and the transport's own CloseIdleConnections is the only thing that
+// can answer it. `sharedRef.CloseIdleConnections` deliberately does not appear here for that reason.
+//
+// Each managed transport is idle-only by its own contract, and the walk holds no lock while calling
+// them: `CloseIdleConnections` on a transport that is mid-`Reset` from a network transition sees a
+// nil epoch and returns, which is the same no-op the memory pass already relies on.
+func (m *Manager) CloseIdleConnections() {
+	m.access.Lock()
+	transports := make([]*ManagedTransport, len(m.managedTransports))
+	copy(transports, m.managedTransports)
+	m.access.Unlock()
+	for _, transport := range transports {
+		transport.CloseIdleConnections()
+	}
+}
+
 func (m *Manager) close() error {
 	m.access.Lock()
 	defer m.access.Unlock()

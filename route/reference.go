@@ -154,22 +154,25 @@ func (m *ReferenceManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 // onReuseBoundary is the core's only reaction to a resume boundary, and it is deliberately the
 // narrowest one that satisfies the requirement.
 //
-// What it does: retires IDLE reusable resources, so the next demand dials a path that is known to be
-// new rather than one that merely looks alive. What it does NOT do, and must not be changed to do:
+// What it does: refuses new work on the reusable resources that predate the sleep, and retires the
+// ones that are carrying nothing, so the next demand dials a path that is known to be new rather than
+// one that merely looks alive. What it does NOT do, and must not be changed to do:
 //
 //   - it does not reset the network. A reset is reserved for a real network transition, which is a
 //     different epoch with a different mechanism (common/runtimecoord); doing it here would kill
 //     every active flow, dial everything at once and make the sleep boundary a reconnect storm.
-//   - it does not terminate an active stream. Every keeper it reaches only closes resources with no
-//     active user traffic: an HTTP/2 pool closes connections with no in-flight request, a mux session
-//     closes only when its last stream has gone, a QUIC transport closes only when its stream count
-//     is zero, and an in-flight response body holds its epoch open that way by design.
+//   - it does not terminate an active stream. A pool that can express "no new work on this, let the
+//     work already on it finish" is asked for exactly that (adapter.ReuseSuspect, and today the XHTTP
+//     XMUX pool is the one that can). Every other keeper only closes resources with no active user
+//     traffic: an HTTP/2 pool closes connections with no in-flight request, a QUIC transport closes
+//     only when its stream count is zero, and an in-flight response body holds its epoch open that
+//     way by design.
 //   - it does not touch the on-demand tunnels. WireGuard, MASQUE, OpenVPN, OpenConnect and the
 //     Tailscale endpoint implement SetKeepIdleConnections - a suspend/resume of the tunnel itself,
 //     which is not idle-only - and not CloseIdleConnections, so they are not reachable from this walk
 //     and are not woken by it. Resuming them here would be a dial with no demand behind it.
-//   - it does not dial. Retiring an idle pool cannot start a connection; the next demand does, and
-//     that demand was going to dial anyway.
+//   - it does not dial. Refusing new work and retiring an idle pool cannot start a connection; the
+//     next demand does, and that demand was going to dial anyway.
 //
 // The suspect band retires nothing by policy: it advances the epoch so the distrust is visible and
 // monotonic, and leaves the pool alone because a mid-length sleep usually survives and churning it
@@ -180,7 +183,7 @@ func (m *ReferenceManager) onReuseBoundary(boundary power.ReuseBoundary) {
 	}
 	switch boundary.Action {
 	case power.ReuseRetire:
-		retired := m.retireIdleResources()
+		retired := m.retireSuspectResources()
 		if m.logger != nil {
 			m.logger.Debug("reuse: epoch ", boundary.Epoch, ", sleep ", boundary.Sleep,
 				", retiring idle connections of ", retired, " reusable pool(s); active flows untouched")
@@ -428,6 +431,12 @@ func (m *ReferenceManager) CloseIdleConnections() {
 // implement SetKeepIdleConnections, which suspends the tunnel - a different and much larger action),
 // so the walk is inert for them, and a future endpoint that does implement it is covered without
 // another review of this file.
+//
+// The HTTP client manager is walked the same way and for the same reason. It owns the fourth set of
+// reusable resources - the pooled connections behind provider refresh, remote rule sets, the
+// dashboard and the API - and it was the one pool this walk could not reach; see the comment at the
+// step itself. It is not an endpoint or a transport, which is why it needs its own assertion rather
+// than a place in one of the three lists above.
 func (m *ReferenceManager) retireIdleResources() int {
 	retired := 0
 	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
@@ -459,6 +468,77 @@ func (m *ReferenceManager) retireIdleResources() int {
 				retired++
 			}
 		}
+	}
+	// The HTTP client service is the fourth owner of reusable state, and it is reached by an
+	// interface assertion rather than by an interface method because it is not an outbound, an
+	// endpoint or a DNS transport: it is the pool behind provider refresh, remote rule sets, the
+	// dashboard and the API. It was the one pool this walk could not reach, so a boundary retired
+	// everything except it - see Manager.CloseIdleConnections for why its idle-only pass is the
+	// right action and why it is not ResetNetwork.
+	httpClientManager := service.FromContext[adapter.HTTPClientManager](m.ctx)
+	if httpClientManager != nil {
+		keeper, isKeeper := httpClientManager.(adapter.IdleConnectionKeeper)
+		if isKeeper {
+			keeper.CloseIdleConnections()
+			retired++
+		}
+	}
+	return retired
+}
+
+// retireSuspectResources is the reuse boundary's walk, and it differs from retireIdleResources in
+// exactly one way: a pool that can express "no NEW work on the resources you hold now, while the work
+// already on them finishes" is asked for that AS WELL AS being asked to drop what is idle.
+//
+// Both actions are applied, and the drain goes first. That order is not cosmetic: draining is what
+// stops a new stream from attaching to a session nobody trusts, so it has to be the first thing that
+// happens at the boundary; the idle release that follows is then the pool's own answer for whatever
+// was not drained. A pool that implements only the idle half - which is every pool except the XHTTP
+// XMUX session pool today - gets exactly the behaviour it had before this walk existed, which is why
+// this ordering removes nothing.
+//
+// The distinction between the two actions is not cosmetic either. A multiplexed session with a stream
+// still open is the case the idle-only action gets wrong in both directions: it cannot be closed (the
+// stream loses its transport) and it must not be left in the pool (an open stream is not proof the
+// path survived the sleep - it can be open and silent), so the only correct action is to stop adding
+// new work to it and let it drain. adapter.ReuseSuspect is that capability.
+func (m *ReferenceManager) retireSuspectResources() int {
+	retired := 0
+	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
+	if outboundManager != nil {
+		for _, outbound := range outboundManager.Outbounds() {
+			retired = m.retireSuspectTarget(retired, outbound)
+		}
+	}
+	endpointManager := service.FromContext[adapter.EndpointManager](m.ctx)
+	if endpointManager != nil {
+		for _, endpoint := range endpointManager.Endpoints() {
+			retired = m.retireSuspectTarget(retired, endpoint)
+		}
+	}
+	transportManager := service.FromContext[adapter.DNSTransportManager](m.ctx)
+	if transportManager != nil {
+		for _, transport := range transportManager.Transports() {
+			retired = m.retireSuspectTarget(retired, transport)
+		}
+	}
+	httpClientManager := service.FromContext[adapter.HTTPClientManager](m.ctx)
+	if httpClientManager != nil {
+		retired = m.retireSuspectTarget(retired, httpClientManager)
+	}
+	return retired
+}
+
+// retireSuspectTarget applies the strongest action a reusable owner can express: refuse new work on
+// what it holds, drop what is idle, and report whether it owns anything reusable at all.
+func (m *ReferenceManager) retireSuspectTarget(retired int, target any) int {
+	if drainer, isDrainer := target.(adapter.ReuseSuspect); isDrainer {
+		drainer.RetireSuspect()
+	}
+	keeper, isKeeper := target.(adapter.IdleConnectionKeeper)
+	if isKeeper {
+		keeper.CloseIdleConnections()
+		retired++
 	}
 	return retired
 }
