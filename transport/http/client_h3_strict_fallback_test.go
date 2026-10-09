@@ -1,3 +1,10 @@
+//go:build with_quic
+
+// Gated on with_quic because it drives the HTTP/3 client's strict-fallback path and shares the
+// package's with_quic-gated test doubles (stubConn lives in stream_error_test.go). Without the
+// constraint the untagged test build failed with `undefined: stubConn`, which made
+// `go vet ./...` and `go test ./...` red in the configuration a reader gets by default. Its
+// coverage is unchanged in every product profile: with_quic is in all of them.
 package http
 
 import (

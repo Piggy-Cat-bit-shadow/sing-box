@@ -1,4 +1,25 @@
+//go:build with_quic
+
 package quic
+
+// Every file in this package is gated on with_quic, and this one was the outlier: it carried no
+// constraint while h3_error_class.go and all three test files did, so a build without the tag
+// compiled THIS file and then failed on the helpers the tagged files define:
+//
+//	protocol/naive/quic/inbound_init.go:203:12: undefined: newNaiveH3ServerLogger
+//	protocol/naive/quic/inbound_init.go:221:23: undefined: classifyNaiveH3Error
+//	protocol/naive/quic/inbound_init.go:231:20: undefined: normalizeNaiveStreamError
+//
+// The constraint is not a workaround for that; it is what the package already was. Its ONLY
+// importer is the blank import in include/quic.go (`//go:build with_quic`), which exists for this
+// file's side effect: init installs naive.ConfigureHTTP3ListenerFunc. The untagged product
+// deliberately leaves that function nil and protocol/naive/inbound.go turns a nil into
+// C.ErrQUICNotIncluded with the "rebuild with -tags with_quic" hint, which is the canonical
+// error every other QUIC-dependent path produces.
+//
+// So there is no unsupported implementation to write here: without the tag the package has no
+// files, `go build ./...` matches no package in this directory, and the untagged naive inbound
+// keeps its existing, explicit HTTP/3-unavailable semantics.
 
 import (
 	"context"

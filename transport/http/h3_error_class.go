@@ -1,6 +1,36 @@
-//go:build with_quic
-
 package http
+
+// This file deliberately carries NO build constraint.
+//
+// # Why the HTTP/3 error classifier is compiled in every build
+//
+// It used to be gated on with_quic, which made three separate packages fail to COMPILE without
+// the tag:
+//
+//	transport/http/client.go:239:33: undefined: http3LifecycleTracer
+//	transport/http/stream_error.go:170:5: undefined: classifyH3ErrorCode
+//	transport/http/stream_error.go:170:34: undefined: h3ErrorExpected
+//	transport/masque/server.go:617:19: undefined: transportHTTP.CarriesQuicSemantics
+//	transport/masque/server.go:618:24: undefined: transportHTTP.IsExpectedH3Closure
+//
+// None of those callers is optional:
+//
+//   - stream_error.go normalizes errors on the stream boundary of the HTTP/2 server and the
+//     HTTP/2 tunnel as well (server_h2.go wraps its connections in normalizingConn), so it cannot
+//     be gated without removing error normalization from builds that have no QUIC;
+//   - transport/masque compiles and is TESTED without the tag: its capsule, route-matching, DNS
+//     and IPv6-extension tests are untagged, and they call IsExpectedH3Closure and the
+//     owned-datagram helpers directly.
+//
+// The classifier has no QUIC runtime dependency: it reads quic-go's concrete types and the
+// http3.ErrCode constants, and both packages are ordinary importable modules in every build.
+// classifyH3ErrorCode is a pure switch over constants. So "none" is the honest constraint for
+// the table and for the classification built on it, while the *use* of HTTP/3 - the transports,
+// listeners and dialers - stays gated on with_quic elsewhere in this package.
+//
+// Keeping ONE table is the point: the client normalizer, the server classifier and the MASQUE
+// session error path must not be able to drift apart, which a second copy under !with_quic would
+// guarantee.
 
 import (
 	"context"
@@ -11,19 +41,6 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	E "github.com/sagernet/sing/common/exceptions"
-)
-
-// h3ErrorClass separates expected HTTP/3 and QUIC lifecycle events from real
-// faults. Only errors that are unambiguously part of normal operation are
-// downgraded to debug; everything unrecognised stays an error.
-type h3ErrorClass int
-
-const (
-	// h3ErrorExpected is a normal shutdown, cancellation or peer-initiated
-	// close that needs no operator attention.
-	h3ErrorExpected h3ErrorClass = iota
-	// h3ErrorUnexpected is anything that may indicate a real fault.
-	h3ErrorUnexpected
 )
 
 // classifyH3Error inspects an error using quic-go's concrete types and error
@@ -110,6 +127,19 @@ func classifyH3Error(err error) h3ErrorClass {
 	}
 	return h3ErrorUnexpected
 }
+
+// h3ErrorClass separates expected HTTP/3 and QUIC lifecycle events from real
+// faults. Only errors that are unambiguously part of normal operation are
+// downgraded to debug; everything unrecognised stays an error.
+type h3ErrorClass int
+
+const (
+	// h3ErrorExpected is a normal shutdown, cancellation or peer-initiated
+	// close that needs no operator attention.
+	h3ErrorExpected h3ErrorClass = iota
+	// h3ErrorUnexpected is anything that may indicate a real fault.
+	h3ErrorUnexpected
+)
 
 // classifyH3ErrorCode maps an HTTP/3 error code to a class.
 func classifyH3ErrorCode(code http3.ErrCode) h3ErrorClass {

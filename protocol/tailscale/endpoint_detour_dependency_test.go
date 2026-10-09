@@ -1,3 +1,9 @@
+//go:build with_tailscale
+
+// Gated on with_tailscale because the endpoint it constructs, NewEndpoint, only exists in that
+// configuration (protocol/tailscale/endpoint.go is with_tailscale). Every product profile sets
+// the tag, so this only removes a build that could not have compiled anyway: without the
+// constraint the untagged test build failed with `undefined: NewEndpoint`.
 package tailscale
 
 import (

@@ -10,9 +10,23 @@
 # DNS-transport, service and certificate-provider registry that upstream ships for
 # servers. Capabilities upstream adds are inherited automatically.
 #
-# The single deviation from upstream's tag file is the removal of
-# `with_clash_api`, which no longer names any file: the Clash API was deleted from
-# this fork as a control-plane decision (see docs/FORK-DIFF.md), not as a size cut.
+# There is NO deviation from that tag file: this script reads it verbatim, as the
+# `tags="$(cat "$tags_file")"` below shows, and appends nothing. A previous version of this
+# comment claimed the single deviation was "the removal of with_clash_api, which no longer
+# names any file: the Clash API was deleted from this fork as a control-plane decision". All
+# three parts of that were false at the time it was written and are false now:
+#
+#   * with_clash_api is IN release/DEFAULT_BUILD_TAGS_OTHERS and is passed through;
+#   * it names include/clashapi.go (`//go:build with_clash_api`), which blank-imports
+#     experimental/clashapi, and include/clashapi_stub.go is its negation;
+#   * the Clash API is upstream's and enabled in both profiles - see the "Clash API" row of
+#     docs/FORK-DIFF.md - and experimental/clashapi is one of the packages the compile-time
+#     `go list -deps` audit in the Linux workflow requires to be in this binary's graph.
+#
+# A comment that describes a capability as removed while the build enables it is worse than no
+# comment: it is the kind of statement a later change is "verified" against. The capability is
+# gated at runtime as well as at compile time - scripts/ci/verify-full-capabilities.sh builds a
+# config with experimental.clash_api and the workflow starts the binary and speaks HTTP to it.
 #
 # # Why the version is injected here
 #

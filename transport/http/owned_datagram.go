@@ -1,6 +1,26 @@
-//go:build with_quic
-
 package http
+
+// This file deliberately carries NO build constraint.
+//
+// # Why the owned-datagram adapter is compiled in every build
+//
+// It used to be gated on with_quic, and transport/masque - which is NOT gated, and whose capsule,
+// route-matching and ownership tests are untagged - failed to compile without the tag:
+//
+//	transport/masque/session.go:88:31: undefined: transportHTTP.OwnedDatagramSender
+//	transport/masque/session.go:116:34: undefined: transportHTTP.AsOwnedDatagramSender
+//
+// Nothing here needs QUIC at build time. The file is two optional capability INTERFACES over
+// sing-box's own *buf.Buffer, plus the adapter that lets a *buf.Buffer satisfy the HTTP/3
+// ownership interface; the only external type it names is http3.OwnedDatagramPayload, which is an
+// ordinary exported type of an ordinary module dependency that compiles in every build.
+//
+// What the absence of QUIC changes is whether a stream that implements the HTTP/3 half can ever
+// exist - not whether the interfaces can be declared. That is why the capability is expressed as
+// an OPTIONAL interface that callers type-assert for, and AsOwnedDatagramSender returns nil for a
+// stream that does not implement either half. A build without QUIC therefore gets the copying
+// path, which is the same behaviour as a QUIC build talking to a peer that cannot do zero-copy
+// datagrams - and that path is tested untagged.
 
 import (
 	"github.com/sagernet/sing/common/buf"

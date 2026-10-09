@@ -1,3 +1,10 @@
+//go:build with_utls
+
+// Gated on with_utls because it builds a RealityClientConfig, which only exists in that
+// configuration (common/tls/reality_client.go is with_utls). It was the only reality test file
+// in this package without the constraint - reality_handshake_test.go, reality_key_share_test.go,
+// reality_short_id_test.go and utls_client_test.go all have it - so the untagged test build
+// failed with `undefined: RealityClientConfig`.
 package tls
 
 import (

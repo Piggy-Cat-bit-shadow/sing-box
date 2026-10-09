@@ -497,6 +497,15 @@ jobs:
             "github.com/sagernet/sing-box/protocol/shadowsocks"
             "github.com/sagernet/sing-box/protocol/naive"
             "github.com/sagernet/sing-box/transport/http"
+            # XHTTP, and it is listed as the transport package rather than as the package that
+            # imports it. include/v2rayxhttp.go is the blank import that pulls it in, but a
+            # blank-import file is not what "the capability is compiled in" means here: the
+            # package whose init() registers the constructor is transport/v2rayxhttp, and it is
+            # absent from this graph when the tag is. The runtime half of the same claim is the
+            # vless-xhttp capability cases in scripts/ci/verify-full-capabilities.sh, which
+            # resolve a real config through the registry; a package in the graph proves what was
+            # COMPILED, that proves what the binary ACCEPTS.
+            "github.com/sagernet/sing-box/transport/v2rayxhttp"
           )
           for pkg in "${required[@]}"; do
             if grep -qxF "$pkg" /tmp/deps.txt; then

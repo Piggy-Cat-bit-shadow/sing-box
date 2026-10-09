@@ -221,12 +221,8 @@ func (c *http3ClientImpl) traceLifecycle(ctx context.Context, message string, ge
 	c.lifecycleLogger.TraceContext(ctx, append([]any{message}, fields...)...)
 }
 
-// http3LifecycleTracer is implemented by HTTP/3 clients that accept a logger for lifecycle
-// tracing. It is optional so that a client built by a test, or by a build without QUIC, does not
-// have to provide one.
-type http3LifecycleTracer interface {
-	SetLifecycleLogger(logger.ContextLogger)
-}
+// http3LifecycleTracer lives in client_h3_tracer.go, WITHOUT a build constraint: the untagged
+// constructor in client.go asserts against it.
 
 // SetLifecycleLogger installs the logger used for TRACE-level connection-lifecycle events.
 func (c *http3ClientImpl) SetLifecycleLogger(lifecycleLogger logger.ContextLogger) {

@@ -125,6 +125,48 @@ for spec in \
   check_config "$name" "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"},$body]}"
 done
 
+# ---------------------------------------------------------------------------
+# VLESS transports that have their own build tag.
+#
+# # Why this is a separate section
+#
+# with_xhttp is in every product tag file and its constructor is registered from an init()
+# in transport/v2rayxhttp, reached through a blank import in include/v2rayxhttp.go. Three
+# separate things have to hold for the capability to exist in a shipped binary, and only the
+# last one of them is what an operator experiences:
+#
+#   1. the tag is in the tag file            - checked by
+#                                              cmd/internal/build_libbox's profile tag tests
+#   2. the package is in the program          - checked by the `go list -deps` audit in the
+#                                              Linux workflow
+#   3. the registry ACCEPTS an xhttp config   - checked here, and nowhere else
+#
+# A capability that disappears silently is indistinguishable from one that was never
+# claimed, so the case below is deliberately a real vless outbound with a real
+# `transport: {"type": "xhttp"}`. Built without with_xhttp the same configuration fails with
+# the registry's own error rather than being quietly ignored:
+#
+#   unknown transport type: xhttp
+#
+# Two modes are exercised because they take different paths through the constructor: the
+# streamed-body mode (stream-one) and the packet-up mode, which is the one that adds the
+# per-packet upload sequence placement. A single case would not notice the registration being
+# narrowed to one of them.
+#
+# outbound-vless-ws is the CONTROL for this section. Websocket is not behind a tag, so it must
+# pass in EVERY build. When the gate is red-checked by removing with_xhttp, this case is what
+# shows the failure is the missing capability and not a broken vless section: websocket keeps
+# passing while both xhttp cases fail.
+echo "== VLESS transports (tagged capabilities) =="
+for spec in \
+  "outbound-vless-xhttp-stream-one:{\"type\":\"vless\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"uuid\":\"00000000-0000-0000-0000-000000000000\",\"transport\":{\"type\":\"xhttp\",\"path\":\"/xhttp\",\"mode\":\"stream-one\"}}" \
+  "outbound-vless-xhttp-packet-up:{\"type\":\"vless\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"uuid\":\"00000000-0000-0000-0000-000000000000\",\"transport\":{\"type\":\"xhttp\",\"path\":\"/xhttp\",\"mode\":\"packet-up\",\"session_placement\":\"path\"}}" \
+  "outbound-vless-ws-control:{\"type\":\"vless\",\"tag\":\"o\",\"server\":\"127.0.0.1\",\"server_port\":1,\"uuid\":\"00000000-0000-0000-0000-000000000000\",\"transport\":{\"type\":\"ws\",\"path\":\"/ws\"}}" \
+  ; do
+  name="${spec%%:*}"; body="${spec#*:}"
+  check_config "$name" "{\"outbounds\":[{\"type\":\"direct\",\"tag\":\"direct\"},$body]}"
+done
+
 echo "== inbound protocols (full registry) =="
 for spec in \
   "inbound-http:{\"type\":\"http\",\"tag\":\"i\",\"listen\":\"127.0.0.1\",\"listen_port\":1080}" \
