@@ -1,0 +1,75 @@
+# libbox gomobile ABI compatibility contract.
+#
+# # What this file is
+#
+# The machine-readable form of "these libbox methods return a bound *StringBox, and every
+# client call site must read it through an accessor". scripts/ci/check-libbox-abi.sh reads
+# it and fails when any of the layers disagrees with it.
+#
+# # Why it exists
+#
+# A bare `string` result puts a Go pointer into the `__attribute__((packed))` gomobile
+# result frame and can throw `fatal error: bulkBarrierPreWrite: unaligned arguments`, which
+# kills the process and cannot be recovered. Migrating the Go signature is therefore only one
+# of three layers, and the easiest one: the generated binding and every Kotlin/Swift call site
+# have to move with it. A build can regenerate libbox.aar successfully and still ship a client
+# whose gitlink points at a revision calling the old ABI. Regenerating an AAR is a green light
+# for the binding and says nothing whatsoever about the call sites. This contract is what
+# makes that state a failure instead of a PASS.
+#
+# # Format
+#
+# One record per line, tab-separated. A line whose first non-blank character is '#' is a
+# comment; blank lines are ignored.
+#
+#   col 1  go-owner     the bound type the declaration is attributed to by the surface
+#                       scanner in experimental/libbox/gomobile_surface_test.go, i.e. the
+#                       EXPORTED type name for an interface method, or "-" for a package-level
+#                       function. This is the scanner's key, not the receiver's type name:
+#                       BridgeSession.Name is implemented on the unexported
+#                       *bridgeServiceSession, but a client reaches it through BridgeSession.
+#   col 2  go-method    Go method / function name, exactly as declared.
+#   col 3  javamethod   method name in the generated Java binding (lowerCamelCase).
+#   col 4  kotlin-res   extended grep -E alternation matching the RECEIVER expression only,
+#                       i.e. everything before `.<javamethod>(`. Used by the Kotlin scan.
+#   col 5  swift-res    same, for the Swift/ObjC scan.
+#   col 6  evidence     the call sites that were moved; for the reader, not parsed.
+#
+# A record asserts, and the gate enforces, all of:
+#   1. the surface scanner still attributes a declaration to <go-owner>.<go-method> AND
+#      classifies its result as a bound object rather than a pointer-bearing bare
+#      string/[]byte. This is what catches a revert of the migration;
+#   2. the Go declaration's result really is `*StringBox`;
+#   3. the generated Java binding declares the method returning
+#      `io.nekohasekai.libbox.StringBox` and does not declare a bare `java.lang.String`
+#      result for it;
+#   4. every call site in the pinned Android/Apple client source whose receiver matches
+#      col 4 / col 5 reads the result through a migrated accessor - `.value`, or the Kotlin
+#      `StringBox?.unwrap` extension. A call that reads it any other way is an old-ABI call
+#      site and fails;
+#   5. the client gitlinks are the revisions the contract was verified against.
+#
+# # Why the receiver is spelled out instead of matching the bare method name
+#
+# `name`, `address`, `mask` and `message` are extremely common identifiers and the clients'
+# own types carry methods with those names too (RemoteControlManager.remoteServer.value,
+# CardGroup.values(), CryptoSwift's `String.bytes`, ...). A scan keyed on the bare method name
+# reports those as violations forever, which trains a reader to ignore the gate. The receiver
+# patterns are anchored on how the bound object is actually reached in each client.
+#
+# # Adding a record
+#
+# When another method is migrated off a bare-string result, add it here AND move the client
+# call sites, in the same change. Adding a record without moving the call sites makes this
+# gate fail, which is the point.
+#
+# go-owner	go-method	javamethod	kotlin-res	swift-res	evidence
+BridgeSession	Name	name	session|bridgeSession|it|s	(session|bridgeSession|it|s)	HelperService/RootHelperService.swift:334,336; JailbreakDaemon/IOSRootHelperService.swift:188,190; Library/Network/BridgeTunTracker.swift:52; app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt:255
+RoutePrefix	Address	address	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|addressPrefix|it)(\.next\(\))?	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|it)	Library/Network/ExtensionPlatformInterface.swift:65,77,95,121,132,150; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:77,83,127,135
+RoutePrefix	Mask	mask	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)(\.next\(\))?	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)	Library/Network/ExtensionPlatformInterface.swift:66,77,95; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt (via toIpPrefix)
+DeprecatedNote	Message	message	(note|it|report)	(note|it|report)	ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift:207,216,224; app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt:222
+TunOptions	GetHTTPProxyServer	getHTTPProxyServer	(options|tunOptions|it)	(options|tunOptions|it)	Library/Network/ExtensionPlatformInterface.swift:176
+TunOptions	GetDNSMode	getDNSMode	(options|tunOptions|it)	(options|tunOptions|it)	Library/Network/ExtensionPlatformInterface.swift:47; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:87
+-	FormatConfig	formatConfig	Libbox	Libbox	app/src/main/java/io/nekohasekai/sfa/compose/screen/profile/EditProfileContentViewModel.kt:232
+-	GenerateConfigSchema	generateConfigSchema	Libbox	Libbox	app/src/minApi24/java/io/nekohasekai/sfa/compat/ConfigSchema.kt:64
+-	RandomHex	randomHex	Libbox	Libbox	(no call site in any client; migrated for frame shape)
