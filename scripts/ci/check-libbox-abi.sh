@@ -139,7 +139,7 @@ printf '\n'
 # Layers 1+2: the Go declaration
 # ---------------------------------------------------------------------------
 printf -- '-- layers 1-2: Go declaration --\n'
-while IFS=$'\t' read -r go_owner go_method javamethod kotlin_re swift_re evidence; do
+while IFS=$'\t' read -r go_owner go_method javamethod check_kind kotlin_re swift_re evidence; do
   key="$go_owner.$go_method"
   [ "$go_owner" = "-" ] && key="$go_method"
 
@@ -204,7 +204,7 @@ if [ -n "$gobind_version" ]; then
   fi
   if (cd "$repo_root" && gobind -lang=java -javapkg=io.nekohasekai -libname=box \
         -tags "$(cat release/DEFAULT_BUILD_TAGS)" -outdir "$tmp/bind" ./experimental/libbox) >/dev/null 2>&1; then
-    while IFS=$'\t' read -r go_owner go_method javamethod kotlin_re swift_re evidence; do
+    while IFS=$'\t' read -r go_owner go_method javamethod check_kind kotlin_re swift_re evidence; do
       key="$go_owner.$go_method"; [ "$go_owner" = "-" ] && key="$go_method"
       if grep -rqE "^[[:space:]]*(public|protected)?[[:space:]]*(static[[:space:]]+)?(final[[:space:]]+)?(native[[:space:]]+)?StringBox ${javamethod}\(" "$tmp/bind" --include=*.java 2>/dev/null; then
         ok "$key -> generated Java 'StringBox ${javamethod}('"
@@ -301,10 +301,22 @@ PYEOF
     printf '%s\n' "$rendered" >&2
     fails=$((fails + $(printf '%s\n' "$rendered" | grep -c '^FAIL:')))
   fi
-  local scanned
+  local scanned iface
   scanned="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("scanned", 0))' "$result" 2>/dev/null || echo 0)"
+  iface="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("interface_methods", 0))' "$result" 2>/dev/null || echo 0)"
   info "$lang sources scanned: $scanned files"
   [ "$scanned" -gt 0 ] || skip "no $lang sources were read under $root"
+  if [ "${iface:-0}" -gt 0 ]; then
+    # Be explicit about the limit of a call-site scan. A method on a bound Go interface is also
+    # implemented BY the platform, and that override must return StringBox too - the call-site
+    # scan cannot see it. BridgeSession.Name is exactly this case in clients/android
+    # (PlatformInterfaceWrapper.kt's RootBridgeSessionWrapper).
+    info "$iface of the contract's methods are declared on a bound Go interface, so the"
+    info "platform implements them as well and those overrides must return StringBox too."
+    info "A call-site scan cannot see an implementation; that side is verified by the client"
+    info "build (the Kotlin compiler rejects a String return) and is recorded per method in"
+    info "the contract's check column."
+  fi
 }
 
 if [ "$skip_client" = 1 ]; then

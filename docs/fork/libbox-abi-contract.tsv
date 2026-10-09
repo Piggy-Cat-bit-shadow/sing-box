@@ -30,10 +30,29 @@
 #                       *bridgeServiceSession, but a client reaches it through BridgeSession.
 #   col 2  go-method    Go method / function name, exactly as declared.
 #   col 3  javamethod   method name in the generated Java binding (lowerCamelCase).
-#   col 4  kotlin-res   extended grep -E alternation matching the RECEIVER expression only,
-#                       i.e. everything before `.<javamethod>(`. Used by the Kotlin scan.
-#   col 5  swift-res    same, for the Swift/ObjC scan.
-#   col 6  evidence     the call sites that were moved; for the reader, not parsed.
+#   col 4  check        interface | concrete | function - what kind of declaration this is.
+#                       `interface` means the method is declared on a bound Go INTERFACE, which
+#                       has a consequence the call-site scan cannot see: the PLATFORM also
+#                       implements that interface, and its implementation has to return
+#                       StringBox as well. BridgeSession.Name is the case that proves it -
+#                       clients/android implements it in PlatformInterfaceWrapper.kt's
+#                       RootBridgeSessionWrapper, and leaving that returning String is a
+#                       compile error, not a silent one. The gate reports `interface` records
+#                       as needing the implementer side checked by hand.
+#   col 5  kotlin-res   alternation matching the RECEIVER expression. Written as a bare
+#                       `a|b|c`; the probe wraps it in a group, and the wrap is load-bearing
+#                       (see probe-accessors.py).
+#
+#                       For a BARE call - `getByName(address())`, where the receiver is an
+#                       extension receiver's implicit `this` - there is no dotted expression to
+#                       match, and the only text identifying the receiver is the method name
+#                       itself. The probe therefore also tries the substring before the method
+#                       name as a receiver, so `<javamethod>` must appear in this list whenever
+#                       a bare call shape exists. Leaving it out means the bare form is not
+#                       detected at all, and the bare form is exactly the shape that was missed
+#                       by the original migration (Wrappers.kt's toIpPrefix calls address()).
+#   col 6  swift-res    same, for the Swift/ObjC scan.
+#   col 7  evidence     the call sites that were moved; for the reader, not parsed.
 #
 # A record asserts, and the gate enforces, all of:
 #   1. the surface scanner still attributes a declaration to <go-owner>.<go-method> AND
@@ -64,12 +83,12 @@
 # gate fail, which is the point.
 #
 # go-owner	go-method	javamethod	kotlin-res	swift-res	evidence
-BridgeSession	Name	name	session|bridgeSession|it|s	(session|bridgeSession|it|s)	HelperService/RootHelperService.swift:334,336; JailbreakDaemon/IOSRootHelperService.swift:188,190; Library/Network/BridgeTunTracker.swift:52; app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt:255
-RoutePrefix	Address	address	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|addressPrefix|it)(\.next\(\))?	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|it)	Library/Network/ExtensionPlatformInterface.swift:65,77,95,121,132,150; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:77,83,127,135
-RoutePrefix	Mask	mask	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)(\.next\(\))?	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)	Library/Network/ExtensionPlatformInterface.swift:66,77,95; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt (via toIpPrefix)
-DeprecatedNote	Message	message	(note|it|report)	(note|it|report)	ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift:207,216,224; app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt:222
-TunOptions	GetHTTPProxyServer	getHTTPProxyServer	(options|tunOptions|it)	(options|tunOptions|it)	Library/Network/ExtensionPlatformInterface.swift:176
-TunOptions	GetDNSMode	getDNSMode	(options|tunOptions|it)	(options|tunOptions|it)	Library/Network/ExtensionPlatformInterface.swift:47; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:87
--	FormatConfig	formatConfig	Libbox	Libbox	app/src/main/java/io/nekohasekai/sfa/compose/screen/profile/EditProfileContentViewModel.kt:232
--	GenerateConfigSchema	generateConfigSchema	Libbox	Libbox	app/src/minApi24/java/io/nekohasekai/sfa/compat/ConfigSchema.kt:64
--	RandomHex	randomHex	Libbox	Libbox	(no call site in any client; migrated for frame shape)
+BridgeSession	Name	name	interface	session|bridgeSession|it|s|name	(session|bridgeSession|it|s)|name	HelperService/RootHelperService.swift:334,336; JailbreakDaemon/IOSRootHelperService.swift:188,190; Library/Network/BridgeTunTracker.swift:52; app/src/main/java/io/nekohasekai/sfa/bg/RootServer.kt:255
+RoutePrefix	Address	address	concrete	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|addressPrefix|it)(\.next\(\))?|address	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|inet4Address|inet6Address|it)|address	Library/Network/ExtensionPlatformInterface.swift:65,77,95,121,132,150; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:77,83,127,135
+RoutePrefix	Mask	mask	concrete	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)(\.next\(\))?|mask	(address|prefix|ipv4Prefix|ipv6Prefix|ipv4RoutePrefix|ipv6RoutePrefix|ipv4ExcludeRoutePrefix|ipv6ExcludeRoutePrefix|inet4RouteAddress|inet6RouteAddress|inet4RouteExcludeAddress|inet6RouteExcludeAddress|inet4RouteRange|inet6RouteRange|routePrefix|it)|mask	Library/Network/ExtensionPlatformInterface.swift:66,77,95; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt (via toIpPrefix)
+DeprecatedNote	Message	message	concrete	(note|it|report)|message	(note|it|report)|message	ApplicationLibrary/Views/Abstract/GlobalChecksModifier.swift:207,216,224; app/src/main/java/io/nekohasekai/sfa/compose/screen/dashboard/DashboardViewModel.kt:222
+TunOptions	GetHTTPProxyServer	getHTTPProxyServer	interface	(options|tunOptions|it)|getHTTPProxyServer	(options|tunOptions|it)|getHTTPProxyServer	Library/Network/ExtensionPlatformInterface.swift:176
+TunOptions	GetDNSMode	getDNSMode	interface	(options|tunOptions|it)|getDNSMode	(options|tunOptions|it)|getDNSMode	Library/Network/ExtensionPlatformInterface.swift:47; app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt:87
+-	FormatConfig	formatConfig	function	Libbox|formatConfig	Libbox|formatConfig	app/src/main/java/io/nekohasekai/sfa/compose/screen/profile/EditProfileContentViewModel.kt:232
+-	GenerateConfigSchema	generateConfigSchema	function	Libbox|generateConfigSchema	Libbox|generateConfigSchema	app/src/minApi24/java/io/nekohasekai/sfa/compat/ConfigSchema.kt:64
+-	RandomHex	randomHex	function	Libbox|randomHex	Libbox|randomHex	(no call site in any client; migrated for frame shape)

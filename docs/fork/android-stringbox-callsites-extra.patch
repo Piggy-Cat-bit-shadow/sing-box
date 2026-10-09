@@ -1,0 +1,52 @@
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt b/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
+index 8956a84..f6729aa 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
+@@ -21,6 +21,7 @@ import io.nekohasekai.libbox.NetworkInterfaceIterator
+ import io.nekohasekai.libbox.PlatformInterface
+ import io.nekohasekai.libbox.PlatformUser
+ import io.nekohasekai.libbox.ShellSession
++import io.nekohasekai.libbox.StringBox
+ import io.nekohasekai.libbox.StringIterator
+ import io.nekohasekai.libbox.TunOptions
+ import io.nekohasekai.libbox.WIFIState
+@@ -335,7 +336,12 @@ interface PlatformInterfaceWrapper : PlatformInterface {
+     ) : BridgeSession {
+         override fun fileDescriptor(): Int = session.fileDescriptor.detachFd()
+ 
+-        override fun name(): String = session.name
++        // BridgeSession.Name returns *StringBox on the Go side (the box keeps the Go pointer
++        // out of gomobile's packed result frame), so the platform's implementation of that
++        // interface has to hand back a StringBox too. The AIDL session field is still a plain
++        // String, so it is wrapped here rather than changing the AIDL contract, which the
++        // root service also implements.
++        override fun name(): StringBox = StringBox().apply { value = session.name }
+ 
+         override fun inet6Active(): Boolean = session.isInet6Active
+ 
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+index 06460c4..5fbf099 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+@@ -170,7 +170,7 @@ class VPNService :
+             if (systemProxyEnabled) {
+                 builder.setHttpProxy(
+                     ProxyInfo.buildDirectProxy(
+-                        options.httpProxyServer,
++                        options.httpProxyServer.value,
+                         options.httpProxyServerPort,
+                         options.httpProxyBypassDomain.toList(),
+                     ),
+diff --git a/app/src/main/java/io/nekohasekai/sfa/ktx/Wrappers.kt b/app/src/main/java/io/nekohasekai/sfa/ktx/Wrappers.kt
+index 1dbf3b5..08e5a77 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/ktx/Wrappers.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/ktx/Wrappers.kt
+@@ -46,7 +46,7 @@ fun LogIterator.toList(): List<LogEntry> = mutableListOf<LogEntry>().apply {
+ }
+ 
+ @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+-fun RoutePrefix.toIpPrefix() = IpPrefix(InetAddress.getByName(address()), prefix())
++fun RoutePrefix.toIpPrefix() = IpPrefix(InetAddress.getByName(address()!!.value), prefix())
+ 
+ fun ConnectionIterator.toList(): List<LibboxConnection> = mutableListOf<LibboxConnection>().apply {
+     while (hasNext()) {

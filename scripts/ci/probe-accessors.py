@@ -62,9 +62,9 @@ def load_contract(path):
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
             fields = line.split("\t")
-            if len(fields) < 5:
+            if len(fields) < 6:
                 raise ValueError(
-                    "contract row needs 5+ tab-separated fields, got %d: %r"
+                    "contract row needs 6+ tab-separated fields, got %d: %r"
                     % (len(fields), line)
                 )
             records.append(
@@ -72,8 +72,9 @@ def load_contract(path):
                     "owner": fields[0],
                     "method": fields[1],
                     "javamethod": fields[2],
-                    "kotlin_res": fields[3],
-                    "swift_res": fields[4],
+                    "check": fields[3],
+                    "kotlin_res": fields[4],
+                    "swift_res": fields[5],
                 }
             )
     if not records:
@@ -125,31 +126,51 @@ def is_declaration(prefix):
     carry the method name where a call would. Requiring a declaration keyword between the last
     statement boundary and the name is what separates them.
     """
+    # The declared name must be the last token before the `(` - i.e. nothing but an identifier
+    # may follow the declaration keyword. Allowing `.` here was wrong and costly: it made
+    # `fun f() = Libbox.formatConfig(...)` look like a declaration of `formatConfig`, so the
+    # package-level records were skipped in every qualified call and the probe reported zero
+    # violations for them. A receiver expression is not part of a function name.
     return (
-        re.search(r"\b(fun|func|val|var|let)\s+[A-Za-z_][A-Za-z0-9_.<>,\[\] ]*$", prefix)
+        re.search(r"\b(fun|func|val|var|let)\s+[A-Za-z_][A-Za-z0-9_<>,\[\] ]*$", prefix)
         is not None
     )
 
 
-def receiver_is_bound(compiled, up_to_method):
-    """True when a receiver that `compiled` accepts ends exactly where the method name begins.
+def receiver_is_bound(compiled, prefix, method):
+    """True when a receiver `compiled` accepts ends exactly where `method` begins.
 
-    `up_to_method` must be the line text UP TO AND INCLUDING the method name, because the
-    receiver is the token immediately before the method name: the classifier has to see the
-    receiver's own characters to match them. Testing the text before the name instead finds
-    nothing at all - which is exactly the bug that made this probe report zero violations on
-    the one call site it was written for.
+    `prefix` is the line text before the method name. The receiver is a suffix of it, and which
+    suffix depends on how the call is written:
 
-    The receiver is a suffix of that text: `address` for a bare call
-    (`getByName(address`), and `expr.` for a qualified one (`prefix.address`). A suffix
-    beginning at an identifier character is rejected, otherwise the match could start mid-word.
+      * qualified - `Libbox.formatConfig(...)`, `session.name(...)`: the receiver ends one
+        character before the name, at the `.`. The slice that must classify is `...Libbox`.
+      * bare - `getByName(address())`: there is no dot, so the receiver ends exactly at the name
+        and the slice that must classify is `...address`.
+
+    Both candidates are tested, the `.`-terminated one first. An earlier revision fed the text
+    UP TO AND INCLUDING the method name to an end-anchored classifier, so no slice ever ended
+    at the receiver and every record reported zero violations - a green gate that inspected
+    nothing.
     """
-    window = up_to_method[-200:]
-    for start in range(len(window)):
-        if window[start].isalnum() or window[start] == "_":
-            continue
-        if compiled.search(window[start:]):
-            return True
+    candidates = []
+    if prefix.endswith("."):
+        candidates.append(prefix[:-1])
+    candidates.append(prefix)
+    if prefix.endswith("." + method):
+        candidates.append(prefix[: -(len(method) + 1)])
+    # A bare call on an extension receiver's implicit `this` - `getByName(address())` - has no
+    # dotted expression anywhere, and the receiver IS the method name, which appears AFTER the
+    # prefix rather than inside it. Without this candidate the bare shape is not detected at
+    # all, which is the shape the original migration missed.
+    candidates.append(prefix + method)
+    for candidate in candidates:
+        window = candidate[-200:]
+        for start in range(len(window)):
+            if window[start].isalnum() or window[start] == "_":
+                continue
+            if compiled.search(window[start:]):
+                return True
     return False
 
 
@@ -194,10 +215,7 @@ def probe(root, lang, records):
                         argument = bool(re.search(r"[(,]\s*$", head))
                         if not (qualified or argument):
                             continue
-                        # Include the method name: the receiver ends where the name begins.
-                        if not receiver_is_bound(
-                            compiled, text[: match.start() + len(method)]
-                        ):
+                        if not receiver_is_bound(compiled, prefix, method):
                             continue
                         tail = text[match.end() :]
                         if accessor_re.match(tail):
@@ -214,7 +232,17 @@ def probe(root, lang, records):
                                 "javamethod": method,
                             }
                         )
-    return {"scanned": len(sources), "violations": violations, "error": ""}
+    # Records declared on a bound INTERFACE need a second look that no call-site scan can do:
+    # the platform implements that interface too, and its override has to return StringBox. The
+    # scan above only sees calls. Report the count so the caller can say so out loud rather than
+    # implying the interface's implementer side was verified.
+    interface_methods = sum(1 for r in records if r["check"] == "interface")
+    return {
+        "scanned": len(sources),
+        "violations": violations,
+        "interface_methods": interface_methods,
+        "error": "",
+    }
 
 
 def main():
