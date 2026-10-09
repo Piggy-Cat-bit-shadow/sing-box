@@ -82,6 +82,7 @@ while [ $# -gt 0 ]; do
 done
 
 fails=0
+skipped_client_layers=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; fails=$((fails + 1)); }
 ok()   { printf 'PASS: %s\n' "$*"; }
 skip() { printf 'SKIP: %s\n' "$*"; }
@@ -273,6 +274,7 @@ scan_client() {
         --contract "$CONTRACT" --lang "$lang" --root "$root" 2>&1)"; then
     skip "the $lang accessor probe could not run against $root:
 $(printf '%s' "$result" | sed 's/^/      /')"
+    skipped_client_layers=$((skipped_client_layers + 1))
     return 0
   fi
   # The JSON is passed as an argument rather than on stdin so that the renderer can be a
@@ -305,7 +307,10 @@ PYEOF
   scanned="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("scanned", 0))' "$result" 2>/dev/null || echo 0)"
   iface="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("interface_methods", 0))' "$result" 2>/dev/null || echo 0)"
   info "$lang sources scanned: $scanned files"
-  [ "$scanned" -gt 0 ] || skip "no $lang sources were read under $root"
+  [ "$scanned" -gt 0 ] || {
+    skip "no $lang sources were read under $root"
+    skipped_client_layers=$((skipped_client_layers + 1))
+  }
   if [ "${iface:-0}" -gt 0 ]; then
     # Be explicit about the limit of a call-site scan. A method on a bound Go interface is also
     # implemented BY the platform, and that override must return StringBox too - the call-site
@@ -321,6 +326,7 @@ PYEOF
 
 if [ "$skip_client" = 1 ]; then
   skip "client scan disabled with --skip-client"
+  skipped_client_layers=2
 else
   if android_root="$(find_root kotlin "${kotlin_roots[@]}")"; then
     info "Android client: $android_root"
@@ -329,6 +335,7 @@ else
     skip "no Android client checkout found (looked in: ${kotlin_roots[*]}).
       An uninitialised submodule is NOT evidence that the call sites are migrated.
       Run: git submodule update --init clients/android"
+    skipped_client_layers=$((skipped_client_layers + 1))
   fi
   if apple_root="$(find_root swift "${swift_roots[@]}")"; then
     info "Apple client: $apple_root"
@@ -336,6 +343,7 @@ else
   else
     skip "no Apple client checkout found (looked in: ${swift_roots[*]}).
       An uninitialised submodule is NOT evidence that the Apple call sites are migrated."
+    skipped_client_layers=$((skipped_client_layers + 1))
   fi
 fi
 
@@ -367,5 +375,13 @@ printf '\n'
 if [ "$fails" -gt 0 ]; then
   printf 'FAILED: %d ABI compatibility violation(s).\n' "$fails" >&2
   exit 1
+fi
+if [ "$skipped_client_layers" -gt 0 ]; then
+  # Deliberately not a bare PASS. A run that never read a client checkout has verified the Go
+  # side and nothing about the call sites, and "PASS ... verified across the client call sites"
+  # would be a false statement about layers that were never opened.
+  printf 'PARTIAL: the Go/binding layers passed, but %d client layer(s) were SKIPPED, so the\n' "$skipped_client_layers"
+  printf 'call sites were NOT verified by this run. See the SKIP lines above for what was missing.\n'
+  exit 0
 fi
 printf 'PASS: %d migrated methods verified across the Go declaration, the generated binding, the client call sites and the client pin.\n' "$record_count"
