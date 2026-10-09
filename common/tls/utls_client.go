@@ -363,10 +363,30 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 var (
 	randomFingerprint     utls.ClientHelloID
 	randomizedFingerprint utls.ClientHelloID
+
+	// modernFingerprints is the pool `utls.fingerprint: random` draws from. It is
+	// a package variable rather than a local of init because the REALITY
+	// fingerprint register asserts what that draw can land on: the pool contains
+	// four presets that cannot present the post-quantum hybrid key share, so a
+	// `random` REALITY client is only able to complete a handshake against a
+	// current reference when the draw happened to be Chrome.
+	modernFingerprints []utls.ClientHelloID
+
+	// uTLSFingerprints is the table of names `utls.fingerprint` accepts.
+	//
+	// It is a table rather than a switch so that it can be ENUMERATED. The
+	// REALITY fingerprint register
+	// (reality_fingerprint_register_test.go) walks this map and fails for any
+	// name whose preset it has not classified, which is the property a
+	// hand-written list in the test cannot have: a name added here would
+	// otherwise be exercised by real users and by nothing else.
+	//
+	// It is built in init because two of its values are resolved there.
+	uTLSFingerprints map[string]utls.ClientHelloID
 )
 
 func init() {
-	modernFingerprints := []utls.ClientHelloID{
+	modernFingerprints = []utls.ClientHelloID{
 		utls.HelloChrome_Auto,
 		utls.HelloFirefox_Auto,
 		utls.HelloEdge_Auto,
@@ -381,33 +401,34 @@ func init() {
 	randomizedFingerprint = utls.HelloRandomized
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
+
+	uTLSFingerprints = map[string]utls.ClientHelloID{
+		// The psk and pq spellings are aliases of Chrome, and they are
+		// deliberately NOT reordered or renamed here: they are part of the
+		// configuration vocabulary users already have.
+		"chrome_psk":                 utls.HelloChrome_Auto,
+		"chrome_psk_shuffle":         utls.HelloChrome_Auto,
+		"chrome_padding_psk_shuffle": utls.HelloChrome_Auto,
+		"chrome_pq":                  utls.HelloChrome_Auto,
+		"chrome_pq_psk":              utls.HelloChrome_Auto,
+		"chrome":                     utls.HelloChrome_Auto,
+		"":                           utls.HelloChrome_Auto,
+		"firefox":                    utls.HelloFirefox_Auto,
+		"edge":                       utls.HelloEdge_Auto,
+		"safari":                     utls.HelloSafari_Auto,
+		"360":                        utls.Hello360_Auto,
+		"qq":                         utls.HelloQQ_Auto,
+		"ios":                        utls.HelloIOS_Auto,
+		"android":                    utls.HelloAndroid_11_OkHttp,
+		"random":                     randomFingerprint,
+		"randomized":                 randomizedFingerprint,
+	}
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
-	switch name {
-	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
-		fallthrough
-	case "chrome", "":
-		return utls.HelloChrome_Auto, nil
-	case "firefox":
-		return utls.HelloFirefox_Auto, nil
-	case "edge":
-		return utls.HelloEdge_Auto, nil
-	case "safari":
-		return utls.HelloSafari_Auto, nil
-	case "360":
-		return utls.Hello360_Auto, nil
-	case "qq":
-		return utls.HelloQQ_Auto, nil
-	case "ios":
-		return utls.HelloIOS_Auto, nil
-	case "android":
-		return utls.HelloAndroid_11_OkHttp, nil
-	case "random":
-		return randomFingerprint, nil
-	case "randomized":
-		return randomizedFingerprint, nil
-	default:
+	id, isKnown := uTLSFingerprints[name]
+	if !isKnown {
 		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
 	}
+	return id, nil
 }

@@ -29,6 +29,20 @@ func TestLiveInteropRealityHybrid(t *testing.T) {
 	runLiveScenarioForName(t, "reality-hybrid")
 }
 
+// TestLiveInteropRealityFirefox covers the Firefox fingerprint with no explicit
+// key_share, which is the configuration `fingerprint: firefox` alone produces.
+// Per the scenario note it measures the pinned uTLS Firefox preset against a
+// reference's hybrid-share requirement, not this fork's REALITY code.
+func TestLiveInteropRealityFirefox(t *testing.T) {
+	runLiveScenarioForName(t, "reality-firefox")
+}
+
+// TestLiveInteropRealitySafari covers the Safari fingerprint with no explicit
+// key_share, which is the configuration `fingerprint: safari` alone produces.
+func TestLiveInteropRealitySafari(t *testing.T) {
+	runLiveScenarioForName(t, "reality-safari")
+}
+
 // TestLiveInteropRealityEncryption covers the VLESS application-layer
 // post-quantum encryption over REALITY.
 func TestLiveInteropRealityEncryption(t *testing.T) {

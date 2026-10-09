@@ -452,7 +452,7 @@ func (in Input) buildClientConfig() clientConfig {
 			ServerName: in.ServerName,
 			UTLS: &clientUTLS{
 				Enabled:     true,
-				Fingerprint: "chrome",
+				Fingerprint: scenario.ClientFingerprint(),
 			},
 			Reality: &clientReality{
 				Enabled:   true,

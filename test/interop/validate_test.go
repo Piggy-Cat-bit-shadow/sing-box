@@ -132,7 +132,12 @@ func TestGeneratedClientConfigJSONShape(t *testing.T) {
 				require.Equal(t, input.ServerName, jsonStringAt(t, tlsBlock, "server_name"))
 				utlsBlock := asObject(t, tlsBlock["utls"], "outbounds[0].tls.utls")
 				require.Equal(t, true, utlsBlock["enabled"])
-				require.Equal(t, "chrome", jsonStringAt(t, utlsBlock, "fingerprint"))
+				// Asserted against the scenario's RESOLVED fingerprint, so a
+				// scenario that names one and a generator that emits another
+				// cannot both pass. The default itself is pinned separately by
+				// TestScenarioFingerprintDefaultIsPinned, so this comparison
+				// cannot become a tautology.
+				require.Equal(t, scenario.ClientFingerprint(), jsonStringAt(t, utlsBlock, "fingerprint"))
 				reality := asObject(t, tlsBlock["reality"], "outbounds[0].tls.reality")
 				require.Equal(t, true, reality["enabled"])
 				require.Equal(t, input.RealityPublicKey, jsonStringAt(t, reality, "public_key"))
@@ -210,7 +215,11 @@ func TestGeneratedClientConfigRoundTripsThroughTheOptionParser(t *testing.T) {
 				require.Equal(t, input.ShortID, vless.TLS.Reality.ShortID)
 				require.Equal(t, scenario.KeyShare, vless.TLS.Reality.KeyShare)
 				require.NotNil(t, vless.TLS.UTLS)
-				require.Equal(t, "chrome", vless.TLS.UTLS.Fingerprint)
+				// The round trip is the half that matters for the fingerprint:
+				// the reference never sees it, so if the parser does not carry
+				// the scenario's name through, the live test silently exercises
+				// the default and reports a pass for a preset it never used.
+				require.Equal(t, scenario.ClientFingerprint(), vless.TLS.UTLS.Fingerprint)
 			}
 			// The route must point at the tunnel; a config that parses but routes
 			// directly would make every round trip succeed against the target
@@ -426,6 +435,8 @@ func TestScenarioMatrixCoversTheRequiredCombinations(t *testing.T) {
 	required := []string{
 		"reality-classical",
 		"reality-hybrid",
+		"reality-firefox",
+		"reality-safari",
 		"reality-encryption",
 		"reality-encryption-vision",
 		"reality-xhttp-stream-one",
@@ -443,6 +454,30 @@ func TestScenarioMatrixCoversTheRequiredCombinations(t *testing.T) {
 	for _, scenario := range Scenarios() {
 		require.NotEmpty(t, scenario.Note, "scenario %s must record what a maintainer needs to know", scenario.Name)
 	}
+}
+
+// TestScenarioFingerprintDefaultIsPinned keeps the assertion in
+// TestGeneratedRealityClientConfigJSONShape from degenerating into a tautology.
+//
+// That test compares the generated JSON against scenario.ClientFingerprint(),
+// which is the right OBJECT to compare (a scenario that names one fingerprint
+// and a generator that emits another must not both pass) but would also pass if
+// the default silently changed to something else. The literal for the default
+// therefore lives here, in one place, where changing it is a deliberate edit.
+func TestScenarioFingerprintDefaultIsPinned(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, "chrome", DefaultClientFingerprint)
+	require.Equal(t, "chrome", Scenario{}.ClientFingerprint())
+
+	// The axis must be reachable from the table, not merely from the struct:
+	// a fingerprint nobody can select is a field, not a scenario dimension.
+	byName := make(map[string]string)
+	for _, scenario := range Scenarios() {
+		byName[scenario.Name] = scenario.ClientFingerprint()
+	}
+	require.Equal(t, "firefox", byName["reality-firefox"])
+	require.Equal(t, "safari", byName["reality-safari"])
+	require.Equal(t, "chrome", byName["reality-hybrid"])
 }
 
 // TestGenerateRejectsInvalidScenarios pins the generator's fail-closed behaviour.

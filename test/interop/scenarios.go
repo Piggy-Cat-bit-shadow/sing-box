@@ -80,6 +80,18 @@ type Scenario struct {
 	// "stream-one". Empty with Transport == "xhttp" means the transport default.
 	XHTTPMode string
 
+	// Fingerprint is the uTLS fingerprint the client presents, spelled the way
+	// the configuration spells it. Empty means the stand's default,
+	// DefaultClientFingerprint, which is what every scenario used before this
+	// axis existed.
+	//
+	// It is a scenario field rather than a constant because the fingerprint
+	// decides the ClientHello, and the ClientHello is what a REALITY reference
+	// verifies: a reference that requires the post-quantum hybrid key share is
+	// satisfiable by some presets and not by others, so "which fingerprint" is
+	// part of the scenario rather than a property of the stand.
+	Fingerprint string
+
 	// PlainTLS selects an ordinary TLS security layer instead of REALITY. Only
 	// HTTP/3 needs it: REALITY is a TCP construction, so an H3 scenario cannot
 	// carry it and the client replaces a REALITY ALPN of ["h3"] with ["h2"].
@@ -99,6 +111,23 @@ type Scenario struct {
 // EncryptionEnabled reports whether the VLESS encryption layer is configured.
 func (s Scenario) EncryptionEnabled() bool {
 	return s.EncryptionAppearance != "" || s.EncryptionRTT != ""
+}
+
+// DefaultClientFingerprint is the uTLS fingerprint a scenario gets when it does
+// not name one.
+//
+// It is a constant with a test that pins it, rather than an inline literal at
+// the point of use, because the value is a claim about what every pre-existing
+// scenario exercises: changing it would silently move the whole matrix onto a
+// different ClientHello.
+const DefaultClientFingerprint = "chrome"
+
+// ClientFingerprint resolves the uTLS fingerprint the scenario configures.
+func (s Scenario) ClientFingerprint() string {
+	if s.Fingerprint == "" {
+		return DefaultClientFingerprint
+	}
+	return s.Fingerprint
 }
 
 // EncryptionSpec builds the `<appearance>.<rtt>` prefix of the encryption
@@ -190,6 +219,28 @@ func Scenarios() []Scenario {
 			Note: "REALITY with X25519MLKEM768 required. Requires a reference Xray at or above " +
 				"v26.9.8, which is the release that made the hybrid share mandatory. The test " +
 				"skips on an older reference.",
+		},
+		{
+			Name:        "reality-firefox",
+			Reality:     true,
+			Fingerprint: "firefox",
+			Note: "REALITY with the Firefox fingerprint and NO explicit key_share, which is the " +
+				"configuration a user gets from `fingerprint: firefox` alone. It is the " +
+				"fingerprint axis rather than a new protocol combination: the preset decides " +
+				"whether the greeting carries X25519MLKEM768, and a reference at or above " +
+				"v26.9.8 requires that share. A failure here is a statement about the pinned " +
+				"uTLS preset, not about this fork's REALITY code, which is why the test " +
+				"records the preset the pinned module resolves the name to.",
+		},
+		{
+			Name:        "reality-safari",
+			Reality:     true,
+			Fingerprint: "safari",
+			Note: "REALITY with the Safari fingerprint and no explicit key_share. The same " +
+				"fingerprint axis as reality-firefox and the same reference requirement; it is " +
+				"a separate scenario because the two names resolve to two different presets in " +
+				"the pinned uTLS module and one of them can carry the hybrid share while the " +
+				"other cannot.",
 		},
 		{
 			Name:    "reality-encryption",
