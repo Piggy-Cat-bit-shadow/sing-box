@@ -191,6 +191,26 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 // early would report SUCCESS for a teardown that had not happened and might still fail, leaving the
 // caller unable to tell a clean close from a broken one.
 //
+// # The completion boundary
+//
+// Close waits for the drain, and for nothing else. When it returns, every cleanup that was in the
+// queue has run and closeErr is final. It does NOT wait for a Start that is already running and has
+// not reached Add yet, because nothing bounds how long a component's Start may take and waiting for
+// one would make Close unbounded. The return of Close therefore must NOT be read as "every in-flight
+// Start has terminated":
+//
+//   - a component still inside Start when Close returns carries on running, and can acquire - and
+//     then release - resources after Close returned;
+//   - the cleanup such a component registers afterwards runs synchronously inside Add, on that
+//     caller's goroutine. That is what stops those resources from leaking permanently, but it
+//     happens AFTER Close returned, so it is not part of the teardown Close reported;
+//   - if that late cleanup returns an error, Add logs it and does nothing else. The error is not
+//     folded into the closeErr that was already returned, and closeErr is final, so a later Close
+//     does not pick it up either. Only the log records it.
+//
+// A Start that was in flight is told the Scope is gone through its own context and must report
+// failure rather than success; see Scope.Start.
+//
 // The wait is bounded by the drain itself and creates no goroutine, so there is nothing to abandon if
 // a cleanup blocks. Close is NOT reentrant from a cleanup running on the SAME Scope: such a call
 // would be waiting for the drain it is itself inside. Closing a nested Scope from a parent's cleanup
