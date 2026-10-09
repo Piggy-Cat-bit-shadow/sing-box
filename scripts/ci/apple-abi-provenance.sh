@@ -469,6 +469,41 @@ if [ -n "$gitlink" ] && g cat-file -e "$gitlink^{commit}" 2>/dev/null; then
   done
 fi
 
+# The counter-check to section 4: sweep the PINNED revision the same way. A gap of
+# "pinned=0 unmigrated, checkout=N unmigrated" is the whole finding in one line, and
+# it is the difference between "the migration is missing" and "the migration is not
+# checked out". Only possible when the pin's blobs can be read.
+if [ "${APPLE_ABI_ALLOW_LAZY_FETCH:-0}" = "1" ] && [ -n "$gitlink" ]; then
+  pinned_sweep="$(mktemp -d)"
+  pinned_paths="$(for pname in $patch_files; do
+    awk '/^diff --git /{p=$4; sub(/^b\//,"",p); print p}' "$patches_dir/$pname"
+  done | sort -u)"
+  got_any=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    mkdir -p "$pinned_sweep/$(dirname "$path")"
+    if g show "$gitlink:$path" >"$pinned_sweep/$path" 2>/dev/null; then got_any=1; fi
+  done <<<"$pinned_paths"
+  if [ "$got_any" = "1" ]; then
+    psum="$(find "$pinned_sweep" -name '*.swift' -print0 2>/dev/null | xargs -0 awk -v accs="$accessors" '
+      BEGIN { n = split(accs, A, " ") }
+      { for (i = 1; i <= n; i++) { a = A[i]; pat = "\\." a "\\(\\)"; s = $0
+          while (match(s, pat)) { after = substr(s, RSTART + RLENGTH, 1)
+            if (after == "!") { m++ } else { u++ }
+            s = substr(s, RSTART + RLENGTH) } } }
+      END { printf "migrated=%d unmigrated=%d", m + 0, u + 0 }')"
+    p_unmig="$(printf '%s' "$psum" | sed -n 's/.*unmigrated=\([0-9]*\).*/\1/p')"
+    if [ "${p_unmig:-1}" = "0" ]; then
+      pass COVERAGE "the pinned revision itself has 0 unmigrated accessor call sites ($psum), so the gap above is the checkout, not the migration"
+    else
+      fail COVERAGE "the pinned revision itself has $p_unmig unmigrated accessor call site(s) ($psum); the migration is incomplete at the pin"
+    fi
+  else
+    skip COVERAGE "the pinned file text could not be read; the pinned-revision sweep was skipped"
+  fi
+  rm -rf "$pinned_sweep"
+fi
+
 # =============================================================================
 echo
 echo "---- provenance summary ----"
