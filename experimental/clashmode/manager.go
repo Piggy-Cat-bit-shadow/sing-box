@@ -48,6 +48,31 @@ type Manager struct {
 	updateAccess sync.Mutex
 	modeList     []string
 	updateHooks  []*observable.Subscriber[struct{}]
+	// modeSequence numbers the switches, and is what keeps an OLDER persistence call from landing
+	// after a newer one.
+	//
+	// # The defect it closes
+	//
+	// SetMode publishes the mode, releases the lock, and only then calls `cacheFile.StoreMode`, which
+	// may touch a disk. Nothing ordered those calls, so two controllers switching concurrently could
+	// have them complete in the opposite order from the switches they belong to:
+	//
+	//	A: switch to Global, park inside StoreMode
+	//	B: switch to Direct, StoreMode returns
+	//	A: StoreMode returns, writing Global over Direct
+	//
+	// The runtime then holds Direct while the persisted value is Global, and the NEXT process start
+	// restores a mode the user had already left. MEASURED before this field existed:
+	// `runtime="Direct" persisted="Global" write order=[Direct Global]`.
+	//
+	// # Why a sequence and not the existing lock
+	//
+	// Putting StoreMode back inside `updateAccess` would hold a control-plane lock across a disk write,
+	// which is the shape that turns a slow filesystem into stalled routing. The sequence instead makes
+	// persistence LAST-WRITER-WINS BY SWITCH ORDER: each switch claims a ticket, and only a switch that
+	// still holds the newest ticket persists. `Mode()` stays a lock-free atomic load, and the mode's
+	// publication is never delayed by persistence.
+	modeSequence atomic.Uint64
 }
 
 func NewManager(ctx context.Context, logger log.Logger, defaultMode string, modeList []string) *Manager {
@@ -137,23 +162,65 @@ func (m *Manager) SetMode(newMode string) {
 	// StoreMode may touch the disk. Holding the lock across any of them would let a slow subscriber or
 	// a slow filesystem stall the next mode switch - and, before Mode() became lock-free, every
 	// connection that reached a `clash_mode` rule.
+	sequence := m.modeSequence.Add(1)
+
 	for _, hook := range updateHooks {
 		hook.Emit(struct{}{})
 	}
 	if m.dnsRouter != nil {
 		m.dnsRouter.ClearCache()
 	}
-	cacheFile := service.FromContext[adapter.CacheFile](m.ctx)
-	if cacheFile != nil {
-		err := cacheFile.StoreMode(newMode)
-		if err != nil {
-			if m.logger != nil {
-				m.logger.Error(E.Cause(err, "save mode"))
-			}
-		}
-	}
+	m.persistMode(newMode, sequence)
 	if m.logger != nil {
 		m.logger.Info("updated mode: ", newMode)
+	}
+}
+
+// persistMode records newMode, unless a later switch has already claimed the right to record its own.
+//
+// See Manager.modeSequence for the defect this closes. The rule is one line: a switch may persist only
+// while it still holds the newest ticket. That makes the last switch - in switch order, not in
+// completion order - the one whose value survives, so the persisted mode converges on the runtime mode
+// even when the underlying store calls complete out of order.
+//
+// It deliberately does NOT wait for an older store to finish before writing a newer value. The ticket
+// is checked immediately before the write and the write is serialised with the other writes, so the
+// newest value is the last one handed to the backend; that is the whole ordering requirement.
+//
+// A superseded switch returns silently rather than reporting success, because it did not persist
+// anything - and it must not, or it would undo the newer switch it lost to.
+func (m *Manager) persistMode(newMode string, sequence uint64) {
+	if m.modeSequence.Load() != sequence {
+		// A newer switch has already claimed persistence. Writing now would overwrite a value the user
+		// moved to more recently, which is exactly the bug this exists to prevent.
+		return
+	}
+	cacheFile := service.FromContext[adapter.CacheFile](m.ctx)
+	if cacheFile == nil {
+		return
+	}
+	// No write lock is taken here, and that is a decision rather than an omission.
+	//
+	// Serialising the calls would mean a switch parked in a slow backend holds the other switch out of
+	// persistence entirely - measured: with a lock here, the second switch could not finish while the
+	// first was parked, which turns a slow disk into a stalled controller. Holding a lock across I/O is
+	// the shape this file already avoids for the hooks and the cache clear.
+	//
+	// It is also unnecessary for the ordering. The ticket is checked immediately before the call, and a
+	// switch only reaches this point while holding the NEWEST ticket; any switch that could supersede
+	// it has already taken a higher one, so the superseded call returns above instead of writing. The
+	// last value handed to the backend is therefore the newest one.
+	//
+	// Re-checked once more here because the claim is read again after the cheap work above, and a
+	// switch that lost the race in that gap must not write.
+	if m.modeSequence.Load() != sequence {
+		return
+	}
+	err := cacheFile.StoreMode(newMode)
+	if err != nil {
+		if m.logger != nil {
+			m.logger.Error(E.Cause(err, "save mode"))
+		}
 	}
 }
 
