@@ -80,6 +80,112 @@ jobs:
         # of something this fork relies on, and it prints where each assumption lives.
         run: ./scripts/ci/verify-upstream-assumptions.sh
 
+      - name: nested Go module integrity
+        # A nested module inherits neither the root module's replaces nor its go.sum, and this
+        # repository has two that build or test the product. The guard decides the parity set from
+        # the RESOLVED module graph rather than from a hand-written list, and it carries an
+        # independent expectation for the load-bearing forks.
+        #
+        # Both halves are needed. The hand-written list named sing and quic-go and omitted
+        # sing-tun, so `test` resolved UPSTREAM sing-tun while the root built the fork carrying the
+        # Go TUN stack's Start/Close fix - the tests verified a different object than the one that
+        # ships, and the guard reported success. The independent list is what fails when a fork pin
+        # is dropped from the root and the nested module at the same time, which the derived rule
+        # alone cannot see by construction.
+        #
+        # --require-checked makes "the test module was actually checked" a condition of passing, so
+        # an --exclude that quietly removes it is a failure rather than a smaller green run.
+        run: ./scripts/ci/check-go-module-integrity.sh --require-checked test
+
+      - name: nested test module type-checks against this checkout
+        # `test/*.go` is `package main` with no `func main`, deliberately: the suites drive the
+        # package directly and `go test` generates the entry point. So `go build ./...` inside
+        # `test` fails by design ("function main is undeclared in the main package") and is NOT the
+        # build check for that module - `go vet ./...` is: it type-checks every package including
+        # the test files and links nothing.
+        #
+        # This is what turns "the test module tests the production sources" into a check. The module
+        # replaces github.com/sagernet/sing-box with the working tree, and the step above pins its
+        # other dependencies to the same fork revisions the root builds; vetting the whole module
+        # here is what proves it still compiles against THIS tree.
+        run: |
+          set -euo pipefail
+          tags="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
+          cd test
+          go vet -tags "$tags" ./...
+          echo "PASS: the test module type-checks against the working tree"
+
+      - name: build-tag policy and linkname gates
+        # cmd/internal/build_libbox owns the tag composition each shipped artifact is compiled with,
+        # and the tests next to it are the only thing that notices when a tag moves. They are easy
+        # to leave out of a package list because the package is a `main`, so they are run by
+        # directory.
+        #
+        # Two of them are gates on the Go linker contract rather than on a tag list:
+        # TestRuntimeLinknamePullsAreGatedOnChecklinkname0 reads the pinned runtime's source to
+        # decide which //go:linkname pulls need -checklinkname=0, and
+        # TestProfileTagFilesDoNotClaimChecklinkname0 requires the profile tag files to stop claiming
+        # that flag. Together they are what keeps a bare `go build ./...` linkable.
+        run: go test -count=1 ./cmd/internal/...
+
+      - name: untagged build of every package
+        # `go build ./...` with NO tags is the configuration a reader gets by default and the one
+        # `make test` uses first. It did not compile:
+        #
+        #   transport/http/client.go:239:33: undefined: http3LifecycleTracer
+        #   transport/http/stream_error.go:170:5: undefined: classifyH3ErrorCode
+        #   transport/http/stream_error.go:170:34: undefined: h3ErrorExpected
+        #   transport/masque/session.go:88:31: undefined: transportHTTP.OwnedDatagramSender
+        #   transport/masque/server.go:617:19: undefined: transportHTTP.CarriesQuicSemantics
+        #   protocol/naive/quic/inbound_init.go:203:12: undefined: newNaiveH3ServerLogger
+        #
+        # The withheld code was the shared HTTP/3 code table, the optional capability interfaces
+        # and the error classifier - none of which is a QUIC runtime dependency. `undefined` is not
+        # an acceptable way to express "this build has no QUIC", so the untagged configuration is
+        # gated rather than tolerated.
+        #
+        # `go test -run '^$'` is part of the same gate on purpose. `go build ./...` does not compile
+        # test files, and three of them were gated on the wrong thing and failed the untagged build
+        # of their own package's test binary (transport/http's strict-fallback test, tailscale's
+        # detour-dependency test, common/tls's session-id test). Compiling every test binary is the
+        # only cheap way to notice that class of drift; the tests are not run here.
+        run: |
+          set -euo pipefail
+          go build ./...
+          echo "PASS: untagged go build ./..."
+          go test -run '^$' ./...
+          echo "PASS: untagged test binaries compile and link"
+
+      - name: tagged build of every package
+        # The server profile - what the Docker image, the Makefile default and build-server.sh all
+        # build - with no -ldflags, which is exactly how a reader would build it. This is the gate
+        # for "a package whose LINK depends on a flag the tag set does not carry".
+        #
+        # DEFAULT_BUILD_TAGS (the Darwin profile) is deliberately NOT used here: it carries
+        # with_naive_outbound, and no Linux product links cronet. DEFAULT_BUILD_TAGS_OTHERS still
+        # exercises the same linker contract on this runner, because
+        # experimental/libbox/internal/runtimeinfo pulls runtime.allgs on every GOOS while the
+        # Darwin-only signal handler pulls runtime.fwdSig.
+        #
+        # experimental/libbox was that package. release/DEFAULT_BUILD_TAGS* named
+        # tfogo_checklinkname0, the tag whose documented meaning is "this build passes
+        # -checklinkname=0", while a bare `go build` links with Go's default policy and cmd/go
+        # cannot inject the flag per package:
+        #
+        #   link: github.com/sagernet/sing-box/experimental/libbox: invalid reference to runtime.fwdSig
+        #   link: .../experimental/libbox/internal/runtimeinfo: invalid reference to runtime.allgs
+        #
+        # The tag now travels with the flag: the mobile builders keep it in
+        # cmd/internal/mobilebuildtags and cmd/internal/build_boxdd appends it, because both really
+        # do pass -checklinkname=0. The Darwin-only half cannot be linked from this runner (a Darwin
+        # cgo binary cannot be cross-linked), so it is guarded structurally by the tag-policy tests
+        # in the step above.
+        run: |
+          set -euo pipefail
+          tags="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
+          go build -tags "$tags" ./...
+          echo "PASS: go build -tags \"$tags\" ./..."
+
       - name: build matrix
         # A signature change upstream is a build failure here rather than a silent behaviour change
         # later. The main binary is not built for every target: only the packages this fork changes,
