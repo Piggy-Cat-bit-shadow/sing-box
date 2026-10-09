@@ -33,11 +33,17 @@ func TestLookupFamiliesPublishesAsFamiliesComplete(t *testing.T) {
 	// Drives the REAL Router.LookupFamilies. A Router with just a client and a logger is
 	// enough, because the no-rule path goes straight to the client with the strategy forced -
 	// which is exactly the code under test.
+	// The slow family is held unanswered until the fast one has been published. That is the claim
+	// - "the fast family must not be held back by its slower sibling" - stated as the event it is.
+	// The old form let AAAA answer at 80ms and required the fast family's publication to land
+	// inside 80ms, which is a statement about the machine: the publication is a callback on a
+	// goroutine the host schedules.
+	holdAAAA := make(chan struct{})
 	transport := &familySchedulingTransport{
 		delayA:      0,
-		delayAAAA:   80 * time.Millisecond,
 		addressA:    "192.0.2.1",
 		addressAAAA: "2001:db8::1",
+		holdAAAA:    holdAAAA,
 	}
 	client := NewClient(ClientOptions{Context: context.Background(), Logger: log.NewNOPFactory().Logger()})
 	client.Start()
@@ -59,25 +65,38 @@ func TestLookupFamiliesPublishesAsFamiliesComplete(t *testing.T) {
 	)
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := router.LookupFamilies(ctx, "example.test.", adapter.DNSQueryOptions{
-		Transport: transport,
-		Strategy:  C.DomainStrategyPreferIPv6,
-	}, func(result adapter.DNSFamilyResult) {
-		access.Lock()
-		arrivals = append(arrivals, arrival{ipv6: result.IPv6, addresses: len(result.Addresses), at: time.Since(start)})
-		access.Unlock()
-	})
-	require.NoError(t, err)
+	firstPublished := make(chan struct{})
+	var publishOnce sync.Once
+	lookupDone := make(chan error, 1)
+	go func() {
+		lookupDone <- router.LookupFamilies(ctx, "example.test.", adapter.DNSQueryOptions{
+			Transport: transport,
+			Strategy:  C.DomainStrategyPreferIPv6,
+		}, func(result adapter.DNSFamilyResult) {
+			access.Lock()
+			arrivals = append(arrivals, arrival{ipv6: result.IPv6, addresses: len(result.Addresses), at: time.Since(start)})
+			access.Unlock()
+			publishOnce.Do(func() { close(firstPublished) })
+		})
+	}()
+
+	select {
+	case <-firstPublished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the fast family was never published while its slower sibling was deliberately " +
+			"left unanswered, so the lookup is waiting for both families before publishing either")
+	}
+	close(holdAAAA)
+
+	require.NoError(t, <-lookupDone)
 
 	access.Lock()
 	defer access.Unlock()
 	require.Len(t, arrivals, 2, "both families must be published")
 	require.False(t, arrivals[0].ipv6, "the fast family must be published first")
-	require.Less(t, arrivals[0].at, 80*time.Millisecond,
-		"the fast family must not be held back by its slower sibling")
 	require.Greater(t, arrivals[0].addresses, 0)
 }
 

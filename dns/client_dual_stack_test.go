@@ -33,6 +33,13 @@ type familySchedulingTransport struct {
 	delayA    time.Duration
 	delayAAAA time.Duration
 
+	// holdAAAA, when non-nil, keeps the AAAA query unanswered until the test closes it. A nil
+	// channel blocks forever, so leaving it unset disables the gate and every caller that does not
+	// set it behaves exactly as before. It exists so a test can state "the fast family is published
+	// before its slower sibling answers" as an event rather than as a wall-clock bound on the
+	// publication.
+	holdAAAA <-chan struct{}
+
 	addressA    string
 	addressAAAA string
 
@@ -92,6 +99,13 @@ func (t *familySchedulingTransport) Exchange(ctx context.Context, message *mDNS.
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if qType == mDNS.TypeAAAA && t.holdAAAA != nil {
+		select {
+		case <-t.holdAAAA:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
