@@ -1,0 +1,370 @@
+{
+  "schema": "jiejiebox.v016-next-round-baseline/v1",
+  "purpose": "machine-parseable snapshot of the state the next round starts from: every repository, branch, full SHA, dirty count, upstream comparison, toolchain, build tags and CI link that was actually measured",
+  "generated_at_utc": "2026-10-09T12:51:21Z",
+  "observed_at_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+  "observed_at_note": "core fork origin/testing at the moment of measurement; nothing in this file is copied from a planning document",
+  "will_not_claim": [
+    "no CI run exists at observed_at_sha or at the phase-A start SHA, so no CI PASS is claimed for either",
+    "no artifact exists at observed_at_sha; every recorded digest was produced at 0fbca8546, 18 commits earlier",
+    "dirty counts are recorded only for repositories that are actually checked out on this host; the others are marked not_checked_out rather than reported as clean",
+    "the utls and sing-tun fork pins are pseudo-versions, not the forks' branch tips; both values are recorded separately"
+  ],
+
+  "core_fork": {
+    "repository": "Piggy-Cat-bit-shadow/sing-box",
+    "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box.git",
+    "role": "the fork under test (core)",
+    "default_branch": "testing",
+    "remote_head_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+    "remote_head_verified_by": "git ls-remote origin refs/heads/testing",
+    "remote_branches": [
+      "testing"
+    ],
+    "remote_branches_verified_by": "gh api repos/Piggy-Cat-bit-shadow/sing-box/branches",
+    "remote_branch_note": "exactly one branch exists on origin. fix/lifecycle-stage1 was never pushed, which is why the stage-A handoff's pushed=false is still literally true.",
+    "local_checkout": {
+      "worktree": "/tmp/jb/s08",
+      "state": "detached HEAD, isolated worktree of the same repository",
+      "head_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+      "local_branch_testing_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+      "matches_remote_head": true,
+      "dirty_count": 0,
+      "dirty_count_command": "git status --porcelain=v1 -uall | wc -l",
+      "note": "the user's own working tree is a different checkout and was deliberately not read or modified by this measurement"
+    },
+    "tag_description": "tooling-v0.1.5-192-gef83b8681",
+    "upstream_compare": {
+      "upstream_remote": "https://github.com/SagerNet/sing-box.git",
+      "upstream_branch": "testing",
+      "upstream_head_sha": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+      "upstream_head_verified_by": "git ls-remote upstream refs/heads/testing",
+      "merge_base": "7a3d4e4a8e71bd7fa824959efdb57b4f39738802",
+      "fork_only": 1479,
+      "upstream_only": 53,
+      "command": "git rev-list --left-right --count origin/testing...upstream/testing",
+      "previous_value_note": "the stage-A handoff recorded 1469/53 at 912ed1efa; the fork-only count is 10 higher because the 10 integrated commits are itself"
+    },
+    "toolchain": {
+      "go_version": "go version go1.25.5 darwin/arm64",
+      "go_version_command": "go version",
+      "goversion": "go1.25.5",
+      "gotoolchain_env": "auto",
+      "goflags": "-mod=mod",
+      "project_pin": "GOTOOLCHAIN=go1.25.5 as used by every stage-A command in docs/fork/",
+      "architecture": "darwin/arm64"
+    },
+    "build_tags": {
+      "source": "release/DEFAULT_BUILD_TAGS",
+      "value": "with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,with_xhttp,badlinkname",
+      "count": 16,
+      "committed_value_trailing_newline": true,
+      "upstream_difference": "carries with_xhttp, which upstream does not, and no tfogo_checklinkname0"
+    },
+    "module_pins": {
+      "sing": "github.com/Piggy-Cat-bit-shadow/sing v0.9.6-0.20261008194531-3af46fe99d3b",
+      "sing_tun_replace": "github.com/Piggy-Cat-bit-shadow/sing-tun v0.0.0-20261008172655-8dde9c8cbe27",
+      "sing_tun_require_line": "github.com/sagernet/sing-tun v0.9.7-0.20261007151655-7539c9855f19",
+      "utls_replace": "github.com/Piggy-Cat-bit-shadow/utls v1.8.8-0.20261009084700-6c3e08ed4c4d",
+      "quic_go": "github.com/Piggy-Cat-bit-shadow/quic-go v0.61.1-0.20260929231714-9c94b1e90d94",
+      "cronet_go": "github.com/Piggy-Cat-bit-shadow/cronet-go v0.0.1-143.0.7499.109-2.0.20260929202119-8c68ce89873c",
+      "note": "root and test/ are separate modules; root/test parity is a standing rule"
+    },
+    "client_gitlinks": {
+      "clients/android": "ec61030d3df74f3e7c39ab848c8996008ecd386a",
+      "clients/apple": "2b23330d489b9f6b45e98f903f458842e8961594",
+      "clients/desktop": "32f915ba595601dbc2dd346c33fe9fedd3e72979",
+      "verified_by": "git ls-tree HEAD clients/"
+    }
+  },
+
+  "repositories": [
+    {
+      "name": "Piggy-Cat-bit-shadow/sing-box",
+      "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box.git",
+      "default_branch": "testing",
+      "head_sha": "ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": 0,
+      "dirty_count_scope": "/tmp/jb/s08 worktree only",
+      "role": "core fork"
+    },
+    {
+      "name": "SagerNet/sing-box",
+      "url": "https://github.com/SagerNet/sing-box.git",
+      "default_branch": "testing",
+      "head_sha": "6afeff4c0f7123b5782f888812e96b8c82c7b699",
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": "not_checked_out",
+      "role": "upstream"
+    },
+    {
+      "name": "Piggy-Cat-bit-shadow/sing-box-for-apple",
+      "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box-for-apple.git",
+      "default_branch": "dev",
+      "head_sha": "d1224bb5081b3df5d0ecc55b1bd3d72ea6c60628",
+      "branches": {
+        "dev": "d1224bb5081b3df5d0ecc55b1bd3d72ea6c60628",
+        "main": "ab33c3f083bb79928ef83c4fb96e9c7ac01bf3ba"
+      },
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": "not_checked_out",
+      "consumed_gitlink_in_core": "2b23330d489b9f6b45e98f903f458842e8961594",
+      "note": "the core consumes a gitlink, not this default branch; the consumed revision is 2b23330d4 and was NOT reachable from the artifact build host"
+    },
+    {
+      "name": "Piggy-Cat-bit-shadow/satelite-one",
+      "url": "https://github.com/Piggy-Cat-bit-shadow/satelite-one.git",
+      "default_branch": "main",
+      "head_sha": "f6a91dfa15392892c9678983907fc2ba5cf4b0a1",
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": "not_checked_out",
+      "main_moved_during_observation": {
+        "newer_sha": "72beebcd977783e0a420e6caa18bf3dc8a2473f2",
+        "seen_via": "gh run list -R Piggy-Cat-bit-shadow/satelite-one (headBranch=main)",
+        "first_seen_utc": "2026-10-09T12:40:43Z",
+        "note": "branches move; the ls-remote value above is the one measured at 12:38:55Z and both are recorded rather than one overwriting the other"
+      },
+      "earlier_measured_sha": {
+        "sha": "f83e8745d05ee1cf7de06425da63c8669a7ef27c",
+        "source": "docs/fork/v016-satelite-release.md, measured in an earlier round",
+        "note": "historical, kept for traceability"
+      },
+      "role": "the shipping Android app (not the standard-SFA submodule)"
+    },
+    {
+      "name": "Piggy-Cat-bit-shadow/sing-tun",
+      "url": "https://github.com/Piggy-Cat-bit-shadow/sing-tun.git",
+      "default_branch": "dev",
+      "head_sha": "7539c9855f19bb51a75f0908ecf6ae1d2d749490",
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": "not_checked_out",
+      "pin_note": "the core consumes the pseudo-version v0.0.0-20261008172655-8dde9c8cbe27, which is NOT this dev tip; the pin and the tip are different coordinates and neither substitutes for the other"
+    },
+    {
+      "name": "Piggy-Cat-bit-shadow/utls",
+      "url": "https://github.com/Piggy-Cat-bit-shadow/utls.git",
+      "default_branch": "v1.7.0-mod-meta",
+      "head_sha": "449a38f8780006758205a60661a0bc374a182ca5",
+      "branches": {
+        "v1.7.0-mod-meta": "449a38f8780006758205a60661a0bc374a182ca5",
+        "master": "4f713392d19ce1802ba11415eb456bf9b5ff6be8",
+        "fix/firefox148-safari263": "6c3e08ed4c4dd43741d4e55f54eb404cd33ad2fa"
+      },
+      "tags": {
+        "utls-hybrid-v1": "6c3e08ed4c4dd43741d4e55f54eb404cd33ad2fa"
+      },
+      "head_sha_verified_by": "git ls-remote --symref HEAD",
+      "observed_at_utc": "2026-10-09T12:38:55Z",
+      "dirty_count": "not_checked_out",
+      "pin_note": "the core consumes the pseudo-version v1.8.8-0.20261009084700-6c3e08ed4c4d, which resolves to 6c3e08ed4 (branch fix/firefox148-safari263, tag utls-hybrid-v1), not to this repository's default branch"
+    }
+  ],
+
+  "ci": {
+    "observed_at_utc": "2026-10-09T12:41:00Z",
+    "tool": "gh run list / gh run view (GitHub Actions API)",
+    "core_fork": {
+      "runs_at_observed_at_sha": 0,
+      "runs_at_observed_at_sha_command": "gh run list -R Piggy-Cat-bit-shadow/sing-box --commit ef83b86819c97cbe58b0397dc74af6aca5f1859d",
+      "runs_at_observed_at_sha_result": "[]",
+      "runs_at_phase_a_start_sha": 0,
+      "runs_at_phase_a_start_sha_result": "[]",
+      "last_ci_covered_sha": "e2d7ac1bee8c0c147b4582ac78f39d503283cf70",
+      "commits_between_last_ci_sha_and_observed_at_sha": 59,
+      "conclusion": "NOT-READY: the integration tip has never been built or tested by CI. The links below are historical evidence at older SHAs and must not be stitched into one acceptance.",
+      "historical_runs": [
+        {
+          "workflow": "Verify",
+          "run_id": 37840121267,
+          "head_sha": "e2d7ac1bee8c0c147b4582ac78f39d503283cf70",
+          "head_branch": "testing",
+          "conclusion": "success",
+          "created_at_utc": "2026-10-08T20:31:45Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37840121267"
+        },
+        {
+          "workflow": "Android Core ARM64",
+          "run_id": 37837674951,
+          "head_sha": "d017b5bb45068e7f35aa2223676dcb5a6f658c7e",
+          "head_branch": "testing",
+          "conclusion": "success",
+          "created_at_utc": "2026-10-08T20:12:15Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37837674951"
+        },
+        {
+          "workflow": "Verify",
+          "run_id": 37837674896,
+          "head_sha": "d017b5bb45068e7f35aa2223676dcb5a6f658c7e",
+          "head_branch": "testing",
+          "conclusion": "success",
+          "created_at_utc": "2026-10-08T20:12:15Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37837674896"
+        },
+        {
+          "workflow": "Verify",
+          "run_id": 37837529036,
+          "head_sha": "4d7b7c1690fdbe575ffa863edf2263b0ab4e23fb",
+          "head_branch": "testing",
+          "conclusion": "failure",
+          "created_at_utc": "2026-10-08T20:11:04Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37837529036"
+        },
+        {
+          "workflow": "Android Core ARM64",
+          "run_id": 37837528736,
+          "head_sha": "4d7b7c1690fdbe575ffa863edf2263b0ab4e23fb",
+          "head_branch": "testing",
+          "conclusion": "failure",
+          "created_at_utc": "2026-10-08T20:11:03Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37837528736"
+        },
+        {
+          "workflow": "Release",
+          "run_id": 37836475099,
+          "head_sha": "8fb4083a318e3cfde39b403d644b3485f3486c97",
+          "head_branch": "testing",
+          "event": "workflow_dispatch",
+          "conclusion": "success",
+          "created_at_utc": "2026-10-08T20:02:35Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37836475099"
+        },
+        {
+          "workflow": "Release",
+          "run_id": 37834659840,
+          "head_sha": "8b2b765bebdca7d767b36b308a3e4a11505915e4",
+          "head_branch": "testing",
+          "event": "workflow_dispatch",
+          "conclusion": "failure",
+          "created_at_utc": "2026-10-08T19:48:06Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37834659840"
+        },
+        {
+          "workflow": "Reference interop (Xray)",
+          "run_id": 37823950876,
+          "head_sha": "1292a85a5e102ff86f2a5974ad8181e1d2d68f1d",
+          "head_branch": "testing",
+          "conclusion": "success",
+          "created_at_utc": "2026-10-08T18:23:50Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/sing-box/actions/runs/37823950876"
+        }
+      ],
+      "historical_runs_note": "all four run ids quoted by docs/fork/v016-release-integration-ledger.md were re-verified against the API and exist with these SHAs; they are still historical evidence spanning several SHAs, exactly as that ledger says"
+    },
+    "satelite_one": {
+      "observed_at_utc": "2026-10-09T12:41:00Z",
+      "runs": [
+        {
+          "workflow": "Release APK",
+          "run_id": 37931613740,
+          "head_sha": "72beebcd977783e0a420e6caa18bf3dc8a2473f2",
+          "head_branch": "main",
+          "status": "in_progress",
+          "conclusion": "",
+          "created_at_utc": "2026-10-09T12:40:43Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/satelite-one/actions/runs/37931613740"
+        },
+        {
+          "workflow": "Android CI",
+          "run_id": 37931598858,
+          "head_sha": "72beebcd977783e0a420e6caa18bf3dc8a2473f2",
+          "head_branch": "main",
+          "status": "in_progress",
+          "conclusion": "",
+          "created_at_utc": "2026-10-09T12:40:35Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/satelite-one/actions/runs/37931598858"
+        },
+        {
+          "workflow": "Android CI",
+          "run_id": 37931459353,
+          "head_sha": "f6a91dfa15392892c9678983907fc2ba5cf4b0a1",
+          "head_branch": "main",
+          "status": "in_progress",
+          "conclusion": "",
+          "created_at_utc": "2026-10-09T12:39:20Z",
+          "url": "https://github.com/Piggy-Cat-bit-shadow/satelite-one/actions/runs/37931459353"
+        }
+      ],
+      "conclusion": "no completed conclusion at observation time; recorded as in_progress, not as a pass",
+      "standing_rule": "satelite-one CI PASS is not a release-core-pin PASS: release-apk.yml fetches the pinned SHA from source, so dev CI floating on testing HEAD proves nothing about the pin"
+    },
+    "sing_box_for_apple": {
+      "observed_at_utc": "2026-10-09T12:41:00Z",
+      "runs": [],
+      "conclusion": "no Actions runs exist on this repository; the Apple product gate remains BLOCKED on the client source tree, not on CI"
+    }
+  },
+
+  "ci_workflows_in_core_fork": [
+    ".github/workflows/android-core-arm64.yml",
+    ".github/workflows/client-apple.yml",
+    ".github/workflows/client-macos.yml",
+    ".github/workflows/interop-xray.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/server-linux-amd64.yml",
+    ".github/workflows/verify.yml",
+    ".github/workflows/windows-core-amd64.yml"
+  ],
+
+  "artifact_baseline": {
+    "note": "no artifact exists at observed_at_sha; these digests were produced at 0fbca85462689c1ea72f7f1af511540ff873aeba, which is 18 commits behind the integration tip",
+    "items": [
+      {
+        "object": "satelite-one-arm64-v8a-release.apk",
+        "size_bytes": 29532055,
+        "sha256": "3a46d824d390ea78973e49b366f4cf780af683593e44f98d5633d2caf749a851",
+        "signed": false,
+        "source": "docs/fork/v016-satelite-release.md"
+      },
+      {
+        "object": "libbox.aar",
+        "size_bytes": 117460338,
+        "sha256": "02c28683c724652e66e74489d57af58bdfb907fba579de6c0705c600ffa0e255",
+        "source": "docs/fork/v016-satelite-release.md"
+      },
+      {
+        "object": "libbox-legacy.aar",
+        "size_bytes": 96946267,
+        "sha256": "c4c1687ecfda2e506ee02f0ef0ba005fd64636ed399fbc7c1095e2973ce2061e",
+        "source": "docs/fork/v016-satelite-release.md"
+      },
+      {
+        "object": "Libbox.xcframework",
+        "artifact_status": "built and ABI-probed, unsigned; no full-tree sha256 recorded anywhere in the tree",
+        "source": "docs/fork/apple-artifact-verification.md"
+      },
+      {
+        "object": "Apple IPA / macOS DMG",
+        "artifact_status": "absent",
+        "blocked_by": "Apple client source tree at 2b23330d489b9f6b45e98f903f458842e8961594 not reachable from the build host"
+      }
+    ]
+  },
+
+  "secrets": {
+    "secrets_included": false,
+    "credential_scan_performed": true,
+    "credential_scan_result": "no credential material appears in any recorded value: every repository URL is a public https URL with no userinfo, and no token, key or password was read into this snapshot",
+    "redaction_policy": "a credential-like value would be recorded only as sha256(salt || value); the salt is supplied out of band via JB_REDACT_SALT and is never committed",
+    "redacted_fields": [],
+    "example_of_the_mechanism": {
+      "algorithm": "sha256(salt || value)",
+      "salt_committed": false,
+      "applied_to": "nothing in this file - the list above is empty by measurement, not by assumption"
+    },
+    "environment_note": "the GitHub CLI is authenticated on this host with a token that was never printed, stored or hashed into this file"
+  },
+
+  "unverifiable_here": [
+    "whether the fork's origin/testing HEAD builds and passes CI: no run exists at ef83b8681, and no build was executed by this documentation round",
+    "the Apple product artifacts (IPA/DMG): blocked on the client source tree at 2b23330d4",
+    "runtime behaviour on any device: no device or emulator was used",
+    "the satelite-one in-progress runs recorded above: they had no conclusion at observation time",
+    "the satelite-one main tip is a moving target and may differ from the value recorded here by the time it is read"
+  ]
+}
