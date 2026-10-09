@@ -89,7 +89,13 @@ unexpected=0
 while IFS= read -r name; do
   [ -z "$name" ] && continue
   known=0
-  for candidate in "${KNOWN_FAILURES[@]}"; do
+  # ${arr[@]+"${arr[@]}"} and not "${arr[@]}": on the bash this actually runs under (3.2 on
+  # macOS) an EMPTY array expanded with "${arr[@]}" under `set -u` is an unbound-variable error, and
+  # `set -e` then aborts the script. So the classification step could never complete in exactly the
+  # state the comment above declares to be the intended one - an EMPTY list - and the "UNEXPECTED
+  # FAILURE" report and its exit-1 gate were unreachable. The guarded form expands to nothing when
+  # the list is empty and still preserves an element containing spaces.
+  for candidate in ${KNOWN_FAILURES[@]+"${KNOWN_FAILURES[@]}"}; do
     if [ "$name" = "$candidate" ]; then known=1; break; fi
   done
   if [ "$known" -eq 1 ]; then
