@@ -1,0 +1,54 @@
+SHA            sing-tun-pin                                   SUBJECT
+6e3c86f51816   v0.9.6-0.20260924001923-ddaa4ca25e3b           Use screen state to end device pause on iOS
+f95aa6ac11d0   v0.9.6                                         Update dependencies
+79fc394d671c   v0.9.6                                         documentation: Update Apple App Store link
+a0d775ea6610   v0.9.7-0.20260928080829-8ab0e83967b4           Fix zero UDP checksum
+52f9bad034d2   v0.9.7-0.20260929152151-0bdadeb4c934           Fix protocol input validation
+bff5acf292d8   v0.9.7-0.20260929152151-0bdadeb4c934           Handle connected UDP EOF on BSD
+a364ff4794f0   v0.9.7-0.20260929152151-0bdadeb4c934           Remove unimplemented hot reload from managers
+a691a4402375   v0.9.7-0.20260929152151-0bdadeb4c934           Refactor lifecycle to scoped cleanup
+f9fcb8964f0b   v0.9.7-0.20260929152151-0bdadeb4c934           Fix usage and cache files overwritten when loading fails
+02537831e188   v0.9.7-0.20260929152151-0bdadeb4c934           Move auto-redirect and bridge index allocation out of constructors
+67fb235ee802   v0.9.7-0.20260929152151-0bdadeb4c934           Add roothide package to iOS jailbreak release
+80c11714105b   v0.9.7-0.20260929152151-0bdadeb4c934           tailscale: Fix SSH auth banners never sent
+194ebd18b64b   v0.9.7-0.20261007151649-0e9e4a586ece           tun: Fix inconsistent DNS mode behavior without auto_route
+1a773a425a8e   v0.9.7-0.20261007151649-0e9e4a586ece           Exclude USB/IP from legacy macOS build
+78d44d52d959   v0.9.7-0.20261009020158-bca4bf029237           Reset network on DNS server changes
+7054cac51244   v0.9.7-0.20261009020158-bca4bf029237           Bump version
+9da9678bae29   v0.9.7-0.20261009020158-bca4bf029237           Format plural list options as arrays
+3f7f7eb3c09d   v0.9.7-0.20261009022811-5c2edb183cc9           Implement fully functional auto redirect for Android
+457105107907   v0.9.7-0.20261009022811-5c2edb183cc9           Migrate anytls into our own library
+e7399fd98147   v0.9.7-0.20261009022811-5c2edb183cc9           Load rule-sets through mmap on iOS
+c7fe73c25710   v0.9.7-0.20261009022811-5c2edb183cc9           Buffer cache file writes
+efe4db93324b   v0.9.7-0.20261009022811-5c2edb183cc9           Close idle connections of unreferenced outbounds and DNS servers
+17e950e74cc0   v0.9.7-0.20261009022811-5c2edb183cc9           Improve idle connection management
+f3e721980c69   v0.9.7-0.20261009022811-5c2edb183cc9           Improve process search
+a4d994a0b0c9   v0.9.7-0.20261009022811-5c2edb183cc9           Report every process sharing a socket in Linux process search
+fd26ea8578f9   v0.9.7-0.20261009022811-5c2edb183cc9           Use screen state to end device pause on iOS
+7632cdab9aae   v0.9.7-0.20261009022811-5c2edb183cc9           Add go TUN stack
+5f404b8c6f5c   v0.9.7-0.20261009022811-5c2edb183cc9           Remove dependency on gVisor
+10dabb8d1271   v0.9.7-0.20261009022811-5c2edb183cc9           Add tailcat support
+9ba85a15fe6b   v0.9.7-0.20261009022811-5c2edb183cc9           Fix auto redirect DNS hijack to local address with iptables
+38b7a586b568   v0.9.7-0.20261009022811-5c2edb183cc9           Resolve Windows connection owners without scanning the TCP table
+d0698c55a8c9   v0.9.7-0.20261009022811-5c2edb183cc9           Validate IP addresses and prefixes in JSON schema
+8feb0ec263e5   v0.9.7-0.20261009022811-5c2edb183cc9           Fix DNS sniffer matching non-DNS packets
+6f6d43b12a33   v0.9.7-0.20261009022811-5c2edb183cc9           Fix Android auto-redirect routing
+1a6b6615c6e5   v0.9.7-0.20261009022811-5c2edb183cc9           Rewrite HTTP proxy protocol
+46a897c5d123   v0.9.7-0.20261009022811-5c2edb183cc9           Fix FakeIP storage consistency with buffered cache file writes
+e2a8d9c85e5a   v0.9.7-0.20261009022811-5c2edb183cc9           Add MASQUE support
+1b226006e64d   v0.9.7-0.20261009022811-5c2edb183cc9           Add full certificate SHA-256 pinning for TLS
+41ef639b548f   v0.9.7-0.20261009022811-5c2edb183cc9           Fix outbound group resolution and interruption for nested groups
+9a0ff4167579   v0.9.7-0.20261009022811-5c2edb183cc9           Fix HTTP/2 extended CONNECT with Go 1.27
+7f7c7ae11a38   v0.9.7-0.20261009022811-5c2edb183cc9           Fix AnyTLS splitting UDP packets into multiple frames
+e8d26b0f75e9   v0.9.7-0.20261009022811-5c2edb183cc9           Fix bridge forwarding with auto-redirect
+9ea795798378   v0.9.7-0.20261009022811-5c2edb183cc9           Use Prefixable for ip_cidr rule options
+530e3aed7aac   v0.9.7-0.20261009022811-5c2edb183cc9           Add dns_server_address and dns_search_domain rule items
+c6d5bafa3630   v0.9.7-0.20261009022811-5c2edb183cc9           Fix on-demand endpoint resume
+7c4516a570c0   v0.9.7-0.20261009022811-5c2edb183cc9           Remove shared field defaults from MASQUE docs
+1e157350b789   v0.9.7-0.20261009022811-5c2edb183cc9           Fix per-destination backpressure to endpoints
+6ef3dbc61078   v0.9.7-0.20261009022811-5c2edb183cc9           Update naiveproxy to v154.0.8037.49-2
+5802f1f71990   v0.9.7-0.20261009022811-5c2edb183cc9           Fix protocol input validation
+a2b0923e0187   v0.9.7-0.20261009022811-5c2edb183cc9           Fix Xcode build cache reuse across package updates
+df8e2edfd587   v0.9.7-0.20261009022811-5c2edb183cc9           Rework forward NAT with UDP mapping and fragment support
+69601481fd36   v0.9.7-0.20261009022811-5c2edb183cc9           Ignore closed and canceled errors in scope cleanup
+6afeff4c0f71   v0.9.7-0.20261009022811-5c2edb183cc9           Bump version

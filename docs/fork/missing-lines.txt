@@ -1,0 +1,1886 @@
+### 6e3c86f51816  Use screen state to end device pause on iOS
+    experimental/libbox/command_server.go: 10/22 added lines absent from the fork tip
+      - // iOS wakes the extension for every push and background task, so wake is ignored there and
+      - // the pause ends on the screen state instead.
+      - if instance == nil || instance.Box() == nil || instance.PauseManager() == nil {
+      - instance.Box().CloseIdleConnections()
+      - instance.PauseManager().DevicePause()
+      - if !C.IsAndroid {
+      - if instance == nil || instance.PauseManager() == nil {
+      - instance.PauseManager().DeviceWake()
+      - if instance == nil || instance.PauseManager() == nil {
+      - instance.PauseManager().DeviceWake()
+### f95aa6ac11d0  Update dependencies
+    go.mod: 6/6 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6
+      - github.com/sagernet/sing-cloudflared v0.1.3
+      - github.com/sagernet/sing-mux v0.3.9
+      - github.com/sagernet/sing-openconnect v0.1.0
+      - github.com/sagernet/sing-openvpn v0.1.0
+      - github.com/sagernet/sing-tun v0.9.6
+### f95aa6ac11d0  Update dependencies
+    go.sum: 12/12 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6 h1:LXTpEMbr4G/65PSjopjfg+Zp1Xq1ilJnGWq47y/eObI=
+      - github.com/sagernet/sing v0.9.6/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-cloudflared v0.1.3 h1:J5v401QFvUzzamw0udgs1kOPgnmPyPjo9jbPUiJgBXo=
+      - github.com/sagernet/sing-cloudflared v0.1.3/go.mod h1:XEqEDYRCAYLaoPjZ1ifVWJg5iWAJHL2gOAXe/PM28Cg=
+      - github.com/sagernet/sing-mux v0.3.9 h1:fhk1tA1OHkDXHedXLanyu/mUepykCXENM9s6sEymo84=
+      - github.com/sagernet/sing-mux v0.3.9/go.mod h1:jricpwCOndDsTEM1TM3piJvhL/2Mm7OhLkm+JadJJ1Q=
+      - github.com/sagernet/sing-openconnect v0.1.0 h1:nen3Hhr52CHASJtduUwZfMhqgLD30A1LE+SN6Ju2X0Y=
+      - github.com/sagernet/sing-openconnect v0.1.0/go.mod h1:4AKZLVcvY3r54UaK2Gbnm7aN8pOwdLz+y4EP0QFZ5Eg=
+      - github.com/sagernet/sing-openvpn v0.1.0 h1:bmULMzzDP0EsO0UMkbiiNLIvEIKBlozM+ZD3GiJ2Vtg=
+      - github.com/sagernet/sing-openvpn v0.1.0/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
+      - github.com/sagernet/sing-tun v0.9.6 h1:6NfiiT7FZMTnqs+Vvn/APQPMvdOGJ00DM4GPCe9mw1U=
+      - github.com/sagernet/sing-tun v0.9.6/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+### a0d775ea6610  Fix zero UDP checksum
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20260928080829-8ab0e83967b4
+### a0d775ea6610  Fix zero UDP checksum
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20260928080829-8ab0e83967b4 h1:8LMh5gE8agrhOqeaTg9xML99oVeP8ApxqC0uKeS+ruk=
+      - github.com/sagernet/sing-tun v0.9.7-0.20260928080829-8ab0e83967b4/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+### 52f9bad034d2  Fix protocol input validation
+    go.mod: 6/10 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.7-0.20260929145605-8d939df03478
+      - github.com/sagernet/sing-cloudflared v0.1.4-0.20260929150702-b3a1e8f3018c
+      - github.com/sagernet/sing-openconnect v0.1.1-0.20260929151225-cbd68c45de58
+      - github.com/sagernet/sing-openvpn v0.1.1-0.20260929151220-7c3045dbddce
+      - github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
+      - github.com/sagernet/sing-tun v0.9.7-0.20260929152151-0bdadeb4c934
+### 52f9bad034d2  Fix protocol input validation
+    go.sum: 12/20 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.7-0.20260929145605-8d939df03478 h1:c3Jpk13MOAc516zCuqAGBr7ok9UcpGjCjgWWOQslL0w=
+      - github.com/sagernet/sing v0.9.7-0.20260929145605-8d939df03478/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-cloudflared v0.1.4-0.20260929150702-b3a1e8f3018c h1:36zXD/qnDk7sh/J4zSEJsnHf4W3TYNCbmjo9MNIlrE4=
+      - github.com/sagernet/sing-cloudflared v0.1.4-0.20260929150702-b3a1e8f3018c/go.mod h1:XEqEDYRCAYLaoPjZ1ifVWJg5iWAJHL2gOAXe/PM28Cg=
+      - github.com/sagernet/sing-openconnect v0.1.1-0.20260929151225-cbd68c45de58 h1:WOPVlvbw3zGl4IzpRcfqB901blgDKuiplVrpptf/TOY=
+      - github.com/sagernet/sing-openconnect v0.1.1-0.20260929151225-cbd68c45de58/go.mod h1:4AKZLVcvY3r54UaK2Gbnm7aN8pOwdLz+y4EP0QFZ5Eg=
+      - github.com/sagernet/sing-openvpn v0.1.1-0.20260929151220-7c3045dbddce h1:uB2DkIJLZ9waR/ZLBO9IF/ws5BWg0FEegLi90ibhX5I=
+      - github.com/sagernet/sing-openvpn v0.1.1-0.20260929151220-7c3045dbddce/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
+      - github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e h1:LKgE/uuqp/D2kgxYViOz8vf4slaCUfpFywXjtuwD5gU=
+      - github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e/go.mod h1:lo7TWEMDcN5/h5B8S0ew+r78ZODn6SwVaFhvB6H+PTI=
+      - github.com/sagernet/sing-tun v0.9.7-0.20260929152151-0bdadeb4c934 h1:CC1NMvo1hpRY33IJCwXldUOSgCLjYh0T4vq9pX30+tM=
+      - github.com/sagernet/sing-tun v0.9.7-0.20260929152151-0bdadeb4c934/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+### 52f9bad034d2  Fix protocol input validation
+    protocol/naive/inbound.go: 10/14 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common/buf"
+      - "github.com/sagernet/sing/common/bufio"
+      - conn, reader, err := hijacker.Hijack()
+      - if cacheLen := reader.Reader.Buffered(); cacheLen > 0 {
+      - cache := buf.NewSize(cacheLen)
+      - _, err = cache.ReadFullFrom(reader.Reader, cacheLen)
+      - cache.Release()
+      - conn.Close()
+      - n.badRequest(ctx, request, E.Cause(err, "read cache"))
+      - conn = bufio.NewCachedConn(conn, cache)
+### 52f9bad034d2  Fix protocol input validation
+    transport/openconnect/device_system_stack.go: 6/6 added lines absent from the fork tip
+      - if len(packet) < header.IPv4MinimumSize {
+      - return netip.Addr{}
+      - }
+      - if len(packet) < header.IPv6MinimumSize {
+      - return netip.Addr{}
+      - }
+### 52f9bad034d2  Fix protocol input validation
+    transport/openvpn/device_system_stack.go: 6/6 added lines absent from the fork tip
+      - if len(packet) < header.IPv4MinimumSize {
+      - return netip.Addr{}
+      - }
+      - if len(packet) < header.IPv6MinimumSize {
+      - return netip.Addr{}
+      - }
+### bff5acf292d8  Handle connected UDP EOF on BSD
+    go.mod: 2/3 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.7-0.20260929150544-0ad23b637bd4
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260929150556-6731c7387c81
+### bff5acf292d8  Handle connected UDP EOF on BSD
+    go.sum: 6/6 added lines absent from the fork tip
+      - github.com/sagernet/quic-go v0.61.0-sing-box-mod.9 h1:Lojx77uC63TxZO38Z1OSo6aOoBSXY+ueH0/IKKeTZuI=
+      - github.com/sagernet/quic-go v0.61.0-sing-box-mod.9/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
+      - github.com/sagernet/sing v0.9.7-0.20260929150544-0ad23b637bd4 h1:d4WT3KO4zhp9qzPHUZCKqCP+ZmP1GXBsAmReqlnE4zA=
+      - github.com/sagernet/sing v0.9.7-0.20260929150544-0ad23b637bd4/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260929150556-6731c7387c81 h1:VsrjoaljEz7jQ1LWbrNyf/scQSQIkVVp7v4nSDrPJ+I=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260929150556-6731c7387c81/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    adapter/certificate/manager.go: 4/4 added lines absent from the fork tip
+      - err := provider.Start(stage)
+      - _, loaded := m.providerByTag[tag]
+      - if loaded {
+      - return E.New("duplicate certificate provider tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    adapter/endpoint/manager.go: 4/4 added lines absent from the fork tip
+      - err := endpoint.Start(stage)
+      - _, loaded := m.endpointByTag[tag]
+      - if loaded {
+      - return E.New("duplicate endpoint tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    adapter/inbound/manager.go: 4/4 added lines absent from the fork tip
+      - err := inbound.Start(stage)
+      - _, loaded := m.inboundByTag[tag]
+      - if loaded {
+      - return E.New("duplicate inbound tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    adapter/outbound/manager.go: 6/8 added lines absent from the fork tip
+      - starter, isStarter := outbound.(adapter.Lifecycle)
+      - if !isStarter {
+      - err := starter.Start(stage)
+      - _, loaded := m.outboundByTag[tag]
+      - if loaded {
+      - return E.New("duplicate outbound tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    adapter/service/manager.go: 4/4 added lines absent from the fork tip
+      - err := service.Start(stage)
+      - _, loaded := m.serviceByTag[tag]
+      - if loaded {
+      - return E.New("duplicate service tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    box.go: 3/19 added lines absent from the fork tip
+      - done := adapter.LogElapsed(s.logger, "close ntp service")
+      - err = E.Append(err, s.ntpService.Close(), func(err error) error {
+      - return E.Cause(err, "close ntp service")
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    common/tls/std_server.go: 1/1 added lines absent from the fork tip
+      - err := p.provider.Start(stage)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    dns/transport_manager.go: 4/4 added lines absent from the fork tip
+      - err := transport.Start(stage)
+      - _, loaded := m.transportByTag[tag]
+      - if loaded {
+      - return E.New("duplicate DNS server tag: ", tag)
+### a364ff4794f0  Remove unimplemented hot reload from managers
+    protocol/group/urltest.go: 4/17 added lines absent from the fork tip
+      - func (s *URLTest) Start(stage adapter.StartStage) error {
+      - group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.tolerance, s.idleTimeout, s.interruptExternalConnections)
+      - s.group = group
+      - s.group.PostStart()
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    dns/transport/multiplexer_test.go: 1/12 added lines absent from the fork tip
+      - scope.Close()
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/bridge/backend_darwin.go: 1/45 added lines absent from the fork tip
+      - releaseBridgeIndex(b.index)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/bridge/backend_linux.go: 3/68 added lines absent from the fork tip
+      - releaseBridgeIndex(b.index)
+      - removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, unix.AF_INET, b.inet4Port)
+      - removeBridgeFamily(b.tunName, b.ruleIndex, b.routeTable, unix.AF_INET6, b.inet6Port)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/bridge/backend_windows.go: 2/23 added lines absent from the fork tip
+      - releaseBridgeIndex(b.index)
+      - b.reservation.Close()
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/group/urltest.go: 1/2 added lines absent from the fork tip
+      - scope.Add(s.group.Close)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/openconnect/client.go: 2/64 added lines absent from the fork tip
+      - device openconnecttransport.Device
+      - scope.Add(e.device.Close)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/openvpn/client.go: 2/60 added lines absent from the fork tip
+      - device ovpntransport.Device
+      - scope.Add(c.device.Close)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/openvpn/server.go: 1/27 added lines absent from the fork tip
+      - scope.Add(s.device.Close)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/tailscale/endpoint.go: 14/59 added lines absent from the fork tip
+      - netmon.RegisterInterfaceGetter(nil)
+      - netns.SetControlFunc(nil)
+      - netns.SetControlFunc(nil)
+      - netns.SetControlFunc(nil)
+      - netns.SetControlFunc(nil)
+      - netns.SetListenPacketFunc(nil)
+      - fallbackTCPCloser := t.server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+      - return func(conn net.Conn) {
+      - source := M.SocksaddrFrom(src.Addr(), src.Port())
+      - destination := M.SocksaddrFrom(dst.Addr(), dst.Port())
+      - t.NewConnectionEx(ctx, conn, source, destination, nil)
+      - }, true
+      - fallbackTCPCloser()
+      - scope.Add(icmpForwarder.Close)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    protocol/tun/inbound.go: 6/38 added lines absent from the fork tip
+      - callback := routeRuleSet.RegisterCallback(t.updateRouteAddressSet)
+      - scope.Add(func() error {
+      - routeRuleSet.UnregisterCallback(callback)
+      - callback := routeExcludeRuleSet.RegisterCallback(t.updateRouteAddressSet)
+      - scope.Add(func() error {
+      - routeExcludeRuleSet.UnregisterCallback(callback)
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    route/network.go: 4/25 added lines absent from the fork tip
+      - r.environmentUpdateAccess.Lock()
+      - if r.environmentUpdateTimer != nil {
+      - r.environmentUpdateTimer.Stop()
+      - r.environmentUpdateAccess.Unlock()
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    service/ccm/service.go: 1/16 added lines absent from the fork tip
+      - if s.usageTracker != nil {
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    service/oomkiller/service.go: 1/1 added lines absent from the fork tip
+      - state := s.adaptiveTimer.stop()
+### a691a4402375  Refactor lifecycle to scoped cleanup
+    service/oomkiller/service_darwin.go: 9/19 added lines absent from the fork tip
+      - globalAccess.Lock()
+      - for i, svc := range globalServices {
+      - if svc == s {
+      - globalServices = append(globalServices[:i], globalServices[i+1:]...)
+      - break
+      - isLast := len(globalServices) == 0
+      - globalAccess.Unlock()
+      - if isLast {
+      - C.stopMemoryPressureMonitor()
+### 02537831e188  Move auto-redirect and bridge index allocation out of constructors
+    protocol/bridge/backend.go: 1/12 added lines absent from the fork tip
+      - releaseBridgeIndex(index)
+### 02537831e188  Move auto-redirect and bridge index allocation out of constructors
+    protocol/bridge/backend_linux.go: 1/8 added lines absent from the fork tip
+      - if b.routeTable == 0 && (b.boundInterface != "" || b.platform != nil) {
+### 02537831e188  Move auto-redirect and bridge index allocation out of constructors
+    protocol/tun/inbound.go: 16/28 added lines absent from the fork tip
+      - enableAutoRedirect bool
+      - disableNFTables bool
+      - if !C.IsLinux {
+      - return nil, E.New("`auto_redirect` is only supported on Linux")
+      - inbound.enableAutoRedirect = true
+      - inbound.disableNFTables = parseErr == nil && disableNFTables
+      - if t.enableAutoRedirect {
+      - t.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
+      - TunOptions: &t.tunOptions,
+      - Handler: (*autoRedirectHandler)(t),
+      - NetworkMonitor: t.networkManager.NetworkMonitor(),
+      - DisableNFTables: t.disableNFTables,
+      - RouteAddressSet: &t.routeAddressSet,
+      - RouteExcludeAddressSet: &t.routeExcludeAddressSet,
+      - return E.Cause(err, "initialize auto-redirect")
+      - var tunInterface tun.Tun
+### 67fb235ee802  Add roothide package to iOS jailbreak release
+    .github/workflows/build.yml: 1/1 added lines absent from the fork tip
+      - cp "clients/apple/build/jailbreak/SFI-${VERSION}-iphoneos-arm64e.deb" dist
+### 67fb235ee802  Add roothide package to iOS jailbreak release
+    Makefile: 1/1 added lines absent from the fork tip
+      - ghr --replace --draft --prerelease "v${VERSION}" ../sing-box-for-apple/build/jailbreak/"SFI-${VERSION}-iphoneos-arm64e.deb"
+### 67fb235ee802  Add roothide package to iOS jailbreak release
+    docs/clients/apple/index.md: 3/4 added lines absent from the fork tip
+      - * `SFI-iphoneos-arm64.deb`: rootless
+      - * `SFI-iphoneos-arm64e.deb`: roothide
+      - The jailbroken version of SFI: requires rootless or roothide iOS 15.0+
+### 80c11714105b  tailscale: Fix SSH auth banners never sent
+    protocol/tailscale/tailssh/server.go: 2/23 added lines absent from the fork tip
+      - err = preAuthConn.SendAuthBanner(connInfo.action.Message)
+      - s.logger.Info("SSH auth rejected for ", userProfile.LoginName, " -> ", conn.User())
+### 194ebd18b64b  tun: Fix inconsistent DNS mode behavior without auto_route
+    docs/configuration/inbound/tun.md: 2/2 added lines absent from the fork tip
+      - | `hijack` | Same as `native`, with additional port 53 hijacking described below. |
+      - `hijack` is used by default when [`auto_route`](#auto_route) is enabled, otherwise `disabled` is used by default.
+### 194ebd18b64b  tun: Fix inconsistent DNS mode behavior without auto_route
+    docs/configuration/inbound/tun.zh.md: 2/2 added lines absent from the fork tip
+      - | `hijack` | 与 `native` 相同，并额外执行下文所述的 53 端口劫持。 |
+      - 启用 [`auto_route`](#auto_route) 时默认使用 `hijack`，否则默认使用 `disabled`。
+### 194ebd18b64b  tun: Fix inconsistent DNS mode behavior without auto_route
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261007151649-0e9e4a586ece
+### 194ebd18b64b  tun: Fix inconsistent DNS mode behavior without auto_route
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261007151649-0e9e4a586ece h1://BO1bRUuh7JjQ2NFRvXt+A2VXd1mBbp5G2lhv5fCag=
+      - github.com/sagernet/sing-tun v0.9.7-0.20261007151649-0e9e4a586ece/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+### 1a773a425a8e  Exclude USB/IP from legacy macOS build
+    .github/workflows/build.yml: 1/1 added lines absent from the fork tip
+      - TAGS=$(sed 's/,with_usbip//' release/DEFAULT_BUILD_TAGS_OTHERS)
+### 78d44d52d959  Reset network on DNS server changes
+    dns/transport/local/systemconfig/source_darwin.go: 15/17 added lines absent from the fork tip
+      - "github.com/sagernet/sing-tun/dnsinfo"
+      - return &Source{
+      - if s.config != nil && !s.stale && !interfaceChanged && s.interfaceMonitor != nil {
+      - dnsConfiguration := dnsinfo.Copy()
+      - if dnsConfiguration == nil {
+      - s.config = newConfig(dnsinfo.Resolver{})
+      - config := newConfig(dnsConfiguration.Select(interfaceIndex))
+      - func newConfig(resolver dnsinfo.Resolver) *Config {
+      - if len(resolver.Servers) == 0 {
+      - config.Servers = common.Map(resolver.Servers, M.SocksaddrFromNetIP)
+      - for _, searchDomain := range resolver.Search {
+      - config.Search = append(config.Search, searchDomain)
+      - if len(config.Search) == 0 {
+      - if resolver.Timeout > 0 {
+      - config.Timeout = resolver.Timeout
+### 78d44d52d959  Reset network on DNS server changes
+    experimental/libbox/monitor.go: 43/65 added lines absent from the fork tip
+      - "net/netip"
+      - "slices"
+      - "github.com/sagernet/sing-box/adapter"
+      - C "github.com/sagernet/sing-box/constant"
+      - "github.com/sagernet/sing-tun/dnsinfo"
+      - "github.com/sagernet/sing/common"
+      - defaultDNSServers []string
+      - dnsWatcher *dnsinfo.Watcher
+      - if C.IsDarwin {
+      - dnsWatcher, err := dnsinfo.NewWatcher(m.updateDNSServers, m.logger)
+      - return E.Cause(err, "watch DNS configuration")
+      - m.dnsWatcher = dnsWatcher
+      - err := m.iif.StartDefaultInterfaceMonitor(m)
+      - if C.IsDarwin {
+      - m.dnsWatcher.Close()
+      - return err
+      - return nil
+      - err := m.iif.CloseDefaultInterfaceMonitor(m)
+      - if C.IsDarwin {
+      - err = E.Errors(err, m.dnsWatcher.Close())
+      - return err
+      - m.defaultDNSServers = nil
+      - oldDNSServers := m.defaultDNSServers
+      - m.defaultDNSServers = m.readDNSServers(newInterface.Index)
+      - if m.defaultInterfaceInitialized && oldInterface != nil && oldInterface.Name == m.defaultInterface.Name && oldInterface.Index == m.defaultInterface.Index && sli
+      - func (m *platformDefaultInterfaceMonitor) updateDNSServers() {
+      - defaultInterface := m.defaultInterface
+      - if defaultInterface == nil {
+      - dnsServers := m.readDNSServers(defaultInterface.Index)
+      - if slices.Equal(m.defaultDNSServers, dnsServers) {
+      - m.defaultDNSServers = dnsServers
+      - callback(defaultInterface, 0)
+      - func (m *platformDefaultInterfaceMonitor) readDNSServers(interfaceIndex int) []string {
+      - if C.IsDarwin {
+      - dnsConfiguration := dnsinfo.Copy()
+      - if dnsConfiguration == nil {
+      - return nil
+      - return common.Map(dnsConfiguration.Select(interfaceIndex).Servers, func(it netip.AddrPort) string {
+      - return it.Addr().String()
+      - })
+      - return common.Find(m.networkManager.NetworkInterfaces(), func(it adapter.NetworkInterface) bool {
+      - return it.Index == interfaceIndex
+      - }).DNSServers
+### 78d44d52d959  Reset network on DNS server changes
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237
+### 78d44d52d959  Reset network on DNS server changes
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237 h1:B9tUcRf1FAatPyzN8sKEvIHMvKNkFMBZikeIOL4gqtQ=
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009020158-bca4bf029237/go.mod h1:3EgPst7agntRO7D6GOsiZ1l9FoqdLeuWmKT5TnWkmf0=
+### 7054cac51244  Bump version
+    clients/android: 1/1 added lines absent from the fork tip
+      - Subproject commit ae93152f21457723af77d144f28c1f7be7362aec
+### 7054cac51244  Bump version
+    clients/apple: 1/1 added lines absent from the fork tip
+      - Subproject commit e232aaf22d6d68773196ffc8e6e79684a6be717c
+### 7054cac51244  Bump version
+    clients/desktop: 1/1 added lines absent from the fork tip
+      - Subproject commit 50f503849148dd73fa4f4bc231119acf5b2f3d7a
+### 7054cac51244  Bump version
+    docs/changelog.md: 1/2 added lines absent from the fork tip
+      - #### 1.14.3
+### 3f7f7eb3c09d  Implement fully functional auto redirect for Android
+    experimental/libbox/redirect.go: 1/116 added lines absent from the fork tip
+      - DNSMode: tunOptions.DNSModeOrDefault(),
+### 3f7f7eb3c09d  Implement fully functional auto redirect for Android
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009022811-5c2edb183cc9
+### 3f7f7eb3c09d  Implement fully functional auto redirect for Android
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009022811-5c2edb183cc9 h1:VBWPwC1CM/9ULXCtl120Nh64tmjFsybhBvB3IWzF+Mc=
+      - github.com/sagernet/sing-tun v0.9.7-0.20261009022811-5c2edb183cc9/go.mod h1:liMb9HPIWcFWqF6VJ/ttIY8fTSRPdRltBeSeEcXt1Dk=
+### 3f7f7eb3c09d  Implement fully functional auto redirect for Android
+    protocol/tun/inbound.go: 15/125 added lines absent from the fork tip
+      - enableAutoRedirect bool
+      - usePlatformAutoRedirect bool
+      - disableNFTables bool
+      - inbound.usePlatformAutoRedirect = platformInterface != nil && platformInterface.UsePlatformAutoRedirect()
+      - if !inbound.usePlatformAutoRedirect && options.NetNs == "" {
+      - if t.usePlatformAutoRedirect {
+      - t.autoRedirect, err = newPlatformAutoRedirect(t)
+      - t.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
+      - TunOptions: &t.tunOptions,
+      - Handler: (*autoRedirectHandler)(t),
+      - NetworkMonitor: t.networkManager.NetworkMonitor(),
+      - DisableNFTables: t.disableNFTables,
+      - callback := routeRuleSet.RegisterCallback(t.updateRouteAddressSet)
+      - scope.Add(func() error {
+      - routeRuleSet.UnregisterCallback(callback)
+### 457105107907  Migrate anytls into our own library
+    go.mod: 1/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260902113941-3a0c2f92e1af
+### 457105107907  Migrate anytls into our own library
+    go.sum: 4/4 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.7-0.20260929150544-6f21f2425a95 h1:taM2SOI5HK/Ubpi3FO0Bc7bKHsFVdGe4YS/jjXD4kAM=
+      - github.com/sagernet/sing v0.9.7-0.20260929150544-6f21f2425a95/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-anytls v0.0.0-20260902113941-3a0c2f92e1af h1:+aY0fZab/+M2sANsHtE3XCf2Kg4/UeDF8fn5wNsK8ew=
+      - github.com/sagernet/sing-anytls v0.0.0-20260902113941-3a0c2f92e1af/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+### e7399fd98147  Load rule-sets through mmap on iOS
+    common/srs/binary.go: 11/86 added lines absent from the fork tip
+      - func writeRuleItemCIDR(writer varbin.Writer, itemType uint8, value []string, rawSet *ipset.Set, mmap *mmapWriter) error {
+      - for i, prefixString := range value {
+      - prefix, err := netip.ParsePrefix(prefixString)
+      - if err == nil {
+      - builder.AddPrefix(prefix)
+      - continue
+      - addr, addrErr := netip.ParseAddr(prefixString)
+      - if addrErr == nil {
+      - builder.Add(addr)
+      - continue
+      - return E.Cause(err, "parse [", i, "]")
+### e7399fd98147  Load rule-sets through mmap on iOS
+    common/srs/mmap_test.go: 2/72 added lines absent from the fork tip
+      - IPCIDR: badoption.Listable[string]{"10.0.0.0/8", "2001:db8::/32", "192.0.2.1"},
+      - SourceIPCIDR: badoption.Listable[string]{"172.16.0.0/12"},
+### c7fe73c25710  Buffer cache file writes
+    experimental/cachefile/fakeip.go: 7/95 added lines absent from the fork tip
+      - c.FakeIPSaveMetadataAsync(metadata)
+      - oldDomain, loaded := c.pending.fakeIPDomain[address]
+      - delete(c.pending.fakeIPAddress4, oldDomain)
+      - delete(c.pending.fakeIPAddress6, oldDomain)
+      - c.enqueueLocked(!loaded, len(domain)-len(oldDomain))
+      - if oldDomain != nil {
+      - return address, true
+### c7fe73c25710  Buffer cache file writes
+    service/oomkiller/service.go: 1/1 added lines absent from the fork tip
+      - s.adaptiveTimer = newAdaptiveTimer(s.logger, s.network, s.connections, service.FromContext[adapter.CacheFile](s.ctx), s.recorder, s.timerConfig)
+### c7fe73c25710  Buffer cache file writes
+    service/oomkiller/timer.go: 1/11 added lines absent from the fork tip
+      - func newAdaptiveTimer(logger log.ContextLogger, network adapter.NetworkManager, connections adapter.ConnectionManager, cacheFile adapter.CacheFile, recorder *Re
+### efe4db93324b  Close idle connections of unreferenced outbounds and DNS servers
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260902142641-43bb1cbea74e
+### efe4db93324b  Close idle connections of unreferenced outbounds and DNS servers
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260902142641-43bb1cbea74e h1:le983HDWe+D4LnnexDf3WXgHGYV8mxQ41n0cQL39cro=
+      - github.com/sagernet/sing-anytls v0.0.0-20260902142641-43bb1cbea74e/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+### efe4db93324b  Close idle connections of unreferenced outbounds and DNS servers
+    protocol/anytls/outbound.go: 1/11 added lines absent from the fork tip
+      - _ adapter.IdleConnectionCloser = (*Outbound)(nil)
+### 17e950e74cc0  Improve idle connection management
+    common/urltest/urltest.go: 2/2 added lines absent from the fork tip
+      - "github.com/sagernet/sing-anytls"
+      - warmContext = anytls.ContextWithKeepSession(warmContext)
+### 17e950e74cc0  Improve idle connection management
+    go.mod: 1/3 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be
+### 17e950e74cc0  Improve idle connection management
+    go.sum: 2/6 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be h1:0uMXu8kcJU0XLc2vfjGH6q6khmECCc5WYpD9dqlu1Xg=
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+### 17e950e74cc0  Improve idle connection management
+    protocol/openconnect/client.go: 1/55 added lines absent from the fork tip
+      - if !keep {
+### 17e950e74cc0  Improve idle connection management
+    protocol/openvpn/client.go: 1/55 added lines absent from the fork tip
+      - if !keep {
+### 17e950e74cc0  Improve idle connection management
+    route/reference.go: 4/62 added lines absent from the fork tip
+      - idleFlushed bool
+      - if devicePaused && !m.idleFlushed {
+      - m.CloseIdleConnections()
+      - m.idleFlushed = devicePaused
+### 17e950e74cc0  Improve idle connection management
+    transport/wireguard/endpoint.go: 1/70 added lines absent from the fork tip
+      - } else if e.options.System {
+### f3e721980c69  Improve process search
+    common/process/searcher_linux.go: 1/2 added lines absent from the fork tip
+      - processInfo.ProcessPaths = []string{processPath}
+### f3e721980c69  Improve process search
+    common/process/searcher_windows.go: 1/34 added lines absent from the fork tip
+      - owner, err := winiphlpapi.FindSocketOwner(network, source)
+### 7632cdab9aae  Add go TUN stack
+    experimental/libbox/setup.go: 1/1 added lines absent from the fork tip
+      - debug.SetMemoryLimit(int64(oomkiller.RuntimeMemoryLimit(uint64(sOOMMemoryLimit))))
+### 7632cdab9aae  Add go TUN stack
+    route/network.go: 1/9 added lines absent from the fork tip
+      - keeper, isKeeper := outbound.(adapter.IdleConnectionKeeper)
+### 7632cdab9aae  Add go TUN stack
+    route/splice.go: 93/304 added lines absent from the fork tip
+      - var target spliceTarget
+      - readCounter, isReadCounter := conn.(N.ReadCounter)
+      - writeCounter, isWriteCounter := conn.(N.WriteCounter)
+      - if isReadCounter || isWriteCounter {
+      - if !isReadCounter || !isWriteCounter {
+      - return spliceTarget{}, false
+      - reader, readCounters := readCounter.UnwrapReader()
+      - writer, writeCounters := writeCounter.UnwrapWriter()
+      - if any(reader) != any(writer) {
+      - return spliceTarget{}, false
+      - target.readCounters = append(target.readCounters, readCounters...)
+      - target.writeCounters = append(target.writeCounters, writeCounters...)
+      - conn = reader
+      - packetReadCounter, isPacketReadCounter := conn.(N.PacketReadCounter)
+      - packetWriteCounter, isPacketWriteCounter := conn.(N.PacketWriteCounter)
+      - if isPacketReadCounter || isPacketWriteCounter {
+      - if !isPacketReadCounter || !isPacketWriteCounter {
+      - return spliceTarget{}, false
+      - reader, readCounters := packetReadCounter.UnwrapPacketReader()
+      - writer, writeCounters := packetWriteCounter.UnwrapPacketWriter()
+      - if any(reader) != any(writer) {
+      - return spliceTarget{}, false
+      - target.readCounters = append(target.readCounters, readCounters...)
+      - target.writeCounters = append(target.writeCounters, writeCounters...)
+      - conn = reader
+      - if allowOffload {
+      - upstream, offload := N.UnwrapPacketOffload(conn)
+      - if offload != nil {
+      - socket, isSocket := upstream.(tun.SpliceSocket)
+      - if !isSocket {
+      - return spliceTarget{}, false
+      - target.socket = socket
+      - target.offload = offload
+      - return target, true
+      - readerWithUpstream, isReaderWithUpstream := conn.(N.ReaderWithUpstream)
+      - if !isReaderWithUpstream || !readerWithUpstream.ReaderReplaceable() {
+      - return spliceTarget{}, false
+      - writerWithUpstream, isWriterWithUpstream := conn.(N.WriterWithUpstream)
+      - if !isWriterWithUpstream || !writerWithUpstream.WriterReplaceable() {
+      - return spliceTarget{}, false
+      - socket, isSocket := conn.(tun.SpliceSocket)
+      - if isSocket {
+      - target.socket = socket
+      - return target, true
+      - withUpstream, hasUpstream := conn.(common.WithUpstream)
+      - if hasUpstream {
+      - conn = withUpstream.Upstream()
+      - upstreamReader, hasUpstreamReader := conn.(N.WithUpstreamReader)
+      - upstreamWriter, hasUpstreamWriter := conn.(N.WithUpstreamWriter)
+      - if !hasUpstreamReader || !hasUpstreamWriter {
+      - return spliceTarget{}, false
+      - reader := upstreamReader.UpstreamReader()
+      - if reader != upstreamWriter.UpstreamWriter() {
+      - return spliceTarget{}, false
+      - conn = reader
+      - target, isTarget := unwrapSpliceTarget(remoteConn, false)
+      - return goConn.Splice(target.socket, tun.SpliceOptions{
+      - }), nil
+      - var source spliceSource
+      - writer, writeCounters := N.UnwrapCountPacketWriter(conn, nil)
+      - natWriter, isNATWriter := N.CastPacketWriter[*tun.UDPNatConn](writer)
+      - if !isNATWriter {
+      - return spliceSource{}, false
+      - source.writeCounters = writeCounters
+      - var reader N.PacketReader = conn
+      - readCounter, isReadCounter := reader.(N.PacketReadCounter)
+      - if isReadCounter {
+      - upstreamReader, readCounters := readCounter.UnwrapPacketReader()
+      - source.readCounters = append(source.readCounters, readCounters...)
+      - reader = upstreamReader
+      - natReader, isNATReader := reader.(*tun.UDPNatConn)
+      - if isNATReader {
+      - if natReader != natWriter {
+      - return spliceSource{}, false
+      - source.natConn = natReader
+      - return source, true
+      - cachedReader, isCached := reader.(N.CachedPacketReader)
+      - if isCached {
+      - source.cachedReaders = append(source.cachedReaders, cachedReader)
+      - readerWithUpstream, isReaderWithUpstream := reader.(N.ReaderWithUpstream)
+      - if !isReaderWithUpstream || !readerWithUpstream.ReaderReplaceable() {
+      - return spliceSource{}, false
+      - withUpstream, hasUpstream := reader.(common.WithUpstream)
+      - if hasUpstream {
+      - reader, _ = withUpstream.Upstream().(N.PacketReader)
+      - upstreamReader, hasUpstreamReader := reader.(N.WithUpstreamReader)
+      - if !hasUpstreamReader {
+      - return spliceSource{}, false
+      - reader, _ = upstreamReader.UpstreamReader().(N.PacketReader)
+      - if reader == nil {
+      - return spliceSource{}, false
+      - spliceSource, isSpliceSource := unwrapSpliceSource(source)
+      - target, isTarget := unwrapSpliceTarget(remote, true)
+### 5f404b8c6f5c  Remove dependency on gVisor
+    cmd/internal/build_libbox/main.go: 1/1 added lines absent from the fork tip
+      - sharedTags = append(sharedTags, "with_quic", "with_wireguard", "with_utls", "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn", "with_opencon
+### 5f404b8c6f5c  Remove dependency on gVisor
+    go.mod: 1/3 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916041743-66c96c36515b
+### 5f404b8c6f5c  Remove dependency on gVisor
+    go.sum: 2/4 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916041743-66c96c36515b h1:+U1yggpa1xpUnpdVKjB2WSC4MTamtcWlDZAVhTXux74=
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916041743-66c96c36515b/go.mod h1:PV+Zt5IUWh9Hyp2nVwWfxEfU0yzImduBpKGxLI1pfNs=
+### 5f404b8c6f5c  Remove dependency on gVisor
+    protocol/openconnect/client.go: 6/12 added lines absent from the fork tip
+      - deviceOptions *openconnecttransport.DeviceOptions
+      - openConnectEndpoint.deviceOptions = &openconnecttransport.DeviceOptions{
+      - device, err := openconnecttransport.NewDevice(*e.deviceOptions)
+      - scope.Add(device.Close)
+      - device.SetPacketWriter(e.writePacketBuffers)
+      - e.device = device
+### 5f404b8c6f5c  Remove dependency on gVisor
+    protocol/openvpn/client.go: 6/12 added lines absent from the fork tip
+      - deviceOptions *ovpntransport.DeviceOptions
+      - clientEndpoint.deviceOptions = &ovpntransport.DeviceOptions{
+      - device, err := ovpntransport.NewDevice(*c.deviceOptions)
+      - scope.Add(device.Close)
+      - device.SetPacketWriter(c.writePacketBuffers)
+      - c.device = device
+### 5f404b8c6f5c  Remove dependency on gVisor
+    protocol/openvpn/server.go: 6/12 added lines absent from the fork tip
+      - deviceOptions *ovpntransport.DeviceOptions
+      - serverEndpoint.deviceOptions = &ovpntransport.DeviceOptions{
+      - device, err := ovpntransport.NewDevice(*s.deviceOptions)
+      - scope.Add(device.Close)
+      - device.SetPacketWriter(s.writePacketBuffersByDestination)
+      - s.device = device
+### 5f404b8c6f5c  Remove dependency on gVisor
+    release/DEFAULT_BUILD_TAGS: 1/1 added lines absent from the fork tip
+      - with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_open
+### 5f404b8c6f5c  Remove dependency on gVisor
+    release/DEFAULT_BUILD_TAGS_OTHERS: 1/1 added lines absent from the fork tip
+      - with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect
+### 5f404b8c6f5c  Remove dependency on gVisor
+    release/DEFAULT_BUILD_TAGS_WINDOWS: 1/1 added lines absent from the fork tip
+      - with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_purego,with_usb
+### 5f404b8c6f5c  Remove dependency on gVisor
+    test/go.mod: 45/49 added lines absent from the fork tip
+      - github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
+      - github.com/sagernet/sing v0.9.5-0.20260914135810-80bfa92a0607
+      - github.com/sagernet/sing-openvpn v0.0.0-20260903200517-e060dda5b1f1
+      - github.com/sagernet/sing-quic v0.7.1-0.20260904135313-497364e8ee3e
+      - github.com/sagernet/sing-tun v0.9.4-0.20260916041232-89d2e01a748a
+      - github.com/sagernet/bbolt v0.0.0-20260823094646-e24805439c9c // indirect
+      - github.com/sagernet/cronet-go v0.0.0-20260912104727-0d28acc44093 // indirect
+      - github.com/sagernet/cronet-go/all v0.0.0-20260912104727-0d28acc44093 // indirect
+      - github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/android_amd64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/android_arm v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/android_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/darwin_amd64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/ios_amd64_simulator v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/ios_arm64_simulator v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_386 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_386_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_amd64_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_arm v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_arm64_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_arm_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_loong64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_loong64_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_mips64le v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_mipsle v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_mipsle_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_riscv64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/linux_riscv64_musl v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/tvos_amd64_simulator v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/tvos_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260912104006-c10c03c318db // indirect
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be // indirect
+      - github.com/sagernet/sing-mux v0.3.7-0.20260905054442-91d1502591ce // indirect
+      - github.com/sagernet/sing-openconnect v0.0.0-20260903200519-8b89c968949d // indirect
+      - github.com/sagernet/sing-vmess v0.2.8 // indirect
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916041743-66c96c36515b // indirect
+      - github.com/sagernet/wireguard-go v0.0.6 // indirect
+      - replace github.com/sagernet/sing-tun => ../../sing-tun
+      - replace github.com/sagernet/tailscale => ../../tailscale
+### 5f404b8c6f5c  Remove dependency on gVisor
+    test/go.sum: 82/90 added lines absent from the fork tip
+      - github.com/sagernet/bbolt v0.0.0-20260823094646-e24805439c9c h1:JdEDkgiwsDxiZb4+dQYgVOU/lND+jZxFmN5y/q49EXk=
+      - github.com/sagernet/bbolt v0.0.0-20260823094646-e24805439c9c/go.mod h1:7/qFPFH5fqK5XQeY8EA1Qpaly08Av77p38Zt50ieQww=
+      - github.com/sagernet/cronet-go v0.0.0-20260912104727-0d28acc44093 h1:CsvsLVIli53L6nzgEpyRjjWnRRhTds4D3eh5sEnF5Sw=
+      - github.com/sagernet/cronet-go v0.0.0-20260912104727-0d28acc44093/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
+      - github.com/sagernet/cronet-go/all v0.0.0-20260912104727-0d28acc44093 h1:1lRUqrLcBz0Q0r/xvyiXS5hZwH5pOq6Lwb4dqbSqJfs=
+      - github.com/sagernet/cronet-go/all v0.0.0-20260912104727-0d28acc44093/go.mod h1:bvm9T9FdwHYYfWdZkLoZ4Qr9Dce0TTQ7ngXlbGZnnJk=
+      - github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260912104006-c10c03c318db h1:o0NCKT9gZsOLJK5s5wXW5A5EaFCnF5En6SApmHwUMJo=
+      - github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260912104006-c10c03c318db/go.mod h1:XXDwdjX/T8xftoeJxQmbBoYXZp8MAPFR2CwbFuTpEtw=
+      - github.com/sagernet/cronet-go/lib/android_amd64 v0.0.0-20260912104006-c10c03c318db h1:75fzfzaz/j1mKsqNE01KTMMP3i/9FgmPlwO2BIV8TpU=
+      - github.com/sagernet/cronet-go/lib/android_amd64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:iNiUGoLtnr8/JTuVNj7XJbmpOAp2C6+B81KDrPxwaZM=
+      - github.com/sagernet/cronet-go/lib/android_arm v0.0.0-20260912104006-c10c03c318db h1:tz6Tm3qqxPKp9QMFDUxbVzu5NgYQZq2hY9CGQ+sTmII=
+      - github.com/sagernet/cronet-go/lib/android_arm v0.0.0-20260912104006-c10c03c318db/go.mod h1:19ILNUOGIzRdOqa2mq+iY0JoHxuieB7/lnjYeaA2vEc=
+      - github.com/sagernet/cronet-go/lib/android_arm64 v0.0.0-20260912104006-c10c03c318db h1:OO+rUNHeZja1m0n/bBfkWtK2NQkNN9iROP0CRqw9aL8=
+      - github.com/sagernet/cronet-go/lib/android_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:JxzGyQf94Cr6sBShKqODGDyRUlESfJK/Njcz9Lz6qMQ=
+      - github.com/sagernet/cronet-go/lib/darwin_amd64 v0.0.0-20260912104006-c10c03c318db h1:78W68WJdZjQDhkp4tcFkLcXBH4W8jlCBK1eFcBKKZwI=
+      - github.com/sagernet/cronet-go/lib/darwin_amd64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:KN+9T9TBycGOLzmKU4QdcHAJEj6Nlx48ifnlTvvHMvs=
+      - github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0-20260912104006-c10c03c318db h1:qVLzw+rWqzD82/CUwvxfSohUj6aSD9zRAX7WtKiSNeQ=
+      - github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:kojvtUc29KKnk8hs2QIANynVR59921SnGWA9kXohHc0=
+      - github.com/sagernet/cronet-go/lib/ios_amd64_simulator v0.0.0-20260912104006-c10c03c318db h1:EoaFEVn+GVZw2jKXgK+73BdpUZKJ85PGUdbAyxy72pk=
+      - github.com/sagernet/cronet-go/lib/ios_amd64_simulator v0.0.0-20260912104006-c10c03c318db/go.mod h1:hkQzRE5GDbaH1/ioqYh0Taho4L6i0yLRCVEZ5xHz5M0=
+      - github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0-20260912104006-c10c03c318db h1:rtv8UspnSr157Hp9k6Pj0IV224GvANVx+XTTd2/CjdY=
+      - github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:tzVJFTOm66UxLxy6K0ZN5Ic2PC79e+sKKnt+V9puEa4=
+      - github.com/sagernet/cronet-go/lib/ios_arm64_simulator v0.0.0-20260912104006-c10c03c318db h1:TwBUmUKDuQzA5nIshSzVE0tCKK1GpEfy54E1h3o62t8=
+      - github.com/sagernet/cronet-go/lib/ios_arm64_simulator v0.0.0-20260912104006-c10c03c318db/go.mod h1:M/pN6m3j0HFU6/y83n0HU6GLYys3tYdr/xTE8hVEGMo=
+      - github.com/sagernet/cronet-go/lib/linux_386 v0.0.0-20260912104006-c10c03c318db h1:T2yA2pXtVKeZniYbp8bfcNTigauAl3EO3AO1UwVXoGE=
+      - github.com/sagernet/cronet-go/lib/linux_386 v0.0.0-20260912104006-c10c03c318db/go.mod h1:cGh5hO6eljCo6KMQ/Cel8Xgq4+etL0awZLRBDVG1EZQ=
+      - github.com/sagernet/cronet-go/lib/linux_386_musl v0.0.0-20260912104006-c10c03c318db h1:w5BfjtEy9mjMiXtmKfB2uBGeRG4pwbuQ6ouTflNnWyU=
+      - github.com/sagernet/cronet-go/lib/linux_386_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:JFE0/cxaKkx0wqPMZU7MgaplQlU0zudv82dROJjClKU=
+      - github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0-20260912104006-c10c03c318db h1:yNdO+HC5OkgKgwqVYd49FRVt5A2jfxsyrSKrf2uM0aM=
+      - github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:vU8VftFeSt7fURCa3JXD6+k6ss1YAX+idQjPvHmJ2tI=
+      - github.com/sagernet/cronet-go/lib/linux_amd64_musl v0.0.0-20260912104006-c10c03c318db h1:jJ1WycEj07LsIhtZdgXSiDa9qMkDUvBtr/B8WQm5utQ=
+      - github.com/sagernet/cronet-go/lib/linux_amd64_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:vCe4OUuL+XOUge9v3MyTD45BnuAXiH+DkjN9quDXJzQ=
+      - github.com/sagernet/cronet-go/lib/linux_arm v0.0.0-20260912104006-c10c03c318db h1:HPBv0BqbHC8ktpn1rSMeoREDPumyFFpJHZsUCwzwLqY=
+      - github.com/sagernet/cronet-go/lib/linux_arm v0.0.0-20260912104006-c10c03c318db/go.mod h1:w9amBWrvjtohQzBGCKJ7LCh22LhTIJs4sE7cYaKQzM0=
+      - github.com/sagernet/cronet-go/lib/linux_arm64 v0.0.0-20260912104006-c10c03c318db h1:7mJdu1gjC45rEkiIGtdCuEs3v1Oj2IXBnSh9uIgZEmE=
+      - github.com/sagernet/cronet-go/lib/linux_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:TqlsFtcYS/etTeck46kHBeT8Le0Igw1Q/AV88UnMS3s=
+      - github.com/sagernet/cronet-go/lib/linux_arm64_musl v0.0.0-20260912104006-c10c03c318db h1:YCBQCFTjlkRkkCXV+ScjN/URW9Mx58f6Dv34a8JRtGw=
+      - github.com/sagernet/cronet-go/lib/linux_arm64_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:B6Qd0vys8sv9OKVRN6J9RqDzYRGE938Fb2zrYdBDyTQ=
+      - github.com/sagernet/cronet-go/lib/linux_arm_musl v0.0.0-20260912104006-c10c03c318db h1:RIp7sKxgUGMidhmi7oVhX8DgnG6UjKk7kvxWvWfKvbY=
+      - github.com/sagernet/cronet-go/lib/linux_arm_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:3tXMMFY7AHugOVBZ5Al7cL7JKsnFOe5bMVr0hZPk3ow=
+      - github.com/sagernet/cronet-go/lib/linux_loong64 v0.0.0-20260912104006-c10c03c318db h1:lElglqZOqg3g7/L8uzJKS6yPNgIxbEu4/vVTzlYE7W8=
+      - github.com/sagernet/cronet-go/lib/linux_loong64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:Wt5uFdU3tnmm8YzobYewwdF7Mt6SucRQg6xeTNWC3Tk=
+      - github.com/sagernet/cronet-go/lib/linux_loong64_musl v0.0.0-20260912104006-c10c03c318db h1:4HvprIkwKcrPYuyQaH5tdIeh5KVBgkauL6o0VqpCkSo=
+      - github.com/sagernet/cronet-go/lib/linux_loong64_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:lyIF6wKBLwWa5ZXaAKbAoewewl+yCHo2iYev39Mbj4E=
+      - github.com/sagernet/cronet-go/lib/linux_mips64le v0.0.0-20260912104006-c10c03c318db h1:rWrNWeyy563mTk3KZas3ore7JPq7M+l8r0XV9lAjc0c=
+      - github.com/sagernet/cronet-go/lib/linux_mips64le v0.0.0-20260912104006-c10c03c318db/go.mod h1:H46PnSTTZNcZokLLiDeMDaHiS1l14PH3tzWi0eykjD8=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle v0.0.0-20260912104006-c10c03c318db h1:YADxQVD/X9yyV3i/xS3T/lWhpVLslIIl+e+srwpT9p0=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle v0.0.0-20260912104006-c10c03c318db/go.mod h1:RBhSUDAKWq7fswtV4nQUQhuaTLcX3ettR7teA7/yf2w=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle_musl v0.0.0-20260912104006-c10c03c318db h1:2hgFBooF0jPOGXKcuJgMA4h1aSOULyAI6OgubZBoD7g=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:wRzoIOGG4xbpp3Gh3triLKwMwYriScXzFtunLYhY4w0=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64 v0.0.0-20260912104006-c10c03c318db h1:fFv7izOOsC/HQCDAwTtPjIlayo8znNlAnPqppDb08Jo=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:LNiZXmWil1OPwKCheqQjtakZlJuKGFz+iv2eGF76Hhs=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64_musl v0.0.0-20260912104006-c10c03c318db h1:meCf6CbZqWpV5ITTjawLJzZfFrx6thSgs7a9PZyqdTM=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64_musl v0.0.0-20260912104006-c10c03c318db/go.mod h1:YFDGKTkpkJGc5+hnX/RYosZyTWg9h+68VB55fYRRLYc=
+      - github.com/sagernet/cronet-go/lib/tvos_amd64_simulator v0.0.0-20260912104006-c10c03c318db h1:7bOFA2F/WApDRUamwGM5OThrY5H3+UZpW0yQLlukE8Y=
+      - github.com/sagernet/cronet-go/lib/tvos_amd64_simulator v0.0.0-20260912104006-c10c03c318db/go.mod h1:aaX0YGl8nhGmfRWI8bc3BtDjY8Vzx6O0cS/e1uqxDq4=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64 v0.0.0-20260912104006-c10c03c318db h1:9HjQtfjpo5PTr5AMBWgyTVnWI/zQOTDVQ1agftOOoGo=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:EdzMKA96xITc42QEI+ct4SwqX8Dn3ltKK8wzdkLWpSc=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260912104006-c10c03c318db h1:9OUQzCcoCvleQVLb3xW3AGB+eKGxPmldK1gg61xh7T8=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260912104006-c10c03c318db/go.mod h1:qix4kv1TTAJ5tY4lJ9vjhe9EY4mM+B7H5giOhbxDVcc=
+      - github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260912104006-c10c03c318db h1:fKs7KaruaDhStaiYpaqMQXDCmAc4YmNLI/pBkPYvwH8=
+      - github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:lm9w/oCCRyBiUa3G8lDQTT8x/ONUvgVR2iV9fVzUZB8=
+      - github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260912104006-c10c03c318db h1:K7/F1mWxmf5yUDxSSk+6pRk+yfCoWsqIgt2LsjRpP8w=
+      - github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260912104006-c10c03c318db/go.mod h1:n34YyLgapgjWdKa0IoeczjAFCwD3/dxbsH5sucKw0bw=
+      - github.com/sagernet/quic-go v0.61.0-sing-box-mod.7 h1:sW2O+DoNF+my1PGlSZ3zG2N+fdxLR3DC0l4sXCM0lBE=
+      - github.com/sagernet/quic-go v0.61.0-sing-box-mod.7/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
+      - github.com/sagernet/sing v0.9.5-0.20260914135810-80bfa92a0607 h1:YzA14QltKgRqFKEZYRP1JBL2meuf3Mx3DiDK/U5+/PA=
+      - github.com/sagernet/sing v0.9.5-0.20260914135810-80bfa92a0607/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be h1:0uMXu8kcJU0XLc2vfjGH6q6khmECCc5WYpD9dqlu1Xg=
+      - github.com/sagernet/sing-anytls v0.0.0-20260904135308-cec2d74334be/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+      - github.com/sagernet/sing-mux v0.3.7-0.20260905054442-91d1502591ce h1:ay1pGbzMF4e7iggj+uESNhwMNPbZZajDghcdC4P92Dc=
+      - github.com/sagernet/sing-mux v0.3.7-0.20260905054442-91d1502591ce/go.mod h1:QvlKMyNBNrQoyX4x+gq028uPbLM2XeRpWtDsWBJbFSk=
+      - github.com/sagernet/sing-openconnect v0.0.0-20260903200519-8b89c968949d h1:Jt/Tb0boIr/xRr4sWr2vC/rrVlYNoumZITLEQpqZ8UE=
+      - github.com/sagernet/sing-openconnect v0.0.0-20260903200519-8b89c968949d/go.mod h1:4AKZLVcvY3r54UaK2Gbnm7aN8pOwdLz+y4EP0QFZ5Eg=
+      - github.com/sagernet/sing-openvpn v0.0.0-20260903200517-e060dda5b1f1 h1:Zn7+pNY5mX1e4DO8oKhTHz5sxqUKNdCWKbfZUtM26Qg=
+      - github.com/sagernet/sing-openvpn v0.0.0-20260903200517-e060dda5b1f1/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
+      - github.com/sagernet/sing-quic v0.7.1-0.20260904135313-497364e8ee3e h1:2r0FRN0DBSfggWYtdH/69uW91kqEOByBWw/5hiCq6qU=
+      - github.com/sagernet/sing-quic v0.7.1-0.20260904135313-497364e8ee3e/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
+      - github.com/sagernet/sing-vmess v0.2.8 h1:xd5nnDOMlC76RgrLksS4jlk3eMt3c3CvQY3NsjWPWeI=
+      - github.com/sagernet/sing-vmess v0.2.8/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
+      - github.com/sagernet/wireguard-go v0.0.6 h1:zAjWSzufYThDsyLHxPLyyR+XdpBMlFDWD7WxJAvynSw=
+      - github.com/sagernet/wireguard-go v0.0.6/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openconnect/device.go: 30/30 added lines absent from the fork tip
+      - Context context.Context
+      - Logger logger.ContextLogger
+      - System bool
+      - Handler tun.Handler
+      - UDPTimeout time.Duration
+      - ICMPTimeout time.Duration
+      - UDPMapping tun.NATMapping
+      - UDPFiltering tun.NATFiltering
+      - UDPNATMax uint32
+      - InterfaceFinder control.InterfaceFinder
+      - MemoryPressure func() tun.MemoryPressure
+      - Name string
+      - MTU uint32
+      - Configuration Configuration
+      - func newStack(options DeviceOptions, memoryTun *tun.MemoryTun) (*tun.Go, error) {
+      - return tun.NewGo(tun.StackOptions{
+      - Context: options.Context,
+      - Tun: memoryTun,
+      - TunOptions: tun.Options{MTU: options.MTU},
+      - UDPTimeout: options.UDPTimeout,
+      - ICMPTimeout: options.ICMPTimeout,
+      - UDPMapping: options.UDPMapping,
+      - UDPFiltering: options.UDPFiltering,
+      - UDPNATMax: options.UDPNATMax,
+      - Handler: options.Handler,
+      - Logger: options.Logger,
+      - InterfaceFinder: options.InterfaceFinder,
+      - MemoryPressure: options.MemoryPressure,
+      - })
+      - }
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openconnect/device_stack.go: 59/59 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common"
+      - stateAccess sync.RWMutex
+      - options DeviceOptions
+      - stack *tun.Go
+      - memoryTun *tun.MemoryTun
+      - inet4Address netip.Addr
+      - inet6Address netip.Addr
+      - closeOnce sync.Once
+      - device.inet4Address, device.inet6Address = firstAddresses(options.Configuration.Addresses)
+      - device.memoryTun = tun.NewMemoryTun(tun.MemoryTunOptions{
+      - MTU: int(options.MTU),
+      - Headroom: PacketHeadroom,
+      - RearSpace: systemDevicePacketRearSpace,
+      - Outbound: device.writeOutbound,
+      - })
+      - var err error
+      - device.stack, err = newStack(options, device.memoryTun)
+      - return d.stack.Start()
+      - d.memoryTun.UpdateMTU(int(configuration.MTU))
+      - d.inet4Address, d.inet6Address = firstAddresses(configuration.Addresses)
+      - _, err := d.memoryTun.WritePackets(common.Map(packetBuffers, (*buf.Buffer).Bytes))
+      - return err
+      - bind, err := d.bindAddress(destination)
+      - if err != nil {
+      - return nil, err
+      - var tcpConn *tun.GoConn
+      - tcpConn, err = d.stack.DialTCP(ctx, bind, destination.AddrPort())
+      - if err != nil {
+      - return nil, err
+      - }
+      - return tcpConn, nil
+      - var udpConn *tun.GoUDPConn
+      - udpConn, err = d.stack.DialUDP(netip.AddrPortFrom(bind, 0), destination.AddrPort())
+      - if err != nil {
+      - return nil, err
+      - }
+      - return udpConn, nil
+      - bind, err := d.bindAddress(destination)
+      - if err != nil {
+      - return nil, err
+      - }
+      - udpConn, err := d.stack.ListenUDP(netip.AddrPortFrom(bind, 0))
+      - if err != nil {
+      - return nil, err
+      - return udpConn, nil
+      - }
+      - func (d *stackDevice) bindAddress(destination M.Socksaddr) (netip.Addr, error) {
+      - d.stateAccess.RLock()
+      - defer d.stateAccess.RUnlock()
+      - if !d.inet4Address.IsValid() {
+      - return netip.Addr{}, E.New("missing IPv4 local address")
+      - return d.inet4Address, nil
+      - }
+      - if !d.inet6Address.IsValid() {
+      - return netip.Addr{}, E.New("missing IPv6 local address")
+      - return d.inet6Address, nil
+      - var err error
+      - err = E.Errors(d.stack.Close(), d.memoryTun.Close())
+      - return err
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openconnect/device_system_stack.go: 1/1 added lines absent from the fork tip
+      - stackDevice, err := newStackDevice(options)
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openvpn/device.go: 30/30 added lines absent from the fork tip
+      - Context context.Context
+      - Logger logger.ContextLogger
+      - System bool
+      - Handler tun.Handler
+      - UDPTimeout time.Duration
+      - ICMPTimeout time.Duration
+      - UDPMapping tun.NATMapping
+      - UDPFiltering tun.NATFiltering
+      - UDPNATMax uint32
+      - InterfaceFinder control.InterfaceFinder
+      - MemoryPressure func() tun.MemoryPressure
+      - Name string
+      - MTU uint32
+      - Configuration Configuration
+      - func newStack(options DeviceOptions, memoryTun *tun.MemoryTun) (*tun.Go, error) {
+      - return tun.NewGo(tun.StackOptions{
+      - Context: options.Context,
+      - Tun: memoryTun,
+      - TunOptions: tun.Options{MTU: options.MTU},
+      - UDPTimeout: options.UDPTimeout,
+      - ICMPTimeout: options.ICMPTimeout,
+      - UDPMapping: options.UDPMapping,
+      - UDPFiltering: options.UDPFiltering,
+      - UDPNATMax: options.UDPNATMax,
+      - Handler: options.Handler,
+      - Logger: options.Logger,
+      - InterfaceFinder: options.InterfaceFinder,
+      - MemoryPressure: options.MemoryPressure,
+      - })
+      - }
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openvpn/device_stack.go: 57/57 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common"
+      - stack *tun.Go
+      - memoryTun *tun.MemoryTun
+      - device.inet4Address, device.inet6Address = firstAddresses(options.Configuration.Address)
+      - device.memoryTun = tun.NewMemoryTun(tun.MemoryTunOptions{
+      - MTU: int(options.MTU),
+      - Headroom: PacketHeadroom,
+      - RearSpace: systemDevicePacketRearSpace,
+      - Outbound: device.writeOutbound,
+      - })
+      - var err error
+      - device.stack, err = newStack(options, device.memoryTun)
+      - return d.stack.Start()
+      - d.options.Logger.Debug("route gateway and metric options are not representable by the stack device; routes are installed by prefix")
+      - d.memoryTun.UpdateMTU(int(configuration.MTU))
+      - d.inet4Address, d.inet6Address = firstAddresses(configuration.Address)
+      - _, err := d.memoryTun.WritePackets(common.Map(packetBuffers, (*buf.Buffer).Bytes))
+      - return err
+      - bind, err := d.bindAddress(destination)
+      - if err != nil {
+      - return nil, err
+      - var tcpConn *tun.GoConn
+      - tcpConn, err = d.stack.DialTCP(ctx, bind, destination.AddrPort())
+      - if err != nil {
+      - return nil, err
+      - }
+      - return tcpConn, nil
+      - var udpConn *tun.GoUDPConn
+      - udpConn, err = d.stack.DialUDP(netip.AddrPortFrom(bind, 0), destination.AddrPort())
+      - if err != nil {
+      - return nil, err
+      - }
+      - return udpConn, nil
+      - bind, err := d.bindAddress(destination)
+      - if err != nil {
+      - return nil, err
+      - udpConn, err := d.stack.ListenUDP(netip.AddrPortFrom(bind, 0))
+      - if err != nil {
+      - return nil, err
+      - return udpConn, nil
+      - func (d *stackDevice) bindAddress(destination M.Socksaddr) (netip.Addr, error) {
+      - if destination.IsIPv4() {
+      - if !d.inet4Address.IsValid() {
+      - return netip.Addr{}, E.New("missing IPv4 local address")
+      - }
+      - return d.inet4Address, nil
+      - }
+      - if d.options.Configuration.BlockIPv6 {
+      - return netip.Addr{}, E.New("IPv6 blocked by pushed block-ipv6")
+      - }
+      - if !d.inet6Address.IsValid() {
+      - return netip.Addr{}, E.New("missing IPv6 local address")
+      - }
+      - return d.inet6Address, nil
+      - var err error
+      - err = E.Errors(d.stack.Close(), d.memoryTun.Close())
+      - return err
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/openvpn/device_system_stack.go: 1/1 added lines absent from the fork tip
+      - stackDevice, err := newStackDevice(options)
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/wireguard/device_stack.go: 9/57 added lines absent from the fork tip
+      - "github.com/sagernet/wireguard-go/conn"
+      - memoryTun *tun.MemoryTun
+      - memoryTun := tun.NewMemoryTun(tun.MemoryTunOptions{MTU: int(options.MTU)})
+      - stack, err := newStack(options, memoryTun)
+      - memoryTun: memoryTun,
+      - return w.memoryTun.ReadPackets(bufs, sizes, offset)
+      - return w.memoryTun.WritePackets(packets)
+      - err = E.Errors(w.stack.Close(), w.memoryTun.Close())
+      - return conn.IdealBatchSize
+### 5f404b8c6f5c  Remove dependency on gVisor
+    transport/wireguard/device_system_stack.go: 25/68 added lines absent from the fork tip
+      - "sync/atomic"
+      - "github.com/sagernet/sing/common/buf"
+      - memoryTun *tun.MemoryTun
+      - device atomic.Pointer[device.Device]
+      - stackDevice := &systemStackDevice{systemDevice: system}
+      - stackDevice.memoryTun = tun.NewMemoryTun(tun.MemoryTunOptions{MTU: int(options.MTU), Outbound: stackDevice.inputPackets})
+      - stackDevice.stack, err = newStack(options, stackDevice.memoryTun)
+      - w.device.Store(device)
+      - _, err := w.memoryTun.WritePackets(stackPackets)
+      - func (w *systemStackDevice) inputPackets(packets []*buf.Buffer) error {
+      - defer buf.ReleaseMulti(packets)
+      - wgDevice := w.device.Load()
+      - if wgDevice == nil {
+      - return nil
+      - references := make([]*device.InputPacketRef, 0, len(packets))
+      - for _, packet := range packets {
+      - var destination []byte
+      - switch header.IPVersion(packet.Bytes()) {
+      - destination = header.IPv4(packet.Bytes()).DestinationAddressSlice()
+      - destination = header.IPv6(packet.Bytes()).DestinationAddressSlice()
+      - continue
+      - references = append(references, &device.InputPacketRef{Destination: destination, PacketSlices: [][]byte{packet.Bytes()}})
+      - wgDevice.InputPackets(references)
+      - return nil
+      - err = E.Errors(w.stack.Close(), w.memoryTun.Close(), w.systemDevice.Close())
+### 10dabb8d1271  Add tailcat support
+    go.mod: 1/2 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838
+### 10dabb8d1271  Add tailcat support
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838 h1:YlcCeRWjFIp6dqxvfdH0i6ku17Lv3YzVuHY5qOA7Nv8=
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838/go.mod h1:xGiEZax5sZ6gHJcwQxp0GmJVtDHGUXPXTgr6Ksm+yIc=
+### 10dabb8d1271  Add tailcat support
+    protocol/tailscale/tailcat_derp.go: 2/160 added lines absent from the fork tip
+      - region, loaded := derpMap.Regions[d.regionID]
+      - if !loaded {
+### 10dabb8d1271  Add tailcat support
+    test/go.mod: 2/4 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260917055437-bc6039037038 // indirect
+### 10dabb8d1271  Add tailcat support
+    test/go.sum: 4/6 added lines absent from the fork tip
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838 h1:YlcCeRWjFIp6dqxvfdH0i6ku17Lv3YzVuHY5qOA7Nv8=
+      - github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260916060041-a8fbeb4b0838/go.mod h1:xGiEZax5sZ6gHJcwQxp0GmJVtDHGUXPXTgr6Ksm+yIc=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260917055437-bc6039037038 h1:1APVQQ0gdlzLXg1fcBVGx+k5xgCiQwB3rvsIKpUT+9A=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260917055437-bc6039037038/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
+### 9ba85a15fe6b  Fix auto redirect DNS hijack to local address with iptables
+    test/go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-tun v0.9.4-0.20260917030658-12dce01d6d8d
+### d0698c55a8c9  Validate IP addresses and prefixes in JSON schema
+    option/rule.go: 2/2 added lines absent from the fork tip
+      - SourceIPCIDR badoption.Listable[string] `json:"source_ip_cidr,omitempty" schema:"prefixable"`
+      - IPCIDR badoption.Listable[string] `json:"ip_cidr,omitempty" schema:"prefixable"`
+### d0698c55a8c9  Validate IP addresses and prefixes in JSON schema
+    option/rule_dns.go: 2/2 added lines absent from the fork tip
+      - SourceIPCIDR badoption.Listable[string] `json:"source_ip_cidr,omitempty" schema:"prefixable"`
+      - IPCIDR badoption.Listable[string] `json:"ip_cidr,omitempty" schema:"prefixable"`
+### d0698c55a8c9  Validate IP addresses and prefixes in JSON schema
+    option/rule_set.go: 2/2 added lines absent from the fork tip
+      - SourceIPCIDR badoption.Listable[string] `json:"source_ip_cidr,omitempty" schema:"prefixable"`
+      - IPCIDR badoption.Listable[string] `json:"ip_cidr,omitempty" schema:"prefixable"`
+### d0698c55a8c9  Validate IP addresses and prefixes in JSON schema
+    schema/generator.go: 10/33 added lines absent from the fork tip
+      - if enumTag != "" || examplesTag != "" || referenceTag != "" || schemaTag != "" {
+      - fieldNode, err = g.taggedFieldNode(fieldType, enumTag, examplesTag, referenceTag, schemaTag)
+      - func (g *generator) taggedFieldNode(fieldType reflect.Type, enumTag string, examplesTag string, referenceTag string, schemaTag string) (*Node, error) {
+      - switch {
+      - case enumTag != "":
+      - case schemaTag == "prefixable":
+      - return nil, E.New("prefixable schema tags require a string field, got ", fieldType.String())
+      - element, err = g.Describe(prefixableType)
+      - case schemaTag != "":
+      - return nil, E.New("unknown schema tag ", schemaTag, " on ", fieldType.String())
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    common/badhttp/badhttp.go: 1/29 added lines absent from the fork tip
+      - return ForwardedSource(request, M.ParseSocksaddr(request.RemoteAddr).Unwrap())
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    common/sniff/http.go: 1/2 added lines absent from the fork tip
+      - request, err := badhttp.ReadRequest(std_bufio.NewReader(reader))
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    include/quic.go: 1/1 added lines absent from the fork tip
+      - _ "github.com/sagernet/sing-box/protocol/http/quic"
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    protocol/http/inbound.go: 18/77 added lines absent from the fork tip
+      - std_http "net/http"
+      - "github.com/sagernet/sing/common/logger"
+      - "golang.org/x/net/http2"
+      - var ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler std_http.Handler, tlsConfig tls.ServerConfig
+      - HTTP2Options: options.HTTP2Options,
+      - quicOptions: options.HTTP3Options,
+      - if tlsConfig != nil && len(tlsConfig.NextProtos()) == 0 {
+      - var nextProtos []string
+      - if serveHTTP2 {
+      - nextProtos = append(nextProtos, http2.NextProtoTLS)
+      - if serveHTTP1 {
+      - nextProtos = append(nextProtos, "http/1.1")
+      - tlsConfig.SetNextProtos(nextProtos)
+      - if ConfigureHTTP3ListenerFunc == nil {
+      - return C.ErrQUICNotIncluded
+      - if !slices.Contains(h.tlsConfig.NextProtos(), "h3") {
+      - h.tlsConfig.SetNextProtos(append([]string{"h3"}, h.tlsConfig.NextProtos()...))
+      - http3Server, err := ConfigureHTTP3ListenerFunc(h.ctx, h.logger, h.listener, h.server.HTTP3Handler(adapter.NewUpstreamHandler(metadata, h.newUserConnection, h.st
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    protocol/http/outbound.go: 30/90 added lines absent from the fork tip
+      - "slices"
+      - "golang.org/x/net/http2"
+      - version := http.ResolveVersion(options.Version, options.Path, headers.Get("Host"))
+      - tlsOptions := common.PtrValueOrDefault(options.TLS)
+      - if version == 3 && !tlsOptions.Enabled {
+      - return nil, C.ErrTLSRequired
+      - alpnIsDefault := tlsOptions.Enabled && len(tlsOptions.ALPN) == 0
+      - if alpnIsDefault {
+      - switch version {
+      - case 1:
+      - tlsOptions.ALPN = []string{"http/1.1"}
+      - tlsOptions.ALPN = []string{http2.NextProtoTLS, "http/1.1"}
+      - detour, err := tls.NewDialerFromOptions(ctx, logger, outboundDialer, options.Server, tlsOptions)
+      - var http1Detour N.Dialer
+      - if version >= 2 && (alpnIsDefault || slices.Contains(tlsOptions.ALPN, "http/1.1")) {
+      - http1TLSOptions := tlsOptions
+      - http1TLSOptions.ALPN = []string{"http/1.1"}
+      - http1Detour, err = tls.NewDialerFromOptions(ctx, logger, outboundDialer, options.Server, http1TLSOptions)
+      - var quicTLSConfig tls.Config
+      - if version == 3 {
+      - if alpnIsDefault {
+      - tlsOptions.ALPN = []string{"h3"}
+      - quicTLSConfig, err = tls.NewClient(ctx, logger, options.Server, tlsOptions)
+      - client, err := http.NewClient(http.ClientOptions{
+      - Dialer: detour,
+      - HTTP1Dialer: http1Detour,
+      - RawDialer: outboundDialer,
+      - TLSConfig: quicTLSConfig,
+      - Server: options.ServerOptions.Build(),
+      - Version: version,
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    protocol/http/quic/inbound_init.go: 104/104 added lines absent from the fork tip
+      - //go:build with_quic
+      - package quic
+      - import (
+      - "context"
+      - "errors"
+      - "io"
+      - "net/http"
+      - "time"
+      - "github.com/sagernet/quic-go"
+      - "github.com/sagernet/quic-go/http3"
+      - "github.com/sagernet/sing-box/common/httpclient"
+      - "github.com/sagernet/sing-box/common/listener"
+      - "github.com/sagernet/sing-box/common/tls"
+      - "github.com/sagernet/sing-box/log"
+      - "github.com/sagernet/sing-box/option"
+      - boxHTTP "github.com/sagernet/sing-box/protocol/http"
+      - transportHTTP "github.com/sagernet/sing-box/transport/http"
+      - "github.com/sagernet/sing-quic"
+      - congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+      - E "github.com/sagernet/sing/common/exceptions"
+      - "github.com/sagernet/sing/common/logger"
+      - )
+      - func init() {
+      - boxHTTP.ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConf
+      - err := qtls.ConfigureHTTP3(tlsConfig)
+      - if err != nil {
+      - return nil, err
+      - }
+      - udpConn, err := listener.ListenUDP()
+      - if err != nil {
+      - return nil, err
+      - }
+      - quicConfig := httpclient.NewQUICConfig(options)
+      - if quicConfig.MaxIncomingStreams == 0 {
+      - quicConfig.MaxIncomingStreams = 1 << 60
+      - }
+      - quicConfig.Allow0RTT = true
+      - quicConfig.DisablePathManager = true
+      - quicConfig.EnableDatagrams = true
+      - quicListener, err := qtls.ListenEarly(udpConn, tlsConfig, quicConfig)
+      - if err != nil {
+      - udpConn.Close()
+      - return nil, err
+      - }
+      - http3Server := &http3.Server{
+      - Handler: handler,
+      - EnableDatagrams: true,
+      - ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
+      - conn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(conn.InitialPacketSize(), congestion_meta2.ProfileStandard))
+      - return log.ContextWithNewID(ctx)
+      - },
+      - }
+      - go func() {
+      - serveErr := http3Server.ServeListener(quicListener)
+      - udpConn.Close()
+      - if serveErr != nil && !E.IsClosedOrCanceled(serveErr) {
+      - logger.Error("http3 server closed: ", serveErr)
+      - }
+      - }()
+      - return quicListener, nil
+      - }
+      - transportHTTP.HTTP3StreamFunc = func(ctx context.Context, writer http.ResponseWriter) (transportHTTP.DatagramStream, bool) {
+      - streamer, isStreamer := writer.(http3.HTTPStreamer)
+      - if !isStreamer {
+      - return nil, false
+      - }
+      - settingser, isSettingser := writer.(http3.Settingser)
+      - if !isSettingser {
+      - return nil, false
+      - }
+      - select {
+      - case <-settingser.ReceivedSettings():
+      - case <-ctx.Done():
+      - return nil, false
+      - }
+      - return &datagramStream{
+      - Stream: streamer.HTTPStream(),
+      - datagramsEnabled: settingser.Settings().EnableDatagrams,
+      - }, true
+      - }
+      - }
+      - type datagramStream struct {
+      - *http3.Stream
+      - datagramsEnabled bool
+      - }
+      - func (s *datagramStream) SendDatagram(payload []byte) error {
+      - if !s.datagramsEnabled {
+      - return transportHTTP.ErrDatagramUnsupported
+      - }
+      - err := s.Stream.SendDatagram(payload)
+      - if err == nil {
+      - return nil
+      - }
+      - var tooLarge *quic.DatagramTooLargeError
+      - if errors.As(err, &tooLarge) {
+      - return transportHTTP.ErrDatagramUnsupported
+      - }
+      - return err
+      - }
+      - func (s *datagramStream) Close() error {
+      - s.Stream.SetWriteDeadline(time.Now())
+      - s.Stream.CancelRead(0)
+      - return s.Stream.Close()
+      - }
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    protocol/mixed/inbound.go: 2/31 added lines absent from the fork tip
+      - Authenticator: inbound.authenticator,
+      - err = socks.HandleConnectionEx(ctx, conn, reader.Reader, h.authenticator, handler, h.listener, h.udpTimeout, metadata.Source, onClose)
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    protocol/naive/inbound.go: 1/3 added lines absent from the fork tip
+      - source := badhttp.SourceAddress(request)
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    test/go.mod: 3/3 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6-0.20260920093640-814d533a21ef
+      - github.com/sagernet/sing-tun v0.9.6-0.20260919141142-a39eab51450b
+      - github.com/sagernet/sing-mux v0.3.9-0.20260927144857-0257b84c582a // indirect
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    test/go.sum: 4/4 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6-0.20260920093640-814d533a21ef h1:xutL8qCHi73T2KBXc3AAF97qUFZJRAJAe43yCkqenR0=
+      - github.com/sagernet/sing v0.9.6-0.20260920093640-814d533a21ef/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-mux v0.3.9-0.20260927144857-0257b84c582a h1:VrlU4QE8Bh4kEeLgvvWLBtyTiuXqc6/5vf3B+xQCTRE=
+      - github.com/sagernet/sing-mux v0.3.9-0.20260927144857-0257b84c582a/go.mod h1:jricpwCOndDsTEM1TM3piJvhL/2Mm7OhLkm+JadJJ1Q=
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    test/http_udp_test.go: 23/354 added lines absent from the fork tip
+      - "net/url"
+      - func TestHTTPInboundConnectUDPHTTP2(t *testing.T) {
+      - clientConn := dialHTTP2Proxy(t, serverPort)
+      - pipeReader, pipeWriter := io.Pipe()
+      - request := &http.Request{
+      - Method: http.MethodConnect,
+      - URL: &url.URL{
+      - Scheme: "https",
+      - Host: "example.org",
+      - Path: connectUDPPath(echo),
+      - Host: "example.org",
+      - Header: http.Header{
+      - ":protocol": []string{"connect-udp"},
+      - "Capsule-Protocol": []string{"?1"},
+      - "Proxy-Authorization": []string{proxyAuthorization},
+      - Body: pipeReader,
+      - response, err := clientConn.RoundTrip(request)
+      - defer response.Body.Close()
+      - defer pipeWriter.Close()
+      - require.Equal(t, http.StatusOK, response.StatusCode)
+      - require.Equal(t, "?1", response.Header.Get("Capsule-Protocol"))
+      - reader := std_bufio.NewReader(response.Body)
+      - writeDatagramCapsule(t, pipeWriter, []byte("ping"))
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/capsule.go: 28/361 added lines absent from the fork tip
+      - capsuleTypeDatagram = 0
+      - capsuleHeadroom = 1 + 4 + 1
+      - maxCapsuleLength = 1 << 20
+      - func readVarint(reader *std_bufio.Reader) (uint64, int, error) {
+      - func decodeVarint(b []byte) (uint64, int, bool) {
+      - func varintLen(value uint64) int {
+      - func putVarint(b []byte, value uint64) int {
+      - switch varintLen(value) {
+      - capsuleType, _, err := readVarint(reader)
+      - length, _, err := readVarint(reader)
+      - if length > maxCapsuleLength {
+      - if capsuleType != capsuleTypeDatagram {
+      - contextID, contextLength, err := readVarint(reader)
+      - func prependContextID(buffer *buf.Buffer) *buf.Buffer {
+      - func writeDatagramCapsule(writer io.Writer, datagram *buf.Buffer) error {
+      - headerLength := 1 + varintLen(length)
+      - header[0] = capsuleTypeDatagram
+      - putVarint(header[1:], length)
+      - header[0] = capsuleTypeDatagram
+      - putVarint(header[1:], length)
+      - return writeDatagramCapsule(c.writer, prependContextID(buffer))
+      - return capsuleHeadroom
+      - contextID, contextLength, valid := decodeVarint(datagram)
+      - buffer := buf.NewSize(len(datagram) - contextLength)
+      - buffer.Write(datagram[contextLength:])
+      - datagram := prependContextID(buffer)
+      - return writeDatagramCapsule(c.stream, datagram)
+      - return capsuleHeadroom
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/client.go: 26/370 added lines absent from the fork tip
+      - ListenPacket(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error)
+      - http2ConnectUDPUnsupported atomic.Bool
+      - conn, err := c.http3.DialContext(ctx, destination)
+      - if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
+      - c.http2ConnectUDPUnsupported.Store(false)
+      - maps.Copy(request.Header, c.headers)
+      - if _, loaded := request.Header["User-Agent"]; !loaded {
+      - request.Header["User-Agent"] = nil
+      - if c.authorization != "" {
+      - request.Header.Set("Proxy-Authorization", c.authorization)
+      - packetConn, err := c.http3.ListenPacket(ctx, destination)
+      - return packetConn, nil
+      - if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
+      - if c.tlsDialer != nil && !c.http2Unsupported.Load() && !c.http2ConnectUDPUnsupported.Load() {
+      - packetConn, connectErr := c.connectUDPHTTP2(ctx, clientConn, destination)
+      - if connectErr == nil {
+      - return packetConn, nil
+      - if !errors.Is(connectErr, errExtendedConnectUnsupported) || c.disableVersionFallback {
+      - return nil, connectErr
+      - c.http2ConnectUDPUnsupported.Store(true)
+      - } else if c.disableVersionFallback {
+      - return c.connectUDPHTTP1AndClose(ctx, conn, destination)
+      - return c.connectUDPHTTP1AndClose(ctx, conn, destination)
+      - func (c *Client) connectUDPHTTP1AndClose(ctx context.Context, conn net.Conn, destination M.Socksaddr) (N.PacketConn, error) {
+      - packetConn, err := c.connectUDPHTTP1(ctx, conn, destination)
+      - return packetConn, nil
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/client_h2.go: 15/118 added lines absent from the fork tip
+      - type http2ClientConn struct {
+      - *http2.ClientConn
+      - c.http2Conns = slices.DeleteFunc(c.http2Conns, func(it *http2ClientConn) bool { return it.State().Closed })
+      - if clientConn.ReserveNewRequest() {
+      - rawClientConn, err := c.http2Transport.NewClientConn(conn)
+      - clientConn := &http2ClientConn{ClientConn: rawClientConn}
+      - clientConn.ReserveNewRequest()
+      - Header: c.headers.Clone(),
+      - if request.Header == nil {
+      - request.Header = make(http.Header)
+      - if _, loaded := request.Header["User-Agent"]; !loaded {
+      - request.Header["User-Agent"] = nil
+      - if c.authorization != "" {
+      - request.Header.Set("Proxy-Authorization", c.authorization)
+      - response, err := clientConn.RoundTrip(request)
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/client_h3.go: 43/299 added lines absent from the fork tip
+      - return &http3ClientImpl{
+      - }, nil
+      - rawConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, c.server)
+      - rawConn.Close()
+      - clientConn, err := c.acquire(ctx)
+      - return nil, nil, err
+      - stream, err := clientConn.OpenRequestStream(ctx)
+      - return nil, nil, E.Cause1(ErrHTTP3Unavailable, err)
+      - if request.Header == nil {
+      - request.Header = make(http.Header)
+      - if _, loaded := request.Header["User-Agent"]; !loaded {
+      - request.Header["User-Agent"] = nil
+      - if c.authorization != "" {
+      - request.Header.Set("Proxy-Authorization", c.authorization)
+      - stop := context.AfterFunc(ctx, func() {
+      - stream.CancelRead(0)
+      - stream.CancelWrite(0)
+      - var response *http.Response
+      - err = stream.SendRequestHeader(request)
+      - response, err = stream.ReadResponse()
+      - select {
+      - case <-clientConn.ReceivedSettings():
+      - case <-clientConn.Context().Done():
+      - err = context.Cause(clientConn.Context())
+      - case <-ctx.Done():
+      - err = ctx.Err()
+      - if !stop() {
+      - err = ctx.Err()
+      - stream.CancelRead(0)
+      - stream.Close()
+      - if response.StatusCode != http.StatusOK {
+      - stream.CancelRead(0)
+      - stream.Close()
+      - return nil, nil, statusError(response)
+      - Header: c.headers.Clone(),
+      - func (c *http3ClientImpl) ListenPacket(ctx context.Context, destination M.Socksaddr) (N.PacketConn, error) {
+      - header := c.headers.Clone()
+      - if header == nil {
+      - header = make(http.Header)
+      - Proto: connectUDPProtocol,
+      - URL: connectUDPURL(c.authority, destination),
+      - return newHTTP3PacketConn(&http3RequestDatagramStream{stream: stream, datagramsEnabled: clientConn.Settings().EnableDatagrams}, destination, M.Socksaddr{}), nil
+      - return qtls.WrapError(err)
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/connect_udp.go: 56/167 added lines absent from the fork tip
+      - func connectUDPURL(authority string, destination M.Socksaddr) *url.URL {
+      - requestURL := &url.URL{
+      - if authority != "" {
+      - requestURL.Scheme = "https"
+      - requestURL.Host = authority
+      - return requestURL
+      - return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, E.New("invalid connect-udp request: ", request.URL.Path))
+      - conn := newHTTP3PacketConn(stream, destination, localAddr)
+      - conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
+      - conn.CloseWrapper()
+      - func (c *Client) connectUDPHTTP1(ctx context.Context, conn net.Conn, destination M.Socksaddr) (N.PacketConn, error) {
+      - stop := context.AfterFunc(ctx, func() {
+      - defer stop()
+      - request := &http.Request{
+      - Method: http.MethodGet,
+      - URL: connectUDPURL("", destination),
+      - Host: c.authority(),
+      - Header: c.headers.Clone(),
+      - if request.Header == nil {
+      - request.Header = make(http.Header)
+      - request.Header.Set("Connection", "Upgrade")
+      - request.Header.Set("Upgrade", connectUDPProtocol)
+      - request.Header.Set("Capsule-Protocol", "?1")
+      - if _, loaded := request.Header["User-Agent"]; !loaded {
+      - request.Header["User-Agent"] = nil
+      - if c.authorization != "" {
+      - request.Header.Set("Proxy-Authorization", c.authorization)
+      - err := request.Write(conn)
+      - return nil, E.Cause(err, "write request")
+      - reader := std_bufio.NewReader(conn)
+      - response, err := http.ReadResponse(reader, request)
+      - return nil, E.Cause(err, "read response")
+      - if response.StatusCode != http.StatusSwitchingProtocols {
+      - return nil, statusError(response)
+      - if !strings.EqualFold(response.Header.Get("Upgrade"), connectUDPProtocol) {
+      - return nil, E.New("unexpected upgrade protocol: ", response.Header.Get("Upgrade"))
+      - if !stop() {
+      - return nil, ctx.Err()
+      - return newCapsuleConn(reader, conn, destination), nil
+      - func (c *Client) connectUDPHTTP2(ctx context.Context, clientConn *http2ClientConn, destination M.Socksaddr) (N.PacketConn, error) {
+      - request := &http.Request{
+      - Method: http.MethodConnect,
+      - URL: connectUDPURL(c.authority(), destination),
+      - Host: c.authority(),
+      - Header: c.headers.Clone(),
+      - if request.Header == nil {
+      - request.Header = make(http.Header)
+      - request.Header.Set(":protocol", connectUDPProtocol)
+      - request.Header.Set("Capsule-Protocol", "?1")
+      - stream, err := c.roundTripHTTP2(ctx, clientConn, request, destination)
+      - return nil, err
+      - return newCapsuleConn(std_bufio.NewReader(stream), stream, destination), nil
+      - func (c *Client) authority() string {
+      - if c.host != "" {
+      - return c.host
+      - return c.server.String()
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/extended_connect.go: 10/10 added lines absent from the fork tip
+      - package http
+      - import (
+      - _ "unsafe"
+      - _ "golang.org/x/net/http2"
+      - )
+      - //go:linkname disableExtendedConnectProtocol golang.org/x/net/http2.disableExtendedConnectProtocol
+      - var disableExtendedConnectProtocol bool
+      - func init() {
+      - disableExtendedConnectProtocol = false
+      - }
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/forward.go: 2/230 added lines absent from the fork tip
+      - return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, E.New("invalid forward target: ", request.URL.String()))
+      - return c.reject(request, true, http.StatusBadGateway, err)
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/reader.go: 2/55 added lines absent from the fork tip
+      - if r.Buffered() == 0 {
+      - buffer := buf.NewSize(r.Buffered())
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/server.go: 6/113 added lines absent from the fork tip
+      - "math"
+      - MaxConcurrentStreams: uint32(max(options.HTTP2Options.MaxConcurrentStreams, 0)),
+      - MaxUploadBufferPerConnection: int32(min(options.HTTP2Options.ConnectionReceiveWindow.Value(), math.MaxInt32)),
+      - MaxUploadBufferPerStream: int32(min(options.HTTP2Options.StreamReceiveWindow.Value(), math.MaxInt32)),
+      - func (s *Server) HTTP3Handler(handler Handler) http.Handler {
+      - return &httpHandler{
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/server_conn.go: 22/160 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common/auth"
+      - c.reader.setLimit(maxHeaderBytes)
+      - ctx := c.ctx
+      - if c.server.authenticator != nil {
+      - username, password, valid := badhttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
+      - if !valid || !c.server.authenticator.Verify(username, password) {
+      - var authErr error
+      - if !valid {
+      - authErr = E.New("authentication failed: missing or malformed Proxy-Authorization")
+      - } else {
+      - authErr = E.New("authentication failed: username=", username)
+      - c.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", c.source))
+      - return c.reject(request, requestKeepAlive(request), http.StatusProxyAuthRequired, authErr)
+      - ctx = auth.ContextWithUser(ctx, username)
+      - source := badhttp.ForwardedSource(request, c.source)
+      - return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, E.New("invalid CONNECT target: ", request.URL.Host))
+      - func (c *serverConn) reject(request *http.Request, keepAlive bool, statusCode int, cause error) (requestResult, error) {
+      - err := c.writeReject(request, statusCode, keepAlive)
+      - err := c.writeReject(request, statusCode, false)
+      - func (c *serverConn) writeReject(request *http.Request, statusCode int, keepAlive bool) error {
+      - Header: make(http.Header),
+      - if statusCode == http.StatusProxyAuthRequired {
+### 1a6b6615c6e5  Rewrite HTTP proxy protocol
+    transport/http/server_h2.go: 18/259 added lines absent from the fork tip
+      - "github.com/sagernet/sing-box/common/badhttp"
+      - "github.com/sagernet/sing/common/auth"
+      - MaxHeaderBytes: maxHeaderBytes,
+      - connectionSource = M.ParseSocksaddr(request.RemoteAddr).Unwrap()
+      - if h.server.authenticator != nil {
+      - username, password, valid := badhttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
+      - if !valid || !h.server.authenticator.Verify(username, password) {
+      - var authErr error
+      - authErr = E.New("authentication failed: missing or malformed Proxy-Authorization")
+      - authErr = E.New("authentication failed: username=", username)
+      - h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
+      - ctx = auth.ContextWithUser(ctx, username)
+      - source := badhttp.ForwardedSource(request, connectionSource)
+      - protocol := request.Header.Get(":protocol")
+      - conn := v2rayhttp.NewHTTP2Wrapper(&v2rayhttp.ServerHTTPConn{
+      - conn.CloseWrapper()
+      - if response.StatusCode == http.StatusSwitchingProtocols {
+      - h.server.logger.ErrorContext(ctx, "process connection from ", source, ": unexpected 101 response")
+### e2a8d9c85e5a  Add MASQUE support
+    docs/configuration/endpoint/masque-client.md: 3/83 added lines absent from the fork tip
+      - `keep_alive_period` is `10s` by default.
+      - `keep_alive_period` is `10s` by default.
+      - `initial_packet_size` is `mtu + 51` by default, so that IP packets up to the tunnel MTU fit into a QUIC datagram. QUIC packets cannot exceed 1452 bytes; with a
+### e2a8d9c85e5a  Add MASQUE support
+    docs/configuration/endpoint/masque-client.zh.md: 3/83 added lines absent from the fork tip
+      - `keep_alive_period` 默认为 `10s`。
+      - `keep_alive_period` 默认为 `10s`。
+      - `initial_packet_size` 默认为 `mtu + 51`，使不超过隧道 MTU 的 IP 数据包能放入一个 QUIC 数据报。QUIC 数据包最大为 1452 字节，`mtu` 更大时，放不下的 IP 数据包会收到 ICMP Packet Too Big 回复。如果路径无法传输这个大小的数据包，QUIC
+### e2a8d9c85e5a  Add MASQUE support
+    docs/configuration/endpoint/masque-server.md: 1/73 added lines absent from the fork tip
+      - `initial_packet_size` is `mtu + 51` by default, so that IP packets up to the tunnel MTU fit into a QUIC datagram. QUIC packets cannot exceed 1452 bytes; with a
+### e2a8d9c85e5a  Add MASQUE support
+    docs/configuration/endpoint/masque-server.zh.md: 1/73 added lines absent from the fork tip
+      - `initial_packet_size` 默认为 `mtu + 51`，使不超过隧道 MTU 的 IP 数据包能放入一个 QUIC 数据报。QUIC 数据包最大为 1452 字节，`mtu` 更大时，放不下的 IP 数据包会收到 ICMP Packet Too Big 回复。
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/http/inbound.go: 1/3 added lines absent from the fork tip
+      - inbound.server.ConfigureTLS(tlsConfig)
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/masque/client.go: 6/344 added lines absent from the fork tip
+      - outboundDialer, err := dialer.NewWithOptions(dialer.Options{
+      - httpClient, err := http.NewClientWithTLS(ctx, logger, outboundDialer, options.ServerOptions, common.PtrValueOrDefault(options.TLS), http.ClientOptions{
+      - if !keep {
+      - packetBuffer.Write(packet)
+      - destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+      - destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/masque/endpoint.go: 1/111 added lines absent from the fork tip
+      - PacketHeadroom: masque.PacketHeadroom,
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/masque/server.go: 10/299 added lines absent from the fork tip
+      - scope.Add(tunnelDevice.Close)
+      - scope.Add(s.server.Close)
+      - scope.Add(s.tlsConfig.Close)
+      - scope.Add(s.listener.Close)
+      - http3Server, listenErr := s.httpServer.ListenHTTP3(s.ctx, s.logger, s.listener, nil, s.tlsConfig, s.quicOptions)
+      - if listenErr != nil {
+      - return listenErr
+      - scope.Add(http3Server.Close)
+      - scope.Add(func() error {
+      - return s.server.WritePacketBuffers(common.Map(packets, buf.As), true)
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/openconnect/client.go: 1/14 added lines absent from the fork tip
+      - PacketHeadroom: openconnecttransport.PacketHeadroom,
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/openvpn/client.go: 7/18 added lines absent from the fork tip
+      - deviceMTU := options.MTU
+      - if deviceMTU == 0 {
+      - deviceMTU = ovpntransport.DefaultMTU
+      - NamePrefix: "ovpn",
+      - MTU: deviceMTU,
+      - PacketHeadroom: ovpntransport.PacketHeadroom,
+      - MTU: deviceMTU,
+### e2a8d9c85e5a  Add MASQUE support
+    protocol/openvpn/server.go: 1/14 added lines absent from the fork tip
+      - PacketHeadroom: ovpntransport.PacketHeadroom,
+### e2a8d9c85e5a  Add MASQUE support
+    transport/device/device.go: 4/14 added lines absent from the fork tip
+      - PacketHeadroom int
+      - packetHeadroom int
+      - if headroom > d.packetHeadroom {
+      - return E.New("return path headroom ", headroom, " exceeds available ", d.packetHeadroom)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/device/stack.go: 2/11 added lines absent from the fork tip
+      - baseDevice: baseDevice{packetHeadroom: options.PacketHeadroom},
+      - Headroom: options.PacketHeadroom,
+### e2a8d9c85e5a  Add MASQUE support
+    transport/device/system.go: 5/9 added lines absent from the fork tip
+      - baseDevice: baseDevice{packetHeadroom: options.PacketHeadroom},
+      - packetBuffer := buf.NewSize(d.packetHeadroom + systemDeviceReadBufferSize + systemDevicePacketRearSpace)
+      - packetBuffer.Resize(d.packetHeadroom, 0)
+      - packetBuffers[i] = buf.NewSize(d.packetHeadroom + mtu + systemDevicePacketRearSpace)
+      - packetBuffer.Resize(d.packetHeadroom, 0)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/client.go: 1/90 added lines absent from the fork tip
+      - conn, stream, err := c.openTunnel(ctx, tunnelRequest{
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/connect_udp.go: 1/3 added lines absent from the fork tip
+      - return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid connect-udp request: ", request.URL.Path))
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/server.go: 8/31 added lines absent from the fork tip
+      - "slices"
+      - var ConfigureHTTP3ListenerFunc func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, op
+      - func (s *Server) ConfigureTLS(tlsConfig tls.ServerConfig) {
+      - if len(tlsConfig.NextProtos()) > 0 {
+      - tlsConfig.SetNextProtos(nextProtos)
+      - if !slices.Contains(tlsConfig.NextProtos(), "h3") {
+      - tlsConfig.SetNextProtos(append([]string{"h3"}, tlsConfig.NextProtos()...))
+      - }, tlsConfig, options)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/server_conn.go: 3/28 added lines absent from the fork tip
+      - return c.serveTunnel(tunnelCtx, request, badhttp.ForwardedSource(request, c.source), tunnelProtocol, tunnelHandler)
+      - return c.reject(request, requestKeepAlive(request), http.StatusProxyAuthRequired, nil, authErr)
+      - return c.reject(request, requestKeepAlive(request), http.StatusBadRequest, nil, E.New("invalid CONNECT target: ", request.URL.Host))
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/server_h2.go: 3/28 added lines absent from the fork tip
+      - tunnelCtx, authErr := h.server.authenticate(ctx, request, "Authorization")
+      - h.serveTunnel(tunnelCtx, writer, request, badhttp.ForwardedSource(request, connectionSource), tunnelHandler)
+      - h.server.logger.ErrorContext(ctx, E.Cause(authErr, "process connection from ", connectionSource))
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/server_h3.go: 1/5 added lines absent from the fork tip
+      - ConfigureHTTP3ListenerFunc = func(ctx context.Context, logger logger.Logger, listener *listener.Listener, handler http.Handler, tlsConfig tls.ServerConfig, opti
+### e2a8d9c85e5a  Add MASQUE support
+    transport/http/tunnel_client.go: 11/161 added lines absent from the fork tip
+      - return nil, E.Cause(err, "parse tunnel path")
+      - conn, stream, err := c.openTunnel(ctx, tunnelRequest{
+      - return stream, nil
+      - func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Conn, DatagramStream, error) {
+      - return nil, stream, nil
+      - if c.tlsDialer != nil && !c.http2Unsupported.Load() && !c.http2ExtendedConnectUnsupported.Load() {
+      - return streamConn, nil, nil
+      - return nil, nil, connectErr
+      - return nil, nil, ErrHTTP2Unsupported
+      - return c.openTunnelHTTP1AndClose(ctx, conn, request)
+      - return c.openTunnelHTTP1AndClose(ctx, conn, request)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/masque/capsule.go: 2/151 added lines absent from the fork tip
+      - case previous.Protocol < route.Protocol:
+      - case previous.End.Compare(start) >= 0:
+### e2a8d9c85e5a  Add MASQUE support
+    transport/masque/client.go: 18/447 added lines absent from the fork tip
+      - stream, err := c.httpClient.OpenTunnel(dialCtx, upgradeToken, c.template.Expand())
+      - current.session = newSession(c.ctx, stream, current, false)
+      - defer current.access.Unlock()
+      - return current.ready
+      - ready := current.ready
+      - if ready {
+      - configuration := current.configuration
+      - ready := current.ready
+      - if !ready {
+      - for i, packetBuffer := range packetBuffers {
+      - routed := !configuration.RoutesAdvertised || RoutesContain(configuration.Routes, destination, protocol)
+      - reply, built := buildICMPError(packetBuffer.Bytes(), errorType, inet4Address, inet6Address, 0, PacketHeadroom)
+      - err := current.writePacket(packetBuffer)
+      - buf.ReleaseMulti(packetBuffers[i+1:])
+      - break
+      - _ = s.writePacket(reply)
+      - inet4Address, inet6Address := firstAddresses(s.configuration.Address)
+      - reply, built := buildICMPError(buffer.Bytes(), tun.ICMPErrorPacketTooBig, inet4Address, inet6Address, mtu, PacketHeadroom)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/masque/server.go: 21/411 added lines absent from the fork tip
+      - current.session = newSession(s.ctx, stream, current, true)
+      - if err != nil && !E.IsClosedOrCanceled(err) {
+      - _, loaded := s.addresses[address]
+      - return loaded || slices.ContainsFunc(s.advertisements, func(it *serverSession) bool {
+      - var replies []*buf.Buffer
+      - routed := target != nil && target.accepts(source, protocol)
+      - if routed && forwarded && !decrementHopLimit(packetBuffer.Bytes()) {
+      - routed = false
+      - if routed {
+      - buffer := buf.NewSize(transportHTTP.CapsuleHeadroom + packetBuffer.Len())
+      - buffer.Resize(transportHTTP.CapsuleHeadroom, 0)
+      - buffer.Write(packetBuffer.Bytes())
+      - target.queuePacket(buffer)
+      - reply, built := buildICMPError(packetBuffer.Bytes(), errorType, s.inet4Address, s.inet6Address, 0, PacketHeadroom)
+      - target.queuePacket(buffer)
+      - s.queuePacket(reply)
+      - reply, built := buildICMPError(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, mtu, PacketHeadroom)
+      - _, destination, protocol, _ := packetAddresses(reply.Bytes())
+      - if target != nil {
+      - target.queuePacket(reply)
+      - err := s.server.handler.WriteInboundBuffers([]*buf.Buffer{reply})
+### e2a8d9c85e5a  Add MASQUE support
+    transport/masque/session.go: 36/234 added lines absent from the fork tip
+      - PacketHeadroom = 64
+      - maxPacketSize = 65535
+      - sendQueueSize = 256
+      - sendQueue chan *buf.Buffer
+      - func newSession(ctx context.Context, stream io.ReadWriteCloser, handler sessionHandler, queued bool) *session {
+      - datagrams, _ := stream.(transportHTTP.DatagramStream)
+      - if queued {
+      - current.sendQueue = make(chan *buf.Buffer, sendQueueSize)
+      - if s.sendQueue != nil {
+      - loops.Go(s.loopSend)
+      - buffer := buf.NewSize(PacketHeadroom + len(datagram) - contextLength)
+      - buffer.Resize(PacketHeadroom, 0)
+      - buffer.Write(datagram[contextLength:])
+      - func (s *session) loopSend() {
+      - select {
+      - case buffer := <-s.sendQueue:
+      - err := s.writePacket(buffer)
+      - case <-s.ctx.Done():
+      - select {
+      - case buffer := <-s.sendQueue:
+      - case capsuleTypeAddressAssign, capsuleTypeAddressRequest, capsuleTypeRouteAdvertisement:
+      - buffer := buf.NewSize(PacketHeadroom + payloadLength)
+      - buffer.Resize(PacketHeadroom, 0)
+      - func (s *session) queuePacket(buffer *buf.Buffer) {
+      - select {
+      - case s.sendQueue <- buffer:
+      - func (s *session) writePacket(buffer *buf.Buffer) error {
+      - err := s.datagrams.SendDatagram(datagram.Bytes())
+      - switch {
+      - case err == nil:
+      - case errors.As(err, &tooLarge):
+      - mtu := tooLarge.MaxPayloadSize - 1
+      - if mtu < minimumLinkMTU {
+      - return E.New("QUIC connection is unable to carry ", minimumLinkMTU, " bytes packets")
+      - case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
+      - return transportHTTP.WriteDatagramCapsule(s.stream, datagram)
+### e2a8d9c85e5a  Add MASQUE support
+    transport/masque/template.go: 1/227 added lines absent from the fork tip
+      - } else if strings.ContainsAny(target, ":/") {
+### e2a8d9c85e5a  Add MASQUE support
+    transport/openconnect/configuration.go: 4/36 added lines absent from the fork tip
+      - "github.com/sagernet/sing-openconnect"
+      - const (
+      - DefaultMTU = 1500
+      - PacketHeadroom = openconnect.PacketHeadroom
+### e2a8d9c85e5a  Add MASQUE support
+    transport/openvpn/configuration.go: 4/32 added lines absent from the fork tip
+      - const (
+      - DefaultMTU = 1500
+      - PacketHeadroom = 4096
+      - )
+### 41ef639b548f  Fix outbound group resolution and interruption for nested groups
+    daemon/started_service.go: 3/7 added lines absent from the fork tip
+      - if history := historyStorage.LoadURLTestHistory(group.RealTag(itemOutbound, N.NetworkTCP)); history != nil {
+      - if history := historyStorage.LoadURLTestHistory(group.RealTag(ob, N.NetworkTCP)); history != nil {
+      - if history := historyStorage.LoadURLTestHistory(group.RealTag(ep, N.NetworkTCP)); history != nil {
+### 41ef639b548f  Fix outbound group resolution and interruption for nested groups
+    experimental/clashapi/proxies.go: 1/8 added lines absent from the fork tip
+      - realTag := group.RealTag(proxy, N.NetworkTCP)
+### 41ef639b548f  Fix outbound group resolution and interruption for nested groups
+    protocol/group/selector.go: 2/19 added lines absent from the fork tip
+      - return detour.Tag()
+      - detour = group.Selected(network)
+### 41ef639b548f  Fix outbound group resolution and interruption for nested groups
+    protocol/group/urltest.go: 9/21 added lines absent from the fork tip
+      - outbound = s.group.selectedOutboundUDP
+      - outbound = s.group.selectedOutboundTCP
+      - outbound, _ = s.group.Select(network)
+      - s.group.Touch()
+      - return s.group.interruptGroup.Add(closer, true)
+      - if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundTCP, N.NetworkTCP)); history != nil {
+      - if history := g.history.LoadURLTestHistory(RealTag(g.selectedOutboundUDP, N.NetworkUDP)); history != nil {
+      - history := g.history.LoadURLTestHistory(RealTag(detour, network))
+      - groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
+### 41ef639b548f  Fix outbound group resolution and interruption for nested groups
+    route/route.go: 5/71 added lines absent from the fork tip
+      - chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP)
+      - r.connection.NewConnection(ctx, outbound, conn, metadata, onClose)
+      - func resolveOutbound(outbound adapter.Outbound, network string) ([]adapter.Outbound, error) {
+      - chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP)
+      - chain, err := resolveOutbound(outbound, metadata.Network)
+### 9a0ff4167579  Fix HTTP/2 extended CONNECT with Go 1.27
+    transport/http/tunnel_client.go: 1/4 added lines absent from the fork tip
+      - return nil, nil, errExtendedConnectUnavailable
+### 7f7c7ae11a38  Fix AnyTLS splitting UDP packets into multiple frames
+    go.mod: 1/1 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a
+### 7f7c7ae11a38  Fix AnyTLS splitting UDP packets into multiple frames
+    go.sum: 2/2 added lines absent from the fork tip
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a h1:pBs90r7Ju2qsT+5PwKkZgmxwHVD5AnGlEXVehDXVplE=
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+### 530e3aed7aac  Add dns_server_address and dns_search_domain rule items
+    dns/transport/dhcp/dhcp.go: 4/38 added lines absent from the fork tip
+      - t.savedState.Store(&transportState{
+      - search: state.search,
+      - servers: state.servers,
+      - if state.serverScope != nil {
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    protocol/openconnect/client.go: 2/15 added lines absent from the fork tip
+      - PacketFrontHeadroom: openconnect.PacketHeadroom,
+      - PacketRearHeadroom: openconnect.PacketRearHeadroom,
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    protocol/openvpn/client.go: 5/19 added lines absent from the fork tip
+      - packetFrontHeadroom, packetRearHeadroom := clientOptions.DataPacketHeadroom()
+      - NamePrefix: "ovpn",
+      - MTU: deviceMTU,
+      - PacketFrontHeadroom: packetFrontHeadroom,
+      - PacketRearHeadroom: packetRearHeadroom,
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    protocol/openvpn/server.go: 7/39 added lines absent from the fork tip
+      - packetFrontHeadroom, packetRearHeadroom := serverOptions.DataPacketHeadroom()
+      - PacketFrontHeadroom: packetFrontHeadroom,
+      - PacketRearHeadroom: packetRearHeadroom,
+      - Route: serverEndpoint.routeOutbound,
+      - serverOptions.NewOutboundQueue = func(write func(buffers []*buf.Buffer)) ovpn.OutboundQueue {
+      - return s.device.NewOutboundQueue(write)
+      - serverOptions.IncomingPacketHeadroom = s.device.FrontHeadroom
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    test/go.mod: 7/9 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6-0.20260922013359-4ca3bebe0b8e
+      - github.com/sagernet/sing-openvpn v0.0.0-20260925112415-fe3a4fdc2e64
+      - github.com/sagernet/sing-quic v0.7.1-0.20260927144857-8601a428f4db
+      - github.com/sagernet/sing-tun v0.9.6-0.20260925112405-97d11460f2ea
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a // indirect
+      - github.com/sagernet/sing-openconnect v0.0.0-20260925112412-098ce1337fbe // indirect
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260925112423-da3fb928cdc1 // indirect
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    test/go.sum: 12/14 added lines absent from the fork tip
+      - github.com/sagernet/sing v0.9.6-0.20260922013359-4ca3bebe0b8e h1:QWET7c7thcrm0svrxVmEIaDnYbmfHbE570gvO89RNN4=
+      - github.com/sagernet/sing v0.9.6-0.20260922013359-4ca3bebe0b8e/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a h1:pBs90r7Ju2qsT+5PwKkZgmxwHVD5AnGlEXVehDXVplE=
+      - github.com/sagernet/sing-anytls v0.0.0-20260924021732-7ca72921ac6a/go.mod h1:VRKLnj0ObEsN228h+zuzf91p+6sjtYE8SBaLPVsBy5o=
+      - github.com/sagernet/sing-openconnect v0.0.0-20260925112412-098ce1337fbe h1:Bt33IHF3ucryCV71KQVZq4tsjBUouy+ol8GByZawAm0=
+      - github.com/sagernet/sing-openconnect v0.0.0-20260925112412-098ce1337fbe/go.mod h1:4AKZLVcvY3r54UaK2Gbnm7aN8pOwdLz+y4EP0QFZ5Eg=
+      - github.com/sagernet/sing-openvpn v0.0.0-20260925112415-fe3a4fdc2e64 h1:bhCnU5nB/Ds8l9ChZRnpbs92EYn+B6PaAWZI2D+qrac=
+      - github.com/sagernet/sing-openvpn v0.0.0-20260925112415-fe3a4fdc2e64/go.mod h1:PWX7WygD8jpwfqfaGNySXpJYTn0SOwjBI1BKHHC2+Bw=
+      - github.com/sagernet/sing-quic v0.7.1-0.20260927144857-8601a428f4db h1:BXT2PPAWBakTs+UF6q+2rrkEFu3FZ31xwS9s8k96gK4=
+      - github.com/sagernet/sing-quic v0.7.1-0.20260927144857-8601a428f4db/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260925112423-da3fb928cdc1 h1:Dsp0Pi6oZk8tNF9jJo2IInDopLx6GHRUBlR6sm7osYs=
+      - github.com/sagernet/wireguard-go v0.0.8-0.20260925112423-da3fb928cdc1/go.mod h1:er10sELpmzLXq7S7Pbc1Zsbyapcr+/gxNAHKTo6fzVA=
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    transport/masque/server.go: 2/59 added lines absent from the fork tip
+      - reply, built := buildICMPError(buffer.Bytes(), tun.ICMPErrorPacketTooBig, s.server.inet4Address, s.server.inet6Address, mtu, s.server.receivedPacketHeadroom())
+      - target.queue.WriteBuffers([]*buf.Buffer{reply})
+### 1e157350b789  Fix per-destination backpressure to endpoints
+    transport/masque/session.go: 10/53 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common"
+      - PacketHeadroom = transportHTTP.CapsuleHeadroom
+      - buffer := buf.NewSize(headroom + len(datagram) - contextLength)
+      - common.Must1(buffer.Write(datagram[contextLength:]))
+      - err := s.datagrams.SendDatagram(datagram.Bytes())
+      - switch {
+      - case err == nil:
+      - case errors.As(err, &tooLarge):
+      - mtu := tooLarge.MaxPayloadSize - 1
+      - case errors.Is(err, transportHTTP.ErrDatagramUnsupported):
+### 6ef3dbc61078  Update naiveproxy to v154.0.8037.49-2
+    go.sum: 62/62 added lines absent from the fork tip
+      - github.com/sagernet/cronet-go v0.0.0-20260929213745-4d18a60dc3a8 h1:yW/KNhSxWxllsPjLx5EUPohHLa4Kvzl2Qt9kHkB0ZIc=
+      - github.com/sagernet/cronet-go v0.0.0-20260929213745-4d18a60dc3a8/go.mod h1:T/mwtrpC4JlWfScw73CmSBvHzIvc7BatQ1MhRr+cYNw=
+      - github.com/sagernet/cronet-go/all v0.0.0-20260929213745-4d18a60dc3a8 h1:xhh9UrPFncqI8r2mr+bybgZyJICtV4GKOSJuhnEx75g=
+      - github.com/sagernet/cronet-go/all v0.0.0-20260929213745-4d18a60dc3a8/go.mod h1:TTVPJ08WtE9Lp7Qa5KpNmBpBrzMpYFaAABXt+YxeLTg=
+      - github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260929213014-a1cafd93eb1f h1:IHDPaQoYGwB6k2GU6noC5ck6ECgR38EB3niEfUpR6Cc=
+      - github.com/sagernet/cronet-go/lib/android_386 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:XXDwdjX/T8xftoeJxQmbBoYXZp8MAPFR2CwbFuTpEtw=
+      - github.com/sagernet/cronet-go/lib/android_amd64 v0.0.0-20260929213014-a1cafd93eb1f h1:oP1VRyWRk+M5nxJ6em64Xoqn+jkNEo7PNYlb0oshlVk=
+      - github.com/sagernet/cronet-go/lib/android_amd64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:iNiUGoLtnr8/JTuVNj7XJbmpOAp2C6+B81KDrPxwaZM=
+      - github.com/sagernet/cronet-go/lib/android_arm v0.0.0-20260929213014-a1cafd93eb1f h1:c/ly9vxBpzLy2PWpYlfY5Ey1ul1xWjpaIPHW2lF9VBk=
+      - github.com/sagernet/cronet-go/lib/android_arm v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:19ILNUOGIzRdOqa2mq+iY0JoHxuieB7/lnjYeaA2vEc=
+      - github.com/sagernet/cronet-go/lib/android_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:mmItB2/i9mrPuiqIrZm0UjcQ+m1RRhC+ayj+scOAvaw=
+      - github.com/sagernet/cronet-go/lib/android_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:JxzGyQf94Cr6sBShKqODGDyRUlESfJK/Njcz9Lz6qMQ=
+      - github.com/sagernet/cronet-go/lib/darwin_amd64 v0.0.0-20260929213014-a1cafd93eb1f h1:xenAxIaoocXqtaNECC1iNOqtdzYRYxhXyE+o+m2ExSw=
+      - github.com/sagernet/cronet-go/lib/darwin_amd64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:KN+9T9TBycGOLzmKU4QdcHAJEj6Nlx48ifnlTvvHMvs=
+      - github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:SpLjX7QCXhKInRzT0hiYCpt+kOmcCVsrJvUV9RRUy2c=
+      - github.com/sagernet/cronet-go/lib/darwin_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:kojvtUc29KKnk8hs2QIANynVR59921SnGWA9kXohHc0=
+      - github.com/sagernet/cronet-go/lib/ios_amd64_simulator v0.0.0-20260929213014-a1cafd93eb1f h1:v4aEyRqDsLeh/QOOTY0NzxnwC/maUwr05Af4e3Wg94A=
+      - github.com/sagernet/cronet-go/lib/ios_amd64_simulator v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:hkQzRE5GDbaH1/ioqYh0Taho4L6i0yLRCVEZ5xHz5M0=
+      - github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:EtYMGvDsx49tlOpjnKG4YmHMJ8yorAatxJht7MRhIzA=
+      - github.com/sagernet/cronet-go/lib/ios_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:tzVJFTOm66UxLxy6K0ZN5Ic2PC79e+sKKnt+V9puEa4=
+      - github.com/sagernet/cronet-go/lib/ios_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f h1:4nh4xShjL66bCWWhUDThGIZ2NgSO/2dzLtihPspdpZM=
+      - github.com/sagernet/cronet-go/lib/ios_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:M/pN6m3j0HFU6/y83n0HU6GLYys3tYdr/xTE8hVEGMo=
+      - github.com/sagernet/cronet-go/lib/linux_386 v0.0.0-20260929213014-a1cafd93eb1f h1:YKTs7860q5YC+arXDoxuAuCq4Ba7hcJnau7/QtkVgcs=
+      - github.com/sagernet/cronet-go/lib/linux_386 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:cGh5hO6eljCo6KMQ/Cel8Xgq4+etL0awZLRBDVG1EZQ=
+      - github.com/sagernet/cronet-go/lib/linux_386_musl v0.0.0-20260929213014-a1cafd93eb1f h1:GbLerpkeRw1SGLHkwSNZXzR02f4aecpOBscKOp2vRkE=
+      - github.com/sagernet/cronet-go/lib/linux_386_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:JFE0/cxaKkx0wqPMZU7MgaplQlU0zudv82dROJjClKU=
+      - github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0-20260929213014-a1cafd93eb1f h1:dAbYhebHYrOBOvJux8hcuj4yTEIT+UqZmuTBKsLs6cQ=
+      - github.com/sagernet/cronet-go/lib/linux_amd64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:vU8VftFeSt7fURCa3JXD6+k6ss1YAX+idQjPvHmJ2tI=
+      - github.com/sagernet/cronet-go/lib/linux_amd64_musl v0.0.0-20260929213014-a1cafd93eb1f h1:PAK8bwbOxhTdyjnAX/UNLEtbwtN9Hyry4N7RRG8lq30=
+      - github.com/sagernet/cronet-go/lib/linux_amd64_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:vCe4OUuL+XOUge9v3MyTD45BnuAXiH+DkjN9quDXJzQ=
+      - github.com/sagernet/cronet-go/lib/linux_arm v0.0.0-20260929213014-a1cafd93eb1f h1:1z4WrEbt5eB6Arpltl/x4pL/cooe6sn+grHrXk0lDCw=
+      - github.com/sagernet/cronet-go/lib/linux_arm v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:w9amBWrvjtohQzBGCKJ7LCh22LhTIJs4sE7cYaKQzM0=
+      - github.com/sagernet/cronet-go/lib/linux_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:ka6fV7nmcXuxxxViMv3lcO1VZQ7og9BWDTsChbdOs5o=
+      - github.com/sagernet/cronet-go/lib/linux_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:TqlsFtcYS/etTeck46kHBeT8Le0Igw1Q/AV88UnMS3s=
+      - github.com/sagernet/cronet-go/lib/linux_arm64_musl v0.0.0-20260929213014-a1cafd93eb1f h1:+ZJPetIdQY6gSB3oEXcFuN803z7hsochw63LUVNbAAw=
+      - github.com/sagernet/cronet-go/lib/linux_arm64_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:B6Qd0vys8sv9OKVRN6J9RqDzYRGE938Fb2zrYdBDyTQ=
+      - github.com/sagernet/cronet-go/lib/linux_arm_musl v0.0.0-20260929213014-a1cafd93eb1f h1:6h/hBfvE9xr+FszN4fvHPlRuMQmkhveOVnlfPiJcNW0=
+      - github.com/sagernet/cronet-go/lib/linux_arm_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:3tXMMFY7AHugOVBZ5Al7cL7JKsnFOe5bMVr0hZPk3ow=
+      - github.com/sagernet/cronet-go/lib/linux_loong64 v0.0.0-20260929213014-a1cafd93eb1f h1:/Vy00lZZkG5usxUMAD/9vRTT93KvJh8NAO4lP1IZEVU=
+      - github.com/sagernet/cronet-go/lib/linux_loong64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:Wt5uFdU3tnmm8YzobYewwdF7Mt6SucRQg6xeTNWC3Tk=
+      - github.com/sagernet/cronet-go/lib/linux_loong64_musl v0.0.0-20260929213014-a1cafd93eb1f h1:r6u8oKJ19t4gNtmggIgFgybaMLa3bliALxFTNN/OUy0=
+      - github.com/sagernet/cronet-go/lib/linux_loong64_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:lyIF6wKBLwWa5ZXaAKbAoewewl+yCHo2iYev39Mbj4E=
+      - github.com/sagernet/cronet-go/lib/linux_mips64le v0.0.0-20260929213014-a1cafd93eb1f h1:ZWfdGEaOPFCsvX26dQi3ac80nL8HP6hmHtRhy4MsYlI=
+      - github.com/sagernet/cronet-go/lib/linux_mips64le v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:H46PnSTTZNcZokLLiDeMDaHiS1l14PH3tzWi0eykjD8=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle v0.0.0-20260929213014-a1cafd93eb1f h1:kYGMQ9qe7MyK8qpTuFaleAxVrQx9DAez1jNKFCFMLVQ=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:RBhSUDAKWq7fswtV4nQUQhuaTLcX3ettR7teA7/yf2w=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle_musl v0.0.0-20260929213014-a1cafd93eb1f h1:a2/KeGNQagO+eexS97/qykr68YLr616QRFot4aV4sJ4=
+      - github.com/sagernet/cronet-go/lib/linux_mipsle_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:wRzoIOGG4xbpp3Gh3triLKwMwYriScXzFtunLYhY4w0=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64 v0.0.0-20260929213014-a1cafd93eb1f h1:lxJLDTBemaS8j+xdOeK+EdxH4FSEndxNG321AO7f/ds=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:LNiZXmWil1OPwKCheqQjtakZlJuKGFz+iv2eGF76Hhs=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64_musl v0.0.0-20260929213014-a1cafd93eb1f h1:1ycIIAvgJsm6opK1nrXgle7QVCo9lOtyUGEDEeDOJQQ=
+      - github.com/sagernet/cronet-go/lib/linux_riscv64_musl v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:YFDGKTkpkJGc5+hnX/RYosZyTWg9h+68VB55fYRRLYc=
+      - github.com/sagernet/cronet-go/lib/tvos_amd64_simulator v0.0.0-20260929213014-a1cafd93eb1f h1:JJ7E0whZLeDheTuJp8C4KhBRa1dZqqp6+Sad/GeAALQ=
+      - github.com/sagernet/cronet-go/lib/tvos_amd64_simulator v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:aaX0YGl8nhGmfRWI8bc3BtDjY8Vzx6O0cS/e1uqxDq4=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:p5FRddmUuEhdSMA8+wS+4H4d+4dd3AiWncn8uc/yomw=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:EdzMKA96xITc42QEI+ct4SwqX8Dn3ltKK8wzdkLWpSc=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f h1:BPRu2p7kFIK6wQtKAXBt9kT1s1CHpcGpIV7TpcDBiME=
+      - github.com/sagernet/cronet-go/lib/tvos_arm64_simulator v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:qix4kv1TTAJ5tY4lJ9vjhe9EY4mM+B7H5giOhbxDVcc=
+      - github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260929213014-a1cafd93eb1f h1:0Z4FyS1oD2Cl/Shp10UYHki8x/2VxCRGbYJi09pWGPU=
+      - github.com/sagernet/cronet-go/lib/windows_amd64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:lm9w/oCCRyBiUa3G8lDQTT8x/ONUvgVR2iV9fVzUZB8=
+      - github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260929213014-a1cafd93eb1f h1:AswvqGrtVC1XfOPbzGjWLgoy9huASLRcheKTrD/l31E=
+      - github.com/sagernet/cronet-go/lib/windows_arm64 v0.0.0-20260929213014-a1cafd93eb1f/go.mod h1:n34YyLgapgjWdKa0IoeczjAFCwD3/dxbsH5sucKw0bw=
+### 69601481fd36  Ignore closed and canceled errors in scope cleanup
+    adapter/lifecycle.go: 6/6 added lines absent from the fork tip
+      - "github.com/sagernet/sing/common"
+      - var cleanupErrors []error
+      - cleanupErrors = append(cleanupErrors, E.Expand(cleanup())...)
+      - return E.Errors(common.Filter(cleanupErrors, func(it error) bool {
+      - return !E.IsClosed(it) && !E.IsCanceled(it)
+      - })...)
+### 6afeff4c0f71  Bump version
+    docs/changelog.md: 1/77 added lines absent from the fork tip
+      - #### 1.15.0-alpha.11

@@ -1,0 +1,372 @@
+[01] 6e3c86f51816  Use screen state to end device pause on iOS  (3 differing paths)
+      experimental/libbox/command_server.go   added-lines-present 12/22
+      service/powerreport/record.go   added-lines-present 2/2
+      service/powerreport/recorder.go   added-lines-present 7/7
+[02] f95aa6ac11d0  Update dependencies  (2 differing paths)
+      go.sum   added-lines-present 0/12
+      go.mod   added-lines-present 0/6
+[03] 79fc394d671c  documentation: Update Apple App Store link  (1 differing paths)
+      docs/clients/apple/index.md   added-lines-present 1/1
+[04] a0d775ea6610  Fix zero UDP checksum  (2 differing paths)
+      go.sum   added-lines-present 0/2
+      go.mod   added-lines-present 0/1
+[05] 52f9bad034d2  Fix protocol input validation  (7 differing paths)
+      go.sum   added-lines-present 8/20
+      protocol/naive/inbound.go   added-lines-present 4/14
+      go.mod   added-lines-present 4/10
+      common/sniff/quic.go   added-lines-present 4/4
+      protocol/tailscale/dns_transport.go   added-lines-present 8/8
+      protocol/tailscale/tailssh/server.go   added-lines-present 3/3
+      route/route.go   added-lines-present 0/0
+[06] bff5acf292d8  Handle connected UDP EOF on BSD  (3 differing paths)
+      go.sum   added-lines-present 0/6
+      go.mod   added-lines-present 1/3
+      common/dialer/default.go   added-lines-present 9/9
+[07] a364ff4794f0  Remove unimplemented hot reload from managers  (12 differing paths)
+      adapter/outbound/manager.go   added-lines-present 2/8
+      adapter/certificate/manager.go   added-lines-present 0/4
+      adapter/endpoint/manager.go   added-lines-present 0/4
+      adapter/inbound/manager.go   added-lines-present 0/4
+      adapter/service/manager.go   added-lines-present 0/4
+      dns/transport_manager.go   added-lines-present 0/4
+      protocol/group/urltest.go   added-lines-present 13/17
+      box.go   added-lines-present 16/19
+      adapter/dns.go   added-lines-present 0/0
+      adapter/inbound.go   added-lines-present 0/0
+      adapter/outbound.go   added-lines-present 0/0
+      route/rule/rule_item_rule_set_test.go   added-lines-present 0/0
+[08] a691a4402375  Refactor lifecycle to scoped cleanup  (57 differing paths)
+      protocol/tun/inbound.go   added-lines-present 13/38
+      protocol/tailscale/endpoint.go   added-lines-present 45/59
+      service/oomkiller/service_darwin.go   added-lines-present 10/19
+      route/network.go   added-lines-present 21/25
+      dns/transport/local/local_resolved_linux.go   added-lines-present 36/39
+      protocol/bridge/backend_linux.go   added-lines-present 65/68
+      protocol/openconnect/client.go   added-lines-present 62/64
+      protocol/openvpn/client.go   added-lines-present 58/60
+      box.go   added-lines-present 92/93
+      dns/transport/multiplexer_test.go   added-lines-present 11/12
+      protocol/group/urltest.go   added-lines-present 1/2
+      protocol/openconnect/dns_transport.go   added-lines-present 39/40
+      protocol/openvpn/server.go   added-lines-present 26/27
+      service/ccm/service.go   added-lines-present 15/16
+      service/oomkiller/service.go   added-lines-present 0/1
+      adapter/certificate/manager.go   added-lines-present 4/4
+      adapter/endpoint/manager.go   added-lines-present 9/9
+      adapter/inbound/manager.go   added-lines-present 4/4
+      adapter/lifecycle.go   added-lines-present 72/72
+      adapter/outbound/manager.go   added-lines-present 21/21
+      adapter/service/manager.go   added-lines-present 4/4
+      common/httpclient/manager.go   added-lines-present 3/3
+      common/trafficcontrol/manager.go   added-lines-present 7/7
+      dns/router.go   added-lines-present 10/10
+      dns/transport/dhcp/dhcp.go   added-lines-present 29/29
+      dns/transport/quic/http3.go   added-lines-present 6/6
+      dns/transport/quic/quic.go   added-lines-present 2/2
+      dns/transport/tcp.go   added-lines-present 2/2
+      dns/transport/tls.go   added-lines-present 2/2
+      dns/transport_manager.go   added-lines-present 11/11
+      go.mod   added-lines-present 1/1
+      go.sum   added-lines-present 2/2
+      protocol/anytls/inbound.go   added-lines-present 8/8
+      protocol/bridge/backend.go   added-lines-present 12/12
+      protocol/direct/outbound.go   added-lines-present 5/5
+      protocol/group/selector.go   added-lines-present 4/4
+      protocol/http/inbound.go   added-lines-present 8/8
+      protocol/mixed/inbound.go   added-lines-present 8/8
+      protocol/naive/inbound.go   added-lines-present 5/5
+      protocol/naive/outbound.go   added-lines-present 2/2
+      protocol/openvpn/dns_transport.go   added-lines-present 50/50
+      protocol/shadowsocks/outbound.go   added-lines-present 8/8
+      protocol/shadowtls/inbound.go   added-lines-present 7/7
+      protocol/socks/inbound.go   added-lines-present 7/7
+      protocol/ssh/outbound.go   added-lines-present 8/8
+      protocol/tailscale/dns_transport.go   added-lines-present 49/49
+      protocol/trojan/outbound.go   added-lines-present 11/11
+      protocol/tuic/outbound.go   added-lines-present 8/8
+      protocol/vless/outbound.go   added-lines-present 11/11
+      protocol/wireguard/endpoint.go   added-lines-present 9/9
+      route/conn.go   added-lines-present 8/8
+      route/reference.go   added-lines-present 2/2
+      route/router.go   added-lines-present 11/11
+      route/rule/rule_item_rule_set_test.go   added-lines-present 1/1
+      service/derp/service.go   added-lines-present 3/3
+      service/ocm/service.go   added-lines-present 23/23
+      service/ssmapi/server.go   added-lines-present 17/17
+[09] f9fcb8964f0b  Fix usage and cache files overwritten when loading fails  (3 differing paths)
+      service/ccm/service.go   added-lines-present 11/11
+      service/ocm/service.go   added-lines-present 11/11
+      service/ssmapi/server.go   added-lines-present 12/12
+[10] 02537831e188  Move auto-redirect and bridge index allocation out of constructors  (3 differing paths)
+      protocol/tun/inbound.go   added-lines-present 11/28
+      protocol/bridge/backend.go   added-lines-present 11/12
+      protocol/bridge/backend_linux.go   added-lines-present 7/8
+[11] 67fb235ee802  Add roothide package to iOS jailbreak release  (2 differing paths)
+      docs/clients/apple/index.md   added-lines-present 1/4
+      Makefile   added-lines-present 0/1
+[12] 80c11714105b  tailscale: Fix SSH auth banners never sent  (1 differing paths)
+      protocol/tailscale/tailssh/server.go   added-lines-present 21/23
+[13] 194ebd18b64b  tun: Fix inconsistent DNS mode behavior without auto_route  (4 differing paths)
+      docs/configuration/inbound/tun.md   added-lines-present 0/2
+      docs/configuration/inbound/tun.zh.md   added-lines-present 0/2
+      go.sum   added-lines-present 0/2
+      go.mod   added-lines-present 0/1
+[15] 78d44d52d959  Reset network on DNS server changes  (4 differing paths)
+      experimental/libbox/monitor.go   added-lines-present 22/65
+      dns/transport/local/systemconfig/source_darwin.go   added-lines-present 2/17
+      go.sum   added-lines-present 0/2
+      go.mod   added-lines-present 0/1
+[16] 7054cac51244  Bump version  (1 differing paths)
+      docs/changelog.md   added-lines-present 1/2
+[17] 9da9678bae29  Format plural list options as arrays  (3 differing paths)
+      docs/schema.json   added-lines-present 114/114
+      option/route.go   added-lines-present 1/1
+      option/tls.go   added-lines-present 48/48
+[18] 3f7f7eb3c09d  Implement fully functional auto redirect for Android  (10 differing paths)
+      protocol/tun/inbound.go   added-lines-present 84/125
+      go.sum   added-lines-present 0/2
+      experimental/libbox/redirect.go   added-lines-present 115/116
+      go.mod   added-lines-present 0/1
+      common/srs/binary.go   added-lines-present 4/4
+      daemon/instance.go   added-lines-present 1/1
+      docs/configuration/inbound/tun.md   added-lines-present 17/17
+      docs/configuration/inbound/tun.zh.md   added-lines-present 16/16
+      experimental/libbox/platform.go   added-lines-present 12/12
+      experimental/libbox/service.go   added-lines-present 67/67
+[19] 457105107907  Migrate anytls into our own library  (3 differing paths)
+      go.sum   added-lines-present 0/4
+      go.mod   added-lines-present 1/2
+      protocol/anytls/inbound.go   added-lines-present 10/11
+[20] e7399fd98147  Load rule-sets through mmap on iOS  (1 differing paths)
+      common/srs/binary.go   added-lines-present 75/86
+[21] c7fe73c25710  Buffer cache file writes  (8 differing paths)
+      experimental/cachefile/fakeip.go   added-lines-present 88/95
+      constant/timeout.go   added-lines-present 10/14
+      service/oomkiller/service.go   added-lines-present 0/1
+      service/oomkiller/timer.go   added-lines-present 10/11
+      adapter/experimental.go   added-lines-present 1/1
+      dns/transport/fakeip/store.go   added-lines-present 1/1
+      docs/schema.json   added-lines-present 26/26
+      service/oomkiller/timer_darwin.go   added-lines-present 1/1
+[22] efe4db93324b  Close idle connections of unreferenced outbounds and DNS servers  (2 differing paths)
+      go.sum   added-lines-present 0/2
+      go.mod   added-lines-present 0/1
+[23] 17e950e74cc0  Improve idle connection management  (10 differing paths)
+      route/reference.go   added-lines-present 58/62
+      transport/wireguard/endpoint.go   added-lines-present 66/70
+      common/urltest/urltest.go   added-lines-present 0/2
+      go.sum   added-lines-present 4/6
+      go.mod   added-lines-present 2/3
+      protocol/openconnect/client.go   added-lines-present 54/55
+      protocol/openvpn/client.go   added-lines-present 54/55
+      docs/schema.json   added-lines-present 12/12
+      protocol/tailscale/endpoint.go   added-lines-present 143/143
+      protocol/wireguard/endpoint.go   added-lines-present 9/9
+[24] f3e721980c69  Improve process search  (7 differing paths)
+      common/dialer/default.go   added-lines-present 2/2
+      daemon/started_service.go   added-lines-present 4/4
+      experimental/libbox/oom_report.go   added-lines-present 4/4
+      experimental/libbox/platform.go   added-lines-present 7/7
+      experimental/libbox/service.go   added-lines-present 8/8
+      route/process_cache.go   added-lines-present 7/7
+      service/powerreport/record.go   added-lines-present 1/1
+[26] fd26ea8578f9  Use screen state to end device pause on iOS  (1 differing paths)
+      route/reference.go   added-lines-present 0/0
+[27] 7632cdab9aae  Add go TUN stack  (16 differing paths)
+      route/splice.go   added-lines-present 211/304
+      service/oomkiller/timer.go   added-lines-present 84/86
+      experimental/libbox/setup.go   added-lines-present 0/1
+      route/network.go   added-lines-present 8/9
+      adapter/network.go   added-lines-present 1/1
+      common/dialer/default.go   added-lines-present 15/15
+      docs/configuration/inbound/tun.md   added-lines-present 16/16
+      docs/configuration/inbound/tun.zh.md   added-lines-present 15/15
+      docs/manual/proxy/client.md   added-lines-present 2/2
+      docs/schema.json   added-lines-present 2/2
+      experimental/deprecated/constants.go   added-lines-present 9/9
+      protocol/tun/inbound.go   added-lines-present 29/29
+      route/conn.go   added-lines-present 114/114
+      route/route.go   added-lines-present 2/2
+      service/oomkiller/recorder.go   added-lines-present 1/1
+      service/oomkiller/service.go   added-lines-present 12/12
+[28] 5f404b8c6f5c  Remove dependency on gVisor  (21 differing paths)
+      test/go.sum   added-lines-present 8/90
+      test/go.mod   added-lines-present 4/49
+      transport/wireguard/device_stack.go   added-lines-present 44/57
+      protocol/openconnect/client.go   added-lines-present 6/12
+      protocol/openvpn/client.go   added-lines-present 6/12
+      protocol/openvpn/server.go   added-lines-present 6/12
+      go.sum   added-lines-present 2/4
+      cmd/internal/build_libbox/main.go   added-lines-present 0/1
+      go.mod   added-lines-present 2/3
+      release/DEFAULT_BUILD_TAGS   added-lines-present 0/1
+      release/DEFAULT_BUILD_TAGS_OTHERS   added-lines-present 0/1
+      release/DEFAULT_BUILD_TAGS_WINDOWS   added-lines-present 0/1
+      docs/installation/build-from-source.md   added-lines-present 1/1
+      docs/installation/build-from-source.zh.md   added-lines-present 1/1
+      protocol/tailscale/dns_transport.go   added-lines-present 1/1
+      protocol/tailscale/endpoint.go   added-lines-present 32/32
+      protocol/tailscale/tailssh/server.go   added-lines-present 1/1
+      protocol/wireguard/endpoint.go   added-lines-present 5/5
+      service/derp/service.go   added-lines-present 1/1
+      service/oomkiller/service.go   added-lines-present 7/7
+      transport/wireguard/endpoint.go   added-lines-present 16/16
+[29] 10dabb8d1271  Add tailcat support  (12 differing paths)
+      test/go.sum   added-lines-present 2/6
+      go.sum   added-lines-present 0/2
+      test/go.mod   added-lines-present 2/4
+      go.mod   added-lines-present 1/2
+      adapter/router.go   added-lines-present 4/4
+      constant/proxy.go   added-lines-present 3/3
+      docs/schema.json   added-lines-present 384/384
+      include/registry.go   added-lines-present 2/2
+      protocol/tailscale/endpoint.go   added-lines-present 5/5
+      protocol/tun/inbound.go   added-lines-present 1/1
+      protocol/wireguard/endpoint.go   added-lines-present 1/1
+      service/derp/service.go   added-lines-present 38/38
+[30] 9ba85a15fe6b  Fix auto redirect DNS hijack to local address with iptables  (1 differing paths)
+      test/go.mod   added-lines-present 0/1
+[32] d0698c55a8c9  Validate IP addresses and prefixes in JSON schema  (1 differing paths)
+      docs/schema.json   added-lines-present 216/216
+[34] 6f6d43b12a33  Fix Android auto-redirect routing  (1 differing paths)
+      protocol/tun/inbound.go   added-lines-present 3/3
+[35] 1a6b6615c6e5  Rewrite HTTP proxy protocol  (24 differing paths)
+      transport/http/client_h3.go   added-lines-present 237/299
+      transport/http/connect_udp.go   added-lines-present 111/167
+      transport/http/client.go   added-lines-present 327/370
+      protocol/http/inbound.go   added-lines-present 46/77
+      transport/http/capsule.go   added-lines-present 333/361
+      transport/http/server_conn.go   added-lines-present 138/160
+      transport/http/server_h2.go   added-lines-present 241/259
+      transport/http/server.go   added-lines-present 101/113
+      test/go.sum   added-lines-present 0/4
+      protocol/mixed/inbound.go   added-lines-present 28/31
+      test/go.mod   added-lines-present 0/3
+      transport/http/reader.go   added-lines-present 53/55
+      common/badhttp/badhttp.go   added-lines-present 28/29
+      common/sniff/http.go   added-lines-present 1/2
+      option/simple.go   added-lines-present 73/74
+      protocol/naive/inbound.go   added-lines-present 2/3
+      common/httpclient/http3_transport.go   added-lines-present 19/19
+      dns/transport/quic/http3.go   added-lines-present 2/2
+      docs/configuration/inbound/http.md   added-lines-present 17/17
+      docs/schema.json   added-lines-present 109/109
+      option/http.go   added-lines-present 51/51
+      test/http_forward_test.go   added-lines-present 504/504
+      transport/http/stream_conn.go   added-lines-present 88/88
+      transport/v2raygrpclite/server.go   added-lines-present 2/2
+[36] 46a897c5d123  Fix FakeIP storage consistency with buffered cache file writes  (3 differing paths)
+      adapter/fakeip.go   added-lines-present 0/0
+      dns/transport/fakeip/store.go   added-lines-present 40/40
+      experimental/cachefile/fakeip.go   added-lines-present 12/12
+[37] e2a8d9c85e5a  Add MASQUE support  (25 differing paths)
+      transport/masque/session.go   added-lines-present 185/234
+      transport/masque/server.go   added-lines-present 383/411
+      protocol/masque/client.go   added-lines-present 324/344
+      transport/masque/client.go   added-lines-present 428/447
+      protocol/masque/endpoint.go   added-lines-present 97/111
+      transport/http/tunnel_client.go   added-lines-present 150/161
+      protocol/masque/server.go   added-lines-present 289/299
+      option/masque.go   added-lines-present 97/106
+      transport/http/server.go   added-lines-present 22/31
+      protocol/openvpn/client.go   added-lines-present 11/18
+      transport/http/server_conn.go   added-lines-present 25/28
+      transport/http/server_h2.go   added-lines-present 25/28
+      transport/masque/capsule.go   added-lines-present 149/151
+      protocol/http/inbound.go   added-lines-present 2/3
+      protocol/openconnect/client.go   added-lines-present 13/14
+      protocol/openvpn/server.go   added-lines-present 13/14
+      transport/http/client.go   added-lines-present 89/90
+      transport/http/connect_udp.go   added-lines-present 2/3
+      transport/masque/template.go   added-lines-present 226/227
+      constant/proxy.go   added-lines-present 6/6
+      docs/schema.json   added-lines-present 427/427
+      include/registry.go   added-lines-present 2/2
+      transport/http/capsule.go   added-lines-present 36/36
+      transport/http/client_h3.go   added-lines-present 13/13
+      transport/masque/icmp.go   added-lines-present 53/53
+[38] 1b226006e64d  Add full certificate SHA-256 pinning for TLS  (3 differing paths)
+      common/tls/utls_client.go   added-lines-present 3/3
+      docs/schema.json   added-lines-present 74/74
+      option/tls.go   added-lines-present 2/2
+[39] 41ef639b548f  Fix outbound group resolution and interruption for nested groups  (10 differing paths)
+      protocol/group/urltest.go   added-lines-present 12/21
+      route/route.go   added-lines-present 66/71
+      daemon/started_service.go   added-lines-present 4/7
+      protocol/group/selector.go   added-lines-present 17/19
+      experimental/clashapi/proxies.go   added-lines-present 7/8
+      adapter/experimental.go   added-lines-present 2/2
+      adapter/inbound.go   added-lines-present 1/1
+      box.go   added-lines-present 1/1
+      common/dialer/default.go   added-lines-present 2/2
+      common/trafficcontrol/manager.go   added-lines-present 1/1
+[40] 9a0ff4167579  Fix HTTP/2 extended CONNECT with Go 1.27  (2 differing paths)
+      transport/http/tunnel_client.go   added-lines-present 3/4
+      transport/http/client.go   added-lines-present 1/1
+[41] 7f7c7ae11a38  Fix AnyTLS splitting UDP packets into multiple frames  (2 differing paths)
+      go.sum   added-lines-present 0/2
+      go.mod   added-lines-present 0/1
+[42] e8d26b0f75e9  Fix bridge forwarding with auto-redirect  (6 differing paths)
+      route/network.go   added-lines-present 12/14
+      adapter/network.go   added-lines-present 2/2
+      experimental/libbox/redirect.go   added-lines-present 3/3
+      protocol/bridge/backend_linux.go   added-lines-present 49/49
+      protocol/bridge/netfilter_linux.go   added-lines-present 143/143
+      protocol/tun/inbound.go   added-lines-present 1/1
+[43] 9ea795798378  Use Prefixable for ip_cidr rule options  (1 differing paths)
+      common/srs/binary.go   added-lines-present 9/9
+[44] 530e3aed7aac  Add dns_server_address and dns_search_domain rule items  (10 differing paths)
+      dns/transport/dhcp/dhcp.go   added-lines-present 34/38
+      protocol/openconnect/dns_transport.go   added-lines-present 18/19
+      adapter/dns.go   added-lines-present 5/5
+      adapter/network.go   added-lines-present 6/6
+      dns/transport/local/local_resolved_linux.go   added-lines-present 12/12
+      docs/schema.json   added-lines-present 128/128
+      experimental/libbox/platform.go   added-lines-present 5/5
+      experimental/libbox/service.go   added-lines-present 3/3
+      protocol/openvpn/dns_transport.go   added-lines-present 21/21
+      protocol/tailscale/dns_transport.go   added-lines-present 26/26
+[45] c6d5bafa3630  Fix on-demand endpoint resume  (5 differing paths)
+      protocol/masque/client.go   added-lines-present 3/3
+      protocol/openconnect/client.go   added-lines-present 3/3
+      protocol/openvpn/client.go   added-lines-present 3/3
+      protocol/tailscale/endpoint.go   added-lines-present 9/9
+      transport/wireguard/endpoint.go   added-lines-present 1/1
+[47] 1e157350b789  Fix per-destination backpressure to endpoints  (16 differing paths)
+      transport/masque/session.go   added-lines-present 28/53
+      protocol/openvpn/server.go   added-lines-present 19/39
+      protocol/openvpn/client.go   added-lines-present 3/19
+      protocol/openconnect/client.go   added-lines-present 0/15
+      test/go.sum   added-lines-present 2/14
+      test/go.mod   added-lines-present 2/9
+      transport/masque/server.go   added-lines-present 57/59
+      transport/wireguard/device_stack.go   added-lines-present 13/15
+      go.mod   added-lines-present 1/1
+      go.sum   added-lines-present 2/2
+      protocol/masque/client.go   added-lines-present 4/4
+      protocol/masque/endpoint.go   added-lines-present 14/14
+      protocol/masque/server.go   added-lines-present 13/13
+      transport/http/capsule.go   added-lines-present 30/30
+      transport/masque/client.go   added-lines-present 12/12
+      transport/wireguard/endpoint.go   added-lines-present 16/16
+[48] 6ef3dbc61078  Update naiveproxy to v154.0.8037.49-2  (2 differing paths)
+      go.sum   added-lines-present 0/62
+      go.mod   added-lines-present 31/31
+[49] 5802f1f71990  Fix protocol input validation  (4 differing paths)
+      common/srs/binary.go   added-lines-present 9/9
+      go.mod   added-lines-present 1/1
+      go.sum   added-lines-present 2/2
+      transport/http/server_h2.go   added-lines-present 2/2
+[51] df8e2edfd587  Rework forward NAT with UDP mapping and fragment support  (8 differing paths)
+      protocol/masque/client.go   added-lines-present 3/3
+      protocol/masque/server.go   added-lines-present 3/3
+      protocol/openconnect/client.go   added-lines-present 3/3
+      protocol/openvpn/client.go   added-lines-present 3/3
+      protocol/openvpn/server.go   added-lines-present 3/3
+      protocol/wireguard/endpoint.go   added-lines-present 3/3
+      route/route.go   added-lines-present 1/1
+      transport/wireguard/device_stack.go   added-lines-present 3/3
+[52] 69601481fd36  Ignore closed and canceled errors in scope cleanup  (1 differing paths)
+      adapter/lifecycle.go   added-lines-present 0/6
+[53] 6afeff4c0f71  Bump version  (1 differing paths)
+      docs/changelog.md   added-lines-present 76/77

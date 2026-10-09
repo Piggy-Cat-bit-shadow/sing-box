@@ -1,0 +1,53 @@
+01	6e3c86f51816	2026-09-08	2026-10-09		5/2/1/2	27/37	2/5	experimental/libbox/command_server.go	Use screen state to end device pause on iOS
+02	f95aa6ac11d0	2026-09-28	2026-10-09	540fe75798	2/0/0/2	0/18	0/2		Update dependencies
+03	79fc394d671c	2026-09-28	2026-10-09	99412f03cd	1/1/0/0	1/1	0/1		documentation: Update Apple App Store link
+04	a0d775ea6610	2026-09-28	2026-10-09	309434d3ca	2/0/0/2	0/3	0/2		Fix zero UDP checksum
+05	52f9bad034d2	2026-09-28	2026-10-09	07512b1093	22/14/0/8	124/164	13/22	protocol/naive/inbound.go,transport/openconnect/device_system_stack.go,transport/openvpn/device_system_stack.go	Fix protocol input validation
+06	bff5acf292d8	2026-09-29	2026-10-09	ff02d3d157	4/2/0/2	54/62	1/4		Handle connected UDP EOF on BSD
+07	a364ff4794f0	2026-10-01	2026-10-09	16c898a82f	18/8/0/10	31/65	5/18	adapter/certificate/manager.go,adapter/endpoint/manager.go,adapter/inbound/manager.go	Remove unimplemented hot reload from managers
+08	a691a4402375	2026-10-01	2026-10-09	813ddfa98a	115/72/0/43	1512/1584	58/115	dns/transport/multiplexer_test.go,protocol/bridge/backend_darwin.go,protocol/bridge/backend_linux.go	Refactor lifecycle to scoped cleanup
+09	f9fcb8964f0b	2026-10-01	2026-10-09	9593bc1069	3/0/0/3	34/34	0/3		Fix usage and cache files overwritten when loading fails
+10	02537831e188	2026-10-01	2026-10-09	b93f56a7a0	5/2/0/3	38/57	2/5	protocol/bridge/backend.go,protocol/bridge/backend_linux.go,protocol/tun/inbound.go	Move auto-redirect and bridge index allocation out of constructors
+11	67fb235ee802	2026-10-07	2026-10-09		3/0/2/1	1/6	0/3	.github/workflows/build.yml,Makefile,docs/clients/apple/index.md	Add roothide package to iOS jailbreak release
+12	80c11714105b	2026-10-07	2026-10-09		1/0/0/1	21/23	0/1	protocol/tailscale/tailssh/server.go	tailscale: Fix SSH auth banners never sent
+13	194ebd18b64b	2026-10-07	2026-10-09		4/0/2/2	0/7	0/4	docs/configuration/inbound/tun.md,docs/configuration/inbound/tun.zh.md	tun: Fix inconsistent DNS mode behavior without auto_route
+14	1a773a425a8e	2026-10-08	2026-10-09		1/0/0/1	0/1	0/1	.github/workflows/build.yml	Exclude USB/IP from legacy macOS build
+15	78d44d52d959	2026-10-09	2026-10-09		4/0/2/2	24/85	0/4	dns/transport/local/systemconfig/source_darwin.go,experimental/libbox/monitor.go	Reset network on DNS server changes
+16	7054cac51244	2026-10-09	2026-10-09		4/0/0/4	1/5	0/4	clients/android,clients/apple,clients/desktop	Bump version
+17	9da9678bae29	2026-09-28	2026-10-09	978d12a7eb	12/10/0/2	223/223	9/12		Format plural list options as arrays
+18	3f7f7eb3c09d	2026-09-01	2026-10-09		21/12/0/9	625/670	11/21	experimental/libbox/redirect.go,protocol/tun/inbound.go	Implement fully functional auto redirect for Android
+19	457105107907	2026-09-02	2026-10-09	d541b8cb8b	5/2/0/3	26/32	1/5		Migrate anytls into our own library
+20	e7399fd98147	2026-09-02	2026-10-09	ef89f5298c	16/13/0/3	818/831	15/16	common/srs/binary.go,common/srs/mmap_test.go	Load rule-sets through mmap on iOS
+21	c7fe73c25710	2026-09-03	2026-10-09	5fa3d77095	15/9/0/6	472/485	7/15	experimental/cachefile/fakeip.go,service/oomkiller/service.go,service/oomkiller/timer.go	Buffer cache file writes
+22	efe4db93324b	2026-09-02	2026-10-09	fbf7738a92	3/0/0/3	10/14	1/3	protocol/anytls/outbound.go	Close idle connections of unreferenced outbounds and DNS servers
+23	17e950e74cc0	2026-09-04	2026-10-09	4aaa2372cb	26/18/0/8	466/481	16/26	common/urltest/urltest.go,protocol/openconnect/client.go,protocol/openvpn/client.go	Improve idle connection management
+24	f3e721980c69	2026-09-04	2026-10-09	afbbb49b4d	19/17/0/2	135/137	12/19	common/process/searcher_linux.go,common/process/searcher_windows.go	Improve process search
+25	a4d994a0b0c9	2026-09-06	2026-10-09	9b93694f66	2/2/0/0	17/17	2/2		Report every process sharing a socket in Linux process search
+26	fd26ea8578f9	2026-09-08	2026-10-09	7d597e56af	1/0/0/1	0/0	0/1		Use screen state to end device pause on iOS
+27	7632cdab9aae	2026-09-13	2026-10-09	126a82483b	27/19/0/8	622/719	11/27	experimental/libbox/setup.go,route/network.go,route/splice.go	Add go TUN stack
+28	5f404b8c6f5c	2026-09-16	2026-10-09	f857f08147	66/42/0/24	407/775	34/66	cmd/internal/build_libbox/main.go,protocol/openconnect/client.go,protocol/openvpn/client.go	Remove dependency on gVisor
+29	10dabb8d1271	2026-09-16	2026-10-09	fced86f1f1	39/30/1/8	2714/2725	27/39	protocol/tailscale/tailcat_derp.go	Add tailcat support
+30	9ba85a15fe6b	2026-09-17	2026-10-09	0273d2aa7a	1/0/0/1	0/1	0/1		Fix auto redirect DNS hijack to local address with iptables
+31	38b7a586b568	2026-09-17	2026-10-09	18a29e58e8	1/1/0/0	1/1	1/1		Resolve Windows connection owners without scanning the TCP table
+32	d0698c55a8c9	2026-09-18	2026-10-09	f66b914616	6/1/0/5	268/284	5/6	option/rule.go,option/rule_dns.go,option/rule_set.go	Validate IP addresses and prefixes in JSON schema
+33	8feb0ec263e5	2026-09-18	2026-10-09	47ce7ddee7	1/1/0/0	63/63	1/1		Fix DNS sniffer matching non-DNS packets
+34	6f6d43b12a33	2026-09-19	2026-10-09	ab287d2fc4	1/1/0/0	3/3	0/1		Fix Android auto-redirect routing
+35	1a6b6615c6e5	2026-09-21	2026-10-09	deeeb09a2c	49/20/4/25	4392/4865	23/49	common/badhttp/badhttp.go,common/sniff/http.go,include/quic.go	Rewrite HTTP proxy protocol
+36	46a897c5d123	2026-09-21	2026-10-09	bf86de22ef	4/1/0/3	52/52	1/4		Fix FakeIP storage consistency with buffered cache file writes
+37	e2a8d9c85e5a	2026-09-21	2026-10-09	e22cd54061	53/18/1/34	3937/4184	19/53	docs/configuration/endpoint/masque-client.md,docs/configuration/endpoint/masque-client.zh.md,docs/configuration/endpoint/masque-server.md	Add MASQUE support
+38	1b226006e64d	2026-09-22	2026-10-09	3a7f1cc54e	19/18/0/1	521/521	16/19		Add full certificate SHA-256 pinning for TLS
+39	41ef639b548f	2026-09-22	2026-10-09	6231b40d7c	13/5/0/8	170/190	3/13	daemon/started_service.go,experimental/clashapi/proxies.go,protocol/group/selector.go	Fix outbound group resolution and interruption for nested groups
+40	9a0ff4167579	2026-09-23	2026-10-09	366fc15f38	12/11/0/1	90/93	9/12	transport/http/tunnel_client.go	Fix HTTP/2 extended CONNECT with Go 1.27
+41	7f7c7ae11a38	2026-09-24	2026-10-09	5d3be1a8df	2/0/0/2	0/3	0/2		Fix AnyTLS splitting UDP packets into multiple frames
+42	e8d26b0f75e9	2026-09-24	2026-10-09	558e8d17cb	9/6/0/3	237/239	3/9		Fix bridge forwarding with auto-redirect
+43	9ea795798378	2026-09-24	2026-10-09	c771ae6f08	10/10/0/0	60/60	8/10		Use Prefixable for ip_cidr rule options
+44	530e3aed7aac	2026-09-24	2026-10-09	3f8c58b85c	24/18/0/6	640/645	14/24	dns/transport/dhcp/dhcp.go	Add dns_server_address and dns_search_domain rule items
+45	c6d5bafa3630	2026-09-24	2026-10-09	dd19d1cb6c	5/5/0/0	19/19	0/5		Fix on-demand endpoint resume
+46	7c4516a570c0	2026-09-25	2026-10-09	9aa7eab16a	4/4/0/0	0/0	4/4		Remove shared field defaults from MASQUE docs
+47	1e157350b789	2026-09-25	2026-10-09	1479dafb71	27/12/0/15	445/544	11/27	protocol/openconnect/client.go,protocol/openvpn/client.go,protocol/openvpn/server.go	Fix per-destination backpressure to endpoints
+48	6ef3dbc61078	2026-09-26	2026-10-09	5bd09951e4	3/2/0/1	32/94	1/3		Update naiveproxy to v154.0.8037.49-2
+49	5802f1f71990	2026-09-28	2026-10-09	f5f6a8d095	5/2/0/3	26/26	1/5		Fix protocol input validation
+50	a2b0923e0187	2026-10-02	2026-10-09	900a9f5e29	1/0/0/1	0/0	0/1		Fix Xcode build cache reuse across package updates
+51	df8e2edfd587	2026-10-06	2026-10-09		24/24/0/0	452/452	15/24		Rework forward NAT with UDP mapping and fragment support
+52	69601481fd36	2026-10-08	2026-10-09		1/0/1/0	0/6	0/1	adapter/lifecycle.go	Ignore closed and canceled errors in scope cleanup
+53	6afeff4c0f71	2026-10-09	2026-10-09		1/0/0/1	76/77	0/1	docs/changelog.md	Bump version
