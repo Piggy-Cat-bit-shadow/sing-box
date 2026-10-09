@@ -226,6 +226,27 @@ func buildTags(operatingSystem string, architecture string, cgoEnabled bool) ([]
 		return nil, E.Cause(err, "read build tags")
 	}
 	tags := strings.Split(strings.TrimSpace(string(content)), ",")
+
+	// tfogo_checklinkname0 records that the build passes -checklinkname=0, which this
+	// recipe does: LinkerFlags always carries the flag. The profile tag files must NOT
+	// carry it, because they are also read by callers that link with Go's DEFAULT
+	// -checklinkname policy - `go build -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...`
+	// and `go test -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...` - and with the tag
+	// set, experimental/libbox compiles signal_handler_darwin.go, whose runtime.getsig /
+	// runtime.fwdSig pulls the linker refuses without the flag:
+	//
+	//	link: github.com/sagernet/sing-box/experimental/libbox: invalid reference to runtime.fwdSig
+	//
+	// The tag therefore travels with the FLAG, at the call site that passes it. This is the
+	// binary that links experimental/libbox into a desktop daemon, so it is the one caller
+	// in the profile-file family that must carry the tag: dropping it here would silently
+	// reduce the daemon's libbox to the stub crash handler and the stub goroutine report.
+	//
+	// The mobile artifacts get the tag from cmd/internal/mobilebuildtags, whose builders also
+	// pass the flag. The invariant is asserted in
+	// cmd/internal/build_libbox/tag_checklinkname_test.go (TestProfileTagFilesDoNotClaimChecklinkname0).
+	tags = append(tags, "tfogo_checklinkname0")
+
 	if operatingSystem == "windows" {
 		tags = append(tags, "with_external_windivert", "with_external_usbip_drivers")
 	}

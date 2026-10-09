@@ -80,6 +80,23 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
     本 fork 不再维护专属 registry 或协议白名单：两个产品都携带 upstream 的完整 registry，
     upstream 新增的协议、endpoint、DNS transport、service 与证书提供者会被自动继承。
 
+    两个标签文件都刻意**不含** `tfogo_checklinkname0`（该标签表示"本次构建传入了
+    `-checklinkname=0`"）。上面的构建脚本确实传了这个标志（`release/LDFLAGS`，libbox 构建器
+    走 `cmd/internal/build_shared.LinkerFlags`），但这两个标签文件同时会被**无法**传该标志的
+    命令读取——`go build -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...` 以及同样带 tags 的
+    `go test`——因为 cmd/go 只能对整个运行传 `-ldflags`，无法按 package 传。带着该标签时，
+    这些命令会编译 `experimental/libbox` 中指向 runtime 内部的 `//go:linkname` 引用，随后链接失败：
+
+    ```text
+    link: github.com/sagernet/sing-box/experimental/libbox: invalid reference to runtime.fwdSig
+    ```
+
+    因此该标签跟着**标志**走，而不是跟着能力走：移动端 libbox 构建器在
+    `cmd/internal/mobilebuildtags` 中保留它，`cmd/internal/build_boxdd` 也自行追加（它同样传了
+    该标志）。这两条规则由 `cmd/internal/build_libbox/tag_checklinkname_test.go` 强制：该测试
+    从当前工具链的 runtime 源码推导出"不允许被 pull"的符号集合，并要求每一处此类 pull 都位于
+    该标签之后。
+
     默认能力集与 upstream 完全一致，包含 `with_clash_api`。本 fork 不再移除任何
     upstream 能力。
 

@@ -12,10 +12,18 @@ no allowlist of permitted capabilities.
 | Registry | `include/registry.go` | `include/registry.go` |
 | Workflow | `.github/workflows/server-linux-amd64.yml` | `.github/workflows/client-macos.yml` |
 
-Both tag files are upstream's, unmodified: the fork's default capability set now
-matches upstream's exactly. The platform split is upstream's own - its CI uses
-`DEFAULT_BUILD_TAGS` for CGO/naive builds and `DEFAULT_BUILD_TAGS_OTHERS`
-otherwise.
+Both tag files carry upstream's capability set exactly. The platform split is upstream's
+own - its CI uses `DEFAULT_BUILD_TAGS` for CGO/naive builds and
+`DEFAULT_BUILD_TAGS_OTHERS` otherwise.
+
+One entry is deliberately missing from both, and it is not a capability:
+`tfogo_checklinkname0`, which records that the build passes `-checklinkname=0`. The products do
+pass that flag, but these files are also read by `go build ./...` and `go test ./...` under those
+tags, where cmd/go cannot apply `-ldflags` to one package - and with the tag set,
+`experimental/libbox`'s `//go:linkname` pulls of runtime internals stop linking. The tag lives
+where the flag does: `cmd/internal/mobilebuildtags` for the libbox artifacts and
+`cmd/internal/build_boxdd` for the daemon. See
+[build from source](installation/build-from-source.md#build-tags).
 
 ## Capability boundary
 

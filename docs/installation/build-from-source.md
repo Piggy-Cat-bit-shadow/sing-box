@@ -78,6 +78,26 @@ It is not recommended to change the default build tag list unless you really kno
     upstream's complete registry, so capabilities upstream adds are inherited
     automatically.
 
+    One tag is deliberately absent from both files: `tfogo_checklinkname0`, which records that
+    the build passes `-checklinkname=0`. The recipes above do pass it (`release/LDFLAGS`, and
+    `cmd/internal/build_shared.LinkerFlags` in the libbox builders), but the tag files are also
+    read by commands that do not and cannot —
+    `go build -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...`, and the same with `go test` —
+    because cmd/go applies `-ldflags` to a whole run and never to one package. With the tag set,
+    those commands compile `experimental/libbox`'s runtime-internal `//go:linkname` pulls and then
+    cannot link them:
+
+    ```text
+    link: github.com/sagernet/sing-box/experimental/libbox: invalid reference to runtime.fwdSig
+    ```
+
+    The tag therefore travels with the flag rather than with the capability: the mobile libbox
+    builders keep it in `cmd/internal/mobilebuildtags`, and `cmd/internal/build_boxdd` appends it
+    because it passes the flag as well. Both rules are enforced by
+    `cmd/internal/build_libbox/tag_checklinkname_test.go`, which derives the set of runtime symbols
+    the pinned toolchain refuses to let a build pull and requires every such pull to sit behind the
+    tag.
+
     The default capability set matches upstream's exactly, including
     `with_clash_api`. The fork does not remove any upstream capability any more.
 

@@ -7,13 +7,24 @@ The macOS client is a headless-first sing-box CLI core for Apple Silicon (`darwi
 The canonical tag file is `release/DEFAULT_BUILD_TAGS`, which is upstream's Darwin profile:
 
 ```text
-with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0
+with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_naive_outbound,with_usbip,with_openvpn,with_openconnect,badlinkname
 ```
 
 Both products use `include/registry.go`, which is upstream's complete registry. There is no
 fork-specific registry and no capability allowlist: capabilities upstream adds are inherited
-automatically. The tag file is upstream's, unmodified: the default capability set matches
-upstream's exactly, including `with_clash_api`.
+automatically. The default capability set matches upstream's exactly, including `with_clash_api`.
+
+The tag file differs from upstream's in one respect, and only in one: it does not name
+`tfogo_checklinkname0`, the tag that records "this build passes `-checklinkname=0`". Both products
+do pass that flag, through `scripts/ci/build-server.sh` / `build-macos-client.sh` and
+`release/LDFLAGS`, but the same tag file is also read by commands that cannot -
+`go build -tags "$(cat release/DEFAULT_BUILD_TAGS)" ./...` and `go test` with the same tags, where
+cmd/go applies `-ldflags` to a whole run rather than to one package. Reading the tag there made
+`experimental/libbox` unlinkable (`invalid reference to runtime.fwdSig`). The tag now travels with
+the flag: the mobile builders keep it in `cmd/internal/mobilebuildtags`, and
+`cmd/internal/build_boxdd` appends it. See
+[build from source](installation/build-from-source.md#build-tags) and
+`cmd/internal/build_libbox/tag_checklinkname_test.go`.
 
 `with_quic` enables MASQUE H3. `with_naive_outbound` links the Cronet-backed Naive client and requires CGO. TUN uses the default Go stack; `with_gvisor` is absent. The client is one product, with no Intel or reduced-capability variant.
 
