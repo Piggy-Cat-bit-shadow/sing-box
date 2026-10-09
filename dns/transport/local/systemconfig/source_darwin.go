@@ -140,11 +140,55 @@ type Source struct {
 	stale            bool
 	interfaceIndex   int
 	config           *Config
+	// platform is the injectable seam over the three operations this source performs against the
+	// Darwin DNS configuration service.
+	//
+	// It is nil in production, where every call goes straight to the libSystem functions below. A
+	// test substitutes a deterministic double, which is the only way to drive "the resolver list
+	// changed" without reconfiguring the machine the test runs on - and reconfiguring it would make
+	// the test depend on a privilege, a network and a service it must not touch.
+	platform *sourcePlatform
+}
+
+// sourcePlatform is the platform seam for one Source.
+//
+// The three operations are the whole of this source's interaction with the system: read the current
+// configuration, ask whether it changed since the last ask, and release the registration. Grouping
+// them keeps the seam one field rather than three, so the production path stays a nil check.
+type sourcePlatform struct {
+	// register acquires the change registration and reports whether it succeeded. Returning false
+	// means the source re-reads on every call, which is what the real path does when
+	// notify_register_check fails.
+	register func() (token int, valid bool)
+	// snapshot returns a copy of the current DNS configuration, or nil when it cannot be read.
+	snapshot func() *dnsInfoConfig
+	// notification reports whether the configuration changed since the previous call and whether
+	// the registration is usable. It CONSUMES the change, exactly as notify_check does.
+	notification func() (changed bool, valid bool)
+	// deregister releases the registration made by register.
+	deregister func(token int)
 }
 
 func NewSource(ctx context.Context) *Source {
-	source := &Source{
-		interfaceMonitor: service.FromContext[adapter.NetworkManager](ctx).InterfaceMonitor(),
+	return newSource(ctx, nil)
+}
+
+// newSource builds a Source over the given platform seam. A nil seam selects the real libSystem
+// implementation.
+func newSource(ctx context.Context, platform *sourcePlatform) *Source {
+	source := &Source{platform: platform}
+	// The monitor is how this source learns which interface's scoped resolvers apply. A manager
+	// without one leaves it at "no default interface known", which defaultInterfaceIndex already
+	// reports as 0 and build() already handles by selecting the unscoped resolvers - so the absence
+	// is a state this reader can express rather than a reason to take the process down.
+	if networkManager := service.FromContext[adapter.NetworkManager](ctx); networkManager != nil {
+		source.interfaceMonitor = networkManager.InterfaceMonitor()
+	}
+	if platform != nil {
+		token, valid := platform.register()
+		source.notifyToken = C.int(token)
+		source.notifyValid = valid
+		return source
 	}
 	if C.box_dnsinfo_load() != 0 {
 		var token C.int
@@ -167,7 +211,7 @@ func (s *Source) Configuration() *Config {
 		return s.config
 	}
 	s.stale = false
-	systemInfo := copyDNSInfo()
+	systemInfo := s.copyDNSInfo()
 	if systemInfo == nil {
 		if s.config == nil {
 			s.config = new(dnsInfoConfig).build(interfaceIndex)
@@ -182,7 +226,28 @@ func (s *Source) Configuration() *Config {
 	return config
 }
 
+// copyDNSInfo reads the platform snapshot through the seam when one is installed.
+func (s *Source) copyDNSInfo() *dnsInfoConfig {
+	if s.platform != nil {
+		if s.platform.snapshot == nil {
+			return nil
+		}
+		return s.platform.snapshot()
+	}
+	return copyDNSInfo()
+}
+
 func (s *Source) changedLocked() bool {
+	if s.platform != nil {
+		if s.platform.notification == nil {
+			return true
+		}
+		changed, valid := s.platform.notification()
+		if !valid {
+			return true
+		}
+		return changed
+	}
 	if !s.notifyValid {
 		return true
 	}
@@ -200,13 +265,27 @@ func (s *Source) Reset() {
 	s.access.Unlock()
 }
 
+// Close releases the platform registration.
+//
+// The registration is what makes a change observable at all, so releasing it is the whole of this
+// source's cleanup: a source that kept it would leave a token behind for every transport the box
+// ever built, and the notify service has a finite number of them. `local` and `mdns` each register
+// their own and each add this to their start scope (dns/transport/local/local.go,
+// dns/transport/mdns/mdns.go).
 func (s *Source) Close() error {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.notifyValid {
-		C.notify_cancel(s.notifyToken)
-		s.notifyValid = false
+	if !s.notifyValid {
+		return nil
 	}
+	s.notifyValid = false
+	if s.platform != nil {
+		if s.platform.deregister != nil {
+			s.platform.deregister(int(s.notifyToken))
+		}
+		return nil
+	}
+	C.notify_cancel(s.notifyToken)
 	return nil
 }
 
