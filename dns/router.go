@@ -3,8 +3,10 @@ package dns
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"maps"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,11 +58,36 @@ type Router struct {
 	// networkGeneration advances on every ResetNetwork so a DNS response can be attributed to the
 	// network its request was issued on.
 	networkGeneration atomic.Uint64
-	platformInterface adapter.PlatformInterface
-	legacyDNSMode     bool
-	rulesAccess       sync.RWMutex
-	started           bool
-	closing           bool
+	// dnsEnvironmentAccess guards the DNS environment observation pair
+	// (dnsEnvironmentObserved, dnsEnvironmentFingerprint) together with the advance of
+	// dnsEnvironmentGeneration, so "the fingerprint I compared" and "the epoch I produced" are one
+	// atomic mutation rather than two.
+	//
+	// It is a leaf lock: it is held only across the transports' own Environment() reads, which do
+	// not call back into the router.
+	dnsEnvironmentAccess sync.Mutex
+	// dnsEnvironmentObserved reports whether the DNS environment has been observed at least once.
+	// The first observation PINS the fingerprint without advancing - see observeDNSEnvironment.
+	dnsEnvironmentObserved bool
+	// dnsEnvironmentFingerprint is the last observed aggregate of every transport's published DNS
+	// environment: the resolver addresses and the search domains the platform is currently handing
+	// this box. It is the "environment fingerprint" the DNS generation is tied to.
+	dnsEnvironmentFingerprint uint64
+	// dnsEnvironmentDescription is the human-readable form of the last observed fingerprint, kept
+	// only for the log line a change emits.
+	dnsEnvironmentDescription string
+	// dnsEnvironmentGeneration advances when - and only when - dnsEnvironmentFingerprint changes.
+	//
+	// It is INDEPENDENT of networkGeneration on purpose. A DNS server change on an unchanged
+	// interface is not a network transition, and the two must be able to move separately: the network
+	// epoch moving tears down connections, while this one only retires the DNS verdicts that were
+	// learned from the previous resolver set.
+	dnsEnvironmentGeneration atomic.Uint64
+	platformInterface        adapter.PlatformInterface
+	legacyDNSMode            bool
+	rulesAccess              sync.RWMutex
+	started                  bool
+	closing                  bool
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -1175,12 +1202,195 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	}, nil, nil
 }
 
-// dnsGeneration returns the current network generation.
+// dnsGeneration returns the current DNS generation: the network epoch plus the DNS environment
+// epoch.
 //
-// It advances on every ResetNetwork, so a response can be attributed to the network its request
-// was issued on rather than to whatever network happens to be current when it arrives.
+// # Why there are two components
+//
+// The network epoch answers "has a NETWORK transition begun since I captured this". It advances in
+// Router.ResetNetwork, and it is the right counter for a changed interface, gateway or SSID.
+//
+// It is the wrong counter for a change to only the DNS servers or search domains on an UNCHANGED
+// interface. Such a change moves nothing the network epoch watches: route/network_environment.go
+// hashes the default interface's gateways, the Wi-Fi SSID and the gateway hardware addresses, and
+// nothing else; the Darwin monitor that drives it reads an AF_ROUTE socket and emits on a route
+// message, which a dnsinfo change is not. So the network epoch does not move, and neither does
+// Router.ResetNetwork run.
+//
+// Every DNS cache except one is nevertheless safe, because Client.environmentHash mixes each
+// transport's LIVE environment list into its cache namespace - the exact entry, the NXDOMAIN
+// verdict, the RDRC namespace and the persistent key all carry it, so a resolver change separates
+// them on its own. The REVERSE MAPPING is the exception: its only namespace is this generation. Its
+// purge in Router.ResetNetwork is justified by exactly the case a resolver change IS - "with
+// split-horizon or captive-portal DNS the same address can mean a different name on the new
+// network" - and a resolver change on the same interface reaches that case without reaching the
+// reset.
+//
+// # What the DNS environment epoch deliberately does NOT do
+//
+// It does not run the network reset body, does not advance NetworkManager's reset epoch, and does
+// not publish anything to runtimecoord. A resolver change is not a network transition: the sockets
+// still lead to the right network, and tearing them down for it would kill every active QUIC, H2,
+// MASQUE and voice session on a device whose network never changed. Only the DNS layer's own
+// ownership epoch moves, plus the one cache that has no other namespace.
+//
+// # Why the observation happens here rather than at a notification
+//
+// There is no push to hook. dns/transport/local/systemconfig/source_darwin.go registers a
+// notify_register_check token and POLLS it with notify_check; notify_check is not a blocking wait,
+// so nothing is woken when the DNS configuration changes and the change becomes visible only when
+// something reads it. Reading it here makes every consumer of the generation - the request capture,
+// the response ownership check and the reverse mapping guard - observe the environment before it
+// acts on the epoch, so no reader can act on a generation that a resolver change has already
+// invalidated. It is the same "no debounce, the recompute decides" shape as
+// NetworkManager.postUpdateNetworkEnvironment, and it needs no goroutine, timer or extra lock
+// ordering.
+//
+// # Cost
+//
+// One aggregate observation per generation read, where the DNS path previously observed the issuing
+// transport's environment once or twice per query. The transports cache their own reads, so an
+// unchanged environment costs one notify_check per transport.
 func (r *Router) dnsGeneration() uint64 {
-	return r.networkGeneration.Load()
+	return r.networkGeneration.Load() + r.observeDNSEnvironment()
+}
+
+// observeDNSEnvironment refreshes the aggregate DNS environment fingerprint and returns the DNS
+// environment epoch that is current as a result.
+//
+// The compare, the advance and the read happen under one lock, so the fingerprint and the epoch are
+// a single observation: a reader that sees the new epoch has also seen the fingerprint that
+// produced it, and no reader can advance the epoch twice for one change.
+func (r *Router) observeDNSEnvironment() uint64 {
+	if r.transport == nil {
+		// A Router built without a transport manager has no DNS environment to observe, and
+		// nothing to attribute an answer to either. Degrade to the network epoch alone.
+		return r.dnsEnvironmentGeneration.Load()
+	}
+	// The snapshot is taken INSIDE the lock, and that is load-bearing rather than tidy.
+	//
+	// Reading the snapshot first and locking only to compare is a lost-update race. Two observers
+	// see states A and B; the one that saw B locks first, advances the epoch and stores B; the one
+	// still holding A then locks, finds A != B, and stores A on top of it. The next observation of
+	// B is a "change" again. The epoch advances twice for one change, and while two observers keep
+	// interleaving the stored fingerprint oscillates between A and B and the epoch advances without
+	// bound - the reset storm the de-bounce exists to prevent, produced by the de-bounce itself.
+	//
+	// Held across the transports' Environment() reads, this is a leaf lock: an Environment()
+	// implementation reads platform state and does not call back into the router. The cost is that
+	// one observation runs at a time; the transports cache their own reads, so an unchanged
+	// environment is one notify_check per transport.
+	r.dnsEnvironmentAccess.Lock()
+	defer r.dnsEnvironmentAccess.Unlock()
+	fingerprint, description, pinned := r.dnsEnvironmentFingerprintNow()
+	if !r.dnsEnvironmentObserved {
+		// The FIRST observation pins without advancing.
+		//
+		// It is not a change: there is no previous environment for anything to be stale against.
+		// Advancing here would also make the initial epoch depend on whether a query happened to
+		// be issued before the first one - a value that must be a property of the network, not of
+		// the order in which the box's callers happened to ask. It matches how
+		// Client.transportEnvironment pins its own first observation.
+		r.dnsEnvironmentObserved = true
+		r.dnsEnvironmentFingerprint = fingerprint
+		r.dnsEnvironmentDescription = description
+		if pinned {
+			r.logger.Debug("pinned DNS environment: ", description)
+		}
+		return r.dnsEnvironmentGeneration.Load()
+	}
+	if fingerprint == r.dnsEnvironmentFingerprint {
+		// A duplicate or reordered notification carrying the same information. This is the
+		// de-bounce: notify_check documents false positives, and the platform repeats itself, but
+		// a repeated notification is not a state change and must not cost an epoch.
+		return r.dnsEnvironmentGeneration.Load()
+	}
+	r.dnsEnvironmentFingerprint = fingerprint
+	r.dnsEnvironmentDescription = description
+	r.dnsEnvironmentGeneration.Add(1)
+	epoch := r.dnsEnvironmentGeneration.Load()
+	// The reverse mapping is the one DNS cache with no environment component in its key, so it is
+	// the one that has to be purged here. With split-horizon or captive-portal DNS the same address
+	// can mean a different name on the new resolver set, which is the reason Router.ResetNetwork
+	// purges it for a network change; a resolver change reaches the same case without a network
+	// change.
+	//
+	// The other caches - the exact entry, the NXDOMAIN verdict, the RDC namespace and the
+	// persistent key - are namespaced by Client.environmentHash, which already mixes the
+	// transport's environment list in. Purging them here would additionally discard entries that
+	// are still correct for the old resolver set and are simply no longer reachable, and would make
+	// a resolver change far more expensive than it needs to be.
+	if r.dnsReverseMapping != nil {
+		r.dnsReverseMapping.Purge()
+	}
+	r.logger.Info("DNS environment changed, advancing DNS generation to ", epoch, ": ", description)
+	return epoch
+}
+
+// dnsEnvironmentFingerprintNow builds the aggregate fingerprint of every transport's published DNS
+// environment, and reports whether any transport published one at all.
+//
+// A transport that publishes an EMPTY list contributes nothing, which is the same rule
+// Client.environmentHash applies when it decides that a transport with no list of its own is
+// namespaced by the network alone. Keeping the two consistent by construction is what lets this
+// fingerprint stand in for "the DNS namespace the caches are about to use".
+//
+// The transports are sorted by TAG, because Transports() is backed by a map and map iteration order
+// is not a property of the environment. Within one transport the published order is SIGNIFICANT, for
+// two reasons that agree:
+//
+//   - Client.environmentHash hashes the list in order, so a reordered list is already a different
+//     cache namespace. A fingerprint that ignored the order would leave the reverse mapping and the
+//     in-flight generation guards on the old epoch while the caches had already moved to the new
+//     namespace - the epoch would be WEAKER than the namespace it is supposed to bound;
+//   - the order is resolution semantics, not bookkeeping. Config.NameList walks the search list in
+//     order and newNameExchanger walks the server list in order, so the same addresses in a
+//     different order can produce a different answer.
+//
+// The cost of being order-sensitive is that a platform returning its resolver list in a
+// nondeterministically shuffled order would advance an epoch on every read. That risk is real and is
+// stated rather than hidden; the measured behaviour of both readers this tree has - dnsinfo's
+// nameserver array and resolv.conf's lines - is index-stable for an unchanged configuration, and
+// TestDuplicateDNSEnvironmentNotificationDoesNotAdvanceWithoutBound asserts that a stably re-read
+// environment does not advance.
+func (r *Router) dnsEnvironmentFingerprintNow() (uint64, string, bool) {
+	type publishedEnvironment struct {
+		tag     string
+		entries []string
+	}
+	var published []publishedEnvironment
+	for _, transport := range r.transport.Transports() {
+		environmentTransport, withEnvironment := transport.(adapter.DNSTransportWithEnvironment)
+		if !withEnvironment {
+			continue
+		}
+		environment := environmentTransport.Environment()
+		if len(environment) == 0 {
+			continue
+		}
+		published = append(published, publishedEnvironment{tag: transport.Tag(), entries: environment})
+	}
+	if len(published) == 0 {
+		return 0, "", false
+	}
+	slices.SortFunc(published, func(a publishedEnvironment, b publishedEnvironment) int {
+		return strings.Compare(a.tag, b.tag)
+	})
+	// The hash is taken over NUL-separated parts, because a tag is user-configured text and "="
+	// alone would let two different (tag, entry) splits collide. The description is built separately
+	// and is log-safe: a NUL byte in a log line truncates it in every consumer.
+	digest := fnv.New64a()
+	descriptions := make([]string, 0, len(published))
+	for _, environment := range published {
+		for _, entry := range environment.entries {
+			digest.Write([]byte(environment.tag))
+			digest.Write([]byte{0})
+			digest.Write([]byte(entry))
+			digest.Write([]byte{0})
+			descriptions = append(descriptions, environment.tag+"="+entry)
+		}
+	}
+	return digest.Sum64(), strings.Join(descriptions, ", "), true
 }
 
 // reverseMappingGenerationCurrent reports whether a captured generation still describes the live
@@ -1194,11 +1404,16 @@ func (r *Router) dnsGeneration() uint64 {
 // tests would keep passing against a rule the product no longer follows.
 //
 // The condition lives here, and both callers use it.
+//
+// It reads dnsGeneration rather than networkGeneration so that a DNS-only environment change counts
+// as an epoch change for the one cache that has no other namespace. The reverse mapping is a
+// statement about what a name means on a resolver set, so it belongs to that resolver set, not to
+// the route the query happened to travel.
 func (r *Router) reverseMappingGenerationCurrent(generation uint64) bool {
 	if r.dnsReverseMapping == nil {
 		return false
 	}
-	return generation == r.networkGeneration.Load()
+	return generation == r.dnsGeneration()
 }
 
 // reverseMappingAnswer is one address-to-name mapping learned from a DNS answer.
