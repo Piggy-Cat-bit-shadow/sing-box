@@ -70,6 +70,14 @@ type Inbound struct {
 	routeAddressSetAccess       sync.RWMutex
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
+	// routeRuleSetRefs records one entry per reference Start successfully took on a rule-set, in
+	// acquisition order. It is guarded by routeAddressSetAccess.
+	//
+	// A rule-set counts its references by hand: IncRef keeps its parsed rules alive across an
+	// update, and a rule-set only drops them once the count is back to zero. The entries are a
+	// slice rather than a set on purpose - the same rule-set may be configured as both a route and
+	// a route-exclude set, and each acquisition needs its own release.
+	routeRuleSetRefs []adapter.RuleSet
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TunInboundOptions) (adapter.Inbound, error) {
@@ -419,7 +427,7 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				if len(ipSets) == 0 {
 					t.logger.Warn("route_address_set: no destination IP CIDR rules found in rule-set: ", routeRuleSet.Name())
 				}
-				routeRuleSet.IncRef()
+				t.acquireRouteSetRef(routeRuleSet)
 				routeAddressSet = append(routeAddressSet, ipSets...)
 			}
 			for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
@@ -427,7 +435,7 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				if len(ipSets) == 0 {
 					t.logger.Warn("route_exclude_address_set: no destination IP CIDR rules found in rule-set: ", routeExcludeRuleSet.Name())
 				}
-				routeExcludeRuleSet.IncRef()
+				t.acquireRouteSetRef(routeExcludeRuleSet)
 				routeExcludeAddressSet = append(routeExcludeAddressSet, ipSets...)
 			}
 			if t.autoRedirect != nil {
@@ -441,21 +449,27 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 				for _, routeExcludeRuleSet := range t.routeExcludeRuleSet {
 					t.routeExcludeRuleSetCallback = append(t.routeExcludeRuleSetCallback, routeExcludeRuleSet.RegisterCallback(t.updateRouteAddressSet))
 				}
-				// Hand the release to the Scope in the same breath as the registration.
-				//
-				// The product closes a Box by closing its Scope, and Scope.Close() runs the entries
-				// handed to it through scope.Add - it never calls a component's Close() method. Storing
-				// the elements here and releasing them from Close() left the Scope with no knowledge of
-				// a resource Start had acquired, so on a real Box.Close() the callbacks were never
-				// unregistered: every rule-set kept an observer pointed at a torn-down inbound for the
-				// lifetime of the process.
-				//
-				// Registering here rather than at the end of the start sequence is deliberate. The
-				// registration is the acquisition, and every later step in Start and PostStart can fail;
-				// an owner established at the acquisition covers all of those failures with the Box's
-				// existing rollback (Box.Start closes the Scope when start() returns an error).
-				scope.Add(t.releaseRouteSetCallbacksCleanup)
 			}
+			// Hand the release to the Scope in the same breath as the acquisition.
+			//
+			// The product closes a Box by closing its Scope, and Scope.Close() runs the entries
+			// handed to it through scope.Add - it never calls a component's Close() method. Storing
+			// the elements here and releasing them from Close() left the Scope with no knowledge of
+			// a resource Start had acquired, so on a real Box.Close() the callbacks were never
+			// unregistered: every rule-set kept an observer pointed at a torn-down inbound for the
+			// lifetime of the process.
+			//
+			// Registering here rather than at the end of the start sequence is deliberate. The
+			// acquisition is what needs an owner, and every later step in Start and PostStart can
+			// fail; an owner established at the acquisition covers all of those failures with the
+			// Box's existing rollback (Box.Start closes the Scope when start() returns an error).
+			//
+			// It sits OUTSIDE the auto-redirect branch because Start takes the reference whether or
+			// not an auto-redirect exists - a plain desktop TUN with route_address_set also reaches
+			// this block - and a release registered only when callbacks were registered left those
+			// references held for the lifetime of the process, so the rule-set could never drop its
+			// rules. The references are the acquisition; the callbacks are a second, optional one.
+			scope.Add(t.releaseRouteSetsCleanup)
 		}
 		var (
 			tunInterface tun.Tun
@@ -599,7 +613,7 @@ func (t *Inbound) InterfaceUpdated(ctx context.Context) {
 }
 
 func (t *Inbound) Close() error {
-	// Release the route-set callbacks BEFORE tearing anything down.
+	// Release the route-set callbacks and references BEFORE tearing anything down.
 	//
 	// Start registers t.updateRouteAddressSet on every route and exclude rule-set and stores the
 	// returned elements, but nothing used to release them. The callback closes over this *Inbound,
@@ -608,7 +622,7 @@ func (t *Inbound) Close() error {
 	// made the omission look handled: the bookkeeping existed, only the release was missing.
 	//
 	// Releasing first also means the rule-set can never fire between the teardown and the release.
-	t.releaseRouteSetCallbacks()
+	t.releaseRouteSets()
 
 	return common.Close(
 		t.tunStack,
@@ -617,14 +631,65 @@ func (t *Inbound) Close() error {
 	)
 }
 
-// releaseRouteSetCallbacksCleanup is the Scope-cleanup form of releaseRouteSetCallbacks.
+// acquireRouteSetRef takes one reference on ruleSet and records it for release.
 //
-// Start hands this to the Scope immediately after it registers the callbacks, so the Scope - not a
-// later Inbound.Close() that the product never calls - is the owner. The release itself stays the
-// single idempotent implementation, so the Scope path and an explicit Close() cannot release the
-// same element twice.
-func (t *Inbound) releaseRouteSetCallbacksCleanup() error {
+// Taking the reference and recording it under the same lock is what keeps the pair exact: a Scope
+// that is already closing runs releaseRouteSetsCleanup on this goroutine the moment it is handed
+// over, so a drain that observed the reference before it was recorded would release a reference
+// that was never taken, and one that missed it would leak. Holding routeAddressSetAccess across
+// both makes the two orders impossible to interleave.
+func (t *Inbound) acquireRouteSetRef(ruleSet adapter.RuleSet) {
+	t.routeAddressSetAccess.Lock()
+	defer t.routeAddressSetAccess.Unlock()
+	ruleSet.IncRef()
+	t.routeRuleSetRefs = append(t.routeRuleSetRefs, ruleSet)
+}
+
+// releaseRouteSetRefs releases exactly the references Start acquired and clears the record.
+//
+// Clearing is what makes this idempotent and what makes the pairing exact: the slice holds one
+// entry per successful IncRef - including the same rule-set twice when it is configured as both a
+// route and a route-exclude set - so a second call finds an empty slice and cannot drive a
+// rule-set's counter negative, which is a panic in every real implementation.
+func (t *Inbound) releaseRouteSetRefs() {
+	// Take the references under the lock, then release them OUTSIDE it, for the same reason the
+	// callbacks are released outside it: DecRef may take the rule-set's own lock.
+	t.routeAddressSetAccess.Lock()
+	refs := t.routeRuleSetRefs
+	t.routeRuleSetRefs = nil
+	t.routeAddressSetAccess.Unlock()
+
+	for _, ruleSet := range refs {
+		ruleSet.DecRef()
+	}
+}
+
+// releaseRouteSets releases everything Start acquired from the route rule-sets: the registered
+// callbacks first, then the references.
+//
+// # Why the order matters
+//
+// A callback that is still registered can be delivered the moment its rule-set updates, and it
+// reads the rule-sets' rules through ExtractIPSet. Releasing the reference first would let a
+// concurrent update drop those rules while a callback that is still wired into this inbound is
+// reading them. Unregistering first means no new delivery can start, and the reference is only
+// dropped once nothing is wired to read through it.
+//
+// Both halves are individually idempotent, so an explicit Inbound.Close(), the Scope's cleanup and
+// closeAutoRedirect's release can all run in any order without releasing anything twice.
+func (t *Inbound) releaseRouteSets() {
 	t.releaseRouteSetCallbacks()
+	t.releaseRouteSetRefs()
+}
+
+// releaseRouteSetsCleanup is the Scope-cleanup form of releaseRouteSets.
+//
+// Start hands this to the Scope at the acquisition, so the Scope - not a later Inbound.Close() that
+// the product never calls - is the owner. The release itself stays the single idempotent
+// implementation, so the Scope path and an explicit Close() cannot release the same element or the
+// same reference twice.
+func (t *Inbound) releaseRouteSetsCleanup() error {
+	t.releaseRouteSets()
 	return nil
 }
 
@@ -638,7 +703,7 @@ func (t *Inbound) releaseRouteSetCallbacksCleanup() error {
 // first means a notification that races the teardown finds no observer left, and the window between
 // "auto-redirect closed" and "callbacks released" does not exist.
 func (t *Inbound) closeAutoRedirect() error {
-	t.releaseRouteSetCallbacks()
+	t.releaseRouteSets()
 	if t.autoRedirect == nil {
 		return nil
 	}

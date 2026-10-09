@@ -26,11 +26,17 @@ import (
 // would call into it on the next rule-set update. The element slice made the omission look like it
 // had been handled - the bookkeeping was there, only the release was missing.
 
-// trackingRuleSet records registration and release.
+// trackingRuleSet records registration, release and the reference count.
+//
+// The reference counter is real, not a no-op. Empty IncRef/DecRef bodies made the double agree with
+// every implementation, including one that never released a reference - a test built on it could
+// only ever prove that the callbacks were released, never that the references were. DecRef mirrors
+// LocalRuleSet and RemoteRuleSet exactly, including the panic on a negative count, so a double
+// release fails here the same way it fails in production.
 type trackingRuleSet struct {
 	adapter.RuleSet
 	access       *callbackAccess
-	refCount     int
+	refs         atomic.Int32
 	callbacks    []*list.Element[adapter.RuleSetUpdateCallback]
 	registered   int
 	unregistered int
@@ -62,8 +68,15 @@ func (s *trackingRuleSet) UnregisterCallback(element *list.Element[adapter.RuleS
 	}
 }
 
-func (s *trackingRuleSet) IncRef() {}
-func (s *trackingRuleSet) DecRef() {}
+func (s *trackingRuleSet) IncRef() {
+	s.refs.Add(1)
+}
+
+func (s *trackingRuleSet) DecRef() {
+	if s.refs.Add(-1) < 0 {
+		panic("rule-set: negative refs")
+	}
+}
 
 // TestCloseReleasesRouteSetCallbacks is §49, §50.
 //
