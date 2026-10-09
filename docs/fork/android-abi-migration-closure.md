@@ -259,7 +259,8 @@ into an unbounded platform API rewrite, and this is the concrete reason that ins
 | GUI APK, client with the fork fix | same | **StringBox errors cleared** — all three are gone; the build stops only on two unrelated pre-existing gaps (below) |
 
 With `docs/fork/android-stringbox-callsites-extra.patch` applied, the Kotlin compiler reports
-exactly two remaining errors, and neither is an ABI-migration gap:
+exactly four remaining errors (`grep -c '^e: '` on the unfiltered Gradle log), across two
+distinct issues, and neither is an ABI-migration gap:
 
 ```
 e: .../bg/BoxService.kt:113:16  Unresolved reference 'promotePowerReportDraft'.
