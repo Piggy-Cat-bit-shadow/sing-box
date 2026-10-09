@@ -211,6 +211,25 @@ Class totals: **PATCH-EQUIVALENT 20 · SEMANTIC-EQUIVALENT 18 · PARTIAL 4 · CO
 NOT-APPLICABLE 6.** No row is `BLOCKED` on external hardware — the device-only items are recorded as
 PARTIAL with the device step named.
 
+### 4.1 Rows 22, 23 and 45 — this table's class is not a behaviour verdict
+
+This ledger's class column answers **one** question: *is the code for this upstream commit present at
+the fork tip?* It does not answer *has anyone validated the behaviour?* The Stage A handoff
+([`upstream-sync-handoff.md`](upstream-sync-handoff.md)) lists the same three commits as **DEFERRED**,
+which reads as a contradiction and is not one — it is a different axis. Both documents now carry both
+axes, and neither original verdict was deleted:
+
+| Row | SHA | `code_status` (this ledger) | `behavior_status` (handoff) | Derived release status |
+| ---: | --- | --- | --- | --- |
+| 22 | `efe4db9332` | `semantic` — PATCH-EQUIVALENT here (pid `fbf7738a92`, lp 10/14) | `not_tested` | **NOT-READY** |
+| 23 | `17e950e74c` | `semantic` — SEMANTIC-EQUIVALENT here (pid `4aaa2372cb`, lp 466/481) | `not_tested` | **NOT-READY** |
+| 45 | `c6d5bafa36` | `exact` — PATCH-EQUIVALENT here (pid `dd19d1cb6c`, lp 19/19, ac 5/5) | `blocked` | **BLOCKED** (device-only) |
+
+So a row can be `PATCH-EQUIVALENT` in §4 and still be unvalidated: the class says the fork does not
+need to port the patch, and the behaviour axis says nobody has shown the behaviour works. The JSON twin
+carries the same split under `upstream_commits[].code_presence` / `.behavior_status` /
+`.derived_release_status`.
+
 ---
 
 ## 5. Row notes — the rows that are not simply "already there"

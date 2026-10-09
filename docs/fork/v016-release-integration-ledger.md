@@ -63,6 +63,10 @@ The work order's rule, recorded so it is not lost: **do not present standard SFA
 
 ## Deliverable gates (per the work order's table)
 
+**Historical observation** — the "status" column below is what was true when this ledger was written,
+at the revision named above. It is not rewritten here. The later, measured artifact facts are added in
+the next subsection rather than in place, so that neither record overwrites the other.
+
 | Object | Artifact | Status |
 | --- | --- | --- |
 | Go core | tagged + untagged CLI | **built, both exit 0** |
@@ -70,6 +74,30 @@ The work order's rule, recorded so it is not lost: **do not present standard SFA
 | Apple macOS | libbox + **unsigned** app/DMG | *in progress this round* |
 | **`satelite-one`** | installable **APK** + `libbox.aar` | *in progress this round* |
 | Standard SFA | AAR + its GUI APK | separate gate; known SFA errors do **not** substitute |
+
+### Artifact status as later measured — additive, `artifact_status` axis
+
+The rows above read *in progress this round* while older reports already contain an unsigned APK and a
+built framework. Both statements are true at different times: *in progress* is the state at this
+ledger's writing revision, and the table below is the state actually reached, with a digest where one
+was recorded. `behavior_status` is stated separately because an artifact is not a runtime proof.
+
+`observed_at_sha` for every row below: **`0fbca85462689c1ea72f7f1af511540ff873aeba`**, which is
+**18 commits before** the integration tip `ef83b8681` — so none of these digests belongs to the current
+integration tip, and **no artifact exists at `ef83b8681`**.
+
+| Object | `artifact_status` | `behavior_status` | Evidence |
+| --- | --- | --- | --- |
+| Apple iOS/iPadOS | `Libbox.xcframework` **built**, unsigned, 349 MB (ios-arm64 + macos-arm64_x86_64); no full-tree sha256 recorded, so it is not re-verifiable from the tree | `not_tested` (ABI probe is a compile-time check, not a device run) | `apple-artifact-verification.md` |
+| Apple iOS/iPadOS device binary | unsigned iPhoneOS arm64 binary produced, 70,126,536 B, `codesign`: not signed at all | `not_tested` | `v016-release-closure-report.md` |
+| Apple macOS / IPA / DMG | **`absent`** — blocked on the Apple client source tree at `2b23330d4` | `blocked` | `v016-release-closure-report.md` |
+| **`satelite-one`** | **`sha256 3a46d824d390ea78973e49b366f4cf780af683593e44f98d5633d2caf749a851`** (release APK, arm64-v8a, 29,532,055 B, **unsigned**) | `not_tested` — **runtime is NOT claimed**; no device or emulator was booted | `v016-satelite-release.md` |
+| Core `libbox.aar` | **`sha256 02c28683c724652e66e74489d57af58bdfb907fba579de6c0705c600ffa0e255`** (117,460,338 B, 4 ABIs) | n/a | `v016-satelite-release.md` |
+| Standard SFA GUI APK | `absent` — build FAILS (4 Kotlin errors, 2 pre-existing client causes, neither migration-related) | `fail` | `v016-release-closure-report.md` |
+
+The work order's rule still binds: **do not present standard SFA's build errors as `satelite-one`'s,
+and do not let `satelite-one`'s CI stand in for SFA compatibility.**
+
 
 ## Version-description correction
 
