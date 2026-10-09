@@ -228,6 +228,21 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 // Callers that own the connection pass true; the speculative preview passes false. Groups
 // without the flow-aware capability ignore the question entirely, so an existing
 // configuration routes through exactly the code it did before.
+//
+// # Termination
+//
+// The walk has NO depth limit, and that is deliberate: a legal chain is as deep as the
+// configuration makes it, so a fixed hop count would truncate a legal graph - which is exactly what
+// the bounded loop this replaced did. Termination therefore comes from a record of what has been
+// visited, and the chain being built IS that record, so the guard costs nothing extra.
+//
+// The startup sort in adapter/outbound/manager.go is the primary guard: it reads Dependencies() and
+// refuses a circular graph before any traffic exists, and every group in this tree declares its
+// members there. It cannot be the only one, because this walk follows Selected() - and, for a
+// flow-aware group, SelectForFlow() - rather than Dependencies(), and the two are the same set only
+// as long as every group answers with an edge it declared. A group that answered with an edge it
+// did not declare would make every flow through it an unbounded mutual loop, and once the stack is
+// exhausted no recover() can report it.
 func resolveOutbound(outbound adapter.Outbound, metadata *adapter.InboundContext, network string, commit bool) ([]adapter.Outbound, error) {
 	chain := []adapter.Outbound{outbound}
 	for {
@@ -242,6 +257,11 @@ func resolveOutbound(outbound adapter.Outbound, metadata *adapter.InboundContext
 		}
 		if outbound == nil {
 			return nil, E.New(strings.ToUpper(network), " is not supported by outbound: ", group.Tag())
+		}
+		// A member the walk has already been through closes a loop. Reported rather than followed:
+		// the caller gets a diagnostic naming the node, which a hang can never produce.
+		if common.Contains(chain, outbound) {
+			return nil, E.New("outbound group cycle detected at ", outbound.Tag())
 		}
 		chain = append(chain, outbound)
 	}
