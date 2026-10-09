@@ -34,10 +34,33 @@ ok  	github.com/sagernet/sing-box/experimental/libbox	1.616s
 The verbose run also dumps the complete 450-row table (`type | method | result type | class`).
 **450 bound declarations, 23 pointer-bearing.** The "~23" in the work order is confirmed exactly.
 
-### The migrated set is ten declarations, not seven
+### The migrated set is nine client-visible declarations, not seven
 
-The work order says the integrator migrated seven methods. Ten declarations in the exported
-surface now return `*StringBox`:
+The work order says the integrator migrated seven methods, and that is the count of *new
+call-site moves*. The number of declarations that a client can reach and that now return a
+`*StringBox` is larger, so the count is worth establishing rather than inheriting.
+
+Sweeping the package for a `*StringBox` result and then removing what gomobile cannot bind
+(the unexported helper `wrapString`, and `httpResponse.GetContent`, whose receiver is
+unexported so no client can name it):
+
+```sh
+grep -rhE '^func .*\) \(\*StringBox|^func .*\) \*StringBox' experimental/libbox/*.go | grep -v _test.go
+```
+
+gives 11 client-reachable declarations:
+`BridgeSession.Name` (one declaration per platform file, `bridge_service_darwin.go` and
+`bridge_service_linux.go`, which is one bound method), `GenerateConfigSchema`, `FormatConfig`,
+`DeprecatedNote.Message`, `DeprecatedNote.MessageWithLink`, `RandomHex`, `RoutePrefix.Address`,
+`RoutePrefix.Mask`, `TunOptions.GetDNSMode`, `TunOptions.GetHTTPProxyServer`, and
+`OnDemandRule.ProbeURL`.
+
+Nine of those are in `docs/fork/libbox-abi-contract.tsv` — the ones a shipped client can call.
+The other two are `DeprecatedNote.MessageWithLink` and `OnDemandRule.ProbeURL`, which have no
+call site anywhere; `ProbeURL` additionally has no implementation, so its frame was latent
+rather than merely unused.
+
+The full set:
 
 ```sh
 grep -nE '^func .*\) \*StringBox' experimental/libbox/*.go | grep -v _test.go
@@ -57,14 +80,16 @@ grep -nE '^func [A-Z][A-Za-z]*\(.*\) \(\*StringBox' experimental/libbox/*.go
 | 9 | `FormatConfig` | yes — Android |
 | 10 | `GenerateConfigSchema` | yes — Android |
 
-`RandomHex` also returns `*StringBox` but has no call site. The **seven** in the work order is the
-count of methods that a *shipped call site* had to move for: 1–6 plus `FormatConfig` and
-`GenerateConfigSchema` are eight client-visible, of which `GetDNSMode` was already boxed in a
-previous change, so seven is the number of *new* client-visible migrations. The count is
-defensible; the point is that it is a count of call-site moves, not a count of boxed methods, and
-the two differ by three. Anyone re-deriving "7" from the Go source will get 10 or 11, and anyone
-re-deriving it from the call sites will get 8. The ABI contract lists the ten declarations; the
-call-site gate enforces the eight that have clients.
+Two further reachable declarations return a box and are deliberately **not** in the contract
+because no client calls them: `DeprecatedNote.MessageWithLink` and `OnDemandRule.ProbeURL`. A
+contract record for them would either fail on the absent call site or need a vacuous exclusion,
+and neither improves the gate.
+
+So: 11 client-reachable declarations return a box, 9 are contracted, 8 have call sites in a
+shipped client (1–6 plus `FormatConfig` and `GenerateConfigSchema`), and `GetDNSMode` was
+already boxed before this change, leaving **7 new call-site moves** — the work order's number.
+The number is a count of *moves*, not of boxed declarations, and re-deriving it from the Go
+source yields 11 or 9 instead. That gap is the reason this section exists.
 
 ## 2. Five-layer reconciliation
 
