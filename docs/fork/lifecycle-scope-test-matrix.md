@@ -236,3 +236,35 @@ as a fix and not as a regression.
 utun requires it), which is why the TUN and MASQUE tests inject a failure or a userspace device at
 the seam that production also uses. Real TUN/bridge/auto-redirect behaviour on device is
 `DEVICE-ONLY` — see the handoff document.
+
+## 7. Box-level close semantics, and one regression this stage caused and fixed (`3afa000d6`)
+
+Absorbing the closed/cancelled filter **broke an existing test**, and that is recorded rather than
+quietly edited:
+
+```console
+--- FAIL: TestBoxCloseRepeatsTheFirstResult (0.00s)
+    box_close_test.go:89:
+    Error: Expected error with "context canceled" in chain but got nil.
+```
+
+`TestBoxCloseRepeatsTheFirstResult` injected `context.Canceled` as its teardown failure. Its stated
+intent is error **repetition** — "the first Close's error is reported to every caller, so a repeated
+Close does not look like a clean shutdown when teardown actually failed" — and the value was only ever
+"some error". Once `Scope.Close` stopped reporting a cancelled cleanup as a failure, that fixture
+asserted the opposite of the contract.
+
+The resolution strengthens the coverage instead of weakening the assertion:
+
+- the repetition test now injects a real teardown failure, so its assertion keeps exactly the strength
+  it had;
+- a new `TestBoxCloseDistinguishesCancellationFromTeardownFailure` pins the contract at the Box level,
+  with two sub-cases: a teardown that only observed cancellation and `net.ErrClosed` returns nil, and
+  a real failure travelling alongside them is still returned to every caller with the filtered errors
+  absent from the result.
+
+Reverse-break: removing the closed/cancelled filter from `Scope.Close` fails
+`TestBoxCloseDistinguishesCancellationFromTeardownFailure` and leaves
+`TestBoxCloseRepeatsTheFirstResult` green — the division the two tests are meant to have.
+
+No assertion was weakened, no test was deleted, and no `|| true` was added.

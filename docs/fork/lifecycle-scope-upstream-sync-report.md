@@ -167,10 +167,27 @@ test passes both before and after. One deliberate difference from upstream: the 
 reported through the Scope logger before being dropped, so filtering removes them from the result
 without losing the observation.
 
+**This change broke an existing test, and that is recorded rather than hidden.** The first full-suite
+run that included `f2ea18240` failed exactly once:
+
+```console
+--- FAIL: TestBoxCloseRepeatsTheFirstResult (0.00s)
+    box_close_test.go:89: Expected error with "context canceled" in chain but got nil.
+```
+
+The test injected `context.Canceled` as its teardown failure. Its stated intent is error
+*repetition* — the first Close's error must reach every caller — and the value was only ever "some
+error"; once a cancellation stopped being reported as a failure, that fixture asserted the opposite of
+the contract. Fixed in `3afa000d6` by injecting a real teardown failure, so the repetition assertion
+keeps exactly the strength it had, and by promoting the cancellation case to an explicit Box-level
+test with both halves: cancellation alone is not a failure, and a real failure alongside it still
+reaches every caller. Removing the filter now fails the new test and leaves the repetition test
+green. No assertion was weakened, no test was deleted, no `|| true` was added.
+
 ## 9. Are active connections, the idle pool, network generation, `TrimMemory` and on-demand resume
 semantics preserved?
 
-**Yes — none of them was touched.** This stage changed six files: `adapter/lifecycle.go`,
+**Yes — none of them was touched.** This stage changed seven files: `adapter/lifecycle.go`,
 `protocol/tun/inbound.go`, `protocol/masque/server.go`, and their tests. In particular it did not
 touch `runtimecoord.Coordinator` or its environment/reset epochs, `ReferenceManager` and its
 idle-only/active-stream policy, the Power Governor or the Apple Sleep/Wake/Lock axes, DNS/Fake-IP/RDRC
@@ -233,7 +250,7 @@ No upstream file was ported mechanically.
 ## 12. Was this stage committed, and what are the SHAs?
 
 Committed on `fix/lifecycle-stage1` in the isolated worktree. **Not pushed** (forbidden for this
-stage). The integrator cherry-picks with `-x`; all six commits are individually buildable and tested.
+stage). The integrator cherry-picks with `-x`; all seven commits are individually buildable and tested.
 
 | SHA | Subject |
 | --- | --- |
@@ -243,6 +260,7 @@ stage). The integrator cherry-picks with `-x`; all six commits are individually 
 | `6019786ae` | `test(bridge): pin the Scope ownership of the bridge instance index` |
 | `ffdbfa334` | `fix(adapter): define the Scope Start x Close x Add contract` |
 | `f2ea18240` | `fix(adapter): stop reporting already-closed and cancelled cleanup as failure` |
+| `3afa000d6` | `test(box): distinguish a cancelled close from a real teardown failure` |
 
 `53a3f97e8` and `f2c728d10` must be taken together: the first carries the ownership fix, and its
 working tree was captured mid-mutation, so its `closeAutoRedirect` body has the teardown order

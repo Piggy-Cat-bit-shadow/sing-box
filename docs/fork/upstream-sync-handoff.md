@@ -56,12 +56,18 @@ protocol/tun/scope_ownership_test.go        | 268 ++++++++++++++    (new, P0-L01
 protocol/masque/server.go                   |  37 +++-              (P0-L01b)
 protocol/masque/scope_ownership_test.go     | 137 +++++++++++++     (new, P0-L01b)
 protocol/bridge/scope_ownership_test.go     | 120 +++++++++++       (new, P0-L02)
+box_close_test.go                           |  +58 (net)           (P1-L05, Box level)
 docs/fork/lifecycle-scope-upstream-sync-report.md       (new)
 docs/fork/lifecycle-scope-resource-ledger.md            (new)
 docs/fork/lifecycle-scope-test-matrix.md                (new)
 docs/fork/upstream-sync-handoff.md                      (this file)
 docs/fork/upstream-sync-handoff.json                    (new)
 ```
+
+**Do not weaken `box_close_test.go`.** `TestBoxCloseRepeatsTheFirstResult` deliberately injects a
+real teardown failure, not a cancellation: a cancelled cleanup is not reported as a failure by
+contract, so a cancellation there would assert the opposite. The cancellation case lives in
+`TestBoxCloseDistinguishesCancellationFromTeardownFailure`, which covers both halves.
 
 **Do not re-do:** the callback ownership in `protocol/tun/inbound.go`, the endpoint teardown in
 `protocol/masque/server.go`, the bridge index wiring, or the `Scope` state machine and error filter in
@@ -142,6 +148,7 @@ PHASE_A consumed work that a naive reading of the plan might assign to PHASE_B. 
 | 4 | `6019786ae` | `test(bridge): pin the Scope ownership of the bridge instance index` |
 | 5 | `ffdbfa334` | `fix(adapter): define the Scope Start x Close x Add contract` |
 | 6 | `f2ea18240` | `fix(adapter): stop reporting already-closed and cancelled cleanup as failure` |
+| 7 | `3afa000d6` | `test(box): distinguish a cancelled close from a real teardown failure` |
 
 **`53a3f97e8` and `f2c728d10` must be taken together.** The first carries the callback ownership fix,
 but its `closeAutoRedirect` body was captured while the worktree was mid-mutation, so it closes the
@@ -149,7 +156,7 @@ auto-redirect before releasing the callbacks. The second restores the intended o
 its message. Cherry-picking #1 alone leaves a broken ordering that
 `TestStartRegistersReleaseBeforeAutoRedirectTeardown` catches.
 
-`FINAL_PHASE_A_SHA` is the branch tip after the six commits above **plus** the documentation commit;
+`FINAL_PHASE_A_SHA` is the branch tip after the seven commits above **plus** the documentation commit;
 the integrator records the exact value when it cherry-picks. PHASE_B must work from the real current
 HEAD of `testing` after integration, not from any SHA written in a planning document.
 
@@ -195,7 +202,7 @@ Scope 所有权层。
 | `go mod tidy -diff` | empty, exit 0 |
 | `go test -count=1 -race -tags "$TAGS" ./adapter/... ./protocol/tun/ ./protocol/masque/ ./protocol/bridge/` | all ok |
 | `go test -count=20 -race -tags "$TAGS" -run '<all new tests>'` on those four packages | all ok |
-| `common/trafficsched` inside `./...` | passed (106.8 s); known load-sensitive flake **did not reproduce** at load 8.56 → 16.82 |
+| `common/trafficsched` inside `./...` | passed; known load-sensitive flake **did not reproduce** |
 
 `build/` (gomobile-generated Go in the repo root) was checked for and is **absent**, so `go test ./...`
 does not walk it and the 76-package count is not inflated.

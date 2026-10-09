@@ -72,6 +72,15 @@
       "subsystem": "adapter",
       "item": "P1-L05",
       "absorbs_upstream": "69601481fd36a3a8a96e199c647132dab819184b"
+    },
+    {
+      "order": 7,
+      "sha": "3afa000d6",
+      "subject": "test(box): distinguish a cancelled close from a real teardown failure",
+      "subsystem": "box",
+      "item": "P1-L05",
+      "production_change": false,
+      "note": "fixes the one regression PHASE_A caused: TestBoxCloseRepeatsTheFirstResult injected context.Canceled as its teardown failure, which the absorbed filter correctly suppresses. The repetition assertion now injects a real teardown failure and keeps its full strength; the cancellation contract is pinned explicitly at Box level by TestBoxCloseDistinguishesCancellationFromTeardownFailure."
     }
   ],
   "files_touched_by_phase_a": [
@@ -87,7 +96,8 @@
     "docs/fork/lifecycle-scope-resource-ledger.md",
     "docs/fork/lifecycle-scope-test-matrix.md",
     "docs/fork/upstream-sync-handoff.md",
-    "docs/fork/upstream-sync-handoff.json"
+    "docs/fork/upstream-sync-handoff.json",
+    "box_close_test.go"
   ],
   "do_not_touch": [
     "the scope.Add(t.releaseRouteSetCallbacksCleanup) placement in protocol/tun/inbound.go",
@@ -102,7 +112,8 @@
     "DNS/Fake-IP/RDRC network isolation",
     "the TUN Direct Fast Path",
     "the low-memory iOS target and local-only signing",
-    "the screen-on != unlocked rule in the Apple lock-state chain"
+    "the screen-on != unlocked rule in the Apple lock-state chain",
+    "the injected error value in TestBoxCloseRepeatsTheFirstResult: it must be a real teardown failure, because a cancelled cleanup is not reported as a failure by contract"
   ],
   "upstream_commits": [
     {
@@ -263,11 +274,17 @@
       "title": "TUN RuleSet callback Scope ownership",
       "status": "FIXED",
       "owner": "PHASE_A",
-      "commits": ["53a3f97e8", "f2c728d10"],
+      "commits": [
+        "53a3f97e8",
+        "f2c728d10"
+      ],
       "defect": "releaseRouteSetCallbacks had exactly one caller, Inbound.Close(), and the product close path never calls Inbound.Close(); Scope.Close runs scope.Add entries only. The rule-set kept an observer pointed at a torn-down *Inbound for the lifetime of the process",
       "why_it_was_invisible": "protocol/tun/callback_lifecycle_test.go called Inbound.Close() directly, which the product never does - a test that verified the wrong object",
       "fix": "scope.Add(t.releaseRouteSetCallbacksCleanup) at the acquisition, plus closeAutoRedirect so the release precedes the auto-redirect teardown instead of following it",
-      "files": ["protocol/tun/inbound.go", "protocol/tun/scope_ownership_test.go"],
+      "files": [
+        "protocol/tun/inbound.go",
+        "protocol/tun/scope_ownership_test.go"
+      ],
       "tests_green_after": true,
       "reverse_breaks": 3
     },
@@ -276,11 +293,16 @@
       "title": "MASQUE server endpoint teardown ownership",
       "status": "FIXED",
       "owner": "PHASE_A",
-      "commits": ["e3349044a"],
+      "commits": [
+        "e3349044a"
+      ],
       "defect": "ServerEndpoint.Start acquired a device, a TLS config, a listener and an HTTP/3 server; Close released all of them and nothing handed Close to the Scope. A real Box.Close() left the device and the listening socket open",
       "found_by": "the ownership sweep P0-L01 called for; it returned exactly two hits on the baseline",
       "fix": "scope.Add(s.Close) at the acquisition in StartStateInitialize, and Close made idempotent with a sync.Once because the Scope and the duplicate-tag loser path in adapter/endpoint/manager.go can both reach it",
-      "files": ["protocol/masque/server.go", "protocol/masque/scope_ownership_test.go"],
+      "files": [
+        "protocol/masque/server.go",
+        "protocol/masque/scope_ownership_test.go"
+      ],
       "tests_green_after": true,
       "reverse_breaks": 2
     },
@@ -289,7 +311,9 @@
       "title": "constructor-phase system side effects",
       "status": "PARTIAL",
       "owner": "PHASE_A",
-      "commits": ["6019786ae"],
+      "commits": [
+        "6019786ae"
+      ],
       "bridge_index": {
         "status": "COVERAGE",
         "verdict": "already correct and stricter than upstream; the Scope wiring was untested and is now covered by four tests that all fail when the scope.Add inside allocateIndex is removed",
@@ -308,7 +332,9 @@
       "title": "Scope.Start x Scope.Close x Scope.Add contract and failure rollback",
       "status": "FIXED",
       "owner": "PHASE_A",
-      "commits": ["ffdbfa334"],
+      "commits": [
+        "ffdbfa334"
+      ],
       "defects": [
         "Add after Close appended to a queue nobody walks again: permanent silent leak",
         "Start returned success for a Scope that closed while the component was starting",
@@ -317,7 +343,10 @@
       "reachability_proof": "box.go:97-100 states Close is exported and an embedder may call it from any goroutine including while Start is still running, which the daemon deliberately allows; and the dynamic sub-scopes in dns/transport/local, service/resolved and the openvpn/openconnect/tailscale resolvers start transports into a scope another goroutine may be replacing",
       "fix": "open/closing/closed state under the existing mutex plus a closeDone channel; Add on a closing Scope runs the cleanup on the caller's goroutine outside the lock; Start reports the cancellation; Close records the drain result and later callers join it",
       "no_goroutine_added": true,
-      "files": ["adapter/lifecycle.go", "adapter/lifecycle_scope_test.go"],
+      "files": [
+        "adapter/lifecycle.go",
+        "adapter/lifecycle_scope_test.go"
+      ],
       "tests_green_after": true,
       "reverse_breaks": 3
     },
@@ -326,9 +355,14 @@
       "title": "close-path error semantics",
       "status": "FIXED",
       "owner": "PHASE_A",
-      "commits": ["f2ea18240"],
+      "commits": [
+        "f2ea18240"
+      ],
       "fix": "expand each cleanup's result, then filter E.IsClosed/E.IsCanceled per error; real failures still returned; filtered errors reported through the Scope logger so the observation is not lost",
-      "files": ["adapter/lifecycle.go", "adapter/lifecycle_error_semantics_test.go"],
+      "files": [
+        "adapter/lifecycle.go",
+        "adapter/lifecycle_error_semantics_test.go"
+      ],
       "tests_green_after": true,
       "reverse_breaks": 2
     },
@@ -363,6 +397,22 @@
       "status": "PARTIAL",
       "owner": "PHASE_A / PHASE_B",
       "note": "the Scope contract now supports dynamic replacement safely; the mapping between resource generation and logical network generation in dns/transport/local and URLTest rounds is untouched"
+    },
+    {
+      "id": "P1-L05-BOX",
+      "title": "Box-level close semantics and the regression this stage caused",
+      "status": "FIXED",
+      "owner": "PHASE_A",
+      "commits": [
+        "3afa000d6"
+      ],
+      "defect": "absorbing 69601481f broke TestBoxCloseRepeatsTheFirstResult, which used context.Canceled as a stand-in for 'some error'",
+      "fix": "inject a real teardown failure there so the repetition assertion keeps its strength, and promote the cancellation case to an explicit Box-level test covering both halves",
+      "files": [
+        "box_close_test.go"
+      ],
+      "assertions_weakened": 0,
+      "tests_deleted": 0
     }
   ],
   "transferred_ownership": [
@@ -378,10 +428,23 @@
       "result": "76 ok / 0 FAIL",
       "exit_code": 0
     },
-    "go_build_tagged": {"command": "go build -tags \"$TAGS\" ./...", "exit_code": 0},
-    "go_build_untagged": {"command": "go build ./...", "exit_code": 0},
-    "gofmt": {"command": "gofmt -l .", "result": "empty"},
-    "go_mod_tidy": {"command": "go mod tidy -diff", "result": "empty", "exit_code": 0},
+    "go_build_tagged": {
+      "command": "go build -tags \"$TAGS\" ./...",
+      "exit_code": 0
+    },
+    "go_build_untagged": {
+      "command": "go build ./...",
+      "exit_code": 0
+    },
+    "gofmt": {
+      "command": "gofmt -l .",
+      "result": "empty"
+    },
+    "go_mod_tidy": {
+      "command": "go mod tidy -diff",
+      "result": "empty",
+      "exit_code": 0
+    },
     "race_touched_packages": {
       "command": "go test -count=1 -race -tags \"$TAGS\" ./adapter/... ./protocol/tun/ ./protocol/masque/ ./protocol/bridge/",
       "result": "all ok"
@@ -404,7 +467,15 @@
       "ran": false,
       "reason": "the branch was not pushed, so no head_sha, job ID or artifact provenance can exist",
       "device_verification_claimed": false
-    }
+    },
+    "registered_regressions": [
+      {
+        "test": "TestBoxCloseRepeatsTheFirstResult",
+        "cause": "context.Canceled injected as a teardown failure is correctly filtered by the absorbed close-path contract",
+        "fixed_by": "3afa000d6",
+        "resolution": "real teardown failure injected; cancellation pinned explicitly in TestBoxCloseDistinguishesCancellationFromTeardownFailure"
+      }
+    ]
   },
   "device_only": [
     {
