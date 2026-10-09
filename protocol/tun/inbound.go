@@ -1,4 +1,4 @@
-﻿package tun
+package tun
 
 import (
 	"context"
@@ -937,21 +937,73 @@ func (t *Inbound) releaseRouteSetCallbacks() {
 
 // JudgeFlow decides what happens to a new flow at the TUN boundary.
 //
-// # Ordering: DNS first, bypass second
+// # The complete order, and what each step is allowed to decide
 //
-// The DNS hijack checks run BEFORE the route address sets and before anything that can bypass
-// userspace. That order is load-bearing, not stylistic:
+//  1. canonicalise a v4-mapped destination (::ffff:a.b.c.d -> a.b.c.d)
+//  2. configured DNS hijack address      UDP -> ActionHijackDNS, TCP -> ActionAccept
+//  3. dnsHijackByPort && port 53         UDP -> ActionHijackDNS, TCP -> ActionAccept
+//  4. FakeIP placeholder guard           makes step 5 inapplicable
+//  5. route_address_set miss / route_exclude_address_set hit
+//     -> ActionBypass, and the Router is never consulted
+//  6. otherwise                          adapter.JudgeFlow -> Router.PreMatch, and therefore
+//     reverse mapping, domain/process/protocol policy and the
+//     router-level Direct Fast Path eligibility
 //
-//	routeAddressSet / routeExcludeAddressSet return ActionBypass directly
+// # L0 is an authoritative IP-only pre-router policy, and that is a product decision
 //
-// so any DNS check placed after them is unreachable for exactly the destinations those sets
-// cover. When the by-port check sat below them, a query to an excluded address (or to an address
-// outside an include set) was handed straight to the operating system: it never reached the DNS
-// router, and DNS rules, ad filtering and Fake-IP policy were silently skipped for the most
-// ordinary DNS destination there is.
+// Step 5 terminates evaluation. A matching L0 policy decides the flow on the DESTINATION ADDRESS
+// alone, which means domain, process, protocol and reverse-mapped-domain policy deliberately do not
+// participate in it - and the Router's call count is zero, not "one, then ignored". That is not an
+// oversight to be repaired by routing literal-IP flows through the router for safety: the route sets
+// ARE the platform routing table's configuration, so a flow they cover is one the platform carries
+// whether or not sing-box has an opinion about its domain, and a verdict produced by consulting the
+// router first is one this layer could not then honour.
 //
-// The hijack checks are cheap - a slice scan and a port/network comparison - so hoisting them
-// also makes the DNS path marginally shorter, and a non-DNS flow pays only those two comparisons.
+// The consequence for whoever writes the configuration, stated plainly: putting an address in
+// route_address_set (or route_exclude_address_set) OUTRANKS every domain, process and protocol rule
+// that would otherwise have described a flow to that address. An address rule and a domain rule are
+// two independent ways to write the same policy, and DNS state is what makes them describe the same
+// flow; when they disagree, the address wins.
+//
+// # The three verdicts that are easy to confuse
+//
+//	ActionAccept      for a configured TCP DNS destination. The flow is NOT bypassed: it stays in
+//	                  sing-box and the existing stream DNS path takes it. Reading this as "hand DNS
+//	                  to the platform" is the mistake this distinction exists to prevent.
+//	ActionBypass      the platform carries the flow and sing-box does not see it again.
+//	L0 bypass vs      a different thing entirely: the router's Direct Fast Path is a per-flow
+//	router-level   decision made from full metadata (sniffed domain, FakeIP state, trackers,
+//	                  resolved candidates, destination rewrite, group membership), which is why it
+//	                  can refuse a flow L0 would have carried.
+//
+// # What takes precedence over L0
+//
+// Configured DNS hijack (step 2, and step 3 when the by-port rule is on) and FakeIP protection
+// (step 4). Those two are checked FIRST, so a query to a configured DNS server is never bypassed
+// just because its address is outside a route set, and a FakeIP placeholder is never handed to a
+// platform that has no route for it. Everything else - including whether port 53 is special at all -
+// follows the configuration: with `dns_hijack` by-port disabled and no configured hijack address,
+// UDP/53 is ordinary traffic and the route sets decide it.
+//
+// # Evidence
+//
+// Steps 2, 3, 4 and 5 were each reverse-broken in a disposable tree and every mutation turned the
+// named tests red (see docs/fork/v016-overnight-implementation-report.md):
+//
+//	move steps 2-3 below step 5        -> TestDNSHijackBeatsRouteExcludeAddressSet and 6 others RED
+//	remove the step 4 guard            -> TestFakeIPIsNotBypassedByRouteAddressSet and 2 others RED
+//	let a step 5 hit continue to step 6 -> TestL0HitReport, TestL0CannotExpressAnythingButAddresses,
+//	                                      TestL0AuthoritativeIPPolicyWinsBeforeReverseMapping RED
+//	make step 6 unconditional          -> the same three plus
+//	                                      TestL0DoesNotDiscardProcessOrProtocolRulesOnTheNonL0Branch RED
+//
+// # Cost
+//
+// Steps 1-3 are a slice scan and a port/network comparison, and a non-DNS flow pays only those. Step
+// 4 is two prefix comparisons, skipped entirely when no FakeIP transport is configured. Step 5 is two
+// radix lookups. Nothing here allocates, takes a lock beyond an RWMutex read of the route sets, or
+// performs a DNS lookup: a flow that reaches step 5 and returns never touches the router, the reverse
+// mapping, the process searcher or any timer.
 func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
 	// The destination is canonicalised BEFORE any policy comparison, and that order is part of the
 	// contract rather than tidiness.
