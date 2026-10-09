@@ -187,6 +187,22 @@ func (d *recordingDialer) attempts() []netip.Addr {
 	return out
 }
 
+// firstAttempt reports when the first attempt on `address` started, and whether one happened.
+//
+// It exists so a test can assert the ORDER and the SPACING of attempts as events, which is what the
+// scheduler contract is actually about, instead of measuring how long a whole DialContext took. The
+// timestamps have been recorded since this fixture was written; only the accessor is new.
+func (d *recordingDialer) firstAttempt(address netip.Addr) (time.Time, bool) {
+	d.access.Lock()
+	defer d.access.Unlock()
+	for index, tried := range d.tried {
+		if tried == address {
+			return d.started[index], true
+		}
+	}
+	return time.Time{}, false
+}
+
 func newDomainTestDialer(router *fakeDomainRouter, inner *recordingDialer, parallel bool, fallback time.Duration) *resolveDialer {
 	return &resolveDialer{
 		router:        router,
@@ -459,11 +475,32 @@ func TestProductionDialerRemembersFamilyFailure(t *testing.T) {
 	inner.reset()
 	start := time.Now()
 	conn, err = dialer.DialContext(ctx, "tcp", M.ParseSocksaddr("example.test:443"))
-	elapsed := time.Since(start)
 	require.NoError(t, err)
 	require.NotNil(t, conn)
-	require.Less(t, elapsed, 40*time.Millisecond,
-		"with a recorded failure the healthy family must start immediately, not after the delay")
+
+	// # Why this is an event gap and not an elapsed-time bound
+	//
+	// This assertion used to be `require.Less(t, elapsed, 40*time.Millisecond)`. MEASURED on this
+	// host: the scenario takes 16.5 ms with the machine idle and **735.9 ms** with 16 busy
+	// goroutines. The load does not change what the scheduler does - it changes how long a
+	// goroutine waits to be scheduled - so a 40 ms bound was reporting the host, and no constant
+	// in that range would have survived it.
+	//
+	// The contract the test is about is that the healthy family's first attempt does NOT wait out
+	// the fallback delay once the penalty is recorded. That is an assertion about the SPACING of
+	// two events inside the dialer, and the fixture records a timestamp for every attempt, so it can
+	// be read directly. The bound is the test's OWN fallbackDelay, which makes the assertion
+	// self-scaling: raise the delay and the bound follows, and a scheduler that failed to start the
+	// healthy family early would push the gap to the delay itself and be caught.
+	healthyStarted, attempted := inner.firstAttempt(healthy4)
+	require.True(t, attempted, "the healthy family must have been attempted")
+	fallbackDelay := 150 * time.Millisecond
+	gap := healthyStarted.Sub(start)
+	t.Logf("the healthy family's first attempt began %v after the call; the fallback delay is %v", gap, fallbackDelay)
+	require.Less(t, gap, fallbackDelay,
+		"with a recorded failure the healthy family must start before the fallback delay elapses, "+
+			"not after it: the attempt began %v after the call, and the fallback delay is %v",
+		gap, fallbackDelay)
 }
 
 // ownerBackedDialer routes attempt connections through the production owner's dial methods
