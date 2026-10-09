@@ -85,6 +85,37 @@ func H3GateReason() string {
 	return ""
 }
 
+// KnownGapEnableEnvVar is the extra gate on scenarios that reproduce a LIMITATION
+// which is known to be unfixed, rather than a behaviour the release claims.
+//
+// Such a scenario is EXPECTED TO FAIL against a reference that exercises the gap,
+// so running it in the matrix would make a leg red for a reason the leg cannot
+// fix — and a leg that is red for a known reason is how a real regression gets
+// ignored. It is therefore opt-in, and the skip text carries the reproduction and
+// points at the gate that DOES fail when the limitation changes: common/tls's
+// REALITY fingerprint register. A skip here is not a claim that anything passed.
+// It is the sentence "this is broken, here is how to see it, and here is the test
+// that will tell you when it stops being broken".
+const KnownGapEnableEnvVar = "INTEROP_ENABLE_KNOWN_GAPS"
+
+// KnownGapGateReason returns the reason a known-gap scenario is disabled, or the
+// empty string when it is enabled.
+func KnownGapGateReason(scenario Scenario) string {
+	if scenario.KnownGap == "" {
+		return ""
+	}
+	if os.Getenv(KnownGapEnableEnvVar) == "1" {
+		return ""
+	}
+	return "scenario " + scenario.Name + " reproduces a known, unfixed limitation and is EXPECTED " +
+		"TO FAIL against a reference that exercises it:\n  " + scenario.KnownGap + "\n" +
+		"Skipping it verifies nothing. The cause is gated by " +
+		"common/tls/reality_fingerprint_register_test.go, which fails when the pinned uTLS changes; " +
+		"run this scenario to see the failure itself.\n" +
+		"Enable it exactly like this:\n  " +
+		strings.Replace(LiveInteropEnableCommand, LiveInteropEnvVar+"=1", LiveInteropEnvVar+"=1 "+KnownGapEnableEnvVar+"=1", 1)
+}
+
 // LiveInteropCapabilityReason reports why this BUILD cannot run a scenario, or
 // the empty string when it can.
 //

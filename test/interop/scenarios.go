@@ -92,6 +92,18 @@ type Scenario struct {
 	// part of the scenario rather than a property of the stand.
 	Fingerprint string
 
+	// KnownGap, when non-empty, says this scenario reproduces a limitation that is
+	// known to be unfixed in the PINNED dependency, so it is expected to FAIL
+	// against a reference that exercises the gap. It states the limitation and
+	// what it costs a user; the gate that decides whether the scenario runs reads
+	// this field (see KnownGapGateReason).
+	//
+	// The alternative — leaving the scenario in the default matrix — makes a leg
+	// red for a reason no code in this repository can fix, which is how a real
+	// regression gets ignored. The alternative in the other direction — deleting
+	// it — throws away the only executable reproduction of the gap.
+	KnownGap string
+
 	// PlainTLS selects an ordinary TLS security layer instead of REALITY. Only
 	// HTTP/3 needs it: REALITY is a TCP construction, so an H3 scenario cannot
 	// carry it and the client replaces a REALITY ALPN of ["h3"] with ["h2"].
@@ -224,6 +236,13 @@ func Scenarios() []Scenario {
 			Name:        "reality-firefox",
 			Reality:     true,
 			Fingerprint: "firefox",
+			KnownGap: "the pinned metacubex/utls v1.8.7 resolves `firefox` to Firefox 120, whose " +
+				"ClientHello carries no X25519MLKEM768 key share. A REALITY reference at or " +
+				"after Xray v26.9.8 requires that share, so the server answers with the " +
+				"camouflage site and the client reports a verification failure that is " +
+				"indistinguishable from a wrong public key. Workaround: `fingerprint: chrome`. " +
+				"Fixed by the three upstream commits recorded in " +
+				"docs/fork/utls-firefox148-safari263.patch",
 			Note: "REALITY with the Firefox fingerprint and NO explicit key_share, which is the " +
 				"configuration a user gets from `fingerprint: firefox` alone. It is the " +
 				"fingerprint axis rather than a new protocol combination: the preset decides " +
@@ -236,6 +255,10 @@ func Scenarios() []Scenario {
 			Name:        "reality-safari",
 			Reality:     true,
 			Fingerprint: "safari",
+			KnownGap: "the pinned metacubex/utls v1.8.7 resolves `safari` to Safari 16.0, whose " +
+				"ClientHello carries no X25519MLKEM768 key share, with the same consequence " +
+				"as reality-firefox. Workaround: `fingerprint: chrome`. Fixed by the same " +
+				"three upstream commits",
 			Note: "REALITY with the Safari fingerprint and no explicit key_share. The same " +
 				"fingerprint axis as reality-firefox and the same reference requirement; it is " +
 				"a separate scenario because the two names resolve to two different presets in " +

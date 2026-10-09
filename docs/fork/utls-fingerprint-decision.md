@@ -28,6 +28,18 @@ each with **no explicit `key_share`** — the configuration `fingerprint: firefo
 the default a real user has. `reality-hybrid` is the control: same REALITY, same reference,
 `fp=chrome`, `key_share: hybrid`.
 
+Those two scenarios are declared as **known gaps** (`Scenario.KnownGap`), so they are **opt-in** and
+skip in the default matrix with a reason that repeats the limitation, points at the register test and
+prints the command below. That is deliberate: a matrix leg that is red for a reason no code in the
+repository can fix is how a real regression gets ignored, and a skip that does not say what it is
+skipping is how a gap gets forgotten. To run the reproduction:
+
+```bash
+cd test && RUN_LIVE_XRAY_INTEROP=1 INTEROP_ENABLE_KNOWN_GAPS=1 XRAY_BINARY=/path/to/xray \
+  go test -tags "$(cat ../release/DEFAULT_BUILD_TAGS),liveinterop" -count=1 -timeout 20m -v \
+  -run 'TestLiveInteropReality(Firefox|Safari)$' ./interop/
+```
+
 First run, pinned tree, reference **Xray v26.9.30**:
 
 ```
@@ -347,8 +359,10 @@ protocol check, and it remains unperformed here.
 
 1. Create `Piggy-Cat-bit-shadow/utls` from `metacubex/utls@v1.8.7`, apply
    `docs/fork/utls-firefox148-safari263.patch`, push branch `fix/firefox148-safari263`.
-2. Add the `replace` to `go.mod` and `test/go.mod`, `go mod tidy` both, and update the register
-   entries as the tripwire dictates.
+2. Add the `replace` to `go.mod` and `test/go.mod`, `go mod tidy` both, update the register entries
+   as the tripwire dictates, and delete `KnownGap` from `reality-firefox` and `reality-safari` — the
+   gate that keeps an expected-to-fail scenario out of the matrix must not outlive the failure. The
+   live command above then has to PASS for both, without `INTEROP_ENABLE_KNOWN_GAPS`.
 3. Re-run the live interop matrix on both reference legs, and the Apple and Android builds.
 
 **If that does not happen before the freeze**, the honest state is not "no-go" and not "fixed": it is

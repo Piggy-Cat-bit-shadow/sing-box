@@ -105,6 +105,9 @@ func runLiveScenarioForName(t *testing.T, name string) {
 		t.Fatalf("%v", err)
 	}
 	binary := requireLiveInterop(t, scenario)
+	if reason := KnownGapGateReason(scenario); reason != "" {
+		t.Skip(reason)
+	}
 	if scenario.H3 {
 		if reason := H3GateReason(); reason != "" {
 			t.Skip(reason)

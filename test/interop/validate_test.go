@@ -456,6 +456,33 @@ func TestScenarioMatrixCoversTheRequiredCombinations(t *testing.T) {
 	}
 }
 
+// TestKnownGapScenariosAreDeclaredAndCarryTheirReason ties the gate to the table.
+//
+// A scenario that reproduces a known limitation must DECLARE it: the register
+// test that gates the cause lives in another module, so the scenario is the only
+// place a maintainer sees "this failure is expected" next to the reproduction.
+func TestKnownGapScenariosAreDeclaredAndCarryTheirReason(t *testing.T) {
+	t.Parallel()
+	declared := make(map[string]bool)
+	for _, scenario := range Scenarios() {
+		if scenario.KnownGap == "" {
+			continue
+		}
+		declared[scenario.Name] = true
+		require.NotEmpty(t, scenario.Fingerprint,
+			"scenario %s declares a known gap, so it must name the fingerprint it is about", scenario.Name)
+		require.NotEqual(t, DefaultClientFingerprint, scenario.ClientFingerprint(),
+			"scenario %s declares a known gap on the DEFAULT fingerprint, which would mean the "+
+				"stand's own baseline is broken rather than one selectable preset", scenario.Name)
+		require.NotEmpty(t, KnownGapGateReason(scenario))
+	}
+	require.Equal(t,
+		map[string]bool{"reality-firefox": true, "reality-safari": true},
+		declared,
+		"the set of scenarios that reproduce a known dependency limitation changed; if a "+
+			"dependency fix landed, delete the entry and run the scenario for real")
+}
+
 // TestScenarioFingerprintDefaultIsPinned keeps the assertion in
 // TestGeneratedRealityClientConfigJSONShape from degenerating into a tautology.
 //
@@ -698,6 +725,19 @@ func TestGateMessagesExplainHowToEnable(t *testing.T) {
 	require.Contains(t, H3GateReason(), H3EnableEnvVar+"=1")
 	require.Contains(t, H3GateReason(), LiveInteropEnvVar+"=1")
 	require.Contains(t, H3GateReason(), LiveInteropBuildTag)
+
+	// The known-gap gate. Its whole job is to keep an expected-to-fail scenario
+	// out of the default matrix while leaving the reproduction reachable, so the
+	// properties worth pinning are: it is closed by default, it names the
+	// environment variable that opens it, it repeats the limitation it is gating,
+	// and it points at the test that fails when the limitation changes. A skip
+	// that lost any of those is a skip that reads as "nothing to see here".
+	gapScenario := Scenario{Name: "reality-gap", Fingerprint: "firefox", KnownGap: "a named limitation"}
+	require.Contains(t, KnownGapGateReason(gapScenario), KnownGapEnableEnvVar+"=1")
+	require.Contains(t, KnownGapGateReason(gapScenario), "EXPECTED TO FAIL")
+	require.Contains(t, KnownGapGateReason(gapScenario), gapScenario.KnownGap)
+	require.Contains(t, KnownGapGateReason(gapScenario), "reality_fingerprint_register_test.go")
+	require.Empty(t, KnownGapGateReason(Scenario{Name: "no-gap"}))
 
 	reason := LiveInteropCapabilityReason(Scenario{Name: "x", Transport: TransportXHTTP, H3: true})
 	if buildHasUTLS && buildHasXHTTP && buildHasQUIC {
