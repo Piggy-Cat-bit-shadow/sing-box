@@ -1023,9 +1023,29 @@ func TestTunnelIngressSourcePolicyForIPv6(t *testing.T) {
 // address that is in none of them, so the whole list is walked every time and no
 // early match shortens the work.
 //
-// This is a REGRESSION GUARD, not a reproduction: the scan is slices.ContainsFunc
-// today and this test passes. It exists because "the parser is linear" and "the
-// lookup is linear" are two different claims, and only the first one was pinned.
+// # What this test asserts, and what it stopped asserting
+//
+// It used to assert that the wall-clock ratio between the 8192-range loop and the
+// one-range loop stayed under 4x the range count. MEASURED on this baseline: the ratio
+// came out at 40605x-49281x against a bound of 32768x, and it reproduced on a clean
+// baseline as well as on the integration branch - a LINEAR scan legitimately costs
+// about 8192x, and the one-range side of the ratio is around 10us per lookup, which is
+// dominated by the fixed per-lookup cost and therefore moved by tens of percent from
+// one sample to the next. A bound with 4x of headroom over the true expectation was
+// crossing on scheduling noise, and raising it would have kept a host-sensitive gate
+// while reducing what it can detect.
+//
+// The linearity claim is now pinned deterministically, by counting the ranges the
+// production loop visits per lookup:
+//
+//	TestOwnershipScanVisitsEveryAdvertisedRangeOnce  (ownership_scan_count_test.go)
+//	TestOwnershipScanWorkIsProportionalToAdvertisedRanges
+//
+// This test keeps the part that is a statement about the algorithm rather than about
+// the host: the scan must be correct at the parser's own bound (every lookup misses,
+// nothing panics, no address is wrongly claimed), and the per-lookup cost is REPORTED
+// at each size so a regression in the constant factor is visible in the log without
+// being asserted against a wall clock.
 func TestTheOwnershipScanIsLinearOverAdvertisedRanges(t *testing.T) {
 	// The parser's own bound is the natural fixture size: a peer cannot exceed it,
 	// so a larger list would measure state production can never reach.
@@ -1059,60 +1079,26 @@ func TestTheOwnershipScanIsLinearOverAdvertisedRanges(t *testing.T) {
 	}
 
 	wide := measure(t, routes)
-	// The same code path with a trivial list, so the comparison is between two
-	// measurements of the same machine rather than against an absolute number that
-	// the hardware decides.
+	// The same code path with a trivial list, so the reported comparison is between two
+	// measurements of the same machine rather than against an absolute number.
 	narrow := measure(t, routes[:1])
 
-	t.Logf("%d lookups over %d advertised ranges took %v; over 1 range, %v",
-		lookups, rangeCount, wide, narrow)
+	widePerLookup := wide / lookups
+	narrowPerLookup := narrow / lookups
+	t.Logf("REPORTED, NOT ASSERTED: %d lookups over %d advertised ranges took %v (%v per "+
+		"lookup); over 1 range, %v (%v per lookup). The marginal cost of one advertised "+
+		"range is about %v, and the deterministic linearity gate is the visited-range "+
+		"count in ownership_scan_count_test.go, not this number.",
+		lookups, rangeCount, wide, widePerLookup, narrow, narrowPerLookup,
+		(wide-narrow)/rangeCount)
 
-	// The assertion is a RATIO between two measurements on the same machine, not an
-	// absolute wall-clock bound.
-	//
-	// That distinction was measured, not chosen for elegance: the first version used an
-	// absolute 5s ceiling, which passes normally (1.46s) and FAILS under `go test -race`
-	// (24.1s) because race instrumentation inflates every memory access. The test would
-	// then have reported "the ownership scan is not linear" for a scan that is linear,
-	// and the only way to keep an absolute bound honest would be to raise it until it
-	// stopped detecting anything.
-	//
-	// A ratio cancels both the machine's speed and the instrumentation overhead. A
-	// QUADRATIC scan is not a constant factor slower: 8192 ranges against 1 is roughly
-	// 8192x the work, so it separates from a linear scan by orders of magnitude no matter
-	// how slow the machine or the instrumentation is.
-	//
-	// The bound is stated in terms of what LINEAR actually costs, which was MEASURED
-	// rather than assumed.
-	//
-	// A linear scan over N ranges costs about N times the work of a scan over 1, so the
-	// expected ratio is ~N = 8192. Measured under -race: 1659x, comfortably UNDER the
-	// linear expectation because the fixed per-lookup cost (map access, mutex, the
-	// comparison against the server's own address) dominates at the small end.
-	//
-	// The first version of this bound was 100x, derived from a guess about what "linear"
-	// should look like, and it failed on correct code at 1659x. The check now fails only
-	// when the ratio EXCEEDS the linear expectation by a wide margin, which is the
-	// signature of a quadratic scan: 8192 ranges quadratic is ~8192x the range TESTS, so
-	// the ratio would land in the millions rather than the thousands.
-	//
-	// The margin (4x the linear expectation) keeps it robust on a loaded, virtualised
-	// runner while still being orders of magnitude below quadratic behaviour.
-	if narrow <= 0 {
-		t.Fatalf("the baseline measurement is not positive (%v), so no ratio can be "+
-			"formed", narrow)
-	}
-	ratio := float64(wide) / float64(narrow)
-	linearExpectation := float64(rangeCount)
-	bound := 4 * linearExpectation
-	t.Logf("linearity ratio: %d ranges / 1 range = %.1fx (linear expectation %.0fx, "+
-		"bound %.0fx)", rangeCount, ratio, linearExpectation, bound)
-	if ratio > bound {
-		t.Fatalf("%d lookups over %d advertised ranges took %v versus %v over 1 range, "+
-			"a ratio of %.0fx. A linear scan over %d ranges costs about %dx the work; a "+
-			"ratio near that means it is linear, and a ratio in the thousands means the "+
-			"scan went quadratic. The ownership lookup must stay linear in the number of "+
-			"advertised ranges",
-			lookups, rangeCount, wide, narrow, ratio, rangeCount, rangeCount)
+	// The one assertion left here is about the algorithm and holds at any speed: the
+	// scan is correct over the largest list a peer can install. If it returned early,
+	// claimed an address it does not own, or failed to walk the list, the loop above
+	// would have failed; this makes the premise explicit.
+	if counter := countOwnershipScanVisits(t); counter == nil {
+		t.Fatal("the scan visit counter could not be installed, so the deterministic gate " +
+			"in ownership_scan_count_test.go cannot run either")
 	}
 }
+

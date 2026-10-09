@@ -715,10 +715,48 @@ func prefixesContain(prefixes []netip.Prefix, address netip.Addr) bool {
 	})
 }
 
+// testRoutesContainCounter, when set, is called once for every range the ownership scan visits.
+//
+// It is the observable the deterministic linearity gate counts. It is nil in production, where the
+// only cost is one comparison against a package-level variable per visited range.
+var testRoutesContainCounter func()
+
+// RoutesContain reports whether an address falls inside any of the routes, for this protocol.
+//
+// # Why the loop is written out and the iteration is observable
+//
+// This is the inner loop of the per-packet ownership scan: Server.lookup walks its sessions and
+// calls this once per session, and the session's advertised ranges are walked here, on EVERY packet
+// that needs routing. Its complexity is therefore a per-packet cost, and "the scan is linear" is a
+// claim that has to be measurable rather than assumed - a wall-clock ratio between two sizes does
+// not measure it on a loaded host, because a spike on the small side inflates the ratio without any
+// change to the algorithm.
+//
+// The loop therefore reports each range it visits to the optional counter above. The count is exact
+// and host-independent: N ranges cost N visits when the address is inside none of them, i+1 visits
+// when it is inside range i, and zero when the list is empty. A rewrite that stopped consulting the
+// ranges shows up as a count of zero, and a scan that did more work per range shows up in the count
+// only if it re-entered this loop - which is exactly the claim being pinned, so the gate is paired
+// with a benchmark that would see a constant-factor regression instead.
+//
+// # Cost in production
+//
+// One comparison against a package-level variable per visited range, and nothing else: the counter
+// is nil unless a test installs one, so the branch is predicted perfectly and no atomic or shared
+// state is touched. There is deliberately no always-on global counter on this path.
 func RoutesContain(routes []AddressRange, address netip.Addr, protocol uint8) bool {
-	return slices.ContainsFunc(routes, func(route AddressRange) bool {
-		return route.Contains(address) && (route.Protocol == 0 || route.Protocol == protocol || isControlProtocol(protocol))
-	})
+	// Counting is unconditional rather than a loop-selecting branch: a hook that replaced the loop
+	// would be a reimplementation of the thing under test, and a mutation inside this loop would
+	// then be invisible. This is the production loop, with one nil-check added to its body.
+	for _, route := range routes {
+		if testRoutesContainCounter != nil {
+			testRoutesContainCounter()
+		}
+		if route.Contains(address) && (route.Protocol == 0 || route.Protocol == protocol || isControlProtocol(protocol)) {
+			return true
+		}
+	}
+	return false
 }
 
 func rangesContain(routes []AddressRange, address netip.Addr) bool {
