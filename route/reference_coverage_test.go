@@ -40,7 +40,7 @@ import (
 // again, this test fails on the real type rather than passing on a fake.
 func TestTheWalkCanReachTheProductionHTTPClientManager(t *testing.T) {
 	var manager *httpclient.Manager
-	require.Implements(t, (*adapter.IdleConnectionRetirer)(nil), manager,
+	require.Implements(t, (*adapter.IdleConnectionReleaser)(nil), manager,
 		"the walk's retire action is unreachable for the production HTTP client manager: "+
 			"the pool behind provider refresh, remote rule sets, the dashboard and the API is "+
 			"not reached by the reuse boundary, the trim or the DEEP_IDLE release")

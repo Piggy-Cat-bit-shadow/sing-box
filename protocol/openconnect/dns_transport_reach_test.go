@@ -15,7 +15,7 @@ import (
 // are created privately and are not in the manager's list, so the walk reached the wrapper and
 // stopped there and every pushed resolver's pool was skipped by the reuse boundary, the trim and the
 // DEEP_IDLE release. It forwards the retire ACTION and not the eligibility axis, because it has no
-// keep-idle policy of its own - see adapter.IdleConnectionRetirer.
+// keep-idle policy of its own - see adapter.IdleConnectionReleaser.
 //
 // The shape differs from OpenVPN's in one way that matters to this test: the routes here live in a
 // SLICE of route structs rather than a map keyed by domain, so the walk over them is the other
@@ -31,7 +31,7 @@ func (r *countingResolver) CloseIdleConnections() { r.retires++ }
 
 func TestTheEndpointOwnedResolversAreRetireCapable(t *testing.T) {
 	var dnsTransport *DNSTransport
-	require.Implements(t, (*adapter.IdleConnectionRetirer)(nil), dnsTransport,
+	require.Implements(t, (*adapter.IdleConnectionReleaser)(nil), dnsTransport,
 		"the runtime resource walk cannot reach the resolvers this transport owns: every pool a "+
 			"pushed DoH/DoT/UDP resolver holds is skipped by the reuse boundary, the trim and the "+
 			"DEEP_IDLE release")
@@ -46,7 +46,7 @@ func TestRetiringThisTransportReachesEveryResolverItOwns(t *testing.T) {
 		defaultResolvers: []adapter.DNSTransport{fallback},
 	}
 
-	require.Implements(t, (*adapter.IdleConnectionRetirer)(nil), owner)
+	require.Implements(t, (*adapter.IdleConnectionReleaser)(nil), owner)
 	owner.CloseIdleConnections()
 
 	require.Equal(t, 1, routed.retires, "a resolver held for a pushed route was not reached")

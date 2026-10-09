@@ -28,7 +28,7 @@ import (
 // owners, so an owner that wants its inner pool to participate has to FORWARD. It is deliberately the
 // retire ACTION and not the eligibility axis: this transport has no keep-idle policy of its own, and
 // requiring one would be requiring a method that does not exist, which is exactly how the HTTP client
-// manager stayed unreachable. See adapter.IdleConnectionRetirer.
+// manager stayed unreachable. See adapter.IdleConnectionReleaser.
 
 // countingResolver is a pushed resolver that records how many times it was asked to retire, and
 // refuses to claim any capability beyond that.
@@ -45,7 +45,7 @@ func (r *countingResolver) CloseIdleConnections() { r.retires++ }
 // owner is how the HTTP client gap survived its own regression test.
 func TestTheEndpointOwnedResolversAreRetireCapable(t *testing.T) {
 	var dnsTransport *DNSTransport
-	require.Implements(t, (*adapter.IdleConnectionRetirer)(nil), dnsTransport,
+	require.Implements(t, (*adapter.IdleConnectionReleaser)(nil), dnsTransport,
 		"the runtime resource walk cannot reach the resolvers this transport owns: every pool a "+
 			"pushed DoH/DoT/UDP resolver holds is skipped by the reuse boundary, the trim and the "+
 			"DEEP_IDLE release")
@@ -64,7 +64,7 @@ func TestRetiringThisTransportReachesEveryResolverItOwns(t *testing.T) {
 		defaultResolvers: []adapter.DNSTransport{fallback},
 	}
 
-	require.Implements(t, (*adapter.IdleConnectionRetirer)(nil), owner)
+	require.Implements(t, (*adapter.IdleConnectionReleaser)(nil), owner)
 	owner.CloseIdleConnections()
 
 	require.Equal(t, 1, routed.retires, "a resolver held for a pushed route was not reached")

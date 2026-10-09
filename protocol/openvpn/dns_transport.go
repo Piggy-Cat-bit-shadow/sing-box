@@ -308,7 +308,7 @@ func (t *DNSTransport) createResolver(server ovpntransport.DNSServer, address ne
 //
 // This transport has no keep-idle policy of its own - the resolvers exist because the far end pushed
 // them, and whether to hold them open is not a routing question here - so it implements
-// adapter.IdleConnectionRetirer and NOT adapter.IdleConnectionKeeper. Requiring the wider interface
+// adapter.IdleConnectionReleaser and NOT adapter.IdleConnectionKeeper. Requiring the wider interface
 // would mean implementing a method this type has no meaning for, and that requirement is exactly how
 // the HTTP client manager stayed unreachable in every real build.
 //
@@ -320,7 +320,7 @@ func (t *DNSTransport) CloseIdleConnections() {
 	resolvers := t.collectResolversLocked()
 	t.access.RUnlock()
 	for _, resolver := range resolvers {
-		retirer, isRetirer := resolver.(adapter.IdleConnectionRetirer)
+		retirer, isRetirer := resolver.(adapter.IdleConnectionReleaser)
 		if isRetirer {
 			retirer.CloseIdleConnections()
 		}
