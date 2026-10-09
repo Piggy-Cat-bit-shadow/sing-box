@@ -1,6 +1,10 @@
 # v0.1.6 release closure — final report
 
-Baseline `151c5ad71` → **FINAL `e610e7660`**, `local == origin/testing`, ordinary pushes only. No tag,
+Baseline `151c5ad71` → **FINAL `e610e7660`** — *historical stamp of this report; this value is
+**historical, not the final release SHA**. It records where the closure round stopped, not where the
+release is. See "Historical stage tips" below and
+[`v016-release-candidate-manifest.md`](v016-release-candidate-manifest.md) for where a release SHA is
+actually allowed to be declared.* Ordinary pushes only. No tag,
 no Release, no signing. Agents worked in **isolated worktrees**; the integrator cherry-picked with `-x`.
 
 ## Deliverables actually built
@@ -114,6 +118,30 @@ Earlier reports stamped `c7a1ef193` (3 commits behind) and `429265376` (25 behin
 **stage code tips**, not HEAD. Resolved in
 [v016-release-integration-ledger.md](docs/fork/v016-release-integration-ledger.md) rather than left in
 prose.
+
+## Historical stage tips — each of these is **historical, not the final release SHA**
+
+Several different values have been called "FINAL" in this stage's documents. They are all real commits
+and all are kept; none of them is the release SHA. The list is additive and no earlier statement was
+rewritten.
+
+| Value | What it actually is | Status |
+| --- | --- | --- |
+| `c7a1ef193` | historical stage **code** tip stamped FINAL by `v0.1.6-closure-report.md` / `final-closure-report.md` (3 commits behind its own HEAD) | **historical, not the final release SHA** |
+| `429265376` | historical stage code tip (25 commits behind) | **historical, not the final release SHA** |
+| `e610e7660` | the value this report stamps FINAL on its first line; the closure round's tip | **historical, not the final release SHA** |
+| `912ed1efa` | the value the later user-facing closure report stamps FINAL; it is also `PHASE_A_START` for the lifecycle stage | **historical, not the final release SHA** |
+| `ef83b8681` | the tip of `origin/testing` after the Stage A cherry-pick series was pushed (10 commits on top of `912ed1efa`) — a verified **integration** tip | **historical, not the final release SHA**; it is an integration coordinate, not a release |
+| `0fbca8546` | the core revision the Android APK, `libbox.aar` and `Libbox.xcframework` were actually built from (18 commits before `ef83b8681`) | **historical, not the final release SHA**; it is an artifact-build coordinate |
+
+Two rules follow, and they are the reason this section exists:
+
+1. **No document may mix these as "the current final release SHA".** A value in this table says when a
+   stage stopped, never what is released.
+2. **A single RC acceptance is recorded only in a separate release-candidate manifest** —
+   [`v016-release-candidate-manifest.md`](v016-release-candidate-manifest.md). That manifest is
+   currently **`not frozen yet`** and is the only place a release SHA may be declared. Existing
+   Actions evidence spans several SHAs and must not be stitched into one verdict.
 
 ## Verdict: **NOT-READY**, and the remaining items are named
 
