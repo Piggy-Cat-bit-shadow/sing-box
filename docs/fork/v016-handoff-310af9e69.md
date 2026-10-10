@@ -876,8 +876,9 @@ IPC_SECRET_LEAK                = FIXED_VERIFIED   (assertion-level reverse-break
 SELECTOR_SELECTION_CONTRACT    = LANDED           (P2: 96e6dc41, six callers enumerated first)
 STATUSVIEW_LIFECYCLE           = LANDED           (P3: 03995f6da, runtime stacks for all three defects)
 NESTED_GROUP_NETWORK_POLICY    = LANDED           (P4: f2dd95d6, per-edge, mutation M5 both directions)
-PATH_01_PACKET_ORDER_AND_EXIT  = FIXED_VERIFIED   (1f6b7b85d + four follow-ups; 12 of 13 detectors green,
-                                                   the 13th proven unsatisfiable alongside another)
+PATH_01_PACKET_ORDER_AND_EXIT  = FIXED_VERIFIED   (1f6b7b85d + five follow-ups; 13 of 13 detectors green
+                                                   - §12 supersedes the "12 of 13 / unsatisfiable"
+                                                   reading this line carried until a39cecf87)
   unknown-and-exit             = also closed      (truncated routes: ordered like Build, no exit claimed)
   dependency-on-a-group        = also closed      (a false PASS this round introduced, then repaired)
 REDACTION_BACKSTOP             = HARDENED         (d7d542d0b: spaced assignments, 8 new cases)
@@ -888,6 +889,7 @@ PER_HOP_STATUS                 = MODEL READY      (StatusView not yet constructe
 CROSS_PLATFORM                 = PASS_WITH_SCOPE  (unchanged this round)
 FULL_TEST_COVERAGE             = 83 packages
 FULL_TEST_RESULT               = 79 ok / 4 FAIL, all four accounted for (1 spec + 3 BLOCKED_EXTERNAL)
+                                 -> SUPERSEDED by §12: 80 ok / 3 FAIL at a39cecf87, the spec failure gone
 FULL_TEST_SHA_MATCH            = YES
 CI                             = NOT_RUN_BY_REQUEST   (no Actions event was ever triggered)
 RELEASE                        = NOT_READY        (blocked on the product decisions in §6 and the
@@ -898,4 +900,130 @@ The standing rules were honoured: every commit carries `[skip ci]`; the prefligh
 `C:\src\sing-box` is still at `8d78dcdd` with only `clients/desktop` dirty; no `go.mod`/`go.sum` change;
 no Actions event was triggered; and every reverse-break in this section was built FIRST, so no RED here
 is a compile error.
+
+---
+
+# 12. The last red detector was a SEGMENTATION defect, not a spec contradiction (`a39cecf87`)
+
+§10.3 concluded that `TestBusinessEntryCountsExactlyOneEntryPerRoute` and
+`TestAnUnresolvedGroupMemberIsNotABusinessEntry` "CANNOT both be green", and left the first permanently
+RED as a defect in the specification. **That conclusion was wrong, and the round it was written in
+closed with a red suite because of it.** The contradiction is real, but it lives in the test's
+route-segmentation heuristic, not in the product and not in either detector.
+
+```text
+ORIGIN_TESTING = a39cecf87   LOCAL == ORIGIN
+COMMIT:  a39cecf87  test(physicalpath): the reference was segmented by position arithmetic, so a route
+                    that leaves the group had no business entry [skip ci]
+         one file changed, +30/-1, TEST ONLY - no production file is touched
+         businessEntry is still `Exit && Resolved`, exactly as §10.2 shipped it
+```
+
+## 12.1 What the detector was actually measuring
+
+`TestBusinessEntryCountsExactlyOneEntryPerRoute` derives routes from the flat `Hops` list with
+
+```go
+if node.Root == last.Root && node.Position == last.Position+1 { /* same route */ }
+```
+
+and then asserts, per derived route, **exactly one business entry AND exactly one exit, and that they
+are the same node**. A member tag that does not resolve is reported as a hop-SHAPED fact so the failure
+can name it, but it is a REFERENCE, not a hop: `PhysicalPath` is empty because it names no object, and
+`Position` is the length of the chain ABOVE it rather than an index into a chain of its own — which is
+precisely what makes `businessEntry` refuse it, by requiring `Resolved` (`dryrun.go:402`).
+
+`Position == previous+1` is therefore not a valid boundary test between a hop and a reference, and the
+measurement shows exactly what that did. Raw enumeration of
+`tcpGroup("group", "present", "present", "absent")`:
+
+```text
+[0] tag="present" route="group -> present" pos=0 exit=true  resolved=true  chain=[present] entry=true
+[1] tag="absent"  route="group -> absent"  pos=0 exit=true  resolved=false chain=[]         entry=false
+```
+
+The reference carries the SAME `Position 0` as the resolved member, because it was never numbered. So the
+boundary test cannot join it to that member's route, it is segmented into a route **of its own**, and the
+assertion then demands one business entry of a route whose only node is the one node the other detector
+requires **not** to be one. That is the whole of §10.3's "no assignment satisfies both".
+
+## 12.2 Reverse-break: BOTH readings of the reference are red, `go vet` exit 0 first
+
+Read 1 is the shipped heuristic; read 2 is the only other thing a route derived from `Hops` could mean.
+Neither RED is a compile error.
+
+```text
+read 1  reference kept, original position arithmetic (the shipped heuristic)
+        go vet exit 0
+        --- FAIL: TestBusinessEntryCountsExactlyOneEntryPerRoute
+          "[]" should have 1 item(s), but has 0
+          root=group size=1. Nodes: [absent(absent pos=0 dep)]
+
+read 2  reference kept and JOINED to the route it descends from (same ControlPath, empty chain)
+        go vet exit 0
+        --- FAIL: TestBusinessEntryCountsExactlyOneEntryPerRoute
+          "[...] should have 1 item(s), but has 2"
+          every route must have EXACTLY ONE exit. root=group size=2.
+          Nodes: [present(present pos=0 ENTRY) absent(absent pos=0 dep)]
+```
+
+Both nodes of that route are `Exit`, so **no assignment of the reference to a route satisfies the
+one-exit assertion**, and **no route containing it can satisfy the one-entry assertion**. Excluding it
+satisfies every assertion in the detector unchanged. The reference is simply not part of an invariant
+that is a statement about hops.
+
+## 12.3 The resolution, and why it loses no coverage
+
+The segmentation skips a node that names no object:
+
+```go
+for _, node := range nodes {
+    if !node.Resolved {
+        continue   // a reference, not a hop: reported, refused by businessEntry, not in a hop invariant
+    }
+    ...
+}
+```
+
+`businessentry_attack_test.go` is the only file changed, +30/-1. Coverage is not reduced:
+
+- A group whose **only** member does not resolve produces **no** routes at all, and is caught by the
+  `require.NotEmpty(t, nodes)` that already precedes the loop.
+- The reference's own fields are still pinned, field by field — `Resolved`, `Exit`, `PhysicalPath`,
+  `Position`, `businessEntry` — by `TestAnUnresolvedGroupMemberIsNotABusinessEntry`, plus the
+  report-level assertions at that detector's end (`Reachable()==false`, the failure named exactly once,
+  `"no outbound or endpoint with this tag exists"`).
+- The two invariants the detector exists for are unchanged and still asserted: one entry and one exit
+  per route, and the exit and the entry are the same node.
+
+## 12.4 Verified, at this tree
+
+```text
+common/physicalpath       PASS   (all 13 PATH-01 detectors green; zero failing tests)
+                          `-race -count=2` PASS, zero WARNING: DATA RACE
+go build -tags "$TAGS" ./...   exit 0
+gofmt -l common/physicalpath   clean
+FULL_TEST_COVERAGE        = 83 packages that carry test files
+                            (`go list -f '{{if or .TestGoFiles .XTestGoFiles}}...' ./...`;
+                             171 is the count of `go list ./...`, and 88 of those have no test files)
+FULL_TEST_RESULT          = 80 ok / 3 FAIL
+FULL_TEST_SHA_MATCH       = YES in effect: the scanned tree is f43e5f378 plus this one test file, and
+                            a39cecf87 commits exactly that file
+  the 3: common/tls, common/tlsspoof, common/windivert - BLOCKED_EXTERNAL, unchanged from §10
+NO UNEXPLAINED FAILURE remains, and there is no longer any red test attributable to the product.
+```
+
+## 12.5 What this round changes about the standing rules
+
+§2.4 and §10.3 both record, correctly, that a red detector must be understood before it is touched. This
+round adds the other half: **"proven unsatisfiable" is a claim about the TEST as written, and it has to
+name which line of the test makes it unsatisfiable.** §10.3 named the two assertions and concluded the
+specification was at fault; the assertion that actually failed was in neither of them — it was the
+three-line route-boundary heuristic above them, and it is not asserted anywhere, so nothing was
+guarding it. A permanently red suite then hid any *future* red detector in that package for as long as
+it stood.
+
+The instinct that was right: leave both detectors alone. The instinct that was wrong: treat "I cannot
+satisfy both" as "both are wrong", when the correct move was to check what the harness was measuring.
+
 
