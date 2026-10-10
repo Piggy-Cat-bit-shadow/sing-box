@@ -146,7 +146,7 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 		return response, nil
 	}
 	if !errors.Is(err, http3.ErrNoCachedConn) {
-		t.markH3Broken(authority)
+		t.recordH3AttemptFailure(request, authority, err)
 		return t.h2FallbackRoundTrip(cloneRequestForRetry(request))
 	}
 	if !requestReplayable(request) {
@@ -155,7 +155,7 @@ func (t *http3FallbackTransport) roundTripHTTP3(request *http.Request) (*http.Re
 			t.clearH3Broken(authority)
 			return response, nil
 		}
-		t.markH3Broken(authority)
+		t.recordH3AttemptFailure(request, authority, err)
 		return nil, err
 	}
 	return t.roundTripHTTP3Race(request, authority)
@@ -230,7 +230,7 @@ func (t *http3FallbackTransport) roundTripHTTP3Race(request *http.Request, autho
 				return raceResult.response, nil
 			}
 			if raceResult.h3 {
-				t.markH3Broken(authority)
+				t.recordH3AttemptFailure(request, authority, raceResult.err)
 				h3Err = raceResult.err
 				if len(cancels) == 1 {
 					if !timer.Stop() {
@@ -312,6 +312,48 @@ func (t *http3FallbackTransport) clearH3Broken(authority string) {
 	t.brokenAccess.Lock()
 	delete(t.broken, authority)
 	t.brokenAccess.Unlock()
+}
+
+// recordH3AttemptFailure arms the per-authority verdict for an attempt that failed, and does
+// nothing for an attempt that was never allowed to conclude.
+//
+// # Why a failed attempt is not automatically evidence
+//
+// The verdict this arms is long-lived and expensive to be wrong about: while it is live every later
+// request for the authority goes straight to the H2 fallback, so a wrong entry costs an H3-capable
+// server its H3 for the length of the window. That makes "what does this attempt prove?" the whole
+// question, and the answer for a request the CALLER ended is: nothing. The caller's context is
+// cancelled by a closed client, an abandoned DNS query, a refresh that lost its consumer, a
+// shutdown or a caller-side deadline - none of which is a fact about the server, and all of which
+// used to reach `markH3Broken` and move the authority onto HTTP/2.
+//
+// # Why the rule is the request's context and not only the error
+//
+// Reading the error alone would miss the shapes where the cancellation is laundered: a transport
+// whose dial is aborted can report the underlying transport error rather than
+// `context.Canceled`, and in the race path the two legs can finish in either order. The caller's
+// own context is the fact that cannot be laundered - if it is done, the attempt was cut short by
+// the caller, whatever error surfaced. `context.Canceled` is checked as well for the case where a
+// cancellation reaches the transport without the request context being the parent that stopped.
+//
+// # What is deliberately still evidence
+//
+// Everything else, including a caller-side deadline that has NOT yet expired and any error the
+// transport produced on its own - a QUIC handshake timeout, a stateless reset, a version
+// negotiation failure. Those are the half-dead peers this fallback exists for, and the sibling
+// implementation (`transport/v2rayxhttp`, SPEC 094) takes the same position while keeping
+// `context.DeadlineExceeded` a failure on purpose.
+func (t *http3FallbackTransport) recordH3AttemptFailure(request *http.Request, authority string, err error) {
+	if err == nil {
+		return
+	}
+	if request != nil && request.Context().Err() != nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	t.markH3Broken(authority)
 }
 
 func (t *http3FallbackTransport) markH3Broken(authority string) {
