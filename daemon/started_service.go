@@ -46,6 +46,11 @@ var _ StartedServiceServer = (*StartedService)(nil)
 
 type StartedService struct {
 	ctx context.Context
+	// fakeIPIssuanceLedger is the object every Box this service builds records its fakeip issuances
+	// into, and consults before dialling a destination it may have invented. It is held here as well as
+	// registered in the context so that the owner is explicit rather than implied by a registry key:
+	// the ledger's lifetime is this service's lifetime.
+	fakeIPIssuanceLedger *adapter.FakeIPIssuanceLedger
 	// platform adapter.PlatformInterface
 	handler           PlatformHandler
 	debug             bool
@@ -95,8 +100,28 @@ type ServiceOptions struct {
 }
 
 func NewStartedService(options ServiceOptions) *StartedService {
+	// The FakeIP issuance ledger is owned HERE, because what it has to outlive is a Box and what it
+	// belongs to is the sequence of Boxes: `StartOrReloadService` closes one Box and builds the next
+	// from `service.ExtendContext(s.ctx)` (:270, :280), and ExtendContext is a shallow registry clone,
+	// so every Box this service builds receives the SAME ledger and the ledger dies with the service.
+	//
+	// It must be registered on the EXTENDED context rather than merely derived from options.Context:
+	// `MustRegisterPtr` and `PtrFromContext` both key on `common.DefaultValue[*T]()`, and they register
+	// into the registry the context already carries. `ExtendContext` returns a NEW context value, so a
+	// registration written to the derived value would never be seen by `newInstance`, which extends
+	// `s.ctx` itself.
+	//
+	// `NewStartedService` is constructed once per application session (libbox's command server,
+	// `NewAttachedService`, boxdd), so this is one ledger per session and NOT one per reload. Every
+	// other Box-construction site - the CLI, `cmd_check`, `cmd_tools`, libbox configuration validation,
+	// every test harness - registers nothing, so those processes take the documented boundary: they
+	// build one Box for the life of the process and have no cross-Box issuance memory at all.
+	startedCtx := service.ExtendContext(options.Context)
+	fakeIPIssuanceLedger := adapter.NewFakeIPIssuanceLedger()
+	service.MustRegisterPtr[adapter.FakeIPIssuanceLedger](startedCtx, fakeIPIssuanceLedger)
 	s := &StartedService{
-		ctx: options.Context,
+		ctx:                  startedCtx,
+		fakeIPIssuanceLedger: fakeIPIssuanceLedger,
 		// platform:                options.Platform,
 		handler:           options.Handler,
 		debug:             options.Debug,

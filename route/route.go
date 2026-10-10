@@ -29,6 +29,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
+	"github.com/sagernet/sing/service"
 )
 
 // defaultPacketSniffers is the plan used when a sniff action names no packet sniffer.
@@ -1048,8 +1049,31 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 			r.logger.InfoContext(ctx, "found neighbor: ", mac)
 		}
 	}
-	if metadata.Destination.Addr.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(metadata.Destination.Addr) {
-		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(metadata.Destination.Addr)
+	// A FakeIP destination is a placeholder this process invented, and there are four states it can be
+	// in. The first two are what the original code handled; the last two are why this function changed.
+	//
+	//  1. the current store maps it -> rewrite to the domain it was issued for (unchanged);
+	//  2. it is inside the current range with NO mapping -> refuse, before any dial (unchanged);
+	//  3. it is OUTSIDE the current range, and nothing can prove this instance issued it -> an ordinary
+	//     literal, byte for byte as before. A blanket refusal of the range would break real traffic: on
+	//     the machine this was measured on `198.18.0.0/15` is live routed space whose resolver answers
+	//     real queries, so "looks like a placeholder" is not evidence of anything;
+	//  4. it is outside the current range, and the issuance ledger can PROVE this process handed it out
+	//     under an earlier configuration -> refuse before any dial. The client is still holding an
+	//     address whose meaning died with the configuration that issued it, and forwarding it asks a
+	//     peer to reach something that does not exist.
+	//
+	// The address is normalised FIRST, because a 4-in-6 destination is an IPv4 address written in
+	// sixteen bytes: `netip.Prefix.Contains` compares bit lengths and answers false for an IPv4 range,
+	// and `netip.Addr` equality is spelling-sensitive, so `Store.Lookup` would miss as well. The
+	// normalised value is also what classifies the flow below, so a mapped destination stops being
+	// reported as neither family.
+	destinationAddress := metadata.Destination.Addr
+	if destinationAddress.Is4In6() {
+		destinationAddress = destinationAddress.Unmap()
+	}
+	if destinationAddress.IsValid() && r.dnsTransport.FakeIP() != nil && r.dnsTransport.FakeIP().Store().Contains(destinationAddress) {
+		domain, loaded := r.dnsTransport.FakeIP().Store().Lookup(destinationAddress)
 		if !loaded {
 			return E.New("missing fakeip record, try enable `experimental.cache_file`")
 		}
@@ -1062,19 +1086,46 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 			metadata.FakeIP = true
 			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
 		}
+	} else if issued, interval := r.issuedFakeIPAddress(destinationAddress); issued {
+		return E.New("refusing destination ", destinationAddress,
+			": this instance issued it as a fakeip placeholder in ", interval,
+			", and no fakeip server currently maps it back to a domain. Forwarding it would ask the ",
+			"peer to reach a synthetic address that exists only inside this process")
 	} else if metadata.Domain == "" {
-		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
+		domain, loaded := r.dns.LookupReverseMapping(destinationAddress)
 		if loaded {
 			metadata.Domain = domain
 			r.logger.DebugContext(ctx, "found reserve mapped domain: ", metadata.Domain)
 		}
 	}
-	if metadata.Destination.IsIPv4() {
+	if destinationAddress.Is4() {
 		metadata.IPVersion = 4
-	} else if metadata.Destination.IsIPv6() {
+	} else if destinationAddress.Is6() {
 		metadata.IPVersion = 6
 	}
 	return nil
+}
+
+// issuedFakeIPAddress asks the issuance ledger whether this PROCESS handed the address out as a
+// placeholder, and reports the interval it did so from.
+//
+// A nil ledger answers false, and that is the boundary rather than a gap: the ledger is owned by
+// whoever owns the sequence of Boxes, so the CLI, `cmd_check`, libbox and every test harness - which
+// build one Box for the process and register nothing - have no cross-Box issuance memory at all.
+// Without a record covering the address there is nothing to attribute it to, and guessing from the
+// address alone is the blanket guard this contract forbids.
+func (r *Router) issuedFakeIPAddress(address netip.Addr) (bool, adapter.FakeIPIssuanceInterval) {
+	if !address.IsValid() {
+		return false, adapter.FakeIPIssuanceInterval{}
+	}
+	ledger := service.PtrFromContext[adapter.FakeIPIssuanceLedger](r.ctx)
+	if ledger == nil {
+		return false, adapter.FakeIPIssuanceInterval{}
+	}
+	// IssuedInterval reports (interval, loaded) in the order the ledger stores it; this helper
+	// reports (issued, interval), which is the order the caller branches on.
+	interval, issued := ledger.IssuedInterval(address)
+	return issued, interval
 }
 
 func (r *Router) matchRule(

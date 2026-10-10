@@ -61,6 +61,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	singtun "github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	"github.com/stretchr/testify/require"
 )
@@ -81,9 +82,14 @@ type chain struct {
 	t        *testing.T
 	instance *box.Box
 	ctx      context.Context
-	cancel   context.CancelFunc
-	tracker  *flowRecorder
-	closed   atomic.Bool
+	// root is the long-lived context this chain EXTENDS, i.e. the context `service.ExtendContext`
+	// clones the service registry from. It is kept so `startChainInContext` can build a second Box
+	// that shares services with the first - which is the shape `daemon.StartedService` produces across
+	// a reload, and the only way to exercise a service whose lifetime is longer than one Box.
+	root    context.Context
+	cancel  context.CancelFunc
+	tracker *flowRecorder
+	closed  atomic.Bool
 }
 
 // startChain builds a box from configJSON and starts it.
@@ -106,12 +112,25 @@ func startChain(t *testing.T, configJSON string) *chain {
 // goroutine while it decides what the box does next.
 func startChainWithWriter(t *testing.T, configJSON string, platformLogWriter log.PlatformWriter) *chain {
 	t.Helper()
+	return startChainInContext(t, context.Background(), configJSON, platformLogWriter)
+}
+
+// startChainInContext starts a chain whose Box extends `root`, so a test can put a service in `root`
+// and have TWO Boxes built from it share that service.
+//
+// This is how the daemon builds every Box it runs: `daemon/instance.go:88` does
+// `ctx = service.ExtendContext(ctx)` from the `StartedService`'s long-lived context, and
+// `sing/service.ExtendContext` is `registry.Clone()`, a shallow copy - so a service registered once in
+// `root` is the SAME object in every Box built from it. A test that wants "the same process built a
+// second Box" cannot express that with independent roots, which is why this entry point exists.
+func startChainInContext(t *testing.T, root context.Context, configJSON string, platformLogWriter log.PlatformWriter) *chain {
+	t.Helper()
 	var (
 		result *chain
 		err    error
 	)
 	for attempt := 0; attempt < 3; attempt++ {
-		result = buildChain(t, configJSON, platformLogWriter)
+		result = buildChainInContext(t, root, configJSON, platformLogWriter)
 		err = result.instance.Start()
 		if err == nil {
 			break
@@ -131,7 +150,13 @@ func startChainWithWriter(t *testing.T, configJSON string, platformLogWriter log
 // whether or not the test ever starts it.
 func buildChain(t *testing.T, configJSON string, platformLogWriter log.PlatformWriter) *chain {
 	t.Helper()
-	ctx, cancel := context.WithCancel(include.Context(context.Background()))
+	return buildChainInContext(t, context.Background(), configJSON, platformLogWriter)
+}
+
+// buildChainInContext is buildChain with the Box extending a caller-supplied root context.
+func buildChainInContext(t *testing.T, root context.Context, configJSON string, platformLogWriter log.PlatformWriter) *chain {
+	t.Helper()
+	ctx, cancel := context.WithCancel(include.Context(service.ExtendContext(root)))
 	require.NotEmpty(t, configJSON)
 	var options option.Options
 	err := options.UnmarshalJSONContext(ctx, []byte(configJSON))
@@ -148,7 +173,7 @@ func buildChain(t *testing.T, configJSON string, platformLogWriter log.PlatformW
 		cancel()
 		t.Fatalf("box.New failed: %v\n--- config ---\n%s", err, configJSON)
 	}
-	result := &chain{t: t, instance: instance, ctx: ctx, cancel: cancel, tracker: newFlowRecorder()}
+	result := &chain{t: t, instance: instance, ctx: ctx, root: root, cancel: cancel, tracker: newFlowRecorder()}
 	instance.Router().AppendTracker(result.tracker)
 	t.Cleanup(func() {
 		if result.closed.CompareAndSwap(false, true) {

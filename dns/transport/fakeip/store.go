@@ -13,6 +13,16 @@ import (
 
 const reservedAddressCount = 1024
 
+// The two generation indices a store uses. They are constants rather than counters because a store
+// serves exactly one live generation at a time and retires at most one, and the LEDGER tick - not the
+// index - is what separates one store's live generation from another's. `FakeIPMetadata` carries no
+// generation index at all, so a restart finds the same index again; if the index were a counter it
+// would have to be persisted, which is exactly the new disk format this change must not introduce.
+const (
+	generationRetired = 0
+	generationLive    = 1
+)
+
 var _ adapter.FakeIPStore = (*Store)(nil)
 
 type Store struct {
@@ -23,6 +33,21 @@ type Store struct {
 	inet4Last  netip.Addr
 	inet6Last  netip.Addr
 	storage    adapter.FakeIPStorage
+
+	// ledger remembers what this store has handed out, for longer than this store lives. It is looked
+	// up from the context, so it belongs to whoever owns the sequence of Boxes; when there is none,
+	// nothing is recorded and the Box has no cross-Box issuance memory. See adapter.FakeIPIssuanceLedger.
+	//
+	// It is held as the CONCRETE adapter type, not as an interface, because that is what the registry
+	// hands back: `service.MustRegisterPtr[adapter.FakeIPIssuanceLedger]` keys on
+	// `common.DefaultValue[*adapter.FakeIPIssuanceLedger]()` and `service.PtrFromContext` returns
+	// exactly that pointer. A pointer to an interface would be a different key, and a mismatched pair
+	// returns nil rather than failing to compile - which is why the pair is pinned by a test.
+	ledger *adapter.FakeIPIssuanceLedger
+	// generationSequence is the ledger tick this store's ranges belong to, taken once at Start.
+	// `FakeIPMetadata` carries no generation index, so a restart finds the same index again; the tick
+	// is what separates the generation this store serves from the one it retired.
+	generationSequence uint64
 
 	addressAccess sync.Mutex
 	inet4Current  netip.Addr
@@ -71,6 +96,18 @@ func nextAddress(addressRange netip.Prefix, last netip.Addr, current netip.Addr)
 }
 
 func (s *Store) Start() error {
+	// The ledger, when one exists, is owned by whoever owns the sequence of Boxes rather than by this
+	// Box, so it is looked up from the context exactly as the cache file is. Nothing is recorded at
+	// construction: a configuration check builds a Box and closes it without ever starting it, and a
+	// write from there would land in a shared ledger while a real Box is running.
+	s.ledger = service.PtrFromContext[adapter.FakeIPIssuanceLedger](s.ctx)
+	if s.ledger != nil {
+		// The tick is taken BEFORE the retired generation is recorded, so the two do not collide.
+		// `FakeIPMetadata` carries no generation index, so a restart finds the same index again and the
+		// tick is the only thing separating "the generation that just handed this address out" from
+		// "the generation that is replacing it".
+		s.generationSequence = s.ledger.Advance()
+	}
 	var storage adapter.FakeIPStorage
 	cacheFile := service.FromContext[adapter.CacheFile](s.ctx)
 	if cacheFile != nil && cacheFile.StoreFakeIP() {
@@ -84,6 +121,17 @@ func (s *Store) Start() error {
 		s.inet4Current = metadata.Inet4Current
 		s.inet6Current = metadata.Inet6Current
 	} else {
+		// The persisted metadata describes a generation that is about to be DESTROYED by the reset
+		// below, and it is the only surviving statement of what that generation handed out. Its ranges
+		// and cursors are read here, BEFORE the reset, so the addresses a client may still be holding
+		// stay attributable after the configuration that issued them is gone.
+		//
+		// This is the durable proof source, and it exists only when `experimental.cache_file` has
+		// `store_fakeip` on: `MemoryStorage.FakeIPMetadata` returns nil, so on the default in-memory
+		// path there is nothing here to read and the ledger records only what this process issues.
+		if metadata != nil {
+			s.recordRetired(metadata)
+		}
 		if s.inet4Range.IsValid() {
 			s.inet4Current = s.inet4Range.Addr().Next()
 		}
@@ -93,7 +141,32 @@ func (s *Store) Start() error {
 		_ = storage.FakeIPReset()
 	}
 	s.storage = storage
+	// Seed this generation at the point it starts from, which is either what the metadata restored or
+	// the beginning of the configured range. The cursor can lead the true high-water mark by the
+	// reservation window `Create` persists; that over-approximation is bounded and documented on
+	// IssuanceLedger.RecordSeed.
+	if s.ledger != nil {
+		s.ledger.RecordSeed(s.generationSequence, generationLive, s.inet4Range, s.inet4Current, s.inet6Range, s.inet6Current)
+	}
 	return nil
+}
+
+// recordRetired records the generation whose metadata is about to be reset.
+//
+// The retired generation is recorded at the tick BEFORE the one this store advanced to, and under the
+// retired generation index, so it cannot be overwritten by the generation replacing it: both
+// identifiers take part in the record's identity, and `Store.Start` advances the tick exactly once per
+// generation.
+func (s *Store) recordRetired(metadata *adapter.FakeIPMetadata) {
+	if s.ledger == nil {
+		return
+	}
+	retiredSequence := s.generationSequence
+	if retiredSequence > 0 {
+		retiredSequence--
+	}
+	s.ledger.RecordSeed(retiredSequence, generationRetired, metadata.Inet4Range, metadata.Inet4Current,
+		metadata.Inet6Range, metadata.Inet6Current)
 }
 
 func (s *Store) Contains(address netip.Addr) bool {
@@ -171,6 +244,11 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 		address = s.inet6Current
 	}
 	s.storage.FakeIPStoreAsync(address, domain, s.logger)
+	if s.ledger != nil {
+		// The exact record: this is one address the store really handed out, so the ledger can narrow
+		// whatever the persisted cursor over-approximated at Start.
+		s.ledger.RecordIssued(s.generationSequence, generationLive, address)
+	}
 	return address, nil
 }
 
