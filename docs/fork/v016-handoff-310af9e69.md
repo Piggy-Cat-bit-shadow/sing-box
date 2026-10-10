@@ -554,8 +554,14 @@ untouched by any of these changes. It should be made load-independent or marked 
 it describes, and that is the whole of the wall.
 
 ```text
-ORIGIN_TESTING = d7d542d0b2295877806e70febda18f19c75946fb   LOCAL == ORIGIN
-COMMITS THIS ROUND (from 26d2c4d9f): 1f6b7b85d PATH-01, d7d542d0b redaction (both [skip ci])
+ORIGIN_TESTING = 2c4240231e804632d587d69f80cb00b104f69663   LOCAL == ORIGIN
+COMMITS FROM 26d2c4d9f, all [skip ci]:
+  1f6b7b85d  PATH-01: number every route in packet order, from the frame that owns it
+  d7d542d0b  the redaction backstop also matches a spaced assignment (§10.5)
+  dd0e32094  a group reached as a dependency extends the route above it (§10.6)
+  f170a1907  this section (docs)
+  eb202f996  an echoed hop is charged to the node budget; the nested shape pinned
+  2c4240231  a truncated route is numbered too, so both APIs order it the same way (§10.7)
 common/physicalpath = 1 red, and it is UNSATISFIABLE (§10.3) - not an unfinished fix
 ```
 
@@ -682,7 +688,32 @@ the index the route begins at; `dependency_on_group_test.go` (3 tests) is the de
 by deleting the echo (`go build` exit 0 first; both model tests RED by assertion, the product test RED
 with `reachable=true failures=[]`).
 
-## 10.7 Still open after this round
+## 10.7 The truncated route was still ordered differently by the two APIs
+
+Reading the diagnostic output for the truncated topologies after §10.6 — the one place the two APIs are
+printed side by side — showed a disagreement that had survived every detector:
+
+```text
+three hop with the entry missing (c -> b -> missing-a)
+  BUILD hops = [b pos=0, c pos=1] + unknown missing-a pos=2
+  HOPS       = [c pos=0, b pos=1]          <- the OPPOSITE order
+```
+
+Both agreed the route has no exit; they disagreed about the ORDER of the hops that ARE known. The
+detectors could not see it: `TestATruncatedRouteClaimsNoExit` asserts the exit rule only, and it passes
+under either order — which is exactly why a detector that only pins the half you were looking at is not
+enough.
+
+`completeRoute` is now `numberRoute(start, complete bool)`: a truncated route is numbered in packet
+order like any other (`c` is dialled through `b` whether or not `b`'s dependency exists, and `Build`
+reverses such a path too), and `complete` false leaves every node of it without an exit.
+`cross_api_agreement_test.go` is the new detector: six linear topologies compared hop by hop for order,
+`Position` and exit — the entity the round's headline is about, asserted rather than printed.
+Reverse-broken by numbering only the complete routes (`go build` exit 0 first, then the middle-missing
+row RED with both orders in the message, while `TestATruncatedRouteClaimsNoExit` stayed GREEN — the
+proof that the new detector covers something the old one cannot).
+
+## 10.8 Still open after this round
 
 1. **`StatusView` is still not constructed by `box.go`** (§9.3) — unchanged by this round.
 2. **`SelectionStatus()` is not wired into any UI** (§9.4) — unchanged.
