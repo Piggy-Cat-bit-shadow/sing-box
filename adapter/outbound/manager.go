@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/physicalpath"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -23,6 +24,41 @@ type Manager struct {
 	outboundByTag           map[string]adapter.Outbound
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
+	physicalPath            *physicalPathValidation
+}
+
+// physicalPathValidation is everything the reachable-leaf dry run needs that is not readable from
+// the outbound objects themselves.
+//
+// # Why the manager owns the dry run rather than the Box
+//
+// The manager is the only component that holds the whole outbound graph on every construction
+// path, and it is the component that already refuses a circular dependency in its own namespace -
+// the dry run is the same class of start-time decision, next to the sort that already exists for
+// the outbound-only case. Doing it here means the check cannot be forgotten by a caller, and it
+// does not duplicate anything: the sort still owns "does the dependency exist" and "is the
+// outbound graph acyclic", and the dry run owns "is every reachable LEAF usable", which the sort
+// cannot see because it materialises no group members.
+type physicalPathValidation struct {
+	declarations  physicalpath.Declarations
+	resolverFor   func(tag string) string
+	defaultConfig bool
+}
+
+// EnablePhysicalPathValidation installs the facts the reachable-leaf dry run needs beyond the
+// outbound objects: which tags DECLARED destination_dns_ownership, and how a domain resolver is
+// derived for one of them.
+//
+// A Manager without this runs no dry run, which is what keeps a manager built by a test or an
+// embedder that has no configuration text behaving exactly as before. The Box always installs it.
+func (m *Manager) EnablePhysicalPathValidation(declarations physicalpath.Declarations, resolverFor func(tag string) string, defaultDomainResolver bool) {
+	m.access.Lock()
+	m.physicalPath = &physicalPathValidation{
+		declarations:  declarations,
+		resolverFor:   resolverFor,
+		defaultConfig: defaultDomainResolver,
+	}
+	m.access.Unlock()
 }
 
 func NewManager(registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
@@ -61,9 +97,47 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 	}
 	outbounds := m.outbounds
+	validation := m.physicalPath
 	m.access.Unlock()
 	if stage == adapter.StartStateStart {
-		return m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
+		// The start-order sort runs FIRST, and it is the same call the start itself makes.
+		//
+		// # Why the order between the two checks is not a detail
+		//
+		// The sort owns "does a declared dependency exist" and "is the declared graph acyclic", and
+		// its message names the dependency chain, which is the more precise report for an outbound
+		// cycle. The dry run below walks the same declared edges, so without this ordering it would
+		// reach the same cycle first and replace that message with its own - a second answer to a
+		// question that already has one. Running the sort here, before the outbound objects are
+		// started, gives the pre-existing answer, and the dry run then owns only what the sort
+		// cannot see: a group's FULL membership, which the sort never materialises.
+		startable, err := m.lintOutbounds(append(append([]adapter.Outbound(nil), outbounds...),
+			common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...))
+		if err != nil {
+			return err
+		}
+		// The reachable-leaf dry run runs HERE, after the sort and before any outbound is started.
+		//
+		// # Why it belongs in this manager rather than in a Box stage
+		//
+		// A group materialises only the member it selected. A configuration whose selector points
+		// at a healthy node and whose second member is not usable therefore starts successfully and
+		// fails at the FIRST SWITCH - which is decided by a health check or by a user action, so
+		// the failure arrives as a traffic outage with no configuration change behind it. Running
+		// the dry run here, in front of the start, on the whole graph, is the smallest place that
+		// can see every member.
+		//
+		// It is deliberately NOT duplicated in box.go: this manager owns the outbound namespace and
+		// already refuses a circular dependency in it, and a second copy of the traversal in the
+		// Box would be a second answer to the same question. box.go supplies only the facts the
+		// objects cannot report - see EnablePhysicalPathValidation.
+		if validation != nil {
+			err = m.validatePhysicalPaths(outbounds, validation)
+			if err != nil {
+				return err
+			}
+		}
+		return m.startOutbounds(scope, append(outbounds, common.Map(m.endpoint.Endpoints(), func(it adapter.Endpoint) adapter.Outbound { return it })...), startable)
 	}
 	for _, outbound := range outbounds {
 		lifecycle, isLifecycle := outbound.(adapter.Lifecycle)
@@ -79,8 +153,169 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	return nil
 }
 
-func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbound) error {
-	started := make(map[string]bool)
+// validatePhysicalPaths runs the reachable-leaf dry run over the whole outbound graph.
+//
+// It is read-only: it dials nothing, resolves nothing, changes no selection and consumes no
+// rotation. See common/physicalpath for the model and the per-leaf contract.
+func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation *physicalPathValidation) error {
+	resolver := physicalpath.NewResolver(m.Outbound, physicalpath.Snapshot{}).
+		WithDomainResolvers(validation.resolverFor, validation.defaultConfig)
+	// The roots are ordered so a GROUP is validated before the objects it names.
+	//
+	// # Why the order is not cosmetic
+	//
+	// One broken object is reachable by many routes: as a selector's unselected member, and as a
+	// top-level outbound in its own right. Reporting it once per route turns one defect into three
+	// lines that look like three defects, and the route through the group is the one that carries
+	// the information an operator needs - it names the selection step that would hand the flow to
+	// it. Validating the groups first and then suppressing the routes they already describe is
+	// what makes the report one line per defect.
+	groups := make([]adapter.Outbound, 0, len(outbounds))
+	leaves := make([]adapter.Outbound, 0, len(outbounds))
+	for _, outbound := range outbounds {
+		if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
+			groups = append(groups, outbound)
+			continue
+		}
+		leaves = append(leaves, outbound)
+	}
+	networks := requiredNetworksFor(outbounds)
+	report := physicalpath.Report{}
+	described := make(map[string]bool)
+	for _, rootSet := range [][]adapter.Outbound{groups, leaves} {
+		rootReport, err := physicalpath.ValidateRoots(resolver, rootSet, m.endpoint, networks, validation.declarations)
+		if err != nil {
+			return err
+		}
+		report.Roots = append(report.Roots, rootReport.Roots...)
+		report.Nodes = append(report.Nodes, rootReport.Nodes...)
+		for _, failure := range rootReport.Failures {
+			if described[failure.Leaf] {
+				continue
+			}
+			report.Failures = append(report.Failures, failure)
+		}
+		if len(rootSet) == 0 {
+			continue
+		}
+		// The set of tags this pass DESCRIBED. The next pass must not repeat them: a broken member
+		// of a group is also a top-level outbound in its own right, and reporting it once per route
+		// turns one defect into three lines that look like three defects.
+		for _, node := range rootReport.Nodes {
+			described[node.Hop] = true
+			for _, tag := range strings.Split(node.Path, " -> ") {
+				described[tag] = true
+			}
+		}
+		for _, failure := range rootReport.Failures {
+			described[failure.Leaf] = true
+		}
+	}
+	// The default outbound and the endpoints are roots in their own right: the default is what an
+	// unmatched flow reaches, and an endpoint is a tunnel the device can be routed into directly.
+	// An object a group report already described is not repeated.
+	if defaultOutbound := m.Default(); defaultOutbound != nil && !described[defaultOutbound.Tag()] {
+		rootReport, err := physicalpath.ValidateRoots(resolver, []adapter.Outbound{defaultOutbound}, m.endpoint, networks, validation.declarations)
+		if err != nil {
+			return err
+		}
+		report.Roots = append(report.Roots, rootReport.Roots...)
+		report.Nodes = append(report.Nodes, rootReport.Nodes...)
+		for _, failure := range rootReport.Failures {
+			if !described[failure.Leaf] {
+				report.Failures = append(report.Failures, failure)
+			}
+		}
+	}
+	endpoints := make([]adapter.Outbound, 0, 4)
+	for _, endpoint := range m.endpoint.Endpoints() {
+		if !described[endpoint.Tag()] {
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+	if len(endpoints) > 0 {
+		rootReport, err := physicalpath.ValidateRoots(resolver, endpoints, m.endpoint, networks, validation.declarations)
+		if err != nil {
+			return err
+		}
+		report.Roots = append(report.Roots, rootReport.Roots...)
+		report.Nodes = append(report.Nodes, rootReport.Nodes...)
+		for _, failure := range rootReport.Failures {
+			if !described[failure.Leaf] {
+				report.Failures = append(report.Failures, failure)
+			}
+		}
+	}
+	return report.Err()
+}
+
+// requiredNetworksFor derives the closed set of networks the graph must be checked against.
+func requiredNetworksFor(roots []adapter.Outbound) []string {
+	networks := make([]string, 0, 2)
+	for _, root := range roots {
+		for _, network := range root.Network() {
+			if network != physicalpath.NetworkTCP && network != physicalpath.NetworkUDP {
+				// ICMP and any future network are carried by a flow port rather than dialled, so
+				// they are outside what this dry run can decide. Ignoring them is the honest
+				// answer: inventing a requirement for them would reject a legal configuration.
+				continue
+			}
+			if !common.Contains(networks, network) {
+				networks = append(networks, network)
+			}
+		}
+	}
+	if len(networks) == 0 {
+		networks = append(networks, physicalpath.NetworkTCP)
+	}
+	return networks
+}
+
+// lintOutbounds is the start-order sort and the per-kind dependency validation, separated from the
+// start itself so it can run BEFORE the reachable-leaf dry run.
+//
+// It returns the topological order it computed, so an outbound is sorted exactly once per Start:
+// the dry run and the checks that follow it must not pay for a second sort, and - more importantly
+// - must not be able to disagree with the order the start will actually use.
+//
+// The two failure modes it owns are the ones it always owned: `dependency[tag] not found for
+// outbound[tag]` for a declared tag that names nothing, and `circular outbound dependency: a -> b
+// -> a` for a declared cycle. Both are reported from the declared DEPENDENCIES, which is the same
+// edge set the dry run reads.
+func (m *Manager) lintOutbounds(outbounds []adapter.Outbound) ([]adapter.Outbound, error) {
+	// A tag used by TWO objects in this graph is refused before the sort runs, because the sort
+	// cannot describe it and would previously CRASH on it.
+	//
+	// # The crash the guard replaces
+	//
+	// The sort marks a node started by TAG, and it decides it is finished when the number of
+	// started tags equals the number of nodes. Two nodes under one tag therefore satisfy the count
+	// with one of them unvisited, and the next sweep finds no unstarted node at all: the code that
+	// then reports a dependency problem dereferenced that nil result. Measured: nil-pointer panic,
+	// not an error. A malformed configuration must be reported, not allowed to take the process
+	// down.
+	//
+	// # Why this is a start-time check and not only a construction one
+	//
+	// box.New refuses an outbound whose tag collides with an ENDPOINT, and Manager.Create refuses a
+	// repeated outbound tag. Neither sees the case this discovers: a group whose member list names
+	// the same tag twice is a legal construction - the tag exists - and it is the group's own list
+	// that is malformed.
+	seenTag := make(map[string]bool, len(outbounds))
+	for _, outbound := range outbounds {
+		if outbound == nil {
+			continue
+		}
+		tag := outbound.Tag()
+		if seenTag[tag] {
+			return nil, E.New("duplicate outbound tag in the start graph: ", tag,
+				"; two objects cannot share a tag, because the start-order sort and the dial lookup "+
+					"are both keyed by it and one of the two would be silently unreachable")
+		}
+		seenTag[tag] = true
+	}
+	started := make(map[string]bool, len(outbounds))
+	order := make([]adapter.Outbound, 0, len(outbounds))
 	for {
 		canContinue := false
 	startOne:
@@ -96,23 +331,8 @@ func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbo
 				}
 			}
 			started[outboundTag] = true
+			order = append(order, outboundToStart)
 			canContinue = true
-			if endpoint, isEndpoint := outboundToStart.(adapter.Endpoint); isEndpoint {
-				err := m.endpoint.StartEndpoint(endpoint)
-				if err != nil {
-					return err
-				}
-				continue
-			}
-			lifecycle, isLifecycle := outboundToStart.(adapter.Lifecycle)
-			if !isLifecycle {
-				continue
-			}
-			name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
-			err := scope.Start(name, lifecycle, adapter.StartStateStart)
-			if err != nil {
-				return err
-			}
 		}
 		if len(started) == len(outbounds) {
 			break
@@ -139,7 +359,52 @@ func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbo
 			}
 			return lintOutbound(append(oTree, problemOutboundTag), problemOutbound)
 		}
-		return lintOutbound([]string{currentOutbound.Tag()}, currentOutbound)
+		return nil, lintOutbound([]string{currentOutbound.Tag()}, currentOutbound)
+	}
+	return order, nil
+}
+
+// startOutbounds starts the outbounds in the order lintOutbounds computed.
+//
+// The order is passed in rather than recomputed: a second sort could disagree with the one the
+// validation saw, and the whole point of moving the validation in front of the start is that both
+// describe the same graph.
+func (m *Manager) startOutbounds(scope *adapter.Scope, outbounds []adapter.Outbound, order []adapter.Outbound) error {
+	started := make(map[string]bool, len(outbounds))
+	for _, outboundToStart := range order {
+		outboundTag := outboundToStart.Tag()
+		started[outboundTag] = true
+		if endpoint, isEndpoint := outboundToStart.(adapter.Endpoint); isEndpoint {
+			err := m.endpoint.StartEndpoint(endpoint)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		lifecycle, isLifecycle := outboundToStart.(adapter.Lifecycle)
+		if !isLifecycle {
+			continue
+		}
+		name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
+		err := scope.Start(name, lifecycle, adapter.StartStateStart)
+		if err != nil {
+			return err
+		}
+	}
+	// An endpoint attached to this manager but not part of the sorted set - which happens when an
+	// endpoint is registered after the sort read the list - is still started, because the endpoint
+	// manager owns its lifecycle. This preserves the previous behaviour exactly for that case.
+	for _, outboundToStart := range outbounds {
+		if started[outboundToStart.Tag()] {
+			continue
+		}
+		endpoint, isEndpoint := outboundToStart.(adapter.Endpoint)
+		if !isEndpoint {
+			continue
+		}
+		if err := m.endpoint.StartEndpoint(endpoint); err != nil {
+			return err
+		}
 	}
 	return nil
 }
