@@ -17,7 +17,7 @@ Companion documents in this directory:
 ```text
 START_SHA                        = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 LIVE_ORIGIN_AT_START             = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
-FINAL_CODE_SHA                   = eca26d8fe8fadd005d784fb39e775d45eae1d74b   (the last CODE commit;
+FINAL_CODE_SHA                   = 666470cbe70e734240bd51d547e00b4b950eb8b1   (the last CODE commit;
                                    the exact scan SHA, see §I)
 ORIGIN_TESTING_FINAL             = the tip of this document's own commit, and it is verified equal to
                                    the local HEAD rather than written down:
@@ -25,12 +25,12 @@ ORIGIN_TESTING_FINAL             = the tip of this document's own commit, and it
                                    A document cannot cite the SHA of the commit that contains it
                                    without changing it, so the shipped pushes are named by the range
                                    each one reported — `686c937cb..04528b8bf`, `04528b8bf..3f703f2a0`,
-                                   `3f703f2a0..3862ea982`, `3862ea982..eb01cb8a3` and
-                                   `eb01cb8a3..7c248c0ac` — every one an ordinary fast-forward, with
-                                   no force and no rejection.
+                                   `3f703f2a0..3862ea982`, `3862ea982..eb01cb8a3`, `eb01cb8a3..7c248c0ac`
+                                   and `7c248c0ac..` onwards for the audit pass — every one an ordinary
+                                   fast-forward, with no force and no rejection.
 FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
                                    before every push)
-NEW_COMMITS                      = 31   (every subject contains the literal `[skip ci]`; 0 missing)
+NEW_COMMITS                      = 42   (every subject contains the literal `[skip ci]`; 0 missing)
 REMOTE_HEADS                     = refs/heads/testing only (`git ls-remote --heads origin`)
 REMOTE_TAGS                      = 636 refs/tags, and the local and remote tag SETS are byte-identical
                                    (`git ls-remote --tags --refs` vs `git for-each-ref refs/tags`,
@@ -88,11 +88,25 @@ a3fbc153b  style(wireguard): gofmt the rebind lease probes
 45aab788f  test(box): the Failure pointer is a caller-owned value, and the straddle test asserts its premise
 c2d93396e  test(route,sniff): two adversarial probes could not survive -count, and one measured a predicate that is gone
 eca26d8fe  test(wireguard): the port table is machine-wide, so the socket census carries the release claim
+eb01cb8a3  docs(fork): the audit-pass corrections, and the final scan at the frozen code SHA
+7c248c0ac  docs(fork): state how the desktop handoff copy is verified, and why its hash is not written here
+2f36515bc  docs(fork): one mangled edit in section A repaired, and the push ranges completed
+da14572a7  test(box,sniff): the nested status scalars verified against running code, and the census allowance's zero margin measured
+10f9e17d2  test(sniff): the leak assertion is "returns to baseline", because testify's own tick is not deterministic
+eac9cc83d  test(sniff): the frame-shape probe captured its readings atomically, because testify's ticks overlap
+2366c73ac  test(group): the sensitivity control identifies its own workers, so other tests cannot cancel it
+95159084c  fix(adapter,sniff): the ledger's ceiling is observable, and the leak contract is tested at the moment it claims
+b5c0009d1  test(sniff,adapter): the two-half leak predicate's blind lifetime, and the ledger bounds measured
+5c15c822b  test(adversary-g): the false-deny direction, the H3 guard's claim/effect split, and the release witness
+ae46d3958  fix(transport/http): the HTTP/3 verdict claim and its effect are one transaction
+8ae8f10d3  fix(physicalpath,wireguard): a truncated route cannot hide behind a sibling, and the release witness checks its precondition
+666470cbe  test(sniff): the frame-shape controls are scoped to the frames they are about
 ```
 
-The last three of those exist because the order's own gate was run **verbatim** rather than
-approximated, and each one is a defect in this round's evidence that `-count=1` and per-package runs
-cannot see. See §L.3.
+The last fourteen exist because the round's own gate and the adversary's re-tests were run **verbatim**
+rather than approximated, because the adversary's second round was run on the **final HEAD** as §15
+requires, and because four of its findings landed in work that had already been reviewed. See §L.3,
+§L.3b, §L.3c and §H.5.
 
 Each agent's commit was cherry-picked with `-x` onto the integration tip; the order's requirement that
 no agent share a worktree was kept — seven detached worktrees, one writer per file, no file written by
@@ -146,7 +160,9 @@ document that then contained it. They are reported outside the artefact instead.
 | Exported `ValidateRoots` accepting a truncated route | `FIXED_VERIFIED` | Found by the integrator; `reachable=true, err=nil` at baseline, refused now. §L. |
 | `route::TestConfiguredRateShapesTheRealTCPCopyPath` naming | `SAFE_WITH_SCOPE` | Renamed to what it measures; no band, no assertion, no socket added. §E. |
 | `common/sniff`, `protocol/group`, `common/power` instruments | `FIXED_VERIFIED` | Three tests that could not fail now fail on the mutation they name, each with a calibrating control. §H. |
-| This round's own evidence under `-race -count=3` | `FIXED_VERIFIED` | Four defects that only the order's gate could see — two probes that could not survive repetition, one measuring a predicate that was gone, and one instrument confounded by a machine-wide port table. §L.3. |
+| This round's own evidence under `-race -count=3` | `FIXED_VERIFIED` | Nine defects that only the order's gate could see, seven of them in the round's own instruments — two probes that could not survive repetition, one measuring a predicate that was gone, one confounded by a machine-wide port table, one data race inside an adversary's own probe, and two sensitivity controls other tests' goroutines could cancel. The last was caught by the FINAL scan, after the gate was already green. §L.3, §L.3b, §L.3c. |
+| The HTTP/3 verdict guard | `FIXED_VERIFIED` | Found by the fresh adversary: the claim was atomic but its effect was a separate read-modify-write, so a stale outcome still won — 1896 and 1758 times in 200000. Now one transaction, with a reverse-break against the integrator's own diff. §H.5. |
+| The wireguard release witness | `FIXED_VERIFIED` with a stated limit | `census 0` does not imply "no socket" during a reopen. The helper now checks the precondition it was silently assuming; what a precondition cannot cover is recorded in it. §H.5. |
 | Six pinned product policies (1250, IPv6 underlay, `mtu<1280`, DNS-only, 48 h backoff, >64 KiB buffer) | `PRESERVED_VERIFIED` | Each located by its own artifact and re-run green. §J. |
 
 `RELEASE` is a separate, single verdict in §N; this table is not one.
@@ -389,6 +405,24 @@ restart path.
 | Real CONNECT / SOCKS / UDP | `VERIFIED_WITH_SCOPE` | package suites green plus the new wiring test; the shared `Client` gains only the verdict ordering and the closed flag |
 | Real iOS radio / roam / WARP | `NOT_RUN_EXTERNAL_DEVICE` | the stand's environment source is a decision source and says so in its own header; **no claim above rests on it** |
 
+### E.5 What the stand does NOT record, stated rather than implied
+
+§10.1 asks the stand to record, per egress, *where DNS was asked*, which egress carried the connection,
+ALPN/transport, and close counts. Measured against that list:
+
+| Asked for | In the stand |
+|---|---|
+| which egress carried the connection | **yes** — each environment's egress attributes the tunnels it served, and the 25-transition churn asserts each cycle's tunnel lands on the environment that was current |
+| ALPN / transport | **yes** — read from the server's own `*quic.Conn.ConnectionState()`, not from a status code |
+| close counts | **yes** — per-egress accepted/closed, plus `TestH3StandCensusDetectsDeliberatelyLeakedConnections` |
+| actual socket count / worker census | **yes** — client and egress censuses, with the package-frame scoping stated in §E.4's instrument note |
+| URLTest / H3 backoff verdict count, H2↔H3 fallback count | **yes** — `client_h3_backoff_memory_test.go` and the stand's fallback-dial counter |
+| **where DNS was asked** | **NO.** The stand does not instrument the DNS layer. Every DNS-position claim in this report comes from the existing `dns/` artefacts instead (`dns/router.go`'s transport selection, the ownership fail-closed rows, the A/AAAA generation-split row), not from this stand. |
+
+That last row is a real hole in the *stand* and it is recorded as one. It does not leave a matrix row
+uncovered — the DNS rows are covered elsewhere and are marked as such — but "the H3 stand records where
+DNS was asked" would have been a claim I could not support.
+
 Why 26 handshakes for 25 transitions: the first tunnel makes handshake #1, and each transition retires
 the live connection so the next dial **must** re-handshake. The transitions are sequential, so no two
 connections coexist, and one connection plus one raw socket are held afterwards.
@@ -546,7 +580,104 @@ hit is the one error class that can turn a supported claim into a false accusati
 transcribed a commit SHA with the right first nine hex digits and the wrong tail, which the integrator
 had to resolve against the object store; both are noted so neither is repeated.
 
-### H.4 The two confirmations that matter most for the two riskiest claims
+### H.4 The adversary's later rounds, including two retractions of its own work
+
+The order requires a second adversarial round **on the final HEAD** (§15) and a mandatory closure loop in
+which every fix made from the adversary's findings is re-tested by the adversary (§15.1). Both were run.
+The results matter as much for what they corrected as for what they found.
+
+**Re-tested fixes, all `FIX_CONFIRMED`:** the group single-flight census (mutation re-applied, `5/5` RED),
+the power coalesced-notification assertion (`5/5` RED on the stale-notification mutation, and the
+adversary confirmed the assertion *does* distinguish a legitimate stale-then-current ordering from an
+uncorrected one), the route census-scope predicate (it verified the replacement is strictly stronger
+than the test it caused to be deleted), and the two `-count` repairs.
+
+**`FIX_WEAKER_THAN_CLAIMED`, twice, both against the integrator's own work and both now closed:** the
+sniff `-1` margin (item 5 in §L.3b) and the two-half predicate's blind lifetime (item 5 again). The
+adversary also declined to claim a clean result in the direction it could not measure — "a transient
+outliving the primary under load I mark reasoned, not measured" — which is the right call and is
+recorded as such rather than as a pass.
+
+**The ledger's bounds (D4), measured, one finding acted on:**
+- the **1024-generation cap evicts silently** — closed by exporting the ceiling (§L.3b item 6);
+- the **reservation is exactly 1024 addresses**, bounded by the persisted cursor and not widening with
+  it, with the address one past the cursor reachable (the compatibility positive holds);
+- the **wrap path cannot produce a blanket block** — a generation contributes at most two intervals, the
+  union is deliberately not taken, and an inverted interval's near-miss is recorded. The FAIL condition
+  the integrator named (a wrapped head-to-tail span) is unreachable by construction;
+- one residual noted, not a defect: the 1024 bound lives in the store's reservation, not in the ledger,
+  so a hand-edited or corrupt cachefile cursor could widen the refused set to whatever it names.
+
+**Two retractions, both the adversary's own, and both the same error class.** It withdrew its round-1
+claim that `holdResetLock` was dead code. In round 5 it **retracted its round-3 finding [21]** as well:
+it had claimed the straddling test "passes vacuously with a nil view", but `statusTestBox` builds its
+instance with `newStatusSurface` directly, so those tests drive a real live view and are *immune to the
+wiring mutation by construction* rather than vacuous. Its own words: *"I inferred a fixture's shape from
+a mutation result instead of reading how it built the instance — the same error class I named in round 2,
+for the second time."* Only two tests in `box_status_test.go` are genuinely vacuous under that mutation,
+and that was already recorded.
+
+Both retractions are kept in this report rather than quietly dropped, because a mutation result is not
+evidence about a fixture until the fixture has been read — that is this round's instrument lesson, and
+it was learned twice.
+
+**What the adversary reached, and what it did not.** Its final pass explicitly reported FOUR areas
+unreached — D2's false-DENY direction, D5's H3 attempt-sequence guard, the wireguard release witness, and
+the WG/H3 reverse questions — and said so before writing its conclusions rather than padding them. Those
+four were handed to a **fresh, independent adversary** (`G`), which reached all four — see §H.5. Its own
+unreached items are recorded there too, as unanswered rather than passed.
+
+### H.5 The fresh adversary (G), and the three defects in the integrator's own work it found
+
+F's final pass reported four areas it had not reached and said so before writing its conclusions. Those
+four went to a **new, independent adversary** with no involvement in any of this code. It reached all
+four and found three defects, **all of them in work the integrator had already reviewed and shipped**.
+
+**D5 — the HTTP/3 guard ordered the claims, not the effects. Product defect, fixed.**
+`claimHTTP3Outcome` is a correct monotone max-CAS, and G confirmed it is immune to the false-negative
+direction (an attempt merely issued and never reporting cannot suppress an older outcome; its mutation
+M1 proved the comparison is load-bearing). But every caller then mutated the verdict in a **separate**
+read-modify-write, so both attempts pass the claim and the effects land in either order. Measured over
+200000 iterations: an old failure armed the verdict after a newer success cleared it **1896** times, and
+re-armed it after a real `ResetConnections` — the A→B→A case the guard exists for — **1758** times. The
+earlier fix had removed the deterministic version of the bug and left a racy one. Fixed by making the
+claim and its effect one transaction; G's witness now reads `0/0/0`, and removing exactly those locks
+reproduces `case1=782 case3=762` of 100000 — a reverse-break against the integrator's own diff rather
+than against G's tree.
+
+**Item 7 — the release witness could not establish its own precondition. Fixed.**
+`socketCensus == 0` does **not** imply "no socket": `bind.Open` binds udp4 and then udp6 before
+assigning the bind, and the receive goroutines start only after `Open` returns. G pinned that state
+deterministically by arming the fixture's gate from inside the udp4 entry — `port=60108 census=0
+port_occupied=true` — where the census half passes for a device that holds a socket and the port half
+excuses the occupied port with the same number, so the two halves the file treats as independent are
+blind together. The assertions were sound at their call sites only because the tests call
+`onPauseUpdated` synchronously and nothing reopens, which was true, unstated and unchecked. Now checked,
+with a reverse-break: with the precondition the helper refuses in that state; removing it makes the
+same call pass.
+
+**D2's residual — a truncated route could hide behind a sibling. Fixed.**
+The truncation check ran *after* an "if any node has Exit, this route is fine" early return, so
+`L.detour = G` with `G -> [m1 complete, m2 (detour=ghost)]` reported `reachable=true failures=0`. Since
+`Report.Reachable` is documented as the stronger question, that was a false READY from the exported API
+rather than a caller's lint problem. The check is now per-node and runs before any question about exits.
+G's verdict table had that case recorded as accepted — it had pinned the residual as current behaviour —
+and the row is updated with its history in place rather than deleted.
+
+**What G got right that is worth recording.** It decided D2 by a **two-tree differential**: the same
+assertions run against the tree and against an `-overlay` that substitutes the pre-change `dryrun.go`,
+with the author's own test as the positive control. That is the only method that can answer "is a legal
+configuration newly refused", and it is why its PASS is worth more than an argument. It also declined to
+claim what it could not measure — the mirror direction of the D5 race (0 in 200000, *"not observed,
+reported as unproven rather than denied"*) and an escaped wireguard leak (*"not demonstrable"*) — rather
+than letting a clean sample stand in for a proof.
+
+**Still not reached, and stated as such:** an independent route/DNS-cache leak instrument for A→B→A and
+DNS-only changes (the cache/worker half was reached only through the author's own tests), and a
+wireguard bind path that spawns no receiver. Neither is a pass.
+
+### H.6 The two confirmations that matter most for the two riskiest claims
+
 
 - **The ledger is reachable.** A fix that silently does nothing while every unit test passes is the
   worst outcome available, and the six-hop walk is what rules it out — with a control showing a lookup
@@ -559,26 +690,26 @@ had to resolve against the object store; both are noted so neither is repeated.
 ## I. Full test coverage, result and SHA
 
 ```text
-SCAN_SHA            = eca26d8fe8fadd005d784fb39e775d45eae1d74b   (the last CODE commit)
-FINAL_CODE_SHA      = eca26d8fe8fadd005d784fb39e775d45eae1d74b
+SCAN_SHA            = 666470cbe70e734240bd51d547e00b4b950eb8b1   (the last CODE commit)
+FINAL_CODE_SHA      = 666470cbe70e734240bd51d547e00b4b950eb8b1
 FULL_TEST_SHA_MATCH = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP
 
                       The pushed tip is this report's own docs-only commit, above the scanned SHA.
-                      `git diff --stat eca26d8fe..HEAD -- . ':(exclude)docs/fork'` is EMPTY — no test
+                      `git diff --stat 666470cbe..HEAD -- . ':(exclude)docs/fork'` is EMPTY — no test
                       file and no production file is added by it — so the tree the scan covered and the
                       tree that ships are the same code tree. A document cannot cite its own commit SHA
                       without changing it, which is exactly why this field has a third value.
 
 COMMAND             = go test -count=1 -tags "$TAGS" -json -timeout 3600s ./...
-                      run via `cmd /c "... > final_full_scan.jsonl 2> final_full_scan.err"` with
+                      run via `cmd /c "... > final_full_scan4.jsonl 2> final_full_scan4.err"` with
                       $LASTEXITCODE read on the immediately following statement, so the exit code is
                       go's and not a pipeline's
 GO_EXIT             = 1
-RAW LOG             = docs/fork/v016-nextstage-final-scan.jsonl   (34835 JSON events, 0 bytes on stderr)
-                      C:\Deepseek\内核\final_scan_meta.txt        (SHA + tags + timestamp)
+RAW LOG             = docs/fork/v016-nextstage-final-scan.jsonl   (0 bytes on stderr)
+                      C:\Deepseek\内核\final_scan_meta3.txt        (SHA + tags + timestamp)
 PACKAGES_TOTAL      = 171 reporting packages
 PACKAGES_WITH_TESTS = 84   (81 ok + 3 FAIL)
-DISTINCT_TESTS      = 7046
+DISTINCT_TESTS      = 7071
 BUILD_FAILURES      = 0
 LAST EVENT          = package pass  ->  REACHED_MODULE_END
 
@@ -586,11 +717,12 @@ FULL_TEST_COVERAGE  = REACHED_MODULE_END
 FULL_TEST_RESULT    = COMPLETED_WITH_FAILURES
 ```
 
-The scan was re-run after the four gate defects in §L.3 were fixed, because those fixes added test files
-and changed two of them. **The failing set is byte-identical to the previous scan and to the historical
-one**: the same 11 names in the same 3 packages, and no package regressed. `common/trafficsched`, whose
-intermittent failure is analysed in §I.4, **passed** in this scan — consistent with its measured rate
-rather than with it having been fixed.
+The scan was re-run **three times** as the round closed, each time after a change that could have moved
+it, and the last one is the one recorded above. Each re-run found something the previous one had not:
+the second found a defect in two of the round's own instruments (§L.3b), and the third found a fifth
+instrument defect that only appears when the whole package runs together (§L.3c). **The failing set is
+byte-identical to the historical one in all three**: the same 11 names in the same 3 packages, and no
+package regressed at any point.
 
 ### I.1 The failing set is exactly the historical one — no new failure
 
@@ -610,8 +742,8 @@ TOTAL              = 11
 ```
 
 Those 11 names are **byte-identical to the historical set**, in the same three packages, and every one
-is attributed in §I.2 — three `BLOCKED_ENV`, eight `BLOCKED_EXTERNAL`. `common/trafficsched`, whose
-intermittent failure is analysed in §I.4, **passed** in this scan, which is consistent with its measured
+is attributed in §I.4 — three `BLOCKED_ENV`, eight `BLOCKED_EXTERNAL`. `common/trafficsched`, whose
+intermittent failure is analysed in §I.6, **passed** in this scan, which is consistent with its measured
 rate rather than with it having been fixed.
 
 The package count moved from the previous round's 80 ok / 3 FAIL (83 with tests) to **81 ok / 3 FAIL
@@ -619,7 +751,7 @@ The package count moved from the previous round's 80 ok / 3 FAIL (83 with tests)
 round; it now has two, one of which is the regression test for the context-cloning defect in §A's commit
 list.
 
-### I.1 The CI premise in the order is FALSE, and the correction matters
+### I.2 The CI premise in the order is FALSE, and the correction matters
 
 The order says a Harness without `gh`/API access may only say `REMOTE_ACTIONS_NOT_QUERYABLE`. **This box
 has unauthenticated API access** — the repository is public — so the honest value is
@@ -640,7 +772,7 @@ Nothing was dispatched, re-run or triggered, and no remote branch, tag, Release 
 integrator's push used the ordinary fast-forward form only, and every one of the 25 commits carries the
 literal marker.
 
-### I.1b The push itself triggered nothing — measured, not assumed
+### I.3 The push itself triggered nothing — measured, not assumed
 
 The query above was re-run **after** the push: runs created on or after 2026-10-10 = **0**, and the
 newest run on `testing` is still from `2026-10-08T20:31:45Z`. That is the end-to-end confirmation of the
@@ -648,7 +780,7 @@ mechanism, from GitHub's own record rather than from the preflight script's read
 messages.
 
 
-### I.2 The three blocked packages, re-attributed
+### I.4 The three blocked packages, re-attributed
 
 The order's stated root causes were partly wrong, and a historical explanation is not a certificate:
 
@@ -658,7 +790,7 @@ The order's stated root causes were partly wrong, and a historical explanation i
 | `common/windivert` | 5 | `BLOCKED_EXTERNAL` | `IsAdmin=False`, `BUILTIN\Administrators` is *"Group used for deny only"*, Mandatory Label = Medium; all five fail with `windivert: open SCM: Access is denied.` The other **20** windivert tests PASS. |
 | `common/tlsspoof` | 3 | `BLOCKED_EXTERNAL` | same SCM denial through `tls_spoof`; the 6 unix tests are `NOT_RUN` **by build constraint** (`linux || darwin`), which is a different state from blocked. |
 
-### I.3 A real coverage hole, filled
+### I.5 A real coverage hole, filled
 
 `common/tlsspoof` had **zero unprivileged tests on any platform**, so the package was a single
 undifferentiated red. Six tests were added over `buildFakeClientHello`, which is pure and carries real
@@ -667,7 +799,7 @@ invariants: empty-SNI refusal; exactly one well-formed handshake record; fits on
 offered; SNI round-trips and two SNIs differ; ALPN is `h2, http/1.1`. The segment-size assertion is
 what makes the file worth having: removing `CurvePreferences` compiles and pushes it to **1521 bytes**.
 
-### I.4 An intermittent failure found, analysed, and deliberately NOT widened
+### I.6 An intermittent failure found, analysed, and deliberately NOT widened
 
 `common/trafficsched::TestAdmittedRateMatchesTheConfiguredRate` failed **1 of 2** full scans (the second
 run was 79 PASS / 4 FAIL), then passed 10/10 plain and under `-race`.
@@ -685,7 +817,7 @@ weakening the order forbids. It is recorded as a **host-bound known flake** with
 ceiling, the same family as the renamed route scheduler test, and it is called out by name wherever the
 final scan reports it.
 
-### I.5 `go vet ./...` is exit 1, pre-existing, and every gate in CI knows it
+### I.7 `go vet ./...` is exit 1, pre-existing, and every gate in CI knows it
 
 Three findings, none introduced by this round: `daemon/managed_service.go:75` and
 `experimental/libbox/debug.go:11` are **deliberate nil-dereference crash triggers**
@@ -715,10 +847,29 @@ Two qualifications, both measured, neither a regression:
 
 - **linux/\* and freebsd need `-ldflags=-checklinkname=0`.** Without it linux fails at link in
   `experimental/boxdd` (`invalid reference to runtime/pprof.parseProcSelfMaps`) — a command omission,
-  not a product defect, and the flag is what the release recipes pass.
+  not a product defect, and the flag is what the release recipes pass. `release/LDFLAGS` carries it,
+  and this round used that file rather than a remembered flag.
 - **FreeBSD `./...` fails only in `experimental/libbox`**, whose six missing symbols are all defined
   under `//go:build darwin || linux || windows`. libbox was never a FreeBSD target; the real FreeBSD
   product builds, and CI's own package list passes on freebsd/amd64.
+
+### J.1 The tag layering is real, and one profile cannot be built here at all
+
+The order says not to assume every tag set is simultaneously available. Measured, per profile:
+
+| Tag file | Built here | What CI uses it for |
+|---|---|---|
+| `release/DEFAULT_BUILD_TAGS_OTHERS` | **windows/amd64 exit 0, linux/amd64 exit 0, linux/arm64 exit 0, darwin/arm64 exit 0** | `verify.yml`, `server-linux-amd64.yml`, `interop-xray.yml` (which says in its own comment that it wants the WIRE profile, not cronet), and `windows-core-amd64.yml`'s `upstream-baseline` probe |
+| `release/DEFAULT_BUILD_TAGS_WINDOWS` (`with_naive_outbound` + `with_purego`) | **windows/amd64 exit 0** | `windows-core-amd64.yml`'s `fork-windows` release profile — i.e. the tag set the shipped Windows product is built with |
+| `release/DEFAULT_BUILD_TAGS` (`with_naive_outbound`, the Darwin profile) | **exit 1, and it cannot be built here** | `client-macos.yml`, and two `verify.yml` steps |
+
+The third one fails for an environmental reason and the failure is precise:
+`github.com/sagernet/cronet-go/all` → `cronet-go/lib/linux_amd64` (and `lib/darwin_arm64`)
+**contain no Go files in this module cache** — those are the prebuilt cronet static libraries, fetched
+as CI artifacts, and they are not present on this machine. CI knows this and says so in
+`verify.yml`'s own comment: *"DEFAULT_BUILD_TAGS (the Darwin profile) is deliberately NOT used here: it
+carries with_naive_outbound, and no Linux product links cronet."* So it is `BLOCKED_EXTERNAL`, not a
+regression, and it is the seventh entry in §M.
 
 **libbox ABI: 383 exported symbols, 0 added, 0 removed.** The artifact pair at
 `C:\Deepseek\内核\abi_*.txt` was found to be a **same-run snapshot** (byte-identical, written 182 ms
@@ -773,6 +924,26 @@ tags, and no single-run wobble is presented as a result.
 
 No cross-package lock was added, no per-packet logging, and no lock was introduced into any dial or
 copy loop by this round.
+
+### K.1 What "high traffic" means for this round's changes, and what covers it
+
+The order's §10.3 asks that concurrent TCP, UDP/UoT, IPv4/IPv6 and Close be covered before a resource
+fix is called safe. Stated precisely rather than claimed wholesale:
+
+- **Nothing this round touched is on a per-packet path.** The H3 change is two atomics per connection
+  *attempt*; the FakeIP ledger is one atomic pointer load plus an interval scan per connection *match*
+  (not per packet); the Box status surface is not on the data path at all and starts no goroutine and
+  arms no timer; the WG change adds two context observations per *rebind*.
+- **The concurrency coverage that exists** is `common/trafficsched`'s contention suite —
+  `TestContentionColdStart`, `TestContentionSteadyState`, `TestContentionHighVersusHigh`,
+  `TestNeitherLaneStarvesWhenBothAreBusy`, `TestSchedulerSurvivesConcurrentFlowChurn`,
+  `TestClosingAFlowReleasesItAndItsSlot`, `TestPacedSchedulerLeavesNoGoroutineBehind` — plus four
+  benchmarks (`BenchmarkCopyLoopTax`, `BenchmarkPacketGateTax`, `BenchmarkStreamWriteTax`,
+  `BenchmarkStreamWriteBufferTax`). All green, including under `-count=3` (319 s).
+- **What is NOT separately measured here**: a concurrent TCP+UDP/UoT+IPv4+IPv6+Close load test written
+  for this round. It was not needed to justify a change that adds no per-packet work, and inventing one
+  to tick a box would have been a measurement of the test rather than of the product. Said plainly here
+  so the absence is not mistaken for coverage.
 
 ---
 
@@ -877,12 +1048,74 @@ The order's gate is now green, twice in a row, in full:
 `common/physicalpath`, `protocol/group`, `route`, `dns`, `common/dialer`, `transport/wireguard`,
 `protocol/wireguard`, `common/httpclient`, `e2e` — all `ok`, exit 0.
 
-**One thing that looked like a fifth defect and is not.** A `-count=3` sweep reported
-`protocol/masque` timing out at 600 s. It is not a hang: the package's suite legitimately takes
-**423.587 s** for a single run in the full scan, and my sweep's timeout was simply too short. Recorded
-because "the package is slow" and "the package hangs" are different facts and only the first is true.
+### L.3b Four more, found by repeating that gate and by the adversary's re-test
+
+The gate is not a formality: running it repeatedly, and having the adversary re-test the fixes made from
+its own findings, produced four more defects. Three of them were **mine**.
+
+5. **`common/sniff` — the two-half predicate had a blind lifetime.** After the adversary showed that
+   `require.Never` is non-deterministic (testify starts its condition with a bare `go checkCond()` and
+   re-arms the ticker only after a result arrives), the leak assertion became two halves: a calibrated
+   `> before+1` and a primary "returns to baseline". The adversary then measured that **neither** sees a
+   goroutine that outlives the sniff call and then exits by itself:
+   `MEASURED one worker left behind for 400ms: secondary fired=false, primary passed=true`. The
+   calibrated half tolerates one transient frame; the primary half is satisfied by the eventual return.
+   But "must not leave a goroutine behind" is a statement about the moment the call **returns**, and no
+   window tests that. Both lifecycle loops now assert the census **at that moment, per iteration**, read
+   on the test goroutine so that no callback correction applies. Reverse-break: a self-terminating leak
+   (`time.Sleep(50ms)` then exit) is RED BY ASSERTION at `iteration 0`, where both window halves pass.
+6. **`adapter` — the ledger's ceiling was unexported, so its loss was invisible.** MEASURED: once the cap
+   is reached the oldest record is dropped and its address answers exactly as one that was never issued
+   (`'evicted after the cap' and 'never issued' both answer (invalid IP, false)`). No third *refusal*
+   behaviour is available — refusing without proof is the blanket block the contract forbids — but a
+   caller could not even compute "saturated" without hardcoding 1024. `MaxIssuanceGenerations` is now
+   exported with the measured loss in its doc.
+7. **The adversary's own frame-shape probe had a data race.** `TestAgentFFrameShapeNever` captured its
+   reading in a plain `var inside int` written on testify's condition goroutine and read on the test
+   goroutine — and testify's overlapping ticks mean two condition goroutines can write it. `-race
+   -count=3` reported `DATA RACE`. The readings are now atomic. The instrument that found the
+   instability found its own author's mistake, which is worth recording as such.
+8. **The adversary's group sensitivity control could be cancelled by other tests.** It compared a peak
+   against a baseline taken beforehand; inside the full package MEASURED `baseline=4, peak=5`, because
+   three goroutines left by earlier tests were alive when the baseline was read and exited while the four
+   injected workers were held, so the difference cancelled. It now identifies **its own** workers by a
+   named frame and asserts the package predicate is a superset of that count — a direction other tests'
+   goroutines can only make larger. Its release assertion needed the same treatment for the same reason,
+   and had to be polled from a plain loop rather than from `require.Eventually`, because a reading taken
+   inside a testify callback carries that callback's own frame.
+
+**One thing that looked like a defect and is not.** A `-count=3` sweep reported `protocol/masque`
+timing out at 600 s. It is not a hang: the package's suite legitimately takes **423.587 s** for a single
+run in the full scan, and my sweep's timeout was simply too short. Recorded because "the package is slow"
+and "the package hangs" are different facts and only the first is true.
+
+### L.3c The same defect class, one more time — and it was caught by the final scan
+
+The pattern this round kept meeting is an instrument that measures **the process** rather than the thing
+it names. Four instances were found by running the gate; the **final full scan caught a fifth**, in the
+adversary's own frame-shape controls:
+
+```text
+MEASURED shape=require.Never with nothing leaked: before=20 inside=20
+"20" is not greater than or equal to "21"
+```
+
+Those controls compared a reading taken inside a testify condition against a baseline read on the test
+goroutine beforehand. Inside the full package twenty goroutines naming `common/sniff_test` were alive at
+the baseline — left by the tests that ran before — and enough exited inside the 60 ms window to cancel
+the callback's own frame exactly. **It passed in isolation (`before=1 inside=2`) and failed in the
+package.** The assertions are now scoped to the condition closure's own frame, which no other test's
+goroutines can enter, and the process-wide difference is reported beside them as an observation rather
+than asserted as a proof. `TestAgentFNestedHelperOverCorrects` needed the same treatment in a different
+shape: it now takes both readings back to back inside the same callback, so the helper's extra frame is
+a difference rather than a comparison against a moving baseline.
+
+The lesson is worth stating because it recurred five times: **a test that passes alone and fails in the
+package is not flaky — it is measuring the process.** Every one of these was fixed by asking what the
+instrument is actually counting, and none by widening a tolerance.
 
 ### L.4 Instruments, not assertions about instruments
+
 Three instruments were found to be incapable of failing and were rebuilt with calibrating controls, and
 two more were scoped or corrected: the `route` census predicate (frame boundary + scope test +
 sensitivity control), the `wireguard` census (scoped by receiver address, `0 → 60 → 0`), the
@@ -918,7 +1151,7 @@ Each item says **why**, and what would be needed. Nothing here is a bug that cou
    never recorded as current by the coordinator. This is a coordinator-integration gap rather than
    D7-02, with no observed failure attached; changing it means choosing new coordinator semantics, which
    is a design decision and not a repair.
-6. **`common/trafficsched` rate bound.** Host timer granularity, analysed in §I.4. Either it stays a
+6. **`common/trafficsched` rate bound.** Host timer granularity, analysed in §I.6. Either it stays a
    documented host-bound flake, or the coarse flat bound stops being the independent check — and that
    is a deliberate weakening, so it is left alone.
 7. **`go vet ./...` exit 1.** Pre-existing, in two deliberate crash triggers and one Win32 pointer
@@ -930,41 +1163,55 @@ Each item says **why**, and what would be needed. Nothing here is a bug that cou
    repositories were not touched. That is the intended boundary of this round, not an omission.
 10. **`common/tls`'s historical wording in the order is factually wrong** and must not be carried
     forward: the failure is a malformed record layer, not "an unexpected record".
+11. **The `release/DEFAULT_BUILD_TAGS` (Darwin/naive) profile cannot be built on this machine.**
+    `cronet-go/lib/{linux_amd64,darwin_arm64}` carry **no Go files** in the module cache — the prebuilt
+    cronet static libraries are fetched as CI artifacts and are absent here — so every target fails at
+    `imports github.com/sagernet/cronet-go/all`. The other two profiles build, including the
+    `DEFAULT_BUILD_TAGS_WINDOWS` set the shipped Windows product actually uses. Resolving it needs the
+    cronet artifact download step from CI, which is a network/CI action and not a code change. See §J.1.
+12. **F's post-integration adversarial round was re-run on the shipped SHA** rather than on the
+    intermediate tree the first pass used, because §15 requires the final HEAD and §15.1 requires
+    re-testing the fixes made from F's own findings. Its result is the last thing appended to this
+    report; where it found something, the fix and its mutation are recorded in the same place.
 
 ---
 
 ## N. Final release verdict
 
 ```text
-FINAL_CODE_SHA                    = eca26d8fe8fadd005d784fb39e775d45eae1d74b
+FINAL_CODE_SHA                    = 666470cbe70e734240bd51d547e00b4b950eb8b1
 ORIGIN_TESTING                    = the tip of this commit; `git rev-parse HEAD` ==
                                     `git rev-parse origin/testing` (ordinary fast-forward, §A)
-ALL_NEW_COMMITS_SKIP_CI           = YES (checked one by one; 29/29)
+ALL_NEW_COMMITS_SKIP_CI           = YES (checked one by one; 42/42)
 OTHER_REPOS_TOUCHED               = NO
 ORIGINAL_DIRTY_WORKTREE_UNTOUCHED = YES (hash-backed, §A.1)
 GO_MOD_GO_SUM                     = UNCHANGED
 LIBBOX_ABI                        = 383 symbols, 0 added, 0 removed
 A_FIP_HISTORIC_ADDRESS            = FIXED_VERIFIED, with two explicit boundaries (C4 unmeasured entry
-                                    paths; C5 the no-ledger/common path)
+                                    paths; C5 the no-ledger/common path) and one now-observable bound
+                                    (the 1024-generation ceiling, §L.3b)
 B_WG_REBIND                       = FIXED_VERIFIED for result ownership;
                                     BLOCKED_DEPENDENCY_LIMITATION_WITH_EVIDENCE for interruption
 C_REAL_CONNECTION_CHURN           = VERIFIED_WITH_SCOPE (real ALPN h3 handshake named, 25 real
-                                    transitions, 2 product defects fixed, every matrix row now resolved
-                                    except the real-device ones)
+                                    transitions, THREE product defects fixed — two in `transport/http`,
+                                    one of them found only by the fresh adversary after the first fix had
+                                    been reviewed — and every matrix row now resolved except the
+                                    real-device ones)
 D_BOX_STATUS_INTEGRATION          = LANDED_VERIFIED
 E_PLATFORM_TEST_MATRIX            = EXPLICIT_PASS_FAIL_BLOCKED
-F_INDEPENDENT_ADVERSARIAL_DEBUG   = COMPLETED_AFTER_INTEGRATION (3 rounds plus one integrator audit
-                                    pass; 1 finding withdrawn by the adversary itself, 1 integrator
-                                    refutation recorded, 3 of its own probes repaired so they can run
-                                    under the round's own gate)
+F_INDEPENDENT_ADVERSARIAL_DEBUG   = COMPLETED_AFTER_INTEGRATION (two adversaries: the first over five
+                                    rounds with two retractions of its own findings, the second fresh and
+                                    independent over the four areas the first did not reach; 3 further
+                                    defects found in already-reviewed work, all fixed and all
+                                    reverse-broken)
 FULL_TEST_COVERAGE                = REACHED_MODULE_END (171 reporting packages, 84 with tests,
-                                    7046 distinct tests, 0 build failures)
+                                    7071 distinct tests, 0 build failures)
 FULL_TEST_RESULT                  = COMPLETED_WITH_FAILURES (81 ok / 3 FAIL; the 11 failing test names
                                     are byte-identical to the historical set)
-FULL_TEST_SHA_MATCH               = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP (scan at eca26d8fe; the tip
+FULL_TEST_SHA_MATCH               = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP (scan at 666470cbe; the tip
                                     adds docs/fork/ only, so no test file and no production file differs)
-CI_REMOTE                         = OBSERVED, NOT_RUN_BY_REQUEST (0 runs triggered; 85 [skip ci]
-                                    commits -> 0 runs measured historically)
+CI_REMOTE                         = OBSERVED, NOT_RUN_BY_REQUEST (0 runs triggered across every push;
+                                    85 [skip ci] commits -> 0 runs measured historically)
 RELEASE                           = NOT_READY
 ```
 
