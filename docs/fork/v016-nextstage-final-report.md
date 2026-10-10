@@ -23,16 +23,14 @@ ORIGIN_TESTING_FINAL             = the tip of this document's own commit, and it
                                    the local HEAD rather than written down:
                                        git rev-parse HEAD   ==   git rev-parse origin/testing
                                    A document cannot cite the SHA of the commit that contains it
-                                   without changing it, so the pushes reported
-                                   `686c937cb..04528b8bf`, `04528b8bf..3f703f2a0` and
-                                   `3f703f2a0..3862ea982` — every one an ordinary fast-forward, with no
-                                   force and no rejection.
+                                   without changing it, so the shipped pushes are named by the range
+                                   each one reported — `686c937cb..04528b8bf`, `04528b8bf..3f703f2a0`,
+                                   `3f703f2a0..3862ea982`, `3862ea982..eb01cb8a3` and
+                                   `eb01cb8a3..7c248c0ac` — every one an ordinary fast-forward, with
+                                   no force and no rejection.
 FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
-                                   before each push)
-NEW_COMMITS                      = 29   (every subject contains the literal `[skip ci]`)
-FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
-                                   before the push; the push reported `686c937cb..04528b8bf  HEAD -> testing`)
-NEW_COMMITS                      = 25   (every subject contains the literal `[skip ci]`)
+                                   before every push)
+NEW_COMMITS                      = 31   (every subject contains the literal `[skip ci]`; 0 missing)
 REMOTE_HEADS                     = refs/heads/testing only (`git ls-remote --heads origin`)
 REMOTE_TAGS                      = 636 refs/tags, and the local and remote tag SETS are byte-identical
                                    (`git ls-remote --tags --refs` vs `git for-each-ref refs/tags`,
