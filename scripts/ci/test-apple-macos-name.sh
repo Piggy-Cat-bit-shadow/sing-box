@@ -718,13 +718,24 @@ if problems:
     sys.exit(1)
 PY
 
-  check "the pinned SFM configurations still declare the anchors the overlay rewrites" python3 - "$pinned_pbx" <<'PY'
+  # The overlay's field-wise contract, asserted against the REAL pinned source: every field it
+  # will rewrite must hold either the upstream value or the branded one, and at least one must
+  # still hold the upstream value or there is nothing for the overlay to do.
+  #
+  # Both spellings are legitimate, because the pinned source ships a MIXED configuration:
+  # PRODUCT_NAME is still "sing-box" while INFOPLIST_KEY_CFBundleDisplayName is already
+  # "Jiejiebox". Requiring both to be upstream - which this check used to do - fails on a source
+  # that is correct, and requiring both to be branded would accept a source the overlay cannot
+  # act on.
+  check "the pinned SFM configurations are in a state the overlay can act on" python3 - "$pinned_pbx" "$brand" <<'PY'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
+branded = sys.argv[2]
 m = re.search(r'Build configuration list for PBXNativeTarget "SFM" \*/ = \{(.*?)\n\t\t\};', src, re.S)
-ids = re.findall(r"([0-9A-Fa-f]{24}) /\*", 
+ids = re.findall(r"([0-9A-Fa-f]{24}) /\*",
                  re.search(r"buildConfigurations = \((.*?)\);", m.group(1), re.S).group(1))
 problems = []
+pending = 0
 for cid in ids:
     b = re.search(rf'{cid} /\* (\w+) \*/ = \{{\s*isa = XCBuildConfiguration;(.*?)\n\t\t\}};',
                   src, re.S)
@@ -736,11 +747,17 @@ for cid in ids:
         v = re.search(rf'^\s*{key} = "([^"]*)";', body, re.M)
         if not v:
             problems.append(f"SFM {name} declares no {key}")
-        elif v.group(1) != "sing-box":
-            problems.append(f"SFM {name} {key} is {v.group(1)!r}, expected 'sing-box'")
+        elif v.group(1) == "sing-box":
+            pending += 1
+        elif v.group(1) != branded:
+            problems.append(
+                f"SFM {name} {key} is {v.group(1)!r}, expected 'sing-box' or {branded!r}")
+if not problems and pending == 0:
+    problems.append("every SFM field is already branded, so the overlay has nothing to rewrite")
 if problems:
     print("\n".join("    - " + p for p in problems), file=sys.stderr)
     sys.exit(1)
+print(f"    {pending} SFM field(s) still upstream, {len(ids) * 2 - pending} already branded")
 PY
 
   check "the pinned SFM scheme has exactly three SFM application buildables" \
