@@ -223,7 +223,7 @@ func (h *Outbound) Close() error {
 	return h.client.Close()
 }
 
-// dialDownstreamOwnedDestination performs the dial when this outbound owns destination DNS.
+// ownedDestinationContext records what was owned, so the metadata travels with the downstream dial.
 //
 // # Why the domain stays in the metadata
 //
@@ -235,53 +235,115 @@ func (h *Outbound) Close() error {
 //
 // `Destination` is left as the domain and `OriginDestination` records it, which is the same pairing the
 // inbound side already uses for a destination that was rewritten: the domain is what the user meant,
-// and the address actually dialled is whatever the dialer was handed.
+// and the address actually dialled is whatever the dialer was handed. `DestinationAddresses` records
+// WHICH local policy answer was chosen, so a diagnostic can tell the two apart afterwards.
 //
-// The extension is scoped to the downstream dial and its nested dials, so the caller's own metadata
-// is untouched.
-func (h *Outbound) dialDownstreamOwnedDestination(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr) (net.Conn, error) {
+// The extension is scoped to the downstream dial and its nested dials, so the caller's own metadata is
+// untouched.
+//
+// It is one function rather than one per entry point because there are now four entry points that can
+// reach the peer with a destination - SOCKS TCP CONNECT, SOCKS UDP ASSOCIATE, UoT through DialContext
+// and UoT through ListenPacket - and four copies of a metadata rule is how one of them ends up
+// differing from the other three.
+func ownedDestinationContext(ctx context.Context, destination M.Socksaddr, addresses []netip.Addr) context.Context {
 	_, metadata := adapter.ExtendContext(ctx)
 	metadata.OriginDestination = destination
 	metadata.DestinationAddresses = addresses
-	return N.DialSerial(adapter.WithContext(ctx, metadata), h.client, network, destination, addresses)
+	return adapter.WithContext(ctx, metadata)
+}
+
+// dialDownstreamOwnedDestination performs the dial when this outbound owns destination DNS.
+func (h *Outbound) dialDownstreamOwnedDestination(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr) (net.Conn, error) {
+	return N.DialSerial(ownedDestinationContext(ctx, destination, addresses), h.client, network, destination, addresses)
 }
 
 // listenDownstreamOwnedDestination is the packet-connection form of
 // dialDownstreamOwnedDestination, with the same metadata rule.
 func (h *Outbound) listenDownstreamOwnedDestination(ctx context.Context, destination M.Socksaddr, addresses []netip.Addr) (net.PacketConn, error) {
-	_, metadata := adapter.ExtendContext(ctx)
-	metadata.OriginDestination = destination
-	metadata.DestinationAddresses = addresses
-	packetConn, _, err := N.ListenSerial(adapter.WithContext(ctx, metadata), h.client, destination, addresses)
+	packetConn, _, err := N.ListenSerial(ownedDestinationContext(ctx, destination, addresses), h.client, destination, addresses)
 	return packetConn, err
+}
+
+// dialUoTDownstreamOwnedDestination opens a UoT session to an address the local policy chose.
+//
+// UoT carries one destination per SESSION, so the session is opened to the first address the policy
+// produced. That is the same "the candidate order decides, and the rest are fallbacks" rule the stream
+// path applies through DialSerial: a UoT session cannot retry per address, so pretending otherwise
+// would need a second resolution rather than a second attempt.
+func (h *Outbound) dialUoTDownstreamOwnedDestination(ctx context.Context, network string, destination M.Socksaddr, addresses []netip.Addr) (net.Conn, error) {
+	return h.uotClient.DialContext(
+		ownedDestinationContext(ctx, destination, addresses),
+		network,
+		M.SocksaddrFrom(addresses[0], destination.Port),
+	)
+}
+
+// listenUoTDownstreamOwnedDestination is the packet-connection form of
+// dialUoTDownstreamOwnedDestination.
+func (h *Outbound) listenUoTDownstreamOwnedDestination(ctx context.Context, destination M.Socksaddr, addresses []netip.Addr) (net.PacketConn, error) {
+	return h.uotClient.ListenPacket(
+		ownedDestinationContext(ctx, destination, addresses),
+		M.SocksaddrFrom(addresses[0], destination.Port),
+	)
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	switch N.NetworkName(network) {
+	networkName := N.NetworkName(network)
+	switch networkName {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
 	case N.NetworkUDP:
 		if h.uotClient != nil {
 			h.logger.InfoContext(ctx, "outbound UoT connect packet connection to ", destination)
-			return h.uotClient.DialContext(ctx, network, destination)
+		} else {
+			h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 		}
-		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	// Destination DNS ownership is checked BEFORE the SOCKS4 workaround, because it is the broader
-	// rule: SOCKS4's reason is a protocol limitation, this one is a product contract, and when both
-	// apply the answer is the same.
+	// Destination DNS ownership is resolved ONCE, before every branch that can reach the peer.
+	//
+	// # The bypass this closes
+	//
+	// The ownership resolution used to sit AFTER the switch, while the UoT branch returned from
+	// INSIDE it:
+	//
+	//	case N.NetworkUDP:
+	//	    if h.uotClient != nil {
+	//	        return h.uotClient.DialContext(ctx, network, destination)   <- the peer gets the NAME
+	//	    }
+	//	...
+	//	downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(...)   <- never reached
+	//
+	// So on a UoT-configured outbound - which is the common shape for a residential downstream hop,
+	// because UDP through a SOCKS proxy needs UoT to be usable at all - `DialContext(UDP)` handed the
+	// destination DOMAIN to the peer without ever consulting the declaration. The stream path was
+	// covered and the packet path was not, and the asymmetry was invisible because the switch read as
+	// presentation rather than as control flow.
+	//
+	// Resolving here, before the switch, means every UDP entry point - plain SOCKS UDP ASSOCIATE,
+	// UoT through DialContext, and UoT through ListenPacket - takes the same decision from the same
+	// place, and a name that must be owned cannot reach the peer through the one branch that used to
+	// return early.
 	downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
 	if ownErr != nil {
 		return nil, ownErr
 	}
+
+	if networkName == N.NetworkUDP && h.uotClient != nil {
+		if owned {
+			return h.dialUoTDownstreamOwnedDestination(ctx, network, destination, downstreamAddresses)
+		}
+		return h.uotClient.DialContext(ctx, network, destination)
+	}
 	if owned {
 		return h.dialDownstreamOwnedDestination(ctx, network, destination, downstreamAddresses)
 	}
+	// The SOCKS4 workaround: SOCKS4 cannot carry a domain at all, so it must be resolved locally
+	// whatever the ownership declaration says.
 	if h.resolve && destination.IsDomain() {
 		destinationAddresses, err := h.dnsRouter.Lookup(ctx, destination.Fqdn, h.targetQueryOptions)
 		if err != nil {
@@ -296,29 +358,21 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	if h.uotClient != nil {
-		// UoT carries the target inside the tunnelled request, so the same ownership rule applies to
-		// it as to a plain SOCKS UDP ASSOCIATE: what must not reach the peer is the NAME. A UoT client
-		// takes one destination for the session, so a name that must be owned is resolved here and the
-		// session is opened to the address.
-		downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
-		if ownErr != nil {
-			return nil, ownErr
-		}
-		if owned {
-			h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination, " via ", downstreamAddresses)
-			_, ownedMetadata := adapter.ExtendContext(ctx)
-			ownedMetadata.OriginDestination = destination
-			ownedMetadata.DestinationAddresses = downstreamAddresses
-			return h.uotClient.ListenPacket(adapter.WithContext(ctx, ownedMetadata),
-				M.SocksaddrFrom(downstreamAddresses[0], destination.Port))
-		}
-		h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
-		return h.uotClient.ListenPacket(ctx, destination)
-	}
+	// Resolved once, before the UoT split, for the same reason DialContext resolves it before its
+	// switch. See the comment there for the bypass this shape closes.
 	downstreamAddresses, owned, ownErr := h.resolveDestinationForDownstream(ctx, destination)
 	if ownErr != nil {
 		return nil, ownErr
+	}
+	if h.uotClient != nil {
+		// UoT carries the target inside the tunnelled request, so the same ownership rule applies to
+		// it as to a plain SOCKS UDP ASSOCIATE: what must not reach the peer is the NAME.
+		if owned {
+			h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination, " via ", downstreamAddresses)
+			return h.listenUoTDownstreamOwnedDestination(ctx, destination, downstreamAddresses)
+		}
+		h.logger.InfoContext(ctx, "outbound UoT packet connection to ", destination)
+		return h.uotClient.ListenPacket(ctx, destination)
 	}
 	if owned {
 		return h.listenDownstreamOwnedDestination(ctx, destination, downstreamAddresses)
