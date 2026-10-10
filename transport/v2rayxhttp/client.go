@@ -341,16 +341,50 @@ func (c *Client) SetKeepIdleConnections(keep bool) {
 // placement engine (applyMeta) appends session/seq path segments and query params
 // as configured; applyXPadding attaches the padding. The base path is set via
 // sHTTP.URLSetPath so percent-encoding matches the rest of sing-box.
+//
+// # A configured QUERY is a query, not path content
+//
+// XHTTP deployments routinely put a query in the configured path:
+//
+//	"path": "/?proxyip=149.56.109.62"    the Cloudflare Worker / edgetunnel / relay shape
+//	"path": "/base?x=1"
+//
+// The worker reads that query to pick an upstream, so losing it is losing the relay.
+//
+// `URLSetPath` is `net/url.(*URL).setPath`, which percent-encodes everything handed to it AS A PATH.
+// A `?` is not a legal path character, so a configured query used to arrive as a literal path segment:
+//
+//	configured   /?proxyip=149.56.109.62
+//	URL.Path     /%3Fproxyip=149.56.109.62     (request line: GET /%3Fproxyip=149.56.109.62 HTTP/1.1)
+//	URL.RawQuery ""                            an EMPTY query, so the worker sees no `proxyip`
+//
+// Nothing errors: the request is well formed and the origin answers. That is why the split happens
+// BEFORE setPath rather than by repairing the path afterwards - once the `?` is inside Path it is
+// already escaped, and `RawQuery` no longer carries the operator's bytes.
+//
+// The split is `strings.Cut` on the FIRST `?`, which is exactly where a URI's query begins (RFC 3986
+// section 3). A `?` inside a query VALUE arrives percent-encoded, so it is already `%3F` by the time
+// it is configured and is not a separator here; a `?` inside a path SEGMENT is likewise written
+// `%3F`. The query half is assigned to RawQuery verbatim, so the operator's own encoding - including
+// deliberate `%20` and an empty `c=` - reaches the wire unchanged and is never re-encoded.
 func (c *Client) baseURL() (*url.URL, error) {
 	u := &url.URL{
 		Scheme: c.scheme,
 		Host:   c.serverAddr.String(),
 	}
-	if err := sHTTP.URLSetPath(u, c.path); err != nil {
+	configuredPath, configuredQuery, hasQuery := strings.Cut(c.path, "?")
+	if !strings.HasPrefix(configuredPath, "/") {
+		// A bare "?query" with no path is a legal URI reference; it targets "/".
+		configuredPath = "/" + configuredPath
+	}
+	if err := sHTTP.URLSetPath(u, configuredPath); err != nil {
 		return nil, E.Cause(err, "parse path")
 	}
 	if !strings.HasPrefix(u.Path, "/") {
 		u.Path = "/" + u.Path
+	}
+	if hasQuery {
+		u.RawQuery = configuredQuery
 	}
 	return u, nil
 }
