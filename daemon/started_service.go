@@ -102,21 +102,41 @@ type ServiceOptions struct {
 func NewStartedService(options ServiceOptions) *StartedService {
 	// The FakeIP issuance ledger is owned HERE, because what it has to outlive is a Box and what it
 	// belongs to is the sequence of Boxes: `StartOrReloadService` closes one Box and builds the next
-	// from `service.ExtendContext(s.ctx)` (:270, :280), and ExtendContext is a shallow registry clone,
-	// so every Box this service builds receives the SAME ledger and the ledger dies with the service.
+	// from `service.ExtendContext(s.ctx)`, and ExtendContext is a shallow registry clone, so every Box
+	// this service builds receives the SAME ledger and the ledger dies with the service.
 	//
-	// It must be registered on the EXTENDED context rather than merely derived from options.Context:
-	// `MustRegisterPtr` and `PtrFromContext` both key on `common.DefaultValue[*T]()`, and they register
-	// into the registry the context already carries. `ExtendContext` returns a NEW context value, so a
-	// registration written to the derived value would never be seen by `newInstance`, which extends
-	// `s.ctx` itself.
+	// # Why the registry is EXTENDED LAZILY here instead of cloned eagerly
+	//
+	// It must land in the registry that `options.Context` ALREADY carries, and `s.ctx` must stay that
+	// same context. Cloning once here - `service.ExtendContext(options.Context)` - looks equivalent and
+	// is not: the clone is a snapshot of the registry at this instant, while `newInstance` extends
+	// `s.ctx` at the moment a Box is built. Any service the CALLER registers into its context after
+	// this constructor returns would be invisible to every Box afterwards.
+	//
+	// That is not hypothetical. `experimental/libbox/command_server.go` registers into the same context
+	// BEFORE this constructor (`:57` power report manager, `:63` platform interface) and AFTER it
+	// (`:87` the OOM killer recorder), and `started_service.go` reads the OOM recorder back out of
+	// `s.ctx` on the reload path:
+	//
+	//	oomRecorder := service.FromContext[*oomkiller.Recorder](s.ctx)
+	//	if oomRecorder != nil { oomRecorder.BeginReload(); defer oomRecorder.EndReload() }
+	//
+	// With an eager clone that lookup returns nil and the OOM killer's reload accounting silently stops
+	// running - a behaviour regression in the reload path, introduced by a change made to protect it.
+	// `daemon/started_service_registration_test.go` pins the ordering so it cannot come back.
+	//
+	// `ContextWithDefaultRegistry` returns the SAME context when a registry is already present (it is
+	// in all three callers today), and only creates one when there is none - in which case there was
+	// nothing to lose. Registering into a shared registry is what the callers themselves already do.
+	//
+	// # Lifetime
 	//
 	// `NewStartedService` is constructed once per application session (libbox's command server,
 	// `NewAttachedService`, boxdd), so this is one ledger per session and NOT one per reload. Every
 	// other Box-construction site - the CLI, `cmd_check`, `cmd_tools`, libbox configuration validation,
 	// every test harness - registers nothing, so those processes take the documented boundary: they
 	// build one Box for the life of the process and have no cross-Box issuance memory at all.
-	startedCtx := service.ExtendContext(options.Context)
+	startedCtx := service.ContextWithDefaultRegistry(options.Context)
 	fakeIPIssuanceLedger := adapter.NewFakeIPIssuanceLedger()
 	service.MustRegisterPtr[adapter.FakeIPIssuanceLedger](startedCtx, fakeIPIssuanceLedger)
 	s := &StartedService{
