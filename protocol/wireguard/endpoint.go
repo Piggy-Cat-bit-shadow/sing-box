@@ -82,6 +82,12 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		udpTimeout = C.UDPTimeout
 	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+	// A WireGuard endpoint reached through a `detour` is a NESTED tunnel: its own transport messages
+	// travel as UDP payloads inside the lower tunnel's inner IP packets. A lower tunnel that can prove
+	// its capacity therefore bounds this endpoint's inner MTU, and the bound is the same number every
+	// other protocol stacked on a tunnel uses - see nestedTunnelMTU for the arithmetic and for why an
+	// unknown detour leaves the configured value exactly as it was.
+	tunnelMTU := nestedTunnelMTU(ctx, logger, tag, options.Detour, options.MTU)
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
 		Context:         ctx,
 		Logger:          logger,
@@ -111,7 +117,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		},
 		Tag:        tag,
 		Name:       options.Name,
-		MTU:        options.MTU,
+		MTU:        tunnelMTU,
 		Address:    options.Address,
 		PrivateKey: options.PrivateKey,
 		ListenPort: options.ListenPort,
@@ -214,6 +220,61 @@ func (w *Endpoint) PortMTU() uint32 {
 	return w.endpoint.PortMTU()
 }
 
+// nestedTunnelMTU bounds a WireGuard endpoint's inner MTU by the capacity of the tunnel it is
+// reached through, and returns the value unchanged when that capacity is not provable.
+//
+// # The arithmetic, in the units each layer actually uses
+//
+// A nested WireGuard's OUTER datagram is one transport message, and it travels as a UDP payload
+// inside the detour's inner IP packet:
+//
+//	detour inner IP packet  48 + transport message  <=  detour inner MTU
+//	transport message       inner MTU + 32          (measured; see
+//	                                                 transport/wireguard/wg_framing_measurement_test.go)
+//
+// so
+//
+//	inner MTU  <=  detour inner MTU - 48 - 32
+//
+// which is exactly the ceiling the detour publishes for a UDP payload - `QuicPayloadCeiling`, the
+// same number MASQUE, Hysteria2 and TUIC size their own QUIC packets with. Using the shared helper
+// rather than a second derivation of the same arithmetic is the point: the 48 and the 32 are already
+// there, and a fourth copy of them would be a fourth thing to keep in step.
+//
+// # Why the padding does not change the bound
+//
+// The transport message is capped at the tunnel MTU before the tag is added, so a full-size inner
+// packet is not padded at all and no inner packet within the MTU produces a message above
+// `MTU + 32`; a consumer of this bound sends an inner packet of at most `ceiling - 48 - 32`, which is
+// one padding quantum below the cap. The measurement is in
+// transport/wireguard/wg_framing_measurement_test.go.
+//
+// # Why an unknown detour changes nothing
+//
+// "We could not find out" and "we found out it is 1280" are different facts, and substituting a
+// default for the first would silently resize every configuration whose detour this helper cannot
+// see - a group, a selector, an unknown outbound, or no manager at all. An endpoint without a detour
+// is not nested either, so it keeps exactly the value it had before this existed.
+func nestedTunnelMTU(ctx context.Context, logger log.ContextLogger, tag string, detour string, configured uint32) uint32 {
+	if detour == "" {
+		return configured
+	}
+	capacity := dialer.DetourPathCapacity(ctx, detour)
+	if !capacity.Known {
+		return configured
+	}
+	ceiling, hasCeiling := capacity.QuicPayloadCeiling()
+	if !hasCeiling {
+		return configured
+	}
+	if configured != 0 && configured <= ceiling {
+		return configured
+	}
+	logger.Info("wireguard[", tag, "] mtu ", configured, " is above what detour ", detour,
+		" can carry; using ", ceiling)
+	return ceiling
+}
+
 // WireGuard's transport-data framing, from the pinned module's own constants.
 //
 // # Where these numbers come from, in the pinned revision
@@ -238,10 +299,12 @@ func (w *Endpoint) PortMTU() uint32 {
 // # Why the fixed part is the whole budget, and the padding is not
 //
 // The padding is 0..15 bytes and depends on the payload's remainder modulo 16, so it is not a fixed
-// per-packet cost and cannot be added to a ceiling. It does not have to be: for any payload length D,
-// the padding takes the plaintext to the next multiple of 16, so the message length is in
-// [D+32, D+47], and a lower path that can carry D+47 bytes can certainly carry the real message. The
-// honest fixed claim is therefore D+32, which is what PortEncapOverhead returns.
+// per-packet cost and cannot be added to a ceiling. The full reason it does not have to be is MEASURED
+// rather than argued: the padded plaintext is capped at the tunnel MTU (`calculatePaddingSize` takes
+// the padded size and clamps it to the MTU), so the transport message for any inner packet within the
+// MTU is at most `MTU + 32`, and for a full-size packet it is exactly that. The measurement over every
+// inner length from 28 to the tunnel MTU is in transport/wireguard/wg_framing_measurement_test.go; the
+// honest fixed claim is D+32, which is what PortEncapOverhead returns.
 const (
 	// wireGuardTransportHeaderLength is device.MessageTransportHeaderSize: the transport-data header
 	// that precedes the payload in every packet.
@@ -276,9 +339,20 @@ const (
 //
 // # What it does not claim
 //
-// It is a ceiling on the FIXED overhead, not a measurement of a particular packet: the real message is
-// 0..15 bytes larger because of WireGuard's padding-to-16 (device.PaddingMultiple). A consumer must
-// treat it as the floor of the cost, which is what a ceiling needs.
+// It is a ceiling on the FIXED overhead, not a measurement of a particular packet: an individual
+// message can be up to 15 bytes larger than its payload plus this figure, because of WireGuard's
+// padding-to-16 (device.PaddingMultiple).
+//
+// The padding does NOT have to be added to the capacity, and that is a MEASURED result rather than an
+// inference from the rule: the padded plaintext is capped at the tunnel MTU, so a full-size inner
+// packet is not padded at all and no inner packet within the MTU can produce a transport message above
+// `MTU + 32`. See transport/wireguard/wg_framing_measurement_test.go, which captures the framing on a
+// real socket for every inner length from 28 to the tunnel MTU; the largest message measured over that
+// whole range is exactly `MTU + 32`.
+//
+// A consumer of the ceiling published here stops one step short of even that: it sends an inner packet
+// of at most `MTU - 48 - 32`, so its largest possible message is `ceil16(MTU-32) + 32`, which for a
+// tunnel MTU that is a multiple of 16 is the MTU itself.
 func (w *Endpoint) PortEncapOverhead() uint32 {
 	return wireGuardEncapOverhead
 }

@@ -125,6 +125,9 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if options.MTU == 0 {
 		options.MTU = 1408
 	}
+	if err = validateTunnelMTU(options.MTU, options.Address); err != nil {
+		return nil, err
+	}
 	return &Endpoint{
 		options:        options,
 		peers:          peers,
@@ -339,6 +342,51 @@ func (e *Endpoint) Start(postStart bool) error {
 	// The callback contract is strict (see sessionStateChanged): cheap, serialized per peer, and it
 	// must not call back into Device. It records state and nudges the recovery worker; nothing else.
 	wgDevice.SetSessionStateFunc(e.sessionStateChanged)
+	return nil
+}
+
+// minimumIPv6TunnelMTU is the smallest inner IP MTU over which IPv6 can be carried, from RFC 8200
+// section 5: every link on an IPv6 path must carry 1280 bytes, and a tunnel interface is a link.
+const minimumIPv6TunnelMTU = 1280
+
+// validateTunnelMTU refuses a tunnel whose MTU cannot carry the addresses it is configured with.
+//
+// # The two cases that must NOT be conflated
+//
+// An MTU below 1280 is not universally illegal - it is illegal FOR IPv6, and it is a legal special
+// case for an IPv4-only tunnel, where a small MTU is a legitimate way to fit a narrow path. A blanket
+// floor would reject those configurations, which is why this refuses exactly one combination: an IPv6
+// address configured on a tunnel whose MTU cannot carry IPv6.
+//
+// # What the refusal replaces
+//
+// Today such a configuration is accepted, and then fails per flow: sing-tun's dispatcher refuses an
+// IPv6 flow whose port reports an MTU below header.IPv6MinimumMTU
+// (flow_dispatch.go:502-505, `if packet.ipVersion == 6 && effectiveMTU != 0 && effectiveMTU <
+// header.IPv6MinimumMTU { return nil, createFlowUnsupported }`), so the operator sees a flow that is
+// "unsupported" rather than an MTU that is too small, and IPv4 through the same endpoint keeps
+// working - which makes the real cause very hard to see. The address the operator configured is
+// unreachable by construction, so the honest place to say so is construction.
+//
+// # Why the address list, and not the MTU alone
+//
+// `Address` is the tunnel's own address set, and it is what the endpoint hands to the device and
+// judges flows against. An IPv6 prefix there means this endpoint is expected to carry IPv6; no IPv6
+// prefix means it is an IPv4-only tunnel, whatever the MTU, and it is left exactly as it was.
+func validateTunnelMTU(mtu uint32, addresses []netip.Prefix) error {
+	if mtu >= minimumIPv6TunnelMTU {
+		return nil
+	}
+	for _, prefix := range addresses {
+		if !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
+			continue
+		}
+		return E.New("`mtu` ", mtu, " cannot carry the IPv6 address ", prefix.Addr(),
+			": an IPv6 path requires at least ", minimumIPv6TunnelMTU,
+			" bytes (RFC 8200 section 5), so the configured address is unreachable. ",
+			"Raise `mtu` to at least ", minimumIPv6TunnelMTU,
+			", or remove the IPv6 address to run an IPv4-only tunnel at this MTU")
+	}
 	return nil
 }
 

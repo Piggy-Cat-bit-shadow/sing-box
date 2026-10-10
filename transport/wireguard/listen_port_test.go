@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -12,9 +14,12 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service/pause"
+	wgDevice "github.com/sagernet/wireguard-go/device"
+	wgTun "github.com/sagernet/wireguard-go/tun"
 
 	"github.com/stretchr/testify/require"
 )
@@ -370,6 +375,51 @@ func TestEndpointWithoutADialerFailsClosed(t *testing.T) {
 	})
 }
 
+// A configured listen_port must be owned by Start itself, not by the tun device's up EVENT.
+//
+// # Why this test exists next to the socket tests above
+//
+// The defect was an ordering race, and a race is a poor thing to assert against: the production
+// stack device reports "up" from a goroutine, so whether that goroutine ran before or after the
+// device's IPC configuration depended on the scheduler. Measured against the unfixed code, the
+// socket tests above go red in roughly one run in five - enough to be a real detector, not enough to
+// be a proof.
+//
+// This test removes the scheduler from the question. The tun device it installs WITHHOLDS the up
+// event entirely, which is precisely the state the endpoint is in when Start returns before that
+// event has been observed - the state the old code returned in. The contract is then decidable: the
+// port must be held, and a port that cannot be bound must fail the start, without any event ever
+// being delivered.
+func TestListenPortDoesNotDependOnTheTunUpEvent(t *testing.T) {
+	port := freeUDPPort(t)
+	require.True(t, udpPortIsFree(t, port))
+
+	endpoint := newEventlessEndpoint(t, port)
+	require.NoError(t, endpoint.Start(false))
+	t.Cleanup(func() { _ = endpoint.Close() })
+
+	require.False(t, udpPortIsFree(t, port),
+		"listen_port=%d must be held once Start returns, even before the tun device's up event is "+
+			"delivered: the bind belongs to Start, not to the event reader", port)
+}
+
+// The same withheld event, with the port already taken: the failure must reach the caller.
+func TestOccupiedListenPortFailsClosedWithoutTheTunUpEvent(t *testing.T) {
+	holder, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	require.NoError(t, err)
+	defer holder.Close()
+	port := uint16(holder.LocalAddr().(*net.UDPAddr).Port)
+
+	endpoint := newEventlessEndpoint(t, port)
+	t.Cleanup(func() { _ = endpoint.Close() })
+
+	startErr := endpoint.Start(false)
+	require.Error(t, startErr,
+		"a listen_port that cannot be bound must fail the start whether or not the tun device has "+
+			"reported itself up; reporting success here leaves a dead endpoint that looks ready")
+	require.Nil(t, endpoint.device.Load(), "a failed start must not publish a device")
+}
+
 // freeUDPPort asks the kernel for an unused port and releases it.
 func freeUDPPort(t *testing.T) uint16 {
 	t.Helper()
@@ -413,6 +463,10 @@ const testListenPeerPublicKey = "yMfGxcTDwsHAv769vLu6ubi3trW0s7KxsK+urayrqqk="
 
 // newListenPortEndpoint builds the endpoint the way a real configuration does: the dialer is the
 // production DefaultDialer the outbound builds, the peer is an IP literal, and no detour is set.
+// The caller drives Initialize and Start, so it also sees their errors.
+//
+// The tun device is left as nil here and is installed by Initialize; callers that need a different
+// device call newEventlessEndpoint instead.
 func newListenPortEndpoint(t *testing.T, port uint16) *Endpoint {
 	t.Helper()
 	ctx := pause.WithDefaultManager(context.Background())
@@ -435,6 +489,86 @@ func newListenPortEndpoint(t *testing.T, port uint16) *Endpoint {
 	})
 	require.NoError(t, err)
 	return endpoint
+}
+
+// newEventlessEndpoint is newListenPortEndpoint with the tun device replaced by one that never
+// reports the up event. Initialize is run here because that is what installs a device.
+func newEventlessEndpoint(t *testing.T, port uint16) *Endpoint {
+	t.Helper()
+	endpoint := newListenPortEndpoint(t, port)
+	require.NoError(t, endpoint.Initialize(nil))
+	production := endpoint.tunDevice
+	endpoint.tunDevice = newEventlessDevice()
+	t.Cleanup(func() {
+		// The production device was built and then set aside; close it so the fixture does not leak
+		// a stack that was never started.
+		_ = production.Close()
+	})
+	return endpoint
+}
+
+// newEventlessDevice is a tun device that comes up WITHOUT ever reporting the up event.
+//
+// It models the exact state the endpoint was in when Start returned: the device has been started,
+// no event has been observed, and nothing has asked wireguard-go to bring itself up. Everything the
+// endpoint can still need is answered - the MTU, a read that blocks until Close, a closed event
+// channel - so a failure here can only come from the bind, never from the fixture.
+func newEventlessDevice() *eventlessDevice {
+	return &eventlessDevice{
+		events: make(chan wgTun.Event, 1),
+		closed: make(chan struct{}),
+	}
+}
+
+type eventlessDevice struct {
+	events    chan wgTun.Event
+	closed    chan struct{}
+	closeOnce sync.Once
+	address4  netip.Addr
+	address6  netip.Addr
+}
+
+func (d *eventlessDevice) File() *os.File { return nil }
+
+func (d *eventlessDevice) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+	<-d.closed
+	return 0, os.ErrClosed
+}
+
+func (d *eventlessDevice) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
+
+func (d *eventlessDevice) MTU() (int, error) { return 1420, nil }
+
+func (d *eventlessDevice) Name() (string, error) { return "eventless", nil }
+
+func (d *eventlessDevice) Events() <-chan wgTun.Event { return d.events }
+
+func (d *eventlessDevice) BatchSize() int { return 1 }
+
+func (d *eventlessDevice) Start() error { return nil }
+
+func (d *eventlessDevice) Close() error {
+	d.closeOnce.Do(func() {
+		close(d.closed)
+		close(d.events)
+	})
+	return nil
+}
+
+func (d *eventlessDevice) SetDevice(wgDevice *wgDevice.Device, peers []*wgDevice.Peer) {}
+
+func (d *eventlessDevice) Inet4Address() netip.Addr { return netip.MustParseAddr("10.0.0.1") }
+
+func (d *eventlessDevice) Inet6Address() netip.Addr { return netip.Addr{} }
+
+func (d *eventlessDevice) UpstreamPort() any { return nil }
+
+func (d *eventlessDevice) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return nil, E.New("eventless device does not dial")
+}
+
+func (d *eventlessDevice) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, E.New("eventless device does not listen")
 }
 
 // plainDialer is a working dialer that is NOT a dialer.UDPListener: it can dial and it can open a

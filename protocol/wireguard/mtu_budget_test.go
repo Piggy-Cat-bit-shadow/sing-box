@@ -51,10 +51,18 @@ import (
 // padding depends on the payload's remainder modulo 16, so it is not a fixed per-packet cost and must
 // not be clamped as one.
 //
-// # What is NOT established here
+// # What is established here, and where the wire measurement lives
 //
-// The wire size itself is NOT_MEASURED in this worktree. See TestWireGuardOverheadIsNotMeasuredHere for
-// the two harnesses that were attempted, why each failed, and exactly what remains unproven.
+// The framing arithmetic above is derived from the pinned module's constants, and it is now also
+// MEASURED: transport/wireguard/wg_framing_measurement_test.go drives two real devices over a real
+// loopback socket, captures every buffer the module hands the bind, and shows the transport message to
+// be `16 + min(ceil16(inner), tunnelMTU) + 16` for every inner length from 28 to the tunnel MTU - with
+// the maximum over that whole range exactly `tunnelMTU + 32`.
+//
+// That measurement is what settles the padding question: the padded plaintext is CAPPED at the tunnel
+// MTU, so the worst-case padding does not enter the conservative capacity. The arithmetic below and the
+// measurement must agree, and TestThePublishedOverheadIsTheTransportFraming pins the constants both
+// rest on.
 
 const (
 	// wireGuardPaddingMultiple is device.PaddingMultiple.
@@ -267,36 +275,45 @@ func TestTheComposedCeilingSubtractsTheWireGuardFraming(t *testing.T) {
 		"a WireGuard at the IPv6 minimum can still carry a QUIC handshake")
 }
 
-// TestBelowTheIPv6Minimum records what the fork does when the tunnel MTU is below 1280, so the behaviour
-// is stated rather than assumed, and so an existing configuration is accounted for.
+// TestBelowTheIPv6Minimum states what happens when the tunnel MTU is below 1280, in the two cases that
+// must not be conflated.
 //
-// # What the code does
+// # The prohibition, and the special case
 //
-// `PortMTU` returns the configured value verbatim with NO floor (transport/wireguard/port.go:17-19,
-// defaulted to 1408 at transport/wireguard/endpoint.go:125-127). sing-tun's flow dispatcher refuses an
-// IPv6 flow whose port reports an MTU below `header.IPv6MinimumMTU`:
+// 1280 is the smallest MTU an IPv6 path may have (RFC 8200 section 5). It is therefore a PROHIBITION on
+// IPv6 below 1280 and nothing more: an IPv4-only tunnel at 576 bytes is a legitimate configuration, and
+// a floor at 1280 would reject it. The two are decided by the address list, not by the MTU alone.
 //
-//	flow_dispatch.go:502-505
-//	  effectiveMTU := verdict.Port.PortMTU()
-//	  if packet.ipVersion == 6 && effectiveMTU != 0 && effectiveMTU < header.IPv6MinimumMTU {
-//	      return nil, createFlowUnsupported
-//	  }
+// # What the code does now
 //
-// and enforces the MTU for everything else at flow_dispatch.go:620: over-size IPv4 without DF is
-// fragmented, over-size with DF gets an ICMP Packet Too Big carrying `effectiveMTU`.
+//   - `PortMTU` still returns the configured value verbatim with NO floor (transport/wireguard/port.go,
+//     defaulted to 1408 at transport/wireguard/endpoint.go). Nothing is silently raised: an operator
+//     who asks for 1200 gets 1200, and the tunnel device enforces 1200.
 //
-// # The consequence for an existing configuration
+//   - An endpoint configured with BOTH an MTU below 1280 AND an IPv6 address is refused at
+//     construction (`transport/wireguard`'s validateTunnelMTU), naming the MTU and the address. The
+//     configured address is unreachable by construction, and the previous behaviour said so in the
+//     least useful place: sing-tun's dispatcher refuses an IPv6 flow whose port reports an MTU below
+//     `header.IPv6MinimumMTU`
 //
-// A WireGuard endpoint configured with `mtu` below 1280 and used for IPv6 fails at flow creation, which
-// surfaces as the flow being unsupported rather than as an MTU problem. IPv4 through the same tunnel
-// keeps working, fragmented as needed. Nothing in the configuration is rejected, nothing is clamped, and
-// no message names the MTU.
+//     flow_dispatch.go:502-505
+//     effectiveMTU := verdict.Port.PortMTU()
+//     if packet.ipVersion == 6 && effectiveMTU != 0 && effectiveMTU < header.IPv6MinimumMTU {
+//     return nil, createFlowUnsupported
+//     }
 //
-// # Why nothing here is changed
+//     so the operator saw "flow unsupported" while IPv4 through the same endpoint kept working, and
+//     nothing in the message named the MTU or the address.
 //
-// A floor can only be added by either refusing the configuration or silently raising the value, and both
-// change what a configuration does today. That is a product decision, recorded as
-// PRODUCT_DECISION_REQUIRED, not a silent edit.
+//   - The IPv4 path is unchanged at every one of those MTUs: `flow_dispatch.go:620` still fragments an
+//     over-size IPv4 packet without DF, and still answers an over-size one carrying DF with an ICMP
+//     Packet Too Big carrying `effectiveMTU`.
+//
+// # Why the refusal is the smaller change
+//
+// It refuses exactly one configuration: one that cannot work. Raising the MTU silently would give the
+// operator a tunnel reporting capacity it was never configured with, and a blanket floor would reject
+// legal IPv4-only tunnels. Both of those are recorded here as the alternatives that were NOT taken.
 func TestBelowTheIPv6Minimum(t *testing.T) {
 	// The fork's own default is above the floor, which is why a default configuration is unaffected.
 	const defaultTunnelMTU = 1408
@@ -328,57 +345,45 @@ func TestBelowTheIPv6Minimum(t *testing.T) {
 	}
 }
 
-// TestWireGuardOverheadIsNotMeasuredHere is the honest boundary, written as a test so it cannot be
-// mistaken for a coverage gap that was overlooked.
+// TestWireGuardOverheadIsMeasuredOnTheWire records the measurement that replaced this file's own
+// NOT_MEASURED note, and the corrected diagnosis of why the earlier harnesses failed.
 //
-// # What IS proven
+// # What was unproven, and is now proven
 //
-//   - the framing arithmetic above, derived from the pinned module's own constants and its own
-//     `calculatePaddingSize`;
-//   - that the capability composes through common/dialer into the ceiling a stacked protocol receives,
-//     with a test for the exact number (1328 for the default 1408-byte tunnel);
-//   - that the capability is answerable before Start, which is when it is consumed.
+// The wire size of a transport message is MEASURED, byte for byte, over every inner packet length the
+// contract allows, by transport/wireguard/wg_framing_measurement_test.go: two real wireguard-go
+// devices, a real handshake between them, a capture conn.Bind on the sending side and the module's own
+// standard bind on the receiving side, over a real loopback socket. The measured series is
+// `16 + min(ceil16(inner), tunnelMTU) + 16` for all of it, and the maximum over the whole contract
+// range is exactly `tunnelMTU + 32`.
 //
-// # What is NOT proven: the datagram size on the wire
+// # What that adds to the 32 published here
 //
-// Two harnesses were built and both failed for reasons outside MTU-03's control, and neither failure was
-// worked around by weakening the claim:
+// The padding-to-16 does NOT have to be added to the conservative capacity. The padded plaintext is
+// capped at the tunnel MTU, so a full-size inner packet is not padded at all, and no inner packet
+// within the MTU can produce a message above MTU+32. A consumer of the published ceiling does not even
+// reach that: its inner packet is at most MTU-32, so its largest possible message is the MTU itself
+// when the MTU is a multiple of 16. The measurement is what establishes this; the rule alone would
+// have left a reader free to charge another 15 bytes.
 //
-//  1. A UDP relay between two `box` endpoints, with each endpoint's peer address pointing at it. The
-//     relay observed ONE 148-byte handshake initiation and never a second peer, so no session came up.
-//     Cause: `Endpoint.Initialize` takes the `NewStdNetBind` branch whenever its dialer implements
-//     `dialer.UDPListener` - and `common.Cast` looks THROUGH `Upstream()`, so the production
-//     `DefaultDialer` reaches a `dialer.UDPMapping` that implements it. A production endpoint therefore
-//     binds a LISTENING socket and sends its handshake from an UNCONNECTED one, so redirecting its peer
-//     address does not redirect the socket. `box.Options` offers no way to inject a dialer, which this
-//     test module cannot work around.
+// # The corrected diagnosis of the earlier failure
 //
-//  2. Two `transport/wireguard` endpoints driven directly, with a recording dialer. Recording the
-//     LISTENING endpoint is impossible for the same reason: `StdNetBind` opens its own sockets
-//     (`conn/bind_std.go` Open -> listenNet) and never calls the dialer. Recording the DIALING endpoint
-//     works - it produced `[148]`, the client's handshake initiation - but no session ever came up,
-//     because a probe proved the listening endpoint never bound its reserved port:
+// The note this test replaces attributed the "the reserved listen_port was FREE" observation to
+// `StdNetBind.Open` or to this fork's `BindUpdate` plumbing. Measured, both were wrong: the port was
+// bound a moment LATER, by the asynchronous UP transition (wireguard-go opens the bind from
+// `Up` -> `BindUpdate`, and that transition arrives on the tun device's event channel), so a probe
+// taken the instant `Start` returned saw the port before the socket existed - and a port that was
+// genuinely already taken failed the bind inside that goroutine, with no error to the caller. That is
+// WG-01, it is fixed in transport/wireguard/endpoint.go, and it is why the endpoint harness can now
+// come up at all.
 //
-//     the reserved port was FREE after both endpoints started: the server bind did NOT listen on it
-//
-//     `listen_port` IS put into the device's IpcSet (`transport/wireguard/endpoint.go:75`), so that
-//     failure is in the pinned `StdNetBind.Open` path (it opens udp4 and then udp6 on the same port,
-//     `bind_std.go:182-217`, and a udp6 bind failure is reported up a goroutine that swallows it) or in
-//     this fork's `BindUpdate` plumbing. It is reported, not worked around, and it is a separate item:
-//     it affects any listener, not only MTU sizing.
-//
-// # The consequence, stated plainly
-//
-// The 32-byte figure rests on the pinned implementation's source, quoted line by line above, and NOT on
-// a measurement in this worktree. The arithmetic that consumes it - the composition in common/dialer and
-// the ceiling a stacked protocol receives - IS tested. If the pinned module's framing ever changes, this
-// file's first test fails on the constants it is derived from, but only a wire measurement would catch a
-// change in the SEND PATH that left those constants alone.
-func TestWireGuardOverheadIsNotMeasuredHere(t *testing.T) {
-	t.Log("MTU-03 wire measurement: NOT_MEASURED in this worktree. " +
-		"Reason: both harnesses that could observe it are blocked by how the listening bind obtains its " +
-		"socket (StdNetBind opens its own; a dialer cannot intercept it) and, in the direct-endpoint " +
-		"harness, by the listening endpoint failing to bind the reserved listen_port at all. " +
-		"Proven instead: the framing constants from the pinned source, the composition through " +
-		"common/dialer, and the ceiling a stacked protocol receives (1328 for the default 1408 tunnel).")
+// The consequence for THIS file: the 32-byte figure no longer rests on the pinned source alone. The
+// source derivation below still stands, and the measurement now agrees with it.
+func TestWireGuardOverheadIsMeasuredOnTheWire(t *testing.T) {
+	t.Log("MTU-01 wire measurement: MEASURED in transport/wireguard/wg_framing_measurement_test.go. " +
+		"Two real devices, a real handshake, an injectable capture Bind, a real loopback socket: the " +
+		"transport message is 16 + min(ceil16(inner), tunnelMTU) + 16 for EVERY inner length from 28 " +
+		"to the tunnel MTU, the maximum is exactly tunnelMTU+32, and the padding therefore does not " +
+		"enter the conservative capacity. The earlier NOT_MEASURED harness failed on WG-01 (the " +
+		"listening endpoint's port was not bound when Start returned), not on StdNetBind.")
 }

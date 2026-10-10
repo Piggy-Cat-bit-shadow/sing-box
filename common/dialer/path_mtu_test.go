@@ -452,6 +452,66 @@ func TestTheCapabilityIsAnswerableBeforeStart(t *testing.T) {
 	require.EqualValues(t, 1280, capacity.InnerMTU)
 }
 
+// TestACeilingIsAConsumerContractNotAWireGuarantee records the one consumer in this tree that cannot
+// apply the ceiling, and the arithmetic that makes it visible.
+//
+// # The contract this helper can and cannot keep
+//
+// `QuicPayloadCeiling` answers "what is the largest UDP payload that fits". Whether that number reaches
+// the wire is decided by the protocol that consumes it, one layer down, inside its QUIC
+// implementation's own configuration - so a ceiling that is computed and then overridden is not a
+// ceiling at all. That is worth pinning here rather than discovering later, because the number this
+// helper returns looks identical in both cases.
+//
+// # The consumer that overrides it: hysteria2 with ChromeParrot
+//
+// hysteria2 enables ChromeParrot by default. The pinned quic-go forces
+// `initialPacketSize = chromeInitialPacketSize` whenever `Config.ChromeParrot` is set
+// (config.go:105-125, `chrome_parrot.go:19 chromeInitialPacketSize = 1250`), so an explicit
+// `initial_packet_size` is discarded. The measurement is protocol/hysteria2's
+// chrome_parrot_first_datagram_test.go: every configured value, 1232 included, produces a 1250-byte
+// first datagram.
+//
+// The consequence is arithmetic and it is stated in the units of each layer: 1250 is a UDP PAYLOAD, so
+// over IPv6 it is 1250 + 40 + 8 = 1298 bytes on the wire, which does not fit a 1280-byte path - the
+// exact case a proven 1280 ceiling exists for. Over IPv4 it is 1278 bytes, which does.
+//
+// # Why this is recorded and not fixed here
+//
+// There is no field of the pinned QUIC configuration that can lower the first flight after
+// ChromeParrot's override: `Conn.maxPacketSize()` returns `config.InitialPacketSize` on the client
+// while MTU discovery is inactive (connection.go:2905-2920) and that value is the overridden one;
+// `MaxPacketBufferSize` is a buffer bound and 1250 is inside it. The only lever in this tree is
+// disabling ChromeParrot, which abandons the fingerprint the hysteria2 outbound deliberately presents.
+// That is a product decision with a wire-visible cost either way, so the measurement and the
+// arithmetic are pinned and the item is reported BLOCKED on the pinned library, not worked around.
+func TestACeilingIsAConsumerContractNotAWireGuarantee(t *testing.T) {
+	// The number a proven 1280-byte tunnel hands to a stacked QUIC protocol.
+	ceiling, hasCeiling := PacketOverheadCeiling(1280, IPFamilyUnknown, 0)
+	require.True(t, hasCeiling)
+	require.EqualValues(t, 1232, ceiling)
+
+	// The number the Chrome-parroting client actually sends, from the pinned library's own constant.
+	const chromeParrotInitialPacketSize = 1250
+
+	require.Greater(t, chromeParrotInitialPacketSize, int(ceiling),
+		"the override is LARGER than the ceiling, which is why the ceiling does not hold")
+	require.EqualValues(t, ipv4HeaderLength+udpHeaderLength+chromeParrotInitialPacketSize, 1278,
+		"over IPv4 the overridden payload is 1278 bytes on an IP path, which a 1280-byte path carries")
+	require.EqualValues(t, ipv6HeaderLength+udpHeaderLength+chromeParrotInitialPacketSize, 1298,
+		"over IPv6 it is 1298 bytes, which a 1280-byte path does NOT carry - so the ceiling is not "+
+			"effective for this consumer over IPv6, and 1232 must not be reported as if it were")
+	require.LessOrEqual(t, ipv4HeaderLength+udpHeaderLength+int(ceiling), 1280,
+		"the ceiling itself does fit, in both families, which is what makes the override the whole "+
+			"of the discrepancy")
+
+	// And the layer rule the whole file turns on, restated where the counter-example is: the ceiling
+	// is a UDP payload. Treating it as an IP packet size would compare it against the wrong thing.
+	require.EqualValues(t, 1232, 1280-48)
+	require.NotEqual(t, 1280, int(ceiling)+ipv6HeaderLength+udpHeaderLength-48,
+		"a payload and a packet are different units and must never be substituted for each other")
+}
+
 // TestAnUnknownDetourNeverBecomesAConstructionError restates the rule that makes this helper safe to
 // call: every failure mode returns "unknown" and NO error, so an outbound whose detour topology the
 // helper cannot see keeps working exactly as it did.
