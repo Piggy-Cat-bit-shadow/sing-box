@@ -435,48 +435,87 @@ func (s PathStatus) Ready() bool {
 
 // StatusView reads the status of paths, and it is the only stateful thing in this file.
 //
-// # The two locks, and why there are two
+// # The receiver contract: a nil *StatusView is a legal value
 //
-// `access` guards the view's own lifetime flag. `walk` serialises the WALKS, and it is not an
-// optimisation - it is a correctness requirement this file's concurrency test found under `-race`:
+// `NewStatusView` returns a `*StatusView`, and a `*StatusView` that is nil is a value this type
+// accepts: a field nobody assigned, a box that did not build one, or a typed nil stored in an
+// interface. Every method below is safe on it. `SnapshotStatus` answers UNKNOWN with a reason,
+// `Connected` reports false and `Disconnect` does nothing, because there is no object graph behind an
+// absent view and reporting one would be exactly the lie this file exists to prevent.
 //
-//	WARNING: DATA RACE
-//	Read at 0x00c00012e058 by goroutine 89:  physicalpath.Build()  physicalpath.go:359
-//	Previous write at 0x00c00012e058 by goroutine 88:  Build.func2()  physicalpath.go:367
+// It is stated as a contract rather than defended by a check because the check on its own is worse
+// than nothing:
 //
-// `Resolver` carries per-walk state - the decision record, and the network pin `Build` saves and
-// restores - so ONE Resolver answering two walks at the same time TEARS. That is the model's business and
-// is being fixed where it lives; what this view can do is not expose it, so it holds `walk` across the
-// whole snapshot: the `Build` AND the per-hop reads that follow, because a hop's report is only
-// meaningful alongside the path it was read for.
+//	if v != nil && !v.Connected() { ... }
+//	v.walk.Lock()          // reached even when v == nil
 //
-// # Why holding a lock across a call into a hop does not risk a deadlock
+// reads to every later reader as "nil is handled" and then dereferences nil one line further down.
+// The reason must also never be a silent empty PathStatus: an empty one has no unknowns and no hops,
+// which reads as "a path was walked and nothing was wrong with it".
 //
-// Because of a property of this file rather than a hope: the only methods called under `walk` are
-// `Build`, which is the model's own, and the four read-only reporter interfaces declared here. None of
-// them can call back into a StatusView - a reporter held no reference to one when it was configured, and
-// nothing here hands it one - so `walk` is not re-entered. The cost is that two concurrent snapshots of
-// the SAME view serialise; two different views do not, and a diagnostic is not a hot path.
+// # The one lock, and what it is deliberately NOT
+//
+// `access` guards ONE bool: whether this view has been disconnected. It is held for the two
+// instructions that read or write that bool and for nothing else, so it is never held across a call
+// into a hop.
+//
+// There is deliberately NO lock around the walk. There was one, and it was a historic artefact: it
+// was added while `Resolver` kept the per-walk state - the decision record and the network pin - on
+// the Resolver itself, so one Resolver answering two concurrent walks tore. That state now lives in
+// the `walkScope` `Build` creates and drops, and `Build` writes nothing the caller can see. The lock
+// therefore protected nothing that this package owns; what it did do was serialise snapshots that
+// share no writable state, and hold a `sync.Mutex` across calls into outbound adapters this package
+// does not control.
+//
+// That last part was not a cost, it was a defect. `SnapshotStatus` calls `StatusState`,
+// `StatusLastError`, `StatusNetworkGeneration`, `StatusResourceGeneration` and `PortMTU` on objects
+// supplied from outside this package, and nothing in an interface stops one of them from calling back
+// into the view that is reading it - an adapter that also reports its own path is the obvious case.
+// `sync.Mutex` is not reentrant, so a lock held across those calls is a self-deadlock waiting for a
+// legal implementation. `TestAReentrantReporterDoesNotDeadlockTheView` is that experiment, and
+// `TestOneViewsSnapshotsDoNotSerialiseBehindEachOther` is the measurement that the lock was doing no
+// work worth that risk.
 //
 // # Re-entrancy
 //
-// SnapshotStatus may be called from any goroutine. It may NOT be called from inside a hop's reporter
-// implementation: that is a re-entrant acquisition of `walk` and would deadlock. It is stated because it
-// is the one way to misuse this type, not because a reporter would ever want to.
+// SnapshotStatus may be called from any goroutine, and - since the walk lock was removed - it may
+// also be called from inside a hop's reporter implementation. Such a call performs its own walk; the
+// state a walk needs belongs to the call, so the inner one neither sees nor disturbs the outer one.
+//
+// # Disconnect, and what a concurrent snapshot is allowed to answer
+//
+// The rule, stated once, because "Disconnect raced a snapshot" has to have one answer:
+//
+//  1. Disconnect publishes the disconnected generation and returns. It NEVER waits for a snapshot
+//     that is in flight: a snapshot's reporter may be slow, blocked on its own I/O, or wedged, and
+//     Disconnect runs on the teardown path where blocking is not recoverable.
+//  2. A snapshot reads the generation BEFORE it observes anything, and reads it AGAIN after it has
+//     finished observing. Both reads must find the view connected for the observed path to be
+//     published.
+//  3. Therefore a call that STARTS after `Disconnect` returned reports disconnected, and a call
+//     whose OBSERVATION straddled the teardown is discarded rather than presented as the current
+//     path.
+//
+// The second read is the half a pre-check alone cannot provide. A walk that began before the teardown
+// and finished after it has read some hops from the live graph and some from a graph being
+// dismantled; publishing that mixture is precisely the "state of a dead object graph presented as
+// current" that Disconnect exists to make unrepresentable. Discarding costs one diagnostic read and
+// says something true.
+//
+// A PathStatus a caller already holds is unaffected: it is a value, and a later teardown cannot
+// rewrite it.
 type StatusView struct {
 	access sync.Mutex
 	// disconnected is set by Disconnect. It exists so a view that was detached from a closed box reports
 	// that fact rather than reporting the last state it saw, which would be a PathStatus of a dead object
 	// graph presented as current.
 	disconnected bool
-
-	// walk serialises snapshots. See the type comment: it exists because one Resolver cannot serve two
-	// concurrent walks without tearing.
-	walk sync.Mutex
 }
 
 // NewStatusView builds a view. It allocates a mutex and nothing else: no goroutine, no timer, no
 // registry registration.
+//
+// A caller that never calls it still has a usable view: see the receiver contract on StatusView.
 func NewStatusView() *StatusView {
 	return &StatusView{}
 }
@@ -490,18 +529,66 @@ func NewStatusView() *StatusView {
 // that kept reading would report a closed tunnel as the current state. Disconnect makes that
 // unrepresentable - the next PathStatus answers "this view is disconnected", which is true.
 //
-// It is safe to call more than once and from any goroutine.
+// It is safe to call more than once, from any goroutine, and on a nil receiver, which it treats as
+// already disconnected.
+//
+// # It does not wait for anything
+//
+// This call publishes one bool and returns. It does NOT wait for snapshots that are in flight, and it
+// must never be changed to: a snapshot may be inside a reporter that is slow or wedged, and Disconnect
+// runs on the teardown path. The linearisation rule in the StatusView comment is what makes not
+// waiting correct - the in-flight snapshot discards its own observation when it finishes.
 func (v *StatusView) Disconnect() {
+	if v == nil {
+		return
+	}
 	v.access.Lock()
 	defer v.access.Unlock()
 	v.disconnected = true
 }
 
 // Connected reports whether the view is still attached to a live object graph.
+//
+// A nil receiver reports false: it is attached to nothing, and true would be a claim it cannot support.
 func (v *StatusView) Connected() bool {
+	if v == nil {
+		return false
+	}
 	v.access.Lock()
 	defer v.access.Unlock()
 	return !v.disconnected
+}
+
+// absentStatus is the answer a view that does not exist returns.
+//
+// It is an UNKNOWN and not an empty PathStatus on purpose. An empty PathStatus has no unknowns and no
+// hops, so it reads as "a path was walked and nothing was wrong with it"; nothing was walked, and a
+// caller must be told that rather than handed a clean-looking blank.
+func absentStatus(root TagOrOutbound, options Options) PathStatus {
+	return PathStatus{
+		Root:    root.Tag,
+		Network: options.Network,
+		Unknowns: []Unknown{{
+			Node:     root.Tag,
+			Position: -1,
+			Reason: "there is no status view here: the receiver is nil, so no object graph was read and " +
+				"no path can be reported; this is an absent answer and not a path that was found healthy",
+		}},
+	}
+}
+
+// disconnectedStatus is the answer a view that has been detached from its object graph returns.
+func disconnectedStatus(root TagOrOutbound, options Options) PathStatus {
+	return PathStatus{
+		Root:    root.Tag,
+		Network: options.Network,
+		Unknowns: []Unknown{{
+			Node:     root.Tag,
+			Position: -1,
+			Reason: "the status view has been disconnected from the object graph it described, so it can " +
+				"no longer report current state",
+		}},
+	}
 }
 
 // SnapshotStatus reads the status of one path.
@@ -510,24 +597,24 @@ func (v *StatusView) Connected() bool {
 // view and the model cannot disagree about the ORDER, the TAGS or the UNKNOWNS of a path. Nothing here
 // re-derives an index: Hops[0] is nearest this device because the model says so, and Entry()/Exit()
 // name the two ends.
+//
+// The two generation reads and the rule they implement are stated on the StatusView type. In short: the
+// view is read before anything is observed and again after, and an observation that straddled a
+// teardown is discarded. Neither read is taken while anything else is locked, so a snapshot never holds
+// a lock across a call into a hop and a reporter may call back in.
 func (v *StatusView) SnapshotStatus(resolver *Resolver, root TagOrOutbound, options Options) PathStatus {
-	if v != nil && !v.Connected() {
-		return PathStatus{
-			Root:    root.Tag,
-			Network: options.Network,
-			Unknowns: []Unknown{{
-				Node:     root.Tag,
-				Position: -1,
-				Reason:   "the status view has been disconnected from the object graph it described, so it can no longer report current state",
-			}},
-		}
+	if v == nil {
+		// The receiver contract: an absent view answers UNKNOWN. See absentStatus for why it is not
+		// simply an empty answer.
+		return absentStatus(root, options)
 	}
 
-	// The walk lock is taken for the WHOLE snapshot, the Build and the per-hop reads together. See the
-	// type comment: one Resolver cannot serve two concurrent walks, and a hop report is only meaningful
-	// alongside the path it was read for.
-	v.walk.Lock()
-	defer v.walk.Unlock()
+	// The generation read on the way IN. It is this snapshot's linearisation point with respect to a
+	// teardown that has already happened, and it is also what keeps the walk off an object graph that
+	// may have been dismantled.
+	if !v.Connected() {
+		return disconnectedStatus(root, options)
+	}
 
 	path, err := Build(resolver, root, options)
 	if err != nil {
@@ -561,6 +648,14 @@ func (v *StatusView) SnapshotStatus(resolver *Resolver, root TagOrOutbound, opti
 		status.Exit = exit.DeclaredTag
 	}
 	status.Failure = firstFailure(status.Hops)
+
+	// The generation read on the way OUT. Everything above observed the object graph, and an
+	// observation that stretched across a teardown may be half live and half dismantled - the hops
+	// before the teardown read from one graph and the hops after it from another. Such an answer is
+	// discarded rather than published as current. See the StatusView comment for the full rule.
+	if !v.Connected() {
+		return disconnectedStatus(root, options)
+	}
 	return status
 }
 
@@ -568,7 +663,22 @@ func (v *StatusView) SnapshotStatus(resolver *Resolver, root TagOrOutbound, opti
 //
 // It uses the model's own lookup, so a decision that names a member which no longer resolves is reported
 // as a reason rather than silently dropped.
+//
+// The read is contained: see recoverValue for the panic policy.
 func controlNode(resolver *Resolver, tag string) ControlNode {
+	var node ControlNode
+	if panicked, didPanic := recoverValue(func() { node = readControlNode(resolver, tag) }); didPanic {
+		return ControlNode{
+			Tag: tag,
+			Reason: "reading this control node panicked, so no decision can be reported for it (" +
+				panicDetail(panicked) + ")",
+		}
+	}
+	return node
+}
+
+// readControlNode is controlNode's body, with the containment lifted out of the way of the logic.
+func readControlNode(resolver *Resolver, tag string) ControlNode {
 	node := ControlNode{Tag: tag}
 	outbound, loaded := resolver.Lookup(tag)
 	if !loaded {
@@ -602,6 +712,17 @@ func controlNode(resolver *Resolver, tag string) ControlNode {
 }
 
 // hopStatus reads one hop. It calls only methods that are reads of state the owner already holds.
+//
+// # Panics are contained, and the answer is UNKNOWN
+//
+// The methods it calls belong to an object this package does not own, and an adapter's status method is
+// exactly the kind of code that can panic - a nil map, a closed channel, a half-initialised field after
+// a failed start. A read-only diagnostic that takes down its caller is worse than one that reports it,
+// so the panic is contained; and a hop whose state could not be read is UNKNOWN, never READY, and never
+// a silent blank. A hop that claimed READY a microsecond before it panicked has not been read, and its
+// claim is not evidence.
+//
+// This is the same containment `Build` applies to a malformed graph, for the same reason.
 func (r *Resolver) hopStatus(lookup func(tag string) (adapter.Outbound, bool), hop Hop) HopStatus {
 	status := HopStatus{
 		Position:   hop.Position,
@@ -631,9 +752,55 @@ func (r *Resolver) hopStatus(lookup func(tag string) (adapter.Outbound, bool), h
 		return status
 	}
 
-	readHopState(&status, object)
-	readHopMTU(&status, object)
+	if panicked, didPanic := recoverValue(func() {
+		readHopState(&status, object)
+		readHopMTU(&status, object)
+	}); didPanic {
+		// The half-read fields are dropped with the rest: a claim, or an error, that was read before the
+		// panic is not a complete reading of the hop, and reporting it next to "panicked" would invite
+		// exactly the "it said ready" conclusion the policy forbids.
+		return HopStatus{
+			Position:   hop.Position,
+			Tag:        hop.DeclaredTag,
+			LeafTag:    hop.ResolvedLeafTag,
+			Type:       hop.Type,
+			Endpoint:   hop.IsEndpoint,
+			SelectedBy: hop.ControlOwner,
+			Readiness:  ReadinessUnknown,
+			Reason: "this hop panicked while it was being read, so nothing about its state was " +
+				"established (" + panicDetail(panicked) + ")",
+		}
+	}
 	return status
+}
+
+// recoverValue runs one read of code this package does not own and reports what it panicked with.
+//
+// It is the panic policy of this file, stated once: a reporter is an interface implementation supplied
+// from outside, a diagnostic must not take down the caller that asked it a question, and it must not
+// turn a failure into a healthy answer either. So a panic is CONTAINED and REPORTED - the caller gets an
+// UNKNOWN whose reason names what happened - rather than propagated or swallowed.
+//
+// The panic value is returned raw and rendered by panicDetail OUTSIDE this deferred frame, so a value
+// whose own String method misbehaves fails loudly instead of inside a recover where it would be lost.
+func recoverValue(read func()) (panicked any, didPanic bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicked = recovered
+			didPanic = true
+		}
+	}()
+	read()
+	return nil, false
+}
+
+// panicDetail renders a recovered panic value as one redacted line.
+//
+// Redaction is not optional here: a panic value is arbitrary text chosen by the code that panicked, and
+// the moment a component panics is the moment it is most likely to be quoting what it was doing - a
+// URL, a header, a key. A containment field that is not redacted turns containment into a new leak.
+func panicDetail(panicked any) string {
+	return redactDetail(E.New("", panicked).Error())
 }
 
 // readHopState fills the lifecycle and error fields from the optional reporters.
@@ -832,6 +999,9 @@ func (f HopFailure) String() string {
 //	user:password@host        URL userinfo, which is how a proxy password leaks
 //	scheme://...?...token=... query parameters named like secrets
 //	password= / token= / ...  key-value forms
+//	password="..." / "password":"..."   the quoted value, and the quoted key of a JSON body
+//	access_token / db_password          a longer name ENDING in a keyword, after `_`
+//	Authorization: Bearer ...           the header, whose WHOLE value goes, scheme included
 //	BEGIN ... PRIVATE KEY     PEM bodies, which are multi-line
 //
 // # What it does NOT do
@@ -895,7 +1065,11 @@ func redactDetail(detail string) string {
 func authorizationHeaderAt(detail string, index int) (string, int) {
 	if index > 0 {
 		previous := rune(detail[index-1])
-		if unicode.IsLetter(previous) || unicode.IsDigit(previous) || previous == '_' {
+		if unicode.IsLetter(previous) || unicode.IsDigit(previous) {
+			// The same boundary rule secretKeywordAt uses, and it must match: an `Authorization` that
+			// starts after an underscore is still an Authorization header, and it MUST take this path
+			// rather than the keyword path. The keyword path stops at the first space, which would
+			// redact the word "Bearer" and leave the credential itself sitting in the message.
 			return "", 0
 		}
 	}
@@ -939,10 +1113,31 @@ var secretKeywords = []string{
 //
 // It returns the literal prefix to emit (the keyword and its separator, so the message still reads) and
 // the length to skip.
+//
+// # The four shapes it must recognise
+//
+// The bare form is the easy one, and it was the only one this used to match:
+//
+//	password=hunter2          key=value
+//	password: hunter2         key: value
+//
+// Three more are ordinary renderings of the same fact, and a backstop that misses them is a backstop
+// against the tidy case only:
+//
+//	password="hunter2"        the value is quoted, which is what an ini or env rendering does
+//	"password":"hunter2"      the KEY is quoted, which is what a JSON body echoed into an error does
+//	access_token=ya29...      the key is a longer name ENDING in a keyword
+//
+// The last one is why the boundary rule is about the SEPARATOR and not about being a whole word. The
+// keyword has to start at the beginning of a name, or after a character that cannot be part of one -
+// which is what keeps `mypassword=` readable - and that character set includes `_`, because
+// `access_token`, `refresh_token`, `db_password` and `user_password` are one name, not two.
 func secretKeywordAt(detail string, index int) (string, int) {
 	if index > 0 {
 		previous := rune(detail[index-1])
-		if unicode.IsLetter(previous) || unicode.IsDigit(previous) || previous == '_' {
+		if unicode.IsLetter(previous) || unicode.IsDigit(previous) {
+			// A keyword that continues a word is not a key: `mypassword=` is somebody else's field.
+			// `_` is deliberately NOT in this set - see the shape list above.
 			return "", 0
 		}
 	}
@@ -953,6 +1148,13 @@ func secretKeywordAt(detail string, index int) (string, int) {
 			continue
 		}
 		after := rest[len(keyword):]
+		// A quoted key, as a JSON body renders one: the closing quote of the key sits between the
+		// keyword and its separator.
+		quotedKey := false
+		if strings.HasPrefix(after, `"`) || strings.HasPrefix(after, `'`) {
+			quotedKey = true
+			after = after[1:]
+		}
 		separator := ""
 		switch {
 		case strings.HasPrefix(after, "="):
@@ -965,11 +1167,31 @@ func secretKeywordAt(detail string, index int) (string, int) {
 			continue
 		}
 		valueStart := len(keyword) + len(separator)
+		if quotedKey {
+			valueStart++
+		}
 		value := rest[valueStart:]
+		// A quoted VALUE, which is how an ini or env rendering writes one. Skipping the opening quote is
+		// what makes the scan below stop at the closing one instead of at the opening one, which would
+		// find an empty value and leave the secret in place.
+		for len(value) > 0 && value[0] == ' ' {
+			valueStart++
+			value = value[1:]
+		}
+		if strings.HasPrefix(value, `"`) || strings.HasPrefix(value, `'`) {
+			valueStart++
+			value = value[1:]
+		}
 		end := len(value)
 		for offset, character := range value {
 			if character == ' ' || character == '\t' || character == '\n' || character == '\r' ||
 				character == ',' || character == '&' || character == '"' {
+				// These terminators are the ones that separate one field from the next in the shapes
+				// above. Nothing else is a terminator on purpose: a character that merely LOOKS like a
+				// delimiter inside a secret would truncate the redaction and leave the tail of the
+				// secret in the message, which is a leak rather than an over-redaction. A closing
+				// single quote is not a terminator for exactly that reason - the scan runs past it and
+				// takes it with the value.
 				end = offset
 				break
 			}
@@ -982,6 +1204,3 @@ func secretKeywordAt(detail string, index int) (string, int) {
 	}
 	return "", 0
 }
-
-// errNoStatus keeps the exceptions import meaningful for the one place this file constructs an error.
-var _ = E.New

@@ -652,12 +652,19 @@ func TestAnEmptyPathIsNotReady(t *testing.T) {
 // Concurrency and re-entrancy
 // ---------------------------------------------------------------------------
 
-// TestConcurrentSnapshotsDoNotBlockEachOther is the lock-discipline test, and it runs under -race.
+// TestConcurrentSnapshotsDoNotBlockEachOther is the smoke test of the lock discipline, and it runs
+// under -race.
 //
-// The view holds one mutex and never holds it across a call into a hop, so N goroutines taking snapshots
-// of the same path must all finish without serialising behind each other's hops. The fixture's hops do
-// real work under their own lock, which is what would deadlock if the view held its lock across the
-// call.
+// # What this test does NOT prove, and where that is proved instead
+//
+// It asserts that concurrent snapshots all return a well-formed path; it does NOT prove they overlap,
+// because a serialising implementation would satisfy it just as well. It used to claim otherwise, in a
+// comment that also claimed the view "never holds it across a call into a hop" while the code held a
+// mutex across every hop read. Both claims are now made by tests that can fail:
+//
+//	TestOneViewsSnapshotsDoNotSerialiseBehindEachOther   overlap, measured by a barrier inside a hop
+//	TestAReentrantReporterDoesNotDeadlockTheView         reentrancy, the cost of a lock held there
+//	TestOneResolverSeveralViewsUnderRace                 the shared structure, under the race detector
 func TestConcurrentSnapshotsDoNotBlockEachOther(t *testing.T) {
 	exit := &reportingLeaf{testLeaf: *dualLeaf("exit"), reportsState: true, state: LifecycleStateReady}
 	entry := &reportingLeaf{
