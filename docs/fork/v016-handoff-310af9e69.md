@@ -1210,6 +1210,18 @@ still usable, and returned the package's goroutine census to its baseline. Clean
 `-race -count=3`, and in the full package. Detector:
 `route/interface_churn_cost_test.go` (`TestRepeatedInterfaceChangesCostBoundedWorkAndAreReversible`).
 
+**One caveat on that `maxSeen` figure, because it was measured rather than assumed** (`4cdb250b0`):
+removing the settle-wait from the loop, so the transitions DO overlap, leaves the test GREEN. A newer
+notification cancels the in-flight update's context, so only one transition reaches the reset at all —
+the serialisation is guaranteed twice, by cancellation first and by `resetRunAccess` behind it. The
+churn test's assertion is therefore meaningful only against the second, which
+`TestConcurrentResetNetworkIsSerialized` exercises directly; what the churn adds is that the guarantee
+still holds when the path is driven end to end 25 times through the real notifier. A test that would have
+staged two live updates was written and removed rather than kept: staged through the production decision
+hook it deadlocks (that hook runs while `interfaceUpdateAccess` is held, and the second notification
+needs the same lock), and staged through the pre-lock gate the second notification cancels the first.
+There is no interleaving here in which two transitions tear down the same network state concurrently.
+
 **Two harness falsifications worth carrying forward**, because a green suite built on them would mean
 nothing:
 
