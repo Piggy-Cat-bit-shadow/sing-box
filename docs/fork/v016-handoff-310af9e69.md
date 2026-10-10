@@ -554,7 +554,7 @@ untouched by any of these changes. It should be made load-independent or marked 
 it describes, and that is the whole of the wall.
 
 ```text
-ORIGIN_TESTING = 2c4240231e804632d587d69f80cb00b104f69663   LOCAL == ORIGIN
+ORIGIN_TESTING = 12c0a9e6032675d45db4ee3864fc3d404ade6a84   LOCAL == ORIGIN
 COMMITS FROM 26d2c4d9f, all [skip ci]:
   1f6b7b85d  PATH-01: number every route in packet order, from the frame that owns it
   d7d542d0b  the redaction backstop also matches a spaced assignment (§10.5)
@@ -562,7 +562,20 @@ COMMITS FROM 26d2c4d9f, all [skip ci]:
   f170a1907  this section (docs)
   eb202f996  an echoed hop is charged to the node budget; the nested shape pinned
   2c4240231  a truncated route is numbered too, so both APIs order it the same way (§10.7)
-common/physicalpath = 1 red, and it is UNSATISFIABLE (§10.3) - not an unfinished fix
+  c216688f9  dialer: a race with no winner must end when both sides have reported (§10.8)
+  032ed4947  the dialer finding, in this document (§10.8)
+  fa45c786a  e2e: a truncated read is the pinned defect, not evidence that it was fixed (§10.9)
+  3c3dd135b  sniff: the leak check counts this package's goroutines, not the process's (§10.10)
+  291698273  group: observe what a traffic failure leaves before the recheck decides (§10.10)
+  12c0a9e60  power: the observation window must be far inside the deadline it measures (§10.10)
+
+FULL_TEST_COVERAGE = 83 test packages (`go list` over ./... with the production tag set)
+FULL_TEST_RESULT   = 79 ok / 4 FAIL at 12c0a9e60, 316s, `go test -count=1 -tags "$TAGS" ./...`
+FULL_TEST_SHA_MATCH = YES (the scanned SHA equals origin/testing)
+  the 4: common/physicalpath (the ONE unsatisfiable detector, §10.3 - not an unfinished fix)
+         common/tls, common/tlsspoof, common/windivert (BLOCKED_EXTERNAL: this host's Schannel has no
+         TLS 1.3 over TCP, and the driver tests need an elevated session)
+NO UNEXPLAINED FAILURE remains, and no failure is attributable to the four flakes this round fixed.
 ```
 
 ## 10.1 The mechanism, measured before the fix
@@ -746,7 +759,81 @@ User impact: whenever the sniffed-domain recovery answers quickly (a cached DNS 
 application's literal address is slower than the head start and ALSO fails, the connect hung for the
 whole connect timeout instead of failing at once.
 
-## 10.9 Still open after this round
+## 10.9 The `e2e/TestRejectReplyCode` flake: an observation defect on top of the pinned one (`fa45c786a`)
+
+Reproduced at **2 in 12** full `./e2e/` runs, **0 in 20** when the same tests run in ONE process, and
+**0 in 30** once stderr logging was added - the window is microseconds. Silent atomic counters kept it
+(1/14), which is how the trace below was captured.
+
+The failing assertion was NOT the SOCKS5 reply code: it was the HTTP CONNECT half, and the helper threw
+the observation away (`httpConnectStatus` returned `"", err.Error()` on any read error). The 40-byte
+`200 Connection established` head IS written (`transport/http/server_conn.go:110`); the reject path
+(`route/route.go:163` -> `:87` -> `conn.Close()`, which a handed-off CONNECT does not route through
+`transport/http/server.go:216`) then closes ABORTIVELY, and that close destroys a response the peer has
+already received:
+
+```text
+[XFLAKE] serveConnect wrote200 127.0.0.1:58314 blocked.test:443
+[XFLAKE] serveConnect handedOff 127.0.0.1:58314
+readHTTPHead failed after 29 byte(s): wsarecv: An existing connection was forcibly closed by the remote host
+```
+
+An isolated plain-Go microbenchmark pins the OS rule: write-then-CLEAN-close is observable 4959/4959,
+write-then-ABORTIVE-close loses the response 4869/5000 (361 of them zero-byte), `SetLinger(0)` likewise.
+
+So the client observes the head, part of it, or a reset with no bytes - three faces of the SAME pinned
+defect - and the test was reading the last two as "the defect may have been fixed". The fix keeps the
+bytes read, asserts `200` on a complete OR partial head (logging the truncation), accepts a zero-byte
+abort with a log, and still fails on a read DEADLINE so a hang is never excused. No timeout is widened
+and a future fix is still detected: a proxy that decides before answering sends a status line that is
+not 200.
+
+**The production ordering is NOT changed** - announce "established", then refuse is inherited from
+upstream (upstream sing's `protocol/http/handshake.go` does the same) and the test's own header records
+it as a product decision owned by `protocol/**`.
+
+```text
+before, this session: subset via go test, 20 separate processes   2 failures
+after:                same command                                0 failures
+after:                full ./e2e/, 6 separate processes           0 failures (16-18s each)
+```
+
+## 10.10 Three more flakes the full scans found, and the mechanism of each
+
+The round's full serial scans are what surfaced these. None is caused by this round's changes, all
+three are pre-existing, and each failed ONLY inside the whole suite - which is why they had survived.
+
+**`common/sniff`, `TestPeekStream{CancelledContextStillTerminates,DoesNotOutliveItsDeadline}`**
+(`3c3dd135b`). The leak check compared a PROCESS-GLOBAL `runtime.NumGoroutine()` against a baseline
+taken before a 64-iteration loop. That count is moved by everything else in the binary: 93 tests in one
+process, several of them completing real TLS handshakes, plus a previous `-count` repetition's
+goroutines. MEASURED: 1 failure per 10 iterations of the two tests, PASS alone, and one failure in a
+full package run - a leak reported in a test that had not leaked. The fix counts the goroutines whose
+stack names this package. The check still fires: with a deliberately leaked goroutine added to
+`PeekStream` (`go build` exit 0 first) BOTH tests go RED by assertion.
+
+**`protocol/group`, `TestTrafficDialFailureDoesNotDeleteHealthEvidence`** (`291698273`). Failed in BOTH
+of the round's first two scans (`expected node-a, actual node-b`), 10/10 alone. The test asserts the
+state left by a failed business dial, but that failure also REQUESTS a forced recheck
+(`clearSelectionFor` -> `requestRecheck`), and the recheck's round probes with `mode = TestHistoryHealth`
+where a failed probe DELETES that member's health measurement (`urltest.go:1170-1175`). So the test was
+racing the product's own verdict - which is the documented contract ("a traffic failure may REQUEST a
+recheck; the recheck decides"). The fix gates the health probe, so the two observations become
+sequential: the state the failure leaves, then the verdict the released recheck reaches. Strictly
+stronger than before - it now also fails if a traffic failure stops requesting a recheck, or if a
+failed health check stops invalidating its own measurement (proved by removing the deletion:
+`go build` exit 0, then RED by assertion).
+
+**`common/power`, `TestCoalescedNotificationsNeverReportAStateThatIsOver`** (`12c0a9e60`). Failed the
+third scan at `expected 0x2 (quiescent), actual 0x3 (deep-idle)`. `ObserveTraffic` moves DEEP_IDLE ->
+QUIESCENT synchronously AND re-arms the deadline; the test then slept 50ms against a `DeepIdleAfter` of
+**60ms**. Ten milliseconds of margin is inside `time.Sleep`'s noise band on a loaded machine, so the
+assertion could read the state the (correct) timer had just moved to. The test's own comment already
+claimed "a deadline long enough that the state cannot legitimately move on by itself during the test",
+so the deadline now says that: 600ms against the 50ms window (and the sibling tests' windows were
+raised out of the noise band too: 150->400ms, 100->300ms). No assertion is weakened.
+
+## 10.11 Still open after this round
 
 1. **`StatusView` is still not constructed by `box.go`** (§9.3) — unchanged by this round.
 2. **`SelectionStatus()` is not wired into any UI** (§9.4) — unchanged.
@@ -757,9 +844,41 @@ whole connect timeout instead of failing at once.
    (`adapter/outbound/manager.go:372`) refuses `dependency[X] not found for outbound[Y]` before the dry
    run, for outbounds and endpoints alike — so this is an API-level gap, and adding a hop for the
    missing tag would double-report the same defect at the manager level. Left as-is, deliberately.
-4. **`route::TestConfiguredRateShapesTheRealTCPCopyPath`** — wall-clock band test, fails under
-   parallel package load (§9, "Flaky test flagged"). Do not widen the band.
-5. **`e2e/TestRejectReplyCode` intermittency** — §4. The `common/dialer` half of that item is CLOSED
-   (§10.8); the e2e half is still under investigation in this round.
-6. **A full serial scan at the final SHA of this round** has not been run yet.
+4. **`route::TestConfiguredRateShapesTheRealTCPCopyPath`** — wall-clock band test, flagged by the
+   previous round, not fixed here (§9). Do not widen the band. It did NOT fail any of this round's four
+   full scans, so its rate is low; the three flakes that did recur are fixed (§10.10).
+5. **`e2e/TestRejectReplyCode`** — CLOSED as an observation defect (§10.9). The production ordering it
+   pins (announce "established", then refuse) is still a product decision owned by `protocol/**`.
+6. **The seven-layer fault tree** (D4 DNS/FakeIP, D6 MTU/fragment, D7 stop/reconnect/platform) is still
+   not walked (§4), and `common/tls`, `common/tlsspoof`, `common/windivert` remain BLOCKED_EXTERNAL.
+
+# 11. Closing status at `12c0a9e60`
+
+```text
+IPC_SECRET_LEAK                = FIXED_VERIFIED   (assertion-level reverse-break, sentinel visible)
+SELECTOR_SELECTION_CONTRACT    = LANDED           (P2: 96e6dc41, six callers enumerated first)
+STATUSVIEW_LIFECYCLE           = LANDED           (P3: 03995f6da, runtime stacks for all three defects)
+NESTED_GROUP_NETWORK_POLICY    = LANDED           (P4: f2dd95d6, per-edge, mutation M5 both directions)
+PATH_01_PACKET_ORDER_AND_EXIT  = FIXED_VERIFIED   (1f6b7b85d + four follow-ups; 12 of 13 detectors green,
+                                                   the 13th proven unsatisfiable alongside another)
+  unknown-and-exit             = also closed      (truncated routes: ordered like Build, no exit claimed)
+  dependency-on-a-group        = also closed      (a false PASS this round introduced, then repaired)
+REDACTION_BACKSTOP             = HARDENED         (d7d542d0b: spaced assignments, 8 new cases)
+DIALER_DEADLINE_STALL          = FIXED_VERIFIED   (c216688f9: production defect, independent reverse-break)
+E2E_REJECT_REPLY_FLAKE         = CLOSED           (fa45c786a: observation contract, not the product order)
+SUITE_FLAKES_FOUND_BY_SCANNING = 3 CLOSED         (sniff, protocol/group, power - §10.10)
+PER_HOP_STATUS                 = MODEL READY      (StatusView not yet constructed by box.go)
+CROSS_PLATFORM                 = PASS_WITH_SCOPE  (unchanged this round)
+FULL_TEST_COVERAGE             = 83 packages
+FULL_TEST_RESULT               = 79 ok / 4 FAIL, all four accounted for (1 spec + 3 BLOCKED_EXTERNAL)
+FULL_TEST_SHA_MATCH            = YES
+CI                             = NOT_RUN_BY_REQUEST   (no Actions event was ever triggered)
+RELEASE                        = NOT_READY        (blocked on the product decisions in §6 and the
+                                                   external blockers; no unexplained failure remains)
+```
+
+The standing rules were honoured: every commit carries `[skip ci]`; the preflight ran before every push;
+`C:\src\sing-box` is still at `8d78dcdd` with only `clients/desktop` dirty; no `go.mod`/`go.sum` change;
+no Actions event was triggered; and every reverse-break in this section was built FIRST, so no RED here
+is a compile error.
 
