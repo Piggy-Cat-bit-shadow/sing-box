@@ -108,11 +108,18 @@ platform_dir() {
 # platform_sha answers "which Apple commit does this product build?" - and for both
 # products the answer is the same gitlink. This is the single most important line in the
 # file: if either arm ever reads a different source, the two products stop being one.
+#
+# The refs file is loaded even though the SHA no longer comes from it, so that the same
+# misconfiguration fails here as everywhere else: a refs file that has been edited back to
+# the two-source model must be refused by every subcommand, not only by the ones that
+# happen to read the file.
 platform_sha() {
   case "$1" in
-    ios|macos) apple_sha ;;
+    ios|macos) ;;
     *) fail "unknown platform '$1' (expected ios or macos)" ;;
   esac
+  load_refs
+  apple_sha
 }
 
 # platform_branch names the branch the pinned commit is reviewed on. It is informational: it
@@ -192,7 +199,7 @@ checkout_ios() {
 checkout_macos() {
   local dir; dir="$(platform_dir macos "$1")"
   local want; want="$(apple_sha)"
-  local repo; load_refs; repo="$APPLE_CLIENT_REPOSITORY"
+  load_refs
   local branch; branch="$(platform_branch macos)"
 
   # The submodule has to exist first: it is the local source the copy is taken from, so
@@ -206,29 +213,59 @@ checkout_macos() {
   require_commit "$submodule" "$want"
   require_on_branch "$submodule" "$want" "$branch"
 
-  # Re-clone when the tree is missing or its origin is not the declared repository: a stale
-  # origin would silently build a different repository than the refs file names.
-  local origin_url=""
+  # Which source tree the copy was taken from is answered by its object-store wiring, not by
+  # `origin`: a `--shared` clone points `origin` at the source PATH rather than at the Apple
+  # repository URL, and the submodule's own URL can be re-pointed between runs, so comparing
+  # origin would be both wrong on a healthy tree and unstable across runs.
+  #
+  # The alternates file names the object store this copy draws from, which is exactly the
+  # question "is this copy of the source this commit pins?". It is also rewritten below on
+  # every call, so the two are kept in step.
+  local submodule_git_dir
+  submodule_git_dir="$(git -C "$submodule" rev-parse --absolute-git-dir)"
+  local submodule_objects="$submodule_git_dir/objects"
+  [ -d "$submodule_objects" ] || fail \
+    "cannot locate the object store of $submodule; the macOS copy cannot be refreshed from it."
+
   if [ -d "$dir/.git" ]; then
-    origin_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
-  fi
-  if [ "$origin_url" != "$repo" ]; then
-    if [ -n "$origin_url" ]; then
-      fail "$dir has origin '$origin_url' but $refs_file names '$repo'.
-  Remove $dir and re-run so the checkout matches the declared repository."
+    local copy_git_dir
+    copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
+    local alternate=""
+    [ -f "$copy_git_dir/objects/info/alternates" ] && \
+      alternate="$(head -n 1 "$copy_git_dir/objects/info/alternates")"
+    if [ -n "$alternate" ] && [ "$alternate" != "$submodule_objects" ]; then
+      fail "$dir draws its objects from '$alternate' instead of $submodule.
+  Remove $dir and re-run so the copy is taken from the source this commit pins."
     fi
+  fi
+
+  if [ ! -d "$dir/.git" ]; then
     rm -rf "$dir"
     mkdir -p "$(dirname "$dir")"
     # A local, shared-object clone: cheap, offline, and it carries every commit the
     # submodule has - which is the commit we are about to check out.
     git clone --shared --no-checkout "$submodule" "$dir" >/dev/null 2>&1 || fail \
       "could not copy $submodule into $dir"
-    git -C "$dir" remote set-url origin "$repo" >/dev/null 2>&1 || fail \
-      "could not point $dir at $repo"
   fi
 
-  git -C "$dir" fetch --prune origin \
-    "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || true
+  # The copy is refreshed from the SUBMODULE, not from the network. A `--shared` clone
+  # aliases the source's object database at clone time, but the submodule gains objects
+  # afterwards - every time the gitlink moves - so the alias has to be re-pointed at the
+  # submodule before the wanted commit can be resolved here.
+  #
+  # This is what makes the ephemeral tree follow the pin. Fetching a commit that exists only
+  # locally is awkward by design (a bare fetch of an arbitrary SHA is not guaranteed, and a
+  # refspec for a commit that is on no branch cannot be written), while an alternate is
+  # exactly the mechanism for "this object store is also mine".
+  local submodule_objects
+  submodule_objects="$(git -C "$submodule" rev-parse --absolute-git-dir)/objects"
+  [ -d "$submodule_objects" ] || fail \
+    "cannot locate the object store of $submodule; the macOS copy cannot be refreshed from it."
+  local copy_git_dir
+  copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
+  mkdir -p "$copy_git_dir/objects/info"
+  printf '%s\n' "$submodule_objects" > "$copy_git_dir/objects/info/alternates"
+
   require_commit "$dir" "$want"
 
   git -C "$dir" checkout --detach "$want" >/dev/null 2>&1 || fail \

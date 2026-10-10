@@ -162,25 +162,27 @@ echo "  style:    $APPLE_SIGNING_STYLE"
 # The two Apple UI sources
 # ---------------------------------------------------------------------------
 #
-# One Apple repository, two branches: iOS carries the custom Hako UI, macOS the original
-# sing-box UI. They are separate sources and are never merged. Each is materialised at the
-# exact revision the release selects - the iOS one is the parent's gitlink, the macOS one
-# the commit pinned in release/apple-client-refs.env - and the SAME Libbox build is
-# installed into both.
-step "select the Apple sources"
+# ONE Apple source, TWO products. Both iOS and macOS are built from the revision the
+# parent's clients/apple gitlink records, and the SAME Libbox build is installed into each.
+# Which UI a device shows is the Apple source's own runtime decision - iPhone the Hako
+# presentation, iPad and macOS upstream's - so the parent selects only the commit, never a
+# per-platform UI branch.
+step "select the Apple source"
 eval "$(./scripts/ci/apple-client-source.sh resolve)"
-./scripts/ci/apple-client-source.sh assert-distinct
+./scripts/ci/apple-client-source.sh assert-shared-source
 
 ios_client_dir="$IOS_APPLE_DIR"
 macos_client_dir="$MACOS_APPLE_DIR"
 export APPLE_CLIENT_REPOSITORY IOS_APPLE_SHA IOS_APPLE_BRANCH MACOS_APPLE_SHA MACOS_APPLE_BRANCH
 
-echo "  iOS:   $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA  (custom Hako UI)   -> $ios_client_dir"
-echo "  macOS: $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA (original sing-box UI) -> $macos_client_dir"
+echo "  source: $APPLE_CLIENT_SHA on $APPLE_CLIENT_BRANCH (shared by both products)"
+echo "  iOS:    $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA  -> $ios_client_dir"
+echo "  macOS:  $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA  -> $macos_client_dir"
 
-# The iOS source is the submodule the parent records; this asserts the checkout matches.
+# The authoritative checkout is the submodule the parent records; this asserts it matches.
 ./scripts/ci/apple-client-source.sh checkout ios >/dev/null
-# The macOS source is an ephemeral checkout of the pinned commit, created on demand.
+# The macOS tree is a same-commit copy, created on demand so the two overlays cannot
+# contaminate each other. A separate DIRECTORY, never a separate revision.
 ./scripts/ci/apple-client-source.sh checkout macos >/dev/null
 
 step "signing environment"

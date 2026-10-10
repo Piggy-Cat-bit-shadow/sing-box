@@ -23,19 +23,23 @@ name: Apple client
 # to be that freshly built framework. If it were missing, the app would fail to link
 # or, worse, link whatever was already there. Nothing downloads an upstream libbox.
 #
-# # Two products, two Apple UI branches, one Libbox
+# # Two products, ONE Apple source, one Libbox
 #
-# The iOS and macOS clients do NOT share an Apple UI source. They are built from two
-# branches of the same Apple client repository, pinned independently in
-# release/apple-client-refs.env:
+# The iOS and macOS clients build the SAME Apple source at the SAME commit: the parent's
+# `clients/apple` gitlink. There is no per-platform revision and no per-platform branch,
+# because which UI a device shows is a runtime decision of the Apple source itself:
 #
-#     iOS / SFI     Repo B @ clients/apple gitlink   branch hako-ui   custom Hako UI
-#     macOS / SFM   Repo B @ MACOS_APPLE_SHA         branch dev       original sing-box UI
+#     iOS / SFI     clients/apple @ gitlink   scheme SFI   iPhone -> Hako, iPad -> upstream
+#     macOS / SFM   clients/apple @ gitlink   scheme SFM   upstream
 #
 # Libbox is built ONCE from this repository's commit and that same artifact is installed
-# into both checkouts, so the core is identical while each platform keeps its own UI.
-# The two branches are never merged: there is no Apple commit that carries both UIs, and
-# the parent keeps recording exactly one Apple gitlink - the iOS one.
+# into both checkouts, so the core is identical and so is the client source; only the
+# scheme, the destination and the platform-specific overlays differ.
+#
+# The two jobs resolve their source independently and then prove they agree -
+# `apple-client-source.sh assert-shared-source` in both, and the macOS job re-checks its
+# checkout against `sha ios`. A future edit that reintroduces a per-platform pin fails
+# there rather than shipping two different UIs under one version.
 #
 # # Trigger
 #
@@ -224,23 +228,24 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: select the Apple client source
-        # The iOS product takes its Swift source from the parent's clients/apple gitlink, which is
-        # the custom Hako UI branch. The macOS product takes a different branch of the same Apple
-        # repository, selected in the macOS job. Neither job may build the other's source, so each
-        # records which platform it is and which revision that platform resolves to.
+        # Both Apple products take their Swift source from the parent's clients/apple gitlink, at
+        # the SAME commit. Which UI a device shows is the Apple source's own runtime decision - it
+        # routes from the device idiom (iPhone Hako, iPad upstream, macOS upstream) - so the parent
+        # selects only the revision, never a per-platform UI branch. `assert-shared-source` fails
+        # the build if the two platforms ever resolve to different commits again.
         run: |
           set -euo pipefail
           eval "$(./scripts/ci/apple-client-source.sh resolve)"
-          ./scripts/ci/apple-client-source.sh assert-distinct
+          ./scripts/ci/apple-client-source.sh assert-shared-source
           {
             echo "APPLE_CLIENT_PLATFORM=ios"
             echo "APPLE_CLIENT_REPOSITORY=$APPLE_CLIENT_REPOSITORY"
             echo "APPLE_CLIENT_DIR=$IOS_APPLE_DIR"
-            echo "APPLE_CLIENT_SHA=$IOS_APPLE_SHA"
-            echo "APPLE_CLIENT_BRANCH=$IOS_APPLE_BRANCH"
-            echo "APPLE_CLIENT_UI=custom Hako"
+            echo "APPLE_CLIENT_SHA=$APPLE_CLIENT_SHA"
+            echo "APPLE_CLIENT_BRANCH=$APPLE_CLIENT_BRANCH"
+            echo "APPLE_CLIENT_UI=iOS: iPhone Hako / iPad upstream (runtime routing)"
           } >> "$GITHUB_ENV"
-          echo "iOS Apple source: $IOS_APPLE_BRANCH @ $IOS_APPLE_SHA in $IOS_APPLE_DIR"
+          echo "iOS Apple source: $APPLE_CLIENT_BRANCH @ $APPLE_CLIENT_SHA in $IOS_APPLE_DIR"
 
       - name: verify the Apple submodule revision
         # The gitlink is the authority for the iOS source, so it is checked against the checkout
@@ -346,6 +351,9 @@ jobs:
             echo "apple_sha:              $APPLE_CLIENT_SHA"
             echo "apple_sha_source:       parent clients/apple gitlink"
             echo "apple_client_dir:       $APPLE_CLIENT_DIR"
+            echo "scheme:                 SFI"
+            echo "ui_contract:            iPhone Hako / iPad upstream (runtime routing in the Apple source)"
+            echo "libbox_source_sha:      $(git rev-parse HEAD)"
             echo "ui:                     $APPLE_CLIENT_UI"
             echo ""
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -486,40 +494,41 @@ jobs:
           brew install create-dmg || echo "create-dmg unavailable; hdiutil will be used"
 
       - name: select the Apple client source
-        # The macOS product takes its Swift source from the dev branch of the same Apple
-        # repository the iOS product uses, at the exact commit pinned in
-        # release/apple-client-refs.env. It must NOT be the iOS gitlink: that branch carries
-        # the custom Hako iOS UI, and the macOS product ships the original sing-box UI.
+        # The macOS product builds the SAME Apple commit the iOS job builds. It must NOT resolve a
+        # different one: the two UI families live in one tree now, and the Apple source - not this
+        # workflow - decides which presentation a device gets. A per-platform revision here would
+        # put the parent back in charge of UI ownership.
         run: |
           set -euo pipefail
           eval "$(./scripts/ci/apple-client-source.sh resolve)"
-          ./scripts/ci/apple-client-source.sh assert-distinct
+          ./scripts/ci/apple-client-source.sh assert-shared-source
           {
             echo "APPLE_CLIENT_PLATFORM=macos"
             echo "APPLE_CLIENT_REPOSITORY=$APPLE_CLIENT_REPOSITORY"
             echo "APPLE_CLIENT_DIR=$MACOS_APPLE_DIR"
             echo "APPLE_CLIENT_SHA=$MACOS_APPLE_SHA"
             echo "APPLE_CLIENT_BRANCH=$MACOS_APPLE_BRANCH"
-            echo "APPLE_CLIENT_UI=original sing-box"
+            echo "APPLE_CLIENT_UI=macOS: upstream (runtime routing)"
           } >> "$GITHUB_ENV"
           echo "macOS Apple source: $MACOS_APPLE_BRANCH @ $MACOS_APPLE_SHA in $MACOS_APPLE_DIR"
 
       - name: check out the macOS Apple source
-        # A pinned commit, never a branch tip: `dev` moves and a release built from
-        # whatever it pointed at would not be reproducible. The resolver refuses a pin that
-        # is unreachable or that is not an ancestor of the branch it names.
+        # A copy of the pinned commit, never a branch tip and never a different revision: the
+        # resolver refuses a gitlink that is unreachable or that is not on the reviewed branch, and
+        # this step proves the resulting tree is the SAME commit the iOS job builds.
         run: |
           set -euo pipefail
           ./scripts/ci/apple-client-source.sh checkout macos
           ./scripts/ci/apple-client-source.sh verify macos
           actual="$(git -C "$APPLE_CLIENT_DIR" rev-parse HEAD)"
-          ios_sha="$(./scripts/ci/apple-client-source.sh sha ios)"
-          if [ "$actual" = "$ios_sha" ]; then
-            echo "FAIL: the macOS job checked out the iOS source ($ios_sha)." >&2
-            echo "      macOS must build the original sing-box UI, not the custom Hako UI." >&2
+          shared="$(./scripts/ci/apple-client-source.sh sha ios)"
+          if [ "$actual" != "$shared" ]; then
+            echo "FAIL: the macOS job checked out $actual but both products must build $shared." >&2
+            echo "      iOS and macOS share one Apple source; a per-platform revision is the" >&2
+            echo "      two-source model this topology removed." >&2
             exit 1
           fi
-          echo "PASS: macOS source is $actual, distinct from the iOS source $ios_sha"
+          echo "PASS: macOS source is $actual, the same Apple commit the iOS job builds"
 
       - name: verify the pinned macOS source and the branding overlay
         # Deliberately BEFORE the build overlays and before Libbox is installed.
@@ -659,8 +668,11 @@ jobs:
             echo "apple_repo:             $APPLE_CLIENT_REPOSITORY"
             echo "apple_branch:           $APPLE_CLIENT_BRANCH"
             echo "apple_sha:              $APPLE_CLIENT_SHA"
-            echo "apple_sha_source:       release/apple-client-refs.env (MACOS_APPLE_SHA)"
+            echo "apple_sha_source:       parent clients/apple gitlink (the SAME commit the iOS job builds)"
             echo "apple_client_dir:       $APPLE_CLIENT_DIR"
+            echo "scheme:                 SFM"
+            echo "ui_contract:            upstream macOS (runtime routing in the Apple source)"
+            echo "libbox_source_sha:      $(git rev-parse HEAD)"
             echo "ui:                     $APPLE_CLIENT_UI"
             echo ""
             echo "build_time_utc:         $(date -u +%Y-%m-%dT%H:%M:%SZ)"

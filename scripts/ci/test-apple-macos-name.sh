@@ -598,11 +598,16 @@ echo "== the pinned macOS source matches what the overlay expects =="
 if [ -n "$source_dir" ]; then
   # An explicit checkout overrides the resolver, so the phase-dependent half can be run
   # against a specific tree - a pristine one, or a deliberately branded one to show that
-  # this half is not phase-agnostic. The expected revision still comes from the pin, and
-  # from the PARENT repository rather than from the checkout under test, so a checkout
-  # cannot nominate itself as its own authority.
+  # this half is not phase-agnostic. The expected revision still comes from the PARENT
+  # repository rather than from the checkout under test, so a checkout cannot nominate
+  # itself as its own authority.
+  #
+  # The revision is read from the resolver, not from the refs file: both platforms build the
+  # clients/apple gitlink now, and the resolver is the one place that says so. Reading a
+  # per-platform variable here would abort under `set -u` and, worse, would reassert the
+  # two-source model this repository removed.
   macos_dir="$source_dir"
-  macos_sha="$(cd "$root" && . release/apple-client-refs.env && printf '%s' "$MACOS_APPLE_SHA")"
+  macos_sha="$(cd "$root" && ./scripts/ci/apple-client-source.sh sha macos)"
 else
   macos_dir="$(./scripts/ci/apple-client-source.sh dir macos 2>/dev/null || true)"
   macos_sha="$(./scripts/ci/apple-client-source.sh sha macos 2>/dev/null || true)"
