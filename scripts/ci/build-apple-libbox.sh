@@ -45,6 +45,11 @@ cd "$root"
 which="${1:-both}"
 client="${APPLE_CLIENT_DIR:-clients/apple}"
 
+# The gomobile work directory `build_libbox` isolates its output in. Named here because that
+# is where a local build actually leaves the framework when there is no sibling client
+# checkout; see the resolution below.
+libbox_build_dir="$root/_libbox_build"
+
 # install_into places an xcframework into a client checkout, replacing whatever was there. A
 # stale slice left behind by an earlier build would make the two platforms link different
 # frameworks while both believed they installed the same artifact, so the destination is
@@ -105,6 +110,7 @@ echo "building Libbox.xcframework for: $targets"
 echo "source commit: $(git rev-parse HEAD)"
 
 rm -rf Libbox.xcframework
+rm -rf "$libbox_build_dir/Libbox.xcframework"
 # Prefer the local module cache when it already holds everything.
 #
 # gomobile resolves dependencies with GOPROXY=off internally, and the outer `go run`
@@ -122,8 +128,28 @@ else
   go run ./cmd/internal/build_libbox -target apple -platform "$targets"
 fi
 
+# Where the framework lands depends on whether a sibling client checkout exists.
+#
+# `build_libbox` writes it to its isolated gomobile work directory and then RENAMES it into
+# ../sing-box-for-apple if that directory is there - the developer layout, where the Apple
+# client sits beside this repository. On CI there is no such sibling, so the framework stays
+# in the work directory and this script's old check for ./Libbox.xcframework failed with
+# "Libbox.xcframework was not produced" while gomobile printed
+# "xcframework successfully written out to: .../_libbox_build/Libbox.xcframework" in the same
+# log. The artifact existed; the check looked only where it is not.
+#
+# Both layouts are therefore accepted, and the local build is NORMALISED to the repository
+# root so that everything downstream - install_into's default source, the checks below, and
+# the packaging helper - keeps the single documented location it was written against.
+if [ ! -d Libbox.xcframework ] && [ -d "$libbox_build_dir/Libbox.xcframework" ]; then
+  echo "  framework is in the gomobile work directory; moving it to the repository root"
+  mv "$libbox_build_dir/Libbox.xcframework" Libbox.xcframework
+fi
+
 if [ ! -d Libbox.xcframework ]; then
   echo "FAIL: Libbox.xcframework was not produced" >&2
+  echo "      looked in . and $libbox_build_dir" >&2
+  ls -d "$libbox_build_dir"/* 2>/dev/null >&2 || true
   exit 1
 fi
 
