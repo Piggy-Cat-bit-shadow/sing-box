@@ -153,10 +153,29 @@ func TestCensusDoesNotCountAnotherEndpointsWorkers(t *testing.T) {
 
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
-	for _, endpoint := range []*Endpoint{first.endpoint, second.endpoint} {
+
+	// A failed assertion must not leave a worker parked inside the hook, so the release is
+	// guarded and runs even when the test fails early.
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer doRelease()
+
+	endpoints := []*Endpoint{first.endpoint, second.endpoint}
+
+	for _, endpoint := range endpoints {
+		// ORDER MATTERS, and getting it wrong is why this test measured 2 workers per endpoint.
+		//
+		// `sessionStateChanged(PeerSessionExpired)` does not merely record the session: it calls
+		// pokeRecovery(), which starts the production recovery worker. Doing that BEFORE installing
+		// the hook left a worker running that had no seam to block in, so the test then started a
+		// SECOND one by hand with `go endpoint.recoveryLoop()` - bypassing pokeRecovery's residency
+		// guard entirely, since that guard is what the manual call skipped. The census then observed
+		// two, correctly: the fixture had really created two.
+		//
+		// So: settle/poll, then the hook, and only then the trigger. The worker that starts is the
+		// production one, started by the production path, with nowhere to go but the hook.
 		endpoint.recovery.settle = time.Millisecond
 		endpoint.recovery.poll = time.Millisecond
-		endpoint.sessionStateChanged(testPeer, device.PeerSessionExpired)
 		endpoint.recovery.access.Lock()
 		endpoint.recovery.rebindHook = func(ctx context.Context) error {
 			entered <- struct{}{}
@@ -164,10 +183,11 @@ func TestCensusDoesNotCountAnotherEndpointsWorkers(t *testing.T) {
 			return nil
 		}
 		endpoint.recovery.access.Unlock()
+		endpoint.sessionStateChanged(testPeer, device.PeerSessionExpired)
 	}
 
-	go first.endpoint.recoveryLoop()
-	go second.endpoint.recoveryLoop()
+	// No manual `go recoveryLoop()` calls: the workers under test are the two the production path
+	// started, one per endpoint, and the census must see exactly those.
 	for index := 0; index < 2; index++ {
 		select {
 		case <-entered:
@@ -181,7 +201,15 @@ func TestCensusDoesNotCountAnotherEndpointsWorkers(t *testing.T) {
 	require.Equal(t, 1, goroutineCensus(t, second.endpoint),
 		"and the second endpoint's census must count exactly its own, not the first one's")
 
-	close(release)
+	// Release, then wait for the residents to actually leave, so the goroutines this test created
+	// cannot leak into whatever runs next.
+	doRelease()
+	for index, endpoint := range endpoints {
+		require.Eventually(t, func() bool {
+			return !endpoint.WorkerResident()
+		}, 10*time.Second, 2*time.Millisecond,
+			"endpoint %d: the worker must exit once the hook is released", index)
+	}
 }
 
 // A revoked rebind must not leave the endpoint unable to recover: the worker flag the loop clears on its way

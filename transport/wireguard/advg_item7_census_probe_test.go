@@ -45,6 +45,7 @@ package wireguard
 // (`held <= socketsPerStandardBind`) therefore passes.
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -167,8 +168,12 @@ func TestAdvGItem7TheTwoWitnessesAgreeWheneverNothingIsReopening(t *testing.T) {
 
 	for cycle := 0; cycle < 3; cycle++ {
 		held := fixture.livePort(t)
-		require.Equal(t, socketsPerStandardBind, socketCensus(t, endpoint),
-			"cycle %d: settled, one bind's worth of receivers", cycle)
+		// The settled count is WAITED for, not read once. StdNetBind starts its receiver
+		// goroutines asynchronously, so an immediate census can legitimately observe 1 before the
+		// full settled count - which is what "expected 2, actual 1" was, on a correct endpoint.
+		// The claim here is about the SETTLED state, and settleSocketsPerStandardBind is the
+		// helper that states exactly that; the exact final count is not weakened.
+		fixture.settleSocketsPerStandardBind(t, fmt.Sprintf("cycle %d: settled", cycle))
 		require.False(t, udpPortIsFree(t, held), "cycle %d: settled, the port is held", cycle)
 
 		endpoint.onPauseUpdated(pause.EventNetworkPause)
@@ -192,8 +197,7 @@ func TestAdvGReverseWGManyFastPauseWakeCyclesLeaveOneSocket(t *testing.T) {
 	fixture.proveStandardBindBranch(t)
 	endpoint := fixture.endpoint
 
-	require.Equal(t, socketsPerStandardBind, socketCensus(t, endpoint),
-		"a freshly started endpoint must hold exactly one bind's worth of receivers")
+	fixture.settleSocketsPerStandardBind(t, "a freshly started endpoint")
 
 	var workerHigh int64
 	start := time.Now()
