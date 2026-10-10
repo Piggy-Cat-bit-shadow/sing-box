@@ -70,14 +70,37 @@ import (
 // Resolver is the read-only view of the object graph a walk is allowed to use.
 //
 // It holds a registry lookup, a Snapshot and a frozen clock-free scope - there is no dialer, no
-// logger, no context and no clock, so a walk physically cannot dial, log, or time anything. One
-// Resolver answers consistently for its whole lifetime: the member a group is reported as having
-// selected is decided once and reused, so two questions about one flow cannot disagree.
+// logger, no context and no clock, so a walk physically cannot dial, log, or time anything.
+//
+// # What a Resolver does NOT hold: anything a walk writes
+//
+// The network a walk answers for and the answer each group gave DURING that walk are properties of
+// one call, not of this view, and they live in the per-call scope `Build` creates (walkScope). That
+// is what makes one Resolver safe to keep and share: nothing here is written after construction, so
+// two concurrent walks cannot make each other answer for the wrong network, and a walk cannot read
+// a decision another walk recorded.
+//
+// # Concurrency contract
+//
+// A Resolver is safe for concurrent use by any number of goroutines, PROVIDED the two things the
+// caller supplies are safe for concurrent READ:
+//
+//   - `lookup` must be read-only and must not create anything (adapter.OutboundManager.Outbound is
+//     the canonical implementation, and the registry it reads is concurrency-safe for reads).
+//   - the Snapshot is COPIED at construction, so the caller's maps are never read again. Mutating
+//     them afterwards is not a race and does not change an answer: rebuild the Resolver instead.
+//
+// The configurable parts are set through With* methods that each return a NEW resolver carrying the
+// change and leave the receiver alone, so "configure it" and "keep it immutable once a walk can see
+// it" are the same instruction rather than two rules a caller has to obey.
 type Resolver struct {
-	lookup    func(tag string) (adapter.Outbound, bool)
-	snapshot  Snapshot
-	network   string
-	decisions map[string]string
+	lookup   func(tag string) (adapter.Outbound, bool)
+	snapshot Snapshot
+	// network is the network this view answers for when a walk does not name one. It is set at
+	// construction (WithNetwork) and never written afterwards.
+	network string
+	// nodeBudget bounds one Hops enumeration; see DefaultNodeBudget. Set through WithNodeBudget.
+	nodeBudget int
 
 	// domainResolverFor reports the DNS server tag an outbound resolves names through, keyed by
 	// outbound tag. It is supplied by the caller because the derivation lives in
@@ -94,29 +117,48 @@ type Resolver struct {
 // lookup MUST be read-only and MUST NOT create anything; adapter.OutboundManager.Outbound is the
 // canonical implementation, because it answers from the outbound map and falls back to the
 // endpoint namespace - the same lookup the dial path performs.
+//
+// The Snapshot is FROZEN here: the resolver takes its own copy of both maps (and of each candidate
+// slice), so the caller may keep using the maps it passed. See Snapshot for what that does and does
+// not promise.
 func NewResolver(lookup func(tag string) (adapter.Outbound, bool), snapshot Snapshot) *Resolver {
 	return &Resolver{
-		lookup:    lookup,
-		snapshot:  snapshot,
-		decisions: make(map[string]string),
+		lookup:     lookup,
+		snapshot:   snapshot.freeze(),
+		nodeBudget: DefaultNodeBudget,
 	}
 }
 
-// WithNetwork pins the network the walk is answering for. It is only consulted when a group has to
-// be asked for a selection, because a group with a per-network answer must not be asked with the
-// wrong one.
-func (r *Resolver) WithNetwork(network string) *Resolver {
-	r.network = network
-	return r
+// configure returns a copy of the resolver with the changes a With* method made applied to it.
+//
+// Copying rather than assigning is the whole point: a Resolver that a walk can already see must not
+// be writable, and a caller that wants a different one asks for a different one.
+func (r *Resolver) configure(change func(configured *Resolver)) *Resolver {
+	configured := *r
+	change(&configured)
+	return &configured
 }
 
-// WithDomainResolvers installs the DNS-availability view the destination-ownership check needs.
+// WithNetwork returns a resolver that answers for the given network when a walk does not name one.
+//
+// The receiver is NOT modified. It is only consulted when a group has to be asked for a selection,
+// because a group with a per-network answer must not be asked with the wrong one; a walk that names
+// its own network through Options overrides the pin for itself and changes nothing here.
+func (r *Resolver) WithNetwork(network string) *Resolver {
+	return r.configure(func(configured *Resolver) {
+		configured.network = network
+	})
+}
+
+// WithDomainResolvers returns a resolver with the DNS-availability view the destination-ownership
+// check needs. The receiver is NOT modified.
 //
 // resolverFor may be nil, in which case no outbound is reported as having its own resolver.
 func (r *Resolver) WithDomainResolvers(resolverFor func(tag string) string, defaultConfigured bool) *Resolver {
-	r.domainResolverFor = resolverFor
-	r.defaultDomainResolver = defaultConfigured
-	return r
+	return r.configure(func(configured *Resolver) {
+		configured.domainResolverFor = resolverFor
+		configured.defaultDomainResolver = defaultConfigured
+	})
 }
 
 // Lookup resolves a tag to the live object, and reports whether it exists.
@@ -293,6 +335,23 @@ func (p Path) GroupsNamed() []string {
 // A nil field falls through to the live object through resolveSelection, which is a preview for
 // every group in this tree. A caller that must not depend on live state sets the field it cares
 // about; a caller that has no opinion leaves it nil and gets the live answer.
+//
+// # The caller-supplied maps are FROZEN, not shared
+//
+// A walk reads these maps without synchronization, so a map the caller can still write would make
+// every concurrent walk a data race on the CALLER's data - a race that would be reported inside
+// this package and that this package cannot prevent by any amount of internal locking.
+//
+// NewResolver therefore copies both maps, and each candidate slice with them, at construction:
+//
+//   - mutating the map afterwards is NOT a data race and does NOT change a single answer, because
+//     the resolver no longer reads it;
+//   - it also cannot be used to change an answer, which is the deliberate half: a Snapshot is the
+//     caller's statement about one moment, and a statement that can be edited under a running walk
+//     is not one. A caller that wants different answers builds a different Resolver.
+//
+// So the contract is neither "the caller must freeze this" nor "concurrent modification is
+// supported": the caller may keep using its maps and this package simply never looks at them again.
 type Snapshot struct {
 	// Selections overrides the member each group has selected, by group tag. Set the value to
 	// "" to state that the member is NOT KNOWABLE, which makes the walk report the group as
@@ -301,6 +360,27 @@ type Snapshot struct {
 	// Candidates overrides the members a group can reach, by group tag. It exists so a dry run
 	// can validate a membership set that does not depend on what the group currently holds.
 	Candidates map[string][]string
+}
+
+// freeze returns a Snapshot this package owns.
+//
+// A nil map stays nil, because nil and an empty map mean different things here: nil falls through
+// to the live object, while an empty map is a caller stating that nothing is overridden.
+func (s Snapshot) freeze() Snapshot {
+	frozen := Snapshot{}
+	if s.Selections != nil {
+		frozen.Selections = make(map[string]string, len(s.Selections))
+		for tag, selection := range s.Selections {
+			frozen.Selections[tag] = selection
+		}
+	}
+	if s.Candidates != nil {
+		frozen.Candidates = make(map[string][]string, len(s.Candidates))
+		for tag, candidates := range s.Candidates {
+			frozen.Candidates[tag] = append([]string(nil), candidates...)
+		}
+	}
+	return frozen
 }
 
 // Options configures one walk.
@@ -330,6 +410,15 @@ type TagOrOutbound struct {
 // Where the selected leaf is not knowable it is reported in Path.Unknowns rather than invented. A
 // cycle returns an error naming the full chain.
 //
+// # Build WRITES nothing the caller can see
+//
+// Everything the walk needs to remember - the network it is answering for, and the answer each
+// group gave during THIS call - lives in the walkScope this function creates and drops. The Resolver
+// is read and never written, which is what makes two concurrent builds through one Resolver two
+// independent answers rather than a race over one shared record. See Resolver for the concurrency
+// contract, and note that the state is PER WALK even single-threaded: two questions about one flow
+// cannot disagree, and two flows cannot be confused with one another.
+//
 // # Panics are contained
 //
 // The walk calls methods on user-configured objects - Dependencies, All, Selected, Tag, Network -
@@ -356,16 +445,10 @@ func Build(resolver *Resolver, root TagOrOutbound, options Options) (path Path, 
 	if label == "" && root.Outbound != nil {
 		label = root.Outbound.Tag()
 	}
-	previousNetwork := resolver.network
-	if options.Network != "" {
-		resolver.network = options.Network
-	}
-	// The per-walk decision record is cleared here, so one Resolver can answer two walks and each
-	// walk is internally consistent without either becoming stale.
-	clear(resolver.decisions)
-	defer func() {
-		resolver.network = previousNetwork
-	}()
+	// The per-walk state: the network this call answers for (Options.Network overrides the pinned
+	// one for THIS call only) and the decision record. Both are created here and die with the call,
+	// so no caller and no other walk can reach them.
+	scope := newWalkScope(resolver, options.Network)
 	path = Path{Root: label}
 	entry := root.Outbound
 	if entry == nil {
@@ -383,7 +466,7 @@ func Build(resolver *Resolver, root TagOrOutbound, options Options) (path Path, 
 			return path, nil
 		}
 	}
-	if err = resolver.walk(&path, entry, nil, ""); err != nil {
+	if err = scope.walk(&path, entry, nil, ""); err != nil {
 		return Path{}, err
 	}
 	// The walk descends the dependency graph, so it records hops ROOT FIRST - which is the order they
@@ -443,12 +526,104 @@ func reversePacketOrder(path *Path) {
 	}
 }
 
+// walkScope is the state of ONE Build call: the network this call answers for, and the answer each
+// group gave while this call was running.
+//
+// # Why this is not on the Resolver
+//
+// Both fields describe a walk, not a view. Putting them on the Resolver makes every Build a write to
+// an object the caller is told is read-only, and two walks through one Resolver then write each
+// other's answers: a walk asks a group with the other walk's network, and a decision record cleared
+// by one walk answers a question that belongs to the other. That is a defect even with the accesses
+// serialised - the value belongs to the wrong walk - so a lock would not fix it, it would only make
+// it harder to see. A scope per call fixes it by construction: there is nothing to share.
+//
+// # And why the record is keyed by IDENTITY
+//
+// The decision record is keyed by the group OBJECT, not by its tag. A tag is configuration and two
+// objects may share one (the package's cycle check says the same thing for the same reason), so a
+// tag-keyed record would answer the second group from the first group's decision - reporting a
+// member the second group cannot reach, or a cycle that does not exist.
+type walkScope struct {
+	resolver  *Resolver
+	network   string
+	decisions walkDecisions
+}
+
+// newWalkScope opens the state of one walk. The network named by the walk wins over the pinned one;
+// neither is written anywhere. It returns a VALUE, so the scope stays on the caller's stack: a
+// diagnostic that a control-plane read runs per flow must not allocate for its own bookkeeping.
+func newWalkScope(resolver *Resolver, network string) walkScope {
+	if network == "" {
+		network = resolver.network
+	}
+	return walkScope{resolver: resolver, network: network}
+}
+
+// walkDecisions is the answer each group gave during ONE walk.
+//
+// # Why an array with an overflow map, and not a map
+//
+// A walk reaches one group per level of nesting - one for a selector, two or three for a real
+// configuration - so the answers live in an array and only a graph deeper than it reaches the map. A
+// map allocated per call would pay for every Build to hold a record that is read at most once, and
+// the per-call record must not tempt anyone to move it back onto the Resolver to save an
+// allocation. The record is a property of the CALL either way; see walkScope.
+type walkDecisions struct {
+	answered [8]walkAnswer
+	count    int
+	// overflow holds the answers of a graph deeper than the array. It is nil until one is needed.
+	overflow map[adapter.OutboundGroup]string
+}
+
+// walkAnswer is one group's answer, with the group it belongs to as its identity key.
+type walkAnswer struct {
+	group    adapter.OutboundGroup
+	selected string
+}
+
+// lookup returns the answer this group gave earlier in this walk, and whether it gave one.
+//
+// An empty answer that IS present means "this group answered no member", which the caller reports as
+// an unknown rather than by asking again.
+func (d *walkDecisions) lookup(group adapter.OutboundGroup) (string, bool) {
+	for index := 0; index < d.count; index++ {
+		if d.answered[index].group == group {
+			return d.answered[index].selected, true
+		}
+	}
+	if d.overflow == nil {
+		return "", false
+	}
+	selected, present := d.overflow[group]
+	return selected, present
+}
+
+// record stores one group's answer for the rest of this walk.
+func (d *walkDecisions) record(group adapter.OutboundGroup, selected string) {
+	for index := 0; index < d.count; index++ {
+		if d.answered[index].group == group {
+			d.answered[index].selected = selected
+			return
+		}
+	}
+	if d.count < len(d.answered) {
+		d.answered[d.count] = walkAnswer{group: group, selected: selected}
+		d.count++
+		return
+	}
+	if d.overflow == nil {
+		d.overflow = make(map[adapter.OutboundGroup]string, 8)
+	}
+	d.overflow[group] = selected
+}
+
 // walk visits one node of the selection graph.
 //
 // chain is the descent that reached this node, and it is simultaneously the cycle record: this
 // mirrors route/route.go's resolveOutbound, which builds the same record for the same reason and
 // deliberately has no separate depth limit.
-func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbound, controlOwner string) error {
+func (s *walkScope) walk(path *Path, node adapter.Outbound, chain []adapter.Outbound, controlOwner string) error {
 	if containsNode(chain, node) {
 		return cycleObjectsError(chain, node)
 	}
@@ -457,7 +632,7 @@ func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbo
 		// A group is a control-plane object. It is recorded in the CONTROL path and never as a
 		// physical hop, because it never carries a byte.
 		path.ControlPath = append(path.ControlPath, node.Tag())
-		selected, reason := r.resolveSelection(group, node.Tag())
+		selected, reason := s.resolveSelection(group, node.Tag())
 		if selected == nil {
 			path.Unknowns = append(path.Unknowns, Unknown{
 				Node:     node.Tag(),
@@ -468,7 +643,7 @@ func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbo
 		}
 		// The hop this member becomes carries the group as its ControlOwner, and the group's
 		// configured tag as its DeclaredTag only when the group itself was what the path named.
-		return r.walk(path, selected, append(chain, node), node.Tag())
+		return s.walk(path, selected, append(chain, node), node.Tag())
 	}
 	// A physical hop.
 	hop := Hop{
@@ -494,7 +669,7 @@ func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbo
 	if dependencyTag == "" {
 		return nil
 	}
-	dependency, reason := r.lookupDependency(dependencyTag)
+	dependency, reason := s.resolver.lookupDependency(dependencyTag)
 	if dependency == nil {
 		path.Unknowns = append(path.Unknowns, Unknown{
 			Node:     dependencyTag,
@@ -503,7 +678,7 @@ func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbo
 		})
 		return nil
 	}
-	return r.walk(path, dependency, append(chain, node), node.Tag())
+	return s.walk(path, dependency, append(chain, node), node.Tag())
 }
 
 // lookupDependency resolves a declared dependency tag through the registry.
@@ -537,18 +712,26 @@ func (r *Resolver) lookupDependency(tag string) (adapter.Outbound, string) {
 //
 // A caller that cannot accept even that still has Snapshot: an entry there replaces the live
 // answer, and an explicit empty entry turns it into an unknown.
-func (r *Resolver) resolveSelection(group adapter.OutboundGroup, tag string) (adapter.Outbound, string) {
-	if r.snapshot.Selections != nil {
-		if declared, present := r.snapshot.Selections[tag]; present {
+//
+// # The decision record is per walk, and keyed by identity
+//
+// The record lives in the walkScope, so it is created by this Build and read by no other: one walk
+// asks a group once, and the answer cannot be another walk's. It is keyed by the group OBJECT
+// because a tag is configuration and two objects may share one - a tag-keyed record would answer
+// the second group from the first group's decision.
+func (s *walkScope) resolveSelection(group adapter.OutboundGroup, tag string) (adapter.Outbound, string) {
+	snapshot := s.resolver.snapshot
+	if snapshot.Selections != nil {
+		if declared, present := snapshot.Selections[tag]; present {
 			if declared == "" {
 				return nil, "the supplied snapshot states that the member selected by group " +
 					tag + " is not knowable"
 			}
-			if r.lookup == nil {
+			if s.resolver.lookup == nil {
 				return nil, "no registry was supplied, so the snapshot's member " + declared +
 					" of group " + tag + " cannot be resolved"
 			}
-			outbound, loaded := r.lookup(declared)
+			outbound, loaded := s.resolver.lookup(declared)
 			if !loaded {
 				return nil, "the supplied snapshot names " + declared + " as the member selected by group " +
 					tag + ", but no such outbound or endpoint exists"
@@ -560,33 +743,27 @@ func (r *Resolver) resolveSelection(group adapter.OutboundGroup, tag string) (ad
 	// changes, a balancing group whose flow-keyed choice differs between two callers - would
 	// otherwise let two questions about the SAME flow disagree, which is the one thing a
 	// diagnostic must not do.
-	if r.decisions != nil {
-		if decided, present := r.decisions[tag]; present {
-			if decided == "" {
-				return nil, "group " + tag + " answered no selection earlier in this walk"
-			}
-			outbound, loaded := r.Lookup(decided)
-			if !loaded {
-				return nil, "group " + tag + " answered " + decided + " earlier in this walk, but that " +
-					"outbound no longer resolves"
-			}
-			return outbound, ""
+	if decided, present := s.decisions.lookup(group); present {
+		if decided == "" {
+			return nil, "group " + tag + " answered no selection earlier in this walk"
 		}
+		outbound, loaded := s.resolver.Lookup(decided)
+		if !loaded {
+			return nil, "group " + tag + " answered " + decided + " earlier in this walk, but that " +
+				"outbound no longer resolves"
+		}
+		return outbound, ""
 	}
-	network := r.network
+	network := s.network
 	if network == "" {
 		network = NetworkTCP
 	}
 	selected := group.Selected(network)
 	if selected == nil {
-		if r.decisions != nil {
-			r.decisions[tag] = ""
-		}
+		s.decisions.record(group, "")
 		return nil, "group " + tag + " has no selected member for " + network
 	}
-	if r.decisions != nil {
-		r.decisions[tag] = selected.Tag()
-	}
+	s.decisions.record(group, selected.Tag())
 	return selected, ""
 }
 
