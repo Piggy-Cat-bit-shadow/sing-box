@@ -740,6 +740,15 @@ func TestH3StandCompletesARealH3HandshakeOnLoopback(t *testing.T) {
 
 	require.Eventually(t, func() bool { return pair.egressA.liveConnections() <= 1 }, 5*time.Second, 10*time.Millisecond)
 	_ = closed
+
+	// Printed rather than only asserted, so a reader of the run can QUOTE the transport that was
+	// negotiated instead of taking the assertion's word for it.
+	t.Logf("MEASURED over loopback: ALPN=%q proto=%q quic_version=%q sni=%q datagrams=%v zero_rtt=%v; "+
+		"egress accepted %d QUIC connection(s), served %d CONNECT tunnel(s), payload %q round-tripped; "+
+		"client holds %d connection(s) and %d raw socket(s); fallback dials %d",
+		handshake.alpn, handshake.proto, handshake.quicVersion, handshake.sni,
+		handshake.datagrams, handshake.zeroRTT, accepted, tunnels, string(payload),
+		stand.liveHTTP3Connections(), stand.liveRawSockets(), stand.fallback.callCount())
 }
 
 // TestH3StandStableNetworkDoesNotDowngradeTheProtocol is the stable-network row.
