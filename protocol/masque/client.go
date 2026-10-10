@@ -134,6 +134,57 @@ func NewClientEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 	if options.HTTP3Options.InitialPacketSize == 0 {
 		options.HTTP3Options.InitialPacketSize = min(int(options.MTU)+masque.QUICPacketOverhead, math.MaxUint16)
 	}
+	// A proven lower tunnel caps the OUTER QUIC packet, when this endpoint reaches its server through a
+	// detour that can state a fixed inner IP capacity.
+	//
+	// # The three sizes this keeps apart
+	//
+	//	inner IP MTU        `options.MTU`, default masque.DefaultMTU = 1280
+	//	                    what the tunnel carries INSIDE, and what PortMTU publishes
+	//	outer QUIC packet   `HTTP3Options.InitialPacketSize`
+	//	                    the tunnel's OWN connection to its server, over the underlay
+	//	outer link MTU      not known here
+	//	                    the underlay's IP MTU, which the `mtu` option says nothing about
+	//
+	// The outer packet is NOT an inner capacity and must never be assigned one: it is one inner IP packet
+	// plus masque.QUICPacketOverhead (51 bytes of MASQUE Context ID, HTTP/3 quarter-stream ID, AEAD tag
+	// and QUIC framing), which is why the default is `MTU + 51` and not `MTU`.
+	//
+	// # Why a lower capacity overrides it
+	//
+	// `MTU + 51` assumes the underlay can carry it. A `detour` is a tunnel this connection travels
+	// INSIDE, so what that tunnel can prove is a hard physical capacity rather than a preference - and
+	// the failure mode of ignoring it is the worst kind: quic-go asks for a first flight the path drops,
+	// the handshake never completes, and the tunnel reports "not ready" with no cause anywhere. The
+	// ceiling is computed by common/dialer, so the same IPv4/IPv6 arithmetic and the same lower-tunnel
+	// encapsulation (WireGuard's own transport framing) are applied as for hysteria2 and TUIC.
+	//
+	// A directory dial has no detour, so `Known` is false and nothing changes: the configured value (or
+	// `MTU + 51`) is what quic-go receives, exactly as before this existed.
+	pathCapacity := dialer.DetourPathCapacity(ctx, options.DialerOptions.Detour)
+	outerPayloadCeiling, hasOuterCeiling := pathCapacity.QuicPayloadCeiling()
+	if hasOuterCeiling {
+		effectiveInitialPacketSize := dialer.ClampToCeiling(options.HTTP3Options.InitialPacketSize, outerPayloadCeiling, true)
+		// A ceiling below the QUIC minimum is a configuration-level impossibility, not a value to clamp:
+		// an Initial packet cannot be smaller than 1200 (RFC 9000 section 14.1), so there is no
+		// conforming handshake to send over this path. Refusing here names the cause; clamping would
+		// produce a handshake no peer accepts, and the failure would surface much further from it.
+		if effectiveInitialPacketSize < dialer.MinimumQUICInitialPacketSize {
+			return nil, E.New("masque: the lower tunnel (inner MTU ", pathCapacity.InnerMTU,
+				", ", pathCapacity.Family.String(), ") leaves ", outerPayloadCeiling,
+				" bytes for this connection's own QUIC packet, which cannot carry a QUIC Initial ",
+				"(minimum ", dialer.MinimumQUICInitialPacketSize,
+				"). This path cannot carry a standard QUIC handshake; configure a larger tunnel MTU or ",
+				"reach this server without this detour")
+		}
+		if effectiveInitialPacketSize != options.HTTP3Options.InitialPacketSize {
+			logger.Info("path capacity: inner MTU ", pathCapacity.InnerMTU,
+				" caps the outer QUIC packet at ", outerPayloadCeiling,
+				", so initial_packet_size ",
+				options.HTTP3Options.InitialPacketSize, " becomes ", effectiveInitialPacketSize)
+		}
+		options.HTTP3Options.InitialPacketSize = effectiveInitialPacketSize
+	}
 	outboundDialer, err := dialer.NewWithOptions(tunnelDialerOptions(ctx, options))
 	if err != nil {
 		return nil, err
