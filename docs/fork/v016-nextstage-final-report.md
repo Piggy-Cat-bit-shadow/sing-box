@@ -17,15 +17,19 @@ Companion documents in this directory:
 ```text
 START_SHA                        = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 LIVE_ORIGIN_AT_START             = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
-FINAL_CODE_SHA                   = 45aab788fa059c4b9586387472870dd137e69944   (the last CODE commit;
+FINAL_CODE_SHA                   = eca26d8fe8fadd005d784fb39e775d45eae1d74b   (the last CODE commit;
                                    the exact scan SHA, see §I)
 ORIGIN_TESTING_FINAL             = the tip of this document's own commit, and it is verified equal to
                                    the local HEAD rather than written down:
                                        git rev-parse HEAD   ==   git rev-parse origin/testing
                                    A document cannot cite the SHA of the commit that contains it
-                                   without changing it, so the last two pushes reported
-                                   `686c937cb..04528b8bf` and `04528b8bf..3f703f2a0`, both ordinary
-                                   fast-forwards with no force and no rejection.
+                                   without changing it, so the pushes reported
+                                   `686c937cb..04528b8bf`, `04528b8bf..3f703f2a0` and
+                                   `3f703f2a0..3862ea982` — every one an ordinary fast-forward, with no
+                                   force and no rejection.
+FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
+                                   before each push)
+NEW_COMMITS                      = 29   (every subject contains the literal `[skip ci]`)
 FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
                                    before the push; the push reported `686c937cb..04528b8bf  HEAD -> testing`)
 NEW_COMMITS                      = 25   (every subject contains the literal `[skip ci]`)
@@ -84,7 +88,13 @@ b5059ef0a  test(route): attack the goroutine census instrument, and pin its scop
 6140afcc5  test(daemon,adapter): the ledger's reachability walked hop by hop, and the interval boundary measured
 a3fbc153b  style(wireguard): gofmt the rebind lease probes
 45aab788f  test(box): the Failure pointer is a caller-owned value, and the straddle test asserts its premise
+c2d93396e  test(route,sniff): two adversarial probes could not survive -count, and one measured a predicate that is gone
+eca26d8fe  test(wireguard): the port table is machine-wide, so the socket census carries the release claim
 ```
+
+The last three of those exist because the order's own gate was run **verbatim** rather than
+approximated, and each one is a defect in this round's evidence that `-count=1` and per-package runs
+cannot see. See §L.3.
 
 Each agent's commit was cherry-picked with `-x` onto the integration tip; the order's requirement that
 no agent share a worktree was kept — seven detached worktrees, one writer per file, no file written by
@@ -120,6 +130,8 @@ Nothing was written, checked out, stashed, reset, cleaned, added, committed or b
 | Exported `ValidateRoots` accepting a truncated route | `FIXED_VERIFIED` | Found by the integrator; `reachable=true, err=nil` at baseline, refused now. §L. |
 | `route::TestConfiguredRateShapesTheRealTCPCopyPath` naming | `SAFE_WITH_SCOPE` | Renamed to what it measures; no band, no assertion, no socket added. §E. |
 | `common/sniff`, `protocol/group`, `common/power` instruments | `FIXED_VERIFIED` | Three tests that could not fail now fail on the mutation they name, each with a calibrating control. §H. |
+| This round's own evidence under `-race -count=3` | `FIXED_VERIFIED` | Four defects that only the order's gate could see — two probes that could not survive repetition, one measuring a predicate that was gone, and one instrument confounded by a machine-wide port table. §L.3. |
+| Six pinned product policies (1250, IPv6 underlay, `mtu<1280`, DNS-only, 48 h backoff, >64 KiB buffer) | `PRESERVED_VERIFIED` | Each located by its own artifact and re-run green. §J. |
 
 `RELEASE` is a separate, single verdict in §N; this table is not one.
 
@@ -354,9 +366,9 @@ restart path.
 | Same generation, success interleaved with an old failure | `FAILED_PRODUCT_FIXED` | defect 1 above |
 | A→B→A ×25 + bursts + Close | `VERIFIED_WITH_SCOPE` | **26 handshakes, every one ALPN h3**, 26 tunnels each attributed to the environment current at the time, ends holding 1 connection + 1 raw socket, 0 fallback dials, package census back to baseline; a 24-transition burst lands on the FINAL environment; Close is idempotent and a later dial fails instead of hanging |
 | DNS-only change is not a network transition | `VERIFIED_WITH_SCOPE` | existing route artifact, re-run green |
-| DNS generation split between A and AAAA | `NOT_RUN` | no artifact; belongs to the DNS owner |
+| DNS generation split between A and AAAA | `VERIFIED_WITH_SCOPE` — **corrected from `NOT_RUN`** | The row is covered, by an artifact Agent C did not own and therefore did not find: `dns/cross_generation_family_test.go::TestLookupFamiliesDoesNotMixGenerations` holds the IPv6 family genuinely in flight behind a real barrier, lands a real `router.ResetNetwork()` **between** the two halves, and then asserts (a) each published family result carries only its own family, (b) both families answered on opposite sides of the reset, and (c) the AAAA answer that **spanned** the reset is not served from cache on the next lookup — checked through the production `Lookup` path by counting upstream queries rather than by a hand-built cache key, which the test's own comment explains is the only way that assertion means anything. Strengthened by `dns/family_no_merge_test.go` and `dns/complete_lookup_generation_test.go`. This is why "not in my worktree" and "not run" are different statements, and the matrix now says which one it was. |
 | Fail-closed DNS ownership on/off | `VERIFIED_WITH_SCOPE` | existing artifacts re-run: ON sends the address, OFF sends the name, and on failure the real peer's recording is **EMPTY** |
-| FakeIP stale-range movement | `VERIFIED_WITH_SCOPE` | covered by Agent A's dedicated e2e rows (§C) |
+| FakeIP stale-range movement | `VERIFIED_WITH_SCOPE` | covered by Agent A's dedicated e2e rows (§C); 17 rows, including the retired-generation refusal and the beyond-the-cursor positive |
 | MASQUE outer initial 1250 vs the 1232 ceiling | `VERIFIED_WITH_SCOPE` | existing artifacts re-run green; nothing MTU-shaped was changed |
 | Real CONNECT / SOCKS / UDP | `VERIFIED_WITH_SCOPE` | package suites green plus the new wiring test; the shared `Client` gains only the verdict ordering and the closed flag |
 | Real iOS radio / roam / WARP | `NOT_RUN_EXTERNAL_DEVICE` | the stand's environment source is a decision source and says so in its own header; **no claim above rests on it** |
@@ -531,14 +543,14 @@ had to resolve against the object store; both are noted so neither is repeated.
 ## I. Full test coverage, result and SHA
 
 ```text
-SCAN_SHA            = 45aab788fa059c4b9586387472870dd137e69944   (the last CODE commit)
-FINAL_CODE_SHA      = 45aab788fa059c4b9586387472870dd137e69944
+SCAN_SHA            = eca26d8fe8fadd005d784fb39e775d45eae1d74b   (the last CODE commit)
+FINAL_CODE_SHA      = eca26d8fe8fadd005d784fb39e775d45eae1d74b
 FULL_TEST_SHA_MATCH = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP
 
-                      The pushed tip is this report's own docs-only commit, one above the scanned SHA.
-                      `git diff --stat 45aab788f..HEAD` lists ONLY files under docs/fork/ — no test file
-                      and no production file was added by it — so the tree the scan covered and the tree
-                      that ships are the same code tree. A document cannot cite its own commit SHA
+                      The pushed tip is this report's own docs-only commit, above the scanned SHA.
+                      `git diff --stat eca26d8fe..HEAD -- . ':(exclude)docs/fork'` is EMPTY — no test
+                      file and no production file is added by it — so the tree the scan covered and the
+                      tree that ships are the same code tree. A document cannot cite its own commit SHA
                       without changing it, which is exactly why this field has a third value.
 
 COMMAND             = go test -count=1 -tags "$TAGS" -json -timeout 3600s ./...
@@ -546,17 +558,23 @@ COMMAND             = go test -count=1 -tags "$TAGS" -json -timeout 3600s ./...
                       $LASTEXITCODE read on the immediately following statement, so the exit code is
                       go's and not a pipeline's
 GO_EXIT             = 1
-RAW LOG             = C:\Deepseek\内核\final_full_scan.jsonl   (34840 JSON events, 0 bytes on stderr)
-                      C:\Deepseek\内核\final_scan_meta.txt      (SHA + tags + timestamp)
+RAW LOG             = docs/fork/v016-nextstage-final-scan.jsonl   (34835 JSON events, 0 bytes on stderr)
+                      C:\Deepseek\内核\final_scan_meta.txt        (SHA + tags + timestamp)
 PACKAGES_TOTAL      = 171 reporting packages
 PACKAGES_WITH_TESTS = 84   (81 ok + 3 FAIL)
-DISTINCT_TESTS      = 7047
+DISTINCT_TESTS      = 7046
 BUILD_FAILURES      = 0
 LAST EVENT          = package pass  ->  REACHED_MODULE_END
 
 FULL_TEST_COVERAGE  = REACHED_MODULE_END
 FULL_TEST_RESULT    = COMPLETED_WITH_FAILURES
 ```
+
+The scan was re-run after the four gate defects in §L.3 were fixed, because those fixes added test files
+and changed two of them. **The failing set is byte-identical to the previous scan and to the historical
+one**: the same 11 names in the same 3 packages, and no package regressed. `common/trafficsched`, whose
+intermittent failure is analysed in §I.4, **passed** in this scan — consistent with its measured rate
+rather than with it having been fixed.
 
 ### I.1 The failing set is exactly the historical one — no new failure
 
@@ -706,6 +724,18 @@ libbox source imports the root package. The authoritative in-repo gate is
   and green in the packages that own them.
 - **`go.mod`/`go.sum`: no diff.** No pinned fork was edited; no fingerprint changed; no new dependency.
 
+The order's §0.2 names six pinned policies to PRESERVE. All six were located by their own artifacts and
+re-run green, so "preserved" is a measurement rather than an absence of edits:
+
+| Pinned policy | Where it is pinned | Result |
+|---|---|---|
+| quic-go first packet **1250** under ChromeParrot | `protocol/hysteria2/chrome_parrot_first_datagram_test.go` (+ `common/dialer/path_mtu_test.go` stating the 1250 → 1298-over-IPv6 arithmetic) | green |
+| narrow IPv6 **underlay budget** | `protocol/masque/endpoint.go:302` folds `MinimumIPv6TunnelMTU` into `boundedRequired`; asserted in `mtu_budget_test.go` | green |
+| **`mtu < 1280` refused for IPv6** | `protocol/masque/mtu_validation_test.go::TestMTUBelowTheIPv6MinimumIsRefusedForIPv6`, with `TestMTUBelowTheIPv6MinimumIsKeptForIPv4Only` as the legitimate-negative control | green |
+| **DNS-only network change does not reset** the whole network | `route/dns_only_change_is_not_a_network_transition_test.go`, `dns/dns_environment_generation_test.go` | green |
+| **48 h H3 backoff cap** | `transport/http/http3_transport_test.go::TestHTTP3BrokenBackoffCap` | green |
+| `sing` fork **>64 KiB buffer** bound | `common/bufio/geometry_test.go` — the pool sizes are `[64, 65536]` or `MaxPooledBufferSize`, and a `BufferSize` outside that set makes every allocation fall out of the pool | green |
+
 **Not run, and not claimed:** real iOS/`NWPathMonitor` radio switching, real Wi-Fi roam, real handover,
 WARP over a real path, Apple signing, and any Apple/macOS/Windows client UI. The client repositories
 were not touched.
@@ -783,8 +813,60 @@ reachable.
 Every mutation was reverted and hash-verified; the reverts are visible in the tree
 (`git diff` empty on each mutated production file).
 
-### L.3 Instruments, not assertions about instruments
+### L.3 Four more defects, found only by running the order's own gate verbatim
 
+The round's own full scan is `-count=1`, so it cannot see a test that breaks when repeated, and it runs
+one package set at a time, so it cannot see an instrument confounded by other processes. The order's
+§16 gate is `-race -count=3` over nine packages **in parallel**, and running exactly that — rather than
+an approximation of it — found four defects that nothing else had:
+
+1. **`route/agentf_census_instrument_attack_test.go` could not survive `-count>1`.** Its injected worker
+   was held by a **package-level** channel closed by a `defer`. Repetition 1 passed and closed the gate;
+   repetition 2's worker exited immediately, the baseline stopped moving, the assertion failed on a
+   state the test itself had created, and the deferred close then **panicked** with
+   `close of closed channel`, taking the rest of the package's repetitions with it. MEASURED:
+   `-count=3` passed once, failed once, panicked; `-count=1` was green. Fixed by creating the gate per
+   invocation and releasing it through a `sync.Once`, plus a settled-baseline read so a worker released
+   by a previous repetition cannot be counted as this one's.
+2. **`common/sniff/agentf_census_slack_attack_test.go` had the same shape, and worse: its
+   `agentFLeakGate` was dead state.** Every leak already had its own per-size channel; nothing but the
+   `defer` ever touched the package-level one. Dead state that can only panic is deleted, not guarded.
+3. **The same file measured a predicate that no longer exists.** It evaluated
+   `sniffGoroutines() > before+4` — the slack it had found, which was then repaired. Leaving it would
+   have left a probe asserting `require.False(fired)` for leak sizes 1–3 forever while describing
+   nothing. It is repointed rather than deleted, because the *method* is what makes it worth keeping,
+   and against the live predicate the sweep now reads: leak 1 → **FIRED**, 2 → **FIRED**, 3 → **FIRED**,
+   4 → **FIRED**. A four-point sensitivity sweep of the instrument that replaced the blind spot.
+4. **`transport/wireguard`'s pause assertion was confounded by a machine-wide resource.**
+   `TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket` failed at cycle 0 with *"a network pause must
+   RELEASE the socket"*. The fixtures bind an **ephemeral** port, and the OS port table is
+   machine-wide — the parallel gate runs nine test processes at once, so a port the endpoint just
+   released can be handed to another process before the probe runs. 55942 is inside the Windows dynamic
+   range. What was ruled out, by measurement rather than argument: isolated `-count=1`/`-count=3`/
+   `-race -count=1`/`-race -count=3` PASS; whole package `-race -count=3` ×3 PASS; `-race -count=20`
+   under sixteen concurrent CPU burners PASS; only the nine-package parallel gate failed.
+   **Pinning the port was the obvious fix and is wrong here** — this test's rebind half asserts the port
+   *moved*, which is the ephemeral branch releasing through `IpcSet("listen_port=0")`, so a fixed port
+   makes a real contract unsatisfiable. The instrument changed instead:
+   `closeBindLocked` calls `bind.Close()` and then waits `netc.stopping.Wait()` for the receive
+   goroutines **before `Down()` returns**, so the synchronous claim the pause makes is stated exactly by
+   the device-owned socket census, which no other process can move. The test now asserts
+   `socketCensus == 0` **immediately**, and the port table is kept as corroboration through
+   `requirePortReleasedByTheEndpoint`, which fails only when the endpoint holds more than one socket's
+   worth of receivers — i.e. exactly when a socket leaked. Reverse-break: withholding `wgDevice.Down()`
+   from `onPauseUpdated` compiles and is **RED BY ASSERTION** with `Should be zero, but was 2`, so the
+   new witness is at least as strong as the one it replaces.
+
+The order's gate is now green, twice in a row, in full:
+`common/physicalpath`, `protocol/group`, `route`, `dns`, `common/dialer`, `transport/wireguard`,
+`protocol/wireguard`, `common/httpclient`, `e2e` — all `ok`, exit 0.
+
+**One thing that looked like a fifth defect and is not.** A `-count=3` sweep reported
+`protocol/masque` timing out at 600 s. It is not a hang: the package's suite legitimately takes
+**423.587 s** for a single run in the full scan, and my sweep's timeout was simply too short. Recorded
+because "the package is slow" and "the package hangs" are different facts and only the first is true.
+
+### L.4 Instruments, not assertions about instruments
 Three instruments were found to be incapable of failing and were rebuilt with calibrating controls, and
 two more were scoped or corrected: the `route` census predicate (frame boundary + scope test +
 sensitivity control), the `wireguard` census (scoped by receiver address, `0 → 60 → 0`), the
@@ -838,9 +920,10 @@ Each item says **why**, and what would be needed. Nothing here is a bug that cou
 ## N. Final release verdict
 
 ```text
-FINAL_SHA                         = 45aab788fa059c4b9586387472870dd137e69944
-ORIGIN_TESTING                    = 45aab788fa059c4b9586387472870dd137e69944 (ordinary fast-forward)
-ALL_NEW_COMMITS_SKIP_CI           = YES (checked one by one; 24/24)
+FINAL_CODE_SHA                    = eca26d8fe8fadd005d784fb39e775d45eae1d74b
+ORIGIN_TESTING                    = the tip of this commit; `git rev-parse HEAD` ==
+                                    `git rev-parse origin/testing` (ordinary fast-forward, §A)
+ALL_NEW_COMMITS_SKIP_CI           = YES (checked one by one; 29/29)
 OTHER_REPOS_TOUCHED               = NO
 ORIGINAL_DIRTY_WORKTREE_UNTOUCHED = YES (hash-backed, §A.1)
 GO_MOD_GO_SUM                     = UNCHANGED
@@ -850,17 +933,19 @@ A_FIP_HISTORIC_ADDRESS            = FIXED_VERIFIED, with two explicit boundaries
 B_WG_REBIND                       = FIXED_VERIFIED for result ownership;
                                     BLOCKED_DEPENDENCY_LIMITATION_WITH_EVIDENCE for interruption
 C_REAL_CONNECTION_CHURN           = VERIFIED_WITH_SCOPE (real ALPN h3 handshake named, 25 real
-                                    transitions, 2 product defects fixed, 2 rows NOT_RUN, real-device
-                                    rows NOT_RUN_EXTERNAL_DEVICE)
+                                    transitions, 2 product defects fixed, every matrix row now resolved
+                                    except the real-device ones)
 D_BOX_STATUS_INTEGRATION          = LANDED_VERIFIED
 E_PLATFORM_TEST_MATRIX            = EXPLICIT_PASS_FAIL_BLOCKED
-F_INDEPENDENT_ADVERSARIAL_DEBUG   = COMPLETED_AFTER_INTEGRATION (3 rounds; 1 finding withdrawn by the
-                                    adversary itself, 1 integrator refutation recorded)
+F_INDEPENDENT_ADVERSARIAL_DEBUG   = COMPLETED_AFTER_INTEGRATION (3 rounds plus one integrator audit
+                                    pass; 1 finding withdrawn by the adversary itself, 1 integrator
+                                    refutation recorded, 3 of its own probes repaired so they can run
+                                    under the round's own gate)
 FULL_TEST_COVERAGE                = REACHED_MODULE_END (171 reporting packages, 84 with tests,
-                                    7047 distinct tests, 0 build failures)
+                                    7046 distinct tests, 0 build failures)
 FULL_TEST_RESULT                  = COMPLETED_WITH_FAILURES (81 ok / 3 FAIL; the 11 failing test names
                                     are byte-identical to the historical set)
-FULL_TEST_SHA_MATCH               = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP (scan at 45aab788f; the tip
+FULL_TEST_SHA_MATCH               = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP (scan at eca26d8fe; the tip
                                     adds docs/fork/ only, so no test file and no production file differs)
 CI_REMOTE                         = OBSERVED, NOT_RUN_BY_REQUEST (0 runs triggered; 85 [skip ci]
                                     commits -> 0 runs measured historically)
