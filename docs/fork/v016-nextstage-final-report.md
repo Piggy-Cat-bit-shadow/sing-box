@@ -115,6 +115,24 @@ AFTER   HEAD = 8d78dcddcc434ed9091a3654e3f6b0b542fa3461   branch = testing
 
 Nothing was written, checked out, stashed, reset, cleaned, added, committed or built there at any point.
 
+### A.2 Desktop handoff copy
+
+The order asks for the report to live in `docs/fork/` **and not only** at a Windows path, and the round
+was given as a file on the Desktop, so two copies exist and are verified byte-identical:
+
+```text
+C:\Users\Jie\Desktop\JiejieBox_v016_686c937c_NextStage_Closure_ReleaseCandidate_Final_Report.md
+C:\Users\Jie\Desktop\JiejieBox_v016_686c937c_NextStage_G0_Baseline_Ledger.md
+```
+
+The check that matters, and how to repeat it: `git status --porcelain` is empty at the tip, so the
+worktree file **is** the committed blob; `Get-FileHash -Algorithm SHA256` on the worktree file and on
+the desktop copy returns the same digest, and `git hash-object <worktree file>` equals
+`git rev-parse HEAD:<path>` — which is what proves the desktop copy is the thing that shipped rather
+than a re-rendering of it. The digests are deliberately **not** written into this document: a file
+cannot contain its own hash, and the previous two push rounds each invalidated a SHA written into the
+document that then contained it. They are reported outside the artefact instead.
+
 ---
 
 ## B. Requirements, item by item
