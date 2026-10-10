@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -312,6 +313,23 @@ func fipAsk(t *testing.T, running *chain, name string, queryType uint16) netip.A
 }
 
 func fipProxyAddress(port uint16) string { return fmt.Sprintf("127.0.0.1:%d", port) }
+
+// fipIssuedIntervals renders the ledger's recorded intervals, so a row can STATE the
+// over-approximation it is working against rather than tune a literal until it passes.
+func fipIssuedIntervals(ledger *adapter.FakeIPIssuanceLedger) string {
+	if ledger == nil {
+		return "<no ledger>"
+	}
+	intervals := ledger.IssuedIntervals()
+	if len(intervals) == 0 {
+		return "<none recorded>"
+	}
+	parts := make([]string, 0, len(intervals))
+	for _, interval := range intervals {
+		parts = append(parts, interval.String())
+	}
+	return strings.Join(parts, " ")
+}
 
 // fipReloadRootContext builds the context a SEQUENCE of Boxes extends, with one issuance ledger in it.
 //
@@ -641,6 +659,102 @@ func TestFIPAddressFromThePreviousGenerationDoesNotEscape(t *testing.T) {
 	t.Logf("CONTROL-A3 %s", fipEgress("own-range-unissued="+own.String(), code2, ownAccepts, peer.acceptCount(), ownAdded))
 	fipRequireRefused(t, code2, ownAdded, ownAccepts, peer.acceptCount(),
 		"an unissued address inside the NEW range (the control that keeps the row honest)")
+}
+
+// TestFIPLiteralBeyondTheCursorStaysReachableAfterARangeMove is the wire-level version of the row that
+// forbids a blanket guard, and it is the one the integrator asked for by name.
+//
+// It has to be a WHOLE-STAND test rather than only a ledger unit test, because the claim is about the
+// router: an address past everything a generation recorded must still cross as an ordinary literal,
+// even when it sits inside a range this process once used.
+//
+// # Why these literals, and why the reservation window has to be respected
+//
+// `Store.Create` persists its cursor `reservedAddressCount` (1024) ahead of the addresses it has really
+// issued, so a generation's recorded interval legitimately reaches roughly 1024 addresses past its
+// first issuance - and on a range SMALLER than that window the reservation WRAPS and the record covers
+// much of the range. `198.18.4.200` and `198.20.0.200` are therefore chosen to be past any window
+// either generation can reserve (a `/16` reservation from `X.0.2` ends near `X.4.2`), which is what
+// makes "beyond the cursor" separable from "reserved". This is not cosmetic: it is the boundary of the
+// ledger's own over-approximation, stated rather than assumed.
+func TestFIPLiteralBeyondTheCursorStaysReachableAfterARangeMove(t *testing.T) {
+	backend := startEchoServer(t, "tcp", "127.0.0.1:0")
+	peer := startFIPPeerSink(t, echoAddress(backend))
+	cachePath := tempDir(t) + "\\fip-a7b.db"
+
+	root, wantLedger := fipReloadRootContext()
+	first := startChainInContext(t, root, fipConfig{
+		mixedPort: freePort(t), peer: peer, fakeIPRange: fipRangeCurrent, cacheFilePath: cachePath,
+	}.json(), nil)
+	issued := fipAsk(t, first, "fip-owned.test", 1)
+	require.Same(t, wantLedger, fipRouterLedger(t, first))
+	require.NoError(t, first.closeNow())
+
+	secondPort := freePort(t)
+	second := startChainInContext(t, root, fipConfig{
+		mixedPort: secondPort, peer: peer, fakeIPRange: fipRangeMoved, cacheFilePath: cachePath,
+	}.json(), nil)
+	t.Cleanup(func() { _ = second.closeNow() })
+
+	// The retired generation's issuance is refused (C4)...
+	retiredMark := peer.mark()
+	retiredAccepts := peer.acceptCount()
+	retiredConn, retiredCode := socks5Request(t, fipProxyAddress(secondPort), 0x01, issued.String(), 443)
+	if retiredConn != nil {
+		defer retiredConn.Close()
+	}
+	retiredAdded := peer.awaitSince(retiredMark, 400*time.Millisecond)
+	t.Logf("EGRESS-A7b-retired %s", fipEgress("issued="+issued.String(), retiredCode, retiredAccepts, peer.acceptCount(), retiredAdded))
+	fipRequireRefused(t, retiredCode, retiredAdded, retiredAccepts, peer.acceptCount(),
+		"the retired generation's own issuance")
+
+	// ...and literals past everything any generation recorded are not - including one in the RETIRED
+	// range, which is the case a blanket range guard gets wrong.
+	//
+	// The boundary is READ from the ledger rather than guessed, because the reservation window is what
+	// decides it: `Store.Create` persists its cursor 1024 addresses ahead, so a generation's record
+	// reaches roughly `firstIssued + 1024`. Printing the recorded intervals is what keeps this row
+	// honest about the over-approximation instead of tuning a literal until it passes.
+	t.Logf("A7b recorded intervals: %s", fipIssuedIntervals(wantLedger))
+
+	// The two literals that are OUTSIDE every range this process used. `198.18.4.200` is inside the
+	// RETIRED range and past its record; `198.24.0.200` is inside none of them.
+	for _, literal := range []string{"198.18.4.200", "198.24.0.200"} {
+		mark := peer.mark()
+		conn, code := socks5Request(t, fipProxyAddress(secondPort), 0x01, literal, 443)
+		added := peer.awaitSince(mark, 500*time.Millisecond)
+		t.Logf("EGRESS-A7b-literal %s", fipEgress("literal="+literal, code, 0, peer.acceptCount(), added))
+		require.Equal(t, byte(0x00), code,
+			"literal %s must stay reachable: it is beyond everything any generation recorded, and "+
+				"refusing it is the compatibility regression the issuance requirement exists to prevent",
+			literal)
+		require.Len(t, added, 1)
+		require.Equal(t, literal, added[0].Host,
+			"the literal must cross unchanged, not rewritten or replaced")
+		require.Equal(t, byte(0x01), added[0].AddressType)
+		if conn != nil {
+			requireEcho(t, conn, "fip-a7b-literal")
+			conn.Close()
+		}
+	}
+
+	// And the OTHER direction on the same Box, so the two refusals cannot be confused with each other:
+	// an address inside the CURRENT range that was never issued is refused by the pre-existing C2
+	// branch (`missing fakeip record`), not by the ledger. MEASURED while writing this row: the first
+	// version of it asserted that this address stays reachable, and it does not - which is correct,
+	// because it is in the range the live store owns.
+	inRangeMark := peer.mark()
+	inRangeAccepts := peer.acceptCount()
+	inRangeConn, inRangeCode := socks5Request(t, fipProxyAddress(secondPort), 0x01, "198.20.0.200", 443)
+	if inRangeConn != nil {
+		defer inRangeConn.Close()
+	}
+	inRangeAdded := peer.awaitSince(inRangeMark, 400*time.Millisecond)
+	t.Logf("EGRESS-A7b-inrange %s",
+		fipEgress("literal=198.20.0.200", inRangeCode, inRangeAccepts, peer.acceptCount(), inRangeAdded))
+	fipRequireRefused(t, inRangeCode, inRangeAdded, inRangeAccepts, peer.acceptCount(),
+		"an address inside the CURRENT range that this generation never issued (the C2 branch, which "+
+			"predates this fix and must be unchanged by it)")
 }
 
 // TestFIPRangeMoveNewGenerationStillIssuesCorrectly is the compatibility half of A3: after the range

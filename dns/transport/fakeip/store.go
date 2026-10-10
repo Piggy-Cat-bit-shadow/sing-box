@@ -245,8 +245,9 @@ func (s *Store) Create(domain string, isIPv6 bool) (netip.Addr, error) {
 	}
 	s.storage.FakeIPStoreAsync(address, domain, s.logger)
 	if s.ledger != nil {
-		// The exact record: this is one address the store really handed out, so the ledger can narrow
-		// whatever the persisted cursor over-approximated at Start.
+		// The exact record: this is one address the store really handed out, so the ledger narrows
+		// whatever the persisted cursor over-approximated at Start. The address IS the advanced cursor -
+		// `nextAddress` returns the address it moved TO, not the one it moved from.
 		s.ledger.RecordIssued(s.generationSequence, generationLive, address)
 	}
 	return address, nil

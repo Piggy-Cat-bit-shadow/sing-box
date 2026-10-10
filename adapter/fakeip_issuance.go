@@ -226,6 +226,20 @@ func (l *FakeIPIssuanceLedger) Clear() {
 	l.publishLocked()
 }
 
+// IssuedIntervals returns a copy of every interval the ledger has recorded, so a diagnostic - or a
+// test stating the boundary its row is working against - can report what the refusal would act on
+// instead of inferring it.
+func (l *FakeIPIssuanceLedger) IssuedIntervals() []FakeIPIssuanceInterval {
+	if l == nil {
+		return nil
+	}
+	snapshot := l.current.Load()
+	if snapshot == nil {
+		return nil
+	}
+	return slices.Clone(snapshot.intervals)
+}
+
 // Intervals reports how many intervals are currently recorded, which is what a boundedness
 // measurement reads.
 func (l *FakeIPIssuanceLedger) Intervals() int {
@@ -269,22 +283,35 @@ func (l *FakeIPIssuanceLedger) publishLocked() {
 		merged = append(merged, record.inet4.intervals...)
 		merged = append(merged, record.inet6.intervals...)
 	}
-	l.current.Store(&issuanceSnapshot{intervals: mergeIssuanceIntervals(merged)})
+	l.current.Store(&issuanceSnapshot{intervals: normalizeIssuanceIntervals(merged)})
 }
 
 // seedFamily builds a family's record from a range and a cursor, or nothing when the family is not
 // configured.
+//
+// # Why the interval starts at `firstIssuable` rather than at the CURSOR
+//
+// The cursor is where the walk HAS reached; `range.Addr().Next()` is the first address the walk can
+// ever hand out, and the walk is in order, so everything between them has been issued. Starting at the
+// cursor instead would drop the addresses a persisted cursor has already passed - which is exactly the
+// window `Store.Create` reserves ahead of the true high-water mark, and the whole reason a retired
+// generation is attributable at all.
+//
+// A cursor BELOW the first issuable address contributes nothing, because such a cursor describes a
+// range with no room to issue from.
 func seedFamily(addressRange netip.Prefix, cursor netip.Addr) familyIssuance {
 	if !addressRange.IsValid() {
 		return familyIssuance{}
 	}
 	family := familyIssuance{addressRange: addressRange}
-	if cursor.IsValid() && cursor.BitLen() == addressRange.Addr().BitLen() && addressRange.Contains(cursor) {
-		first := addressRange.Addr().Next()
-		if first.IsValid() && cursor.Compare(first) >= 0 {
-			family.intervals = []FakeIPIssuanceInterval{{From: first, To: cursor}}
-		}
+	if !cursor.IsValid() || cursor.BitLen() != addressRange.Addr().BitLen() || !addressRange.Contains(cursor) {
+		return family
 	}
+	firstIssuable := addressRange.Addr().Next()
+	if !firstIssuable.IsValid() || cursor.Compare(firstIssuable) < 0 {
+		return family
+	}
+	family.intervals = []FakeIPIssuanceInterval{{From: firstIssuable, To: cursor}}
 	return family
 }
 
@@ -328,37 +355,41 @@ func extendFamily(family familyIssuance, address netip.Addr) familyIssuance {
 	return family
 }
 
-// mergeIssuanceIntervals returns the union of the intervals as an ordered, disjoint set, merging only
-// across the same address family.
-func mergeIssuanceIntervals(intervals []FakeIPIssuanceInterval) []FakeIPIssuanceInterval {
-	if len(intervals) == 0 {
+// normalizeIssuanceIntervals filters out unusable intervals and orders the rest.
+//
+// # Why this does NOT union or merge
+//
+// The published set was merged once, and the merge was wrong in a way worth recording. A wrapped
+// generation's intervals are the TAIL and the HEAD of its range, and `Addr.Next()` of the range's last
+// address is the range's first address - so an adjacency test written as `from <= previous.to.Next()`
+// reads a wrapped pair as adjacent and glues them into a single interval from `.254` to `.1`, whose
+// bounds are inverted and which therefore contains NOTHING. The wrap then silently stopped being
+// attributable, which is the original defect in a new place.
+//
+// It is not repaired, it is removed: written on a circular address space an adjacency test is wrong
+// somewhere whatever it is compared against, and the ledger does not need the union. `Issued` is a
+// scan over a handful of intervals, so overlapping or adjacent entries cost one comparison each and
+// the answer is identical. What bounds the size is the per-generation representation (at most two
+// intervals) and the generation cap, not the merge.
+func normalizeIssuanceIntervals(intervals []FakeIPIssuanceInterval) []FakeIPIssuanceInterval {
+	kept := make([]FakeIPIssuanceInterval, 0, len(intervals))
+	for _, interval := range intervals {
+		if !interval.From.IsValid() || !interval.To.IsValid() {
+			continue
+		}
+		if interval.From.BitLen() != interval.To.BitLen() || interval.From.Compare(interval.To) > 0 {
+			continue
+		}
+		kept = append(kept, interval)
+	}
+	if len(kept) == 0 {
 		return nil
 	}
-	slices.SortFunc(intervals, func(left, right FakeIPIssuanceInterval) int {
+	slices.SortFunc(kept, func(left, right FakeIPIssuanceInterval) int {
 		if order := cmp.Compare(left.From.BitLen(), right.From.BitLen()); order != 0 {
 			return order
 		}
 		return left.From.Compare(right.From)
 	})
-	merged := make([]FakeIPIssuanceInterval, 0, len(intervals))
-	for _, interval := range intervals {
-		if len(merged) == 0 {
-			merged = append(merged, interval)
-			continue
-		}
-		previous := &merged[len(merged)-1]
-		if previous.From.BitLen() != interval.From.BitLen() {
-			merged = append(merged, interval)
-			continue
-		}
-		// Overlapping or adjacent: extend the previous interval to whichever end is further.
-		if interval.From.Compare(previous.To.Next()) <= 0 {
-			if interval.To.Compare(previous.To) > 0 {
-				previous.To = interval.To
-			}
-			continue
-		}
-		merged = append(merged, interval)
-	}
-	return merged
+	return kept
 }
