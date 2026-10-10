@@ -232,8 +232,28 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 	// defect from being reported once per route that reaches it. It is filled from the tags this
 	// root actually covers.
 	described := make(map[string]bool)
-	// reported is the set of tags that were already the LEAF of a failure, and it is deliberately
+	// reported is the set of ROOTS that have already contributed a failure, and it is deliberately
 	// narrower than described.
+	//
+	// # Why the key is the root and not the leaf
+	//
+	// Keying on the leaf made the verdict depend on the order the outbounds were DECLARED in, and
+	// suppressed a real one. MEASURED, on a configuration whose two routing rules both deliver udp
+	// to one tcp-only leaf, once through a selector and once directly:
+	//
+	//	outbounds: [tcp-only, A(selector -> tcp-only), B(selector -> tcp-only)]
+	//	rules:     {network: udp, outbound: A}, {network: udp, outbound: B}
+	//
+	// `tcp-only` is a declared outbound, so the manager validates it as a root FIRST and records its
+	// tag in `reported`. `A` then failed against that leaf and its failure was DROPPED, so the report
+	// named only `outbound/tcp-only` and never mentioned the route. Reordering the outbounds changes
+	// which root is named. `Failure.Root` is what tells an operator which entry point to fix, so a
+	// unit that hides it is the wrong unit.
+	//
+	// The duplication the mechanism exists for is one OBJECT described once per route, which the
+	// `described` set already handles - a group member that is also a top-level outbound is skipped
+	// as a ROOT when `described` covers its tag. `reported` is the narrow second guard that stops one
+	// root contributing the same failure twice.
 	//
 	// # Why a verdict cannot be suppressed by a tag that never failed
 	//
@@ -262,10 +282,10 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 		report.Roots = append(report.Roots, rootReport.Roots...)
 		report.Nodes = append(report.Nodes, rootReport.Nodes...)
 		for _, failure := range rootReport.Failures {
-			if reported[failure.Leaf] {
+			if reported[failure.Root] {
 				continue
 			}
-			reported[failure.Leaf] = true
+			reported[failure.Root] = true
 			report.Failures = append(report.Failures, failure)
 		}
 		// The set of tags this root DESCRIBED. The roots that follow must not repeat them: a

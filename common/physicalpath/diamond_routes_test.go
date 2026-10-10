@@ -164,35 +164,105 @@ func TestSharedLeafFailureIsAttributedToItsOwnRoute(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, report.Reachable())
 
-	type attribution struct {
+	// # What this test was originally written to prove, and why the premise had to change
+	//
+	// It asserted that the `shared` leaf fails on BOTH routes, so that the two failures could be
+	// told apart by their route. Measurement says otherwise, and the reason is the contract rather
+	// than a bug: `shared` under route A is a DEPENDENCY hop (position 1), and a dependency carries
+	// the CONSUMER's own transport rather than the business network, so nothing is required of it
+	// that it cannot do. `shared` under route B is position 0, where the business UDP flow actually
+	// arrives, and it carries TCP only - so THAT is the route that fails.
+	//
+	// The property the name claims is still real and still worth pinning; it just needs a fixture
+	// where two routes genuinely fail. See TestTwoRoutesToOneLeafAreBothReported below.
+
+	sharedFailures := make([]struct {
 		route string
 		hop   int
-	}
-	sharedFailures := make([]attribution, 0, 2)
-	reasons := make([]string, 0, 2)
+	}, 0, 2)
 	for _, failure := range report.Failures {
 		if failure.Leaf != "shared" {
 			continue
 		}
-		sharedFailures = append(sharedFailures, attribution{route: failure.Route, hop: failure.Hop})
-		reasons = append(reasons, failure.Reason)
+		sharedFailures = append(sharedFailures, struct {
+			route string
+			hop   int
+		}{route: failure.Route, hop: failure.Hop})
 	}
-	require.ElementsMatch(t, []attribution{
-		{route: "outer -> A -> shared", hop: 1},
-		{route: "outer -> B -> shared", hop: 0},
-	}, sharedFailures,
-		"both routes that reach the leaf must be reported, each with its own hop")
-	require.Equal(t, reasons[0], reasons[1],
-		"the two failures carry the same defect text and are told apart by their route, not by their wording")
+	require.Equal(t, []struct {
+		route string
+		hop   int
+	}{{route: "outer -> B -> shared", hop: 0}}, sharedFailures,
+		"only the route that requires UDP of the shared leaf fails: route A reaches it as a "+
+			"dependency, where the leaf carries exactly what is asked of it. A failure reported for "+
+			"route A here would mean the dry run was demanding the ROOT's business network of a "+
+			"dependency hop - the false-rejection class START-01 exists to remove")
 
-	// The node list itself carries the routes, so a caller can see the routes even when they are
-	// usable: the report is not a list of failures only.
+	// The route list is still complete, so a caller can see both routes even though only one of
+	// them is broken: the report is not a list of failures only.
 	routes := make([]string, 0, len(report.Nodes))
 	for _, node := range report.Nodes {
 		routes = append(routes, node.Route)
 	}
 	require.Contains(t, routes, "outer -> A -> shared")
 	require.Contains(t, routes, "outer -> B -> shared")
+}
+
+// TestTwoRoutesToOneLeafAreBothReported is the property the test above was named for, with a fixture
+// where it is actually true.
+//
+// # The defect this pins
+//
+// The manager de-duplicated failures by LEAF TAG, so once one route had reported a broken leaf, a
+// SECOND route to the same leaf could not report its own failure. The two routes are two chances to
+// be wrong and they carry different requirements, so a caller was shown one broken route where there
+// were two - and because the manager walks its roots in declaration order, WHICH of the two survived
+// depended on the order the outbounds happened to be written in.
+//
+// The key is therefore (route, leaf, hop). The same triple reached twice is still one line, which is
+// what the de-duplication was for.
+func TestTwoRoutesToOneLeafAreBothReported(t *testing.T) {
+	// One leaf that cannot carry UDP, reached by two DIFFERENT routes that both require UDP of it at
+	// the position where the business flow arrives.
+	shared := &testLeaf{tag: "shared", leafType: "socks", networks: []string{N.NetworkTCP}}
+	groupA := &testGroup{
+		tag: "A", groupType: "test-group", members: []string{"shared"},
+		networks: []string{N.NetworkUDP}, selected: "shared",
+	}
+	groupB := &testGroup{
+		tag: "B", groupType: "test-group", members: []string{"shared"},
+		networks: []string{N.NetworkUDP}, selected: "shared",
+	}
+	outer := &testGroup{
+		tag: "outer", groupType: "test-group", members: []string{"A", "B"},
+		networks: []string{N.NetworkUDP}, selected: "A",
+	}
+	registry := newRegistry(shared, groupA, groupB, outer)
+	for _, group := range []*testGroup{groupA, groupB, outer} {
+		group.lookup = registry.objects
+	}
+
+	report, err := ValidateRoots(registry.resolver(), []adapter.Outbound{outer}, nil,
+		[]string{N.NetworkUDP}, Declarations{})
+	require.NoError(t, err)
+
+	reasonByRoute := make(map[string]string)
+	for _, failure := range report.Failures {
+		if failure.Leaf != "shared" {
+			continue
+		}
+		reasonByRoute[failure.Route] = failure.Reason
+	}
+	require.Len(t, reasonByRoute, 2,
+		"both routes to the shared leaf are broken and both must be reported; one line for two "+
+			"broken routes is how an operator fixes one and ships the other. Reported routes: %v",
+		reasonByRoute)
+	require.Contains(t, reasonByRoute, "outer -> A -> shared")
+	require.Contains(t, reasonByRoute, "outer -> B -> shared")
+	require.Equal(t, reasonByRoute["outer -> A -> shared"], reasonByRoute["outer -> B -> shared"],
+		"the two failures carry the SAME defect text and are told apart by their route, so a "+
+			"de-duplication key that includes the route is what keeps them separate - keying on the "+
+			"reason or the leaf alone would collapse them again")
 }
 
 // TestADiamondWithACycleIsStillRefused is the guard for the other half of PATH-03: with the global

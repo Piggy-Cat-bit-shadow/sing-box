@@ -410,16 +410,33 @@ func validateNode(resolver *Resolver, hop PathNode, endpoints EndpointRegistry, 
 	//    configurations that had always started.
 	if len(requirement) > 0 {
 		networksCarried := networksOf(hop.Outbound)
+		if len(networksCarried) == 0 {
+			return failure("this outbound reports no network it can carry, so it cannot serve the " +
+				strings.Join(requirement, ",") + " flow routed through it")
+		}
+		// EVERY network in the requirement is checked before a verdict is reached, and the report
+		// names the ones this hop CANNOT carry.
+		//
+		// # Why the loop does not return on the first unsupported network
+		//
+		// It used to, and the consequence was a wrong message rather than a missing check. A hop
+		// required to carry both networks while carrying only TCP reported "this outbound carries
+		// tcp and cannot serve the udp flow" - which reads as "it carries tcp and therefore cannot
+		// serve udp", i.e. as though carrying tcp were the CAUSE of the udp failure. The cause is
+		// that it does not carry udp, and the sentence said the opposite.
+		//
+		// A caller that is told the wrong cause looks in the wrong place, so the failure now names
+		// exactly the missing set and separately what the hop does carry.
+		var missing []string
 		for _, network := range requirement {
-			if slices.Contains(networksCarried, network) {
-				continue
+			if !slices.Contains(networksCarried, network) {
+				missing = append(missing, network)
 			}
-			if len(networksCarried) == 0 {
-				return failure("this outbound reports no network it can carry, so it cannot serve the " +
-					network + " flow routed through it")
-			}
-			return failure("this outbound carries " + strings.Join(networksCarried, ",") + " and cannot " +
-				"serve the " + network + " flow routed through it (the entry point routes " +
+		}
+		if len(missing) > 0 {
+			return failure("this outbound does not carry " + strings.Join(missing, ",") +
+				" (it carries " + strings.Join(networksCarried, ",") + ") and cannot serve the " +
+				strings.Join(missing, ",") + " flow routed through it (the entry point routes " +
 				strings.Join(requirement, ",") + " to it)")
 		}
 	}
