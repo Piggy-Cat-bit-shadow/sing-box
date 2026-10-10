@@ -195,17 +195,33 @@ production consumer that overclaims.
 
    Two facts follow, and both matter more than the list.
 
-   **The baseline does not complete a full test run on this machine at all.** `transport/http` hangs
-   for ninety minutes, so `go test -p 1 ./...` never reaches the packages ordered after it. The
-   attribution for those is therefore bounded by that hang, which is stated rather than glossed.
+   **The same serial command at the final SHA, measured against that baseline:**
 
-   **Both failures that PREVENTED completion are fixed in this session.** The `transport/http` hang is
-   the `loopbackDialer` defect: it dialled a connected UDP socket for EVERY network, and `net.DialUDP`
-   to a port nobody listens on SUCCEEDS, so the HTTP/1 fallback received a working "connection" and
-   blocked in `ReadResponse` with no deadline. The `protocol/shadowtls` failure is the assertion
-   against `syscall.ECONNREFUSED`, which is false on Windows (a TCP dial returns WSAECONNREFUSED,
-   10061) and whose message is LOCALIZED by the OS. Both are fixed, so this round's tree is the first
-   in which `transport/http` runs to completion here - `ok 16.7s`, and `ok 18.4s` under `-race`.
+   | package | baseline `8e6c0a96` | final `d0b1c6c0` |
+   |---|---|---|
+   | `transport/http` | **HUNG, 5400.042s** | **ok 16.643s** |
+   | `protocol/shadowtls` | FAIL | **ok 0.022s** |
+   | `common/tls` | FAIL (the same 3 cases) | FAIL (the same 3 cases) |
+   | `common/tlsspoof` | FAIL (the same 3 cases) | FAIL (the same 3 cases) |
+   | `common/urltest` | FAIL | FAIL |
+   | `common/windivert` | FAIL (the same 5 cases) | FAIL (the same 5 cases) |
+   | `experimental/clashapi` | FAIL (the same 2 cases) | FAIL (the same 2 cases) |
+   | `experimental/libbox` | FAIL (the same 1 case) | FAIL (the same 1 case) |
+
+   **The baseline does not complete a full test run on this machine at all.** `transport/http` hangs
+   for ninety minutes, so `go test -p 1 ./...` never reaches the packages ordered after it, and the
+   baseline comparison for those is bounded by that hang.
+
+   **Both failures that PREVENTED completion are fixed in this session**, and they are the two rows
+   that changed. The `transport/http` hang is the `loopbackDialer` defect: it dialled a connected UDP
+   socket for EVERY network, and `net.DialUDP` to a port nobody listens on SUCCEEDS, so the HTTP/1
+   fallback received a working "connection" and blocked in `ReadResponse` with no deadline. The
+   `protocol/shadowtls` failure is the assertion against `syscall.ECONNREFUSED`, which is false on
+   Windows (a TCP dial returns WSAECONNREFUSED, 10061) and whose message is LOCALIZED by the OS.
+
+   So this round's tree is the first in which `transport/http` runs to completion here - `ok 16.643s`,
+   and `ok 18.4s` under `-race` - and the six packages that fail do so identically at both SHAs, which
+   is what makes them attributable to the environment rather than to this work.
 
    The six remaining packages are identical at both SHAs. Two apparent regressions in `common/dialer`
    and `common/power` appeared only in a PARALLEL sweep and BOTH PASS in isolation at the final SHA;
