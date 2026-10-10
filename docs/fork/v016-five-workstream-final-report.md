@@ -270,13 +270,41 @@ was not audited.
 LX_SPEC120_MTU_STATUS = PARTIAL
 ```
 
-### F.4 L3 H3→H2 fallback — being handled concurrently
+### F.4 L3 H3→H2 fallback — `PARTIALLY_FIXED`, gap proven and fixed
 
-`transport/http/client.go` already has `http3Broken`/`http3Backoff` with exponential backoff
-(`markHTTP3Broken` doubles to `http3BrokenBackoffMax`), `clearHTTP3Broken` on success, and a strict-mode
-check that runs BEFORE failure classification so `disable_version_fallback` cannot fall back. A dedicated
-audit and regression workstream was run against it; its result is folded into section J rather than
-claimed here.
+The expiry semantics were **already correct and stronger than a latch**: `http3Available()`
+(`transport/http/client.go`) compares a stored DEADLINE (`brokenUntil == 0 || now >= brokenUntil`),
+bounded 5s → 5m, cleared on H3 success (`tunnel_client.go`) and by `ResetConnections`, with no timer
+anywhere — expiry is evaluated per dial, so the memory can never be permanent.
+
+The unclosed part was **concurrency**. `markHTTP3Broken` was a non-atomic read-modify-write over two
+separate atomics, run once per FAILING DIAL. Every dial of a burst passes `http3Available()` before the
+first of them arms the memory, so N parallel dials met ONE transient failure and multiplied the schedule
+by 2^N in that instant. MEASURED with 16 genuinely concurrent dials: the stored window was
+`300000000000` ns (5 minutes, the ceiling) instead of `5000000000` ns (5 seconds). One blip therefore
+read as "H3 is down for minutes", and each later burst re-pinned the ceiling — the user-visible form of
+"HTTP/3 never works here".
+
+Fixed minimally: the escalation step is now CLAIMED by one `CompareAndSwap` on the deadline, so the dial
+that finds the memory unarmed escalates and every other dial that failed in the same event is covered by
+the window it opened. Both halves are load-bearing — a mutation keeping the CAS but dropping the
+open-window guard goes RED again.
+
+Eight new tests pin invariants 2-8, including the two halves of the LX bug that were previously UNTESTED:
+that an EXPIRED window retries HTTP/3 (both with a controlled clock and on the real 5-second clock,
+writing no state at all), and that a successful H2 does not permanently disqualify HTTP/3. Five
+mutations in a disposable copy are RED, including `http3Available` changed to a permanent latch.
+
+Honest limits: `-race` could NOT have caught the original defect — both fields were atomics, so it was a
+lost update rather than a data race; the instrument is the value assertion. An adjacent per-authority
+memory in `common/httpclient/http3_transport.go` has the same per-attempt escalation shape with a 48h
+ceiling (not permanent, and its cap is deliberately pinned) and was NOT changed — flagged for a separate
+decision. A pre-existing environmental hang in `TestTunnelTransportIsNotReportedWhenTheTunnelFails` was
+proven pre-existing at the baseline commit and is why whole-package runs there use `-skip`.
+
+```text
+LX_SPEC121_FALLBACK_STATUS = PARTIALLY_FIXED (expiry already correct; the concurrency gap is FIXED)
+```
 
 ### F.5 L4 Adjacent bugfixes
 
@@ -496,7 +524,8 @@ PHYSICAL_PATH_OBSERVABILITY_LIFECYCLE_STATUS = NOT_READY (only the MASQUE PortMT
 LX_SPEC119_QUERY_STATUS                 = READY
 LX_SPEC120_MTU_STATUS                   = PARTIAL (HY2 wired and measured; TUIC not wired;
                                           ChromeParrot override needs authorisation)
-LX_SPEC121_FALLBACK_STATUS              = see the concurrent workstream result
+LX_SPEC121_FALLBACK_STATUS              = PARTIALLY_FIXED, gap FIXED (expiry already correct;
+                                          the per-dial escalation burst is fixed)
 ZERO_EXTRA_COPY_STATUS                  = NOT_RUN
 ACTIONS_REFACTOR_STATIC_STATUS          = PASS
 ACTIONS_RUN_STATUS                      = NOT_RUN (hard requirement)
