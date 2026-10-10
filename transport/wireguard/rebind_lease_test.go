@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"runtime"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -397,6 +397,7 @@ func endpointFrameAddress(pointer any) string {
 	// `[0x2c5fbed57608]` is what the slice printer produces for a single pointer.
 	return strings.TrimSuffix(strings.TrimPrefix(rendered, "["), "]")
 }
+
 // endpointGoroutineCensus counts the goroutines whose stack runs inside `function` on this endpoint.
 //
 // It refuses to count a goroutine whose stack names one of ITS OWN caller's frames. That exclusion is what
