@@ -97,11 +97,40 @@ func TestBusinessEntryCountsExactlyOneEntryPerRoute(t *testing.T) {
 			// PhysicalPath is built from tags, so no element of it can be relied on to name the
 			// route's selected hop.
 			//
-			// What IS structural: `reverseRoute` numbers each completed route 0..k-1 in packet
+			// What IS structural: `numberRoute` numbers each completed route 0..k-1 in packet
 			// order, and the routes are emitted consecutively. So a new route starts wherever the
 			// position does not continue as previous+1 under the same root.
+			//
+			// # Why a node that names no object is NOT segmented
+			//
+			// The invariant below is a statement about HOPS - "every route has exactly one business
+			// entry, and exactly one exit, and they are the same node". A member tag that resolves to
+			// nothing is reported as a hop-SHAPED fact so the report can name it (see the
+			// unresolved-member branch of `enumerateHops`), but it is a REFERENCE and not a hop: it
+			// carries an empty `PhysicalPath` because it names no object, `Position` is the length of
+			// the chain ABOVE it rather than an index into any chain of its own, and `businessEntry`
+			// refuses it by requiring `Resolved`.
+			//
+			// Counting it here is what made the two detectors unsatisfiable together. MEASURED on
+			// `tcpGroup("group", "present", "present", "absent")`: the reference carries
+			// `Position 0` - the same value as the resolved member, because it was never numbered -
+			// so `Position == previous+1` cannot join it to that member's route. It was segmented into
+			// a route OF ITS OWN, and this assertion then demanded one business entry of a route whose
+			// only node is the reference that `TestAnUnresolvedGroupMemberIsNotABusinessEntry`
+			// requires NOT to be one. Joining them into one route does not resolve it either: both
+			// nodes are `Exit`, so the one-exit assertion below then fails with "has 2". The
+			// contradiction was in the segmentation, not in the product: neither detector needs a
+			// change, and the reference is simply not part of a hop invariant.
+			//
+			// Dropping it loses no coverage: a group whose ONLY member does not resolve produces no
+			// routes at all and is caught by the `require.NotEmpty` above, and the reference itself is
+			// pinned field by field - `Resolved`, `Exit`, `PhysicalPath`, `Position`,
+			// `businessEntry` - by that detector and by the report-level assertions at its end.
 			var routes [][]PathNode
 			for _, node := range nodes {
+				if !node.Resolved {
+					continue
+				}
 				if len(routes) == 0 {
 					routes = append(routes, []PathNode{node})
 					continue
