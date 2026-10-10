@@ -22,8 +22,23 @@ import (
 )
 
 // The production integration of the upload scheduler: configuration reaches the shaper, and the
-// shaper is measured where it actually runs - inside the copy loop the connection manager starts,
-// not around a writer a test built for itself.
+// shaper is measured where it actually runs - inside the userspace copy loop the connection manager
+// starts, in front of the writer the manager installs, rather than around a writer a test built for
+// itself.
+//
+// # What these tests are NOT named after, and why the names are exact
+//
+// The harness is `net.Pipe()`, which has no socket at all, and `uploadStreamGate` returns `nil, nil`
+// for a flow whose ends are both syscall-capable - a flow `bufio.copyDirect` would have moved
+// through the kernel without entering the copy loop. So what is measured here is the USERSPACE copy
+// loop and nothing else: no TCP pair is created, `spliceConnection` is never reached, and the
+// gate's own guard (route/conn.go) is what keeps the two apart. Managing only the userspace path is
+// the stated scope of this scheduler round, so the tests are named for it. An earlier name claimed
+// a "real TCP copy path"; the measurement was sound and the claim was stronger than the code, which
+// is the one direction this file must not drift in.
+//
+// No band in this file was widened or narrowed by that correction, and no socket was added to make
+// a name true.
 
 // configureUploadRate decodes a route section and applies it exactly the way box.New does, so the
 // wiring under test is the wiring that ships.
@@ -63,13 +78,18 @@ func TestConfiguredUploadRateReachesTheScheduler(t *testing.T) {
 	}
 }
 
-// TestConfiguredRateShapesTheRealTCPCopyPath is the end-to-end claim: a rate in the configuration
-// bounds how fast a managed upload actually leaves, through the connection manager's own copy
-// function and the gate it installs.
+// TestConfiguredRatePacesTheUserspaceTCPCopyLoop is the end-to-end claim for the stream side: a
+// rate in the configuration bounds how fast a managed upload actually leaves, through the
+// connection manager's own copy function and the gate it installs in front of the destination.
+//
+// "Userspace" is load-bearing, not a hedge: the flow is a `net.Pipe()` pair, so the gate's
+// syscall-capable guard cannot apply and the bytes really do travel through
+// `manager.connectionCopy`. Nothing here exercises a socket, and nothing here may be read as
+// evidence about the kernel splice path - see the file header.
 //
 // The measurement is wall-clock over a fixed payload, which is the only observable that cannot be
 // satisfied by a shaper that is present but inert.
-func TestConfiguredRateShapesTheRealTCPCopyPath(t *testing.T) {
+func TestConfiguredRatePacesTheUserspaceTCPCopyLoop(t *testing.T) {
 	const (
 		rate    = 2_000_000
 		payload = 4_000_000
@@ -149,10 +169,14 @@ func byteCount(bytes int) string {
 	}
 }
 
-// TestConfiguredRateShapesTheRealUDPCopyPath is the same claim for the packet path, and it also
+// TestConfiguredRatePacesTheUserspaceUDPCopyLoop is the same claim for the packet path, and it also
 // pins that batching survives shaping: the copy must go through the batch entry point rather than
 // degrading to one syscall per packet.
-func TestConfiguredRateShapesTheRealUDPCopyPath(t *testing.T) {
+//
+// It carries the same scope limit as the stream test above and for the same reason: the harness is
+// `net.Pipe()`, so this is the userspace packet copy loop behind the production gate, not a UDP
+// socket.
+func TestConfiguredRatePacesTheUserspaceUDPCopyLoop(t *testing.T) {
 	const rate = 2_000_000
 
 	t.Run("unshaped control", func(t *testing.T) {
