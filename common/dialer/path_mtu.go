@@ -33,6 +33,25 @@ const (
 	udpHeaderLength  = 8
 )
 
+// MinimumQUICInitialPacketSize is the smallest QUIC Initial packet the protocol permits (RFC 9000
+// section 14.1). It is a floor on the UDP PAYLOAD, which is why it composes with the ceiling above
+// rather than with an IP MTU: a path whose remaining payload budget is below this cannot carry a
+// standard QUIC handshake at all, and that is a configuration-level impossibility rather than a value
+// to clamp. Reporting a smaller number would produce a handshake no conforming peer accepts.
+const MinimumQUICInitialPacketSize = 1200
+
+// String renders a family for a diagnostic message.
+func (f IPFamily) String() string {
+	switch f {
+	case IPFamilyIPv4:
+		return "IPv4"
+	case IPFamilyIPv6:
+		return "IPv6"
+	default:
+		return "unknown family (sized as IPv6, the larger header)"
+	}
+}
+
 // IPFamily is the address family an upper protocol's packets will actually travel in.
 //
 // The distinction is not cosmetic: an IPv6 header is 20 bytes larger than an IPv4 one, so the same inner

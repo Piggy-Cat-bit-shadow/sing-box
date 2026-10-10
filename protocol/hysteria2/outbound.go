@@ -126,6 +126,51 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	networkList := options.Network.Build()
+	// A proven lower tunnel caps what this QUIC connection may put on the wire.
+	//
+	// # Where the ceiling comes from, and where it stops
+	//
+	// `dialer.DetourPathCapacity` resolves the endpoint this outbound's `detour` names, when that
+	// endpoint publishes a FIXED inner IP capacity (MASQUE and WireGuard do; a group does not, and is
+	// reported unknown). The QUIC payload ceiling is that capacity minus this protocol's own IPv6/IPv4
+	// overhead, computed once in common/dialer so HY2 and TUIC cannot disagree about the arithmetic.
+	//
+	// An unknown path yields no ceiling and the configured value is used unchanged, so a direct dial
+	// keeps exactly its previous behaviour.
+	//
+	// # The measured limit of what this can achieve today
+	//
+	// The ceiling reaches quic-go as `InitialPacketSize`, and the pinned quic-go OVERRIDES that field
+	// with `chromeInitialPacketSize` (1250) whenever `ChromeParrot` is set - which hysteria2's default
+	// is. So this clamp is effective only when ChromeParrot is off, or when the pinned library is
+	// changed to treat the configured value as a hard ceiling. MEASURED, and asserted rather than
+	// assumed: `TestPathCeilingReachesTheWireOnlyWithoutChromeParrot` in this package measures the real
+	// first datagram both ways.
+	//
+	// It is still wired here rather than left for later, because the value has to be computed and
+	// handed down BEFORE a library change can make it effective, and because a configuration that
+	// already sets `disable_chrome_parrot: true` gets the ceiling today. The residual - a hard ceiling
+	// that ChromeParrot still overrides - is reported as a product decision about the pinned fork, not
+	// as a silent gap.
+	pathCapacity := dialer.DetourPathCapacity(ctx, options.DialerOptions.Detour)
+	quicPayloadCeiling, hasCeiling := pathCapacity.QuicPayloadCeiling()
+	effectiveInitialPacketSize := dialer.ClampToCeiling(options.InitialPacketSize, quicPayloadCeiling, hasCeiling)
+	if hasCeiling && effectiveInitialPacketSize != options.InitialPacketSize {
+		logger.Info("path capacity: inner MTU ", pathCapacity.InnerMTU,
+			" caps the QUIC payload at ", quicPayloadCeiling,
+			", so initial_packet_size ",
+			options.InitialPacketSize, " becomes ", effectiveInitialPacketSize)
+	}
+	// A ceiling below the QUIC minimum is a configuration-level impossibility, not a value to clamp:
+	// an Initial packet cannot be smaller than 1200, so there is no safe number to send.
+	if hasCeiling && effectiveInitialPacketSize < dialer.MinimumQUICInitialPacketSize {
+		return nil, E.New("hysteria2: the lower tunnel (inner MTU ", pathCapacity.InnerMTU,
+			", ", (dialer.IPFamily)(pathCapacity.Family).String(),
+			") leaves ", quicPayloadCeiling, " bytes of UDP payload, which cannot carry a QUIC Initial ",
+			"packet (minimum ", dialer.MinimumQUICInitialPacketSize,
+			"). This path cannot carry a standard QUIC handshake; configure a larger tunnel MTU or ",
+			"reach this server without this detour")
+	}
 	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
 		Context:            ctx,
 		Dialer:             outboundDialer,
@@ -149,7 +194,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
 			ConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
 			MaxConcurrentStreams:    options.MaxConcurrentStreams,
-			InitialPacketSize:       options.InitialPacketSize,
+			InitialPacketSize:       effectiveInitialPacketSize,
 			DisablePathMTUDiscovery: options.DisablePathMTUDiscovery,
 		},
 		UDPDisabled:  !common.Contains(networkList, N.NetworkUDP),
