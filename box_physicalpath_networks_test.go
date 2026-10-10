@@ -87,6 +87,19 @@ const networkRequirementLoadBalanceWithMixedMembers = `{
   ]
 }`
 
+// Case B3: the same two members under a urltest. URLTestGroup.Select skips a member whose Network()
+// does not contain the requested network (protocol/group/urltest.go), so this group carries the same
+// guarantee as the loadbalance above and mixed membership below it is legal for the same reason.
+const networkRequirementURLTestWithMixedMembers = `{
+  "log": {"disabled": true},
+  "outbounds": [
+    {"type": "socks", "tag": "tcp-only", "server": "127.0.0.1", "server_port": 1080,
+     "version": "5", "network": "tcp"},
+    {"type": "socks", "tag": "dual", "server": "127.0.0.1", "server_port": 1081, "version": "5"},
+    {"type": "urltest", "tag": "ut", "outbounds": ["tcp-only", "dual"]}
+  ]
+}`
+
 // Case C: a TCP-only exit that only TCP routes reach, beside a UDP-carrying outbound.
 const networkRequirementTCPOnlyExitWithTCPRoute = `{
   "log": {"disabled": true},
@@ -289,6 +302,12 @@ var networkRequirementMatrix = []networkRequirementCase{
 		id:        "START-01-B2-loadbalance-mixed-members",
 		why:       "a network-aware group filters a member by Network() before choosing it, so mixed membership is legal",
 		config:    networkRequirementLoadBalanceWithMixedMembers,
+		wantStart: true,
+	},
+	{
+		id:        "START-01-B3-urltest-mixed-members",
+		why:       "a urltest selects per network too, so it must not be refused for a member whose network set is narrower",
+		config:    networkRequirementURLTestWithMixedMembers,
 		wantStart: true,
 	},
 	{
