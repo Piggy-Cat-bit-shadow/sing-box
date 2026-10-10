@@ -1031,7 +1031,7 @@ satisfy both" as "both are wrong", when the correct move was to check what the h
 
 ---
 
-# 13. The seven-layer fault tree walked: D4, D6, D7 (`0c3f48fac`)
+# 13. The seven-layer fault tree walked: D4, D6, D7 (`ea083eb60`)
 
 §4 and §10.11 both ended with the same open item: D4 (DNS/FakeIP/Route), D6 (MTU/Fragment/Network
 Change) and D7 (stop/reconnect/power/cross-platform) had never been walked. This section walks them. Each
@@ -1040,7 +1040,7 @@ LIFECYCLE_INTERLEAVE — by an investigator working in its own worktree, and eve
 re-measured by the integrator before a line was changed.
 
 ```text
-ORIGIN_TESTING = 0c3f48fac   LOCAL == ORIGIN
+ORIGIN_TESTING = ea083eb60   LOCAL == ORIGIN
 COMMITS THIS ROUND, all [skip ci]:
   a39cecf87  test(physicalpath): the reference was segmented by position arithmetic (§12)
   244a70049  docs(fork): §12
@@ -1050,6 +1050,10 @@ COMMITS THIS ROUND, all [skip ci]:
              could name one                                                    <- D4
   0c3f48fac  fix(wireguard): an egress pool option whose zero value kills the process is refused at
              Start                                                             <- D7
+  bb29e021f  docs(fork): this section
+  ea083eb60  test(route): churn the interface 25 times and require the cost to be bounded and
+             reversible                                                        <- D7 H3, and the two
+                                                                                  contract corrections
 ```
 
 ## 13.1 Verdicts, one line each
@@ -1062,8 +1066,8 @@ COMMITS THIS ROUND, all [skip ci]:
 | D6, unit/floor/clamp arms | VERIFIED_SAFE (layer units, QUIC 1200 floor at all three protocols, nested integer consistency, IPv6 1280 floor both ways) | §13.5 |
 | D7 stop/reconnect/power | **CONFIRMED_BUG, FIXED** — the zero value of a public option panicked the process from a goroutine nothing can recover | §13.4 |
 | D7 cycles/leaks | VERIFIED_SAFE — 15 Start/Close, 24 real rebinds, 20 consecutive rebinds, 10 pause/wake cycles: no worker and no socket leaked | §13.5 |
+| D7 route/environment churn | **VERIFIED_SAFE** — 25 sequential transitions → 25 resets, at most 1 serialised, reversible, closed at `ea083eb60` | §13.5 |
 | D7 revocation latency | NOT_REPRODUCIBLE_YET as damage — measured and documented as a bounded limitation | §13.6 |
-| D7 route/environment churn | **NOT RUN** — no claim is made | §13.7 |
 
 ## 13.2 D4: a fakeip server could answer a destination lookup (`8fad3e9bc`)
 
@@ -1198,6 +1202,14 @@ and "exactly one port bound out of every port observed" held at every step; 20 c
 20/20 port changes with exactly one socket held throughout; 10 pause/wake/recovery cycles → no drift.
 `-race -count=3` clean.
 
+**D7, route/environment churn (H3), measured after this section was first written.** §13.7 recorded it
+as NOT RUN; it is now closed at `ea083eb60`. 25 sequential interface transitions, driven through the
+production entry `notifyInterfaceUpdate` with each one waited out before the next, produced **25 resets
+with at most 1 reset body inside the router's reset at a time, in 1ms**, left the manager settled and
+still usable, and returned the package's goroutine census to its baseline. Clean under `-count=10`,
+`-race -count=3`, and in the full package. Detector:
+`route/interface_churn_cost_test.go` (`TestRepeatedInterfaceChangesCostBoundedWorkAndAreReversible`).
+
 **Two harness falsifications worth carrying forward**, because a green suite built on them would mean
 nothing:
 
@@ -1216,12 +1228,19 @@ consults it again. MEASURED with the rebind held inside a real socket operation 
 advanced under it: the lease IS expired and its context IS cancelled, and the rebind **completes anyway**,
 committing the endpoint to a new socket.
 
-This contradicts the contract written on the mechanism itself — `RebindLease.Context` says the context is
-"the only thing that reaches work already blocked in a dial" (`common/runtimecoord/coordinator.go:264-266`)
-and `recovery.go:199-205` repeats it. For this code path the statement holds only up to entry.
+This contradicted the contract written on the mechanism itself — `RebindLease.Context` said the context
+is "the only thing that reaches work already blocked in a dial"
+(`common/runtimecoord/coordinator.go:264-266`) and `recovery.go:199-205` repeated it — and the claim was
+stronger than the code. **The two comments were corrected at `ea083eb60`** to state what is true: `ctx` is
+observed once, at entry, and cancellation reaches what is written to observe it rather than what was never
+written to. The bound is now also exact rather than approximate: the reopen runs on
+`context.Background()` (`wireguard-go`'s `conn/bind_std.go:165` passes it into the listener), and
+`ClientBind`'s own dial context is cancelled by `Close`, not by a generation change — so neither the lease
+context nor a generation change reaches an in-flight dial from here, because no dial runs inside the
+rebind's stack at all.
 
-**Why it is not repaired here, rather than repaired badly.** The commit for the socket reopen happens
-*inside* `BindUpdate`, in the dialer's socket control hook, which is handed **no context**
+**Why the code is not repaired here, rather than repaired badly.** The commit for the socket reopen
+happens *inside* `BindUpdate`, in the dialer's socket control hook, which is handed **no context**
 (`common/dialer`'s listener control is `func(network, address string, conn syscall.RawConn) error`).
 Nothing in this repository can reach it. The only in-repo change available is a re-check between the two
 calls, which shrinks the window instead of closing it and would be a guard that does not do what its name
@@ -1229,8 +1248,8 @@ says. So it is recorded as a bounded revocation latency:
 
 - No lifecycle damage was found: no extra bound socket, no goroutine growth, `Close` still releases
   everything, and the new generation would perform the same reopen anyway.
-- It is a configuration-versus-behaviour gap: the mechanism is DOCUMENTED to do something it only partly
-  does.
+- The remedy that WOULD close it is in the pinned fork: a `BindUpdate` variant that takes a context, or a
+  listener control that receives one. That is a dependency change, which the standing rules forbid.
 
 **D7 open, bounded coupling, not a hang.** `Close` was blocked at `endpoint.go:596` (`wgDevice.Down()`)
 while the worker sat at `recovery.go:343`, because the rebind holds wireguard-go's device lock while
@@ -1238,12 +1257,13 @@ opening sockets and `Close` needs that lock. Identical stacks in 3/3 runs. It is
 operation — `Close` completed as soon as it was released, with a scoped census of 1 and zero held ports
 afterwards. Report it as "Close waits on an in-flight recovery's socket operation", never as a deadlock.
 
-## 13.7 D7 NOT RUN, and D4 open by decision
+## 13.7 D4 open by decision
 
-- **Route/environment churn accumulation (H3) is NOT RUN.** No claim is made about route timers, workers
-  or cached verdicts after repeated interface changes. The investigator read
-  `route/interface_transition_coalescing_test.go` and `route/reference.go:116` and saw no measurement, and
-  chose to spend its budget on the leak question instead of claiming coverage it did not have.
+- **Route/environment churn (H3)** was NOT RUN when this section was written and is now CLOSED — see the
+  measurement added to §13.5. The investigator had read `route/interface_transition_coalescing_test.go`
+  and `route/reference.go:116`, saw no measurement, and chose to spend its budget on the leak question
+  rather than claim coverage it did not have; that judgement was right, and the gap it left is the one
+  closed afterwards.
 - **A fakeip address issued under a PREVIOUS configuration is dialled for real.** `route/route.go:1051`
   gates the whole FakeIP treatment on membership in the CURRENTLY configured range
   (`Store.Contains(dest)`), so once the configuration changes, an address the box itself issued is
@@ -1268,6 +1288,8 @@ FULL_TEST_RESULT          = 80 ok / 3 FAIL
 FULL_TEST_SHA_MATCH       = YES (the scanned SHA equals HEAD, and HEAD is deployed to origin/testing)
   the 3: common/tls, common/tlsspoof, common/windivert - BLOCKED_EXTERNAL, unchanged
   the 11 failing TEST NAMES are byte-identical to the pre-round set, so no failure is new
+  -> the scan predates ea083eb60, which adds one TEST file and changes no production code; route/ is
+     green under that commit (-count=10, -race -count=3, and the full package)
 CROSS_PLATFORM            = PASS_WITH_SCOPE (go build ./... exit 0; ABI unchanged this round)
 CI                        = NOT_RUN_BY_REQUEST (no Actions event was triggered)
 RELEASE                   = NOT_READY (the product decisions in §6 and the external blockers remain)
@@ -1285,5 +1307,22 @@ process-global goroutine count with a `+8` allowance and never publishes a devic
 anything — and it cannot say *which* code leaked even when it does fire. That test is not wrong; it is
 weak, and the difference only became visible when a probe held a gate no code reached and reported three
 green no-ops.
+
+The churn detector then made the same class of mistake TWICE, in two different ways, which is worth
+recording separately because each produced a number that looked like evidence:
+
+1. `runtime.NumGoroutine` is process-global. It was caught reporting *"goroutines went from 2 to 2 … and
+   did not come back"* — a sentence that contradicts itself, because the baseline and the sample were
+   moved by different things.
+2. The scoped census, taken from **inside** the `require.Eventually` closure, counts the executing
+   closure itself: a closure in this package has this package on its stack. The first version was
+   therefore unsatisfiable by construction — it read 2 against a baseline of 1 forever, while its own
+   failure message printed `(currently 1)`, because that argument was evaluated outside the closure. The
+   stacks identified it: the second goroutine was
+   `TestRepeatedInterfaceChangesCostBoundedWorkAndAreReversible.func1`.
+
+Scoping fixed the first and created the second. **Neither was in the code under test, and neither would
+have been visible without dumping the stacks rather than reading the number** — which is the general
+rule this section exists to state.
 
 
