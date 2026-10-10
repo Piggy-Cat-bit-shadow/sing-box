@@ -75,34 +75,102 @@ func agentFPeakGoroutines(window time.Duration) int {
 	return peak
 }
 
+// agentFCountFrames counts goroutines whose stack names `frame`, which is how this file identifies the
+// workers IT injected rather than inferring them from a difference.
+func agentFCountFrames(frame string) int {
+	buffer := make([]byte, 1<<20)
+	read := runtime.Stack(buffer, true)
+	count := 0
+	for _, block := range strings.Split(string(buffer[:read]), "\n\n") {
+		if strings.Contains(block, frame) {
+			count++
+		}
+	}
+	return count
+}
+
+// agentFInjectedWorker is the body of the goroutines this control starts, as a NAMED function rather
+// than a function literal.
+//
+// The frame has to be unambiguous: `group.TestAgentFGroupCensusIsSensitive` also matches the TEST
+// goroutine, and a literal's suffix (`.func1`) depends on how many closures precede it in the function,
+// which a later edit can silently renumber. MEASURED: with the test-function name as the pattern the
+// count was 5 - the four workers plus the reader - and the superset assertion below then demanded a
+// peak of 6 from a process that had 5.
+func agentFInjectedWorker(entered chan<- struct{}, gate <-chan struct{}) {
+	entered <- struct{}{}
+	<-gate
+}
+
+// agentFInjectedWorkerFrame is the frame agentFInjectedWorker produces.
+const agentFInjectedWorkerFrame = "group.agentFInjectedWorker"
+
 // TestAgentFGroupCensusIsSensitive is the control: the census must move for workers it is supposed to
 // see, or the bound it supports means nothing.
+//
+// # Why this does NOT compare against a baseline, which is a correction
+//
+// The first version took `baseline := agentFGroupGoroutines()` before injecting and required
+// `peak >= baseline+4`. That assumes the process is otherwise quiet for the whole window, and inside
+// the FULL package it is not: MEASURED, the same assertion read `baseline=4, peak=5` in a full-package
+// `-race -count=3` run - three goroutines from earlier tests were still alive when the baseline was
+// taken and exited while the four injected workers were being held, so the difference cancelled. It
+// passed in isolation (baseline 1, peak 5) and failed in the package, which is the signature of an
+// instrument measuring the process rather than the thing it names.
+//
+// The control now identifies its OWN workers by frame and asserts that the PACKAGE predicate is a
+// superset of that count plus the reading goroutine. Leftover goroutines can only make the package
+// count larger, so this direction cannot be cancelled by them - and the release assertion is stated as
+// a DROP of four rather than a return to an absolute number, for the same reason.
 func TestAgentFGroupCensusIsSensitive(t *testing.T) {
-	baseline := agentFGroupGoroutines()
-
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 4)
 	for range 4 {
-		go func() {
-			entered <- struct{}{}
-			<-gate
-		}()
+		go agentFInjectedWorker(entered, gate)
 	}
 	for range 4 {
 		<-entered
 	}
 
 	peak := agentFPeakGoroutines(100 * time.Millisecond)
-	t.Logf("MEASURED injected 4 group-stack workers: census from this frame %d, peak over the window %d",
-		baseline, peak)
-	require.GreaterOrEqual(t, peak, baseline+4,
-		"four injected workers whose stacks name this package must be visible to the census; if they "+
-			"are not, the census cannot support any bound")
+	injected := agentFCountFrames(agentFInjectedWorkerFrame)
+	t.Logf("MEASURED injected 4 group-stack workers: identified by their own frame %d, package census "+
+		"peak over the window %d", injected, peak)
 
+	require.Equal(t, 4, injected,
+		"the four injected workers must be alive and identifiable by their own frame, or this control "+
+			"measures nothing at all")
+	require.GreaterOrEqual(t, peak, injected+1,
+		"the package census (peak %d) must count every goroutine the frame census counts (%d), plus "+
+			"the goroutine that reads it; if it does not, the census cannot support any bound. Leftover "+
+			"goroutines from other tests can only make this LARGER, so this direction is the one that "+
+			"cannot be cancelled", peak, injected)
+
+	// The release assertion is relative to a reading taken the SAME way while the workers are held, for
+	// the same reason the entry assertion is not a baseline difference: an absolute number here would be
+	// a claim about the whole process.
+	//
+	// It is polled from a PLAIN LOOP rather than from `require.Eventually`, and that is the second
+	// correction this control needed: `agentFPeakGoroutines` counts every goroutine whose stack names
+	// this package, and testify runs an `Eventually` condition on a goroutine of its own - so a reading
+	// taken inside one is one HIGHER than the same reading taken on the test goroutine. MEASURED, the
+	// release check compared a callback-frame reading (2) against a test-goroutine reading minus four
+	// (1) and could never be satisfied. Both readings are now taken on the test goroutine.
+	held := agentFPeakGoroutines(20 * time.Millisecond)
 	close(gate)
-	require.Eventually(t, func() bool { return agentFPeakGoroutines(20*time.Millisecond) <= baseline+1 },
-		5*time.Second, 5*time.Millisecond,
-		"and the census must come back down once they are released")
+
+	settled := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		settled = agentFPeakGoroutines(20 * time.Millisecond)
+		if settled <= held-4 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.LessOrEqual(t, settled, held-4,
+		"the census must fall by at least the four released workers; it read %d with the workers held "+
+			"(peak %d) and %d after releasing them", held, peak, settled)
 }
 
 // TestAgentFBurstMustNotCreateAWorkerPerFailure is the property, measured with a counter that moves.
