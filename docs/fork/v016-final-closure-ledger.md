@@ -18,6 +18,72 @@ STATUS                  see the closing block
 
 ---
 
+
+Four fix attempts were written for PATH-01 this round and all four were reverted. None was committed,
+because each was measured wrong before it could ship. The measurements are recorded here so the next
+attempt does not repeat them - that is the whole value of this commit.
+
+# What is now KNOWN, not guessed
+
+Attempt 5 built each node's `PhysicalPath` by PREPENDING during the descent and derived `Exit` from
+supersession. Measured output for `c.detour = b`, `b.detour = a`:
+
+    HOPS node "c" chain=[c]     pos=0 exit=true
+    HOPS node "b" chain=[b c]   pos=1 exit=true
+    HOPS node "a" chain=[a b c] pos=2 exit=true
+
+That is a correct, nested, per-node chain - and `Position` now equals the node's index in its own
+chain, which is what `TestEachNodePositionIndexesItsOwnChain` asserts, and it PASSED. Two things are
+still wrong, and they are the SAME thing:
+
+  * the chain is in DESCENT order (`[a b c]` reads deepest-first-to-root-last), so a node's index in
+    it is its distance from the ROOT, not from the DEVICE. `Build` places `a` at 0 and `c` at 2; this
+    places `c` at 0 and `a` at 2 - exactly inverted;
+  * supersession never fires, because `sameTagPrefix` requires the prefix to match from index 0 and
+    `[b c]` is a SUFFIX of `[a b c]`, not a prefix. Every node therefore reports `exit=true`.
+
+# The wall, stated plainly
+
+The two requirements pull the chain in opposite directions, and that is why five attempts failed:
+
+    supersession needs NESTED chains        [c] [b c] [a b c]      -> suffix relation
+    packet order needs DEVICE-FIRST chains  [c] [c b] [c b a]      -> prefix relation
+
+A chain built by prepending is nested and rooted-last, so supersession would have to test SUFFIXES. A
+chain built to be device-first is rooted-first, so supersession tests PREFIXES and works - which is
+what the current shipped code's `PhysicalPath` actually is, and why `Build`'s `reversePacketOrder`
+maps `Unknown.Position` the way it does.
+
+So the next attempt should keep the chain DEVICE-FIRST and take `Position` from it directly, rather
+than building a rooted-last chain and trying to convert. The two failed conversions are:
+
+    reverse a range per frame        depth-dependent: each level flips its own suffix
+    reverse the whole range at root  re-reverses what a child already corrected, giving
+                                     [entry, exit] for a two-hop chain
+
+# What each attempt cost, in one line each
+
+1. reverse inside every recursing frame - result depends on depth
+2. reverse the whole range from the frame that completes the route - double-reverses the child's work
+3. `Position == len(PhysicalPath)-1` as the business-entry test - calls a dependency the entry
+4. supersession guarded by `Root` - vacuous, `Root` is identical for every node under one root
+5. supersession guarded by `Route()` - also vacuous, `Route()` is unique per node
+6. supersession with NO guard, on a rooted-last chain - never fires, wrong end
+
+Attempts 4 and 5 are recorded because the guard looked obviously correct both times and was
+obviously wrong both times, and only running the detector showed it.
+
+# The evidence that stands
+
+`common/physicalpath/p1_contract_test.go` and F's four `*attack_test.go` files are committed RED. They
+are the specification: 13 failing tests that go green when the model is right. The P1 item
+`PHYSICALPATH_UNKNOWN_AND_EXIT` is `NOT_READY`.
+
+`TestATruncatedRouteClaimsNoExit` is the exception and PASSES today: a route with an unresolved
+dependency reports its `Unknown` and claims no exit, so that sub-item is `ALREADY_FIXED` on evidence.
+
+---
+
 > # STOP-SHIP: PATH-01 IS NOT CLOSED
 >
 > An independent adversarial review (role F) **falsified** this round's headline claim, and the
