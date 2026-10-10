@@ -247,7 +247,7 @@ func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Di
 	}
 	defer instance.Close()
 	if debugEnabled {
-		dialElapsed = time.Since(dialStart)
+		dialElapsed = elapsedOfCompletedPhase(time.Since(dialStart))
 	}
 
 	transport := newMeasurementTransport(instance, ctx)
@@ -278,7 +278,7 @@ func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Di
 	if debugEnabled {
 		firstStart := time.Now()
 		firstResponse, firstErr := client.Do(firstRequest.WithContext(ctx))
-		firstElapsed = time.Since(firstStart)
+		firstElapsed = elapsedOfCompletedPhase(time.Since(firstStart))
 		if firstErr != nil {
 			return Measurement{}, firstErr
 		}
@@ -305,7 +305,11 @@ func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Di
 		if !options.ExpectedStatus.Match(secondResponse.StatusCode) {
 			return Measurement{}, statusMismatch(options.ExpectedStatus, secondResponse.StatusCode, scope)
 		}
-		warmElapsed := time.Since(secondStart)
+		// The timed request completed, so the interval it took is positive by construction even when
+		// the clock could not resolve it: see elapsedOfCompletedPhase. Everything derived from it -
+		// the reported delay and the debug record's Warm - is derived from the same value, so the
+		// two can never disagree about whether the timed phase produced the result.
+		warmElapsed := elapsedOfCompletedPhase(time.Since(secondStart))
 		if debugEnabled {
 			debugReport.Dial = dialElapsed
 			debugReport.Warmup = firstElapsed
@@ -340,7 +344,7 @@ func measureWithTimeout(ctx context.Context, options MeasureOptions, detour N.Di
 		options.Debug(debugReport)
 	}
 	return Measurement{
-		Delay:      durationToDelay(time.Since(measurementStart)),
+		Delay:      durationToDelay(elapsedOfCompletedPhase(time.Since(measurementStart))),
 		StatusCode: firstStatus,
 		Scope:      scope,
 	}, nil
@@ -382,6 +386,49 @@ func shouldFallbackSecondRequest(ctx context.Context, err error) bool {
 	return true
 }
 
+// minimumPhaseElapsed is the elapsed time attributed to a phase that demonstrably ran but whose
+// duration the platform's clock could not resolve.
+//
+// It is the smallest positive time.Duration: it asserts only what is actually known - the phase
+// completed, so it took longer than nothing - and invents no magnitude the clock never measured.
+const minimumPhaseElapsed = time.Nanosecond
+
+// elapsedOfCompletedPhase returns the elapsed time of a phase that HAS completed.
+//
+// # Why a completed phase can measure zero
+//
+// time.Since is only as fine as the platform's monotonic clock, and on Windows that clock is the
+// system interrupt time: runtime.nanotime1 reads KUSER_SHARED_DATA.InterruptTime (see
+// runtime/sys_windows_amd64.s in the Go distribution) and the OS updates that field at clock
+// interrupts. The effective resolution is therefore the system tick - about half a millisecond on
+// the host this was found on - and not the 100ns the field is expressed in. Measured there:
+// 400000 consecutive QueryPerformanceCounter reads all differed, while only 16 of 400000
+// consecutive time.Now() reads did, and a warm keep-alive loopback HEAD round trip - exactly the
+// shape of the test fixtures - measured exactly zero on 86% of 3000 trials. The same is true of a
+// local, LAN or co-located endpoint on any platform: it is comfortably inside one tick.
+//
+// Zero elapsed ticks is therefore NOT a missing measurement. The request completed; the interval
+// was simply shorter than the clock can express. Reporting it as 0 corrupts a sentinel the rest of
+// the system already relies on:
+//
+//   - Measurement.Delay: 0 means "no result", and the Clash API answers a 0 delay with no error as
+//     "An error occurred in the delay test". A healthy node would be reported as a failure.
+//   - MeasureDebug.Warm: 0 is what the fallback path leaves behind, meaning "the timed request is
+//     not what produced the delay". A successful second request that also reports 0 leaves the two
+//     cases indistinguishable.
+//
+// So a non-positive elapsed time can only be a clock that did not tick, and it is raised to the
+// smallest positive duration rather than being passed on as "no result".
+//
+// Failure paths do not come through here. A measurement that fails returns the zero Measurement,
+// so its 0 delay keeps meaning exactly what it always meant.
+func elapsedOfCompletedPhase(elapsed time.Duration) time.Duration {
+	if elapsed <= 0 {
+		return minimumPhaseElapsed
+	}
+	return elapsed
+}
+
 // durationToDelay converts a duration to the reported millisecond delay.
 //
 // # Why the floor is 1
@@ -390,6 +437,11 @@ func shouldFallbackSecondRequest(ctx context.Context, err error) bool {
 // measured. A successful measurement that took less than a millisecond would therefore report a
 // value indistinguishable from failure and could be dropped by any consumer testing for zero. The
 // smallest representable successful delay is 1ms.
+//
+// This function is a pure unit conversion and cannot tell an interval that was never measured from
+// one the clock could not resolve: both arrive as a non-positive duration. A caller converting the
+// elapsed time of a phase that COMPLETED must pass it through elapsedOfCompletedPhase first, or a
+// success will be reported as the 0 sentinel.
 func durationToDelay(duration time.Duration) uint16 {
 	if duration <= 0 {
 		return 0

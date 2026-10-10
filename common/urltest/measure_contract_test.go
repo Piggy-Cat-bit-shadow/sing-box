@@ -159,6 +159,45 @@ func TestDurationToDelay(t *testing.T) {
 	require.EqualValues(t, 0xFFFF, durationToDelay(time.Hour))
 }
 
+// TestCompletedPhaseElapsedIsNeverTheNoResultSentinel pins, deterministically, the defect that made
+// the delay assertions in this package non-deterministic.
+//
+// # The defect
+//
+// Measure timed the second request as time.Since(secondStart) and converted it with durationToDelay,
+// which maps a non-positive duration to 0. 0 means "no result" everywhere else in the system, so a
+// measurement that SUCCEEDED could report the failure sentinel - and did, whenever the timed request
+// completed inside a single tick of the platform's monotonic clock. On Windows that clock is the
+// system interrupt time, so the tick is about half a millisecond while a warm keep-alive round trip
+// to a local listener is tens of microseconds: the assertions that a successful measurement reports
+// at least 1 failed at a measured rate of about 86%, and which cases failed changed from run to run.
+// The Clash API reads the same sentinel, answering a 0 delay with no error as a delay-test failure.
+//
+// The fix is that a phase which has COMPLETED is never converted from a non-positive elapsed time:
+// such a reading is the clock declining to resolve an interval that demonstrably happened.
+func TestCompletedPhaseElapsedIsNeverTheNoResultSentinel(t *testing.T) {
+	// Non-positive readings are what a sub-tick interval produces. None of them may become 0.
+	for _, elapsed := range []time.Duration{0, -time.Nanosecond, -time.Microsecond, -time.Second} {
+		require.GreaterOrEqual(t, elapsedOfCompletedPhase(elapsed), time.Nanosecond,
+			"a completed phase read %v elapsed; a non-positive reading means the clock did not tick "+
+				"across the phase, not that the phase did not run", elapsed)
+		require.GreaterOrEqual(t, durationToDelay(elapsedOfCompletedPhase(elapsed)), uint16(1),
+			"a completed phase must never be reported as delay 0, which means 'no result'")
+	}
+
+	// A resolved interval is passed through untouched, so the floor cannot inflate a real
+	// measurement into a slower one.
+	require.Equal(t, time.Nanosecond, elapsedOfCompletedPhase(time.Nanosecond))
+	require.Equal(t, 250*time.Millisecond, elapsedOfCompletedPhase(250*time.Millisecond))
+	require.EqualValues(t, 250, durationToDelay(elapsedOfCompletedPhase(250*time.Millisecond)))
+
+	// And the sentinel itself stays reachable, which is the negative control: durationToDelay is a
+	// pure unit conversion, so the failure paths - which return the zero Measurement rather than
+	// converting anything - keep reporting 0 for "no result".
+	require.EqualValues(t, 0, durationToDelay(0))
+	require.EqualValues(t, 0, durationToDelay(-time.Second))
+}
+
 func TestFastFixtureReportsOneNotZero(t *testing.T) {
 	server := newStatusServer(t, http.StatusNoContent)
 
