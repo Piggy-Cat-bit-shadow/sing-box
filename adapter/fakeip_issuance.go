@@ -8,7 +8,8 @@ import (
 	"sync/atomic"
 )
 
-// maxIssuanceGenerations bounds how many FakeIP generations the ledger remembers.
+// MaxIssuanceGenerations bounds how many FakeIP generations the ledger remembers, and it is EXPORTED
+// so that the bound is something a caller can reason about rather than a number buried here.
 //
 // # Why a bound is not a compromise
 //
@@ -17,9 +18,21 @@ import (
 // instance". Keeping every generation forever would be a growth path with no owner - a daemon that
 // reloads on a schedule would accumulate one entry per reload, forever - and a thousand generations
 // of configuration churn in one process is far past the point where an address from the first of them
-// is still in anybody's DNS cache. The bound is stated here rather than hidden inside an eviction
-// policy, and `FakeIPIssuanceLedger.Generations` reports the live count so a measurement can read it.
-const maxIssuanceGenerations = 1024
+// is still in anybody's DNS cache.
+//
+// # The loss is real and it is silent, which is why the ceiling is exported
+//
+// MEASURED by an independent adversary: once the cap is reached the oldest record is dropped, and the
+// address it covered answers exactly as an address that was NEVER issued does - the same `false`, the
+// same zero interval. A caller reading `IssuedInterval` therefore cannot tell "we have no record of
+// this" from "we had one and it is gone", and the refusal stops covering anything older than the cap.
+//
+// There is no third REFUSAL behaviour available: refusing without proof is the blanket block the
+// product contract forbids, and guessing would be worse than the honest answer. What was wrong was
+// that the bound was unexported, so a caller could not even compute "saturated" without hardcoding
+// 1024. `Generations()` reports the live count, this constant reports the ceiling, and a diagnostic
+// that wants to say "issuance memory is full, an older placeholder may now be dialled" now can.
+const MaxIssuanceGenerations = 1024
 
 // FakeIPIssuanceInterval is a closed range of addresses of ONE family that a FakeIP generation has
 // handed out. It is reported in the normalised four-byte form for an IPv4 address.
@@ -48,7 +61,7 @@ func (i FakeIPIssuanceInterval) contains(address netip.Addr) bool {
 //
 // The router asks this question on every connection it matches, and the answer must not become a
 // point of contention between Boxes or between connections. One atomic load of a pointer is the whole
-// read path; a writer copies the merged slice, which is bounded by maxIssuanceGenerations.
+// read path; a writer copies the merged slice, which is bounded by MaxIssuanceGenerations.
 type issuanceSnapshot struct {
 	intervals []FakeIPIssuanceInterval
 }
@@ -269,7 +282,7 @@ func (l *FakeIPIssuanceLedger) recordLocked(sequence uint64, generation int) *is
 			return &l.records[index]
 		}
 	}
-	if len(l.records) >= maxIssuanceGenerations {
+	if len(l.records) >= MaxIssuanceGenerations {
 		copy(l.records, l.records[1:])
 		l.records = l.records[:len(l.records)-1]
 	}

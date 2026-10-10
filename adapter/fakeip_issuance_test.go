@@ -252,11 +252,11 @@ func TestIssuanceLedgerIsBoundedInGenerations(t *testing.T) {
 	ledger.RecordIssued(0, 1, firstAddress)
 	require.True(t, ledger.Issued(firstAddress))
 
-	for index := range maxIssuanceGenerations + 64 {
+	for index := range MaxIssuanceGenerations + 64 {
 		sequence := uint64(index + 1)
 		ledger.RecordSeed(sequence, 1, fakeIPTestRange(t, "198.20.0.0/16"), fakeIPTestRange(t, "198.20.0.0/16").Addr().Next(), netip.Prefix{}, netip.Addr{})
 	}
-	require.LessOrEqual(t, ledger.Generations(), maxIssuanceGenerations,
+	require.LessOrEqual(t, ledger.Generations(), MaxIssuanceGenerations,
 		"the ledger grew past its stated bound: an owner that reloads forever would accumulate state")
 	require.False(t, ledger.Issued(firstAddress),
 		"the OLDEST record must be the one evicted, and once it is gone the honest answer is that the "+
@@ -375,7 +375,7 @@ func TestIssuanceLedgerCostIsBoundedAcrossCycles(t *testing.T) {
 	require.Equal(t, 1, smallIntervals)
 	require.Equal(t, 100, largeIntervals)
 	require.Equal(t, 1000, thousandIntervals)
-	require.LessOrEqual(t, thousandIntervals, maxIssuanceGenerations,
+	require.LessOrEqual(t, thousandIntervals, MaxIssuanceGenerations,
 		"1000 cycles produced more intervals than the ledger is allowed to hold: the cap is not a cap")
 	require.LessOrEqual(t, thousandIntervals, 2*1000,
 		"the interval count grew past two per generation, which the representation should not permit")

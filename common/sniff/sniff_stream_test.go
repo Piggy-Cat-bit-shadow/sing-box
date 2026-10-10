@@ -295,6 +295,20 @@ func TestPeekStreamDoesNotOutliveItsDeadline(t *testing.T) {
 		err := sniff.PeekStream(context.Background(), &metadata, conn, nil, sniffBuffer, 10*time.Millisecond, sniff.DefaultStreamSniffers...)
 		sniffBuffer.Release()
 		require.ErrorIs(t, err, sniff.ErrNeedMoreData)
+
+		// THE POINT ASSERTION, and it is the strongest of the three. "Must not leave a goroutine
+		// behind" is a statement about the moment the call RETURNS, and only a reading taken at that
+		// moment tests it. MEASURED by an independent adversary, without this line a goroutine left
+		// behind that then exits on its own inside the window is invisible to BOTH window halves: the
+		// calibrated one tolerates one transient frame, and the "returns to baseline" one is satisfied
+		// by the eventual return. Here there is no window at all.
+		//
+		// It is read on the TEST goroutine, which is where `before` was read, so the two are on the
+		// same scale and no callback correction applies.
+		require.LessOrEqual(t, sniffGoroutines(), before,
+			"iteration %d: PeekStream returned with a goroutine of this package still alive. The "+
+				"contract is about the moment of return, so this reading is taken there rather than "+
+				"from a window that a self-terminating leak could outlast", i)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
 	requireTheSniffCensusReturnsToBaseline(t, before,
@@ -359,6 +373,11 @@ func TestPeekStreamCancelledContextStillTerminates(t *testing.T) {
 		// but it may never be "ask for more data", which is the state that would leave the caller
 		// reading from a flow whose context is already gone.
 		require.NotErrorIs(t, err, sniff.ErrNeedMoreData)
+
+		// The point assertion, for the reason given in TestPeekStreamDoesNotOutliveItsDeadline: the
+		// contract is about the moment the call returns, and a window cannot test that.
+		require.LessOrEqual(t, sniffGoroutines(), before,
+			"iteration %d: PeekStream returned with a goroutine of this package still alive", i)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
 	requireTheSniffCensusReturnsToBaseline(t, before,
