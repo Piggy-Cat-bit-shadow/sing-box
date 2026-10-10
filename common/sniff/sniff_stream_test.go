@@ -47,26 +47,40 @@ func sniffGoroutines() int {
 }
 
 // sniffGoroutinesFromCallback is sniffGoroutines for a census taken from the goroutine testify runs a
-// `require.Never` condition on, and the subtraction is the difference between an allowance and a
-// measurement.
+// condition on, and the subtraction is the difference between an allowance and a measurement.
 //
 // # Why `before` and the samples were not comparable
 //
-// `before` is read on the TEST goroutine. The condition of `require.Never` runs on a goroutine testify
-// starts, and a closure defined in this file has `sing-box/common/sniff_test` on its own stack - the
-// same substring the predicate matches. MEASURED: a census taken from the test goroutine reads 1 and
-// the same census taken from a callback goroutine reads 2, so every sample the predicate saw was one
-// HIGHER than the baseline it was compared against.
+// `before` is read on the TEST goroutine. The condition of `require.Never`/`require.Eventually` runs on
+// a goroutine testify starts, and a closure defined in this file has `sing-box/common/sniff_test` on
+// its own stack - the same substring the predicate matches. MEASURED: a census taken from the test
+// goroutine reads 1 and the same census taken from a callback goroutine reads 2, so every sample the
+// predicate saw was one HIGHER than the baseline it was compared against.
 //
-// The consequence is the failure direction that matters for a leak check. With the old `> before+4`
-// the real allowance was 3, not 4, and a FIXED leak was measured at every size below it: one leaked
-// goroutine left the census at 3, two at 4 and three at 5, and the predicate fired at none of them;
-// only four was caught. An allowance that hides three goroutines is not a tolerance, it is a blind
-// spot - and it was invisible because the number was never calibrated.
+// The consequence is the failure direction that matters for a leak check. With the `> before+4` this
+// replaced, the real allowance was 3, not 4, and a FIXED leak was measured at every size below it: one
+// leaked goroutine left the census at 3, two at 4 and three at 5, and the predicate fired at none of
+// them; only four was caught. An allowance that hides three goroutines is not a tolerance, it is a
+// blind spot - and it was invisible because the number was never calibrated.
 //
-// The test goroutine itself cancels out and is not part of this correction: it is blocked inside
-// `require.Never` with `sniff_test` on its stack in both readings, so it contributes to `before` and
-// to every sample alike. Only the callback's own frame is uncancelled, and it is exactly one.
+// The test goroutine itself cancels out and is not part of this correction: it is blocked inside the
+// assertion with `sniff_test` on its stack in both readings, so it contributes to `before` and to every
+// sample alike. Only the callback's own frame is uncancelled, and it is exactly one.
+//
+// # Why this correction is necessary but NOT sufficient, measured by an adversary
+//
+// `assert.Never` starts its condition with a bare `go checkCond()` and re-arms the ticker only after a
+// result arrives - so the PREVIOUS tick's condition goroutine can still be exiting while the next one
+// runs, and a single sample can therefore see TWO callback frames rather than one. MEASURED with
+// nothing leaked at all: `sniffGoroutines()` inside a condition read 2 on one run and 3 on the next,
+// against a test-goroutine baseline of 1 - i.e. the corrected reading is `before` sometimes and
+// `before+1` sometimes.
+//
+// That is why the two lifecycle checks do NOT assert `> before` over a window any more. A zero-margin
+// "never exceeds" predicate would fire on testify's own scheduling with nothing wrong with the
+// product. The leak assertion is instead "the census RETURNS to its baseline", which is immune to a
+// transient extra frame and is exactly the property these tests exist for: a leaked goroutine never
+// comes back.
 func sniffGoroutinesFromCallback() int {
 	return sniffGoroutines() - 1
 }
@@ -283,9 +297,8 @@ func TestPeekStreamDoesNotOutliveItsDeadline(t *testing.T) {
 		require.ErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return sniffGoroutinesFromCallback() > before }, 200*time.Millisecond, 20*time.Millisecond,
-		"PeekStream left a goroutine behind after an unsatisfiable sniff: the census is exact and "+
-			"already excludes the callback's own frame, so one leaked goroutine is enough to fail this")
+	requireTheSniffCensusReturnsToBaseline(t, before,
+		"PeekStream left a goroutine behind after an unsatisfiable sniff")
 }
 
 // TestPeekStreamUnknownPayloadSweepsEverySniffer pins the full-sweep path: a payload nothing claims
@@ -348,9 +361,44 @@ func TestPeekStreamCancelledContextStillTerminates(t *testing.T) {
 		require.NotErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return sniffGoroutinesFromCallback() > before }, 200*time.Millisecond, 20*time.Millisecond,
-		"a cancelled context left a goroutine behind: the census is exact and already excludes the "+
-			"callback's own frame, so one leaked goroutine is enough to fail this")
+	requireTheSniffCensusReturnsToBaseline(t, before,
+		"a cancelled context left a goroutine behind")
+}
+
+// requireTheSniffCensusReturnsToBaseline is the leak assertion both lifecycle checks use, and it is
+// shaped the way it is because of a measurement rather than a preference.
+//
+// # Why "returns to baseline" and not "never exceeds baseline"
+//
+// "Never exceeds" is the more obvious phrasing and it cannot be asserted safely here. `assert.Never`
+// starts its condition with a bare `go checkCond()` and re-arms the ticker only after a result
+// arrives, so the previous tick's condition goroutine can still be exiting while the next one runs.
+// MEASURED with nothing leaked: a sample inside a condition read two callback frames on one run and
+// one on the next. With the frame correction applied that is `before` or `before+1`, so a zero-margin
+// "never exceeds" predicate fires on testify's own scheduling with the product perfectly correct.
+//
+// The two halves below are therefore:
+//
+//  1. SECONDARY, and calibrated rather than guessed: the census never exceeds `before+1`. The one
+//     allowed frame is the transient one above, MEASURED - not the uncalibrated 3 that the `+4`
+//     allowance really was. This catches a burst leak of two or more immediately.
+//  2. PRIMARY: the census RETURNS to `before`. A leaked goroutine never returns, so a single leaked
+//     goroutine is caught by this half and by nothing else. It is immune to the transient frame
+//     because a transient frame is gone by the next sample.
+//
+// The window is generous (2 s) because this half is about a permanent consequence, not about speed:
+// there is no timing assumption to tune and none is stated.
+func requireTheSniffCensusReturnsToBaseline(t *testing.T, before int, message string) {
+	t.Helper()
+	require.Never(t, func() bool { return sniffGoroutinesFromCallback() > before+1 },
+		200*time.Millisecond, 20*time.Millisecond,
+		"%s: the census exceeded its baseline by more than the one callback frame testify's own tick "+
+			"can leave behind (baseline %d)", message, before)
+	require.Eventually(t, func() bool { return sniffGoroutinesFromCallback() <= before },
+		2*time.Second, 5*time.Millisecond,
+		"%s: the census did not return to its baseline of %d. A leaked goroutine never comes back, "+
+			"which is why THIS half is the leak assertion - the calibrated window above tolerates one "+
+			"transient frame and therefore cannot see a single leak on its own", message, before)
 }
 
 // TestTheSniffCensusMovesForExactlyOneLeakedGoroutine is the calibration the two lifecycle checks were
