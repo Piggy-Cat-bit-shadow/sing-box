@@ -187,25 +187,32 @@ func TestRacerDoesNotTreatUDPConnectAsSuccess(t *testing.T) {
 	//
 	// # What the real cause IS depends on the platform, and that is the point
 	//
-	// The fixture dials UDP to a port nothing listens on, so no handshake can ever complete. Both
+	// The fixture dials UDP to a port nothing listens on, so no handshake can ever complete. The
 	// platforms agree the race must fail; they disagree about what the failure looks like, and the
-	// difference is a genuine Winsock/BSD divergence rather than a defect in either:
+	// difference is a genuine BSD/Winsock divergence rather than a defect in either:
 	//
-	//   - POSIX: the datagrams are dropped and nothing comes back, so the attempt fails with
+	//   - macOS: the kernel answers the datagram with ICMP port-unreachable, the socket reports it on
+	//     the next receive, and the attempt fails with
+	//     "quic: transport closed: recvmsg_x: connection refused". MEASURED on the macOS runner.
+	//   - Windows: the same ICMP answer arrives and is reported on the socket immediately, so the
+	//     attempt fails with "An existing connection was forcibly closed by the remote host."
+	//     (WSAECONNRESET). MEASURED on this host, and it is the same reset the real-data-path TUN
+	//     tests observe for a loopback RST.
+	//   - Linux: the datagrams are silently dropped, so nothing comes back and the attempt fails with
 	//     "context deadline exceeded" when the handshake gives up.
-	//   - Windows: the kernel answers the datagram with ICMP port-unreachable and reports it on the
-	//     socket, so the attempt fails with "An existing connection was forcibly closed by the remote
-	//     host." (WSAECONNRESET) immediately. MEASURED on this host, and it is the same reset the
-	//     real-data-path TUN tests observe for a loopback RST.
 	//
-	// The assertion is therefore that the caller receives one of those two REAL failures. What it must
+	// The first two are the same kernel behaviour wearing each platform's error text; the third is a
+	// genuinely silent path. All three are the connector's OWN failure, which is what this asserts.
+	//
+	// The assertion is therefore that the caller receives one of those REAL failures. What it must
 	// not receive is the racer's own "nothing to try" sentinel, and what it must not receive is a
-	// socket reported as a win. A third outcome - a different error entirely - still fails here, so
-	// the assertion keeps its discriminating power rather than being widened to "any error will do".
+	// socket reported as a win. An unrecognised error still fails here, so the assertion keeps its
+	// discriminating power rather than being widened to "any error will do".
 	require.NotContains(t, err.Error(), "no bootstrap candidates")
 	require.True(t,
 		strings.Contains(err.Error(), "context deadline exceeded") ||
-			strings.Contains(err.Error(), "forcibly closed"),
+			strings.Contains(err.Error(), "forcibly closed") ||
+			strings.Contains(err.Error(), "recvmsg_x: connection refused"),
 		"the race must surface the connector's own hard failure - a handshake timeout on a "+
 			"silently-dropping path, or a connection reset where the kernel reports one - rather than a "+
 			"synthesised error, got %v", err)
