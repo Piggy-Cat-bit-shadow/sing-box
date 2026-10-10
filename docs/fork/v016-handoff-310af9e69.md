@@ -713,7 +713,40 @@ Reverse-broken by numbering only the complete routes (`go build` exit 0 first, t
 row RED with both orders in the message, while `TestATruncatedRouteClaimsNoExit` stayed GREEN — the
 proof that the new detector covers something the old one cannot).
 
-## 10.8 Still open after this round
+## 10.8 The `common/dialer` 30s stall was a PRODUCTION defect, and it is fixed (`c216688f9`)
+
+§4 listed this as "consistent with a lost completion signal" and named two suspect arms
+(`dual_stack_scheduler.go:320-323`, `resolve.go:596-601`). **Neither is the cause**, and it is not a
+lost signal either: the exit condition itself was wrong.
+
+`raceWithPendingOriginal` (`resolve.go:913`) looped `for winner == nil` while each side reports EXACTLY
+ONCE on a capacity-one channel. When BOTH attempts fail there is no winner, both channels deliver and
+are then drained forever, and the select blocks on two dead channels until the caller's context
+expires. The other arm (`dialRecoveredOrReport`, `resolve.go:641`) always handled that case, which is
+why it only appeared when the head-start timer fired before the original reported.
+
+```text
+pristine, -run TestLiteralBothFailReturnsPromptly -count=200 x20 batches (4000 runs): 3 failures
+  --- FAIL: TestLiteralBothFailReturnsPromptly (30.00s)   "30.0009301s" is not less than "5s"
+goroutine dump AT the stall: 1 goroutine in raceWithPendingOriginal (resolve.go:914), 0 workers,
+  counters enter=1 A1=0 B=1 origRecv=1 recRecv=1 cancel=0   <- both channels delivered, no winner
+```
+
+It reproduces in ISOLATION, so it is not a load artefact - load only decides which of the two arms runs
+(2ms-publish vs 5ms-dial boundary), which is also why adding debug logging masked it (0/2600) and why
+the shipped detector sees it ~1% of the time.
+
+The fix breaks the loop on `winner != nil || (originalSettled && recoveredSettled)`. No timeout is
+widened. `literal_pending_failure_test.go` pins the broken arm deterministically, and I re-ran the
+reverse-break myself rather than trusting the report: **pristine code + new test → `go build` exit 0,
+then RED by ASSERTION at `"30.0007495s" is not less than "5s"`; fixed code → PASS at 0.20s**; the
+shipped detector `-count=50` ok, the full package ok, `-race` ok.
+
+User impact: whenever the sniffed-domain recovery answers quickly (a cached DNS answer) while the
+application's literal address is slower than the head start and ALSO fails, the connect hung for the
+whole connect timeout instead of failing at once.
+
+## 10.9 Still open after this round
 
 1. **`StatusView` is still not constructed by `box.go`** (§9.3) — unchanged by this round.
 2. **`SelectionStatus()` is not wired into any UI** (§9.4) — unchanged.
@@ -726,6 +759,7 @@ proof that the new detector covers something the old one cannot).
    missing tag would double-report the same defect at the manager level. Left as-is, deliberately.
 4. **`route::TestConfiguredRateShapesTheRealTCPCopyPath`** — wall-clock band test, fails under
    parallel package load (§9, "Flaky test flagged"). Do not widen the band.
-5. **e2e / `common/dialer` intermittency** — §4, under investigation; results are not in this section.
-6. **A full serial scan at `d7d542d0b`** has not been run yet in this round.
+5. **`e2e/TestRejectReplyCode` intermittency** — §4. The `common/dialer` half of that item is CLOSED
+   (§10.8); the e2e half is still under investigation in this round.
+6. **A full serial scan at the final SHA of this round** has not been run yet.
 
