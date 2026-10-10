@@ -268,15 +268,43 @@ func (c *Client) http3Available() bool {
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
 
+// markHTTP3Broken records a failed HTTP/3 attempt and advances the backoff schedule by one step.
+//
+// # One failing event, one step
+//
+// The step is CLAIMED, once, by a compare-and-swap on the deadline. The dial that finds the memory
+// unarmed -- or expired -- escalates; every other dial that failed in the same event finds a
+// window already open, and its failure is already covered by that window.
+//
+// The claim is what makes this a memory of EVENTS rather than of DIALS. Without it the
+// read-modify-write ran once per failing dial, so a burst of parallel dials met one transient
+// failure and multiplied the schedule by 2^N in the same instant: sixteen parallel dials -- a page
+// load, a reconnect storm, anything after one blip on the UDP path -- landed on the five-minute
+// ceiling straight away. A single fast failure then read as "HTTP/3 has been down for minutes",
+// and because every later burst repeated it, the ceiling stayed pinned for the life of the client.
+// That is the outcome this memory exists to bound, not to manufacture.
+//
+// A failure that arrives while a window is open is deliberately NOT charged again: it cannot be
+// distinguished from the failure that opened the window, and charging one event twice is the
+// direction that strands the caller on HTTP/2.
 func (c *Client) markHTTP3Broken() {
-	backoff := time.Duration(c.http3Backoff.Load())
-	if backoff == 0 {
-		backoff = http3BrokenBackoffInitial
-	} else {
-		backoff = min(backoff*2, http3BrokenBackoffMax)
+	now := time.Now()
+	brokenUntil := c.http3Broken.Load()
+	if brokenUntil != 0 && now.UnixNano() < brokenUntil {
+		// The failure that armed this window is still being remembered: this one belongs to the
+		// same event, and the window already covers it.
+		return
 	}
-	c.http3Backoff.Store(int64(backoff))
-	c.http3Broken.Store(time.Now().Add(backoff).UnixNano())
+	next := http3BrokenBackoffInitial
+	if previous := time.Duration(c.http3Backoff.Load()); previous != 0 {
+		next = min(previous*2, http3BrokenBackoffMax)
+	}
+	if !c.http3Broken.CompareAndSwap(brokenUntil, now.Add(next).UnixNano()) {
+		// Another dial claimed this event first; the window it armed is the one that is
+		// remembered, and this failure is covered by it.
+		return
+	}
+	c.http3Backoff.Store(int64(next))
 }
 
 func (c *Client) clearHTTP3Broken() {
