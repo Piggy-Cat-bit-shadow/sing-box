@@ -51,6 +51,24 @@ ok()      { printf 'ok       %s\n' "$1"; }
 note()    { printf 'note     %s\n' "$1"; }
 die()     { printf 'ERROR    %s\n' "$1" >&2; exit 2; }
 
+# --- option parsing helpers ------------------------------------------------------------------
+# "file.yml_Display_Name" -> file.yml / "Display Name".
+#
+# The separator is an underscore, and that is forced by the shell rather than chosen: the list is a
+# space-separated string, so any display name containing a space must encode them. A pipe or a colon
+# would have to survive that split, and neither does. Underscores are mapped back to spaces here, in
+# one place, so the comparison below sees the workflow's real name.
+#
+# These are defined before the argument loop because the required-workflow list is validated against
+# the workflow files as soon as it is final, and that validation needs both of them.
+workflow_file() { printf '%s' "${1%%_*}"; }
+workflow_name() {
+	case "$1" in
+		*_*) printf '%s' "$(printf '%s' "${1#*_}" | tr '_' ' ')" ;;
+		*) printf '' ;;
+	esac
+}
+
 usage() {
 	cat <<'USAGE'
 usage: sh scripts/ci/verify-release-acceptance.sh --candidate-sha SHA --snapshot DIR [options]
@@ -79,7 +97,11 @@ usage: sh scripts/ci/verify-release-acceptance.sh --candidate-sha SHA --snapshot
   --json PATH             also write the machine-readable result to PATH.
 
 The default required workflow list is:
-  verify.yml_Verify  interop-xray.yml_Interop  server-linux-amd64.yml_Server_Linux_amd64
+  verify.yml_Verify  interop-xray.yml_Reference_interop_(Xray)  server-linux-amd64.yml_Linux_amd64
+
+The display names are the workflows' own `name:` values, and the gate refuses to run if
+any of them has drifted: a rename that is not reflected here makes the gate reject a
+correct release with "run N belongs to workflow X, not Y".
 
 Every one of these is overridable so the gate can be exercised against a deliberately broken
 snapshot without touching the real evidence. Nothing in this script writes to a repository, signs,
@@ -126,35 +148,35 @@ if ! printf '%s' "$CANDIDATE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
 fi
 
 if [ -z "$WORKFLOWS" ]; then
-	WORKFLOWS=" verify.yml_Verify interop-xray.yml_Interop server-linux-amd64.yml_Server_Linux_amd64"
+	WORKFLOWS="verify.yml_Verify interop-xray.yml_Reference_interop_(Xray) server-linux-amd64.yml_Linux_amd64"
 fi
+
+# A display name is evidence only if it is the name the workflow actually declares. The names below
+# are literals, and a literal that drifts from the YAML does not fail loudly at the right moment: it
+# fails at RELEASE time, rejecting a correct run with "belongs to workflow X, not Y". That already
+# happened - server-linux-amd64.yml was renamed from "Linux amd64 server" to "Linux amd64", and this
+# list kept a third spelling ("Server Linux amd64") that was never any workflow's name, while
+# interop-xray.yml's "Reference interop (Xray)" was recorded as "Interop".
+#
+# So the literals are checked against the workflow files here, before any snapshot is read, and a
+# mismatch is a usage error: it is the gate's own inputs that are wrong, never the evidence.
+for entry in $WORKFLOWS; do
+	file=$(workflow_file "$entry")
+	declared=$(workflow_name "$entry")
+	[ -n "$declared" ] || continue
+	workflow_path=".github/workflows/$file"
+	if [ ! -f "$workflow_path" ]; then
+		die "$workflow_path does not exist, so '$file' in the required workflow list names no workflow. Fix the list (or --workflow) before trusting this gate's answer."
+	fi
+	actual=$(sed -n 's/^name:[[:space:]]*//p' "$workflow_path" | head -n 1)
+	if [ "$actual" != "$declared" ]; then
+		die "$workflow_path declares name '$actual', but the required workflow list expects '$declared'. The list is stale: run 'grep -m1 ^name: $workflow_path' and correct it (or pass --workflow FILE_NAME), because comparing against the wrong name rejects a correct release."
+	fi
+done
 
 printf 'verify-release-acceptance: repo %s\n' "$REPO"
 printf 'verify-release-acceptance: candidate %s\n' "$CANDIDATE_SHA"
 printf 'verify-release-acceptance: snapshots %s\n\n' "$SNAPSHOT"
-
-# --- option parsing helpers ------------------------------------------------------------------
-# "file.yml_Display_Name" -> file.yml / "Display Name".
-#
-# The separator is an underscore, and that is forced by the shell rather than chosen: the list is a
-# space-separated string, so any display name containing a space must encode them. A pipe or a colon
-# would have to survive that split, and neither does. Underscores are mapped back to spaces here, in
-# one place, so the comparison below sees the workflow's real name.
-workflow_file() { printf '%s' "${1%%_*}"; }
-workflow_name() {
-	case "$1" in
-		*_*) printf '%s' "$(printf '%s' "${1#*_}" | tr '_' ' ')" ;;
-		*) printf '' ;;
-	esac
-}
-
-in_list() {
-	# $1 = needle, $2 = space separated list
-	for item in $2; do
-		[ "$item" = "$1" ] && return 0
-	done
-	return 1
-}
 
 # --- fetching --------------------------------------------------------------------------------
 if [ "$DO_FETCH" -eq 1 ]; then

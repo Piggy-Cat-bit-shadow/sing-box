@@ -41,10 +41,17 @@ import sys
 
 root, variant, candidate, other_sha, artifact_name, artifact_digest = sys.argv[1:7]
 
+# The display name is the workflow's own `name:` value, and the job name is what the API reports for
+# that job. Both come from the real workflow files, so a rename there has to be reflected here - and
+# a drift guard, further down this file, checks every display name against its workflow's `name:`.
+#
+# The interop job is named for its MATRIX LEG, not the bare job id: GitHub appends the matrix values
+# to the display name, and the real run's jobs are "interop (v26.9.30)" / "interop (v26.3.27)".
+# A fixture using the bare id would be a job name that no run ever has.
 WORKFLOWS = [
-    ("verify.yml", "Verify", "Verify"),
-    ("interop-xray.yml", "Interop", "Interop Xray reference"),
-    ("server-linux-amd64.yml", "Server Linux amd64", "Server Linux amd64"),
+    ("verify.yml", "Verify", "verify"),
+    ("interop-xray.yml", "Reference interop (Xray)", "interop (v26.9.30)"),
+    ("server-linux-amd64.yml", "Linux amd64", "linux-amd64"),
 ]
 
 os.makedirs(root, exist_ok=True)
@@ -148,6 +155,45 @@ run_case() {
 printf 'verify-release-acceptance self-test\n'
 printf 'gate: %s\n\n' "$GATE"
 
+# --- the display names must be the workflows' own names ----------------------------------------
+# A fixture that agrees with a stale literal proves nothing about a real release: the gate compares a
+# run's workflow name against the declared one, so a literal that drifted from the YAML rejects a
+# correct release. server-linux-amd64.yml was renamed "Linux amd64 server" -> "Linux amd64" on
+# 2026-09-27, and the gate's default list kept a third spelling that was never any workflow's name.
+#
+# This reads the list out of the gate rather than restating it, so the two cannot drift apart, and
+# fails the self-test when a workflow file is renamed without the list following it.
+#
+# The pattern is anchored with `^[[:space:]]*` on purpose: the usage text inside the gate prints the
+# same list, indented, and an unanchored match would find that prose instead of the assignment.
+entry_list=$(sed -n 's/^[[:space:]]*WORKFLOWS="\([^"]*\)".*/\1/p' "$GATE" \
+	| grep -v '^[[:space:]]*$' | head -n 1)
+if [ -z "$entry_list" ]; then
+	printf 'FAIL  no default workflow list found in the gate (the sed above matched nothing)\n'
+	FAILED=$((FAILED + 1))
+else
+	for entry in $entry_list; do
+		file=${entry%%_*}
+		declared=$(printf '%s' "${entry#*_}" | tr '_' ' ')
+		path=".github/workflows/$file"
+		if [ ! -f "$path" ]; then
+			printf 'FAIL  drift: %s is in the gate default list but does not exist\n' "$path"
+			FAILED=$((FAILED + 1))
+			continue
+		fi
+		actual=$(sed -n 's/^name:[[:space:]]*//p' "$path" | head -n 1)
+		if [ "$actual" = "$declared" ]; then
+			printf 'ok    drift %-28s gate says "%s", %s declares it\n' "$file" "$declared" "$file"
+			PASSED=$((PASSED + 1))
+		else
+			printf 'FAIL  drift %-28s gate says "%s", %s declares "%s"\n' \
+				"$file" "$declared" "$path" "$actual"
+			FAILED=$((FAILED + 1))
+		fi
+	done
+fi
+printf '\n'
+
 # --- the case that must be accepted ------------------------------------------------------------
 run_case complete-evidence 0 good
 
@@ -167,9 +213,9 @@ run_case runs-snapshot-absent 1 missing-runs-snapshot
 run_case snapshot-directory-absent 1 no-snapshot-at-all
 
 # --- and the escape hatches must not be a way through ------------------------------------------
-run_case skipped-job-declared-optional 0 skipped-job --optional-job Verify
+run_case skipped-job-declared-optional 0 skipped-job --optional-job verify
 run_case all-jobs-optional 0 skipped-job \
-	--optional-job Verify --optional-job "Interop Xray reference" --optional-job "Server Linux amd64"
+	--optional-job verify --optional-job "interop (v26.9.30)" --optional-job linux-amd64
 # run_case always declares the artifact, so every variant below runs with that declaration in force.
 # "The artifact is absent while --allow-no-artifacts was given" is therefore a REQUIREMENT failure,
 # not a permitted absence: the flag relaxes the absence of artifacts, never the absence of a declared
