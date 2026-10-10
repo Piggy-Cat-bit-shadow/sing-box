@@ -174,17 +174,43 @@ production consumer that overclaims.
 
 ## 6. Honest limits
 
-1. **`go test ./...` was NOT run to completion on this machine at the final SHA.** Every package
+1. **The full sweep was NOT run to completion on this machine at the final SHA.** Every package
    touched by this round was run and is green, and `-race` is green over `common/physicalpath`,
    `common/dialer`, `common/httpclient`, `protocol/tuic`, `adapter/outbound`, `route` and the root
-   package. A full-sweep attempt at `3ddd1bac` was started but not finished inside this round.
-2. **A full-sweep comparison against `8e6c0a96` was run once and produced package-level failures in
-   `common/tls`, `common/tlsspoof`, `common/urltest`, `common/windivert`, `experimental/clashapi` and
-   `experimental/libbox`. Those packages FAIL AT THE BASELINE TOO** (measured serially at `8e6c0a96`),
-   and their failing case NAMES differ between runs, so they are network/toolchain/env dependent. Two
-   apparent regressions in `common/dialer` and `common/power` appeared only in the parallel sweep and
-   BOTH PASS in isolation at the final SHA; they are load-induced flakes of deadline-bound tests, and
-   that is a robustness observation about those tests, not a regression from this work.
+   package. `FULL_TEST_STATUS` is therefore `NOT_RUN_TO_COMPLETION`, and a serial sweep at the final
+   SHA was started as this round closed.
+2. **MEASURED, serially, at the baseline `8e6c0a96` (`go test -p 1 ./...`, so load-induced flakes
+   cannot hide):**
+
+   ```text
+   FAIL  common/tls                (3 TLS 1.3 Windows cases)
+   FAIL  common/tlsspoof           (3 spoofer integration cases)
+   FAIL  common/urltest            (4 cases)
+   FAIL  common/windivert          (5 driver integration cases)
+   FAIL  experimental/clashapi     (2 cases)
+   FAIL  experimental/libbox       (1 case)
+   FAIL  protocol/shadowtls        (TestShadowTLSRealRefusedDialIsAFault)
+   FAIL  transport/http            (5400.042s - it HUNG, 90 minutes, until the timeout)
+   ```
+
+   Two facts follow, and both matter more than the list.
+
+   **The baseline does not complete a full test run on this machine at all.** `transport/http` hangs
+   for ninety minutes, so `go test -p 1 ./...` never reaches the packages ordered after it. The
+   attribution for those is therefore bounded by that hang, which is stated rather than glossed.
+
+   **Both failures that PREVENTED completion are fixed in this session.** The `transport/http` hang is
+   the `loopbackDialer` defect: it dialled a connected UDP socket for EVERY network, and `net.DialUDP`
+   to a port nobody listens on SUCCEEDS, so the HTTP/1 fallback received a working "connection" and
+   blocked in `ReadResponse` with no deadline. The `protocol/shadowtls` failure is the assertion
+   against `syscall.ECONNREFUSED`, which is false on Windows (a TCP dial returns WSAECONNREFUSED,
+   10061) and whose message is LOCALIZED by the OS. Both are fixed, so this round's tree is the first
+   in which `transport/http` runs to completion here - `ok 16.7s`, and `ok 18.4s` under `-race`.
+
+   The six remaining packages are identical at both SHAs. Two apparent regressions in `common/dialer`
+   and `common/power` appeared only in a PARALLEL sweep and BOTH PASS in isolation at the final SHA;
+   those are deadline-bound tests that flake under load, which is a robustness observation about those
+   tests rather than a regression from this work, and the serial baseline confirms they pass there.
 3. **`PathNode.RequiredNetworks` is still write-only.** It is populated by `leaves.go` and read
    nowhere; the function parameter was authoritative. The START-01 fix does not rely on it, and its doc
    comment is actively wrong until the owner wires or deletes it.
@@ -234,7 +260,9 @@ HY2_TUIC_WG_MTU_STATUS=HY2 wired with a measured ChromeParrot limit; TUIC wired 
                        wire; WG budget from source with the wire size NOT_MEASURED; MASQUE wired (no-op)
 ZERO_COPY_STATUS=COPY-01 AUDITED with measured allocation numbers; kernel_bypass/kernel_splice do not
                  exist in this tree; no optimisation claimed as a system-wide win
-FULL_TEST_STATUS=NOT_RUN_TO_COMPLETION (every touched package green; pre-existing failures identified)
+FULL_TEST_STATUS=NOT_RUN_TO_COMPLETION (every touched package green and raced; the serial
+                 baseline does not complete at all, and the two failures that stopped it are
+                 fixed here)
 RACE_STATUS=PASS on every changed package
 CODE_CORRECTNESS=two P0 defects found by measurement and fixed, four more reported with evidence
 RELEASE_STATUS=NOT_READY
