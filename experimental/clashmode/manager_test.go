@@ -669,7 +669,14 @@ func TestHookReentryDuringSwitch(t *testing.T) {
 	awaitDone(t, "reentrant switch", done)
 	require.Eventually(t, func() bool { return manager.Mode() == "Direct" }, 5*time.Second, time.Millisecond,
 		"the reentrant switch never became the accepted mode")
-	require.Equal(t, "Direct", cacheFile.persistedMode())
+	// The PERSIST is awaited too, not read once. The hooks run outside the write gate so that a
+	// subscriber may switch again, which means the accepted mode and the bytes on disk become
+	// visible at different moments: reading persistedMode() the instant Mode() agrees raced the
+	// write and observed the superseded "Global" on a slower runner. The property under test is
+	// that the LAST ACCEPTED mode is the one persisted, which is exactly what waiting for it says.
+	require.Eventually(t, func() bool { return cacheFile.persistedMode() == "Direct" },
+		5*time.Second, time.Millisecond,
+		"the last accepted mode must be the one persisted")
 }
 
 // TestLoggerIsOptional keeps the manager usable with no logger, which several embedders rely on.

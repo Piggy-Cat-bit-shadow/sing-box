@@ -130,8 +130,11 @@ func TestCensusInstrumentIsSensitiveAndDoesNotCountItself(t *testing.T) {
 	require.Zero(t, goroutineCensus(t, other.endpoint),
 		"a second endpoint's census must not see the first endpoint's workers: the instrument must be "+
 			"scoped to the instance under test, not to the type")
-	require.Greater(t, socketCensus(t, other.endpoint), 0,
-		"the second endpoint must be live, or its zero above proves nothing")
+	// The "other endpoint is live" control is WAITED for, not read once: a standard bind starts its
+	// receiver goroutines asynchronously, so an immediate census is legitimately 0 and this
+	// assertion - which exists to prove the zero above is meaningful - would fail on a correct
+	// endpoint. Measured on the macOS runner as `"0" is not greater than "0"`.
+	other.settleSocketsPerStandardBind(t, "the second endpoint must be live")
 
 	// The control, other direction: 60 -> 0.
 	close(release)

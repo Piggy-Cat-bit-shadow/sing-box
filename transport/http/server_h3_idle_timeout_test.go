@@ -144,11 +144,19 @@ func TestH3ConnectionWithNoRequestStreamIsReclaimed(t *testing.T) {
 // This is the regression guard for long-lived CONNECT tunnels, which are the
 // only reason this inbound exists.
 func TestH3ActiveStreamIsNotKilledByApplicationIdleTimeout(t *testing.T) {
-	// A short idle window keeps the test quick; the handler then blocks for many
-	// times that window, so the test is not sensitive to scheduling jitter under
-	// a loaded parallel test run.
-	const idleTimeout = 200 * time.Millisecond
-	const handlerDelay = 2 * time.Second
+	// The idle window has to be long enough to survive CONNECTION SETUP, because the
+	// application timer is armed at connection creation and only stopped once a request
+	// stream arrives. At 200ms the window had to absorb the QUIC handshake, TLS and the
+	// stream open before any stream existed; on a slower runner that slipped and the server
+	// closed the connection mid-request, which surfaced as
+	//
+	//     http3: parsing frame failed: timeout: no recent network activity
+	//
+	// - a setup race, not the property under test. The property is that a request WHICH
+	// OUTLIVES the idle timeout still completes, so the handler below blocks for twice the
+	// window and the multiple is what matters, not the absolute value.
+	const idleTimeout = 1 * time.Second
+	const handlerDelay = 2 * idleTimeout
 
 	// The handler deliberately blocks for well over the idle timeout before
 	// responding, standing in for a long-lived tunnel.
