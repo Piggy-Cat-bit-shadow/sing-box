@@ -146,7 +146,7 @@ func newH3EgressStand(t *testing.T, name string) *h3EgressStand {
 	stand.packetConn = packetConn
 
 	stand.server = &http3.Server{
-		Handler: http.HandlerFunc(stand.handle),
+		Handler:   http.HandlerFunc(stand.handle),
 		TLSConfig: tlsConfig,
 		QUICConfig: &quic.Config{
 			HandshakeIdleTimeout: 5 * time.Second,
@@ -328,11 +328,11 @@ func newH3Blackhole(t *testing.T) *h3Blackhole {
 // address it produced, so "this path carried that connection" is answered by the object that made
 // the socket rather than inferred from a counter elsewhere.
 type recordingUDPPath struct {
-	name    string
-	access  sync.Mutex
-	dials   int
+	name     string
+	access   sync.Mutex
+	dials    int
 	produced map[string]bool
-	closed  int
+	closed   int
 }
 
 func newRecordingUDPPath(name string) *recordingUDPPath {
@@ -379,8 +379,8 @@ func (p *recordingUDPPath) owns(local net.Addr) bool {
 
 // h3Environment is one emulated network environment: a local path plus the egress dialled over it.
 type h3Environment struct {
-	name  string
-	path  *recordingUDPPath
+	name   string
+	path   *recordingUDPPath
 	egress *h3EgressStand
 	// dialDestination is what the client is told to reach in this environment. It is a real
 	// address, so the client's own destination handling is exercised rather than bypassed.
@@ -397,11 +397,11 @@ type h3Environment struct {
 // It does NOT change a real interface, a real route table, or a real radio, and no claim about iOS
 // or WLAN behaviour may be drawn from it. See the file header.
 type h3EnvironmentSource struct {
-	access      sync.Mutex
-	current     string
+	access       sync.Mutex
+	current      string
 	environments map[string]*h3Environment
-	transitions int
-	order       []string
+	transitions  int
+	order        []string
 }
 
 func newH3EnvironmentSource(environments ...*h3Environment) *h3EnvironmentSource {
@@ -523,10 +523,10 @@ func newStandClient(t *testing.T, source *h3EnvironmentSource) *standClient {
 	// blackhole environment has no egress object at all.
 	destination := source.currentEnvironment().dialDestination
 	impl := &http3ClientImpl{
-		dialer:     dialer,
-		server:     destination,
-		authority:  destination.String(),
-		tlsConfig:  tlsConfig,
+		dialer:    dialer,
+		server:    destination,
+		authority: destination.String(),
+		tlsConfig: tlsConfig,
 		quicConfig: &quic.Config{
 			HandshakeIdleTimeout: 5 * time.Second,
 			MaxIdleTimeout:       30 * time.Second,
@@ -921,10 +921,10 @@ func TestH3StandGenuineFailureFollowsTheBackoffAndRecovers(t *testing.T) {
 // a real stream on a real connection, stalled for real -- and lets a second attempt reuse the same
 // connection and succeed.
 //
-//	1. attempt 1 dials a destination the egress deliberately never answers;
-//	2. attempt 2 reuses the live connection, is answered, and succeeds;
-//	3. attempt 1's window expires, and it reports a failure about a moment attempt 2 has already
-//	   disproved.
+//  1. attempt 1 dials a destination the egress deliberately never answers;
+//  2. attempt 2 reuses the live connection, is answered, and succeeds;
+//  3. attempt 1's window expires, and it reports a failure about a moment attempt 2 has already
+//     disproved.
 //
 // Step 3 must decide nothing.
 func TestH3StandStaleFailureDoesNotOverwriteANewerSuccess(t *testing.T) {
