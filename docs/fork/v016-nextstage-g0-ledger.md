@@ -204,13 +204,14 @@ used. The signal is exact, not a heuristic — `numberRoute` sets `Exit = comple
 len(route)-1` and `Hops` passes `complete == false` for exactly the truncation case. A root that
 produced no node at all is deliberately left alone (that belongs to the group's own Start).
 
-Committed as `e0b743f5e`. Reverse-break: the assertion was RED on unmodified code first, by
+Committed as the first integrator commit of this round (see the final report's section A for the
+exact SHA — a document cannot cite its own commit without changing it). Reverse-break: the assertion
+was RED on unmodified code first, by
 assertion and not by compile error. Discriminating control kept: the same fixture with the detour
 resolving stays reachable. `common/physicalpath`, `adapter/...`, `protocol/group`, `route`, `e2e`
 green; `go vet` exit 0; `gofmt -l` empty on both files.
 
 ## 3. Integrator rulings issued to the agents
-
 - **FIP-01 contract C1–C6** (issued to Agent A verbatim): map what is mapped, refuse in-range with no
   mapping, leave genuinely-unevidenced literals alone, refuse what the Box can *prove* it issued, mark
   "cannot be attributed" honestly where no durable/shared fact exists, and never blanket-block a range.
@@ -218,3 +219,53 @@ green; `go vet` exit 0; `gofmt -l` empty on both files.
   extended only by adding **separate optional capability interfaces**, never by widening an adapter
   interface that the libbox ABI surface depends on.
 - `route/route.go` has exactly one writer this round: Agent A.
+
+## 4. Independent adversary, round 1 — outcome, and one finding the integrator refuted
+
+Round 1 attacked the *pre-existing* evidence at the shared baseline before any fix landed. Two
+mutations were run, both compiled first, both went RED **by assertion**:
+
+| Mutation | Compiles | Result |
+|---|---|---|
+| delete the fakeip refusal at `dns/router.go:1935-1939` | `go vet ./dns` exit 0 | `dns:68` (expected an error, got nil) and `e2e:51` `Should be empty, but was [198.18.0.2:443]` |
+| restore the pre-`c216688f9` exit condition in `common/dialer/resolve.go` `raceWithPendingOriginal` | `go vet ./common/dialer` exit 0 | `literal_pending_failure_test.go:61` `"30.0003129s" is not less than "5s"` |
+
+So the FakeIP wire detector and the dialer double-failure detector are **causally tied to the
+behaviour they name**, not incidental. Two reverse-hypotheses the adversary held against them were
+explicitly refuted by its own measurements: the churn census's `-1` correction is exact, and the
+dialer arm genuinely holds both sides pending at once.
+
+**One `FALSE_GREEN_CONFIRMED`:** the `common/physicalpath` `StatusView` / `SnapshotStatus` /
+`Disconnect` surface has **no production caller anywhere in the repository** — every call site is in
+a `_test.go` file or in `status.go` itself, and the only non-test `.Disconnect()` hits are a
+*different* type in `experimental/boxdd`. This is STATUS-04 stated as a measured fact rather than as
+a gap, and it is what Agent D is closing this round.
+
+**Findings acted on immediately (integrator).** The leak census matched the bare substring
+`sing-box/route`, which is also a prefix of the subpackage `sing-box/route/rule`, so a goroutine
+owned by another package could move the churn test's leak assertion. Fixed in `9ebc42928`:
+`routePackageFrame` carries the frame boundary, `route/census_scope_test.go` pins the scope against
+the exact frame shapes `runtime.Stack` produces **and** carries the discriminating control (the old
+predicate is reproduced and shown to accept the `route/rule` frame), and a second test proves the
+narrowed census still moves by **exactly one** for a single goroutine started by `package route`, then
+returns to baseline. Narrowing a predicate can make an assertion easier to satisfy, which is the
+direction that turns a leak check into decoration — so the narrowing was not made without its own
+sensitivity control.
+
+**One adversary finding REFUTED by the integrator.** The adversary reported
+`interfaceTransitionHarness.holdResetLock` and its `release` channel as dead code, and concluded that
+the "removing the settle-wait leaves this test GREEN" note in `route/interface_churn_cost_test.go`
+was not reproducible from the tree. Both are wrong: `route/android_handover_generation_test.go` uses
+them at `:39`→`:51`→`:62`→`:66`→`:67` and again at `:78`→`:87`. The helper is live and the note stands.
+The refutation is recorded here rather than the finding, because a repo-wide search that misses a hit
+is the one error class that can turn a supported claim into a false accusation — and the adversary
+has been asked to re-check every search-based finding in round 2.
+
+Findings routed but not yet landed: a stale citation in `dns/fakeip_resolver_guard_test.go`
+(pointing at `e2e/zz_d4_fakeip_probe_test.go`, which does not exist — the real exerciser is
+`e2e/fakeip_resolver_wire_test.go`), a reply-code assertion in `e2e/fakeip_resolver_wire_test.go`
+that is environment-dependent and is **not** the discriminator, the name and comment of
+`route::TestConfiguredRateShapesTheRealTCPCopyPath` (no TCP socket and no splice path — the
+measurement is sound, the name is not), and the `common/sniff` census's `+4` allowance, which hides a
+fixed leak of up to three goroutines.
+
