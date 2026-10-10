@@ -1,4 +1,4 @@
-//go:build (darwin || linux || windows) && tfogo_checklinkname0
+//go:build darwin || linux || windows
 
 package oomprofile
 
@@ -73,11 +73,6 @@ func WriteFile(filePath string, name string) error {
 	}
 	return nil
 }
-
-// profileSupport reports whether this build carries the real writer. The other half of the package
-// (oomprofile_stub.go) reports false, so which implementation is compiled is observable rather than
-// assumed; the package's tests assert both directions.
-func profileSupport() bool { return true }
 
 var profileWriters = map[string]func(io.Writer) error{
 	"allocs":       writeAlloc,

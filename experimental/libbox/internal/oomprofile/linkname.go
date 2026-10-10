@@ -1,4 +1,4 @@
-//go:build (darwin || linux || windows) && tfogo_checklinkname0
+//go:build darwin || linux || windows
 
 package oomprofile
 
@@ -38,9 +38,3 @@ func runtimeFrameSymbolName(f *runtime.Frame) string
 
 //go:linkname runtimeExpandFinalInlineFrame runtime/pprof.runtime_expandFinalInlineFrame
 func runtimeExpandFinalInlineFrame(stk []uintptr) []uintptr
-
-//go:linkname stdParseProcSelfMaps runtime/pprof.parseProcSelfMaps
-func stdParseProcSelfMaps(data []byte, addMapping func(lo uint64, hi uint64, offset uint64, file string, buildID string))
-
-//go:linkname stdELFBuildID runtime/pprof.elfBuildID
-func stdELFBuildID(file string) (string, error)

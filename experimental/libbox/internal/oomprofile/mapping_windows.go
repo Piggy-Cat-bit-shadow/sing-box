@@ -1,4 +1,4 @@
-//go:build windows && tfogo_checklinkname0
+//go:build windows
 
 package oomprofile
 

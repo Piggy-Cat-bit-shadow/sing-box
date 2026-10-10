@@ -1,4 +1,4 @@
-//go:build (darwin || linux || windows) && tfogo_checklinkname0
+//go:build darwin || linux || windows
 
 package oomprofile
 
