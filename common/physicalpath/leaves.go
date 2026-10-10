@@ -228,7 +228,7 @@ func (r *Resolver) Hops(root adapter.Outbound) (nodes []PathNode, err error) {
 	// root itself was therefore never numbered at all: every node kept Position 0, no node carried
 	// Exit, `Leaves()` reported nothing for a one-hop outbound and `businessEntry` could not name
 	// the hop the flow arrives at. See completeRoute.
-	outcome, err := scope.enumerateHops(root, root.Tag(), nil, nil, networksOf(root), true)
+	outcome, err := scope.enumerateHops(root, root.Tag(), nil, nil, networksOf(root), true, 0)
 	if err != nil {
 		// The enumeration is discarded rather than partially reported: see DefaultNodeBudget.
 		return nil, err
@@ -280,7 +280,12 @@ const (
 
 // enumerateHops visits one node of the selection graph and reports how it left the route it was
 // extending, so the frame that OWNS that route can number it exactly once, when it is complete.
-func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain []adapter.Outbound, physicalPath []string, required []string, isCurrent bool) (routeOutcome, error) {
+//
+// routeStart is the index in e.hops where the route being extended BEGINS. A caller that is opening a
+// route passes the index its own node will be appended at; a physical hop passes down the value it
+// received. It is what lets a group that is reached as a DEPENDENCY extend the route above it instead
+// of replacing it - see the group branch below - and there is no other reason for it to travel.
+func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain []adapter.Outbound, physicalPath []string, required []string, isCurrent bool, routeStart int) (routeOutcome, error) {
 	e.visited++
 	if e.visited > e.budget {
 		return routeContinues, errNodeBudgetExceeded(rootTag, e.budget)
@@ -299,11 +304,40 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 		// whose declaration does not answer leaves every member unflagged, which is the honest
 		// answer for a group whose choice is per flow.
 		selectedTag := e.resolver.selectedTag(group)
+		// # A group reached as a DEPENDENCY extends the route above it; it does not replace it
+		//
+		// `L.detour = G` is a legal configuration: L reaches its own server through whichever member
+		// G picks, so the packet path is member -> L -> target and L is the FAR END - the hop the
+		// business flow arrives at. The members are branches of ONE route that already has hops in
+		// it, not sibling routes of their own.
+		//
+		// MEASURED before this branch existed: `L` (tcp-only, `detour: G`) with `G` a selector over
+		// two dual-network members and a rule delivering UDP to L reported `reachable=true,
+		// failures=0` - L was neither an exit nor a business entry, so the delivery requirement was
+		// never applied to the hop the flow arrives at. The members' chains were wrong in the same
+		// way: each said only `m1`, when the route through m1 is m1 -> L.
+		//
+		// So the hops above the group are ECHOED once per member: each member route gets its own copy
+		// of them, printed in declared order before that member's own descent, and the whole range is
+		// numbered once the member's recursion completes. `routeStart` is what makes that possible -
+		// it is the index the route being extended begins at, and `physicalPath` (the chain of those
+		// hops) is non-empty exactly when there is something to echo, because a group contributes no
+		// tag of its own to it.
+		var prefix []PathNode
+		if len(physicalPath) > 0 && routeStart < len(e.hops) {
+			prefix = append([]PathNode(nil), e.hops[routeStart:]...)
+			e.hops = e.hops[:routeStart]
+		}
+		echoed := false
 		for _, memberTag := range e.resolver.candidatesOf(group) {
 			member, reason := e.resolver.lookupDependency(memberTag)
 			if member == nil {
 				// A member that does not resolve becomes a hop-shaped fact, so the report names it
 				// with the route that reaches it instead of dropping it here.
+				if len(prefix) > 0 {
+					e.hops = append(e.hops, prefix...)
+					echoed = true
+				}
 				e.hops = append(e.hops, PathNode{
 					Root:             rootTag,
 					ControlPath:      groupTags(chain),
@@ -322,6 +356,11 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 				// Position is the length of the group's own chain rather than an index into a chain
 				// of its own, because it has no chain of its own - it names no object. That is what
 				// makes it UNKNOWN rather than the far end of anything: see businessEntry.
+				//
+				// The hops echoed above it are left in declared order and unnumbered: the route is
+				// refused by the existence check, so no packet order is claimed for it - but the
+				// caller still sees the hops the flow would have traversed, which is what names the
+				// entry point to fix.
 				continue
 			}
 			// The cycle check runs BEFORE the recursion, and it reads the CURRENT descent rather
@@ -338,8 +377,12 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 			// range and the loop that opened it is what numbers it, once its recursion reports that
 			// it reached its far end.
 			memberStart := len(e.hops)
+			if len(prefix) > 0 {
+				e.hops = append(e.hops, prefix...)
+				echoed = true
+			}
 			outcome, err := e.enumerateHops(member, rootTag, chain, physicalPath, required,
-				isCurrent && selectedTag == memberTag)
+				isCurrent && selectedTag == memberTag, memberStart)
 			if err != nil {
 				return routeContinues, err
 			}
@@ -349,6 +392,11 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 			// A member route that stopped at a dependency which does not resolve is left exactly as
 			// it was recorded - declared order, no exit - because packet order is not knowable for a
 			// route whose far end was never reached.
+		}
+		if len(prefix) > 0 && !echoed {
+			// The group has no members at all. The route above it still exists - it is simply a
+			// route this enumeration reach no end of - so its own hops are kept rather than dropped.
+			e.hops = append(e.hops, prefix...)
 		}
 		// A group is a control node: it never terminates a physical route by itself, so how the route
 		// it extends ended is answered below it, not here.
@@ -401,7 +449,10 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 		// returns a connection must not be swallowed.
 		return routeContinues, cycleObjectsError(chain, dependency)
 	}
-	return e.enumerateHops(dependency, rootTag, chain, physicalPath, required, isCurrent)
+	// The route start travels unchanged: this hop is a continuation of a route that already began,
+	// and if the dependency turns out to be a group, that group has to know where the route it
+	// extends starts. See the group branch.
+	return e.enumerateHops(dependency, rootTag, chain, physicalPath, required, isCurrent, routeStart)
 }
 
 // completeRoute numbers ONE completed route in packet order, in place.

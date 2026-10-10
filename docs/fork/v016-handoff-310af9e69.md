@@ -114,6 +114,10 @@ falsification. **Keep that discipline** — a RED that is a build error proves n
 
 # 2. NOT DONE — PATH-01, and the wall that six attempts hit
 
+**CLOSED — see §10 for what the wall actually was, the fix, the reverse-break, and the one detector
+that cannot be green alongside another one. §2 is kept because its measurements are the record this
+section was reasoned from.**
+
 **This is the main open defect. `PHYSICALPATH_UNKNOWN_AND_EXIT = NOT_READY`.**
 
 ## 2.1 What is wrong, measured
@@ -540,3 +544,133 @@ untouched by any of these changes. It should be made load-independent or marked 
 5. **The P4 fixer's own honesty note**: the reverse-break mutated the worktree from pristine copies in
    a temp directory (both files restored byte-identical, hashes in their report) rather than in a
    separate clone. Weaker isolation than the other agents used; the hashes are the evidence.
+
+---
+
+# 10. PATH-01 CLOSED at `d7d542d0b` — what the wall actually was
+
+§2 is superseded by this section. The direction §2.3 prescribed ("keep the chain DEVICE-FIRST and take
+`Position` from it directly") was right; what it did not say is that the chain has to END at the node
+it describes, and that is the whole of the wall.
+
+```text
+ORIGIN_TESTING = d7d542d0b2295877806e70febda18f19c75946fb   LOCAL == ORIGIN
+COMMITS THIS ROUND (from 26d2c4d9f): 1f6b7b85d PATH-01, d7d542d0b redaction (both [skip ci])
+common/physicalpath = 1 red, and it is UNSATISFIABLE (§10.3) - not an unfinished fix
+```
+
+## 10.1 The mechanism, measured before the fix
+
+`Hops` discarded the flag its own top-level call returned (`leaves.go:200`,
+`_, err = scope.enumerateHops(root, ...)`), so **the segment consisting of the root's own node was
+never numbered**: `Position` stayed 0 everywhere and `Exit` stayed false unless a group's member loop
+happened to reverse the range. `businessEntry` then read `Position == len(PhysicalPath)-1`, which on a
+three-hop route under a group is true for the **middle** hop:
+
+```text
+node a  chain "a -> b -> c"  pos=0 exit=false entry=false
+node b  chain "b -> c"       pos=1 exit=false entry=TRUE     <- the wrong hop
+node c  chain "c"            pos=2 exit=true  entry=false    <- the routing-selected hop, UNCHECKED
+report: reachable=true failures=0                            <- a FALSE PASS
+```
+
+## 10.2 The fix
+
+`enumerateHops` returns a three-valued `routeOutcome` (`routeContinues` / `routeComplete` /
+`routeTruncated`) instead of a bool, because "the route ended" and "the route ended at its FAR END"
+license different things. The frame that **owns** a route numbers it exactly once — a group's member
+loop for a member route, and `Hops` itself for the route that begins at the root. `completeRoute`
+replaces `reverseRoute`: it reverses the declared range into packet order and gives each node the
+**prefix of that route which ends at it**, so `Position` is the last index of the field beside it and
+the node that no longer chain extends is the far end. The prefixes of one route share one backing
+array, so memory is linear in nodes, not quadratic in chain depth.
+
+`businessEntry` is now `Exit && Resolved`. The old `Position == len(PhysicalPath)-1` test held for
+**every** node once the chain ends at the node, which is exactly how it named the middle hop; `Exit` is
+the enumeration's own statement of the far end, and `Resolved` keeps the one node that is `Exit`
+without being a far end (a group member that names no object) out of the answer.
+
+```text
+three hop under a group:  a "a" pos=0, b "a -> b" pos=1, c "a -> b -> c" pos=2 exit=true
+                          udp delivered to a tcp-only c -> reachable=FALSE   (was TRUE)
+diamond route A:          shared "shared" pos=0 exit=false, middle "shared -> middle" pos=1
+                          exit=true, requirement=[tcp]                        (was []: unvalidated)
+```
+
+## 10.3 The two things that CANNOT both be green — with proof
+
+**1. `businessEntry` for a member that does not resolve.** `TestAnUnresolvedGroupMemberIsNotABusinessEntry`
+asserts `require.False(t, businessEntry(missing))` on the node `{Tag:"absent", PhysicalPath:[], Position:0,
+Exit:true, Resolved:false}`. `TestBusinessEntryCountsExactlyOneEntryPerRoute/group_whose_member_does_not_resolve`
+segments that node into a route **of its own** (its `Position` is pinned to 0 by the first test, so it
+cannot continue the other member's route) and then demands **exactly one** business entry in it — which
+is the same node, so it demands `true`. The failing output prints the route as `root=group size=1.
+Nodes: [absent(absent pos=0 dep)]`. No assignment satisfies both; the first detector is the
+product-correct one and is kept green. **This is a defect in the specification, not in the code.**
+
+**2. The diamond's chain string.** `diamond_routes_test.go`'s route-A expectation for `shared` is now
+`{physicalChain: "shared", position: 0, exit: false, required: tcp}`. The previous value
+(`"shared -> middle"`, position 0) was introduced by **`0ad08d645`, one of the six failed attempts** —
+its own diff rewrites the expectation from the pre-attempt `{physicalChain: "middle -> shared",
+position: 1}`. That string is incompatible with the field's documentation ("the packet-order chain that
+ends at this node"), with `TestEachNodePositionIndexesItsOwnChain` and with
+`TestEveryNodeOfEveryRouteIsReachableAtItsOwnPosition`: `position: 0` beside a two-element chain means
+`Position != len(PhysicalPath)-1` and a chain that does not end at its node. One field of one green
+test was updated; `position`, `required` and a new `exit` field carry the per-route distinction the
+test exists for. **This is the only test expectation changed by 1f6b7b85d and it is called out in the
+commit message too.**
+
+If the diamond string is preferred over those two detectors, the correct resolution is to change the
+two detectors — deliberately, in one commit, with this section as the reason — not to reinstate the
+failed attempt's representation.
+
+## 10.4 Reverse-break, both mutations compile
+
+```text
+MUTATION A  `leaves.go` + `dryrun.go` restored to 26d2c4d9 (the pre-fix source), tests untouched
+            go build exit=0  ->  13 tests RED BY ASSERTION (the 12 detectors + the diamond string)
+MUTATION B  the ONE line: `_, err = scope.enumerateHops(root, ...)` again, `completeRoute(0)` gone
+            go build exit=0  ->  16 tests RED BY ASSERTION, including three that were GREEN before:
+              TestADeliveredNetworkTheChainCannotCarryIsAccepted   (the false PASS returns)
+              TestADeliveredNetworkIsEnforcedOnATwoHopChain
+              TestADeliveredNetworkIsEnforcedOnASingleHopRoot
+```
+
+Mutation B is the load-bearing evidence in **both** directions: it shows the discarded outcome was the
+defect, and it shows that a "fix" that only redefined `businessEntry` without numbering the root's route
+would break three previously-green product-level network checks.
+
+## 10.5 Also closed this round
+
+- **P5** — `physicalpath.go` cited `TestControlPathIsRootToLeafRegardlessOfPacketOrder`, which does not
+  exist (the pinning test is `TestControlPathIsShorterThanThePhysicalPath`); `status.go`'s
+  `PathStatus.ControlPath` said "packet order" for a descent-order field; the "first hop / position 0"
+  wording on `nodeRequirementFor`/`advertisedNetworks` now names `businessEntry`; `PathNode.Exit`'s
+  comment no longer describes the removed "node with no dependency" rule.
+- **A redaction leak P3 did not cover** (`d7d542d0b`). The matcher required the separator to TOUCH the
+  keyword, so `password = hunter2`, `token : abc123`, `"password" : "hunter2"`, `password:\thunter2`,
+  `password =\thunter2` and `api_key   =   sk-...` all returned their secrets verbatim — the TAB case
+  worst, because a tab is a value terminator and the scan therefore found an empty value and gave up.
+  Space and TAB are now skipped before the separator (only when a separator follows, so
+  `the password field is required` stays readable) and after it; a newline is deliberately not skipped.
+  Reverse-broken with `go build` exit 0 first: all 8 new positive cases RED with the secret in the
+  message, all 4 negative controls green. Found by adversarial verification of P3, which also proved
+  P3's `_`-boundary change was a strict improvement (16/41 probe inputs leaked before it, 9/41 after,
+  zero regressions).
+
+## 10.6 Still open after this round
+
+1. **`StatusView` is still not constructed by `box.go`** (§9.3) — unchanged by this round.
+2. **`SelectionStatus()` is not wired into any UI** (§9.4) — unchanged.
+3. **`ValidateRoots` alone accepts a root whose declared *dependency* does not resolve** (a group
+   *member* that does not resolve is reported; a `detour` that names nothing is not). MEASURED:
+   `exit.detour = missing-entry` gives `Reachable=true, failures=0, nodes=1` from `ValidateRoots`
+   while `Build` reports the Unknown. Production start is **not** exposed — `lintOutbounds`
+   (`adapter/outbound/manager.go:372`) refuses `dependency[X] not found for outbound[Y]` before the dry
+   run, for outbounds and endpoints alike — so this is an API-level gap, and adding a hop for the
+   missing tag would double-report the same defect at the manager level. Left as-is, deliberately.
+4. **`route::TestConfiguredRateShapesTheRealTCPCopyPath`** — wall-clock band test, fails under
+   parallel package load (§9, "Flaky test flagged"). Do not widen the band.
+5. **e2e / `common/dialer` intermittency** — §4, under investigation; results are not in this section.
+6. **A full serial scan at `d7d542d0b`** has not been run yet in this round.
+
