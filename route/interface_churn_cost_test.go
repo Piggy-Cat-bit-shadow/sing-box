@@ -44,9 +44,19 @@ import (
 //     What this churn adds is that the guarantee still HOLDS once the path is driven end to end 25 times
 //     through the real notifier and the real dispatcher, not that it is the only thing enforcing it.
 //
-//  3. REVERSIBLE. Once the churn stops the manager must report a settled network and the process must
-//     hold no more goroutines than it started with. This is the half a "does it reset correctly" test
-//     cannot see: work that accumulates and is never released still passes every count above.
+//  3. REVERSIBLE, and the scope of that word is narrower than it looks. Once the churn stops the
+//     manager must report a settled network and must not be holding more of its OWN goroutines than it
+//     started with. This is the half a "does it reset correctly" test cannot see: work that accumulates
+//     and is never released still passes every count above.
+//
+//     What it does NOT measure, stated because the earlier wording implied otherwise: the router in
+//     this harness is `countingRouter`, which embeds a nil `adapter.Router` and overrides only
+//     `ResetNetwork` and `TrimIdleResources`, and the managers are the `empty*` fixtures over nil
+//     slices with a nil connection manager. `resetNetworkLocked` calls `r.router.ResetNetwork()` as its
+//     unconditional LAST statement, so the assertions DO reach the real decision function and its last
+//     call - but no teardown runs, and therefore no transport, DNS or connection worker is involved.
+//     What "reversible" establishes here is that the MANAGER's own dispatch and timer goroutines come
+//     back; it is not a statement about the object graph below it.
 //
 // # The instrument, and why the global count is not it
 //
@@ -118,7 +128,9 @@ func TestRepeatedInterfaceChangesCostBoundedWorkAndAreReversible(t *testing.T) {
 	require.Greater(t, harness.manager.NetworkResetGeneration(), generationBefore,
 		"the reset epoch did not advance across %d real transitions", transitions)
 
-	// 3. REVERSIBLE. Nothing accumulated and nothing is still running.
+	// 3. REVERSIBLE. Nothing this package started is still running, and the manager is settled. See the
+	// scope note on point 3 in the header: "reversible" is a claim about the MANAGER's own goroutines,
+	// because the router below it is a counting stand-in and no teardown runs.
 	require.True(t, harness.manager.NetworkTransitionStable(),
 		"the network did not return to a settled state after the churn stopped")
 
