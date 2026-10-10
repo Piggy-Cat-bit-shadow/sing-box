@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,10 +44,18 @@ type ClientBind struct {
 }
 
 func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr netip.AddrPort, reserved [3]uint8) *ClientBind {
+	// The bind context is created HERE, not in Open, so a Send or a receive that arrives before Open
+	// has a parent to derive its dial deadline from. Deriving it lazily left a nil context in that
+	// window, and `context.WithTimeout(nil, ...)` panics - from wireguard-go's send or receive
+	// goroutine, which is process-fatal rather than a failed operation. Open replaces it with a
+	// fresh one, which is what makes the bind restartable after a Close.
+	bindCtx, bindDone := context.WithCancel(ctx)
 	return &ClientBind{
 		ctx:                 ctx,
 		logger:              logger,
 		pauseManager:        service.FromContext[pause.Manager](ctx),
+		bindCtx:             bindCtx,
+		bindDone:            bindDone,
 		dialer:              dialer,
 		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 		done:                make(chan struct{}),
@@ -66,7 +75,41 @@ func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, i
 // It is a var so a test can shrink it.
 var clientBindDialTimeout = constant.TCPTimeout
 
+// errNoDialer is the capability boundary for a bind built without a dialer.
+//
+// os.ErrInvalid rather than a new sentinel: what is wrong is the construction of this bind, not the
+// state of the network, and a caller that wants to distinguish it from a transient failure only
+// needs to know that retrying cannot help.
+var errNoDialer = E.Cause(os.ErrInvalid, "wireguard: bind has no dialer")
+
+// logError reports through the logger when the embedder supplied one.
+//
+// The logger is optional for the same reason the pause manager is: a box always installs both, a
+// bare embedder may install neither, and calling a method on a nil interface is a panic on a
+// background goroutine.
+func (c *ClientBind) logError(err error) {
+	if c.logger != nil {
+		c.logger.Error(err)
+	}
+}
+
+// waitActive honours the pause manager when one is installed, and does nothing when there is none.
+//
+// service.FromContext returns a nil interface for a service that was never registered, so the call
+// this replaces would have dereferenced a nil pause.Manager.
+func (c *ClientBind) waitActive() {
+	if c.pauseManager != nil {
+		c.pauseManager.WaitActive()
+	}
+}
+
 func (c *ClientBind) connect() (*wireConn, error) {
+	// Checked before anything else is touched: this function is called from wireguard-go's receive
+	// loop and from its send path, both on goroutines the caller does not own, and a nil dereference
+	// there takes the process down instead of failing an operation.
+	if c.dialer == nil {
+		return nil, errNoDialer
+	}
 	serverConn := c.conn.Load()
 	if serverConn != nil {
 		select {
@@ -118,9 +161,27 @@ func (c *ClientBind) connect() (*wireConn, error) {
 	return created, nil
 }
 
+// Open prepares the bind for a run.
+//
+// # Why a nil dialer is refused HERE
+//
+// Told apart from the send and receive paths on purpose: this is the call wireguard-go makes from
+// its bind update, so returning an error here fails the device's up transition and, with it, the
+// endpoint's start. A bind that cannot establish a socket is a capability the endpoint does not
+// have, and an endpoint that comes up with it would have no receive path at all - reachable, and
+// silently unable to carry a single packet.
+//
+// It deliberately does NOT substitute a system dialer. The dialer carries the operator's detour,
+// bind_interface and routing mark; dialling around it would send the tunnel's traffic out of a path
+// the operator did not choose, which is a worse failure than refusing to start.
 func (c *ClientBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	if c.dialer == nil {
+		return nil, 0, errNoDialer
+	}
 	select {
 	case <-c.done:
+		// A bind is opened again after a Close by every rebind and every down/up transition, so a
+		// closed bind must be restartable rather than permanently spent.
 		c.done = make(chan struct{})
 	default:
 	}
@@ -143,11 +204,11 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 			return 0, net.ErrClosed
 		default:
 		}
-		c.logger.Error(E.Cause(err, "connect to server"))
+		c.logError(E.Cause(err, "connect to server"))
 		// One retry per second while the dial keeps failing, but only while the device still has
 		// a reason to be up: the sleep is not interruptible, so an unbounded number of them after
 		// the bind was closed is what the c.done check above exists to prevent.
-		c.pauseManager.WaitActive()
+		c.waitActive()
 		if !c.sleepRetry() {
 			return 0, net.ErrClosed
 		}
@@ -162,7 +223,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 			// error, not with a nil that asks wireguard-go to call straight back in.
 			return 0, net.ErrClosed
 		default:
-			c.logger.Error(E.Cause(err, "read packet"))
+			c.logError(E.Cause(err, "read packet"))
 			err = nil
 		}
 		return
@@ -210,9 +271,15 @@ func (c *ClientBind) SetMark(mark uint32) error {
 }
 
 func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
+	if c.dialer == nil {
+		// Answered before the retry machinery on purpose: this failure is permanent, and the retry
+		// path sleeps a second before reporting it. Sleeping there would add a second of delay to
+		// EVERY packet the device tries to send, turning a construction error into a stall.
+		return errNoDialer
+	}
 	udpConn, err := c.connect()
 	if err != nil {
-		c.pauseManager.WaitActive()
+		c.waitActive()
 		if !c.sleepRetry() {
 			return net.ErrClosed
 		}

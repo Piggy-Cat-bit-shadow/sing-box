@@ -187,6 +187,13 @@ func (e *Endpoint) Start(postStart bool) error {
 	// Holding the lock across the whole build was the first shape of this fix, and it is wrong:
 	// wgDevice.IpcSet brings the device up, which runs the pause/network callbacks, and those
 	// take the same lock - a self-deadlock.
+	// An endpoint with no dialer has no way to reach the network at all, and the bind it would build
+	// from it (ClientBind, since a nil dialer cannot provide the listener capability) would fail
+	// later, from wireguard-go's own goroutines. Refusing here reports it as the configuration error
+	// it is, before a tun stack and a device have been built for a tunnel that cannot carry a packet.
+	if e.options.Dialer == nil {
+		return E.New("missing dialer for wireguard endpoint")
+	}
 	var bind conn.Bind
 	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
 	if isUDPListener {
@@ -295,6 +302,10 @@ func (e *Endpoint) Start(postStart bool) error {
 		wgDevice.Close()
 		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
 	}
+	if err = e.bindListenPort(wgDevice); err != nil {
+		wgDevice.Close()
+		return err
+	}
 	wgPeers := make([]*device.Peer, 0, len(e.peers))
 	for _, peer := range e.peers {
 		wgPeer, loaded := wgDevice.LookupActivePeer(peer.publicKey)
@@ -328,6 +339,75 @@ func (e *Endpoint) Start(postStart bool) error {
 	// The callback contract is strict (see sessionStateChanged): cheap, serialized per peer, and it
 	// must not call back into Device. It records state and nudges the recovery worker; nothing else.
 	wgDevice.SetSessionStateFunc(e.sessionStateChanged)
+	return nil
+}
+
+// bindListenPort brings the device up and makes a configured `listen_port` a fact of the running
+// endpoint rather than a line of text in the IPC configuration.
+//
+// # The two failures this closes
+//
+// wireguard-go opens the bind from the UP transition, not from IpcSet: `BindUpdate` closes the
+// existing sockets and then returns immediately when the device is not up, and the transition that
+// actually opens them is driven by the tun device's event channel - an ASYNCHRONOUS goroutine
+// (`device.RoutineTUNEventReader`). So `listen_port=N` reached `device.net.port` and the bind was
+// opened later, off whichever goroutine happened to observe the event. Two things followed:
+//
+//  1. Start returned before the socket existed. The port was still free after a successful Start, so
+//     the endpoint was published as ready while nothing could receive on it, and anything that
+//     checked the port - a monitoring probe, a second instance starting on the same port - got the
+//     answer "free" from an endpoint that was about to take it.
+//  2. A bind failure was SWALLOWED. When the port was already held by another process, `IpcSet`
+//     succeeded (its own BindUpdate was a no-op on a device that was not up yet), Start returned nil,
+//     and the failure surfaced only later as a logged "Unable to update bind" while the device fell
+//     back to down. The endpoint then had no socket at all and no error to the operator:
+//     `listen_port` was configured, silently not honoured, and the tunnel was dead.
+//
+// # The order, and why it is this order
+//
+//  1. Up() - the bind is opened HERE, synchronously, and its error is returned. This is the only
+//     state in which wireguard-go opens sockets, so a port that cannot be bound fails Start.
+//  2. With a pinned port, read back the port the device reports and, when it is not the configured
+//     one, re-apply the pin. The device's asynchronous up transition can interleave with the
+//     `listen_port` line of IpcSet, and `netc.port` is assigned from the bind's own return value, so
+//     a concurrent open with port 0 could replace the pinned port with an ephemeral one - silently,
+//     with no error anywhere. Re-applying the pin is deterministic precisely because it runs after
+//     the device is up; it happens only when the port is wrong, so the normal path opens one bind.
+//  3. Verify. A dialer that cannot own a listening socket at all - ClientBind, which is the bind for a
+//     detour and has no local port of its own - reports actualPort 0 instead of failing. That is a
+//     capability boundary rather than a transient error, so it is reported as one: the operator asked
+//     for a listening port and this endpoint cannot provide one.
+//
+// It deliberately does not substitute another dialer to make the bind succeed. The dialer carries the
+// operator's detour, bind_interface and routing mark, and opening a listening socket on a path the
+// operator did not choose would be a worse failure than refusing to start.
+func (e *Endpoint) bindListenPort(wgDevice *device.Device) error {
+	err := wgDevice.Up()
+	if err != nil {
+		return E.Cause(err, "bring up wireguard device")
+	}
+	actualPort := e.currentListenPort(wgDevice)
+	if e.options.ListenPort == 0 {
+		// Dynamic allocation: there is nothing to verify. The port the kernel chose is still worth
+		// reporting, because it is the one fact about this endpoint an operator cannot otherwise see.
+		if actualPort != 0 {
+			e.options.Logger.Info("wireguard[", e.options.Tag, "] listening on port ", actualPort)
+		}
+		return nil
+	}
+	if actualPort != e.options.ListenPort {
+		err = wgDevice.IpcSet("listen_port=" + F.ToString(e.options.ListenPort) + "\n")
+		if err != nil {
+			return E.Cause(err, "bind listen_port ", e.options.ListenPort)
+		}
+		actualPort = e.currentListenPort(wgDevice)
+		if actualPort != e.options.ListenPort {
+			return E.New("listen_port ", e.options.ListenPort,
+				" is not bound: this endpoint's dialer cannot own a listening socket (the device reports port ",
+				actualPort, ")")
+		}
+	}
+	e.options.Logger.Info("wireguard[", e.options.Tag, "] listening on port ", actualPort)
 	return nil
 }
 
