@@ -359,7 +359,7 @@ func TestBelowTheIPv6Minimum(t *testing.T) {
 //     works - it produced `[148]`, the client's handshake initiation - but no session ever came up,
 //     because a probe proved the listening endpoint never bound its reserved port:
 //
-//	the reserved port was FREE after both endpoints started: the server bind did NOT listen on it
+//     the reserved port was FREE after both endpoints started: the server bind did NOT listen on it
 //
 //     `listen_port` IS put into the device's IpcSet (`transport/wireguard/endpoint.go:75`), so that
 //     failure is in the pinned `StdNetBind.Open` path (it opens udp4 and then udp6 on the same port,

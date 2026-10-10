@@ -11,8 +11,8 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/service"
 	qtls "github.com/sagernet/sing-quic"
+	"github.com/sagernet/sing/service"
 
 	quic "github.com/sagernet/quic-go"
 	"github.com/stretchr/testify/require"

@@ -443,7 +443,7 @@ func TestRedactionKeepsTheMessageReadable(t *testing.T) {
 func TestAWordEndingInASecretKeywordIsNotRedacted(t *testing.T) {
 	for _, detail := range []string{
 		"mypassword=not-a-secret-field",
-		"the auth path failed",   // no separator, so not an assignment
+		"the auth path failed",      // no separator, so not an assignment
 		"context deadline exceeded", // unrelated
 	} {
 		require.Equal(t, detail, redactDetail(detail),
@@ -458,12 +458,12 @@ func TestAWordEndingInASecretKeywordIsNotRedacted(t *testing.T) {
 // TestTheMTUBudgetsAreDerivedForThisHop is the number a stacked protocol needs, reported per hop.
 func TestTheMTUBudgetsAreDerivedForThisHop(t *testing.T) {
 	cases := []struct {
-		name             string
-		innerIP          uint32
-		encap            uint32
-		wantUDPv4        uint32
-		wantUDPv6        uint32
-		wantEncapInNote  bool
+		name            string
+		innerIP         uint32
+		encap           uint32
+		wantUDPv4       uint32
+		wantUDPv6       uint32
+		wantEncapInNote bool
 	}{
 		{
 			name: "a plain QUIC tunnel at the MASQUE default", innerIP: 1280,
