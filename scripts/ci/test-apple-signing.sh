@@ -302,10 +302,15 @@ check "CI never references a distribution identity or key" \
   bash -c '! grep -qE "Apple Distribution|Apple Development|\.p12|\.p8" .github/workflows/client-apple.yml'
 check "no signing material is tracked" \
   bash -c '! git ls-files | grep -qiE "\.(p12|pfx|p8|cer|mobileprovision|provisionprofile)$"'
-# Exclude this file: it contains the search pattern as a literal, so a naive grep
-# matches itself and reports a private key that does not exist.
+# The search is a Python gate, not a grep. See scripts/ci/check-no-tracked-private-keys.py
+# for why: the loose `BEGIN .*PRIVATE KEY` form matched a doc comment and two upstream
+# redaction fixtures whose key body is twelve base64 characters, while `git grep -P` in the
+# Git for Windows build matches nothing at all and `grep -P` there ignores `\n` in a
+# pattern - so a grep-based check is either wrong or silently vacuous depending on the host.
+# The gate requires a PEM header followed by at least 80 base64 characters, which is well
+# clear of any fixture and far below any real key.
 check "no private key block is tracked" \
-  bash -c '! git grep -lI "BEGIN .*PRIVATE KEY" -- . ":(exclude)scripts/ci/test-apple-signing.sh" 2>/dev/null | grep -q .'
+  python3 scripts/ci/check-no-tracked-private-keys.py
 
 
 echo "== the archives are signed, and the export re-signs for distribution =="

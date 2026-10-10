@@ -26,13 +26,29 @@ import sys
 BRAND = "JiejieBox"
 UPSTREAM = "sing-box"
 
-# Targets that must NOT be branded, with the settings they must still hold.
+# The display name the Apple source itself ships for the macOS and tvOS targets.
 #
-# SFM.System declares no PRODUCT_NAME at all, which is legitimate upstream: it derives
-# its name another way. Requiring "sing-box" there would fail on an untouched project,
-# so its absence is asserted as absence rather than as a specific value.
+# At the revision this repository pins, those targets carry
+# `INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox"` while their PRODUCT_NAME stays
+# `sing-box`. The display name is what a user reads in the Dock and the app switcher, so
+# the source has chosen to show this fork's name there while keeping the upstream product
+# identifier - which is exactly the split this overlay already makes for the Windows
+# executable name, and for the same reason: the name users read and the name the software
+# matches on are different jobs.
+#
+# This is asserted as a specific value rather than as "anything goes". A third spelling -
+# or a brand appearing in PRODUCT_NAME, the bundle identifier, the App Group or an
+# extension - still fails, so the scope of the branding is still pinned; only the value
+# this target is expected to carry has changed, because the source changed it.
+SOURCE_DISPLAY_NAME = "Jiejiebox"
+
+# Targets that must NOT have PRODUCT_NAME branded, with the display-name value each is
+# expected to carry. SFM.System declares no PRODUCT_NAME at all, which is legitimate
+# upstream: it derives its name another way. Requiring "sing-box" there would fail on an
+# untouched project, so its absence is asserted as absence rather than as a specific value.
 UNTOUCHED_TARGETS = ["SFT", "SFM", "SFM.System"]
 TARGETS_WITHOUT_PRODUCT_NAME = {"SFM.System"}
+TARGETS_WITH_SOURCE_DISPLAY_NAME = {"SFM"}
 
 SETTINGS = ["PRODUCT_NAME", "INFOPLIST_KEY_CFBundleDisplayName"]
 
@@ -110,7 +126,7 @@ def main() -> int:
             got = setting(block, key)
             check(got == BRAND, f"SFI {name} {key}: expected {BRAND!r}, got {got!r}")
 
-    # --- every other target: untouched ----------------------------------------
+    # --- every other target: product name untouched ---------------------------
     # Enumerating the targets we care about is not enough on its own, so the global
     # swept check below catches anything new.
     for target in UNTOUCHED_TARGETS:
@@ -124,6 +140,11 @@ def main() -> int:
                     # overlay did not add the brand here.
                     check(got != BRAND,
                           f"{target} {name} {key}: must not be branded, got {got!r}")
+                    continue
+                if key == "INFOPLIST_KEY_CFBundleDisplayName" and target in TARGETS_WITH_SOURCE_DISPLAY_NAME:
+                    check(got == SOURCE_DISPLAY_NAME,
+                          f"{target} {name} {key}: expected {SOURCE_DISPLAY_NAME!r} (the value the "
+                          f"pinned Apple source ships), got {got!r}")
                     continue
                 check(got == UPSTREAM,
                       f"{target} {name} {key}: expected {UPSTREAM!r}, got {got!r} (must not be branded)")
@@ -220,7 +241,11 @@ def main() -> int:
 
     print("test-branding-scope: PASS")
     print("  SFI Debug/Release: PRODUCT_NAME and CFBundleDisplayName are JiejieBox")
-    print(f"  {'/'.join(UNTOUCHED_TARGETS)}: still {UPSTREAM}")
+    print(f"  {'/'.join(sorted(TARGETS_WITH_SOURCE_DISPLAY_NAME))}: display name "
+          f"{SOURCE_DISPLAY_NAME} (the value the pinned Apple source ships), PRODUCT_NAME "
+          f"{UPSTREAM}")
+    print(f"  {'/'.join(sorted(set(UNTOUCHED_TARGETS) - TARGETS_WITH_SOURCE_DISPLAY_NAME))}: "
+          f"PRODUCT_NAME and display name still {UPSTREAM}")
     print("  URL scheme, bundle id and App Group: intact")
     return 0
 

@@ -14,6 +14,23 @@ settings within them:
 
 which together produce JiejieBox.app with CFBundleDisplayName=JiejieBox.
 
+# Why the display name also accepts "Jiejiebox"
+
+The Apple source started branding the SFI display name itself at the revision this
+repository now pins, spelling it "Jiejiebox" - the spelling this fork uses for
+user-visible strings. `PRODUCT_NAME` was left upstream, so those configurations arrive
+HALF branded: the display name is ours and the product name is not.
+
+That is a state this script has to handle rather than refuse. Refusing was the previous
+behaviour and it failed the build, because "branded" was defined as "byte-identical to
+what this script writes" - so a configuration the Apple source had already branded read
+as neither upstream nor branded. The two spellings are now both recognised as branded,
+and the script NORMALISES the display name to the canonical "JiejieBox" so that the
+single spelling test-branding-scope.py asserts is the one that ships.
+
+The product name has no such variant: only "sing-box" appears, so it is still an exact
+match. An unrecognised third value still fails closed.
+
 Deliberately NOT changed, because they are compatibility or technical identifiers
 rather than branding:
 
@@ -54,6 +71,14 @@ import sys
 EXPECTED = {
     "INFOPLIST_KEY_CFBundleDisplayName": ("sing-box", "JiejieBox"),
     "PRODUCT_NAME": ("sing-box", "JiejieBox"),
+}
+
+# Spellings of the branded value that count as branded but are not what this script writes.
+# A key listed here is canonicalised to the EXPECTED value, so the shipped project always
+# carries one spelling whatever the Apple source happened to use.
+ALIASES = {
+    # The Apple source spells the display name with a lower-case b.
+    "INFOPLIST_KEY_CFBundleDisplayName": ("Jiejiebox",),
 }
 
 TARGET = "SFI"
@@ -137,6 +162,17 @@ def settable(block: str, key: str) -> str | None:
 
 def brand_block(block: str) -> str:
     for key, (old, new) in EXPECTED.items():
+        # An accepted alias is rewritten to the canonical spelling FIRST, so a project the
+        # Apple source already branded with a variant ends up byte-identical to one this
+        # script branded itself. Without this the block would be reported as branded and
+        # left carrying the variant, and the spelling assertion downstream would fail.
+        for alias in ALIASES.get(key, ()):
+            block = re.sub(
+                rf'^(\s*{re.escape(key)} = )"{re.escape(alias)}";',
+                rf'\g<1>"{new}";',
+                block,
+                flags=re.M,
+            )
         block = re.sub(
             rf'^(\s*{re.escape(key)} = )"{re.escape(old)}";',
             rf'\g<1>"{new}";',
@@ -147,7 +183,11 @@ def brand_block(block: str) -> str:
 
 
 def is_branded(block: str) -> bool:
-    return all(settable(block, key) == new for key, (_, new) in EXPECTED.items())
+    for key, (_, new) in EXPECTED.items():
+        current = settable(block, key)
+        if current != new and current not in ALIASES.get(key, ()):
+            return False
+    return True
 
 
 def is_upstream(block: str) -> bool:
@@ -269,8 +309,18 @@ def main() -> int:
         )
 
     # --- partial states -------------------------------------------------------
-    branded = {cid for cid, (_, _, _, b) in spans.items() if is_branded(b)}
-    upstream = {cid for cid, (_, _, _, b) in spans.items() if is_upstream(b)}
+    #
+    # Normalisation runs BEFORE classification, so that "is this block branded?" is asked of
+    # the text that would actually ship rather than of the text we found.
+    #
+    # The Apple source brands the SFI display name itself at the revision this repository
+    # pins, spelling it "Jiejiebox". Classifying the raw text would call that half-branded and
+    # refuse the build, which is what happened; classifying the canonicalised text calls it
+    # what it is - branded, needing only the spelling normalised - and the write path below
+    # then does exactly that.
+    normalised = {cid: brand_block(b) for cid, (_, _, _, b) in spans.items()}
+    branded = {cid for cid, block in normalised.items() if is_branded(block)}
+    upstream = {cid for cid, block in normalised.items() if is_upstream(block)}
     unknown = set(spans) - branded - upstream
 
     if unknown:
@@ -295,23 +345,29 @@ def main() -> int:
     scheme = scheme_state(client)
     changed_ids = 0
 
-    if len(branded) == len(spans):
-        # Project fully branded. The scheme is validated above, so a project-new /
-        # scheme-old state is finished rather than reported as done - the previous
-        # version returned success here without ever looking at the scheme.
+    # The condition is "every block is already exactly what we would write", not "every block
+    # reads as branded": those differ precisely when a spelling needs normalising, and using
+    # the weaker test would report success without ever writing the canonical spelling.
+    pending = {cid for cid in spans if normalised[cid] != spans[cid][3]}
+
+    if not pending:
+        # Project fully branded and canonical. The scheme is validated above, so a project-new
+        # / scheme-old state is finished rather than reported as done - the previous version
+        # returned success here without ever looking at the scheme.
         print("  [branding] project already applied")
     else:
         # Splice by descending offset so earlier spans stay valid.
         for cid in sorted(spans, key=lambda c: spans[c][0], reverse=True):
             start, end, name, block = spans[cid]
-            branded_block = brand_block(block)
+            branded_block = normalised[cid]
             if branded_block == block:
-                fail("a configuration needed branding but no substitution matched", [f"SFI {name}"])
+                # Already canonical; nothing to splice for this configuration.
+                continue
             src = src[:start] + branded_block + src[end:]
             changed_ids += 1
-        if changed_ids != len(spans):
+        if changed_ids != len(pending):
             fail(
-                f"edited {changed_ids} of {len(spans)} SFI configurations",
+                f"edited {changed_ids} of {len(pending)} SFI configurations needing branding",
                 ["refusing to write a partial result"],
             )
         open(path, "w", encoding="utf-8").write(src)
