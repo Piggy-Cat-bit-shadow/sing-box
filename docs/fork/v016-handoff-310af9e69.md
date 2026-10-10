@@ -852,6 +852,23 @@ raised out of the noise band too: 150->400ms, 100->300ms). No assertion is weake
 6. **The seven-layer fault tree** (D4 DNS/FakeIP, D6 MTU/fragment, D7 stop/reconnect/platform) is still
    not walked (§4), and `common/tls`, `common/tlsspoof`, `common/windivert` remain BLOCKED_EXTERNAL.
 
+## 10.12 The worktrees this round left behind, and what is in them
+
+`git worktree list` still shows the investigation worktrees. Their content is INTEGRATED (or
+deliberately not); nothing there is a pending deliverable:
+
+```text
+work    ae0846ea8   the integration worktree, clean, == origin/testing
+wB2     4c56ed86f   pre-round, untouched
+wC2     a49e04dd4   P4's own commit, which is f2dd95d6 in the line above
+wD      b634f3c2a   pre-round, untouched
+wD2     798c57eb4   P3's own commit, which is 03995f6da in the line above
+wDL     1f6b7b85d   the dialer fix and its test - BOTH are committed as c216688f9, so the `M` there is
+                    not pending work
+wE2E    1f6b7b85d   all four instrumented files reverted; one untracked evidence file
+                    (FLAKE_evidence_TestRejectReplyCode.txt) whose decisive excerpt is quoted in §10.9
+```
+
 # 11. Closing status at `12c0a9e60`
 
 ```text
