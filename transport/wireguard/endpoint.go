@@ -209,7 +209,40 @@ func (e *Endpoint) Start(postStart bool) error {
 			standardBind.SetSinglePeerMode()
 		}
 		if egressEnabled {
+			// The egress pool dereferences three fields of this struct UNCONDITIONALLY, from
+			// wireguard-go's own goroutines: InterfaceMonitor at SetEgressPort (sing-tun
+			// udp_egress.go:119), InterfaceFinder at its bind and at Close (:125, :177, :83), and Logger
+			// on the warning path (:218). Their ZERO VALUE is therefore not "unset", it is a nil
+			// dereference inside RoutineTUNEventReader - reached from BindUpdate, which is reached from
+			// the recovery worker - where no recover can catch it and the process dies.
+			//
+			// MEASURED: a caller that sets only the fields it cares about panics the whole test binary
+			// the first time the bind opens a port.
+			//
+			// The in-tree callers are all safe - protocol/wireguard/endpoint.go, protocol/openvpn and
+			// protocol/tailscale each fill all three from their network manager - so this refuses
+			// exactly the configuration that would have crashed later, and refuses it as the
+			// configuration error it is, BEFORE a device exists. A check here rather than in sing-tun
+			// because the missing guard is in the pinned fork, which this repository does not write to.
 			egressPoolOptions := e.options.EgressPoolOptions
+			if egressPoolOptions.InterfaceMonitor == nil {
+				return E.New("missing InterfaceMonitor in EgressPoolOptions for wireguard endpoint ",
+					e.options.Tag, ": the UDP egress pool dereferences it when it takes a port (sing-tun ",
+					"udp_egress.go:119) and the failure would be a nil pointer dereference on ",
+					"wireguard-go's own goroutine rather than an error here")
+			}
+			if egressPoolOptions.InterfaceFinder == nil {
+				return E.New("missing InterfaceFinder in EgressPoolOptions for wireguard endpoint ",
+					e.options.Tag, ": the UDP egress pool registers an interface callback with it ",
+					"(sing-tun udp_egress.go:125) and the failure would be a nil pointer dereference on ",
+					"wireguard-go's own goroutine rather than an error here")
+			}
+			if egressPoolOptions.Logger == nil {
+				return E.New("missing Logger in EgressPoolOptions for wireguard endpoint ",
+					e.options.Tag, ": the UDP egress pool logs a per-member listen failure through it ",
+					"(sing-tun udp_egress.go:218), and a failure that has nothing to report it with is a ",
+					"nil pointer dereference instead of the warning it was meant to be")
+			}
 			egressPoolOptions.Control = listenerControl
 			e.egressPool = tun.NewUDPEgressPool(egressPoolOptions)
 			standardBind.SetEgressProvider(e.egressPool)
