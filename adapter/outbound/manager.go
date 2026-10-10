@@ -25,6 +25,10 @@ type Manager struct {
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
 	physicalPath            *physicalPathValidation
+	// deliveredNetworks is what the ROUTES proved can reach a tag: the networks of the routing
+	// rules that name it and constrain the network explicitly. A tag absent from the map has
+	// nothing proven about it, which is not the same as "nothing reaches it".
+	deliveredNetworks map[string][]string
 }
 
 // physicalPathValidation is everything the reachable-leaf dry run needs that is not readable from
@@ -58,6 +62,26 @@ func (m *Manager) EnablePhysicalPathValidation(declarations physicalpath.Declara
 		resolverFor:   resolverFor,
 		defaultConfig: defaultDomainResolver,
 	}
+	m.access.Unlock()
+}
+
+// EnablePhysicalPathDelivery installs what the ROUTES proved can reach a tag: for each tag named by
+// a routing rule that constrains the network explicitly, the set of those networks.
+//
+// # Why delivery is a separate fact from the declarations
+//
+// It is the fact that decides whether a network requirement is a PROOF or a guess. A requirement
+// with no delivery behind it must not be invented - the dry run falls back to what the objects
+// advertise between them - and a delivery that IS declared is what lets the dry run refuse a leaf
+// that a rule delivers UDP to while it declares it carries only TCP. Installing it separately keeps
+// a Manager that was never given it behaving exactly as one that has no route model at all, which
+// is what every embedder that calls EnablePhysicalPathValidation alone keeps.
+//
+// A nil or empty map means nothing was proven, never "no requirement": the two are distinguished by
+// presence, so a caller cannot accidentally forbid every network by passing nothing.
+func (m *Manager) EnablePhysicalPathDelivery(delivered map[string][]string) {
+	m.access.Lock()
+	m.deliveredNetworks = delivered
 	m.access.Unlock()
 }
 
@@ -98,6 +122,7 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	outbounds := m.outbounds
 	validation := m.physicalPath
+	delivered := m.deliveredNetworks
 	m.access.Unlock()
 	if stage == adapter.StartStateStart {
 		// The start-order sort runs FIRST, and it is the same call the start itself makes.
@@ -132,7 +157,7 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		// Box would be a second answer to the same question. box.go supplies only the facts the
 		// objects cannot report - see EnablePhysicalPathValidation.
 		if validation != nil {
-			err = m.validatePhysicalPaths(outbounds, validation)
+			err = m.validatePhysicalPaths(outbounds, validation, delivered)
 			if err != nil {
 				return err
 			}
@@ -157,7 +182,7 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 //
 // It is read-only: it dials nothing, resolves nothing, changes no selection and consumes no
 // rotation. See common/physicalpath for the model and the per-leaf contract.
-func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation *physicalPathValidation) error {
+func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation *physicalPathValidation, delivered map[string][]string) error {
 	resolver := physicalpath.NewResolver(m.Outbound, physicalpath.Snapshot{}).
 		WithDomainResolvers(validation.resolverFor, validation.defaultConfig)
 	// The roots are ordered so a GROUP is validated before the objects it names.
@@ -170,20 +195,51 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 	// the information an operator needs - it names the selection step that would hand the flow to
 	// it. Validating the groups first and then suppressing the routes they already describe is
 	// what makes the report one line per defect.
-	groups := make([]adapter.Outbound, 0, len(outbounds))
-	leaves := make([]adapter.Outbound, 0, len(outbounds))
+	//
+	// # Why each root is validated on its own
+	//
+	// The requirement is a fact about ONE root - what the routes proved reaches it, or, when
+	// nothing is proven, what its own reachable objects advertise. Passing one set for a batch of
+	// roots is precisely the mistake that made the requirement the union of every outbound in the
+	// configuration, so the set is computed per root and handed to a call for that root.
+	type rootEntry struct {
+		root     adapter.Outbound
+		optional bool
+	}
+	entries := make([]rootEntry, 0, len(outbounds)+4)
 	for _, outbound := range outbounds {
 		if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
-			groups = append(groups, outbound)
+			entries = append(entries, rootEntry{root: outbound})
+		}
+	}
+	for _, outbound := range outbounds {
+		if _, isGroup := outbound.(adapter.OutboundGroup); isGroup {
 			continue
 		}
-		leaves = append(leaves, outbound)
+		entries = append(entries, rootEntry{root: outbound})
 	}
-	networks := requiredNetworksFor(outbounds)
+	// The default outbound and the endpoints are roots in their own right: the default is what an
+	// unmatched flow reaches, and an endpoint is a tunnel the device can be routed into directly.
+	// An object a group report already described is not repeated.
+	if defaultOutbound := m.Default(); defaultOutbound != nil {
+		entries = append(entries, rootEntry{root: defaultOutbound, optional: true})
+	}
+	for _, endpoint := range m.endpoint.Endpoints() {
+		entries = append(entries, rootEntry{root: endpoint, optional: true})
+	}
 	report := physicalpath.Report{}
 	described := make(map[string]bool)
-	for _, rootSet := range [][]adapter.Outbound{groups, leaves} {
-		rootReport, err := physicalpath.ValidateRoots(resolver, rootSet, m.endpoint, networks, validation.declarations)
+	seenRoot := make(map[adapter.Outbound]bool)
+	for _, entry := range entries {
+		root := entry.root
+		if root == nil || seenRoot[root] {
+			continue
+		}
+		if entry.optional && described[root.Tag()] {
+			continue
+		}
+		seenRoot[root] = true
+		rootReport, err := physicalpath.ValidateRoots(resolver, []adapter.Outbound{root}, m.endpoint, deliveredNetworksFor(delivered, root), validation.declarations)
 		if err != nil {
 			return err
 		}
@@ -195,12 +251,9 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 			}
 			report.Failures = append(report.Failures, failure)
 		}
-		if len(rootSet) == 0 {
-			continue
-		}
-		// The set of tags this pass DESCRIBED. The next pass must not repeat them: a broken member
-		// of a group is also a top-level outbound in its own right, and reporting it once per route
-		// turns one defect into three lines that look like three defects.
+		// The set of tags this root DESCRIBED. The roots that follow must not repeat them: a
+		// broken member of a group is also a top-level outbound in its own right, and reporting it
+		// once per route turns one defect into three lines that look like three defects.
 		for _, node := range rootReport.Nodes {
 			described[node.Hop] = true
 			for _, tag := range strings.Split(node.Path, " -> ") {
@@ -211,64 +264,19 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 			described[failure.Leaf] = true
 		}
 	}
-	// The default outbound and the endpoints are roots in their own right: the default is what an
-	// unmatched flow reaches, and an endpoint is a tunnel the device can be routed into directly.
-	// An object a group report already described is not repeated.
-	if defaultOutbound := m.Default(); defaultOutbound != nil && !described[defaultOutbound.Tag()] {
-		rootReport, err := physicalpath.ValidateRoots(resolver, []adapter.Outbound{defaultOutbound}, m.endpoint, networks, validation.declarations)
-		if err != nil {
-			return err
-		}
-		report.Roots = append(report.Roots, rootReport.Roots...)
-		report.Nodes = append(report.Nodes, rootReport.Nodes...)
-		for _, failure := range rootReport.Failures {
-			if !described[failure.Leaf] {
-				report.Failures = append(report.Failures, failure)
-			}
-		}
-	}
-	endpoints := make([]adapter.Outbound, 0, 4)
-	for _, endpoint := range m.endpoint.Endpoints() {
-		if !described[endpoint.Tag()] {
-			endpoints = append(endpoints, endpoint)
-		}
-	}
-	if len(endpoints) > 0 {
-		rootReport, err := physicalpath.ValidateRoots(resolver, endpoints, m.endpoint, networks, validation.declarations)
-		if err != nil {
-			return err
-		}
-		report.Roots = append(report.Roots, rootReport.Roots...)
-		report.Nodes = append(report.Nodes, rootReport.Nodes...)
-		for _, failure := range rootReport.Failures {
-			if !described[failure.Leaf] {
-				report.Failures = append(report.Failures, failure)
-			}
-		}
-	}
 	return report.Err()
 }
 
-// requiredNetworksFor derives the closed set of networks the graph must be checked against.
-func requiredNetworksFor(roots []adapter.Outbound) []string {
-	networks := make([]string, 0, 2)
-	for _, root := range roots {
-		for _, network := range root.Network() {
-			if network != physicalpath.NetworkTCP && network != physicalpath.NetworkUDP {
-				// ICMP and any future network are carried by a flow port rather than dialled, so
-				// they are outside what this dry run can decide. Ignoring them is the honest
-				// answer: inventing a requirement for them would reject a legal configuration.
-				continue
-			}
-			if !common.Contains(networks, network) {
-				networks = append(networks, network)
-			}
-		}
+// deliveredNetworksFor reports the networks PROVEN to reach one root, or nil when nothing is.
+//
+// Nil and an empty slice both mean "nothing proven" to the dry run, so a tag that no rule
+// constrains is reported the same way as a tag no rule names: the requirement then comes from what
+// the root's own objects advertise.
+func deliveredNetworksFor(delivered map[string][]string, root adapter.Outbound) []string {
+	if len(delivered) == 0 {
+		return nil
 	}
-	if len(networks) == 0 {
-		networks = append(networks, physicalpath.NetworkTCP)
-	}
-	return networks
+	return delivered[root.Tag()]
 }
 
 // lintOutbounds is the start-order sort and the per-kind dependency validation, separated from the

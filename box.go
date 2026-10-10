@@ -215,6 +215,80 @@ func declaredDestinationDNSOwnership(options option.Options) physicalpath.Declar
 	return declarations
 }
 
+// deliveredNetworksFromRoutes reports, per outbound tag, the networks a routing rule with an
+// EXPLICIT network condition can deliver to it.
+//
+// # Why only an explicit condition counts as a proof
+//
+// A rule that does not name a network can hand ANY network to its outbound, so it proves nothing
+// about delivery. Reading "nothing proven" as "every network" is exactly the mistake the dry run
+// made when it unioned the Network() of every outbound in the configuration: one unrelated
+// TCP+UDP outbound then made every other root responsible for UDP, and configurations that had
+// always started were refused. A tag named by a rule that DOES constrain the network is the
+// opposite case - the configuration states which flows reach it - and that statement is what lets
+// a leaf declaring tcp-only be refused when a rule delivers UDP to it.
+//
+// # What is deliberately not summarised
+//
+//   - `route.final` receives everything no rule matched, which is every network: it is left
+//     unproven rather than read as both.
+//   - A LOGICAL rule's conditions are a tree whose network constraints are an intersection this
+//     helper does not evaluate. Summarising it would be a second routing engine, so its outbound
+//     is left unproven.
+//   - A rule whose action is not `route` does not deliver to an outbound at all.
+//
+// A tag some rule constrains and another rule does not is left unproven: one unconstrained rule is
+// enough for any network to arrive.
+func deliveredNetworksFromRoutes(rules []option.Rule) map[string][]string {
+	delivered := make(map[string][]string)
+	unproven := make(map[string]bool)
+	for _, rule := range rules {
+		if rule.Type != C.RuleTypeDefault {
+			continue
+		}
+		action := rule.DefaultOptions
+		if action.Action != C.RuleActionTypeRoute {
+			continue
+		}
+		outboundTag := action.RouteOptions.Outbound
+		if outboundTag == "" {
+			continue
+		}
+		networks := decidedRouteNetworks(action.Network)
+		if len(networks) == 0 {
+			unproven[outboundTag] = true
+			continue
+		}
+		for _, network := range networks {
+			if !common.Contains(delivered[outboundTag], network) {
+				delivered[outboundTag] = append(delivered[outboundTag], network)
+			}
+		}
+	}
+	for tag := range unproven {
+		delete(delivered, tag)
+	}
+	return delivered
+}
+
+// decidedRouteNetworks keeps the networks a rule's condition names that the dry run can decide
+// about, in the order the configuration wrote them.
+//
+// icmp is dropped for the same reason the dry run ignores it everywhere: it is carried by a flow
+// port rather than dialled, so a rule matching it says nothing about a dialable network.
+func decidedRouteNetworks(networks []string) []string {
+	var decided []string
+	for _, network := range networks {
+		if network != physicalpath.NetworkTCP && network != physicalpath.NetworkUDP {
+			continue
+		}
+		if !common.Contains(decided, network) {
+			decided = append(decided, network)
+		}
+	}
+	return decided
+}
+
 // ensureURLTestServices supplies the URL-test services a Box needs, if the caller has not.
 //
 // # The two decisions are INDEPENDENT
@@ -414,6 +488,10 @@ func New(options Options) (*Box, error) {
 		},
 		common.PtrValueOrDefault(routeOptions.DefaultDomainResolver).Server != "",
 	)
+	// The other half of the dry run's input: what the ROUTES prove can reach a tag. Installing it
+	// separately keeps a Manager that was never given a route model behaving as it did before this
+	// fact existed - see EnablePhysicalPathDelivery.
+	outboundManager.EnablePhysicalPathDelivery(deliveredNetworksFromRoutes(routeOptions.Rules))
 	dnsTransportManager := dns.NewTransportManager(dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(certificateProviderRegistry)

@@ -52,6 +52,23 @@ type HopCheck struct {
 	// Current is true when this node is on the path the root resolves to RIGHT NOW, rather than
 	// one of the other reachable members.
 	Current bool
+	// Requirement is the network set this node was ACTUALLY checked against, which is the fact the
+	// report has to state: a node that was not required to carry anything was not failed for
+	// carrying nothing, and a reader who cannot tell those apart cannot tell a verified leaf from
+	// an undecided one.
+	//
+	// A nil slice means no network requirement applied at this node, for one of three reasons:
+	//
+	//   - the node is a DEPENDENCY (Position > 0). A dependency carries the consumer's own
+	//     transport, not the business flow, and which network that transport is - TCP for every
+	//     proxy protocol in this tree, UDP for the QUIC-based ones - is a fact about the consumer
+	//     that no object publishes before Start. Comparing the business network against it is the
+	//     mistake that refused a TCP-only hop under a UDP-over-TCP outbound.
+	//   - the node is below a group whose selection filters members by network before choosing one,
+	//     so an incapable member is never handed the flow.
+	//   - nothing proved which networks reach this root, and the root advertises none this package
+	//     can decide (see advertisedNetworks).
+	Requirement []string
 	// Unknowns are the problems found at this node. A node with unknowns was NOT verified, and it
 	// is never reported as reachable.
 	Unknowns []Unknown
@@ -142,19 +159,24 @@ func (r Report) Err() error {
 
 // ValidateRoots runs the reachable-leaf dry run over an explicit set of roots.
 //
-// networks is the set of networks every root must be able to serve; each node is checked against
-// the networks its own root advertises. An empty slice means TCP, which is the network every dial
-// path in this tree supports.
+// delivered is what the caller has PROVEN can reach these roots: the networks a routing rule with
+// an explicit network condition delivers, unioned over the rules that name the root. Each node is
+// checked against the part of that set that is a requirement FOR IT - see nodeRequirementFor.
+//
+// An empty or nil delivered means exactly that nothing was proven, and it is NOT read as "both
+// networks" or as "TCP". The requirement then falls back to what the root itself advertises,
+// computed from the reachable objects rather than from a group's own Network() - a selector
+// reports both networks while nothing is selected (protocol/group/selector.go), so its pre-Start
+// answer is a blanket rather than a capability, and treating it as a hard requirement refused
+// every selector whose members were all TCP-only.
 //
 // It dials nothing, resolves nothing, starts nothing, changes no selection and consumes no
 // rotation, and it takes NO selection preview either: whether a node is on the path the root
 // resolves to right now is decided by which members the groups DECLARED as their selection, so no
 // group's Selected() is called. See Hops and the package documentation.
-func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints EndpointRegistry, networks []string, declarations Declarations) (Report, error) {
+func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints EndpointRegistry, delivered []string, declarations Declarations) (Report, error) {
 	report := Report{}
-	if len(networks) == 0 {
-		networks = []string{NetworkTCP}
-	}
+	proven := decidedNetworks(delivered)
 	seenRoot := make(map[adapter.Outbound]bool)
 	for _, root := range roots {
 		if root == nil || seenRoot[root] {
@@ -166,17 +188,48 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 		if err != nil {
 			return Report{}, E.Cause(err, "enumerate reachable leaves of outbound/", root.Tag())
 		}
+		requirement := proven
+		if requirement == nil {
+			// Nothing was proven about delivery, so the requirement is what the root's own
+			// reachable objects say they can carry. Reading it from the NODES rather than from
+			// root.Network() is what keeps a group's pre-Start answer, which is a blanket, out of
+			// the decision.
+			requirement = advertisedNetworks(nodes)
+		}
+		// A group that picks its member BY NETWORK never hands a flow to a member that cannot carry
+		// it, so a network delivered to such a group is served by whichever member can carry it -
+		// and the group is unusable only when NO member can. Refusing every member that could not
+		// carry it would refuse a configuration protocol/group/loadbalance.go documents as the
+		// reason the union is advertised at all.
+		if hasNetworkFilteringGroup(resolver, nodes) {
+			for _, network := range requirement {
+				if anyNodeCarries(nodes, network) {
+					continue
+				}
+				report.Failures = append(report.Failures, Failure{
+					Root:  root.Tag(),
+					Leaf:  root.Tag(),
+					Route: root.Tag(),
+					Path:  root.Tag(),
+					Hop:   0,
+					Reason: "no reachable member carries " + network + ", and this group selects its " +
+						"member by network, so every " + network + " flow delivered here would be " +
+						"refused at run time",
+				})
+			}
+		}
 		for _, node := range nodes {
 			check := HopCheck{
-				Root:     node.Root,
-				Hop:      node.Tag,
-				Route:    node.Route(),
-				Path:     node.Path(),
-				Position: node.Position,
-				Exit:     node.Exit,
-				Current:  node.IsCurrent,
+				Root:        node.Root,
+				Hop:         node.Tag,
+				Route:       node.Route(),
+				Path:        node.Path(),
+				Position:    node.Position,
+				Exit:        node.Exit,
+				Current:     node.IsCurrent,
+				Requirement: nodeRequirementFor(resolver, node, requirement),
 			}
-			for _, failure := range validateNode(resolver, node, endpoints, networks, declarations) {
+			for _, failure := range validateNode(resolver, node, endpoints, check.Requirement, declarations) {
 				check.Unknowns = append(check.Unknowns, Unknown{
 					Node:     failure.Leaf,
 					Position: failure.Hop,
@@ -190,9 +243,147 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 	return report, nil
 }
 
+// nodeRequirementFor reports the networks THIS node has to be able to carry, and nil when nothing
+// is decided for it.
+//
+// # Why the requirement is not the same for every node of a route
+//
+// The flow the routing selected reaches the FIRST physical node. Every node after it is a
+// dependency of the node above, and a dependency is dialled to carry that consumer's own
+// connection - not the business flow - so its network requirement is a TRANSPORT requirement, and
+// the consumer's transport is not published by any object before Start. A dependency that carries
+// the business network is therefore accepted, and one that does not is left UNVERIFIED rather than
+// refused: UDP-over-TCP is a legal conversion and this is exactly the case it covers.
+func nodeRequirementFor(resolver *Resolver, hop PathNode, delivered []string) []string {
+	if hop.Position > 0 {
+		return nil
+	}
+	if hasNetworkFilteringGroup(resolver, []PathNode{hop}) {
+		return nil
+	}
+	return delivered
+}
+
+// hasNetworkFilteringGroup reports whether any group on these nodes' control paths filters its
+// members by network before choosing one.
+//
+// # Why the group objects are recovered by tag
+//
+// PathNode carries the control ROUTE as tags rather than the group objects, because the walk that
+// produced it is about the physical chain and the groups are not hops. The tags are enough: the
+// resolver's lookup is the same read-only registry lookup the enumeration itself used, so the
+// object recovered here is the object that declared the membership.
+func hasNetworkFilteringGroup(resolver *Resolver, nodes []PathNode) bool {
+	for _, node := range nodes {
+		for _, tag := range node.ControlPath {
+			object, loaded := resolver.Lookup(tag)
+			if !loaded {
+				continue
+			}
+			group, isGroup := object.(adapter.OutboundGroup)
+			if !isGroup {
+				continue
+			}
+			if networkFilteringGroup(group) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// networkFilteringGroup reports whether a group refuses a member that cannot carry the flow's
+// network, which is what makes a member with a narrower network set legal below it.
+//
+// # Why these two capabilities, and what is not detectable
+//
+// The property is per-network SELECTION, and the only observable statements of it in this tree are
+// the two interfaces whose implementations filter before choosing: a flow-aware group answers
+// SelectForFlow(.., network, ..), and a urltest group's Select skips a member whose Network() does
+// not contain the network. Both were checked against their implementations rather than assumed:
+// protocol/group/loadbalance.go filters in candidateCount/isCandidate, and protocol/group/urltest.go
+// filters at URLTestGroup.Select.
+//
+// A group that implements neither is treated as NOT filtering, which is the conservative direction
+// and the one that matches the contract every group already implements: Selected(network) may
+// return any member, and Selector.Selected does exactly that for every network
+// (protocol/group/selector_edge_test.go pins it). A third-party group that filters per network
+// without either interface is therefore checked as if it did not, which can refuse a member that
+// would in fact never be handed the flow - the same answer this package gave before the distinction
+// existed, so it adds no refusal.
+func networkFilteringGroup(group adapter.OutboundGroup) bool {
+	if _, flowAware := group.(adapter.FlowAwareOutboundGroup); flowAware {
+		return true
+	}
+	if _, measured := group.(adapter.URLTestGroup); measured {
+		return true
+	}
+	return false
+}
+
+// advertisedNetworks is what the reachable objects under one root say they can carry between them.
+//
+// It is the fallback requirement when nothing is proven about delivery, and it is deliberately
+// derived from the NODES rather than from root.Network(): a group's Network() before Start is the
+// group's own answer about a selection it has not made, and for a selector that answer is a
+// blanket covering both networks regardless of its members.
+//
+// Only the nodes the business flow can actually arrive at are counted - the ones at position 0.
+// A node further down the chain is a dependency, so its network set describes what it can serve as
+// a PROXY, not what the flow entering this root can be: a TCP-only middle hop under a UDP-carrying
+// outbound is the ordinary shape of UDP-over-TCP, and unioning its answer in would make the root
+// responsible for a network no flow reaches it with.
+func advertisedNetworks(nodes []PathNode) []string {
+	var advertised []string
+	for _, node := range nodes {
+		if node.Position > 0 {
+			continue
+		}
+		for _, network := range decidedNetworks(networksOf(node.Outbound)) {
+			if !slices.Contains(advertised, network) {
+				advertised = append(advertised, network)
+			}
+		}
+	}
+	return advertised
+}
+
+// anyNodeCarries reports whether any reachable node under a root can carry the network.
+func anyNodeCarries(nodes []PathNode, network string) bool {
+	for _, node := range nodes {
+		if slices.Contains(networksOf(node.Outbound), network) {
+			return true
+		}
+	}
+	return false
+}
+
+// decidedNetworks keeps the networks this dry run can decide about, in first-seen order.
+//
+// ICMP and any future network are carried by a flow port rather than dialled, so they are outside
+// what this dry run can decide. Ignoring them is the honest answer: inventing a requirement for
+// them would reject a legal configuration.
+func decidedNetworks(networks []string) []string {
+	var decided []string
+	for _, network := range networks {
+		if network != NetworkTCP && network != NetworkUDP {
+			continue
+		}
+		if slices.Contains(decided, network) {
+			continue
+		}
+		decided = append(decided, network)
+	}
+	return decided
+}
+
 // validateNode is the per-node contract. Every check below is decidable without the network, which
 // is what makes it legal to run before any traffic exists.
-func validateNode(resolver *Resolver, hop PathNode, endpoints EndpointRegistry, networks []string, declarations Declarations) []Failure {
+//
+// requirement is the set THIS node must be able to carry, as nodeRequirementFor decided it; an
+// empty set means no network requirement applies here and step 2 is skipped rather than passed
+// with a default.
+func validateNode(resolver *Resolver, hop PathNode, endpoints EndpointRegistry, requirement []string, declarations Declarations) []Failure {
 	failure := func(reason string) []Failure {
 		return []Failure{{
 			Root:   hop.Root,
@@ -210,23 +401,27 @@ func validateNode(resolver *Resolver, hop PathNode, endpoints EndpointRegistry, 
 		return failure("the group declares this member but no outbound or endpoint with this tag " +
 			"exists; the group would fail on the first switch to it")
 	}
-	networksCarried := networksOf(hop.Outbound)
 	// 2. The node can serve the networks required at its position.
 	//
-	//    The requirement is the ROOT's, which is what the flow at this entry point is. Checking
-	//    every node of a detour chain against it is not redundant: a middle hop that cannot carry
-	//    the flow makes the whole chain unusable even when the exit can.
-	for _, network := range networks {
-		if slices.Contains(networksCarried, network) {
-			continue
+	//    The requirement is the node's OWN - what the routes proved reaches this entry point, or,
+	//    when nothing was proven, what this root's reachable objects advertise between them. It is
+	//    never the union of every outbound in the configuration: an unrelated outbound that carries
+	//    UDP says nothing about what reaches this one, and treating it as if it did refused
+	//    configurations that had always started.
+	if len(requirement) > 0 {
+		networksCarried := networksOf(hop.Outbound)
+		for _, network := range requirement {
+			if slices.Contains(networksCarried, network) {
+				continue
+			}
+			if len(networksCarried) == 0 {
+				return failure("this outbound reports no network it can carry, so it cannot serve the " +
+					network + " flow routed through it")
+			}
+			return failure("this outbound carries " + strings.Join(networksCarried, ",") + " and cannot " +
+				"serve the " + network + " flow routed through it (the entry point routes " +
+				strings.Join(requirement, ",") + " to it)")
 		}
-		if len(networksCarried) == 0 {
-			return failure("this outbound reports no network it can carry, so it cannot serve the " +
-				network + " flow routed through it")
-		}
-		return failure("this outbound carries " + strings.Join(networksCarried, ",") + " and cannot " +
-			"serve the " + network + " flow routed through it (the entry point routes " +
-			strings.Join(networks, ",") + " to it)")
 	}
 	// 3. Endpoint participation and lifecycle ownership are coherent.
 	//
