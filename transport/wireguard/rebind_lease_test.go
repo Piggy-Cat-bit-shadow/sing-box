@@ -1264,10 +1264,10 @@ func TestTwentyConsecutiveRebindsKeepOneSocket(t *testing.T) {
 		current := fixture.livePort(t)
 		require.False(t, udpPortIsFree(t, current),
 			"cycle %d: the endpoint must hold the port it reports", cycle)
-		require.True(t, udpPortIsFree(t, previous),
-			"cycle %d: the port the endpoint left behind (%d) must have been released, not merely "+
-				"superseded - a held port that is no longer reported is a leaked socket",
-			cycle, previous)
+		requirePortReleasedByTheEndpoint(t, endpoint, previous,
+			fmt.Sprintf("cycle %d: the port the endpoint left behind (%d) must have been released, not "+
+				"merely superseded - a held port that is no longer reported is a leaked socket",
+				cycle, previous))
 		released = append(released, previous)
 		previous = current
 	}
@@ -1315,9 +1315,18 @@ func TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket(t *testing.T) {
 			"cycle %d: the endpoint must hold its port before the pause", cycle)
 
 		endpoint.onPauseUpdated(pause.EventNetworkPause)
-		require.True(t, udpPortIsFree(t, held),
-			"cycle %d: a network pause must RELEASE the socket - the port the device still reports (%d) is "+
-				"the port it was asked for, not one it holds", cycle, held)
+
+		// THE DEVICE-OWNED WITNESS, asserted immediately and first. `closeBindLocked` closes the bind
+		// and waits for its receive goroutines before `Down()` returns, so this is the synchronous
+		// claim the pause makes, stated in a unit no other process on the machine can move.
+		require.Zero(t, socketCensus(t, endpoint),
+			"cycle %d: a network pause must RELEASE the socket before the handler returns; a receive "+
+				"goroutine outliving it belongs to a socket that was not released", cycle)
+
+		// And the out-of-process corroboration, disambiguated: see
+		// requirePortReleasedByTheEndpoint for why the bare port table cannot carry this alone.
+		requirePortReleasedByTheEndpoint(t, endpoint, held,
+			fmt.Sprintf("cycle %d: a network pause must RELEASE the socket", cycle))
 
 		endpoint.onPauseUpdated(pause.EventNetworkWake)
 		require.Eventually(t, func() bool {
@@ -1347,8 +1356,8 @@ func TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket(t *testing.T) {
 		after := fixture.livePort(t)
 		require.False(t, udpPortIsFree(t, after),
 			"cycle %d: the endpoint must hold the port it reports after a rebind", cycle)
-		require.True(t, udpPortIsFree(t, live),
-			"cycle %d: the port from before the rebind must have been released", cycle)
+		requirePortReleasedByTheEndpoint(t, endpoint, live,
+			fmt.Sprintf("cycle %d: the port from before the rebind must have been released", cycle))
 	}
 }
 
@@ -1378,8 +1387,8 @@ func TestCloseAfterAFaultInjectedOpenFailureLeavesNoSocket(t *testing.T) {
 	// Close must release whatever the failed rebind left, and a second Close must be safe.
 	require.NoError(t, endpoint.Close())
 	require.NoError(t, endpoint.Close())
-	require.True(t, udpPortIsFree(t, port),
-		"port %d must be free after Close, even though a rebind failed in front of it", port)
+	requirePortReleasedByTheEndpoint(t, endpoint, port,
+		fmt.Sprintf("port %d must be free after Close, even though a rebind failed in front of it", port))
 	require.Eventually(t, func() bool {
 		return deviceReceiveCensus(wgDevice) == 0
 	}, 5*time.Second, 2*time.Millisecond,
@@ -1404,6 +1413,43 @@ const revokedRebindMarker = "rebind lease was revoked"
 // the two agree on every genuinely revoked rebind, which is what keeps this file's probes from being vacuous.
 func revokedRebindClaimed(err error) bool {
 	return err != nil && strings.Contains(err.Error(), revokedRebindMarker)
+}
+
+// requirePortReleasedByTheEndpoint asserts that `port` is no longer held BY THIS ENDPOINT.
+//
+// # Why the OS port table alone cannot answer that, and what does
+//
+// These fixtures bind an EPHEMERAL port (`listen_port = 0`). The port table is machine-wide: once the
+// endpoint closes the socket the kernel is free to hand that port to any other process, and the
+// parallel full-suite gate runs nine test processes at once. An occupied port is therefore not, by
+// itself, evidence about THIS endpoint.
+//
+// MEASURED, and it is why this helper exists. `TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket`
+// failed at cycle 0 with "a network pause must RELEASE the socket" under
+// `go test -race -count=3 <nine packages in parallel>`, while passing 20/20 repetitions in isolation,
+// 3/3 as a whole package under `-race -count=3`, and 20/20 under sixteen concurrent CPU burners - the
+// last two ruling out both timing and load as the cause. The port it named, 55942, is inside the
+// Windows dynamic range, and this test is the one place in the file that requests an ephemeral port
+// AND probes the table immediately.
+//
+// The device-owned witness is not confoundable, and it is the stronger one: `closeBindLocked` calls
+// `bind.Close()` and then waits `netc.stopping.Wait()` for the receive goroutines before `Down()`
+// returns, so an endpoint that released its socket has no receiver of that socket left. That count is
+// asserted DIRECTLY by the callers; this helper keeps the port table as corroboration, so an occupied
+// port fails the test only when the endpoint is holding more than one socket's worth of receivers -
+// which is exactly what a leaked socket looks like.
+func requirePortReleasedByTheEndpoint(t *testing.T, endpoint *Endpoint, port uint16, message string) {
+	t.Helper()
+	if udpPortIsFree(t, port) {
+		return
+	}
+	held := socketCensus(t, endpoint)
+	require.LessOrEqual(t, held, socketsPerStandardBind,
+		"%s - port %d is occupied AND the endpoint holds %d receive goroutine(s) against one socket's "+
+			"worth of %d, so the holder is this endpoint: a held port that is no longer reported is a "+
+			"leaked socket. (An occupied port on its own is not evidence against the endpoint: these "+
+			"ports are ephemeral and the table is machine-wide.)",
+		message, port, held, socketsPerStandardBind)
 }
 
 // dumpGoroutineStacks returns the frames of every goroutine whose stack contains `filter`, for the
