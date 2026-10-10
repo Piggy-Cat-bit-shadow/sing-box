@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,34 @@ import (
 	"github.com/sagernet/sing/common/buf"
 	"github.com/stretchr/testify/require"
 )
+
+// sniffGoroutines counts the goroutines whose stack names this package, which is what a leak check on
+// a sniff is about.
+//
+// # Why not runtime.NumGoroutine()
+//
+// Both lifecycle tests below compare a goroutine count taken before a 64-iteration loop against the
+// same count afterwards, and they used the PROCESS-GLOBAL number. That number is moved by everything
+// else in the test binary: this package runs 93 tests in one process, several of them complete real
+// TLS handshakes, and a previous repetition's goroutines can still be running when the next one
+// starts. MEASURED: the assertion at the cancelled-context test fails roughly once per ten
+// `-count=10` iterations and once in a full `./common/sniff/` run, while the same test passes on its
+// own - i.e. a leak reported in a test that did not leak, caused by the tests around it.
+//
+// Counting the stacks that name this package keeps the property the tests exist for - PeekStream must
+// not leave a goroutine behind - and drops the dependence on what the rest of the process is doing. A
+// goroutine that this package leaked still names it, wherever it is blocked.
+func sniffGoroutines() int {
+	stacks := make([]byte, 1<<20)
+	read := runtime.Stack(stacks, true)
+	count := 0
+	for _, stack := range strings.Split(string(stacks[:read]), "\n\n") {
+		if strings.Contains(stack, "sing-box/common/sniff") {
+			count++
+		}
+	}
+	return count
+}
 
 // peekStreamChunks drives PeekStream over an in-memory connection that hands back the given chunks
 // one per read, using the production stream plan, and reports what the sniffers decided.
@@ -216,7 +245,7 @@ func TestPeekStreamDeadlineIsCleared(t *testing.T) {
 // TestPeekStreamDoesNotOutliveItsDeadline checks the lifecycle claim that matters on a mobile
 // device: a sniff that cannot be satisfied still ends and leaves no goroutine behind.
 func TestPeekStreamDoesNotOutliveItsDeadline(t *testing.T) {
-	before := runtime.NumGoroutine()
+	before := sniffGoroutines()
 	metadata := adapter.InboundContext{}
 	start := time.Now()
 	for i := 0; i < 64; i++ {
@@ -229,7 +258,7 @@ func TestPeekStreamDoesNotOutliveItsDeadline(t *testing.T) {
 		require.ErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return runtime.NumGoroutine() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
+	require.Never(t, func() bool { return sniffGoroutines() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
 }
 
 // TestPeekStreamUnknownPayloadSweepsEverySniffer pins the full-sweep path: a payload nothing claims
@@ -273,7 +302,7 @@ func TestPeekStreamDefaultTimeoutIsNotShortened(t *testing.T) {
 // read is served without blocking and the answer is the same one an uncancelled context gets; the
 // deadline set once at the start of the call is what bounds a sniffer that would otherwise wait.
 func TestPeekStreamCancelledContextStillTerminates(t *testing.T) {
-	before := runtime.NumGoroutine()
+	before := sniffGoroutines()
 	hello := captureClientHello(t, &tls.Config{ServerName: "www.example.com"})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -292,5 +321,5 @@ func TestPeekStreamCancelledContextStillTerminates(t *testing.T) {
 		require.NotErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return runtime.NumGoroutine() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
+	require.Never(t, func() bool { return sniffGoroutines() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
 }
