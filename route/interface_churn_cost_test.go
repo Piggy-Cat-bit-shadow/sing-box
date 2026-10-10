@@ -154,6 +154,30 @@ func waitForTransitionStable(manager *NetworkManager, timeout time.Duration) boo
 	return manager.NetworkTransitionStable()
 }
 
+// routePackageFrame is this package's import path followed by the dot that separates it from the
+// identifier in a stack frame - `github.com/sagernet/sing-box/route.(*NetworkManager).updateInterface`.
+//
+// # Why the trailing dot is load-bearing, and it is not cosmetic
+//
+// A bare `sing-box/route` substring also matches the SUBPACKAGE `github.com/sagernet/sing-box/route/rule`,
+// whose frames read `.../route/rule.Check(...)`. MEASURED with the predicate below and a synthetic
+// stack block holding that frame: the bare substring returned true and this constant returns false.
+// A goroutine owned by route/rule would therefore have been counted as this package's, and a leak
+// check that another package can move is a leak check that can report a leak in code that did not
+// leak - the exact failure mode section 10.10 had to repair in `common/sniff`, and the reason this
+// constant exists rather than a prefix test. The external test package `route_test` is excluded by
+// the same dot, and every test file in this directory is `package route`, so the closure that takes
+// the census is itself still counted - which is what routeGoroutinesFromClosure's correction assumes.
+const routePackageFrame = "github.com/sagernet/sing-box/route."
+
+// routeStackBlockCounts reports whether one goroutine's stack block belongs to this package.
+//
+// It is a named function rather than an inline condition so the scope claim above is testable: see
+// TestTheCensusPredicateExcludesTheRouteRuleSubpackage.
+func routeStackBlockCounts(block string) bool {
+	return strings.Contains(block, routePackageFrame)
+}
+
 // routeGoroutines counts the goroutines whose STACK names this package, rather than every goroutine in
 // the process.
 //
@@ -167,13 +191,15 @@ func waitForTransitionStable(manager *NetworkManager, timeout time.Duration) boo
 //
 // A goroutine started BY this package but currently executing inside a dependency would not match, and
 // that is the conservative direction: it under-counts, so it cannot invent an accumulation that is not
-// there. The counts it does see are exact.
+// there. The counts it does see are exact - and the SCOPE is exact too, which is what routePackageFrame
+// is for: "no other package can move it" was true of the package and false of the subpackage until the
+// predicate carried the frame boundary.
 func routeGoroutines() int {
 	buffer := make([]byte, 1<<20)
 	read := runtime.Stack(buffer, true)
 	count := 0
 	for _, block := range strings.Split(string(buffer[:read]), "\n\n") {
-		if strings.Contains(block, "sing-box/route") {
+		if routeStackBlockCounts(block) {
 			count++
 		}
 	}
