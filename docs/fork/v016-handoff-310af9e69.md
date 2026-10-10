@@ -403,3 +403,54 @@ RELEASE                        = NOT_READY
 run the preflight before every push; never write `C:\src\sing-box`; no dependency or `go.mod` change;
 never trigger Actions; and **a reverse-break whose RED is a compile error is not evidence** — that
 mistake was made twice this round and both attempts had to be thrown away.
+
+---
+
+# 8. P2/P3 INTEGRATION STATUS — read this before starting
+
+Both subagent fixes were rescued onto the tip. **The branch is green except for the PATH-01
+detectors.**
+
+```text
+P2  selector          LANDED   35246a212 -> 96e6dc41   protocol/group, route, root all green
+P3  StatusView        LANDED   798c57eb -> 03995f6da   D's 14 tests green, also under -race -count=3
+```
+
+`common/physicalpath` currently fails 13 tests, and they are ALL the PATH-01 specification — verified
+under `-race`: **zero `WARNING: DATA RACE`**, 13 `--- FAIL`, every name in §2.5. Do not read that FAIL
+as a new regression.
+
+## What P3 changed, and the two guards whoever wires it up must not break
+
+- **A nil `*StatusView` is now a LEGAL VALUE** answering UNKNOWN with a reason (`absentStatus`),
+  `Connected()==false`, `Disconnect()` a no-op. Chosen over a refusal because the file's own policy is
+  that a diagnostic must not crash on the graph it describes, and over an empty `PathStatus` because an
+  empty answer has no unknowns and reads as "walked and clean". The typed-nil path (a nil receiver
+  behind a non-nil interface) is covered by the same contract and tested explicitly.
+- **The `walk sync.Mutex` was REMOVED, not shrunk.** It protected nothing this package owns: `Resolver`
+  is written only in `NewResolver` and in `configure`, which copies; the per-walk state lives in a
+  stack value. It was held across calls to external reporter methods, and a reporter that calls back
+  into the view **self-deadlocked** — shown with real runtime stacks. Measured cost of the lock:
+  parallel snapshots went from 4409–5032 ns/op to 954–1214 ns/op, a ~4x serialisation.
+  **If anyone re-adds per-walk state to `Resolver`, a lock has to come back WITH a measurement, and
+  these two tests are the tripwire:** `TestAReentrantReporterDoesNotDeadlockTheView`,
+  `TestOneViewsSnapshotsDoNotSerialiseBehindEachOther`.
+- **The `Disconnect` rule has three clauses** and only the first was implemented before: `Disconnect`
+  publishes and returns without waiting; a snapshot reads the generation BEFORE and AFTER observing and
+  both must find it connected; a call starting after `Disconnect` returned reports disconnected, and an
+  observation that STRADDLED the teardown is discarded rather than published. The real hole was the
+  second half — a walk past the pre-check could read hops from a dismantled graph.
+- **A panicking reporter fails UNKNOWN, not silent READY**, with the half-read claim/error/generation
+  fields discarded so a hop that claimed Ready then panicked cannot be reported ready. The panic value
+  is rendered outside the recover frame and redacted.
+- **Three real redaction leaks were found BY A RED TEST, not by reading**: `{"password":"hunter2"}`,
+  `password="hunter2"`, and `access_token=`/`db_password=` (because `_` was treated as a word
+  character). Fixing the last one naively would have introduced a NEW leak — with `_` allowed,
+  `X_Authorization: Bearer sk-...` falls to the keyword path, which stops at the first space and would
+  have redacted "Bearer" and kept the token — so both matchers now share one boundary rule.
+
+Allocation claim, independently re-measured on the integrated tree: **1200 B/op, 9 allocs/op**, both
+before and after — the containment, the generation re-read and the nil contract added zero allocations.
+
+**Still not wired**: `StatusView` is referenced only by its own tests; `box.go` does not construct one.
+Whoever wires it should rely on the nil contract and must not re-introduce the lock.
