@@ -184,6 +184,40 @@ could not be pinned further because an isolated replica of the same scenario pas
 load - the trigger needs the full-package loaded run - and it was deliberately NOT guess-fixed.
 `common/power` did not reproduce and is recorded as a maintenance note, not a bug.
 
+## 5.1 The final serial sweep, and the one name that appeared
+
+`go test -p 1 ./...` at the code candidate, 12 minutes, **REACHED_MODULE_END** - which the baseline
+could never do, because `transport/http` hung for 90 minutes there.
+
+```text
+REMOVED from the failure list by this round:
+  common/urltest            ok 7.259s    (was FAIL, 4-6 varying cases)
+  experimental/clashapi     ok 0.684s    (was FAIL 2/2; fixed by the urltest change alone)
+  experimental/libbox       ok 0.346s    (was FAIL)
+  transport/http            ok 16.6s     (was HUNG 5400.042s at the baseline)
+  protocol/shadowtls        ok 0.022s    (was FAIL)
+
+REMAINING, all BLOCKED_ENV, identical case names at both SHAs:
+  common/tls                3 cases   Schannel has no TLS-1.3-over-TCP on this host
+  common/tlsspoof           3 cases   WinDivert -> SCM access denied, session not elevated
+  common/windivert          5 cases   same precondition; 19 non-driver tests pass
+```
+
+`e2e`'s `TestRejectReplyCode` is the ONE name that appears in the final sweep and in no earlier list,
+so it is attributed here rather than left as a loose end. MEASURED:
+
+```text
+final SHA, full e2e package, serial, 3 runs   ok / FAIL / ok       <- 1 of 3
+final SHA, TestRejectReplyCode alone, 5 runs  ok ok ok ok ok        <- 5 of 5
+round BASE bc7456db, same command, 4 runs     ok ok FAIL ok        <- 1 of 4
+```
+
+It is therefore **PRE-EXISTING and load-sensitive**, not a regression from this round: it fails in the
+full package at the base with none of this round's changes present, and it passes in isolation every
+time. It is the same class as `common/dialer`'s deadline-bound test - a suite whose fixtures interact
+under a full-package run - and it is recorded rather than "fixed" by widening a bound, because the
+assertion is not what is wrong.
+
 ## 6. Preserved and NOT re-done
 
 The two earlier P0s (the original hop-direction reversal and the global network-union false
@@ -223,6 +257,11 @@ MTU_PATH_BUDGET                 = PARTIAL  (WG measured; HY2 ChromeParrot BLOCKE
 H3_FALLBACK                     = READY    (both memories fixed and re-run)
 PER_HOP_STATUS                  = READY    (read-only, no new timers or goroutines)
 COPY_PATH                       = MEASURED (COPY-01 audited with allocation numbers; no invented knob)
+FULL_TEST_COVERAGE              = REACHED_MODULE_END
+FULL_TEST_RESULT                = COMPLETED_WITH_FAILURES (3 BLOCKED_ENV suites)
+FULL_TEST_SHA_MATCH             = IDENTICAL_CODE_TREE_DOCUMENT_ONLY_TIP
+                                  (proven: git diff <tested>..<tip> -- '*.go' 'go.mod' 'go.sum'
+                                   is EMPTY; the only added path is one docs/ file)
 CI                              = NOT_RUN_BY_REQUEST
 RELEASE                         = NOT_READY
 ```
