@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -89,6 +91,26 @@ func TestTrafficFailureForcesAHealthRecheck(t *testing.T) {
 // TestRecheckSingleFlightCollapsesABurst is §5.
 //
 // Many concurrent traffic failures must not create many recheck goroutines.
+//
+// # What this test used to count, and why it could not fail
+//
+// It asserted on `recheckRuns`, the number of forced ROUNDS, and its own comment said that counting
+// probes "would pass either way: the health function's own `checking` guard already collapses
+// concurrent measurements, so a per-failure goroutine also produces one probe. What that design
+// produces is one short-lived goroutine per failure, which is what this pins."
+//
+// The comment rejected one insensitive instrument and adopted another of the same kind. MEASURED by an
+// independent adversary with the single-flight guard deleted from `requestHealthRecheck`
+// (`if g.recheckWorker` -> `if false && g.recheckWorker`; `go vet` exit 0 first): this test and its
+// handoff sibling BOTH PASSED, because a SECOND, downstream guard - the round's own `checking` flag -
+// still collapses the rounds. The property in the name was the goroutine count, and the assertion
+// could not see it.
+//
+// The census below counts the thing the name is about: the goroutines actually executing
+// `(*URLTestGroup).drainHealthRechecks`, which is the worker the guard exists to single-flight. It is
+// exact rather than sampled, because `requestHealthRecheck` starts its worker and RETURNS - there is
+// no inline path - so with the guard at most one such goroutine exists, and without it one exists per
+// request.
 func TestRecheckSingleFlightCollapsesABurst(t *testing.T) {
 	// The probe blocks, so the recheck stays in flight while the burst arrives.
 	release := make(chan struct{})
@@ -111,16 +133,39 @@ func TestRecheckSingleFlightCollapsesABurst(t *testing.T) {
 	close(start)
 	waitGroup.Wait()
 
-	// Let the in-flight rounds finish.
+	// THE DETERMINISTIC WINDOW. Every requester has returned and the probe is still blocking, so every
+	// worker that was started is parked inside `drainHealthRechecks` right now - no sampling, no peak
+	// tracking, and no dependence on how fast the machine is.
+	require.Eventually(t, func() bool { return recheckWorkers() >= 1 },
+		3*time.Second, 5*time.Millisecond,
+		"no drain worker was started at all, so there is nothing here under test")
+
+	// 2 and not 1: a worker that finds new debt retired while it ran hands the tail to a REPLACEMENT it
+	// starts from inside its own frame, so the retiring and the replacement worker coexist for an
+	// instant. The number that indicates the defect is `burst`, so the gap between 2 and 100 is the
+	// whole margin this assertion needs.
+	require.LessOrEqual(t, recheckWorkers(), 2,
+		"%d concurrent traffic failures started %d recheck workers; the single-flight guard must "+
+			"collapse them into at most one worker (plus an instant of handoff). A worker per failure is "+
+			"the goroutine storm the guard exists to prevent", burst, recheckWorkers())
+
+	// Let the in-flight round finish, then wait for the worker to go IDLE before reading the round
+	// count: the previous version read it as soon as one probe had been observed, so it compared a
+	// mid-drain snapshot against a final bound. Its own handoff sibling already waits for the worker,
+	// and the adversary measured the mutated product reporting 12 and then 3 against a bound of 2 -
+	// discriminating in value, read before the value existed.
 	close(release)
 	require.Eventually(t, func() bool { return node.probes.Load() >= 1 },
 		3*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool {
+		group.recheckAccess.Lock()
+		defer group.recheckAccess.Unlock()
+		return !group.recheckWorker
+	}, 3*time.Second, 5*time.Millisecond, "the recheck worker must finish before its count is read")
 
-	// The assertion is on ROUNDS, not probes.
-	//
-	// Counting probes would pass either way: the health function's own `checking` guard already
-	// collapses concurrent measurements, so a per-failure goroutine also produces one probe. What
-	// that design produces is one short-lived goroutine per failure, which is what this pins.
+	// The round count is kept as a SECOND, weaker signal: it is what the coalescing contract is about,
+	// and it would catch a design that served the burst sequentially. It is not the load-bearing
+	// assertion any more - the census above is.
 	//
 	// The bound is 2, not 1, and that is the coalescing contract working: one round was already
 	// running when the burst arrived, and the burst is owed exactly ONE further forced round. The
@@ -132,6 +177,30 @@ func TestRecheckSingleFlightCollapsesABurst(t *testing.T) {
 
 	require.GreaterOrEqual(t, node.probes.Load(), int32(1),
 		"and the burst must actually cause a probe")
+}
+
+// recheckWorkers counts the goroutines currently executing this package's recheck worker.
+//
+// # Why the frame and not a counter
+//
+// A counter would have to live in production and be incremented on a goroutine start - test-visible
+// state added to the thing under test, which is the shape this repository avoids. The stack already
+// carries the fact, and it carries it for exactly the function the single-flight guard protects.
+//
+// It is called from `require.Eventually`, so it runs on testify's goroutine; that goroutine's frames
+// belong to testify, not to this package, so unlike the churn census in `route` this predicate cannot
+// count its own caller. It also cannot see a worker currently executing inside a dependency - an
+// under-count, the conservative direction, and one that cannot invent a storm that is not there.
+func recheckWorkers() int {
+	buffer := make([]byte, 1<<20)
+	read := runtime.Stack(buffer, true)
+	count := 0
+	for _, block := range strings.Split(string(buffer[:read]), "\n\n") {
+		if strings.Contains(block, "(*URLTestGroup).drainHealthRechecks") {
+			count++
+		}
+	}
+	return count
 }
 
 // blockingRecheckOutbound blocks its probe until released, so a recheck stays in flight.

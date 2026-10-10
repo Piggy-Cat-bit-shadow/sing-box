@@ -119,6 +119,20 @@ func TestStateStringsCoverEveryState(t *testing.T) {
 // A DEEP_IDLE notification that is delivered after traffic has already moved the governor on is the
 // dangerous one: acting on it would release a pool that is about to be used. The state delivered must
 // therefore be the CURRENT one, not the one that scheduled the flush.
+//
+// # The assertion this file used to be missing
+//
+// This test previously drained the observer channel in a loop whose every branch either `continue`d or
+// fell to `default: return` - there was NO assertion inside it - and its only real check was
+// `governor.State() == StateQuiescent`, which is the different property "traffic leaves deep idle" and
+// is already covered by `TestDeepIdleCanBeReenteredAfterTraffic`. MEASURED by an independent adversary
+// with the governor mutated to deliver the REMEMBERED deep-idle state instead of the current one
+// (`go vet` exit 0 first): this test still PASSED, while a detector that read the last delivered state
+// went RED with `last state delivered to the observer: deep-idle; governor state now: quiescent`.
+//
+// So the property in this test's NAME was unfalsifiable, before the DeepIdleAfter widening and after
+// it. The fix is to assert the property: the last state an observer was told about must not be one the
+// governor has already left.
 func TestCoalescedNotificationsNeverReportAStateThatIsOver(t *testing.T) {
 	// A deadline long enough that the state cannot legitimately move on by itself during the test: the
 	// question here is what a coalesced notification REPORTS, not how fast the machine is.
@@ -147,15 +161,36 @@ func TestCoalescedNotificationsNeverReportAStateThatIsOver(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	require.Equal(t, StateQuiescent, governor.State(),
 		"the governor stayed deep idle after traffic arrived")
+
+	// Drain until the channel has been quiet for a moment, so "the last notification" is the last one
+	// the observer will actually receive rather than whichever one a single non-blocking read saw.
+	//
+	// The quiet window is deliberately small against the re-armed DeepIdleAfter above (600ms): the
+	// whole drain is bounded well inside it, so the governor cannot legitimately move on while this
+	// runs, and the assertion below therefore compares two facts about the same instant. That bound is
+	// a property of the DRAIN, not a widened assertion - nothing here accepts an older state.
+	var last State
+	sawAny := false
+	quietSince := time.Now()
 	for {
 		select {
 		case state := <-delivered:
-			if state == StateDeepIdle && governor.State() != StateDeepIdle {
-				// Allowed only if a QUIESCENT notification follows it; the observer re-checks anyway.
-				continue
-			}
+			last = state
+			sawAny = true
+			quietSince = time.Now()
+			continue
 		default:
-			return
 		}
+		if time.Since(quietSince) > 30*time.Millisecond {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
+
+	require.True(t, sawAny, "no state was delivered to the observer at all, so this test proves nothing")
+	require.False(t, last == StateDeepIdle && governor.State() != StateDeepIdle,
+		"the LAST state delivered to the observer was %s while the governor is %s: a coalesced "+
+			"notification reported a state that is OVER, and an observer acting on it would release a "+
+			"pool that is about to be used. The delivered state must be the current one, not the one "+
+			"that scheduled the flush", last, governor.State())
 }
