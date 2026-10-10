@@ -173,6 +173,65 @@ func TestTheReportedStateIsTheOwnersOwn(t *testing.T) {
 	require.True(t, status.Ready(), "a single ready hop is a ready path")
 }
 
+// TestTheFIRSTFailingHopInPacketOrderIsTheOneReported closes a gap a mutation found.
+//
+// Reversing `firstFailure`'s loop to report the LAST failing hop left every other test passing, because
+// each of them had exactly ONE failing hop - so "first" and "last" were the same hop and no assertion
+// could tell them apart. That is the shape of a test that documents a rule without enforcing it.
+//
+// The rule is not cosmetic: packet order is CAUSAL order. A packet reaches hop 0 before hop 1, so when
+// both report an error the later one is a consequence - a stale error kept from an earlier attempt, or a
+// failure that only happened because the first hop was already broken. Reporting it would name a symptom
+// as the cause and send an operator to the wrong node.
+func TestTheFIRSTFailingHopInPacketOrderIsTheOneReported(t *testing.T) {
+	// A chain of three: entry.detour = middle, middle.detour = exit. The direction itself is read from
+	// the model by the test above; here the fixture only has to be a chain of three hops.
+	exit := &reportingLeaf{
+		testLeaf:     *dualLeaf("exit"),
+		reportsState: true,
+		state:        LifecycleStateReady,
+		reportsError: true,
+		lastError:    errors.New("exit hop: dial timeout"),
+		errorPhase:   PhaseConnect,
+	}
+	middle := &reportingLeaf{
+		testLeaf:     *dualLeaf("middle", "exit"),
+		reportsState: true,
+		state:        LifecycleStateReady,
+		reportsError: true,
+		lastError:    errors.New("middle hop: no route to host"),
+		errorPhase:   PhaseTunnel,
+	}
+	entry := &reportingLeaf{testLeaf: *dualLeaf("entry", "middle"), reportsState: true, state: LifecycleStateReady}
+	registry := newReportingRegistry(exit, middle, entry)
+
+	status := NewStatusView().SnapshotStatus(registry.resolver(),
+		TagOrOutbound{Tag: "entry"}, Options{Network: N.NetworkTCP})
+
+	// Both hops must actually be failing, or the test proves nothing about which one is chosen.
+	failing := make([]string, 0, 2)
+	for _, hop := range status.Hops {
+		if hop.Readiness == ReadinessFailed {
+			failing = append(failing, hop.Tag)
+		}
+	}
+	require.Len(t, failing, 2,
+		"this fixture must have TWO failing hops, or 'first' and 'last' are indistinguishable and "+
+			"the assertions below are vacuous; it found %v", failing)
+
+	require.NotNil(t, status.Failure)
+	require.Equal(t, status.Hops[0].Tag, status.Failure.Hop,
+		"the FIRST failing hop in packet order must be reported: it is the cause, and the one after "+
+			"it is a consequence")
+	require.Equal(t, 0, status.Failure.Position)
+	require.Equal(t, PhaseConnect, status.Failure.Phase,
+		"and the phase must be the first hop's, not the second's")
+	require.Contains(t, status.Failure.Detail, "exit hop",
+		"and the detail must be the first hop's error")
+	require.Empty(t, status.Failure.Reached, "nothing precedes the first hop")
+	require.Len(t, status.Failure.Unreached, 2)
+}
+
 // TestARecordedFailureBeatsASelfDeclaredState is the precedence rule: evidence wins over a claim.
 func TestARecordedFailureBeatsASelfDeclaredState(t *testing.T) {
 	leaf := &reportingLeaf{
