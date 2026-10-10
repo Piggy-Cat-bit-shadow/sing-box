@@ -184,15 +184,18 @@ func TestTheBudgetTable(t *testing.T) {
 		{
 			name: "a nested WireGuard at its default inside a 1280-byte tunnel", tunnelMTU: 1408,
 			outerLinkMTU: 1280, outerV6: false, wantFits: false,
-			comment: "1408 + 32 + 28 = 1468 > 1280: the code PERMITS this nesting (a peer endpoint " +
-				"may itself be reached through a detour - protocol/wireguard wires one), and nothing " +
-				"sizes the inner tunnel against the outer one",
+			comment: "1408 + 32 + 28 = 1468 > 1280: the UNDERLAY here is an operator's physical path, " +
+				"which this endpoint cannot see and does not size against. The nesting this code CAN " +
+				"see is a `detour` naming a fixed-capacity tunnel, and that one is now bounded - see " +
+				"nested_mtu_test.go. The row stays as the honest statement that a tunnel MTU is not a " +
+				"physical link MTU",
 		},
 		{
 			name: "a nested WireGuard sized for a 1280-byte tunnel", tunnelMTU: 1220,
 			outerLinkMTU: 1280, outerV6: false, wantFits: true,
-			comment: "1220 + 32 + 28 = 1280 <= 1280: what the operator has to work out by hand, and " +
-				"the reason the note below asks for a derivation rather than a constant",
+			comment: "1220 + 32 + 28 = 1280 <= 1280: this is now what the code derives by itself when " +
+				"the outer tunnel is a `detour` it can ask - 1280 - 48 - 32 = 1200 for an IPv6 outer, " +
+				"and the operator's own value wins when it is already smaller",
 		},
 		{
 			name: "a tunnel at the IPv6 minimum over an ordinary underlay", tunnelMTU: 1280,
