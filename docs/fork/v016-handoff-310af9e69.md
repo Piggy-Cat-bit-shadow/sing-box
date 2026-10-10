@@ -312,7 +312,7 @@ file, so check there before redoing P4. Owns `protocol/group/selector.go` and
 | `common/dialer` 30s deadline | `common/dialer/dual_stack_scheduler.go`, `resolve.go` | `TestLiteralBothFailReturnsPromptly` returned at **exactly** the caller's 30s deadline under package load while both attempts fail within 5ms — consistent with a lost completion signal. Two suspect arms: `dual_stack_scheduler.go:320-323` and `resolve.go:596-601` |
 | `common/tls` 3 cases | `common/tls/windows_client_test.go` | `BLOCKED_EXTERNAL`: this host's Schannel has no TLS-1.3-over-TCP (Windows 10 19044). Only the three tests that pin `MinVersion/MaxVersion = TLS13` fail; every other Windows TLS test passes |
 | `common/tlsspoof`, `common/windivert` | — | `BLOCKED_EXTERNAL`: `windivert: open SCM: Access is denied`, session not elevated. All 19 non-driver windivert tests pass |
-| the seven-layer fault tree | — | D4 DNS/FakeIP, D6 MTU/fragment, D7 stop/reconnect/platform were not walked this round |
+| the seven-layer fault tree | — | D4 DNS/FakeIP, D6 MTU/fragment, D7 stop/reconnect/platform were not walked this round — **CLOSED by §13, which walked all three** |
 | a fresh serial full scan | — | must be run at whatever SHA you finish on; record `FULL_TEST_COVERAGE` / `FULL_TEST_RESULT` / `FULL_TEST_SHA_MATCH` as three separate fields |
 
 ---
@@ -851,6 +851,8 @@ raised out of the noise band too: 150->400ms, 100->300ms). No assertion is weake
    pins (announce "established", then refuse) is still a product decision owned by `protocol/**`.
 6. **The seven-layer fault tree** (D4 DNS/FakeIP, D6 MTU/fragment, D7 stop/reconnect/platform) is still
    not walked (§4), and `common/tls`, `common/tlsspoof`, `common/windivert` remain BLOCKED_EXTERNAL.
+   -> SUPERSEDED by §13: D4, D6 and D7 were all walked, two of the three produced a CONFIRMED_BUG that is
+      fixed, and the three BLOCKED_EXTERNAL packages are unchanged.
 
 ## 10.12 The worktrees this round left behind, and what is in them
 
@@ -890,6 +892,7 @@ CROSS_PLATFORM                 = PASS_WITH_SCOPE  (unchanged this round)
 FULL_TEST_COVERAGE             = 83 packages
 FULL_TEST_RESULT               = 79 ok / 4 FAIL, all four accounted for (1 spec + 3 BLOCKED_EXTERNAL)
                                  -> SUPERSEDED by §12: 80 ok / 3 FAIL at a39cecf87, the spec failure gone
+                                 -> and CONFIRMED by §13: 80 ok / 3 FAIL at 0c3f48fac, same 11 test names
 FULL_TEST_SHA_MATCH            = YES
 CI                             = NOT_RUN_BY_REQUEST   (no Actions event was ever triggered)
 RELEASE                        = NOT_READY        (blocked on the product decisions in §6 and the
@@ -1025,5 +1028,262 @@ it stood.
 
 The instinct that was right: leave both detectors alone. The instinct that was wrong: treat "I cannot
 satisfy both" as "both are wrong", when the correct move was to check what the harness was measuring.
+
+---
+
+# 13. The seven-layer fault tree walked: D4, D6, D7 (`0c3f48fac`)
+
+§4 and §10.11 both ended with the same open item: D4 (DNS/FakeIP/Route), D6 (MTU/Fragment/Network
+Change) and D7 (stop/reconnect/power/cross-platform) had never been walked. This section walks them. Each
+layer was attacked along the order's three dimensions — LEGAL_POSITIVE, INVALID_NEGATIVE,
+LIFECYCLE_INTERLEAVE — by an investigator working in its own worktree, and every finding below was
+re-measured by the integrator before a line was changed.
+
+```text
+ORIGIN_TESTING = 0c3f48fac   LOCAL == ORIGIN
+COMMITS THIS ROUND, all [skip ci]:
+  a39cecf87  test(physicalpath): the reference was segmented by position arithmetic (§12)
+  244a70049  docs(fork): §12
+  b36f5cdb5  fix(wireguard): a nested MTU's refusal must not tell the operator to raise a number the
+             clamp owns                                                       <- D6
+  8fad3e9bc  fix(dns): a fakeip server must not answer a destination lookup, and `domain_resolver`
+             could name one                                                    <- D4
+  0c3f48fac  fix(wireguard): an egress pool option whose zero value kills the process is refused at
+             Start                                                             <- D7
+```
+
+## 13.1 Verdicts, one line each
+
+| layer | verdict | where |
+|---|---|---|
+| D4 DNS/FakeIP/Route | **CONFIRMED_BUG, FIXED** — a `domain_resolver` naming a fakeip server handed the synthetic address to a peer | §13.2 |
+| D4, remaining arms | VERIFIED_SAFE (epoch/stale-mapping/forwarding, NXDOMAIN matrix, ownership fail-closed) | §13.5 |
+| D6 MTU/Fragment | **CONFIRMED_BUG, FIXED** — the refusal for a DERIVED MTU told the operator to raise a number the clamp owns | §13.3 |
+| D6, unit/floor/clamp arms | VERIFIED_SAFE (layer units, QUIC 1200 floor at all three protocols, nested integer consistency, IPv6 1280 floor both ways) | §13.5 |
+| D7 stop/reconnect/power | **CONFIRMED_BUG, FIXED** — the zero value of a public option panicked the process from a goroutine nothing can recover | §13.4 |
+| D7 cycles/leaks | VERIFIED_SAFE — 15 Start/Close, 24 real rebinds, 20 consecutive rebinds, 10 pause/wake cycles: no worker and no socket leaked | §13.5 |
+| D7 revocation latency | NOT_REPRODUCIBLE_YET as damage — measured and documented as a bounded limitation | §13.6 |
+| D7 route/environment churn | **NOT RUN** — no claim is made | §13.7 |
+
+## 13.2 D4: a fakeip server could answer a destination lookup (`8fad3e9bc`)
+
+`Router.Lookup`'s `options.Transport != nil` branch used the caller-supplied transport with **no fakeip
+check**, while every other path that could put a fakeip server in front of a real address refuses it: the
+rule walk skips one when `allowFakeIP` is false (`dns/router.go:411`, `:507`), the manager refuses one as
+a default and refuses to replace one (`dns/transport_manager.go:224`, `:228`), the evaluate action refuses
+it outright (`dns/router.go:2427`), and fakeip answers are kept out of the reverse mapping
+(`dns/router.go:1621`).
+
+That branch is reached from ordinary configuration: `common/dialer`'s `NewDNSQueryOptions` sets
+`DNSQueryOptions.Transport` from `domain_resolver` on an outbound or endpoint (`dialer.go:107-112`) and
+from `route.default_domain_resolver` (`dialer.go:123-130`).
+
+```text
+before, unit   Lookup("leak.test", Transport=fakeip) -> [198.18.0.1], err=<nil>, exchanges=2
+before, e2e    domain "fakeip-resolver-leak.test" -> reply code 0x00, real SOCKS5 hop asked for
+               [198.18.0.2:443]
+after,  unit   Lookup(...) -> [], err=domain resolver fakeip is a fakeip server: ..., exchanges=0
+after,  e2e    domain -> reply code 0x01, hop recorded []
+```
+
+Both halves of the "before" are wrong at once: the flow **succeeds**, and the destination handed to a
+peer is one only the box can interpret. The fix refuses, matching the evaluate action and for the same
+reason. It sits at the branch rather than at the two dialer sites so that every caller is covered.
+
+**The exchange count is the load-bearing assertion.** A refusal raised after the query would still have
+created the mapping, which is the state the refusal exists to prevent; asserting the error alone would
+have accepted that.
+
+Reverse-break, both built FIRST (`go vet` exit 0), so neither RED is a compile error:
+
+```text
+MUTATION 6  guard disabled, unit  -> RED BY ASSERTION, printing the leak:
+              "[198.18.0.1], err=<nil>, exchanges=2"
+MUTATION 7  guard disabled, e2e   -> RED BY ASSERTION, printing the wire fact:
+              reply code 0x00, hop recorded [198.18.0.2:443]   ("Should be empty, but was ...")
+```
+
+**Attribution: inherited upstream.** The same missing check is in `upstream/testing:dns/router.go`, and
+upstream keeps the evaluate-action refusal, which is the contract this restores here.
+
+**Reproducible entry points:** `dns/fakeip_resolver_guard_test.go`
+(`TestADestinationLookupRefusesAFakeIPResolver`) and `e2e/fakeip_resolver_wire_test.go`
+(`TestAFakeIPDomainResolverNeverPutsASyntheticAddressOnTheWire`, a real box and a real recording SOCKS5
+hop).
+
+## 13.3 D6: the refusal for a derived MTU was unfollowable (`b36f5cdb5`)
+
+A nested endpoint's inner MTU is bounded by its detour's proven capacity, and the refusal for a
+too-small MTU told the operator to *raise `mtu`* — but the clamp owns that number. MEASURED with a detour
+whose own inner MTU is 1210 (nested MTU `1210 - 48 - 32 = 1130`):
+
+```text
+configured     0 -> 1130      configured  1280 -> 1130
+configured  1131 -> 1130      configured  1408 -> 1130
+configured  1130 -> 1130 (not changed)        configured  1500 -> 1130
+```
+
+The message now names the detour **and the number**: the detour's own `mtu` must reach 1360. That is
+derived, not guessed, and restates no header length — a detour's capacity is its own inner MTU minus a
+constant difference, so 1210 + (1280 − 1130) = 1360, and 1360 − 80 = 1280 exactly.
+`MinimumIPv6TunnelMTU` is exported from `transport/wireguard` so `protocol/wireguard` reads the one
+definition.
+
+The boundary is **"did the clamp CHANGE the value"**, not "was a detour involved": at or below the ceiling
+the value is the operator's own and the original advice is correct there. Four mutations, each built
+FIRST, each caught by the layer that owns it:
+
+```text
+MUTATION 1  bounded branch disabled          -> RED, prints the unfollowable message verbatim
+MUTATION 2  clamped value reported as the operator's own
+            -> RED on exactly the two clamped subtests; "exactly at the ceiling" and "below the ceiling"
+               stayed GREEN, which is the proof the boundary is where it is claimed to be
+MUTATION 3  required detour MTU never computed   -> RED at the protocol layer (expected 1360, got 0)
+MUTATION 4  detour named but the number zeroed   -> RED at the transport layer ("to at least 0 bytes")
+```
+
+**Reproducible entry points:** `protocol/wireguard/nested_mtu_test.go`
+(`TestAClampedMTUReportsTheDetourThatProducedIt`) and `transport/wireguard/mtu_validation_test.go`
+(`TestARefusalNamesTheDetourThatBoundedTheMTU`).
+
+## 13.4 D7: a public option whose zero value killed the process (`0c3f48fac`)
+
+`transport/wireguard.EndpointOptions.EgressPoolOptions` is public, and the pool it configures
+dereferences three of its fields unconditionally from wireguard-go's own goroutines, reached through
+`BindUpdate`, which the recovery worker calls:
+
+```text
+sing-tun udp_egress.go:119  p.interfaceMonitor.DefaultInterface()      <- the nil deref
+sing-tun udp_egress.go:125  p.interfaceFinder.RegisterInterfaceUpdateCallback(...)
+sing-tun udp_egress.go:218  p.logger.Warn(...)                          on the failure path
+```
+
+So the zero value is not "unset", it is a nil dereference inside `RoutineTUNEventReader`, where no
+`recover` can reach it. MEASURED by disabling the new guards and building first (`go vet` exit 0):
+
+```text
+panic: runtime error: invalid memory address or nil pointer dereference
+  .../sing-tun@.../udp_egress.go:119 +0x2a0
+FAIL github.com/sagernet/sing-box/transport/wireguard 0.028s
+```
+
+`Start` now refuses it before a device exists, naming the missing field and the endpoint. The three
+in-tree callers already fill all three, so nothing that starts today changes; the positive control in the
+same file asserts exactly that.
+
+**Reproducible entry point:** `transport/wireguard/egress_pool_validation_test.go`
+(`TestAEgressPoolWithoutAMonitorIsRefusedRatherThanPanicking`, three subtests plus the control
+`TestACompleteEgressPoolStillStarts`).
+
+## 13.5 What was measured SAFE — do not rebuild these
+
+**D4, the arms that held.** The rule-path destination lookup never consults fakeip, before and after both
+`ResetNetwork` and `ClearCache` (fakeip query counter unchanged 1→1, 3→3, 4→4); a fakeip answer is not
+cached; the rule-path answer stayed `93.184.216.34`. A packet to an unmapped in-range address is refused
+(`0x01`, hop asked nothing); a packet to a mapped in-range address is **unmapped to the name**, not
+dialled as a literal (`d4-alloc.test:8443`, not `198.18.0.2:8443`). NXDOMAIN (±SOA), NODATA and SERVFAIL
+all answer with **zero** queries to the real server, in both legacy modes. `destination_dns_ownership`
+fails CLOSED on a DNS timeout and on a generation change, with the peer never contacted. One genuinely
+uncovered branch was closed: the `options.Transport != nil` path now has a generation-guard measurement
+(`dns/zz_d4_ownership_lookup_probe_test.go` in `wD4`).
+
+**D7, the leak question, answered with a stronger instrument than the repo had.** The investigator
+explicitly did NOT use the process-global `runtime.NumGoroutine` as the verdict — the mistake §10.10 had
+to repair in `common/sniff` — and instead used a package-scoped goroutine census, per-port
+independent-bind liveness, and the OS UDP table. Sensitivity was PROVED, not assumed: `total=1` quiet →
+`total=60` with a resident worker whose stack names `(*Endpoint).recoveryLoop` → back to `1` after
+`Close`. With that instrument: 15 idle Start/Close cycles → no drift, every port free; 12 cycles × 2 fired
+recoveries = **24 real rebinds against live sockets** with a generation `Advance` between them → no drift,
+and "exactly one port bound out of every port observed" held at every step; 20 consecutive `RebindStale` →
+20/20 port changes with exactly one socket held throughout; 10 pause/wake/recovery cycles → no drift.
+`-race -count=3` clean.
+
+**Two harness falsifications worth carrying forward**, because a green suite built on them would mean
+nothing:
+
+1. This package's own fixtures run with **no network manager**, so `UDPListenerControl()` returns
+   `ok=false` — yet the live bind is still `*conn.StdNetBind`. The flag means "has an egress bind to
+   combine with", not "is the standard bind". The investigator's first probes held a gate no code ever
+   reached and would have "proved" safety from three green no-ops.
+2. The investigator's own leak instrument was falsified early (it was counting a helper's own frame plus
+   device goroutines) and had to be pinned by a sensitivity control before any of its numbers were used.
+
+## 13.6 D7 open, measured and NOT repaired: revocation latency
+
+`RebindStale` observes its lease context **once, at entry** (`transport/wireguard/recovery.go:306-309`);
+everything after it — the `IpcSet("listen_port=0")` at `:343` and the `BindUpdate()` at `:346` — never
+consults it again. MEASURED with the rebind held inside a real socket operation and the generation
+advanced under it: the lease IS expired and its context IS cancelled, and the rebind **completes anyway**,
+committing the endpoint to a new socket.
+
+This contradicts the contract written on the mechanism itself — `RebindLease.Context` says the context is
+"the only thing that reaches work already blocked in a dial" (`common/runtimecoord/coordinator.go:264-266`)
+and `recovery.go:199-205` repeats it. For this code path the statement holds only up to entry.
+
+**Why it is not repaired here, rather than repaired badly.** The commit for the socket reopen happens
+*inside* `BindUpdate`, in the dialer's socket control hook, which is handed **no context**
+(`common/dialer`'s listener control is `func(network, address string, conn syscall.RawConn) error`).
+Nothing in this repository can reach it. The only in-repo change available is a re-check between the two
+calls, which shrinks the window instead of closing it and would be a guard that does not do what its name
+says. So it is recorded as a bounded revocation latency:
+
+- No lifecycle damage was found: no extra bound socket, no goroutine growth, `Close` still releases
+  everything, and the new generation would perform the same reopen anyway.
+- It is a configuration-versus-behaviour gap: the mechanism is DOCUMENTED to do something it only partly
+  does.
+
+**D7 open, bounded coupling, not a hang.** `Close` was blocked at `endpoint.go:596` (`wgDevice.Down()`)
+while the worker sat at `recovery.go:343`, because the rebind holds wireguard-go's device lock while
+opening sockets and `Close` needs that lock. Identical stacks in 3/3 runs. It is bounded by the socket
+operation — `Close` completed as soon as it was released, with a scoped census of 1 and zero held ports
+afterwards. Report it as "Close waits on an in-flight recovery's socket operation", never as a deadlock.
+
+## 13.7 D7 NOT RUN, and D4 open by decision
+
+- **Route/environment churn accumulation (H3) is NOT RUN.** No claim is made about route timers, workers
+  or cached verdicts after repeated interface changes. The investigator read
+  `route/interface_transition_coalescing_test.go` and `route/reference.go:116` and saw no measurement, and
+  chose to spend its budget on the leak question instead of claiming coverage it did not have.
+- **A fakeip address issued under a PREVIOUS configuration is dialled for real.** `route/route.go:1051`
+  gates the whole FakeIP treatment on membership in the CURRENTLY configured range
+  (`Store.Contains(dest)`), so once the configuration changes, an address the box itself issued is
+  outside it and is treated as an ordinary literal. MEASURED on the real stand: removing the fakeip
+  server, or moving the range, forwards `198.18.0.2:443` to the peer; narrowing the range so the address
+  stays inside it is refused correctly (`0x01`). Repairing it means remembering the ranges a process has
+  ever issued from — new persisted state with its own failure modes — which is a product decision and not
+  a guard. **Left as-is, deliberately.**
+- The investigator's honest gaps, recorded so they are not mistaken for coverage: an in-process RELOAD
+  changing the fakeip range (the arm above used two boxes); `protocol/http`'s instance of §13.2
+  (code-identical to `protocol/socks`, measured only in `dns` + `socks`); `route.default_domain_resolver`
+  naming a fakeip server (same code path as the outbound's `domain_resolver`, read but not separately
+  measured); and the IPv4-mapped-IPv6 form `::ffff:198.18.0.5` (code read only).
+
+## 13.8 Verified at the finishing SHA
+
+```text
+SCAN_SHA (scanned tree)   = 0c3f48fac2c6137b0641403f1c28c71bc6f9a8c9, working tree CLEAN
+COMMAND                   = go test -count=1 -tags "$TAGS" -json -timeout 3600s ./...
+FULL_TEST_COVERAGE        = 83 packages that carry test files
+FULL_TEST_RESULT          = 80 ok / 3 FAIL
+FULL_TEST_SHA_MATCH       = YES (the scanned SHA equals HEAD, and HEAD is deployed to origin/testing)
+  the 3: common/tls, common/tlsspoof, common/windivert - BLOCKED_EXTERNAL, unchanged
+  the 11 failing TEST NAMES are byte-identical to the pre-round set, so no failure is new
+CROSS_PLATFORM            = PASS_WITH_SCOPE (go build ./... exit 0; ABI unchanged this round)
+CI                        = NOT_RUN_BY_REQUEST (no Actions event was triggered)
+RELEASE                   = NOT_READY (the product decisions in §6 and the external blockers remain)
+```
+
+Every fix in this section is `go vet` exit 0, `gofmt` clean, `go build ./...` exit 0, and passes under
+`-race` over the packages it touches: `dns`, `e2e`, `route`, `protocol/socks`, `protocol/http`,
+`protocol/wireguard`, `transport/wireguard`, `protocol/tuic`, `protocol/hysteria2`, `common/dialer`.
+
+## 13.9 The instrument lesson this round adds
+
+§12.5 concluded that "proven unsatisfiable" is a claim about the TEST. This round adds its mirror: **a
+leak claim is a claim about an INSTRUMENT.** The package's own leak test loops 25 cycles against the
+process-global goroutine count with a `+8` allowance and never publishes a device, so it never rebound
+anything — and it cannot say *which* code leaked even when it does fire. That test is not wrong; it is
+weak, and the difference only became visible when a probe held a gate no code reached and reported three
+green no-ops.
 
 
