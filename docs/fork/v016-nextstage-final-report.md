@@ -17,18 +17,41 @@ Companion documents in this directory:
 ```text
 START_SHA                        = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 LIVE_ORIGIN_AT_START             = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
-FINAL_CODE_SHA                   = 45aab788fa059c4b9586387472870dd137e69944
-ORIGIN_TESTING_FINAL             = 45aab788fa059c4b9586387472870dd137e69944   (ordinary fast-forward)
-FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0)
-NEW_COMMITS                      = 24   (every subject contains the literal `[skip ci]`)
+FINAL_CODE_SHA                   = 45aab788fa059c4b9586387472870dd137e69944   (the last CODE commit;
+                                   the exact scan SHA, see §I)
+ORIGIN_TESTING_FINAL             = 04528b8bfa3e820eed28ae48a5164b560ca125b7
+                                   (== local HEAD; the tip is this report's own docs-only commit, one
+                                   above FINAL_CODE_SHA)
+FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
+                                   before the push; the push reported `686c937cb..04528b8bf  HEAD -> testing`)
+NEW_COMMITS                      = 25   (every subject contains the literal `[skip ci]`)
 REMOTE_HEADS                     = refs/heads/testing only (`git ls-remote --heads origin`)
-REMOTE_TAGS                      = 20 refs/tags, unchanged this round
+REMOTE_TAGS                      = 636 refs/tags, and the local and remote tag SETS are byte-identical
+                                   (`git ls-remote --tags --refs` vs `git for-each-ref refs/tags`,
+                                   `Compare-Object` empty) — nothing created, moved or pushed
 OTHER_REPOS_TOUCHED              = NO
 GO_MOD_GO_SUM_CHANGED            = NO   (`git diff --stat <base>..HEAD -- go.mod go.sum` empty)
 GITLINKS_CHANGED                 = NO   (clients/android, clients/apple, clients/desktop all identical
                                          to the base; clients/desktop = 32f915ba595601dbc2dd346c33fe9fedd3e72979)
-CI_REMOTE                        = OBSERVED (see the correction in §I)
+CI_REMOTE                        = OBSERVED, NOT_RUN_BY_REQUEST
 ```
+
+**Correction to this report's own G0 record, and to the order's premise.** The order says a Harness
+without `gh`/API access may only say `REMOTE_ACTIONS_NOT_QUERYABLE`; that premise is false here — the
+repository is public and unauthenticated `api.github.com` answers. The read-only query after the push:
+
+```text
+total workflow runs in the repository   = 910
+runs created on or after 2026-10-10     = 0        <-- this round pushed on 2026-10-10
+latest run on branch `testing`          = 2026-10-08T20:31:45Z, head e2d7ac1be ("Verify", success)
+```
+
+So the push triggered **nothing**, which is the empirical confirmation of the `[skip ci]` mechanism the
+preflight gate enforces. **One number in the on-disk G0 ledger was truncated and is corrected here**: the
+remote tag count was recorded as "20 refs/tags" because the G0 command that produced it was
+`Select-Object -First 20`. Measured properly, the remote carries **636** tag refs, exactly matching the
+local set. No tag was created, moved or pushed: the push named a single ref,
+`HEAD:refs/heads/testing`, and the two tag sets compare equal.
 
 The committed batch:
 
@@ -576,8 +599,16 @@ has unauthenticated API access** — the repository is public — so the honest 
   **irrelevant to the other seven**, which only a human dispatch can start.
 
 Nothing was dispatched, re-run or triggered, and no remote branch, tag, Release or PR was created. The
-integrator's push uses the ordinary fast-forward form only, and every one of the 24 commits carries the
+integrator's push used the ordinary fast-forward form only, and every one of the 25 commits carries the
 literal marker.
+
+### I.1b The push itself triggered nothing — measured, not assumed
+
+The query above was re-run **after** the push: runs created on or after 2026-10-10 = **0**, and the
+newest run on `testing` is still from `2026-10-08T20:31:45Z`. That is the end-to-end confirmation of the
+mechanism, from GitHub's own record rather than from the preflight script's reading of the commit
+messages.
+
 
 ### I.2 The three blocked packages, re-attributed
 

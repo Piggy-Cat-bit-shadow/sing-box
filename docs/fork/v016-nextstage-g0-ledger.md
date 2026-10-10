@@ -11,9 +11,12 @@ LIVE_ORIGIN_SHA (origin/testing) = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 MERGE_BASE HEAD origin/testing   = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 BASE_DIFF_STATUS             = origin/testing == HEAD; nothing to reconcile, no upstream drift
 REMOTE_HEADS                 = refs/heads/testing only
-REMOTE_TAGS                  = 20 refs/tags (v0.1 … v1.0.6, tooling-v0.1.5, 1.1-beta17,
-                               checkpoint-20261002-pre-resource-efficiency,
-                               archive/macos-client-before-consolidation)
+REMOTE_TAGS                  = 636 refs/tags (and the local set is identical to it)
+                               CORRECTED: this line first read "20 refs/tags" because the G0 command
+                               that produced it ended in `Select-Object -First 20`. Measured with the
+                               full list, the remote carries 636 tag refs and `Compare-Object` against
+                               `git for-each-ref refs/tags` is empty, so nothing was created, moved or
+                               pushed. The misreading is left visible rather than overwritten.
 GO                           = go1.26.8 windows/amd64
 GO_ENV                       = GOOS=windows GOARCH=amd64 CGO_ENABLED=1
                                GOROOT=C:\src\_toolchain\goroot  GOPATH=C:\Users\Jie\go
