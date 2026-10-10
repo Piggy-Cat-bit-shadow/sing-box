@@ -21,47 +21,86 @@ PHYSICAL PATH (the transport/proxy hops the traffic ACTUALLY traverses)
 A diagnostic that reports (3) as (2), or that reports (2) backwards, describes a path the traffic
 does not take. That is worse than no diagnostic.
 
-## Direction: the direction proof, quoted
+## Direction: CORRECTED — the dependency is entered FIRST
 
-A configured `detour` is a DEPENDENCY edge. `X.detour = Y` means X consumes Y, so the packet reaches
-X first and Y second. The configured field is the DEPENDENCY, not the predecessor.
+> **This section was wrong and is superseded (commit `524ea41e`).** The first version of this document
+> argued that `X.detour = Y` means "the packet reaches X first, Y second", reading the dependency edge
+> as if it were the packet edge. That is the CONFIGURATION nesting order, and it is the opposite of the
+> packet path. The model shipped `Hops[0]` = the exit and called it "nearest to this device", so
+> `Exit()` returned the entry and any consumer would have named a healthy hop as the broken one.
 
-`common/dialer/detour.go`
+A configured `detour` is a DEPENDENCY edge: `X.detour = Y` means X consumes Y. The decisive question is
+**what X uses Y for**, and the answer is not "to reach the user's destination".
 
-```go
-func (d *DetourDialer) init() {                              // :57
-    dialer, loaded = d.outboundManager.Outbound(d.detour)   // :61  <- Y
-    d.dialer = dialer                                        // :77
-}
-func (d *DetourDialer) DialContext(...) {                    // :80
-    return dialer.DialContext(ctx, network, destination)     // :85  <- X asks Y to dial
-}
-```
+### The convention that decides it
 
-`protocol/socks/outbound.go`: the proxy outbound builds its dialer from those options and uses it
-only to reach its own SERVER, so its own hop is entered before the dependency is dialled.
+A SOCKS/HTTP proxy outbound sends the user's TARGET inside the protocol, and uses its dialer only to
+reach its OWN SERVER:
 
 ```go
-outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())  // :134
-dialClientDialer := clientDialer(outboundDialer, version, options.ServerOptions.Build()) // :157
-client: socks.NewClient(dialClientDialer, ...)                                           // :162
-... h.client.DialContext(ctx, network, destination)                                      // :292
+// sing/protocol/socks/client.go
+:162  tcpConn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.serverAddr)   // the SERVER
+:198  response, err = ClientHandshake5(tcpConn, command, address, ...)        // the TARGET, in the request
 ```
 
-`route/route.go`: the chain is built consumer-first and the LAST element is the one that is dialled.
+and `common/dialer.NewWithOptions` puts the `DetourDialer` in exactly that position:
 
 ```go
-chain := []adapter.Outbound{outbound}   // :247
-chain = append(chain, outbound)         // :266
-leaf := chain[len(chain)-1]             // :899, :956
+// common/dialer/dialer.go
+:47  dialer = NewDetour(outboundManager, dialOptions.Detour, options.DisableEmptyDirectCheck)
 ```
 
-Therefore, in `common/physicalpath`:
+So for `exit.detour = entry`, **exit's SERVER dial is carried by entry**. The device therefore enters
+ENTRY first, EXIT second, and the destination last.
 
 ```text
-Hops[0]            is the outbound the flow's routing selected,
-Hops[len(Hops)-1]  is the last dependency reached - the exit.
+configuration            exit.detour = entry
+dependency descent       exit -> entry          (ROOT first)
+PACKET order             entry -> exit          (DEPENDENCY first)
 ```
+
+### How this was decided — from the wire, not from the code above
+
+Reasoning about the same lines is what produced the original error, so the conclusion rests on an
+observation of the real plumbing instead: `common/dialer/detour_wire_order_test.go` builds the dialer
+with the real `NewDetour`, substitutes a recording peer, and records **which hop is entered and in what
+order**, for two hops and for three.
+
+```text
+exit.detour = entry                        -> the entry outbound is entered FIRST
+c.detour = b, b.detour = a                 -> b is entered first, then a
+no detour                                  -> the outbound itself, and the address the caller named
+```
+
+The recorder keeps BOTH the hop's tag and the address that hop was asked for, and that is what makes the
+observation conclusive rather than suggestive: an address alone cannot distinguish "the entry was
+reached and asked to carry a connection to the exit's server" from "the device dialled the exit
+directly" — both show the exit's address — and that distinction is the entire question.
+
+### Therefore, in `common/physicalpath`
+
+```text
+Hops[0]            is the hop NEAREST THIS DEVICE — the DEEPEST DEPENDENCY (the entry)
+Hops[len(Hops)-1]  is the hop the routing selected — the EXIT
+Path.Entry()       returns Hops[0]
+Path.Exit()        returns the last element
+```
+
+`Build` produces this by reversing the walk's output once, in `reversePacketOrder`, which also renumbers
+`Hop.Position`, reverses `ControlPath` (which is in descent order by definition, so two adjacent fields
+do not describe the same path in opposite directions), and remaps `Unknown.Position` through the same
+permutation.
+
+Nine tests that pinned the old order FAILED when the reversal landed. Two were renamed because they
+asserted the opposite of their own names: `TestDetourTwoHopIsConsumerFirst` is now
+`TestDetourTwoHopReachesTheDetourFirst`, and `TestOutboundToEndpointKeepsTheEndpointLast` is now
+`TestOutboundToEndpointReachesTheEndpointFirst`.
+
+### Honest limit
+
+This ordering is derived from the DIAL EDGE each hop declares. It is exact for a chain of forwarding
+proxies, which is what `detour` expresses. It does not model a hop that carries traffic for a server
+other than the one its dependency names, and it cannot see a route the configuration did not declare.
 
 ## Files
 
@@ -178,7 +217,7 @@ pins the replacement.
 | test | pins |
 | --- | --- |
 | `TestDirectSingleLeafIsOneHop` | a leaf with no dependency is one hop at position 0; `ControlPath` empty |
-| `TestDetourTwoHopIsConsumerFirst` | `h2.detour=h1` reports `[h2, h1]` - the ORDER |
+| `TestDetourTwoHopReachesTheDetourFirst` | `h2.detour=h1` reports `[h1, h2]` - the ORDER, entry first |
 | `TestDetourThreeHopKeepsTheOrder` | `[h3, h2, h1]` - the full descent, not the two ends |
 | `TestEndpointLeafIsMarkedAsAnEndpoint` | `IsEndpoint`, not `IsGroup`, for an `adapter.Endpoint` |
 | `TestOutboundToEndpointKeepsTheEndpointLast` | outbound -> endpoint: the endpoint is the exit |

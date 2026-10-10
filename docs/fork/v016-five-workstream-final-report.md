@@ -174,8 +174,18 @@ route/route.go:247/266        chain := []adapter.Outbound{outbound}; chain = app
 route/route.go:899/956        leaf := chain[len(chain)-1]                  the exit is dialled last
 ```
 
-So `Hops[0]` is what routing selected and `Hops[len-1]` is the exit. `ControlPath` (tags, in selection
-order) is a separate field from `PhysicalHops`.
+> **CORRECTED after this report was written (`524ea41e`).** The reading below was the model's
+> original one and it was WRONG about the packet path. A SOCKS/HTTP proxy outbound uses its detour
+> dialer to reach its OWN SERVER (`sing/protocol/socks/client.go:162` dials `c.serverAddr`), so for
+> `exit.detour = entry` the device enters ENTRY first. `Hops[0]` is the hop nearest this device — the
+> DEEPEST DEPENDENCY — and the last element is the hop the routing selected. `Build` now reverses the
+> walk's output to produce that, and `Path.Entry()` was added so a caller never has to work out which
+> end is which. The direction was decided by observing the real `NewDetour` plumbing in
+> `common/dialer/detour_wire_order_test.go`, not by re-reading the walk.
+
+The walk descends the dependency graph root-first, which is the CONFIGURATION nesting order. That is
+what `Hops` was originally reversed FROM; `ControlPath` is reversed with it so the two adjacent fields
+do not describe the same path in opposite directions.
 
 Read-only by construction: `Resolver` holds only a lookup func, a `Snapshot` and a network name — no
 dialer, logger, context or clock in the type, so it cannot dial, log or time. No cloning (`require.Same`

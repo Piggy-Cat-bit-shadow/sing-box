@@ -447,7 +447,7 @@ func TestHopZeroIsTheNearestEntryForTheWholeMatrix(t *testing.T) {
 
 // TestControlPathOrderIsNotPacketOrder makes the distinction explicit rather than implied: the
 // two lists are different sequences of different lengths for one topology.
-func TestControlPathOrderIsNotPacketOrder(t *testing.T) {
+func TestControlPathIsShorterThanThePhysicalPath(t *testing.T) {
 	exit := dualLeaf("exit")
 	member := dualLeaf("member", "exit")
 	inner := tcpGroup("inner", "member", "member")
