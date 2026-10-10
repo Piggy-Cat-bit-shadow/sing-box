@@ -251,11 +251,14 @@ jobs:
       - name: Verify provenance and the ARM64 payload
         run: |
           set -euo pipefail
-          # The builder's real output paths, confirmed from a successful run rather than guessed:
-          # writeProvenance writes "libbox.provenance" and the Android variant's OutputName is
-          # "libbox.aar", both relative to the working directory. An earlier revision searched with
-          # `find`, which would have accepted an artifact from anywhere in the tree - including a
-          # stale one left by an earlier step.
+          # The builder's real output paths, and they are not the same directory. writeProvenance
+          # writes "libbox.provenance" relative to the working directory, but the AAR is written to an
+          # ABSOLUTE path inside the builder's isolated working directory - buildAndroidVariant does
+          # `outputPath := filepath.Join(gomobileWorkDir(rootDir), config.OutputName)` with
+          # gomobileWorkDirName = "_libbox_build" - so it is _libbox_build/libbox.aar and never the
+          # working directory. Both paths are exact rather than searched for: a `find` here would
+          # accept an artifact from anywhere in the tree, including a stale one left by an earlier
+          # step, which is precisely what this check exists to rule out.
           prov="libbox.provenance"
           if [ ! -f "$prov" ]; then
             echo "FAIL: the builder did not write $prov; it did not record what it built" >&2
@@ -270,8 +273,12 @@ jobs:
           fi
           echo "PASS: provenance names the commit that was built"
 
-          aar="libbox.aar"
-          if [ ! -f "$aar" ]; then echo "FAIL: the builder did not produce $aar" >&2; ls -la | head -20 >&2; exit 1; fi
+          aar="_libbox_build/libbox.aar"
+          if [ ! -f "$aar" ]; then
+            echo "FAIL: the builder did not produce $aar" >&2
+            ls -la _libbox_build 2>&1 | head -20 >&2
+            exit 1
+          fi
           echo "aar: $aar ($(stat -c%s "$aar") bytes)"
           rm -rf /tmp/aar && mkdir -p /tmp/aar && unzip -q "$aar" -d /tmp/aar
           find /tmp/aar -name '*.so' -printf '%p %s\n' | sort
@@ -332,7 +339,7 @@ jobs:
         with:
           name: android-core-arm64-${{ github.sha }}
           path: |
-            libbox.aar
+            _libbox_build/libbox.aar
             libbox.provenance
             SHA256SUMS.txt
           if-no-files-found: error
