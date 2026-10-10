@@ -188,6 +188,25 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 		if err != nil {
 			return Report{}, E.Cause(err, "enumerate reachable leaves of outbound/", root.Tag())
 		}
+		// A route that never reached its far end is a failure of THIS report, not a fact for the
+		// caller's own existence check to catch.
+		//
+		// MEASURED before this check existed, with `exit.detour = "ghost"` and no such object in the
+		// registry: `roots=[exit] nodes=[exit(exit pos=0 exit=false)] failures=[] reachable=true
+		// err=<nil>`. The node correctly refuses to claim an exit - the walk reported
+		// routeTruncated - and the report still called the route proven usable.
+		//
+		// The one caller this repository ships is protected by accident of ordering rather than by
+		// this function: adapter/outbound's start-order lint rejects `dependency[tag] not found for
+		// outbound[tag]` before it runs the dry run, which is what leaves.go's truncation comment
+		// means by "reported by the caller's own existence check". ValidateRoots is exported, and
+		// Report.Reachable is documented as the STRONGER question - "was every leaf PROVEN usable" -
+		// so a caller that gates on it is told a route with no far end was proven. That is a false
+		// READY produced by this API, and it is fixed here rather than left to whichever caller
+		// happens to run a lint first.
+		if failure, truncated := truncatedRouteFailure(resolver, root, nodes); truncated {
+			report.Failures = append(report.Failures, failure)
+		}
 		requirement := proven
 		if requirement == nil {
 			// Nothing was proven about delivery, so the requirement is what the root's own
@@ -261,6 +280,77 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 		}
 	}
 	return report, nil
+}
+
+// truncatedRouteFailure reports the route under root when the enumeration could not reach its far
+// end, and nothing else.
+//
+// # How truncation is recognised, and why this signal is exact
+//
+// `numberRoute` marks a node as the exit with `route[index].Exit = complete && index ==
+// len(route)-1`, and `Hops` calls it with `complete == false` for exactly one reason:
+// `enumerateHops` returned routeTruncated, which happens at exactly one place - a physical hop
+// declared a dependency that does not resolve (leaves.go). So "no node of this root carries Exit"
+// is not a heuristic about the shape of a route; it is the same bit the walk set when it decided
+// the route had no far end.
+//
+// The one other way a group can produce nodes without an exit is the `len(prefix) > 0 && !echoed`
+// branch: a group reached as a dependency that materialises no member at all. That route also never
+// reaches a far end, so it belongs in the same answer.
+//
+// A root that produced NO node at all is deliberately left alone. `Hops` returns nothing for a
+// group whose candidate list is empty, and whether that configuration is refused is a question for
+// the group's own Start rather than for this report; claiming it here would widen this fix from
+// "a route that stopped" to "a group that is empty", which is a different contract.
+//
+// # Why the hop that declared the missing tag is named when it can be
+//
+// "the route is truncated" tells an operator nothing about which line of the configuration to fix.
+// The declaration is right there on the object, and it is read through the same `lookupDependency`
+// the enumeration used, so the name in the report cannot disagree with the edge that produced it.
+func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []PathNode) (Failure, bool) {
+	if len(nodes) == 0 {
+		return Failure{}, false
+	}
+	for _, node := range nodes {
+		if node.Exit {
+			return Failure{}, false
+		}
+	}
+	for _, node := range nodes {
+		if node.Outbound == nil {
+			// An unresolvable GROUP MEMBER is already a hop-shaped fact with Exit set, so it never
+			// reaches this loop; a nil object here would have nothing to declare.
+			continue
+		}
+		dependencyTag := firstDependency(node.Outbound)
+		if dependencyTag == "" {
+			continue
+		}
+		if dependency, _ := resolver.lookupDependency(dependencyTag); dependency == nil {
+			return Failure{
+				Root:  root.Tag(),
+				Leaf:  node.Tag,
+				Route: node.Route(),
+				Path:  node.Path(),
+				Hop:   node.Position,
+				Reason: "this hop declares " + dependencyTag + " as the outbound it dials through, and " +
+					"no outbound or endpoint with that tag exists; the route never reaches its far end, " +
+					"so no node of it can be proven usable and none of them claims to be where the flow " +
+					"arrives",
+			}, true
+		}
+	}
+	last := nodes[len(nodes)-1]
+	return Failure{
+		Root:  root.Tag(),
+		Leaf:  last.Tag,
+		Route: last.Route(),
+		Path:  last.Path(),
+		Hop:   last.Position,
+		Reason: "this route never reached its far end: no node of it is where the flow arrives, so " +
+			"nothing in it was proven usable",
+	}, true
 }
 
 // nodeRequirementFor reports the networks THIS node has to be able to carry, and nil when nothing
