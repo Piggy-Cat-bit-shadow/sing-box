@@ -454,3 +454,89 @@ before and after — the containment, the generation re-read and the nil contrac
 
 **Still not wired**: `StatusView` is referenced only by its own tests; `box.go` does not construct one.
 Whoever wires it should rely on the nil contract and must not re-introduce the lock.
+
+---
+
+# 9. FINAL INTEGRATED STATE — all four fixes landed, PATH-01 is the only red
+
+```text
+P5  citations/comments   (mine, low risk)   see §2.6 — still open
+S0  WG private key       FIXED_VERIFIED     assertion-level reverse-break, sentinel printed
+P2  selector             LANDED             35246a212 -> 96e6dc41
+P3  StatusView           LANDED             798c57eb -> 03995f6da
+P4  edge network policy  LANDED             a49e04dd -> f2dd95d6
+```
+
+`common/physicalpath` fails exactly **13** tests and they are **all** the PATH-01 specification in
+§2.5. Verified under `-race -count=1` over the whole package binary: **zero `WARNING: DATA RACE`**,
+13 `--- FAIL`, every name accounted for. `gofmt -l` clean on `common/physicalpath`, `protocol/group`,
+`route` and the root package. `protocol/group`, `route`, the root package, `adapter/...` and
+`adapter/outbound` are all green.
+
+**Do not read that FAIL as a regression, and do not "fix" it by inverting the detectors.**
+
+## What P4 actually changed, and the mutation that makes it trustworthy
+
+The defect: `hasNetworkFilteringGroup(resolver, nodes)` returned true if ANY node's control path
+contained ANY filtering group, so an inner filtering group exempted an OUTER non-filtering selector's
+whole subtree. Raw RED on `outer(loadbalance) -> inner(selector) -> [tcp-only, udp-only]` with both
+networks delivered: **`[]` failures** — a miss, not a misattribution.
+
+The fix is per EDGE: a node is exempt only when the group that **handed it the flow** filters, which
+is the INNERMOST group on its control path (the last element — a group is never emitted as a hop, so
+the last element is always the immediate parent). `hasNetworkFilteringGroup` is deleted and replaced
+by per-filtering-group responsibility: `filteringGroups()` (de-duplicated by IDENTITY, not tag) +
+`nodesUnder()` + the existing `anyNodeCarries`. The failure is attributed to the FILTERING GROUP with
+its route named rather than to the root.
+
+**The mutation that matters, in the fixer's own words**: mutation M5 — *never exempt anyone* — fails
+`START-01-B2`, `START-01-B3` and the new blanket case. So the exempt edge is load-bearing in **both**
+directions: removing it causes false refusals, not just missed ones. A fix in this area that only
+proved the miss would be half-verified.
+
+**Nine previously-legal configurations re-run: all nine still start**, all six refusals keep their
+reasons. Fixing the miss did NOT become a false refusal.
+
+## What P2 actually changed, and the trap that turned out not to exist
+
+`Selector.References()` returned `s.tags[:1]` while nothing was selected, and through the real
+`SnapshotStatus` consumer that became `Decision = "node-a"`, `Committed = true` for a selector
+configured `default: node-b` that had never started.
+
+**The trap was checked before the change, and it does not exist for this method**: the start-order
+sort (`manager.go:341`), the cycle lint and the cross-kind check all walk `Dependencies()`, which for
+a selector is the whole declared tag list; `cross_kind_cycle.go:155` reads `References()` only for a
+DNS *transport*; and the one caller that would notice, `route/reference.go`'s idle walk, first runs at
+`StartStateStarted` (3), after outbounds start at `StartStateStart` (1). So `References()` could be
+changed directly, to `nil` — matching what `URLTest.References` and physicalpath's **own `testGroup`
+fixture** already do.
+
+**Why not `defaultTag`: `status.go` maps ANY single reference to `Committed = true`, so returning the
+configured default would still display a configured value as live — the same defect with a better
+name.** That is pinned by mutation M3, which specifically catches the plausible wrong fix.
+
+The four states are now explicit and never merged: `SelectionUnknown`, `SelectionConfigured`,
+`SelectionPersisted` (validated against the DECLARED tag list, so the accessor cannot race `Start`),
+`SelectionCommitted`. Only `SelectionCommitted` carries `Committed`.
+
+## Flaky test flagged, not fixed
+
+`route::TestConfiguredRateShapesTheRealTCPCopyPath` failed once under a 5-package parallel run. It
+self-describes as "wall-clock over a fixed payload" (`route/traffic_scheduler_integration_test.go:70`),
+passes 3/3 in isolation and passed 4 earlier full-suite runs. The copy path and scheduler are
+untouched by any of these changes. It should be made load-independent or marked as timing-sensitive —
+**do not "fix" it by widening the band.**
+
+## Still open
+
+1. **PATH-01** — §2.3 gives the direction (keep the chain device-first, take `Position` from it
+   directly), §2.4 lists the six failed attempts so they are not repeated.
+2. **P5** — the stale citations and comments in §2.6. Low risk, currently misleading.
+3. **`StatusView` is still not constructed by `box.go`.** It is referenced only by its own tests. The
+   nil contract means a box whose view failed to build reports UNKNOWN rather than crashing, but
+   nothing in-tree reaches it yet.
+4. **`SelectionStatus()` is available but not wired into any UI** — "configured but not committed" is
+   displayable rather than displayed. No consumer was changed.
+5. **The P4 fixer's own honesty note**: the reverse-break mutated the worktree from pristine copies in
+   a temp directory (both files restored byte-identical, hashes in their report) rather than in a
+   separate clone. Weaker isolation than the other agents used; the hashes are the evidence.
