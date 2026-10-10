@@ -658,7 +658,31 @@ would break three previously-green product-level network checks.
   P3's `_`-boundary change was a strict improvement (16/41 probe inputs leaked before it, 9/41 after,
   zero regressions).
 
-## 10.6 Still open after this round
+## 10.6 A follow-up defect that 1f6b7b85d INTRODUCED, and its fix (`dd0e32094`)
+
+Measuring a shape no test built — a leaf whose declared dependency resolves to a GROUP (`L.detour = G`)
+— found a **false PASS created by the PATH-01 fix itself**:
+
+```text
+node "L"   route="L"        chain="L"   pos=0 exit=false entry=false   <- nothing asked of it
+node "m1"  route="G -> m1"  chain="m1"  pos=0 exit=true  entry=true
+node "m2"  route="G -> m2"  chain="m2"  pos=0 exit=true  entry=true
+reachable=true failures=0                       <- UDP delivered to a TCP-only L, accepted
+```
+
+Before 1f6b7b85d the shape was refused **by accident**: the un-numbered route left `L` at `Position 0`
+with a one-element chain, which the OLD `businessEntry` read as "nothing is dialled through me" — true
+for the wrong reason. Replacing that predicate removed the accident, so this was a regression to
+repair, not a pre-existing gap. The lesson generalises: **a predicate that is right by accident is a
+liability, and the shape it was accidentally right about is exactly the one no test covers.**
+
+The fix: a group reached as a DEPENDENCY is a branch of one route that already has hops in it, so the
+hops above it are ECHOED once per member and each member route ends at `L`. `enumerateHops` now takes
+the index the route begins at; `dependency_on_group_test.go` (3 tests) is the detector, reverse-broken
+by deleting the echo (`go build` exit 0 first; both model tests RED by assertion, the product test RED
+with `reachable=true failures=[]`).
+
+## 10.7 Still open after this round
 
 1. **`StatusView` is still not constructed by `box.go`** (§9.3) — unchanged by this round.
 2. **`SelectionStatus()` is not wired into any UI** (§9.4) — unchanged.
