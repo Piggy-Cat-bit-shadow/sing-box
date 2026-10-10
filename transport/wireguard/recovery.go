@@ -196,10 +196,14 @@ func (e *Endpoint) recoveryLoop() {
 			// Coalesced: a rebind for this generation already ran or is in flight.
 			return
 		}
-		// The rebind runs under the LEASE's context, derived from the lease's deadline, so a
-		// generation change or a close reaches a rebind that is already blocked in a dial. Running
+		// The rebind runs under the LEASE's context, derived from the lease's deadline, so a generation
+		// change or a close is observed by a rebind that has not yet STARTED its socket work. Running
 		// under the endpoint's own context would only observe the core shutting down, which is a
 		// different and much later event.
+		//
+		// Its reach stops at RebindStale's entry, and that is stated there rather than implied here: the
+		// socket reopen below takes no context, so a revocation arriving during it is a bounded latency
+		// rather than a cancellation. See RebindStale's own note for the measurement.
 		rebindCtx, cancel := context.WithTimeout(lease.Context(), e.rebindTimeout())
 		err := e.RebindStale(rebindCtx, reason)
 		cancel()
@@ -300,9 +304,28 @@ func (e *Endpoint) rebindTimeout() time.Duration {
 // recovery was limited, because silently changing a configured port would be a configuration
 // change, not a recovery.
 //
-// It is safe to call from the coordinator or directly: it observes ctx, it never runs while the
-// endpoint is suspended or closed, and the rebind itself is a device UAPI operation that holds the
-// device's own lock rather than ours.
+// It is safe to call from the coordinator or directly: it never runs while the endpoint is suspended or
+// closed, and the rebind itself is a device UAPI operation that holds the device's own lock rather
+// than ours.
+//
+// # What ctx actually reaches, and what it cannot
+//
+// ctx is observed ONCE, at entry. That is the whole of its reach, and it is a limitation of the
+// interface below rather than an oversight here: the socket is reopened by `BindUpdate`, which lands in
+// the dialer's listener control - `func(network, address string, conn syscall.RawConn) error`, with no
+// context parameter - so a revocation that arrives while that operation is running cannot be delivered
+// to it. MEASURED, with a rebind held inside a real socket open and the network generation advanced
+// under it: the lease is expired, its context is cancelled, and the rebind completes anyway, moving the
+// endpoint (port 61179 -> 61180 in that measurement).
+//
+// The consequence is a bounded REVOCATION LATENCY, not a leak and not a hang: the superseded generation
+// gets one socket reopen it would otherwise have asked for again, the endpoint still holds exactly one
+// socket, and Close still releases everything. The alternative available inside this repository - a
+// second ctx check between the two UAPI calls below - would narrow the window without closing it, and a
+// guard that does not do what its name says is worse than a measured and stated bound.
+//
+// Note that `closeRecovery` is NOT limited this way: a Close marks the endpoint closed, which
+// `BindUpdate`'s own path observes, which is why Close is correct even while a rebind is in flight.
 func (e *Endpoint) RebindStale(ctx context.Context, reason adapter.RebindReason) error {
 	if ctx.Err() != nil {
 		return ctx.Err()

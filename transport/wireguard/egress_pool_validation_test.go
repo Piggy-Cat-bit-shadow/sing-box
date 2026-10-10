@@ -142,8 +142,11 @@ func TestACompleteEgressPoolStillStarts(t *testing.T) {
 }
 
 // egressFixtureNetworkManager advertises the listener capability, which is what makes Endpoint.Start
-// take the standard-bind branch and build an egress pool. It deliberately does NOT auto-fill the
-// monitor, so a test can supply a nil one.
+// take the standard-bind branch and build an egress pool.
+//
+// Its own accessors always answer non-nil, so the endpoint built in the control test gets a complete
+// pool. The refusal cases do NOT go through them: they build the options with the field deliberately
+// left at its zero value, which is exactly the shape an embedder outside this repository can produce.
 type egressFixtureNetworkManager struct {
 	adapter.NetworkManager
 }

@@ -262,8 +262,15 @@ func (l *RebindLease) Reason() adapter.RebindReason {
 }
 
 // Context is cancelled when the lease stops being the owner: a generation change, a close, or the
-// owner's own parent context. A rebind must observe it, because it is the only thing that reaches
-// work already blocked in a dial.
+// owner's own parent context. A rebind must observe it, because it is the only thing that can reach
+// work the owner has already started.
+//
+// "can reach" is bounded by where the owner actually reads it, and a consumer must not read a stronger
+// guarantee into this: a step that is handed no context - a socket operation inside a library, for
+// instance - cannot be interrupted no matter how promptly this is cancelled. The WireGuard endpoint's
+// rebind is the measured example: it observes this at entry only, so a revocation arriving during its
+// socket reopen is a bounded latency rather than a cancellation, and `RebindStale` documents that
+// bound. Cancellation reaches what is written to observe it; it does not reach what is not.
 func (l *RebindLease) Context() context.Context {
 	if l == nil {
 		return context.Background()
