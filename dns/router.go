@@ -1915,6 +1915,28 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	metadata.DestinationAddressMatchFromResponse = false
 	if options.Transport != nil {
 		transport := options.Transport
+		// A FakeIP server ANSWERS a name with a synthetic address it invents, and the caller of this
+		// function is a dialer: the result is dialled. Every other path that could put a fakeip server
+		// in front of a real address already refuses it - the rule walk skips a fakeip transport when
+		// allowFakeIP is false (:411, :507), the manager refuses it as a default (:228) and refuses to
+		// replace one (:224), the evaluate action refuses it outright (:2427), and its answers are kept
+		// out of the reverse mapping (:1621). This branch was the one that did not, and a caller that
+		// names one explicitly - `domain_resolver` on an outbound, or route.default_domain_resolver -
+		// therefore received the fake address as though it were real.
+		//
+		// MEASURED before this check: Lookup("leak.test", Transport=fakeip) returned [198.18.0.1] with no
+		// error, while the router's own store mapped 198.18.0.1 back to "leak.test" - so the address
+		// handed to the dialer was one only this process can interpret, and the reverse mapping that
+		// would have identified it is excluded for exactly that reason one screen up.
+		//
+		// Refusing rather than falling through is the same choice the evaluate action makes, and for the
+		// same reason: the configuration names a server that cannot answer this question, so the honest
+		// answer is an error that names it rather than a different server's answer.
+		if transport.Type() == C.DNSTypeFakeIP {
+			return nil, E.New("domain resolver ", transport.Tag(),
+				" is a fakeip server: a fakeip server answers with a synthetic address that is only ",
+				"meaningful inside this process, so it cannot resolve a destination that will be dialled")
+		}
 		if options.Strategy == C.DomainStrategyAsIS {
 			options.Strategy = r.defaultDomainStrategy
 		}
