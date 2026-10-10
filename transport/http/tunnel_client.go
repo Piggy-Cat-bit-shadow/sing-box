@@ -96,16 +96,22 @@ func (c *Client) OpenTunnelWithInfo(ctx context.Context, protocol string, path s
 // openTunnel returns the transport each successful branch used, so the caller never has to
 // infer it from which connection objects happen to exist.
 func (c *Client) openTunnel(ctx context.Context, request tunnelRequest) (net.Conn, DatagramStream, TunnelTransport, error) {
+	if c.closed.Load() {
+		return nil, nil, TunnelTransportUnknown, net.ErrClosed
+	}
 	if c.http3Available() {
+		// Stamped before the attempt for the same reason as in DialContext: the verdict must be
+		// decided by the newest attempt STARTED, not by whichever one reports last.
+		http3Attempt := c.beginHTTP3Attempt()
 		stream, err := c.http3.OpenTunnel(ctx, request)
 		if err == nil {
-			c.clearHTTP3Broken()
+			c.clearHTTP3Broken(http3Attempt)
 			return nil, stream, TunnelTransportHTTP3, nil
 		}
 		if c.disableVersionFallback || !errors.Is(err, ErrHTTP3Unavailable) {
 			return nil, nil, TunnelTransportUnknown, err
 		}
-		c.markHTTP3Broken()
+		c.markHTTP3Broken(http3Attempt)
 	}
 	if !extendedConnectAvailable && c.tlsDialer != nil && c.disableVersionFallback {
 		return nil, nil, TunnelTransportUnknown, errExtendedConnectUnavailable

@@ -131,6 +131,14 @@ type Client struct {
 	http3                           http3Client
 	http3Broken                     atomic.Int64
 	http3Backoff                    atomic.Int64
+	// http3Attempt issues the sequence number that stamps one HTTP/3 attempt, and http3Outcome is
+	// the highest sequence whose outcome has already been recorded. Together they are what makes
+	// the verdict a memory of the NEWEST attempt rather than of whichever attempt reported last.
+	// See claimHTTP3Outcome.
+	http3Attempt atomic.Uint64
+	http3Outcome atomic.Uint64
+	// closed is set by Close. A closed client must not create a connection: see Close.
+	closed atomic.Bool
 	// lifecycleLogger is used ONLY for connection-lifecycle tracing. Every call site must
 	// stay at TRACE/DEBUG: the success path must be silent at INFO and above, and nothing
 	// sensitive (Authorization, Proxy-Authorization, credentials, destination query strings)
@@ -268,7 +276,68 @@ func (c *Client) http3Available() bool {
 	return brokenUntil == 0 || time.Now().UnixNano() >= brokenUntil
 }
 
+// beginHTTP3Attempt issues the sequence number that stamps one HTTP/3 attempt.
+//
+// It is taken BEFORE the attempt is made, so "newer" means "started later" rather than "reported
+// later". That is the ordering the verdict needs: an attempt that started earlier describes an
+// earlier moment, and if a later attempt has already succeeded, the earlier one's failure is
+// evidence about a condition that is over.
+func (c *Client) beginHTTP3Attempt() uint64 {
+	return c.http3Attempt.Add(1)
+}
+
+// claimHTTP3Outcome reports whether this attempt's outcome is still the newest observation, and
+// records it if so.
+//
+// # Why the verdict has to be ordered at all
+//
+// markHTTP3Broken and clearHTTP3Broken used to act on arrival order, and arrival order is not
+// attempt order. Two dials can be in flight across the attempt boundary -- the HTTP/3 client
+// serialises the handshake, but a dial that has already returned from its attempt and one that is
+// about to make one are independent goroutines -- so an attempt that started first can report
+// last. A stale failure then arms the verdict directly on top of a newer success, pinning the
+// client to the fallback transport for the backoff window (and charging an escalation step, so up
+// to the ceiling) on the strength of a condition the success already disproved. The mirror case
+// is just as wrong: a stale success clears a newer failure, so a client that has just watched
+// HTTP/3 fail pays a failed attempt on every dial.
+//
+// # Why the claim is a compare-and-swap loop rather than a mutex
+//
+// This is on the dial path, and a mutex here would serialise the decision of every H3 dial behind
+// every other one. One atomic load and, at most, one CAS is the whole cost, and the loop only
+// spins when a genuinely concurrent outcome lands between the load and the store.
+//
+// # What it does not do
+//
+// It never refuses an outcome that is NEWER than the last one recorded, so the memory is not
+// weakened: a failure that happens after the last success is still remembered, at the initial
+// step. It only refuses outcomes that a newer attempt has already superseded.
+func (c *Client) claimHTTP3Outcome(attempt uint64) bool {
+	for {
+		recorded := c.http3Outcome.Load()
+		if attempt <= recorded {
+			return false
+		}
+		if c.http3Outcome.CompareAndSwap(recorded, attempt) {
+			return true
+		}
+	}
+}
+
+// supersedeHTTP3Outcomes marks every attempt issued so far as stale.
+//
+// A network transition is the case this exists for: an attempt that was in flight against the
+// network being LEFT belongs to that network, so its outcome is not evidence about the one just
+// entered. Without this, ResetConnections clears the verdict and the abandoned attempt immediately
+// re-arms it, charging the first dial on the new path for the old path's failure.
+func (c *Client) supersedeHTTP3Outcomes() {
+	c.claimHTTP3Outcome(c.http3Attempt.Load())
+}
+
 // markHTTP3Broken records a failed HTTP/3 attempt and advances the backoff schedule by one step.
+//
+// `attempt` is the sequence number beginHTTP3Attempt issued for the attempt being reported. An
+// outcome that a newer attempt has already superseded is refused: see claimHTTP3Outcome.
 //
 // # One failing event, one step
 //
@@ -287,7 +356,10 @@ func (c *Client) http3Available() bool {
 // A failure that arrives while a window is open is deliberately NOT charged again: it cannot be
 // distinguished from the failure that opened the window, and charging one event twice is the
 // direction that strands the caller on HTTP/2.
-func (c *Client) markHTTP3Broken() {
+func (c *Client) markHTTP3Broken(attempt uint64) {
+	if !c.claimHTTP3Outcome(attempt) {
+		return
+	}
 	now := time.Now()
 	brokenUntil := c.http3Broken.Load()
 	if brokenUntil != 0 && now.UnixNano() < brokenUntil {
@@ -307,12 +379,23 @@ func (c *Client) markHTTP3Broken() {
 	c.http3Backoff.Store(int64(next))
 }
 
-func (c *Client) clearHTTP3Broken() {
+// clearHTTP3Broken discards the verdict for a successful HTTP/3 attempt.
+//
+// `attempt` is the sequence number beginHTTP3Attempt issued. A success that a NEWER attempt has
+// already superseded does not clear the verdict, for the reason given on claimHTTP3Outcome: the
+// newer attempt is the more recent observation of the path, and the older one cannot speak for it.
+func (c *Client) clearHTTP3Broken(attempt uint64) {
+	if !c.claimHTTP3Outcome(attempt) {
+		return
+	}
 	c.http3Broken.Store(0)
 	c.http3Backoff.Store(0)
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if c.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
 	case N.NetworkUDP:
@@ -321,6 +404,10 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
 	if c.http3Available() {
+		// The sequence number is taken BEFORE the attempt, so an outcome is judged against the
+		// newest attempt STARTED rather than the one that happened to report last. See
+		// claimHTTP3Outcome.
+		http3Attempt := c.beginHTTP3Attempt()
 		// The H3 attempt gets its OWN window, not the caller's whole dial budget; see
 		// http3EstablishTimeout. context.WithTimeout resolves to the EARLIER of this window and
 		// the caller's deadline, so a caller with less time than the window is not delayed by it.
@@ -329,7 +416,7 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		probeExpired := probeCtx.Err() != nil
 		cancelProbe()
 		if err == nil {
-			c.clearHTTP3Broken()
+			c.clearHTTP3Broken(http3Attempt)
 			return conn, nil
 		}
 		// The CALLER gave up, or the core is closing. That is a local lifecycle event: it is not
@@ -365,7 +452,7 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 		if !probeExpired && !errors.Is(err, ErrHTTP3Unavailable) {
 			return nil, err
 		}
-		c.markHTTP3Broken()
+		c.markHTTP3Broken(http3Attempt)
 	}
 	if c.tlsDialer != nil && !c.http2Unsupported.Load() {
 		clientConn, conn, err := c.acquireHTTP2(ctx)
@@ -403,7 +490,12 @@ func (c *Client) ResetConnections() {
 	c.http2ExtendedConnectUnsupported.Store(false)
 	if c.http3 != nil {
 		c.http3.ResetConnection()
-		c.clearHTTP3Broken()
+		// Anything already in flight belongs to the network being left, so it is superseded
+		// BEFORE the verdict is cleared: otherwise an abandoned attempt reports its failure a
+		// moment later and re-arms the verdict on the network that was just entered.
+		c.supersedeHTTP3Outcomes()
+		c.http3Broken.Store(0)
+		c.http3Backoff.Store(0)
 	}
 }
 
@@ -476,7 +568,26 @@ func buildRequestHeader(headers http.Header, authorization string, originAuthori
 	return header
 }
 
+// Close releases the client, and a closed client stops being a dialer.
+//
+// # Why the closed flag is not decoration
+//
+// Close is reached from the outbound's composition scope at shutdown and on a configuration
+// reload. Before the flag existed, a dial that raced that teardown found `c.http3` non-nil and the
+// verdict clear, so it went on to perform a whole QUIC handshake and install a connection on a
+// transport that had ALREADY been closed. Nothing owns that connection afterwards: the scope has
+// run, so no later Close reaches it, and the socket lives until the process does.
+//
+// MEASURED on the loopback HTTP/3 stand (h3_churn_stand_test.go,
+// TestH3StandCloseDuringChurnIsClean): a tunnel established after Close returned successfully over
+// HTTP/3, with no error at all.
+//
+// The flag is set BEFORE the teardown, so a dial that observes the client as open is either
+// already inside a teardown that will reach its connection, or has been refused. It is checked
+// first in every entry point that can create a connection, and the error is net.ErrClosed, which
+// the route layer already classifies as a closed/canceled lifecycle event rather than a fault.
 func (c *Client) Close() error {
+	c.closed.Store(true)
 	c.http2Access.Lock()
 	defer c.http2Access.Unlock()
 	c.closeHTTP2Locked()
