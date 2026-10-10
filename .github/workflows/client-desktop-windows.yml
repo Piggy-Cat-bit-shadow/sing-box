@@ -145,7 +145,17 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.toolchain.outputs.go }}
-          cache: false
+          # The Go module graph this job builds is the CORE checkout's, not this
+          # repository's: `pnpm run package:win` runs build_boxdd inside `core`, which
+          # is pinned at CORE_SHA. That is why caching was off - setup-go's default key
+          # is the root go.sum, and there is no root go.sum here (the publishing tooling
+          # is checked out under `tooling/`, `core/` and `build/` are the only other
+          # roots), so the default key would either not resolve or key on a file the
+          # build never reads. Keyed on core/go.sum the cache is correct and stable
+          # across runs, because the core pin is a fixed commit: the daemon's whole
+          # dependency graph is downloaded once instead of on every run.
+          cache: true
+          cache-dependency-path: core/go.sum
 
       - name: "[gate 1] install Node ${{ steps.toolchain.outputs.node }}"
         uses: actions/setup-node@v4

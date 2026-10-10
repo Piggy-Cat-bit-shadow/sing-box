@@ -39,8 +39,16 @@ name: Reference interop (Xray)
 # leg and the hybrid scenarios skip on the classical leg, and each leg's artifact
 # list records which one ran.
 #
-# The default (non-live) half of the stand runs in the `Verify` workflow on every
-# push; this one adds the reference.
+# The default (non-live) half of the stand is NOT wired into the push-time `Verify`
+# workflow: that workflow's test steps are scoped to the packages this fork changes in
+# the root module, and this package lives in the separate `test` module. The earlier
+# version of this comment claimed the opposite, which is exactly the assumption
+# test/interop/README.md warns against ("some CI runs it" is what lets a suite rot) and
+# would have invited deleting the step below as redundant. It runs HERE and nowhere
+# else - `cd test && go test -tags "$TAGS" ./interop/` appears in this file only - so
+# the `default (non-live) half of the stand` step is a gate, not a warm-up, and the
+# generator, the scenario matrix and the live-gate refusals would have no automated
+# caller at all without it.
 
 on:
   workflow_dispatch:

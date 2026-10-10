@@ -278,9 +278,16 @@ jobs:
             --parent-sha "${{ github.sha }}"
           ./scripts/ci/apple-libbox-artifact.sh install build/apple-libbox "$APPLE_CLIENT_DIR"
 
-      - name: warm the Go module cache
-        run: go mod download all
-
+      # `go mod download all` used to run here. Nothing in this job compiles this
+      # repository's Go code: Libbox arrives as the artifact the two steps above
+      # download and install, and the Xcode build, the overlays and every check this
+      # job runs are shell, python3 and xcodebuild. The step pulled the entire module
+      # graph into a job that reads none of it, so it is gone.
+      #
+      # `setup-go` is deliberately KEPT: whether any Xcode build phase shells out to
+      # `go` cannot be proven from this repository, because clients/apple is a
+      # submodule. A phase that did would resolve its own dependencies; downloading
+      # the graph up front is not what makes that work.
       - name: Apple signing preflight
         # In unsigned mode this prints SKIP. In development mode it fails with an
         # actionable message rather than letting xcodebuild produce an artifact
@@ -537,9 +544,11 @@ jobs:
           set -euo pipefail
           ./scripts/ci/test-apple-macos-name.sh
 
-      - name: warm the Go module cache
-        run: go mod download all
-
+      # No `go mod download all` here either - see the note in the ios job. This job
+      # compiles no Go from this repository: Libbox is the shared artifact, and the
+      # gomobile install above fetches its OWN toolchain module (`go install
+      # github.com/sagernet/gomobile/cmd/gomobile@<version>`), which does not read this
+      # module's graph or go.sum.
       - name: Apple signing preflight
         run: ./scripts/ci/check-apple-signing-environment.sh
 

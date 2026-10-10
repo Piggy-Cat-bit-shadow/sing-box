@@ -66,6 +66,11 @@ jobs:
   core:
     name: sing-box.exe (windows/amd64)
     runs-on: ubuntu-latest
+    # Three full windows/amd64 cross-builds (the release artifact, the unstripped build
+    # the symbol check reads, and the upstream-baseline negative control) plus packaging
+    # and the zip re-expansion. This job had NO ceiling, so a hung build or a wedged
+    # module download would have burned the 360-minute default before anyone saw it.
+    timeout-minutes: 60
     steps:
       - name: Check out the source to build
         uses: actions/checkout@v5
@@ -74,6 +79,21 @@ jobs:
           # Everything compiled below comes from this checkout and nothing else.
           ref: ${{ github.event.inputs.source_ref || github.ref }}
           fetch-depth: 0
+
+      # The pinned toolchain is installed BEFORE the step that records it. version.sh
+      # reports JJ_GO_VERSION from `go env GOVERSION`, and this step used to run after
+      # the provenance step instead of before it, so that value was whichever Go the
+      # runner image happened to ship - or `unknown` if it shipped none - while the
+      # build below compiled with env.GO_VERSION. build-info.json records it as
+      # `go_declared_in_go_mod`, so the shipped record could name a toolchain that built
+      # nothing and disagree with its own `go_toolchain` field. Installing first makes
+      # the recorded value the toolchain that actually compiles. No artifact byte
+      # changes: JJ_GO_VERSION is not in the ldflags.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
       - name: Resolve the version, the build tags and the provenance
         shell: bash
@@ -132,12 +152,6 @@ jobs:
           echo "tags profile   : $TAGS_PROFILE"
           echo "tags file      : $tags_file"
           echo "tags           : $tags"
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
 
       - name: Report the resolved inputs
         shell: bash
