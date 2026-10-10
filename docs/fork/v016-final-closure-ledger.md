@@ -18,6 +18,64 @@ STATUS                  see the closing block
 
 ---
 
+> # STOP-SHIP: PATH-01 IS NOT CLOSED
+>
+> An independent adversarial review (role F) **falsified** this round's headline claim, and the
+> falsification was reproduced. `Hops()`/`Leaves()` still do NOT report packet order, so `Build` and
+> `Hops` still disagree - which is the exact defect section 1 below claims to have fixed.
+>
+> ```text
+> MEASURED   Hops(exit) for exit.detour = entry:  exit pos=0, entry pos=0
+>            Build(exit):                          exit pos=1
+> MEASURED   Hops(c) for c.detour=b, b.detour=a:   EVERY node pos=0
+> ```
+>
+> **Root cause.** `leaves.go` reverses a route only when a MEMBER's recursion reports that it ended
+> one, inside the group's member loop, and the root call's own flag is DISCARDED:
+>
+> ```go
+> _, err = scope.enumerateHops(root, ...)            // flag dropped
+> if memberEnded { e.reverseRoute(memberStart) }      // the only reversal
+> ```
+>
+> So the segment consisting of the root's own node plus everything appended after the last child
+> returned is never reversed. Two consequences, both user-visible:
+>
+> 1. **A FALSE PASS.** `Position` keeps its append-time value, so on a chain the routing-selected hop
+>    AND its underlay both read 0 and `businessEntry` is false for EVERY node of every chain of depth
+>    >= 2. `advertisedNetworks` then returns nil, `nodeRequirementFor` returns nil, and
+>    `validateNode`'s network step is `if len(requirement) > 0` - **skipped**. A detour chain reached
+>    by a rule with no explicit `network:` therefore receives NO network validation at all. That is
+>    the failure class START-01 exists to remove, reached from the other side.
+> 2. **An empty leaf list.** `Exit` is never assigned, so `Leaves()` returns ZERO entries for a
+>    dependency-free outbound.
+>
+> **Why it survived a round that claimed to fix it.** Every test in `common/physicalpath` is green,
+> `adapter/outbound` is green and `route` is green, because the manager ASSUMES `Position`/`Exit` mean
+> packet order and the package ASSUMES its own numbering is right. Neither owner sees the seam. The
+> file the round NAMED as its verification, `common/dialer/detour_wire_order_test.go`, is **green for
+> the wrong reason**: with `reversePacketOrder(&path)` deleted from `Build`, all four of its tests still
+> PASS, because it never calls `Build` - it only builds `NewDetour` over its own fake outbounds. Its
+> sibling `TestThePacketOrderContractIsTheReverseOfTheDependencyWalk` reverses a hard-coded slice
+> literal with its own loop, which is a tautology.
+>
+> **What is committed in response.** `detour_wire_order_pin_test.go` is the missing pin: it reads its
+> expected values out of the wire log and asserts them against `Build`, so it FAILS under that mutation
+> and PASSES on this tree. The four `*attack_test.go` files are F's detectors, committed RED ON
+> PURPOSE as a specification the fix must satisfy. They are not a broken build and must not be
+> "fixed" by inverting them.
+>
+> **What was NOT committed, and why.** Two fix attempts were written and both were reverted. The first
+> reversed inside every recursing frame, so the result depended on the route's DEPTH. The second let
+> the root reverse the whole range, which re-reversed what a child had already corrected and turned a
+> two-hop chain into `[entry, exit]`. The correct implementation is a per-frame ROTATION of the frame's
+> own node to the front of its own segment, with `Position` and `Exit` DERIVED from the settled list
+> rather than maintained while it is built. Shipping a third speculative attempt without the detectors
+> green throughout would repeat the mistake this review exists to catch.
+>
+> `PHYSICALPATH_ORDER_AND_CONTRACT` is therefore **NOT_READY**, and the closing block below has been
+> corrected accordingly.
+
 ## 1. PATH-01 — `Hops` reported the OPPOSITE packet order from `Build`
 
 `Build` reverses its walk; `leaves.go`'s enumeration did not. For the same topology:
@@ -347,13 +405,18 @@ TUIC's measured 1232 datagram, `common/physicalpath/status.go`, the COPY-01 allo
 Recorded after the last push; see the git evidence in the session report for the exact values.
 
 ```text
-PHYSICALPATH_ORDER_AND_CONTRACT = READY    (Build and Hops agree; ControlPath is the decision order)
+PHYSICALPATH_ORDER_AND_CONTRACT = NOT_READY (Build and Hops STILL DISAGREE - see the STOP-SHIP
+                                  banner at the top; four detectors are committed red on
+                                  purpose as the specification the fix must satisfy)
 STARTUP_COMPATIBILITY           = READY    (the nine relaxed configurations hold; the matrix is green)
 DNS_OWNERSHIP_AND_L0            = READY    (unchanged from the earlier round, re-run green)
 WIREGUARD_BIND_AND_LIFECYCLE    = READY    (port owned or Start fails; nil dialer fails closed)
 MTU_PATH_BUDGET                 = PARTIAL  (WG measured; HY2 ChromeParrot BLOCKED on the pinned fork)
 H3_FALLBACK                     = READY    (both memories fixed and re-run)
-PER_HOP_STATUS                  = READY    (read-only, no new timers or goroutines)
+PER_HOP_STATUS                  = READY    (read-only, no new timers or goroutines) - but it
+                                  reports through Path.Exit(), which is correct, while the dry
+                                  run reports through PathNode.Exit, which is not, so the two
+                                  can name different hops in the same report
 COPY_PATH                       = MEASURED (COPY-01 audited with allocation numbers; no invented knob)
 FULL_TEST_COVERAGE              = REACHED_MODULE_END
 FULL_TEST_RESULT                = COMPLETED_WITH_FAILURES (3 BLOCKED_ENV suites)
