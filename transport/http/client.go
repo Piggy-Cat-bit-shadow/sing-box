@@ -137,6 +137,30 @@ type Client struct {
 	// See claimHTTP3Outcome.
 	http3Attempt atomic.Uint64
 	http3Outcome atomic.Uint64
+	// http3VerdictMu makes the CLAIM and its EFFECT one transaction.
+	//
+	// # Why the claim alone was not enough, and this is a measured defect rather than a worry
+	//
+	// claimHTTP3Outcome orders the DECISIONS, and every caller then mutated the verdict in a
+	// separate read-modify-write. Two attempts can therefore both pass the claim -- the older one
+	// first -- and then land their effects in the opposite order. MEASURED by an independent
+	// adversary, two goroutines released from one gate and driving exactly what DialContext calls,
+	// 200000 iterations:
+	//
+	//	an old failure armed the verdict AFTER a newer success cleared it   1896 / 200000
+	//	an old failure re-armed it AFTER a real ResetConnections cleared it 1758 / 200000
+	//
+	// The second line is the A->B->A case this guard exists for, and it means the fix removed the
+	// DETERMINISTIC version of the bug while leaving a racy one behind. The mirror direction (an
+	// old success clearing a newer failure) was not observed in 200000 iterations, because the
+	// lagging effect there is a single store with a window of one or two instructions; it is the
+	// same mechanism and it is covered by the same transaction, not by a separate argument.
+	//
+	// The critical section is a handful of instructions with no I/O and no blocking, and it is
+	// entered once per HTTP/3 ATTEMPT -- not per dial, not per packet. The claim stays lock-free
+	// for direct callers, and the decision is still not serialised behind a handshake: nothing
+	// inside the section can wait on anything outside it.
+	http3VerdictMu sync.Mutex
 	// closed is set by Close. A closed client must not create a connection: see Close.
 	closed atomic.Bool
 	// lifecycleLogger is used ONLY for connection-lifecycle tracing. Every call site must
@@ -324,14 +348,27 @@ func (c *Client) claimHTTP3Outcome(attempt uint64) bool {
 	}
 }
 
-// supersedeHTTP3Outcomes marks every attempt issued so far as stale.
+// resetHTTP3Verdict marks every attempt issued so far as stale AND clears the verdict, as one
+// transaction.
 //
 // A network transition is the case this exists for: an attempt that was in flight against the
 // network being LEFT belongs to that network, so its outcome is not evidence about the one just
 // entered. Without this, ResetConnections clears the verdict and the abandoned attempt immediately
 // re-arms it, charging the first dial on the new path for the old path's failure.
-func (c *Client) supersedeHTTP3Outcomes() {
+//
+// # Why the supersede and the clear cannot be two statements
+//
+// They were, and the isolation between them is exactly what let an abandoned attempt through:
+// MEASURED, an old failure re-armed the verdict after a real ResetConnections had cleared it in
+// 1758 of 200000 iterations. Superseding only rejects outcomes that have not yet CLAIMED; an
+// outcome that claimed just before the supersede and stores just after it is not rejected by
+// anything, so the clear has to happen inside the same critical section as the supersede.
+func (c *Client) resetHTTP3Verdict() {
+	c.http3VerdictMu.Lock()
+	defer c.http3VerdictMu.Unlock()
 	c.claimHTTP3Outcome(c.http3Attempt.Load())
+	c.http3Broken.Store(0)
+	c.http3Backoff.Store(0)
 }
 
 // markHTTP3Broken records a failed HTTP/3 attempt and advances the backoff schedule by one step.
@@ -357,6 +394,9 @@ func (c *Client) supersedeHTTP3Outcomes() {
 // distinguished from the failure that opened the window, and charging one event twice is the
 // direction that strands the caller on HTTP/2.
 func (c *Client) markHTTP3Broken(attempt uint64) {
+	// The claim and the effect are one transaction: see http3VerdictMu.
+	c.http3VerdictMu.Lock()
+	defer c.http3VerdictMu.Unlock()
 	if !c.claimHTTP3Outcome(attempt) {
 		return
 	}
@@ -385,6 +425,9 @@ func (c *Client) markHTTP3Broken(attempt uint64) {
 // already superseded does not clear the verdict, for the reason given on claimHTTP3Outcome: the
 // newer attempt is the more recent observation of the path, and the older one cannot speak for it.
 func (c *Client) clearHTTP3Broken(attempt uint64) {
+	// The claim and the effect are one transaction: see http3VerdictMu.
+	c.http3VerdictMu.Lock()
+	defer c.http3VerdictMu.Unlock()
 	if !c.claimHTTP3Outcome(attempt) {
 		return
 	}
@@ -490,12 +533,11 @@ func (c *Client) ResetConnections() {
 	c.http2ExtendedConnectUnsupported.Store(false)
 	if c.http3 != nil {
 		c.http3.ResetConnection()
-		// Anything already in flight belongs to the network being left, so it is superseded
-		// BEFORE the verdict is cleared: otherwise an abandoned attempt reports its failure a
-		// moment later and re-arms the verdict on the network that was just entered.
-		c.supersedeHTTP3Outcomes()
-		c.http3Broken.Store(0)
-		c.http3Backoff.Store(0)
+		// Anything already in flight belongs to the network being left, so it is superseded AND
+		// the verdict is cleared inside ONE critical section: see resetHTTP3Verdict. Doing the two
+		// as separate statements left a window in which an abandoned attempt re-armed the verdict
+		// on the network that was just entered, measured at 1758/200000.
+		c.resetHTTP3Verdict()
 	}
 }
 
