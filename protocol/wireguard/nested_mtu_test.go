@@ -316,3 +316,100 @@ func TestANestedCapacityBelowTheIPv6MinimumIsRefused(t *testing.T) {
 	// the refusal.
 	require.Equal(t, netip.MustParsePrefix("fd17::1/128").Addr().Is6(), true)
 }
+
+// TestAClampedMTUReportsTheDetourThatProducedIt is the half the refusal needs in order to be
+// actionable, and the boundary is the whole test.
+//
+// `boundedBy` is non-empty exactly when the clamp CHANGED the value - not when a detour was involved.
+// That is what keeps the advice honest in both directions:
+//
+//	a value the clamp produced   the operator cannot raise it (a larger one is clamped back), so a
+//	                             refusal that leads with "raise `mtu`" is instructing them to do the
+//	                             one thing that cannot work
+//	the operator's own value     at or below the ceiling the value is kept, so it IS theirs to raise
+//	                             and the generic message is the right one
+func TestAClampedMTUReportsTheDetourThatProducedIt(t *testing.T) {
+	ctx, _ := nestingContext(t, map[string]adapter.Endpoint{
+		"outer": &nestedEndpoint{innerMTU: 1210, overhead: wireGuardEncapOverhead},
+	})
+	// 1210 - 48 (inner IPv6 + UDP) - 32 (the outer tunnel's framing) = 1130.
+	const ceiling = 1210 - 48 - wireGuardEncapOverhead
+	// The constant difference between a detour's own inner MTU and the capacity it proves: 48 + 32.
+	const capacityGap = 48 + wireGuardEncapOverhead
+
+	cases := []struct {
+		name       string
+		configured uint32
+		want       uint32
+		wantBound  string
+		comment    string
+	}{
+		{
+			name: "unset", configured: 0, want: ceiling, wantBound: "outer",
+			comment: "the capacity IS the preference, and it is still not the operator's number",
+		},
+		{
+			name: "above the ceiling", configured: 1408, want: ceiling, wantBound: "outer",
+			comment: "this is the case the actionable refusal exists for: 1408 was asked for and 1130 " +
+				"was used, so telling the operator to raise `mtu` would send them in a circle",
+		},
+		{
+			name: "one byte above the ceiling", configured: ceiling + 1, want: ceiling, wantBound: "outer",
+			comment: "the clamp is what decides, not the size of the difference",
+		},
+		{
+			name: "exactly at the ceiling", configured: ceiling, want: ceiling, wantBound: "",
+			comment: "nothing was changed, so the value is the operator's own and is theirs to raise - " +
+				"bounding this case would withhold advice that would work",
+		},
+		{
+			name: "below the ceiling", configured: 1000, want: 1000, wantBound: "",
+			comment: "kept unchanged, for the same reason",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			mtu, boundedBy, boundedRequired := nestedTunnelMTUFrom(ctx, log.NewNOPFactory().Logger(),
+				"inner", "outer", testCase.configured)
+			require.EqualValues(t, testCase.want, mtu, testCase.comment)
+			require.Equal(t, testCase.wantBound, boundedBy, testCase.comment)
+			if testCase.wantBound == "" {
+				require.Zero(t, boundedRequired,
+					"the detour's required MTU is meaningless unless the detour is what bounded this one")
+				return
+			}
+			// The number the operator has to go and set. It is not a restatement of the headers: it is
+			// the detour's own inner MTU plus the shortfall from what it proves to what IPv6 needs, and
+			// the two must be consistent - a detour at `boundedRequired` proves exactly the minimum.
+			require.EqualValues(t, 1360, boundedRequired)
+			require.EqualValues(t, boundedRequired-capacityGap, uint32(1280),
+				"a detour at the required MTU must prove exactly the IPv6 minimum for a nested tunnel: "+
+					"1210 + 150 = 1360, and 1360 - 80 = 1280")
+		})
+	}
+
+	// The required number must not be emitted for a detour whose capacity is already enough: there is
+	// nothing to raise, and a number there would send an operator to change a working configuration.
+	enoughCtx, _ := nestingContext(t, map[string]adapter.Endpoint{
+		"outer": &nestedEndpoint{innerMTU: 1408, overhead: wireGuardEncapOverhead},
+	})
+	enough, enoughBound, enoughRequired := nestedTunnelMTUFrom(enoughCtx, log.NewNOPFactory().Logger(),
+		"inner", "outer", 0)
+	require.EqualValues(t, 1408-48-wireGuardEncapOverhead, enough)
+	require.Equal(t, "outer", enoughBound)
+	require.Zero(t, enoughRequired, "a capacity that already carries IPv6 needs no detour MTU named")
+
+	// A detour whose capacity is NOT provable changes nothing and must not claim to have bounded
+	// anything: an unknown capacity is not a small one.
+	unknownCtx, _ := nestingContext(t, map[string]adapter.Endpoint{})
+	mtu, boundedBy, _ := nestedTunnelMTUFrom(unknownCtx, log.NewNOPFactory().Logger(), "inner", "outer", 1408)
+	require.EqualValues(t, 1408, mtu)
+	require.Empty(t, boundedBy)
+
+	// And neither does a detour with no ceiling to apply.
+	limited, hasCeiling := dialer.PathCapacity{InnerMTU: 1210, Known: true,
+		EncapsulatedOverhead: wireGuardEncapOverhead}.QuicPayloadCeiling()
+	require.True(t, hasCeiling)
+	require.EqualValues(t, ceiling, limited)
+}

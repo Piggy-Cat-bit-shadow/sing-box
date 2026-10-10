@@ -126,7 +126,7 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if options.MTU == 0 {
 		options.MTU = 1408
 	}
-	if err = validateTunnelMTU(options.MTU, options.Address); err != nil {
+	if err = validateTunnelMTU(options.MTU, options.Address, options.MTUBoundedBy, options.MTUBoundedRequired); err != nil {
 		return nil, err
 	}
 	return &Endpoint{
@@ -370,9 +370,17 @@ func (e *Endpoint) Start(postStart bool) error {
 	return nil
 }
 
-// minimumIPv6TunnelMTU is the smallest inner IP MTU over which IPv6 can be carried, from RFC 8200
+// MinimumIPv6TunnelMTU is the smallest inner IP MTU over which IPv6 can be carried, from RFC 8200
 // section 5: every link on an IPv6 path must carry 1280 bytes, and a tunnel interface is a link.
-const minimumIPv6TunnelMTU = 1280
+//
+// It is exported because protocol/wireguard has to name it too: a nested endpoint's MTU can be bounded
+// by a detour's capacity, and the remedy it reports is the detour MTU that would prove this much
+// capacity. One definition, read from both places, is the point.
+const MinimumIPv6TunnelMTU = 1280
+
+// minimumIPv6TunnelMTU is the in-package reading of the exported constant above, kept so the validation
+// below and its tests read as they did before the export.
+const minimumIPv6TunnelMTU = MinimumIPv6TunnelMTU
 
 // validateTunnelMTU refuses a tunnel whose MTU cannot carry the addresses it is configured with.
 //
@@ -398,13 +406,44 @@ const minimumIPv6TunnelMTU = 1280
 // `Address` is the tunnel's own address set, and it is what the endpoint hands to the device and
 // judges flows against. An IPv6 prefix there means this endpoint is expected to carry IPv6; no IPv6
 // prefix means it is an IPv4-only tunnel, whatever the MTU, and it is left exactly as it was.
-func validateTunnelMTU(mtu uint32, addresses []netip.Prefix) error {
+func validateTunnelMTU(
+	mtu uint32,
+	addresses []netip.Prefix,
+	// boundedBy names the `detour` whose proven capacity produced the MTU, and is empty when the value
+	// is the operator's own. It changes the ADVICE, never the decision: both cases are refused, because
+	// an IPv6 address is unreachable on a tunnel below 1280 whichever way the number was arrived at.
+	boundedBy string,
+	// boundedRequired is the `mtu` the detour would need in order to prove a capacity large enough for
+	// this tunnel to carry IPv6, and is meaningful only when boundedBy is set. It is handed in rather
+	// than re-derived here: the header lengths and the detour's own encapsulation are common/dialer's
+	// arithmetic, and a second derivation in this package would be a second thing to keep in step.
+	boundedRequired uint32,
+) error {
 	if mtu >= minimumIPv6TunnelMTU {
 		return nil
 	}
 	for _, prefix := range addresses {
 		if !prefix.Addr().Is6() || prefix.Addr().Is4In6() {
 			continue
+		}
+		if boundedBy != "" {
+			// The one remediation the operator cannot perform is the one the generic message leads
+			// with, so it must not be offered here at all: `mtu` is derived from `detour`, and a larger
+			// configured value is clamped straight back to this same number. The reachable levers are
+			// named instead, and the detour's own number is given as a value rather than as a
+			// description of one, because it is the thing the operator has to go and change.
+			//
+			// MEASURED: a detour with a 1210-byte inner MTU produces a 1130-byte nested MTU, and the
+			// detour would need 1210 + (1280 - 1130) = 1360 bytes of its own for this tunnel to carry
+			// the address.
+			return E.New("`mtu` ", mtu, " cannot carry the IPv6 address ", prefix.Addr(),
+				": an IPv6 path requires at least ", minimumIPv6TunnelMTU,
+				" bytes (RFC 8200 section 5), so the configured address is unreachable. ",
+				"This MTU was not configured: it is the capacity detour `", boundedBy,
+				"` proves for a tunnel nested inside it, so raising `mtu` cannot help - any larger value ",
+				"is clamped back to ", mtu, ". Raise the detour's own `mtu` to at least ",
+				boundedRequired, " bytes, or remove the IPv6 address to run an IPv4-only tunnel at ",
+				"this MTU")
 		}
 		return E.New("`mtu` ", mtu, " cannot carry the IPv6 address ", prefix.Addr(),
 			": an IPv6 path requires at least ", minimumIPv6TunnelMTU,

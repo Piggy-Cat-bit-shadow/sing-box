@@ -87,7 +87,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	// its capacity therefore bounds this endpoint's inner MTU, and the bound is the same number every
 	// other protocol stacked on a tunnel uses - see nestedTunnelMTU for the arithmetic and for why an
 	// unknown detour leaves the configured value exactly as it was.
-	tunnelMTU := nestedTunnelMTU(ctx, logger, tag, options.Detour, options.MTU)
+	tunnelMTU, mtuBoundedBy, mtuBoundedRequired := nestedTunnelMTUFrom(ctx, logger, tag, options.Detour, options.MTU)
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
 		Context:         ctx,
 		Logger:          logger,
@@ -115,12 +115,16 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 				},
 			}))
 		},
-		Tag:        tag,
-		Name:       options.Name,
-		MTU:        tunnelMTU,
-		Address:    options.Address,
-		PrivateKey: options.PrivateKey,
-		ListenPort: options.ListenPort,
+		Tag:  tag,
+		Name: options.Name,
+		MTU:  tunnelMTU,
+		// Carried so transport/wireguard can explain a refusal that names a number the operator
+		// cannot change: see EndpointOptions.MTUBoundedBy.
+		MTUBoundedBy:       mtuBoundedBy,
+		MTUBoundedRequired: mtuBoundedRequired,
+		Address:            options.Address,
+		PrivateKey:         options.PrivateKey,
+		ListenPort:         options.ListenPort,
 		// ResolvePeer resolves a PEER ENDPOINT hostname, which is an address OUTSIDE the tunnel:
 		// the client has to reach it before any tunnel exists. It therefore uses the resolver this
 		// outbound was configured with, exactly like any other external server address.
@@ -223,6 +227,10 @@ func (w *Endpoint) PortMTU() uint32 {
 // nestedTunnelMTU bounds a WireGuard endpoint's inner MTU by the capacity of the tunnel it is
 // reached through, and returns the value unchanged when that capacity is not provable.
 //
+// It answers only the number. nestedTunnelMTUFrom also answers WHICH value was used, which the caller
+// needs in order to report a refusal the operator can act on - see transport/wireguard's
+// EndpointOptions.MTUBoundedBy.
+//
 // # The arithmetic, in the units each layer actually uses
 //
 // A nested WireGuard's OUTER datagram is one transport message, and it travels as a UDP payload
@@ -256,23 +264,45 @@ func (w *Endpoint) PortMTU() uint32 {
 // see - a group, a selector, an unknown outbound, or no manager at all. An endpoint without a detour
 // is not nested either, so it keeps exactly the value it had before this existed.
 func nestedTunnelMTU(ctx context.Context, logger log.ContextLogger, tag string, detour string, configured uint32) uint32 {
+	mtu, _, _ := nestedTunnelMTUFrom(ctx, logger, tag, detour, configured)
+	return mtu
+}
+
+// nestedTunnelMTUFrom is nestedTunnelMTU plus the facts the caller needs in order to explain a refusal:
+// whether the value it returns came from the detour's capacity rather than from the configuration, and
+// what the detour's own MTU would have to be for that capacity to be enough.
+//
+// boundedBy is non-empty exactly when the clamp CHANGED the value. That distinction is what keeps the
+// advice honest in both directions: an operator's own `mtu` of 1200 under a 1408 detour is below the
+// IPv6 floor and IS theirs to raise, so it must keep the generic message; only a value the clamp
+// produced is one they cannot raise.
+//
+// boundedRequired is derived rather than guessed, and it restates no header length: a detour's capacity
+// is its own inner MTU minus a constant difference, so asking it for the shortfall more bytes is that
+// same constant added once. MEASURED for the 1210-byte detour below: capacity 1130, shortfall 150, and
+// 1210 + 150 = 1360 proves 1360 - 80 = 1280, which is exactly
+// transport/wireguard.MinimumIPv6TunnelMTU.
+func nestedTunnelMTUFrom(ctx context.Context, logger log.ContextLogger, tag string, detour string, configured uint32) (mtu uint32, boundedBy string, boundedRequired uint32) {
 	if detour == "" {
-		return configured
+		return configured, "", 0
 	}
 	capacity := dialer.DetourPathCapacity(ctx, detour)
 	if !capacity.Known {
-		return configured
+		return configured, "", 0
 	}
 	ceiling, hasCeiling := capacity.QuicPayloadCeiling()
 	if !hasCeiling {
-		return configured
+		return configured, "", 0
 	}
 	if configured != 0 && configured <= ceiling {
-		return configured
+		return configured, "", 0
 	}
 	logger.Info("wireguard[", tag, "] mtu ", configured, " is above what detour ", detour,
 		" can carry; using ", ceiling)
-	return ceiling
+	if ceiling < wireguard.MinimumIPv6TunnelMTU {
+		boundedRequired = capacity.InnerMTU + (wireguard.MinimumIPv6TunnelMTU - ceiling)
+	}
+	return ceiling, detour, boundedRequired
 }
 
 // WireGuard's transport-data framing, from the pinned module's own constants.

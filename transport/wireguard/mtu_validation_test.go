@@ -28,7 +28,7 @@ import (
 func TestMTUBelowTheIPv6MinimumIsRefusedForIPv6(t *testing.T) {
 	for _, mtu := range []uint32{1232, 1250, 1279} {
 		t.Run(mtuCase(mtu), func(t *testing.T) {
-			err := validateTunnelMTU(mtu, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")})
+			err := validateTunnelMTU(mtu, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}, "", 0)
 			require.Error(t, err,
 				"an IPv6 address on a %d-byte tunnel is unreachable by construction and must be refused", mtu)
 			require.ErrorContains(t, err, "mtu")
@@ -42,19 +42,19 @@ func TestMTUBelowTheIPv6MinimumIsKeptForIPv4Only(t *testing.T) {
 		t.Run(mtuCase(mtu), func(t *testing.T) {
 			require.NoError(t, validateTunnelMTU(mtu, []netip.Prefix{
 				netip.MustParsePrefix("10.0.0.1/24"),
-			}), "an IPv4-only tunnel at %d bytes is a legal configuration and must not gain a floor", mtu)
+			}, "", 0), "an IPv4-only tunnel at %d bytes is a legal configuration and must not gain a floor", mtu)
 			// No addresses at all is the same case: nothing is expected to be unreachable.
-			require.NoError(t, validateTunnelMTU(mtu, nil))
+			require.NoError(t, validateTunnelMTU(mtu, nil, "", 0))
 		})
 	}
 }
 
 // The boundary is inclusive: 1280 is the IPv6 minimum, so it is exactly the smallest accepted value.
 func TestTheIPv6MinimumItselfIsAccepted(t *testing.T) {
-	require.NoError(t, validateTunnelMTU(1280, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}))
-	require.Error(t, validateTunnelMTU(1279, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}))
+	require.NoError(t, validateTunnelMTU(1280, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}, "", 0))
+	require.Error(t, validateTunnelMTU(1279, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}, "", 0))
 	// And the fork's default is above it, so a default configuration never meets this rule.
-	require.NoError(t, validateTunnelMTU(1408, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}))
+	require.NoError(t, validateTunnelMTU(1408, []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}, "", 0))
 }
 
 // A v4-MAPPED address is an IPv4 address on the wire, so it is not the IPv6 case.
@@ -69,17 +69,17 @@ func TestAV4MappedAddressIsNotTheIPv6Case(t *testing.T) {
 	require.True(t, mapped.Is6(), "and Is6() must really be true for it, or this test proves nothing")
 	require.False(t, mapped.Is4(), "and Is4() must really be false, for the same reason")
 
-	require.NoError(t, validateTunnelMTU(1232, []netip.Prefix{netip.PrefixFrom(mapped, 128)}),
+	require.NoError(t, validateTunnelMTU(1232, []netip.Prefix{netip.PrefixFrom(mapped, 128)}, "", 0),
 		"a v4-mapped address travels as an IPv4 packet, so a narrow MTU is legal for it")
 
 	// The same prefix written as a plain IPv4 address agrees, which is the point.
-	require.NoError(t, validateTunnelMTU(1232, []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")}))
+	require.NoError(t, validateTunnelMTU(1232, []netip.Prefix{netip.MustParsePrefix("10.0.0.1/32")}, "", 0))
 
 	// A real IPv6 address in the same list is still refused.
 	require.Error(t, validateTunnelMTU(1232, []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.1/32"),
 		netip.MustParsePrefix("fd17::1/128"),
-	}), "one unreachable address is enough to refuse the configuration")
+	}, "", 0), "one unreachable address is enough to refuse the configuration")
 }
 
 // The refusal happens at CONSTRUCTION, before any device exists, and it names both numbers.
@@ -109,6 +109,66 @@ func TestTheMTURefusalHappensAtConstruction(t *testing.T) {
 	require.EqualValues(t, 1232, ipv4Only.PortMTU(),
 		"the configured MTU must be published unchanged: raising it would give the operator a tunnel "+
 			"that reports capacity it was never configured with")
+}
+
+// A refusal has to name a lever the operator can actually pull.
+//
+// # The two cases, and why one message cannot serve both
+//
+// `mtu` can arrive two ways. The operator can set it, or a `detour` with a provable capacity can
+// produce it. When the value is the operator's own, "raise `mtu` to at least 1280" is exactly right.
+// When a detour's capacity produced it, that instruction is impossible to follow: the clamp is what
+// produced the number, so EVERY larger configured value is clamped straight back to it. MEASURED with a
+// detour whose own inner MTU is 1210: the nested MTU is 1130, and 1131, 1280, 1408 and 1500 all clamp to
+// 1130. An operator told to "raise `mtu`" would edit the value, watch it come back as 1130, and have
+// nothing naming the detour that is really responsible.
+//
+// So the bounded case names the detour and the value, and offers the lever that exists - the detour's
+// own MTU - while the unbounded case keeps the advice that works for it. The generic message is
+// asserted to still be produced, so this is a split rather than a replacement.
+func TestARefusalNamesTheDetourThatBoundedTheMTU(t *testing.T) {
+	const bounded = 1130
+	ipv6 := []netip.Prefix{netip.MustParsePrefix("fd17::1/128")}
+
+	derived := validateTunnelMTU(bounded, ipv6, "outer", 1360)
+	require.Error(t, derived)
+	derivedMessage := derived.Error()
+	require.Contains(t, derivedMessage, "outer",
+		"a refusal for a derived MTU must name the detour, or nothing identifies where the number came from")
+	require.Contains(t, derivedMessage, "1130")
+	require.Contains(t, derivedMessage, "fd17::1")
+	require.Contains(t, derivedMessage, "1360",
+		"and it must name the detour MTU that would work, not only describe it: 1130 needs 150 more bytes "+
+			"of capacity, and the detour's own MTU is its capacity plus the difference, "+
+			"1210 + 150 = 1360")
+	require.NotContains(t, derivedMessage, "Raise `mtu` to at least",
+		"the bounded case must not lead with the one instruction that cannot be carried out")
+	require.Contains(t, derivedMessage, "Raise the detour's own `mtu`",
+		"and it must offer the lever that does exist")
+
+	own := validateTunnelMTU(bounded, ipv6, "", 0)
+	require.Error(t, own, "the decision is the same either way: the address is unreachable at 1130")
+	ownMessage := own.Error()
+	require.Contains(t, ownMessage, "Raise `mtu` to at least",
+		"an operator's own value IS theirs to raise, so the generic advice must survive")
+	require.NotContains(t, ownMessage, "detour",
+		"and it must not invent a detour that was never involved")
+
+	// The construction path carries both facts through, which is what makes the split reachable rather
+	// than only callable: they are set from the detour the endpoint was configured with.
+	_, err := NewEndpoint(EndpointOptions{
+		Context:            t.Context(),
+		Logger:             log.NewNOPFactory().Logger(),
+		MTU:                bounded,
+		MTUBoundedBy:       "outer",
+		MTUBoundedRequired: 1360,
+		Address:            ipv6,
+		PrivateKey:         testPrivateKey,
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "outer")
+	require.Contains(t, err.Error(), "1360")
+	require.NotContains(t, err.Error(), "Raise `mtu` to at least")
 }
 
 // The published MTU is a field, so it cannot be left stale by a lifecycle transition: it answers before
