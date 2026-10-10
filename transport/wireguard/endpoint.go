@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -303,7 +304,31 @@ func (e *Endpoint) Start(postStart bool) error {
 	err = wgDevice.IpcSet(ipcConf.String())
 	if err != nil {
 		wgDevice.Close()
-		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
+		// The IPC configuration is NOT included, and that is the point.
+		//
+		// # What was leaking
+		//
+		// This returned `E.Cause(err, "setup wireguard: \n", ipcConf.String())`, and that string
+		// begins `private_key=<hex>` and carries every peer's `preshared_key=<hex>`. A failed IpcSet
+		// is a ROUTINE event - a malformed allowed_ip, a key the kernel rejects, a port conflict -
+		// and each one put the device's identity key and every PSK into an error that the caller
+		// logs, wraps, or hands to an SDK. An operator pasting that error into a bug report, or a
+		// crash reporter shipping it, would disclose the keys themselves.
+		//
+		// # Why the fix is not a redaction pass
+		//
+		// Filtering the text would mean deciding, at the point of the error, which substrings are
+		// secret - and that decision is exactly the kind that goes stale: a new IPC field, a new key
+		// format, a peer option that carries a token. The configuration is therefore not passed at
+		// all. What is kept is everything an operator needs to locate the failure: the subsystem,
+		// the underlying parser error (which names the offending FIELD, not its value), and the peer
+		// count, so a multi-peer configuration can be narrowed down.
+		//
+		// The underlying error is NOT swallowed: it is the cause, so `errors.Is`/`errors.As` and the
+		// full text still work.
+		return E.Cause(err, "setup wireguard: configure device with ",
+			strconv.Itoa(len(e.peers)), " peer(s); the configuration itself is deliberately omitted from "+
+				"this error because it contains private key material")
 	}
 	if err = e.bindListenPort(wgDevice); err != nil {
 		wgDevice.Close()
