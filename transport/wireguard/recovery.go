@@ -30,7 +30,45 @@ var (
 	// state where it may act: closing, suspended, not started, or already inside a recovery window.
 	// It is a local lifecycle outcome, not a path failure, and callers must not record it as one.
 	errRebindNotPossible = E.New("wireguard rebind not possible in the current state")
+
+	// errRevokedRebind is returned by RebindStale when its lease was revoked - by a newer network
+	// generation, by Close, or by the registration being invalidated - while the socket work was in
+	// flight. It is not a failure of the rebind: the socket was reopened and the endpoint still holds
+	// exactly one. What it withholds is the CLAIM. "The socket was reopened" and "this generation
+	// recovered" are different facts, and a caller that conflated them would record a superseded
+	// generation as healthy. See RebindStale's own note for why this cannot be an abort instead.
+	errRevokedRebind = E.New("rebind lease was revoked while the socket was being reopened")
 )
+
+// revokedRebindError carries BOTH facts a revoked rebind has to report: that the rebind was revoked, and
+// the cancellation reason of the lease it ran under.
+//
+// # Why both, and why not one wrapped in the other
+//
+// They are needed by different readers, and each one is useless to the other's:
+//
+//   - `errors.Is(err, errRevokedRebind)` is what a caller uses to withhold a recovery claim, and it is the
+//     only signal that distinguishes "I reopened the socket for a generation that had been superseded" from
+//     "I reopened the socket".
+//   - `errors.Is(err, context.Canceled)` is what the existing cancellation filters in this file use
+//     (`E.IsClosedOrCanceled`), and a revoked rebind must keep being filtered out of the warning path -
+//     reporting a superseded generation as a rebind FAILURE would be a second, noisier wrong answer.
+//
+// Wrapping either inside the other loses the other: `E.Cause(errRevokedRebind, reason)` gives a chain whose
+// only leaf is the sentinel, so `errors.Is(err, context.Canceled)` is false and the rebuttal goes to the
+// warning path. This type therefore reports both, and the joining implementation is explicit so the
+// behaviour does not depend on which error wrapper a dependency happens to provide.
+type revokedRebindError struct {
+	reason error
+}
+
+func (e *revokedRebindError) Error() string {
+	return errRevokedRebind.Error() + ": " + e.reason.Error()
+}
+
+func (e *revokedRebindError) Unwrap() []error {
+	return []error{errRevokedRebind, e.reason}
+}
 
 // peerSession is what the session-state callback records per peer.
 //
@@ -60,6 +98,10 @@ type recoveryState struct {
 	poll time.Duration
 	// rebindHook, when set, replaces the device UAPI rebind. Tests use it to observe the decision
 	// path without a live device; production leaves it nil.
+	//
+	// It is run SYNCHRONOUSLY on the recovery goroutine, from RebindStale. That makes it the seam a test
+	// uses to hold a recovery worker resident inside `recoveryLoop` - the goroutine census's sensitivity
+	// control is built on it, so no second seam is needed for that.
 	rebindHook func(ctx context.Context) error
 }
 
@@ -119,6 +161,21 @@ func (e *Endpoint) sessionStateChanged(peer device.NoisePublicKey, state device.
 	if needWorker {
 		e.pokeRecovery()
 	}
+}
+
+// WorkerResident reports whether a recovery worker is running for this endpoint.
+//
+// It is a diagnostic, and it exists because the residency flag has exactly one owner (`recoveryLoop`, under
+// `recovery.access`) and two readers that must not read it raw: anything deciding whether to start another
+// worker, and anything observing from outside. Reading the field directly from another goroutine is a data
+// race - `-race` caught precisely that in a test that did it - so the flag is read through the same lock it is
+// written under. The recovery comment that explains what a finished worker leaves behind depends on this
+// being readable.
+func (e *Endpoint) WorkerResident() bool {
+	recovery := &e.recovery
+	recovery.access.Lock()
+	defer recovery.access.Unlock()
+	return recovery.worker
 }
 
 // pokeRecovery starts the recovery worker if it is not running.
@@ -196,19 +253,41 @@ func (e *Endpoint) recoveryLoop() {
 			// Coalesced: a rebind for this generation already ran or is in flight.
 			return
 		}
-		// The rebind runs under the LEASE's context, derived from the lease's deadline, so a generation
-		// change or a close is observed by a rebind that has not yet STARTED its socket work. Running
-		// under the endpoint's own context would only observe the core shutting down, which is a
-		// different and much later event.
-		//
-		// Its reach stops at RebindStale's entry, and that is stated there rather than implied here: the
-		// socket reopen below takes no context, so a revocation arriving during it is a bounded latency
-		// rather than a cancellation. See RebindStale's own note for the measurement.
+		// The rebind runs under the LEASE's context, derived from the lease's deadline. A generation change
+		// or a close revokes that lease, and the revocation is observed at the points RebindStale
+		// documents: at entry, and again before the socket is reopened. Its reach stops at the socket
+		// operation itself, which takes no context, so a revocation arriving during the reopen is reported
+		// rather than acted on. See RebindStale's own note.
 		rebindCtx, cancel := context.WithTimeout(lease.Context(), e.rebindTimeout())
 		err := e.RebindStale(rebindCtx, reason)
 		cancel()
 		lease.Complete()
-		if err != nil && !E.IsClosedOrCanceled(err) && !errors.Is(err, errRebindNotPossible) {
+		switch {
+		case rebindWasRevoked(err):
+			// The generation moved while the socket was being reopened. The reopen could not be interrupted
+			// (see RebindStale), and it is deliberately not claimed as a recovery for the generation that
+			// revoked it: this loop reports what it may claim, and stops here.
+			//
+			// # What recovers the NEW generation, and when
+			//
+			// Nothing here retries, and the loop does not continue: it returns at the bottom of this case
+			// because it performs one rebind per series by design. What makes the NEXT rebind possible is
+			// the deferred `recovery.worker = false` at the top of this function - it runs as this loop
+			// returns, and `pokeRecovery` refuses to start a worker while that flag is set. So once this
+			// returns, the flag is clear and the next trigger can start a worker.
+			//
+			// The next trigger is a fresh fact, and there are two, both live:
+			//
+			//   - a session-state transition from the device. The peer is still retrying - that is what
+			//     made it stale - so `sessionStateChanged` runs again and calls `pokeRecovery`;
+			//   - a device wake, through `rebindOnWake`, which takes its own lease.
+			//
+			// The registration's window does not stand in the way: `observeEpoch` clears `lastRebind` when
+			// the generation advances, which is the same event that revoked this rebind.
+			e.options.Logger.Info("wireguard[", e.options.Tag, "] rebind after ", reason,
+				" was revoked by a newer network generation; the reopen completed but is not "+
+					"recorded as a recovery for it")
+		case err != nil && !E.IsClosedOrCanceled(err) && !errors.Is(err, errRebindNotPossible):
 			e.options.Logger.Warn("wireguard[", e.options.Tag, "] rebind failed: ", err)
 		}
 		// One rebind per series: the next one requires a new proven failure.
@@ -308,23 +387,41 @@ func (e *Endpoint) rebindTimeout() time.Duration {
 // closed, and the rebind itself is a device UAPI operation that holds the device's own lock rather
 // than ours.
 //
-// # What ctx actually reaches, and what it cannot
+// # Where ctx is observed, and the one thing it cannot reach
 //
-// ctx is observed ONCE, at entry. That is the whole of its reach, and it is a limitation of the
-// interface below rather than an oversight here: the socket is reopened by `BindUpdate`, which lands in
-// the dialer's listener control - `func(network, address string, conn syscall.RawConn) error`, with no
-// context parameter - so a revocation that arrives while that operation is running cannot be delivered
-// to it. MEASURED, with a rebind held inside a real socket open and the network generation advanced
-// under it: the lease is expired, its context is cancelled, and the rebind completes anyway, moving the
-// endpoint (port 61179 -> 61180 in that measurement).
+// ctx is observed at every point where this layer still has a CHOICE: at entry, and again immediately
+// before the UAPI call that reopens the socket. Those are the only two places, and the reason is
+// structural rather than a matter of adding more checks.
 //
-// The consequence is a bounded REVOCATION LATENCY, not a leak and not a hang: the superseded generation
-// gets one socket reopen it would otherwise have asked for again, the endpoint still holds exactly one
-// socket, and Close still releases everything. The alternative available inside this repository - a
-// second ctx check between the two UAPI calls below - would narrow the window without closing it, and a
-// guard that does not do what its name says is worse than a measured and stated bound.
+// It is NOT observed inside the socket operation, and no arrangement of checks here can make it so: the
+// socket is reopened by `BindUpdate`, which lands in the dialer's listener control -
+// `func(network, address string, conn syscall.RawConn) error`, which has no context parameter - and
+// which `wireguard-go`'s conn/bind_std.go reaches through `net.ListenConfig.Control` from a
+// `ListenPacket(context.Background(), ...)` call. Nothing in this repository can hand a context to that
+// operation, so the reach of a revocation stops at the boundary of this method.
 //
-// Note that `closeRecovery` is NOT limited this way: a Close marks the endpoint closed, which
+// MEASURED, and the measurement is the point: with a rebind held inside a real socket open and the
+// network generation advanced underneath it, the lease IS expired and its context IS cancelled, and the
+// operation that is already running completes anyway, because it is attached to a socket that is already
+// gone. `TestCtxCannotReachASocketOperationAlreadyRunning` pins that as the stated bound rather than
+// leaving it to be re-derived.
+//
+// What the check before the reopen does buy:
+//
+//   - A revocation that arrives while the rebind is still deciding - after `BeginRebind`, before the
+//     first UAPI call - now stops the socket from being reopened AT ALL. Without it, that rebind
+//     committed the endpoint to a new socket on behalf of a generation that had been superseded.
+//   - A revocation that arrives after the socket operation has STARTED cannot stop it, and the outcome
+//     is therefore reported as REVOKED rather than as a success, so no caller can record a superseded
+//     generation as recovered. The operation is deliberately not abandoned mid-flight: by then the old
+//     socket is already closed, and walking away would leave the endpoint with no socket at all -
+//     strictly worse than the one a superseded generation asked for.
+//
+// In one line: this method can refuse to START a reopen on a revoked lease, and can refuse to CLAIM a
+// reopen it performed; it cannot INTERRUPT one. A guard whose name promised the third would be worse
+// than no guard.
+//
+// Note that `closeRecovery` is not limited this way: a Close marks the endpoint closed, which
 // `BindUpdate`'s own path observes, which is why Close is correct even while a rebind is in flight.
 func (e *Endpoint) RebindStale(ctx context.Context, reason adapter.RebindReason) error {
 	if ctx.Err() != nil {
@@ -362,17 +459,71 @@ func (e *Endpoint) RebindStale(ctx context.Context, reason adapter.RebindReason)
 
 	oldPort := e.currentListenPort(wgDevice)
 	if e.options.ListenPort == 0 {
+		// The guard is the LAST instant at which this rebind can still be abandoned: the call it guards
+		// reopens the socket itself (device/uapi.go's listen_port handler calls BindUpdate).
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// Release the ephemeral port so the reopen picks a fresh one: this IS the new 5-tuple.
 		if err := wgDevice.IpcSet("listen_port=0\n"); err != nil {
-			return E.Cause(err, "release listen port")
+			return rebindOutcome(ctx, E.Cause(err, "release listen port"))
 		}
-	} else if err := wgDevice.BindUpdate(); err != nil {
-		// A pinned port cannot move; reopening on it is all that is available.
-		return E.Cause(err, "rebind socket")
+	} else {
+		// A pinned port cannot move; reopening on it is all that is available. The guard is the same
+		// last instant: `BindUpdate` is the call that reopens.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := wgDevice.BindUpdate(); err != nil {
+			return rebindOutcome(ctx, E.Cause(err, "rebind socket"))
+		}
+	}
+	// The socket work is done, so the question is no longer whether to act but what may be claimed. A
+	// revocation that arrived while the operation ran is reported instead of being absorbed, and the
+	// port is read only after that: an operation performed for a generation that no longer exists is not
+	// evidence about this one, so there is nothing here worth logging as a success.
+	if err := ctx.Err(); err != nil {
+		return rebindOutcome(ctx, err)
 	}
 	newPort := e.currentListenPort(wgDevice)
 	e.options.Logger.Info("wireguard[", e.options.Tag, "] rebound after ", reason,
 		": port ", oldPort, " -> ", newPort, e.pinnedPortNote())
+	return nil
+}
+
+// rebindOutcome decides what a rebind that has finished its socket work may CLAIM.
+//
+// The lease's context is the authority on whether the recovery still belongs to a current generation: a
+// generation change, a coordinator close, a registration invalidation and this endpoint's own Close all
+// cancel it, and the lease is the only thing that can. A cancelled context therefore means the work
+// belongs to a generation that no longer exists, and the caller must not treat it as a recovery - even
+// when the work itself succeeded. The cancel reason is carried as the cause, so `errors.Is` still finds
+// context.Canceled or context.DeadlineExceeded, which is also what keeps a revoked rebind out of the
+// "rebind failed" warning path.
+func rebindOutcome(ctx context.Context, rebindErr error) error {
+	if err := ctx.Err(); err != nil {
+		return &revokedRebindError{reason: err}
+	}
+	return rebindErr
+}
+
+// rebindWasRevoked reports whether a rebind finished without being able to claim its generation.
+func rebindWasRevoked(err error) bool {
+	return errors.Is(err, errRevokedRebind)
+}
+
+// revokedRebindCause reports WHY a revoked rebind was revoked, or nil when the error is not one.
+//
+// It exists so a caller can tell the two causes apart without parsing the message. They arrive through the
+// same cancellation: a generation advance, a coordinator close, a registration invalidation and this
+// endpoint's own Close all cancel the LEASE, which surfaces as context.Canceled, while the rebind's own
+// `rebindTimeout` surfaces as context.DeadlineExceeded. The first is a revocation by the runtime and the
+// second is this layer's own bound expiring, and a caller that needed to report them differently can.
+func revokedRebindCause(err error) error {
+	var revoked *revokedRebindError
+	if errors.As(err, &revoked) {
+		return revoked.reason
+	}
 	return nil
 }
 
@@ -435,7 +586,9 @@ func (e *Endpoint) rebindOnWake() {
 		defer cancel()
 		err := e.RebindStale(ctx, adapter.RebindDeviceWake)
 		lease.Complete()
-		if err != nil && !errors.Is(err, errRebindNotPossible) && !E.IsClosedOrCanceled(err) {
+		// A revoked rebind is not a failure and not something to report as one: it is the same
+		// generation change the loop above handles, observed from the wake path.
+		if err != nil && !rebindWasRevoked(err) && !errors.Is(err, errRebindNotPossible) && !E.IsClosedOrCanceled(err) {
 			e.options.Logger.Debug("wireguard[", e.options.Tag, "] wake rebind skipped: ", err)
 		}
 	}()
