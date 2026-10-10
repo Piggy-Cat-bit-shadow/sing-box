@@ -29,9 +29,21 @@ import (
 //  1. BOUNDED. Each transition is churned only after the previous one settled, so the expected number
 //     of resets is exact rather than a bound. A drop below it means a transition was LOST; a rise above
 //     it means one physical change cost more than one teardown.
+//
 //  2. SERIALISED. `countingRouter` records the maximum number of reset bodies inside the router's own
-//     reset at one time. Anything above 1 is two transitions tearing the network down concurrently,
-//     which is the interleaving the transition protocol exists to prevent.
+//     reset at one time. Anything above 1 is two transitions tearing the network down concurrently.
+//
+//     MEASURED while writing this, and it is why the claim is stated narrowly: removing the settle-wait
+//     from the loop below - so that transitions overlap - leaves this test GREEN. Together with the
+//     supersede test, the reason is visible: a newer notification CANCELS the in-flight update's
+//     context, so only one transition ever reaches the reset at all. The serialisation observed here is
+//     therefore guaranteed twice, by cancellation first and by the reset lock behind it, and this
+//     assertion is meaningful only against the second - which `TestConcurrentResetNetworkIsSerialized`
+//     exercises directly, with two resets dispatched from independent goroutines.
+//
+//     What this churn adds is that the guarantee still HOLDS once the path is driven end to end 25 times
+//     through the real notifier and the real dispatcher, not that it is the only thing enforcing it.
+//
 //  3. REVERSIBLE. Once the churn stops the manager must report a settled network and the process must
 //     hold no more goroutines than it started with. This is the half a "does it reset correctly" test
 //     cannot see: work that accumulates and is never released still passes every count above.
