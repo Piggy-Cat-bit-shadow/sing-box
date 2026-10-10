@@ -234,8 +234,16 @@ func (r *Resolver) Hops(root adapter.Outbound) (nodes []PathNode, err error) {
 		// The enumeration is discarded rather than partially reported: see DefaultNodeBudget.
 		return nil, err
 	}
-	if outcome == routeComplete {
-		scope.completeRoute(0)
+	// A route that reached its far end is numbered WITH an exit; a route truncated by a missing
+	// dependency is numbered without one. Both are numbered in packet order, because the order of the
+	// hops that ARE known does not depend on what is missing below them - and `Build` reverses its own
+	// walk in both cases, so numbering only the complete route would leave the two APIs describing one
+	// topology in two orders, which is the defect this change exists to remove.
+	switch outcome {
+	case routeComplete:
+		scope.numberRoute(0, true)
+	case routeTruncated:
+		scope.numberRoute(0, false)
 	}
 	return scope.hops, nil
 }
@@ -268,9 +276,10 @@ func (r *Resolver) Leaves(root adapter.Outbound) ([]PathNode, error) {
 //	                no route end of its own, so the frame that OWNS the route decides.
 //	routeComplete   the descent reached a physical hop that declares no dependency. The route is
 //	                over and its far end is known, so packet order can be established.
-//	routeTruncated  a physical hop declared a dependency that does not resolve. The route stops
-//	                short of its far end: it has no packet order and no exit, and numbering it would
-//	                claim a far end the configuration never provided.
+//	routeTruncated  a physical hop declared a dependency that does not resolve. The route never
+//	                reached its far end, so no node of it may claim an exit - but its KNOWN hops are
+//	                numbered in packet order all the same, because their order does not depend on what
+//	                is missing below them, and `Build` reverses such a path like any other.
 type routeOutcome int
 
 const (
@@ -396,12 +405,17 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 			if err != nil {
 				return routeContinues, err
 			}
-			if outcome == routeComplete {
-				e.completeRoute(memberStart)
+			switch outcome {
+			case routeComplete:
+				e.numberRoute(memberStart, true)
+			case routeTruncated:
+				// Numbered in packet order but with no exit: the route never reached its far end, so
+				// nothing in it may claim to be where the flow arrives - see PathNode.Exit.
+				e.numberRoute(memberStart, false)
 			}
-			// A member route that stopped at a dependency which does not resolve is left exactly as
-			// it was recorded - declared order, no exit - because packet order is not knowable for a
-			// route whose far end was never reached.
+			// A member route that stopped at a dependency which does not resolve is numbered too, and
+			// without an exit. Its declared order is not a packet order, so leaving it alone would
+			// make this enumeration describe one topology in the opposite order from `Build`.
 		}
 		if len(prefix) > 0 && !echoed {
 			// The group has no members at all. The route above it still exists - it is simply a
@@ -466,7 +480,8 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 	return e.enumerateHops(dependency, rootTag, chain, physicalPath, required, isCurrent, routeStart)
 }
 
-// completeRoute numbers ONE completed route in packet order, in place.
+// numberRoute numbers ONE route in packet order, in place, and marks its far end as the exit only when
+// the route is COMPLETE.
 //
 // # Why the frame that OWNS the range is the one that calls this
 //
@@ -476,26 +491,35 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 // becomes a packet-order route.
 //
 // The caller is the frame that opened the range - a group's member loop for a member route, and
-// `Hops` for the route that begins at the root - and it calls this only when that recursion reported
-// routeComplete. Numbering from anywhere else is what left the root's own route in declared order,
-// with every Position at zero and no Exit at all.
+// `Hops` for the route that begins at the root - and it calls this when that recursion reports
+// routeComplete or routeTruncated. Numbering from anywhere else is what left the root's own route in
+// declared order, with every Position at zero and no Exit at all.
 //
 // # What every node of the route carries afterwards
 //
 // The route is DEVICE FIRST: the deepest dependency is the hop nearest this device and the routing
 // selected hop is the far end. Each node then carries the PREFIX of that route that ENDS AT IT, so
 // `Position` - the last index of the field beside it - is the node's packet-order index, and the one
-// node whose chain nothing continues past is the far end, which is the exit. That is the shape
-// `businessEntry` reads: a node whose chain a longer chain on the same route extends is a hop
-// something is dialled THROUGH, and the flow arrives at the node that no chain extends.
+// node whose chain nothing continues past is the far end. That is the shape `businessEntry` reads: a
+// node whose chain a longer chain on the same route extends is a hop something is dialled THROUGH, and
+// the flow arrives at the node that no chain extends.
+//
+// # Why a truncated route is numbered too, and what it does not claim
+//
+// A route that stopped at a dependency which does not resolve has hops whose ORDER is nevertheless
+// known: `c` is dialled through `b` whether or not `b`'s own dependency exists. `Build` reverses such
+// a path like any other, so the hops that are known agree with it only if this does the same. What the
+// truncation forbids is the OTHER claim - the far end is not in the path at all, so `complete` is
+// false and no node of it is an exit, which is what keeps `Leaves()` from reporting an unverifiable
+// path as one the flow can leave by.
 //
 // # Why the prefixes share one backing array
 //
 // A route of k hops has k prefixes of k(k+1)/2 elements between them, and each node needs its own
 // LENGTH but not its own storage: the answer is read-only and nothing in this package writes to a
-// node's chain after it is numbered. One array per route keeps the enumeration's memory linear in
-// the number of nodes instead of quadratic in the depth of a chain.
-func (e *enumeration) completeRoute(start int) {
+// node's chain after it is numbered. One array per route keeps the enumeration's memory linear in the
+// number of nodes instead of quadratic in the depth of a chain.
+func (e *enumeration) numberRoute(start int, complete bool) {
 	route := e.hops[start:]
 	// The declared range reversed IS packet order, and the reversal is done once, here, rather than
 	// inside the descent: reversing inside would flip each suffix at every level and the result would
@@ -514,7 +538,7 @@ func (e *enumeration) completeRoute(start int) {
 		// The exit is the last hop in packet order, which is the hop the routing selected - the same
 		// answer `Path.Exit()` gives. It is "last" rather than "the node with no dependency" because
 		// that node is the deepest dependency, at the OTHER end: the hop nearest this device.
-		route[index].Exit = index == len(route)-1
+		route[index].Exit = complete && index == len(route)-1
 	}
 }
 
