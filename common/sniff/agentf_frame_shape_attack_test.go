@@ -1,6 +1,7 @@
 package sniff_test
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -69,17 +70,28 @@ func agentFShapeSettle(t *testing.T, want int) {
 func TestAgentFFrameShapeEventually(t *testing.T) {
 	before := sniffGoroutines()
 
-	var inside int
+	// # Why these two are ATOMIC, and it is not defensive style
+	//
+	// The condition runs on a goroutine testify starts, and testify can have the PREVIOUS tick's
+	// condition goroutine still exiting while the next one runs - that overlap is the whole subject of
+	// this file. A plain `var inside int` written there and read on the test goroutine is therefore
+	// written by two different goroutines and read by a third, and `-race -count=3` reports it:
+	// MEASURED, `WARNING: DATA RACE ... Previous write at ... TestAgentFFrameShapeNever` from exactly
+	// this pattern. The same instrument that found the instability found its own author's mistake.
+	var insideReading, correctedReading atomic.Int64
+
 	require.Eventually(t, func() bool {
-		inside = sniffGoroutines()
+		insideReading.Store(int64(sniffGoroutines()))
 		return true
 	}, 2*time.Second, time.Millisecond, "the condition must run")
 
-	var corrected int
 	require.Eventually(t, func() bool {
-		corrected = sniffGoroutinesFromCallback()
+		correctedReading.Store(int64(sniffGoroutinesFromCallback()))
 		return true
 	}, 2*time.Second, time.Millisecond)
+
+	inside := int(insideReading.Load())
+	corrected := int(correctedReading.Load())
 
 	t.Logf("MEASURED shape=require.Eventually with nothing leaked: before=%d inside=%d corrected=%d fires=%v",
 		before, inside, corrected, agentFShapeFires(before))
@@ -97,11 +109,15 @@ func TestAgentFFrameShapeEventually(t *testing.T) {
 func TestAgentFFrameShapeNever(t *testing.T) {
 	before := sniffGoroutines()
 
-	var inside int
+	// Atomic for the reason spelled out in TestAgentFFrameShapeEventually: this is the shape where the
+	// overlapping condition goroutines actually occur, so a plain variable here IS a data race.
+	var insideReading atomic.Int64
 	require.Never(t, func() bool {
-		inside = sniffGoroutines()
+		insideReading.Store(int64(sniffGoroutines()))
 		return false
 	}, 60*time.Millisecond, 10*time.Millisecond)
+
+	inside := int(insideReading.Load())
 
 	t.Logf("MEASURED shape=require.Never with nothing leaked: before=%d inside=%d post-return probe fires=%v",
 		before, inside, agentFShapeFires(before))
@@ -152,14 +168,17 @@ func TestAgentFFrameShapePlainGoroutine(t *testing.T) {
 func TestAgentFNestedHelperOverCorrects(t *testing.T) {
 	before := sniffGoroutines()
 
-	var nested int
+	// Atomic, same reason: the inner helper already makes this the busiest shape in the file.
+	var nestedReading atomic.Int64
 	require.Eventually(t, func() bool {
 		// The helper spawns its own goroutine, so this frame shape costs two goroutines, not one.
 		done := make(chan int, 1)
 		go func() { done <- sniffGoroutines() }()
-		nested = <-done
+		nestedReading.Store(int64(<-done))
 		return true
 	}, 2*time.Second, time.Millisecond)
+
+	nested := int(nestedReading.Load())
 
 	t.Logf("MEASURED shape=require.Eventually wrapping a helper that spawns a goroutine: before=%d "+
 		"inside=%d, so `sniffGoroutinesFromCallback()` reads %d (a false read of one goroutine over "+
