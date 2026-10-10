@@ -125,6 +125,22 @@ const networkRequirementUoTOverTCPOnlyMiddleHop = `{
   }
 }`
 
+// Case A3: the rule that reaches the TCP-only outbound does NOT constrain the network. Nothing is
+// proven about delivery, and "nothing proven" must not be read as "both networks": the route model
+// explains what MAY arrive, it does not invent a requirement the configuration never stated.
+const networkRequirementUnconstrainedRoute = `{
+  "log": {"disabled": true},
+  "outbounds": [
+    {"type": "socks", "tag": "tcp-only", "server": "127.0.0.1", "server_port": 1080,
+     "version": "5", "network": "tcp"}
+  ],
+  "route": {
+    "rules": [
+      {"outbound": "tcp-only"}
+    ]
+  }
+}`
+
 // Case E: business UDP explicitly delivered to a leaf that declares it cannot carry UDP. This is
 // the rejection that must SURVIVE: the route says udp, the object says tcp.
 const networkRequirementUDPRouteToTCPOnlyLeaf = `{
@@ -154,6 +170,25 @@ const networkRequirementGroupWithIllegalReachableMember = `{
   "route": {
     "rules": [
       {"network": "tcp", "outbound": "sel"}
+    ]
+  }
+}`
+
+// Case G2: a loadbalance whose members are ALL TCP-only, reached by a UDP route. The group filters
+// by network, so no individual member is at fault - and the group still cannot serve the flow the
+// route delivers to it, which is the same defect as E one level up.
+const networkRequirementGroupNoMemberCanCarry = `{
+  "log": {"disabled": true},
+  "outbounds": [
+    {"type": "socks", "tag": "tcp-a", "server": "127.0.0.1", "server_port": 1080,
+     "version": "5", "network": "tcp"},
+    {"type": "socks", "tag": "tcp-b", "server": "127.0.0.1", "server_port": 1081,
+     "version": "5", "network": "tcp"},
+    {"type": "loadbalance", "tag": "lb", "outbounds": ["tcp-a", "tcp-b"]}
+  ],
+  "route": {
+    "rules": [
+      {"network": "udp", "outbound": "lb"}
     ]
   }
 }`
@@ -226,6 +261,12 @@ var networkRequirementMatrix = []networkRequirementCase{
 		wantStart: true,
 	},
 	{
+		id:        "START-01-A3-unconstrained-route-is-unproven",
+		why:       "a rule that does not constrain the network proves nothing, and 'nothing proven' must not become 'every network'",
+		config:    networkRequirementUnconstrainedRoute,
+		wantStart: true,
+	},
+	{
 		id:        "START-01-E-udp-route-to-tcp-only-leaf",
 		why:       "a route that explicitly delivers UDP to a leaf that declares tcp-only is a real defect and must stay refused",
 		config:    networkRequirementUDPRouteToTCPOnlyLeaf,
@@ -238,6 +279,13 @@ var networkRequirementMatrix = []networkRequirementCase{
 		config:    networkRequirementGroupWithIllegalReachableMember,
 		wantStart: false,
 		wantErr:   []string{"cannot serve the tcp flow", "udp-only", "outbound/sel"},
+	},
+	{
+		id:        "START-01-G2-no-member-can-carry-the-delivered-network",
+		why:       "a group that filters by network is unusable when NO member can carry the network the routes deliver to it",
+		config:    networkRequirementGroupNoMemberCanCarry,
+		wantStart: false,
+		wantErr:   []string{"no reachable member carries udp", "outbound/lb"},
 	},
 	{
 		id:        "START-01-F1-missing-member",
