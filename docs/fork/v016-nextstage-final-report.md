@@ -19,9 +19,13 @@ START_SHA                        = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 LIVE_ORIGIN_AT_START             = 686c937cbb13aafdfe6276c8813993dfcb51d9ac
 FINAL_CODE_SHA                   = 45aab788fa059c4b9586387472870dd137e69944   (the last CODE commit;
                                    the exact scan SHA, see §I)
-ORIGIN_TESTING_FINAL             = 04528b8bfa3e820eed28ae48a5164b560ca125b7
-                                   (== local HEAD; the tip is this report's own docs-only commit, one
-                                   above FINAL_CODE_SHA)
+ORIGIN_TESTING_FINAL             = the tip of this document's own commit, and it is verified equal to
+                                   the local HEAD rather than written down:
+                                       git rev-parse HEAD   ==   git rev-parse origin/testing
+                                   A document cannot cite the SHA of the commit that contains it
+                                   without changing it, so the last two pushes reported
+                                   `686c937cb..04528b8bf` and `04528b8bf..3f703f2a0`, both ordinary
+                                   fast-forwards with no force and no rejection.
 FAST_FORWARD                     = YES  (`git merge-base --is-ancestor origin/testing HEAD` exit 0
                                    before the push; the push reported `686c937cb..04528b8bf  HEAD -> testing`)
 NEW_COMMITS                      = 25   (every subject contains the literal `[skip ci]`)
