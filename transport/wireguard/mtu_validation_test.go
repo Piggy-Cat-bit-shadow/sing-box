@@ -111,6 +111,39 @@ func TestTheMTURefusalHappensAtConstruction(t *testing.T) {
 			"that reports capacity it was never configured with")
 }
 
+// The published MTU is a field, so it cannot be left stale by a lifecycle transition: it answers before
+// Start, while running, and after Close with the same configured number.
+//
+// # Why this is asserted rather than argued
+//
+// The previous stale-value defect in this area was real: MASQUE's `PortMTU` read through a device that
+// only existed after `StartStateInitialize`, so an upper protocol sizing itself at construction hit a
+// nil interface. The equivalent property here - that the number a stacked protocol sizes against cannot
+// change when the device is created, restarted or torn down - is what keeps an upper protocol's packet
+// size and the tunnel's actual MTU from drifting apart.
+func TestThePublishedMTUIsNotStaleAcrossTheLifecycle(t *testing.T) {
+	ctx := pauseContext()
+	endpoint := newListenPortEndpoint(t, 0)
+	// A configured value that is not the default, so a stale default would be visible.
+	endpoint.options.MTU = 1360
+
+	beforeStart := endpoint.PortMTU()
+	require.EqualValues(t, 1360, beforeStart,
+		"the capability must be answerable before Start: the protocols stacked on it are constructed "+
+			"first and size themselves then")
+
+	require.NoError(t, endpoint.Initialize(nil))
+	require.NoError(t, endpoint.Start(false))
+	require.Equal(t, beforeStart, endpoint.PortMTU(),
+		"and the value the device was built with must be the value it publishes")
+
+	require.NoError(t, endpoint.Close())
+	require.Equal(t, beforeStart, endpoint.PortMTU(),
+		"and a closed endpoint still reports the configuration rather than a zero that a caller "+
+			"could read as 'no capacity' (see dialer.PathCapacity for why the two are kept apart)")
+	_ = ctx
+}
+
 func mtuCase(mtu uint32) string {
 	switch mtu {
 	case 1232:
