@@ -803,3 +803,47 @@ func TestRedactionCoversTheQuotedAndPrefixedForms(t *testing.T) {
 			"redaction must not destroy a message that carries no secret")
 	}
 }
+
+// TestRedactionCoversAWhitespaceSeparatedAssignment is the shape the matcher missed because it required
+// the separator to TOUCH the keyword.
+//
+// MEASURED before the fix, with the identical probe: every case below returned its secret verbatim.
+// They are not exotic - `password = hunter2` is how a human writes it, `password:\thunter2` is how a
+// shell or a table writes it - and a backstop that only covers the tidy `password=hunter2` is a
+// backstop against the case that was already easy.
+func TestRedactionCoversAWhitespaceSeparatedAssignment(t *testing.T) {
+	cases := []struct {
+		detail  string
+		secret  string
+		keyword string
+	}{
+		{detail: `password = hunter2 refused`, secret: "hunter2", keyword: "keyword SPACE ="},
+		{detail: `db_password = hunter2 refused`, secret: "hunter2", keyword: "longer name SPACE ="},
+		{detail: `token : abc123def456 expired`, secret: "abc123def456", keyword: "keyword SPACE colon"},
+		{detail: `"password" : "hunter2" rejected`, secret: "hunter2", keyword: "quoted key SPACE colon"},
+		{detail: "password:\thunter2 refused", secret: "hunter2", keyword: "TAB after the separator"},
+		{detail: "password =\thunter2 refused", secret: "hunter2", keyword: "TAB on both sides"},
+		{detail: `api_key   =   sk-live-0123456789abcdef`,
+			secret: "sk-live-0123456789abcdef", keyword: "several spaces on both sides"},
+		{detail: `password = "hunter2" refused`, secret: "hunter2", keyword: "space, then a quoted value"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.keyword, func(t *testing.T) {
+			redacted := redactDetail(testCase.detail)
+			require.NotContains(t, redacted, testCase.secret,
+				"an assignment with whitespace around the separator must be redacted")
+		})
+	}
+
+	// The negative controls. The gap is skipped only when a separator follows it, so prose that
+	// happens to contain a keyword stays readable - and the `mypassword` boundary rule is unchanged.
+	for _, clean := range []string{
+		"the password field is required",
+		"the token must not be empty",
+		"mypassword = not-a-secret-field",
+		"a credential is required here",
+	} {
+		require.Equal(t, clean, redactDetail(clean),
+			"skipping the gap must not turn prose into a redaction")
+	}
+}

@@ -1117,24 +1117,34 @@ var secretKeywords = []string{
 // It returns the literal prefix to emit (the keyword and its separator, so the message still reads) and
 // the length to skip.
 //
-// # The four shapes it must recognise
+// # The shapes it must recognise
 //
 // The bare form is the easy one, and it was the only one this used to match:
 //
 //	password=hunter2          key=value
 //	password: hunter2         key: value
 //
-// Three more are ordinary renderings of the same fact, and a backstop that misses them is a backstop
+// More are ordinary renderings of the same fact, and a backstop that misses them is a backstop
 // against the tidy case only:
 //
 //	password="hunter2"        the value is quoted, which is what an ini or env rendering does
 //	"password":"hunter2"      the KEY is quoted, which is what a JSON body echoed into an error does
+//	password = hunter2        the separator does not touch the keyword
+//	token : abc123            the same, with the colon form
+//	password:\thunter2        a TAB after the separator, which a shell or a table produces
 //	access_token=ya29...      the key is a longer name ENDING in a keyword
 //
 // The last one is why the boundary rule is about the SEPARATOR and not about being a whole word. The
 // keyword has to start at the beginning of a name, or after a character that cannot be part of one -
 // which is what keeps `mypassword=` readable - and that character set includes `_`, because
 // `access_token`, `refresh_token`, `db_password` and `user_password` are one name, not two.
+//
+// # What it deliberately does not treat as a separator
+//
+// A NEWLINE between the keyword and its separator is not skipped, because a message that wraps is a
+// message about something else by the time the next line starts: redacting across the line break
+// would take the first word of an unrelated sentence. Space and tab are the gap a rendering of a
+// key/value pair actually uses.
 func secretKeywordAt(detail string, index int) (string, int) {
 	if index > 0 {
 		previous := rune(detail[index-1])
@@ -1158,26 +1168,43 @@ func secretKeywordAt(detail string, index int) (string, int) {
 			quotedKey = true
 			after = after[1:]
 		}
+		// Whitespace BETWEEN the keyword (or its closing quote) and the separator, which is how a
+		// human-written or pretty-printed rendering writes the same fact:
+		//
+		//	password = hunter2        the separator does not touch the keyword
+		//	token : abc123            the same, with the colon form
+		//	"password" : "hunter2"    the same, with both quotes
+		//
+		// Requiring the separator to touch the keyword left every one of those UNREDACTED - measured,
+		// and the reason this loop exists. It is skipped only when a separator actually follows, so
+		// `the password field is required` keeps reading as prose.
+		gap := 0
+		for gap < len(after) && (after[gap] == ' ' || after[gap] == '\t') {
+			gap++
+		}
+		separated := after[gap:]
 		separator := ""
 		switch {
-		case strings.HasPrefix(after, "="):
+		case strings.HasPrefix(separated, "="):
 			separator = "="
-		case strings.HasPrefix(after, ": "):
-			separator = ": "
-		case strings.HasPrefix(after, ":"):
+		case strings.HasPrefix(separated, ":"):
 			separator = ":"
 		default:
 			continue
 		}
-		valueStart := len(keyword) + len(separator)
+		valueStart := len(keyword) + gap + len(separator)
 		if quotedKey {
 			valueStart++
 		}
 		value := rest[valueStart:]
-		// A quoted VALUE, which is how an ini or env rendering writes one. Skipping the opening quote is
-		// what makes the scan below stop at the closing one instead of at the opening one, which would
-		// find an empty value and leave the secret in place.
-		for len(value) > 0 && value[0] == ' ' {
+		// Whitespace after the separator, TAB included. A tab is a terminator for the value scan
+		// below, so leaving one here would find an empty value and keep the secret in the message:
+		// `password:\thunter2` is a rendering a shell or a table actually produces.
+		//
+		// A quoted VALUE is skipped for the same class of reason: it is how an ini or env rendering
+		// writes one, and skipping the opening quote is what makes the scan below stop at the closing
+		// one instead of at the opening one, which would find an empty value.
+		for len(value) > 0 && (value[0] == ' ' || value[0] == '\t') {
 			valueStart++
 			value = value[1:]
 		}
