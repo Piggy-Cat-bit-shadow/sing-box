@@ -23,7 +23,11 @@ func deepIdlePolicy(after time.Duration) Policy {
 
 // Case A: a transient request must POSTPONE deep idle, not prevent it.
 func TestTransientTrafficPostponesDeepIdle(t *testing.T) {
-	const after = 150 * time.Millisecond
+	// The deadline is an ORDER OF MAGNITUDE above the observation window below (50ms), so the verdict
+	// is the governor's sequencing and not the accuracy of time.Sleep on a loaded machine. MEASURED:
+	// with the previous 150ms against the same 50ms window the margin was 100ms, which a full-suite
+	// scan can exceed.
+	const after = 400 * time.Millisecond
 	governor := NewGovernor(deepIdlePolicy(after))
 	t.Cleanup(governor.Close)
 
@@ -68,7 +72,9 @@ func TestDeepIdleCanBeReenteredAfterTraffic(t *testing.T) {
 // This is what "idle since the LAST real activity" means, and what a device receiving a slow trickle
 // of background pushes actually experiences.
 func TestIntermittentTrafficExtendsTheDeadline(t *testing.T) {
-	const after = 100 * time.Millisecond
+	// 300ms against 60ms gaps, so "no gap reached the deadline" is a statement about the governor
+	// rather than about how late a 60ms sleep can return under load. The cadence is unchanged.
+	const after = 300 * time.Millisecond
 	governor := NewGovernor(deepIdlePolicy(after))
 	t.Cleanup(governor.Close)
 
@@ -116,8 +122,13 @@ func TestStateStringsCoverEveryState(t *testing.T) {
 func TestCoalescedNotificationsNeverReportAStateThatIsOver(t *testing.T) {
 	// A deadline long enough that the state cannot legitimately move on by itself during the test: the
 	// question here is what a coalesced notification REPORTS, not how fast the machine is.
+	//
+	// It must be WELL above the 50ms observation window below. MEASURED: with the previous 60ms the
+	// margin was 10ms, so on a loaded machine (a full-suite scan) the 50ms sleep returned after the
+	// re-armed deadline had already fired and the assertion saw the state the timer had just moved it
+	// to - a verdict decided by time.Sleep's accuracy, not by the governor.
 	policy := DefaultPolicy()
-	policy.DeepIdleAfter = 60 * time.Millisecond
+	policy.DeepIdleAfter = 600 * time.Millisecond
 	policy.WakeStagger = WakeStagger{}
 	governor := NewGovernor(policy)
 	t.Cleanup(governor.Close)
