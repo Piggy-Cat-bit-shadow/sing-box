@@ -163,6 +163,38 @@ def plan(text, rule):
 # applied inside a region a block rule is about to rewrite.
 
 RULES = [
+    # --- update channel ------------------------------------------------------
+    #
+    # The update feed is THIS fork's releases, not upstream's.
+    #
+    # The client shipped from here is Jiejiebox, and its installer is named
+    # Jiejiebox-v<version>-windows-<arch>.exe. Upstream's feed carries SFW-... assets
+    # instead, so leaving the URL alone did not merely point at the wrong project: the
+    # asset matcher below could not recognise our own installer either, and the updater
+    # therefore reported "no update" forever. Production and consumption have to name the
+    # same thing, and both halves are corrected together for that reason.
+    #
+    # The repository is spelled out rather than derived because this overlay is added to
+    # the client source before any network or git context is available, and a placeholder
+    # here would be a silent failure if it ever survived into the build.
+    Rule(
+        "src/main/updates.ts",
+        'const RELEASES_URL = "https://api.github.com/repos/SagerNet/sing-box/releases";',
+        'const RELEASES_URL = "https://api.github.com/repos/Piggy-Cat-bit-shadow/sing-box/releases";',
+        1,
+        note="update feed -> this fork's releases (the feed that carries Jiejiebox installers)",
+    ),
+    # The asset matcher has to accept the name the packaging actually produces. It is kept
+    # as a PREFIX test on the product name, so architecture selection still works exactly as
+    # it did - only the product prefix changes, from upstream's `SFW-` to ours.
+    Rule(
+        "src/main/updates.ts",
+        '(asset) => asset.name.startsWith("SFW-") && asset.name.endsWith(".exe"),',
+        '(asset) => asset.name.startsWith("Jiejiebox-v") && asset.name.endsWith(".exe"),',
+        1,
+        note="Windows update asset matcher -> Jiejiebox-v<version>-windows-<arch>.exe",
+    ),
+
     # --- release identity ----------------------------------------------------
     #
     # The desktop GUI for this release is the v0.1.5 client, so its version is the
@@ -170,6 +202,11 @@ RULES = [
     # is what electron-builder stamps into the app and substitutes for ${version} in
     # the installer name below, so setting it here is what makes the artifact called
     # Jiejiebox-v0.1.5-windows-x64.exe rather than naming it after the wrong product.
+    #
+    # This literal is the one version source the overlay cannot read from the repository,
+    # because it runs against the client tree with no root context. It is therefore checked
+    # against release/JIEJIE_VERSION by the Windows workflow, which fails if the two drift -
+    # see the "the overlaid desktop version is the core version" gate there.
     Rule(
         "version.json",
         '"version": "1.14.2",',

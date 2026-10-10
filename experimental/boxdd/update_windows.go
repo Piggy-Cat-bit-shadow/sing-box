@@ -22,11 +22,42 @@ import (
 
 const (
 	updateInstallerDesktop = `winsta0\default`
-	updateProductName      = "sing-box"
 	seTcbPrivilege         = "SeTcbPrivilege"
 	seAssignPrimaryToken   = "SeAssignPrimaryTokenPrivilege"
 	seIncreaseQuota        = "SeIncreaseQuotaPrivilege"
 )
+
+// updateProductName is the product name the shipped installer carries.
+//
+// It is NOT a security boundary - the Authenticode signer comparison below is, and a name is
+// trivially forgeable. It is an early, cheap rejection of "this is not one of our
+// executables", and it has to agree with what the packaging actually writes into the
+// installer's version resource.
+//
+// The value that reaches the resource is electron-builder's `appInfo.productName`, which
+// electron-builder computes as `config.productName || metadata.productName || metadata.name`
+// (`app-builder-lib/out/appInfo.js`). This fork's overlay sets `productName: Jiejiebox`, so
+// the shipped installer says "Jiejiebox" - while the constant here said "sing-box", the
+// UPSTREAM product name. The check therefore rejected this fork's own installer and accepted
+// upstream's, which is the opposite of what it is for: `downloadAndInstall` could never
+// succeed, and the guard that was supposed to help would have waved the wrong binary through
+// to the signer check.
+//
+// Both spellings are accepted because both are genuinely this product: the daemon keeps
+// working against an installer built by an older, unbranded packaging, and the branded
+// installer the fork now ships is accepted. Anything else is still refused here.
+var updateProductNames = []string{"Jiejiebox", "sing-box"}
+
+// isAcceptedInstallerProduct reports whether the installer's ProductName is one this daemon
+// will install. It is deliberately a whitelist: a name that is neither spelling is refused.
+func isAcceptedInstallerProduct(productName string) bool {
+	for _, accepted := range updateProductNames {
+		if productName == accepted {
+			return true
+		}
+	}
+	return false
+}
 
 func (d *Daemon) installUpdate(identity peerIdentity, installerPath string) (*InstallUpdateResponse, error) {
 	if installerPath == "" {
@@ -63,8 +94,8 @@ func (d *Daemon) installUpdate(identity peerIdentity, installerPath string) (*In
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, E.Cause(err, "read update installer identity").Error())
 	}
-	if installerIdentity.productName != updateProductName {
-		return nil, status.Error(codes.InvalidArgument, "update executable is not a sing-box installer")
+	if !isAcceptedInstallerProduct(installerIdentity.productName) {
+		return nil, status.Error(codes.InvalidArgument, "update executable is not a Jiejiebox/sing-box installer")
 	}
 	err = validateNSISExecutable(installerFinalPath)
 	if err != nil {

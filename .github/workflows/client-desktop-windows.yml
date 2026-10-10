@@ -243,6 +243,38 @@ jobs:
             echo "FAIL: package.ts does not require signing when a certificate is configured" >&2; exit 1; }
           echo "executable name and conditional forceCodeSigning are in place"
 
+      - name: "[gate 2] confirm the overlaid version is the core version"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # version.json is the ONE value behind both the app's own version - what the updater
+          # compares a release against - and ${version} in the artifact name. release/JIEJIE_VERSION
+          # is the single version source for this fork.
+          #
+          # They are separate files because the overlay runs against the client tree with no root
+          # context, so it cannot read the root file: the version is a literal in
+          # scripts/ci/apply-desktop-branding-overlay.py. This is the check that the literal and the
+          # single source have not drifted - without it, a release could ship
+          # Jiejiebox-v0.1.6-windows-x64.exe whose CONTENTS believe they are 0.1.5, and the updater
+          # would then refuse to upgrade to it (or offer it forever).
+          core_version_file="core/release/JIEJIE_VERSION"
+          [ -f "$core_version_file" ] || { echo "FAIL: no $core_version_file" >&2; exit 1; }
+          core_version="$(tr -d '[:space:]' < "$core_version_file")"
+          client_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' \
+            "$CLIENT_DIR/version.json")"
+          echo "release/JIEJIE_VERSION : $core_version"
+          echo "clients/desktop        : $client_version"
+          if [ "$core_version" != "$client_version" ]; then
+            echo "FAIL: the overlaid desktop version ($client_version) is not the core version ($core_version)." >&2
+            echo "      The version rule in scripts/ci/apply-desktop-branding-overlay.py writes the" >&2
+            echo "      literal the client carries; update it to match release/JIEJIE_VERSION, or the" >&2
+            echo "      installer will be named for one version while containing another." >&2
+            exit 1
+          fi
+          # The installer the updater will look for is named from the same value, so state the name.
+          echo "installer name: Jiejiebox-v$core_version-windows-x64.exe"
+          echo "PASS: the overlaid desktop version is the core version"
+
       - name: "[gate 2] install the client's dependencies"
         working-directory: ${{ env.CLIENT_DIR }}
         run: pnpm install --frozen-lockfile
