@@ -68,17 +68,19 @@ import (
 // ---------------------------------------------------------------------------
 
 // edgeLeaf is a member with a DECLARED network set, which is the only thing a walk reads about a
-// leaf. It implements every method the walk calls, so nothing here relies on an embedded nil.
+// leaf, plus an optional single declared dependency - the edge an underlay is reached by. It
+// implements every method the walk calls, so nothing here relies on an embedded nil.
 type edgeLeaf struct {
 	adapter.Outbound
-	tag      string
-	networks []string
+	tag       string
+	networks  []string
+	dependsOn []string
 }
 
 func (l *edgeLeaf) Type() string           { return C.TypeDirect }
 func (l *edgeLeaf) Tag() string            { return l.tag }
 func (l *edgeLeaf) Network() []string      { return l.networks }
-func (l *edgeLeaf) Dependencies() []string { return nil }
+func (l *edgeLeaf) Dependencies() []string { return l.dependsOn }
 func (l *edgeLeaf) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	return nil, net.ErrClosed
 }

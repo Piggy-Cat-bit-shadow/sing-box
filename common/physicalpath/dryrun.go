@@ -201,16 +201,36 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 		// and the group is unusable only when NO member can. Refusing every member that could not
 		// carry it would refuse a configuration protocol/group/loadbalance.go documents as the
 		// reason the union is advertised at all.
-		if hasNetworkFilteringGroup(resolver, nodes) {
+		//
+		// # Why the question is asked per EDGE rather than of the whole tree
+		//
+		// It used to be `if hasNetworkFilteringGroup(resolver, nodes)`, a single boolean that is
+		// true when ANY group anywhere on ANY node's control path filters, followed by
+		// `anyNodeCarries(nodes, network)` over the WHOLE node set. That is a pass for the whole
+		// tree: one filtering group was taken as protecting every node, including nodes it never
+		// chooses, and the "is this network served at all" question was asked of nodes that are not
+		// below it.
+		//
+		// MEASURED, with `outer(loadbalance) -> inner(selector) -> [tcp-only, udp-only]` and both
+		// networks delivered, the walk reported NO failures at all: `outer` filters, so every node
+		// below `outer` was treated as exempt - while `inner` does not filter and hands a UDP flow
+		// straight to `tcp-only`.
+		//
+		// The responsibility belongs to the group that does the filtering, so the question is asked
+		// once per filtering group that was actually reached, of the exits THAT group can reach.
+		// The failure is attributed to that group rather than to the root, because that group is
+		// what refuses the flow at run time.
+		for _, group := range filteringGroups(resolver, nodes) {
+			reachable := nodesUnder(nodes, group.Tag())
 			for _, network := range requirement {
-				if anyNodeCarries(nodes, network) {
+				if anyNodeCarries(reachable, network) {
 					continue
 				}
 				report.Failures = append(report.Failures, Failure{
 					Root:  root.Tag(),
-					Leaf:  root.Tag(),
-					Route: root.Tag(),
-					Path:  root.Tag(),
+					Leaf:  group.Tag(),
+					Route: routeUnder(reachable, root.Tag()),
+					Path:  routeUnder(reachable, root.Tag()),
 					Hop:   0,
 					Reason: "no reachable member carries " + network + ", and this group selects its " +
 						"member by network, so every " + network + " flow delivered here would be " +
@@ -254,14 +274,106 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 // the consumer's transport is not published by any object before Start. A dependency that carries
 // the business network is therefore accepted, and one that does not is left UNVERIFIED rather than
 // refused: UDP-over-TCP is a legal conversion and this is exactly the case it covers.
+//
+// # Why the exemption reads the PARENT EDGE and not the whole control path
+//
+// A node is exempt when the group that HANDS IT THE FLOW refuses to hand it a flow it cannot carry.
+// That group is the innermost one on the node's control path, because the path is recorded from the
+// root down (leaves.go's `groupTags`), so it is the LAST element and not "any element".
+//
+// Reading the whole path made an ANCESTOR's filter a pass for every node below it. MEASURED, with
+// `outer(loadbalance) -> inner(selector) -> [tcp-only, udp-only]` and both networks delivered, the
+// walk reported no failures: `outer` filters and is on both nodes' control paths, so both were
+// exempt - while `inner` does not filter and hands a UDP flow to `tcp-only` and a TCP flow to
+// `udp-only`. The presence of a filtering group anywhere must not be a pass for a whole subtree.
 func nodeRequirementFor(resolver *Resolver, hop PathNode, delivered []string) []string {
 	if !businessEntry(hop) {
 		return nil
 	}
-	if hasNetworkFilteringGroup(resolver, []PathNode{hop}) {
+	if parentGroup(resolver, hop) != nil && networkFilteringGroup(parentGroup(resolver, hop)) {
 		return nil
 	}
 	return delivered
+}
+
+// parentGroup recovers the group that handed this node the flow.
+//
+// The control path is recorded from the root DOWN - the root first, then each group entered
+// (leaves.go's `enumerateHops` appends as it descends) - so the group that chose this node is the
+// last element. A group is never emitted as a hop itself, so the last element is always the
+// immediate parent rather than the node.
+//
+// The object is recovered by tag through the resolver's lookup, which is the same read-only
+// registry lookup the enumeration used, so what is returned is the object that declared this
+// membership.
+func parentGroup(resolver *Resolver, hop PathNode) adapter.OutboundGroup {
+	if len(hop.ControlPath) == 0 {
+		return nil
+	}
+	object, loaded := resolver.Lookup(hop.ControlPath[len(hop.ControlPath)-1])
+	if !loaded {
+		return nil
+	}
+	group, isGroup := object.(adapter.OutboundGroup)
+	if !isGroup {
+		return nil
+	}
+	return group
+}
+
+// filteringGroups reports every group that filters its members by network and that this walk
+// actually reached, de-duplicated by identity.
+//
+// Identity rather than tag is what de-duplicates: a tag is configuration and two objects may share
+// one, and asking the question of the wrong object would answer for a group that is not on this
+// route.
+func filteringGroups(resolver *Resolver, nodes []PathNode) []adapter.OutboundGroup {
+	var groups []adapter.OutboundGroup
+	for _, node := range nodes {
+		for _, tag := range node.ControlPath {
+			object, loaded := resolver.Lookup(tag)
+			if !loaded {
+				continue
+			}
+			group, isGroup := object.(adapter.OutboundGroup)
+			if !isGroup || !networkFilteringGroup(group) {
+				continue
+			}
+			if !slices.Contains(groups, group) {
+				groups = append(groups, group)
+			}
+		}
+	}
+	return groups
+}
+
+// nodesUnder reports the nodes whose control path passes through this group, which is every exit it
+// can reach: its own members, and everything below them.
+//
+// # Why the members are not read from the group instead
+//
+// A group's declared members include nested GROUPS, and a group is never emitted as a hop
+// (leaves.go: "a group is a control node: it never terminates a physical route by itself"). Asking a
+// nested member what it can carry would therefore ask a group for its own pre-Start `Network()`,
+// which is the blanket this package exists to keep out of the decision. The nodes below the group
+// are the PHYSICAL exits it can reach, which is the question being asked.
+func nodesUnder(nodes []PathNode, tag string) []PathNode {
+	var under []PathNode
+	for _, node := range nodes {
+		if slices.Contains(node.ControlPath, tag) {
+			under = append(under, node)
+		}
+	}
+	return under
+}
+
+// routeUnder renders the control descent that reaches the first of these nodes, so a failure
+// attributed to a group still says which route arrives at it. It falls back to the root.
+func routeUnder(nodes []PathNode, rootTag string) string {
+	if len(nodes) == 0 {
+		return rootTag
+	}
+	return nodes[0].Route()
 }
 
 // businessEntry reports whether the flow the routing selected ARRIVES at this node.
@@ -288,33 +400,25 @@ func businessEntry(hop PathNode) bool {
 	return hop.Position == len(hop.PhysicalPath)-1
 }
 
-// hasNetworkFilteringGroup reports whether any group on these nodes' control paths filters its
-// members by network before choosing one.
+// hasNetworkFilteringGroup used to report whether any group on these nodes' control paths filters
+// its members by network, and it is deliberately GONE rather than kept as a helper.
 //
-// # Why the group objects are recovered by tag
+// # Why it must not come back
 //
-// PathNode carries the control ROUTE as tags rather than the group objects, because the walk that
-// produced it is about the physical chain and the groups are not hops. The tags are enough: the
-// resolver's lookup is the same read-only registry lookup the enumeration itself used, so the
-// object recovered here is the object that declared the membership.
-func hasNetworkFilteringGroup(resolver *Resolver, nodes []PathNode) bool {
-	for _, node := range nodes {
-		for _, tag := range node.ControlPath {
-			object, loaded := resolver.Lookup(tag)
-			if !loaded {
-				continue
-			}
-			group, isGroup := object.(adapter.OutboundGroup)
-			if !isGroup {
-				continue
-			}
-			if networkFilteringGroup(group) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// It answered a question about the whole tree - "is there a filtering group anywhere below this
+// root" - and both of its callers used that answer as though it were about ONE edge: the root-level
+// pass above, and `nodeRequirementFor`, which called it with a single node and then read "any group
+// on the whole path" as "the group that chose this node". A filtering group one or more levels up
+// therefore exempted every node below it, including nodes it never chooses.
+//
+// MEASURED, with `outer(loadbalance) -> inner(selector) -> [tcp-only, udp-only]`: every node was
+// exempt and the walk reported no failures, while `inner` does not filter and would hand UDP to
+// `tcp-only` and TCP to `udp-only`.
+//
+// The two questions it conflated are now asked separately and per edge: `parentGroup` for "does the
+// group that chose this node filter", and `filteringGroups` for "which filtering groups did this
+// walk reach, and what can each of them reach". A boolean over the whole tree cannot express either
+// one, so there is nothing here to preserve.
 
 // networkFilteringGroup reports whether a group refuses a member that cannot carry the flow's
 // network, which is what makes a member with a narrower network set legal below it.
