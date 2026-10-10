@@ -341,9 +341,10 @@ func TestSelectorToLoadBalanceToLeafKeepsOnlyTheLeaf(t *testing.T) {
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "sel"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
 	require.Equal(t, []string{"leaf"}, hopTags(path))
-	require.Equal(t, []string{"lb", "sel"}, path.ControlPath,
-		"the control path is in packet order to match Hops: the device-nearest decision first. It is "+
-			"not the physical path, because a group never carries a byte")
+	require.Equal(t, []string{"sel", "lb"}, path.ControlPath,
+		"the control path is the DESCENT order: the routing decision first, then each group as it "+
+			"was entered. It is not packet order and not the physical path, because a group never "+
+			"carries a byte")
 	require.Equal(t, "lb", path.Hops[0].ControlOwner,
 		"the owner reported is the group that made the DECIDING choice: the innermost one")
 }
@@ -363,8 +364,8 @@ func TestNestedGroupToLeafResolvesToTheInnermostLeaf(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"exit", "leaf"}, hopTags(path),
 		"the leaf reaches its own server through exit, so exit is nearest this device")
-	require.Equal(t, []string{"inner", "outer"}, path.ControlPath,
-		"and the control path is in packet order too: the innermost group decides nearest this device")
+	require.Equal(t, []string{"outer", "inner"}, path.ControlPath,
+		"and the control path is the descent order: outer was entered first, inner second")
 	require.Len(t, path.ControlPath, 2)
 	require.Len(t, path.Hops, 2, "a control node must not appear in the physical path")
 	require.Equal(t, []string{"inner"}, path.GroupsNamed(),
@@ -458,10 +459,11 @@ func TestControlPathIsShorterThanThePhysicalPath(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "outer"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"inner", "outer"}, path.ControlPath,
-		"control path in packet order: the innermost group decides nearest this device")
+	require.Equal(t, []string{"outer", "inner"}, path.ControlPath,
+		"the control path is the descent order, which is NOT the physical order")
 	require.Equal(t, []string{"exit", "member"}, hopTags(path),
-		"and the physical path is ENTRY first: member reaches its own server through exit")
+		"while the physical path is ENTRY first: member reaches its own server through exit, so the "+
+			"two lists differ in both membership and order")
 	require.NotContains(t, hopTags(path), "outer", "the root is a control node here and is not a hop")
 	require.NotContains(t, hopTags(path), "inner")
 }

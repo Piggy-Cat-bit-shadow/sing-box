@@ -251,9 +251,18 @@ func (h Hop) String() string {
 type Path struct {
 	// Root is the tag of the outbound the walk started from.
 	Root string
-	// ControlPath lists the tags involved in SELECTING, in PACKET order to match Hops: the
-	// device-nearest selection first. It is not the physical path and must never be reported as one -
-	// a group is a control-plane object that never carries a byte.
+	// ControlPath lists the tags involved in SELECTING, in DESCENT order: the routing decision
+	// first, then each group as it was entered, then the leaf.
+	//
+	// # What this order is, and what it is not
+	//
+	// It is the order the DECISIONS were taken, which is root-to-leaf by construction. It is NOT
+	// packet order and it is not reversed with Hops: a group is a control-plane object that never
+	// carries a byte, so it has no position on the wire to be ordered by. Reporting it in wire order
+	// would say that the innermost group decided first, which is the opposite of what happened.
+	//
+	// The last element is the node the descent reached, which is a leaf or an unresolved member -
+	// `GroupsNamed` is what a caller wanting only the groups should use.
 	ControlPath []string
 	// Hops is the physical path in PACKET order: Hops[0] is nearest to this device and the last
 	// element is the exit. Packet order is the REVERSE of the dependency descent the configuration
@@ -510,9 +519,22 @@ func reversePacketOrder(path *Path) {
 	for index := range path.Hops {
 		path.Hops[index].Position = index
 	}
-	for left, right := 0, len(path.ControlPath)-1; left < right; left, right = left+1, right-1 {
-		path.ControlPath[left], path.ControlPath[right] = path.ControlPath[right], path.ControlPath[left]
-	}
+	// ControlPath is deliberately NOT reversed.
+	//
+	// # Why the two lists do not move together
+	//
+	// They answer different questions and their natural orders are different:
+	//
+	//	ControlPath   WHO DECIDED, in the order the decisions were taken: the routing selects the
+	//	              outer group, that group selects the inner one, which selects the leaf. There is
+	//	              no physical direction in it at all - a group never carries a byte.
+	//	Hops          WHERE THE BYTES GO, nearest this device first.
+	//
+	// Reversing ControlPath was applying a PHYSICAL correction to a CONTROL-plane list. The selection
+	// sequence is root-to-leaf by definition, and packet order does not change who decided what.
+	//
+	// This is pinned by TestControlPathIsRootToLeafRegardlessOfPacketOrder, which builds a topology
+	// whose two orders are provably different and asserts each list against its own rule.
 	// An Unknown's Position names the hop index it belongs at. The walk recorded it before the
 	// reversal, so it is remapped through the same permutation rather than left describing a slot that
 	// now holds a different hop. A negative Position means "not on the path" and is left alone.
