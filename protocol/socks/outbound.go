@@ -89,17 +89,11 @@ var lookupDestinationAddresses = func(ctx context.Context, router adapter.DNSRou
 // resolveDestinationForDownstream returns the addresses to dial when this outbound owns destination
 // DNS, or ok=false when it must leave the destination as it is.
 //
-// # The three answers, and why "no answer" is not one of them
-//
-//   - not declared: ok=false, and the destination travels unchanged. This is every ordinary
-//     single-hop proxy, where the proxy's own resolver is the better one.
-//   - declared, the destination is already an address: ok=false. There is nothing to own, and a
-//     reverse lookup would be inventing a name.
-//   - declared, the destination is a domain: the addresses are returned, or the error is returned.
-//     A failed lookup does NOT fall through to sending the domain. Falling through would hand the
-//     name to the peer after the configuration said not to, which is the silent remote resolution
-//     this option exists to forbid; failing closed is the only answer that keeps the contract
-//     readable from the failure.
+// The DECISION lives in common/dialer.DestinationOwnership, because protocol/http makes the same
+// decision for the same option and a second copy of the rule is how one protocol ends up enforcing
+// ownership on its stream path and not on its packet path. What stays here is the one thing the shared
+// helper cannot supply: the `lookupDestinationAddresses` seam, which is the point these tests
+// substitute so they can drive the real entry points without a DNS transport.
 func (h *Outbound) resolveDestinationForDownstream(ctx context.Context, destination M.Socksaddr) ([]netip.Addr, bool, error) {
 	if !h.destinationDNSOwnership || !destination.IsDomain() {
 		return nil, false, nil
