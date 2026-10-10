@@ -600,10 +600,30 @@ func TestRejectReplyCode(t *testing.T) {
 			case head != "":
 				// A complete head, or as much of one as the reset left: either way the announcement
 				// is what was observed, and the truncated case is logged with how much arrived.
-				require.Contains(t, status, "200",
+				//
+				// # Why a TRUNCATED head needs its own acceptance rule
+				//
+				// `readHTTPHead` reads one byte at a time, so an abortive close can leave ANY prefix
+				// of the announcement: `H`, `HTTP/1.1 200 Con`, or the whole line. MEASURED under a
+				// six-package parallel run, one byte arrived and this assertion reported
+				// `"H" does not contain "200"` -- a failure that says nothing about the product and
+				// everything about the instrument, because the branch's own comment already accepts
+				// "part of it" while the assertion demanded a substring an arbitrarily short prefix
+				// cannot contain.
+				//
+				// The acceptance is a PREFIX test rather than a loosened one, so the direction of the
+				// defect is preserved exactly: every byte that arrived must be a prefix of the
+				// announcement `server_conn.go` writes. `H`, `HTTP/1.1 200 Con` and the full line all
+				// qualify; a real refusal -- `HTTP/1.1 403 Forbidden`, or any other status line --
+				// is not a prefix of it and still fails here, which is what the flip-the-expectation
+				// signal depends on.
+				require.True(t,
+					strings.Contains(status, "200") || strings.HasPrefix(pinnedConnEstablishedAnnouncement, head),
 					"PINNED DEFECT: transport/http/server_conn.go writes 200 Connection established "+
 						"before the route decision, so a rejected CONNECT is announced as established. "+
-						"If this assertion now fails, the defect was fixed: flip the expectation.")
+						"If this assertion now fails, the defect was fixed: flip the expectation. "+
+						"Received %q, which is neither a 200 status nor a prefix of the announcement (%d byte(s) of head)",
+					status, len(head))
 				if connectErr != nil {
 					t.Logf("the rejected CONNECT was aborted after %d byte(s) of head: %q (%v)",
 						len(head), head, connectErr)
@@ -648,6 +668,12 @@ func httpConnectStatus(t *testing.T, proxyAddress string, target string) (string
 	}
 	return firstLine(head), head, nil
 }
+
+// pinnedConnEstablishedAnnouncement is the bytes `transport/http/server_conn.go` writes before the
+// route decision, which is the pinned defect this file observes. It is spelled here rather than
+// imported because the assertion is ABOUT the wire text: if that line ever changes, this constant
+// and the test must change together, and a shared symbol would hide it.
+const pinnedConnEstablishedAnnouncement = "HTTP/1.1 200 Connection established\r\n\r\n"
 
 // firstLine is the status line of a head, complete or truncated.
 func firstLine(head string) string {
