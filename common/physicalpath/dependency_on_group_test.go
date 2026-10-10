@@ -123,6 +123,49 @@ func TestADeliveredNetworkIsEnforcedOnAHopThatDialsThroughAGroup(t *testing.T) {
 	}
 }
 
+// TestANestedGroupDependencyEchoesOnceAndNotTwice is the same shape one level down: `L.detour = G1`,
+// `G1 -> G2 -> [m1, m2]`. The echo happens at BOTH group frames, and the physical chain must still be
+// `member -> L` - a group contributes no tag to a chain, so G1 and G2 must not appear in one.
+func TestANestedGroupDependencyEchoesOnceAndNotTwice(t *testing.T) {
+	m1 := dualLeaf("m1")
+	m2 := dualLeaf("m2")
+	inner := tcpGroup("G2", "m1", "m1", "m2")
+	outer := tcpGroup("G1", "G2", "G2")
+	leaf := tcpLeaf("L", "G1")
+	registry := newRegistry(m1, m2, inner, outer, leaf)
+	inner.lookup = registry.objects
+	outer.lookup = registry.objects
+
+	nodes, err := registry.resolver().Hops(leaf)
+	require.NoError(t, err)
+	require.Len(t, nodes, 4, "two member routes, each with the declaring hop at its far end: %v",
+		describeNodes(nodes))
+
+	entryChains := make([]string, 0, 2)
+	for _, node := range nodes {
+		if node.Tag != "L" {
+			require.False(t, node.Exit, "only the declaring hop is an exit: %v", describeNodes(nodes))
+			require.NotContains(t, node.PhysicalPath, "G1", "a group is not a hop")
+			require.NotContains(t, node.PhysicalPath, "G2", "a group is not a hop")
+			continue
+		}
+		require.True(t, node.Exit)
+		require.True(t, businessEntry(node))
+		require.Len(t, node.PhysicalPath, 2, "the chain is member -> L and nothing else: %v", node.PhysicalPath)
+		require.Equal(t, "L", node.PhysicalPath[1])
+		entryChains = append(entryChains, node.Path())
+	}
+	require.ElementsMatch(t, []string{"m1 -> L", "m2 -> L"}, entryChains)
+
+	report, err := ValidateRoots(registry.resolver(), []adapter.Outbound{leaf}, nil,
+		[]string{N.NetworkUDP}, Declarations{})
+	require.NoError(t, err)
+	require.False(t, report.Reachable(),
+		"the declaring hop is still the hop the flow arrives at, through one group or two: %v",
+		describeChecks(report.Nodes))
+	require.Len(t, report.Failures, 2, "one per route: %v", report.Failures)
+}
+
 // TestADependencyOnAGroupWithADeeperMemberIsStillDeviceFirst is the same shape with a member that has
 // a dependency of its own, which is where an echoed prefix and a member descent have to interleave
 // correctly rather than merely coexist.

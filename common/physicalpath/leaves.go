@@ -110,7 +110,8 @@ func (h PathNode) Path() string {
 	return strings.Join(h.PhysicalPath, " -> ")
 }
 
-// DefaultNodeBudget is the number of nodes one Hops enumeration will visit before it REFUSES.
+// DefaultNodeBudget is the number of nodes one Hops enumeration will visit - or re-emit, when a hop
+// above a group is echoed into each member route - before it REFUSES.
 //
 // # Why there is a budget at all
 //
@@ -337,6 +338,8 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 				if len(prefix) > 0 {
 					e.hops = append(e.hops, prefix...)
 					echoed = true
+					// Charged like the echo in the member path: see the note there.
+					e.visited += len(prefix)
 				}
 				e.hops = append(e.hops, PathNode{
 					Root:             rootTag,
@@ -380,6 +383,13 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 			if len(prefix) > 0 {
 				e.hops = append(e.hops, prefix...)
 				echoed = true
+				// An echoed hop is emitted once per member route, so the enumeration's OUTPUT is no
+				// longer the same size as its walk. The budget bounds the output as well as the walk
+				// (`DefaultNodeBudget`: "the number of nodes one Hops enumeration will visit"), and
+				// a graph of deep declaring hops that each branch would otherwise multiply the two:
+				// measured reasoning, not a live defect - a route of depth d under b branches
+				// produces d*b nodes from b visits - so the re-emitted hops are charged here.
+				e.visited += len(prefix)
 			}
 			outcome, err := e.enumerateHops(member, rootTag, chain, physicalPath, required,
 				isCurrent && selectedTag == memberTag, memberStart)
@@ -395,7 +405,8 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 		}
 		if len(prefix) > 0 && !echoed {
 			// The group has no members at all. The route above it still exists - it is simply a
-			// route this enumeration reach no end of - so its own hops are kept rather than dropped.
+			// route this enumeration reaches no end of - so its own hops are kept rather than
+			// dropped.
 			e.hops = append(e.hops, prefix...)
 		}
 		// A group is a control node: it never terminates a physical route by itself, so how the route
