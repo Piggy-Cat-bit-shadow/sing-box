@@ -255,13 +255,37 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 // the business network is therefore accepted, and one that does not is left UNVERIFIED rather than
 // refused: UDP-over-TCP is a legal conversion and this is exactly the case it covers.
 func nodeRequirementFor(resolver *Resolver, hop PathNode, delivered []string) []string {
-	if hop.Position > 0 {
+	if !businessEntry(hop) {
 		return nil
 	}
 	if hasNetworkFilteringGroup(resolver, []PathNode{hop}) {
 		return nil
 	}
 	return delivered
+}
+
+// businessEntry reports whether the flow the routing selected ARRIVES at this node.
+//
+// # Why this is not Position == 0
+//
+// `Position` is an index into PACKET order, whose origin is the hop nearest THIS DEVICE. For a route
+// with a detour the device-nearest hop is a DEPENDENCY, so reading position 0 as "the flow arrives
+// here" demands the BUSINESS network of an underlay hop and refuses a legal TCP-only middle hop under
+// a UDP-carrying outbound.
+//
+// The business entry is the far end of packet order: the hop the routing selected. A node therefore
+// is the entry exactly when nothing was dialled THROUGH it, which is when its own physical chain does
+// not continue past it. `Position` is the node's index in `PhysicalPath`, so that is
+// `len(PhysicalPath)-1 == Position`.
+//
+// It is stated in terms of the node's OWN CHAIN rather than in terms of an index, so it stays correct
+// whichever end the ordering convention counts from.
+func businessEntry(hop PathNode) bool {
+	if len(hop.PhysicalPath) == 0 {
+		// No physical chain at all: the root itself, which is where the flow is delivered.
+		return true
+	}
+	return hop.Position == len(hop.PhysicalPath)-1
 }
 
 // hasNetworkFilteringGroup reports whether any group on these nodes' control paths filters its
@@ -336,7 +360,10 @@ func networkFilteringGroup(group adapter.OutboundGroup) bool {
 func advertisedNetworks(nodes []PathNode) []string {
 	var advertised []string
 	for _, node := range nodes {
-		if node.Position > 0 {
+		if !businessEntry(node) {
+			// A dependency. Its network set describes what it can serve as a PROXY for the hop that
+			// dials through it, not what the flow entering this root can be, so unioning its answer
+			// in would make the root responsible for a network no flow reaches it with.
 			continue
 		}
 		for _, network := range decidedNetworks(networksOf(node.Outbound)) {
@@ -351,6 +378,12 @@ func advertisedNetworks(nodes []PathNode) []string {
 // anyNodeCarries reports whether any reachable node under a root can carry the network.
 func anyNodeCarries(nodes []PathNode, network string) bool {
 	for _, node := range nodes {
+		if !businessEntry(node) {
+			// A dependency carries the transport of the hop that dials through it, so its Network()
+			// answers a different question. Counting it here answers the wrong question in the PASS
+			// direction: a udp-carrying underlay would bless a group whose exit is tcp-only.
+			continue
+		}
 		if slices.Contains(networksOf(node.Outbound), network) {
 			return true
 		}

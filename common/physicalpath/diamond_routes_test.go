@@ -81,24 +81,45 @@ func TestDiamondValidatesBothRoutesToASharedLeaf(t *testing.T) {
 	leaves, err := fixture.registry.resolver().Leaves(fixture.outer)
 	require.NoError(t, err)
 	require.Len(t, leaves, 2,
-		"a leaf reachable by two routes is two validation subjects: the routes require different things of it")
+		"one leaf PER ROUTE: the routes reach different hops and require different things of them")
 
 	byRoute := make(map[string]PathNode, len(leaves))
 	for _, leaf := range leaves {
 		byRoute[leaf.Route()] = leaf
 	}
-	require.Contains(t, byRoute, "outer -> A -> shared")
-	require.Contains(t, byRoute, "outer -> B -> shared",
-		"route B is reachable and must be enumerated, not swallowed because route A reached the same object")
 
-	require.Equal(t, []string{N.NetworkTCP}, byRoute["outer -> A -> shared"].RequiredNetworks,
-		"route A carries TCP")
+	// Route A's leaf is `middle`, because `middle` is the hop A selected - `shared` is its dependency
+	// and carries A's own transport, not the business flow. Route B's leaf is `shared` itself.
+	require.Contains(t, byRoute, "outer -> A -> middle",
+		"route A's leaf is the hop A selected")
+	require.Contains(t, byRoute, "outer -> B -> shared",
+		"route B reaches the shared object directly and must be enumerated, not swallowed because "+
+			"route A reached the same object further down its chain")
+
+	require.Equal(t, []string{N.NetworkTCP}, byRoute["outer -> A -> middle"].RequiredNetworks,
+		"route A carries TCP, and a tcp-only hop satisfies it")
 	require.Equal(t, []string{N.NetworkUDP}, byRoute["outer -> B -> shared"].RequiredNetworks,
 		"route B carries UDP, and therefore requires the shared leaf to carry UDP")
-	require.True(t, byRoute["outer -> A -> shared"].IsCurrent,
+	require.True(t, byRoute["outer -> A -> middle"].IsCurrent,
 		"the live route is A, and that is a ROUTE fact, not a node fact")
 	require.False(t, byRoute["outer -> B -> shared"].IsCurrent,
 		"route B is reachable but is not the route the flow takes right now")
+
+	// `shared` is still enumerated, as route A's DEPENDENCY, and it is not an exit on that route: the
+	// traffic does not leave from it, it is dialled THROUGH by `middle`.
+	hops, err := fixture.registry.resolver().Hops(fixture.outer)
+	require.NoError(t, err)
+	var sharedOnRouteA *PathNode
+	for index := range hops {
+		if hops[index].Tag == "shared" && hops[index].Route() == "outer -> A -> shared" {
+			sharedOnRouteA = &hops[index]
+		}
+	}
+	require.NotNil(t, sharedOnRouteA, "the dependency hop must still be enumerated with its own chain")
+	require.False(t, sharedOnRouteA.Exit,
+		"a dependency is not an exit: the flow is dialled THROUGH it, so nothing leaves from it")
+	require.Equal(t, 0, sharedOnRouteA.Position,
+		"and it is nearest this device on that route, which is what a dependency of the entry is")
 
 	// Route B's independent validation, expressed as the caller of this enumeration would perform
 	// it: every route must be able to serve what its own group advertises.
@@ -141,11 +162,14 @@ func TestDiamondKeepsPerRoutePhysicalPosition(t *testing.T) {
 		}
 	}
 	require.Equal(t, map[string]routeContext{
-		"outer -> A -> shared": {physicalChain: "middle -> shared", position: 1, required: N.NetworkTCP},
+		// Packet order: the device reaches `shared` first and `middle` second, so on route A the
+		// shared object sits at position 0 with the chain that continues past it.
+		"outer -> A -> shared": {physicalChain: "shared -> middle", position: 0, required: N.NetworkTCP},
+		// Route B reaches the shared object directly, so it is both the entry and the exit there.
 		"outer -> B -> shared": {physicalChain: "shared", position: 0, required: N.NetworkUDP},
 	}, contexts,
-		"the shared leaf's physical position, chain and requirement are per ROUTE: route A reaches it "+
-			"through middle, route B reaches it directly")
+		"the shared object's physical position, chain and requirement are per ROUTE: on route A it is "+
+			"a dependency of the entry, on route B it is the entry itself")
 }
 
 // TestSharedLeafFailureIsAttributedToItsOwnRoute is the report-layer statement of the same
