@@ -46,6 +46,31 @@ func sniffGoroutines() int {
 	return count
 }
 
+// sniffGoroutinesFromCallback is sniffGoroutines for a census taken from the goroutine testify runs a
+// `require.Never` condition on, and the subtraction is the difference between an allowance and a
+// measurement.
+//
+// # Why `before` and the samples were not comparable
+//
+// `before` is read on the TEST goroutine. The condition of `require.Never` runs on a goroutine testify
+// starts, and a closure defined in this file has `sing-box/common/sniff_test` on its own stack - the
+// same substring the predicate matches. MEASURED: a census taken from the test goroutine reads 1 and
+// the same census taken from a callback goroutine reads 2, so every sample the predicate saw was one
+// HIGHER than the baseline it was compared against.
+//
+// The consequence is the failure direction that matters for a leak check. With the old `> before+4`
+// the real allowance was 3, not 4, and a FIXED leak was measured at every size below it: one leaked
+// goroutine left the census at 3, two at 4 and three at 5, and the predicate fired at none of them;
+// only four was caught. An allowance that hides three goroutines is not a tolerance, it is a blind
+// spot - and it was invisible because the number was never calibrated.
+//
+// The test goroutine itself cancels out and is not part of this correction: it is blocked inside
+// `require.Never` with `sniff_test` on its stack in both readings, so it contributes to `before` and
+// to every sample alike. Only the callback's own frame is uncancelled, and it is exactly one.
+func sniffGoroutinesFromCallback() int {
+	return sniffGoroutines() - 1
+}
+
 // peekStreamChunks drives PeekStream over an in-memory connection that hands back the given chunks
 // one per read, using the production stream plan, and reports what the sniffers decided.
 func peekStreamChunks(t *testing.T, chunks [][]byte, cached []*buf.Buffer, terminal error) (*adapter.InboundContext, error, int) {
@@ -258,7 +283,9 @@ func TestPeekStreamDoesNotOutliveItsDeadline(t *testing.T) {
 		require.ErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return sniffGoroutines() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
+	require.Never(t, func() bool { return sniffGoroutinesFromCallback() > before }, 200*time.Millisecond, 20*time.Millisecond,
+		"PeekStream left a goroutine behind after an unsatisfiable sniff: the census is exact and "+
+			"already excludes the callback's own frame, so one leaked goroutine is enough to fail this")
 }
 
 // TestPeekStreamUnknownPayloadSweepsEverySniffer pins the full-sweep path: a payload nothing claims
@@ -321,5 +348,77 @@ func TestPeekStreamCancelledContextStillTerminates(t *testing.T) {
 		require.NotErrorIs(t, err, sniff.ErrNeedMoreData)
 	}
 	require.Less(t, time.Since(start), 10*time.Second)
-	require.Never(t, func() bool { return sniffGoroutines() > before+4 }, 200*time.Millisecond, 20*time.Millisecond)
+	require.Never(t, func() bool { return sniffGoroutinesFromCallback() > before }, 200*time.Millisecond, 20*time.Millisecond,
+		"a cancelled context left a goroutine behind: the census is exact and already excludes the "+
+			"callback's own frame, so one leaked goroutine is enough to fail this")
+}
+
+// TestTheSniffCensusMovesForExactlyOneLeakedGoroutine is the calibration the two lifecycle checks were
+// missing, and it is the half that makes the exact bound above safe to assert.
+//
+// A census another test in the binary can move, or one that cannot move at all, is not evidence. The
+// allowance this replaced (`> before+4`) was never calibrated, and MEASURED it hid a fixed leak of one,
+// two and three goroutines while catching four. So the instrument is shown here to move for EXACTLY
+// one goroutine started by this package, read the same way the lifecycle predicates read it - from a
+// callback goroutine, through the correction - and to come back when that goroutine is released.
+func TestTheSniffCensusMovesForExactlyOneLeakedGoroutine(t *testing.T) {
+	baseline := sniffGoroutines()
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		// A function literal defined in this file carries `sing-box/common/sniff_test` on its stack,
+		// which is exactly the shape the predicate matches - so this is a real leaked-goroutine
+		// stand-in rather than a simulation of one.
+		close(started)
+		<-release
+	}()
+	<-started
+
+	require.Equal(t, baseline+1, pollCensusFromCallback(t, baseline, 5*time.Second),
+		"one goroutine started by this package must move the census by exactly one; a census that "+
+			"cannot move proves nothing, and one that moves by more is counting something else "+
+			"(baseline was %d)", baseline)
+
+	close(release)
+
+	returned := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		// Read the PLAIN census here, not the callback-corrected one: this reading is taken on the
+		// test goroutine, which is where `baseline` was taken, so the two are already comparable and
+		// subtracting the callback's frame would compare a corrected number against an uncorrected one.
+		// That asymmetry was MEASURED while writing this test - it reported "expected 1, actual 0" - and
+		// it is the same class of error as the one the correction exists to remove.
+		returned = sniffGoroutines()
+		if returned <= baseline || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, baseline, returned,
+		"the census must come back to its baseline once the goroutine is released, or it reports an "+
+			"accumulation that is not there (baseline was %d)", baseline)
+}
+
+// pollCensusFromCallback reads the census the way a lifecycle predicate reads it - from a goroutine
+// other than the test's - until it exceeds baseline, and returns the last reading if the window
+// passes, so the caller's assertion is what reports the failure rather than a timeout.
+func pollCensusFromCallback(t *testing.T, baseline int, window time.Duration) int {
+	t.Helper()
+	observed := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		deadline := time.Now().Add(window)
+		for {
+			observed = sniffGoroutinesFromCallback()
+			if observed > baseline || time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	<-done
+	return observed
 }
