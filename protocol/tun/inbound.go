@@ -518,6 +518,23 @@ func (t *Inbound) Tag() string {
 	return t.tag
 }
 
+// isFlowCapable reports whether a registered component can hand a whole flow to the TUN, which is
+// the capability the GSO / multi-pending-packets probe below is looking for.
+func isFlowCapable(component any) bool {
+	flowOutbound, isFlowOutbound := component.(adapter.FlowOutbound)
+	return isFlowOutbound && flowOutbound.PreMatchFlow(N.NetworkTCP, netip.Addr{}) == adapter.PreMatchFlow
+}
+
+// setFlowCapability records, on the options the platform interface is built from, that a
+// flow-capable component exists. The Linux and Darwin spellings are two names for the same probe.
+func (t *Inbound) setFlowCapability() {
+	if C.IsLinux {
+		t.tunOptions.GSO = true
+	} else {
+		t.tunOptions.EXP_MultiPendingPackets = true
+	}
+}
+
 func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
@@ -544,26 +561,33 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	case adapter.StartStateStart:
 		if t.platformInterface == nil &&
 			((C.IsLinux && !t.tunOptions.GSO) || (C.IsDarwin && !t.tunOptions.EXP_MultiPendingPackets)) {
+			// A manager can legitimately be absent from this context, and that is not an error: the
+			// probe below asks whether some component can hand a whole flow to the TUN, so a context
+			// with no outbound or endpoint registry simply has nothing to ask. Dereferencing the nil
+			// crashed Start outright - MEASURED on the race gate as
+			//
+			//	panic: runtime error: invalid memory address or nil pointer dereference
+			//	github.com/sagernet/sing-box/protocol/tun.(*Inbound).Start
+			//		protocol/tun/inbound.go:549
+			//
+			// from a scope that registered neither manager. The Initialize stage above already
+			// guards its own manager lookup this way; this stage was the one that did not.
 			outboundManager := service.FromContext[adapter.OutboundManager](t.ctx)
-			endpointManager := service.FromContext[adapter.EndpointManager](t.ctx)
-			for _, outbound := range outboundManager.Outbounds() {
-				if flowOutbound, isFlowOutbound := outbound.(adapter.FlowOutbound); isFlowOutbound && flowOutbound.PreMatchFlow(N.NetworkTCP, netip.Addr{}) == adapter.PreMatchFlow {
-					if C.IsLinux {
-						t.tunOptions.GSO = true
-					} else {
-						t.tunOptions.EXP_MultiPendingPackets = true
+			if outboundManager != nil {
+				for _, outbound := range outboundManager.Outbounds() {
+					if isFlowCapable(outbound) {
+						t.setFlowCapability()
+						break
 					}
-					break
 				}
 			}
-			for _, endpoint := range endpointManager.Endpoints() {
-				if flowOutbound, isFlowOutbound := endpoint.(adapter.FlowOutbound); isFlowOutbound && flowOutbound.PreMatchFlow(N.NetworkTCP, netip.Addr{}) == adapter.PreMatchFlow {
-					if C.IsLinux {
-						t.tunOptions.GSO = true
-					} else {
-						t.tunOptions.EXP_MultiPendingPackets = true
+			endpointManager := service.FromContext[adapter.EndpointManager](t.ctx)
+			if endpointManager != nil {
+				for _, endpoint := range endpointManager.Endpoints() {
+					if isFlowCapable(endpoint) {
+						t.setFlowCapability()
+						break
 					}
-					break
 				}
 			}
 		}
