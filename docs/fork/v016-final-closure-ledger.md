@@ -218,6 +218,74 @@ time. It is the same class as `common/dialer`'s deadline-bound test - a suite wh
 under a full-package run - and it is recorded rather than "fixed" by widening a bound, because the
 assertion is not what is wrong.
 
+## 5.2 MERGE-01 — the upstream absorption matrix
+
+**Two corrections to the record first, because they are my errors and they cost the round time.**
+
+1. An earlier round reported "LX was not read: this environment has no general internet access". That
+   was **FALSE**. GitHub is reachable from this machine; I simply never tested it. LX was fetched and
+   read this round, and the claim has been wrong in the repository since it was written.
+2. I then made the opposite mistake and treated LX as a sync target. **It is not the upstream.** The
+   upstream the task order names is `SagerNet/sing-box`. LX is only a comparison anchor for SPEC
+   119/120/121.
+
+```text
+UPSTREAM              SagerNet/sing-box, remote `upstream`, tip 6afeff4c0 (2026-10-09)
+MERGE_BASE            7a3d4e4a8e71bd7fa824959efdb57b4f39738802   (2026-09-06)
+upstream side         53 commits
+my side               1527 commits
+git cherry            42 patch-equivalent / 11 genuinely new   (verified against origin/testing)
+REAL_GAP              0
+PARTIAL_IDEA          0
+NEW COMMITS           none - nothing needed merging
+```
+
+**All 42 patch-equivalent commits have a fork commit on `testing` whose subject is upstream's
+VERBATIM and whose date is the same day** (42/42, zero unmatched). The analysis did not stop at that:
+every item within this round's scope was re-verified against the CODE at HEAD rather than trusted from
+the `-` line. Three findings are worth recording because the fork is **stronger** than upstream, not
+merely equal:
+
+| upstream | fork's position |
+|---|---|
+| `80c117141` tailscale SSH auth banners | the fork has `authBannerSender` + `applyAction` (`protocol/tailscale/tailssh/server.go:282,324`) which **upstream does not have at all**, plus 5 controls upstream lacks |
+| `69601481f` scope-cleanup errors | `adapter/lifecycle.go:196-208` *Expands* each cleanup before judging it (upstream does not), filters closed/cancelled, and adds a state machine so a second `Close` JOINS the first instead of reporting success early |
+| `df8e2edfd` forward NAT + UDP mapping | the fork has no `reservation_windows.go` (the file upstream deletes) and instead owns `common/kernelports/pool.go` byte-identical to upstream's new file plus a 1049-line `backend_windows.go` carrying the fragment and embedded-ICMP handling |
+
+Two of the 11 "new" commits are pure dependency bumps whose fix is already **carried by the pinned
+module**: `194ebd18b` is `sing-tun/tun.go:134 DNSModeOrDefault()`, and `7f7c7ae11` is a
+`sing-anytls` bump the fork is already **ahead** of. Both are `EXTERNAL_DEPENDENCY` by construction.
+
+### The one genuine divergence — a product decision, not a gap
+
+`78d44d52d` "Reset network on DNS server changes" is the single row where the fork is **deliberately
+divergent**, and the divergence is documented in the fork's own code:
+
+```text
+dns/router.go:1266-1317   dnsGeneration = networkGeneration + observeDNSEnvironment
+route/dns_only_change_is_not_a_network_transition_test.go   enforces it
+```
+
+The fork treats a DNS-only change as a **DNS**-generation change and never as a **network** transition,
+because a network reset would tear down every QUIC/H2/MASQUE/voice session on a device whose network
+never changed. Notably, upstream's own commit **deletes the same cgo `dnsinfo` reader** the fork uses
+for the Darwin path - i.e. upstream converged on the fork's position from the other side.
+
+If the intended policy is instead upstream's "a DNS change IS a network reset", it is one line of
+wiring. It would contradict the fork's own test, so it is a decision for whoever owns
+`dns/router.go`, and it is recorded in section 7 rather than changed here.
+
+### LX, and the three SPECs
+
+MEASURED: LX does **not** contain `transport/v2rayxhttp` and does **not** contain `common/physicalpath`
+across its 1199 tracked files. The fork-only PhysicalPath model and the XHTTP transport the SPECs 119
+and 121 discuss therefore have no LX counterpart to compare against, and there was never an LX patch
+to absorb for them. SPEC 120 (MTU alignment) was addressed in this and the previous round by
+measurement on the wire rather than by comparison.
+
+The `lxref` remote was removed after this check: it is a comparison anchor, never a merge source, and
+leaving it configured is what caused the misdirection in the first place.
+
 ## 6. Preserved and NOT re-done
 
 The two earlier P0s (the original hop-direction reversal and the global network-union false
@@ -241,7 +309,8 @@ TUIC's measured 1232 datagram, `common/physicalpath/status.go`, the COPY-01 allo
 4. `common/httpclient`'s 48h HTTP/3 cap is reachable only by failures CONCURRENT inside one window,
    because an expired entry is deleted on read. The comment reads like a doubling ladder; the code is
    a concurrency-amplified one.
-5. The `sing` fork's `BufferedVectorisedWriter` allocates unpooled above 64KiB - the one genuinely
+5. **A DNS-only change: DNS generation or full network reset?** The fork treats it as DNS-only (`dns/router.go:1266-1317`, enforced by `route/dns_only_change_is_not_a_network_transition_test.go`); upstream `78d44d52d` treats it as a network transition. The fork's position avoids tearing down every QUIC/H2/MASQUE/voice session on a device whose network did not change, and upstream's own commit deletes the same cgo reader the fork uses. Confirm the policy.
+6. The `sing` fork's `BufferedVectorisedWriter` allocates unpooled above 64KiB - the one genuinely
    avoidable per-write allocation found - and it is inside the read-only dependency.
 
 ## 8. Closing block
