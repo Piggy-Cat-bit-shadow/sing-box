@@ -390,6 +390,37 @@ func (f *rebindFixture) establishSocketsPerStandardBind(t *testing.T) {
 	}
 }
 
+// settleSocketsPerStandardBind returns the number of receivers one standard bind holds, having
+// WAITED for the endpoint to reach it.
+//
+// This is the assertion the socket-count tests actually want, and reading a census once is not
+// it. A standard bind does not reach its full set atomically - `StdNetBind.Open` listens on
+// udp4, listens on udp6 and only then starts one receiver per listener - so a reading taken
+// during that window legitimately sees fewer. MEASURED on the macOS runner, in a later cycle
+// than the one that established the count:
+//
+//	cycle 1: a started endpoint must own exactly one socket's receivers
+//	expected: 2   actual: 1
+//
+// The endpoint was correct; the reading was early. Comparing a single reading against the
+// established count therefore fails for a reason that has nothing to do with what the test is
+// about, which is that a started endpoint owns exactly one socket's receivers and that Close
+// releases them.
+//
+// Waiting keeps the property exact - the census must REACH the established count, and a bind
+// that settles on more than a standard bind produces still fails - while not mistaking a
+// transient value for a settled one. A census that never arrives still fails, on the timeout.
+func (f *rebindFixture) settleSocketsPerStandardBind(t *testing.T, what string) int {
+	t.Helper()
+	expected := measuredSocketsPerStandardBind(t, socketCensus(t, f.endpoint))
+	require.Eventually(t, func() bool {
+		return socketCensus(t, f.endpoint) == expected
+	}, 10*time.Second, 2*time.Millisecond,
+		"%s: a started endpoint must own exactly one socket's receivers (%d) and must reach "+
+			"that count; it never did", what, expected)
+	return expected
+}
+
 // livePort reads the port the running device reports.
 func (f *rebindFixture) livePort(t *testing.T) uint16 {
 	t.Helper()
@@ -1272,16 +1303,7 @@ func TestFifteenStartCloseCyclesWithRecoveriesLeakNothing(t *testing.T) {
 		endpoint := fixture.endpoint
 		wgDevice := endpoint.device.Load()
 		ports = append(ports, fixture.livePort(t))
-		// The expectation is established FROM this reading rather than read before it.
-		//
-		// `socketsPerStandardBind` is a sentinel (-1) until something measures it, and reading it here
-		// compared a real census against that sentinel - which is what the macOS runner reported as
-		// "expected: 2, actual: 0", the unmeasured value being whatever a previous test left behind.
-		// The endpoint is started and proved settled by this point, so its census IS "one socket's
-		// receivers on this machine", which is exactly the quantity the assertion is about.
-		held := socketCensus(t, endpoint)
-		require.Equal(t, measuredSocketsPerStandardBind(t, held), held,
-			"cycle %d: a started endpoint must own exactly one socket's receivers", cycle)
+		fixture.settleSocketsPerStandardBind(t, fmt.Sprintf("cycle %d", cycle))
 
 		// A full recovery worker run: a stale session, a real rebind through the worker, and a clean exit.
 		endpoint.recovery.settle = time.Millisecond
@@ -1320,9 +1342,7 @@ func TestTwentyFourRecoveriesThroughTheWorker(t *testing.T) {
 	fixture.proveStandardBindBranch(t)
 
 	endpoint := fixture.endpoint
-	// Established from this reading, not read before it: see the note in the cycle test above.
-	held := socketCensus(t, endpoint)
-	require.Equal(t, measuredSocketsPerStandardBind(t, held), held)
+	fixture.settleSocketsPerStandardBind(t, "the started endpoint")
 	endpoint.recovery.settle = time.Millisecond
 	endpoint.recovery.poll = time.Millisecond
 	endpoint.registration.SetRecoveryWindow(time.Millisecond)
