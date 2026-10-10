@@ -23,6 +23,23 @@ on:
 permissions:
   contents: read
 
+# `group` is keyed by the ref AND the event, so a newer push to the same ref supersedes
+# the run the previous push started - this is the only workflow a push triggers, and
+# finishing a 40-minute structural gate for a commit that has already been replaced is
+# pure wall clock.
+#
+# A manual dispatch is deliberately NOT cancellable: `github.event_name` puts it in a
+# group of its own, and `cancel-in-progress` is false for it, so a dispatch can never be
+# cancelled by a push, and two dispatches can run at the same time.
+#
+# A superseded run is not a silent pass. scripts/ci/verify-release-acceptance.sh accepts
+# only a COMPLETED SUCCESSFUL run of `verify.yml`/`Verify` at the release commit and
+# fails closed on `cancelled`, so if the superseded run was the release candidate's, the
+# release fails loudly and the workflow is dispatched again for that commit.
+concurrency:
+  group: verify-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -30,25 +47,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: |
-            go.sum
-            test/go.sum
-
-      - name: gofmt
-        run: |
-          set -euo pipefail
-          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter 2>&1 || true)"
-          if [ -n "$unformatted" ]; then
-            echo "FAIL: these files are not gofmt-clean:" >&2
-            echo "$unformatted" >&2
-            exit 1
-          fi
-          echo "PASS: gofmt clean"
-
+      # The two gate self-tests run FIRST, before `setup-go`. They need no Go
+      # toolchain, no module download and no network - which is why their notes say
+      # they can run on every push - so they were paying for a toolchain install and a
+      # module-cache restore to discover, in seconds, that the release gate is broken.
       - name: release gate self-test
         # The release gate decides what gets published, and its expensive failure
         # modes are invisible to a happy path: the previous version waited out its
@@ -84,6 +86,25 @@ jobs:
         # discovered before a release is attempted, not during one.
         run: ./scripts/ci/verify-release-acceptance-test.sh
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            test/go.sum
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l cmd include option protocol route service transport common dns adapter 2>&1 || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
       - name: gomobile single-source check
         # `github.com/sagernet/gomobile/cmd/gomobile@v0.1.13` used to be written out
         # three times: twice in the Apple workflow and once in the Makefile. Nothing
@@ -97,11 +118,6 @@ jobs:
         # run here: it would add a module download to every push for a fact that only
         # changes when the declaration does.
         run: ./scripts/ci/test-gomobile-toolchain.sh
-
-      - name: pinned-upstream assumptions
-        # The one step that exists for a fork: it fails when an upstream revision changes the meaning
-        # of something this fork relies on, and it prints where each assumption lives.
-        run: ./scripts/ci/verify-upstream-assumptions.sh
 
       - name: nested Go module integrity
         # A nested module inherits neither the root module's replaces nor its go.sum, and this
@@ -150,6 +166,17 @@ jobs:
         # TestProfileTagFilesDoNotClaimChecklinkname0 requires the profile tag files to stop claiming
         # that flag. Together they are what keeps a bare `go build ./...` linkable.
         run: go test -count=1 ./cmd/internal/...
+
+      - name: pinned-upstream assumptions
+        # The one step that exists for a fork: it fails when an upstream revision changes the meaning
+        # of something this fork relies on, and it prints where each assumption lives.
+        #
+        # Placed AFTER the three cheap gates above on purpose. It runs the tripwire suites under
+        # DEFAULT_BUILD_TAGS - which links the cronet profile - and builds ./cmd/ci-artifact-probe
+        # to read the probe's provenance, so it is the most expensive step before the builds. A
+        # module, tag or linkname break should be named by the seconds-long gate that owns it, not
+        # discovered here.
+        run: ./scripts/ci/verify-upstream-assumptions.sh
 
       - name: untagged build of every package
         # `go build ./...` with NO tags is the configuration a reader gets by default and the one
