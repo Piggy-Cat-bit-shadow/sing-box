@@ -907,12 +907,23 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 		haveErr  bool
 	)
 
-	// The original is not owned by this function; its worker belongs to the caller and is
-	// cancelled through cancelOriginal. It reports on the `original` channel, which is buffered,
-	// so a late result cannot block it and cannot be lost.
-	for winner == nil {
+	// Each side reports exactly ONCE, on a channel buffered with capacity one. The loop must
+	// therefore end when both sides have reported, not merely when one of them won.
+	//
+	// Waiting only for a winner deadlocked here: with both attempts failed - the caller's
+	// original and every recovered candidate - there is no winner, both channels have already
+	// delivered their single error, and the select below blocks forever on two drained
+	// channels. The dial then returned nothing until the caller's own context expired, so a
+	// user whose addresses had all failed in milliseconds still waited out the whole connect
+	// timeout. This is the case dialLiteralWithRecovery's OTHER arm (dialRecoveredOrReport) has
+	// always handled, which is why the defect only appeared when the head-start timer fired
+	// before the original reported.
+	originalSettled := false
+	recoveredSettled := false
+	for {
 		select {
 		case result := <-original:
+			originalSettled = true
 			if result.err == nil {
 				winner = result.conn
 			} else if !haveErr {
@@ -920,6 +931,7 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 				haveErr = true
 			}
 		case result := <-recoveredResult:
+			recoveredSettled = true
 			if result.err == nil {
 				winner = result.conn
 			} else if !haveErr {
@@ -935,12 +947,16 @@ func (d *resolveDialer) raceWithPendingOriginal(ctx context.Context, network str
 			return nil, raceCtx.Err()
 		}
 
-		if winner != nil {
+		// A winner ends the race immediately. Otherwise both sides must have reported, which
+		// with a one-shot channel each means nothing is left to wait for and the errors
+		// collected so far are the answer.
+		if winner != nil || (originalSettled && recoveredSettled) {
 			break
 		}
 	}
 
-	// A winner exists. Stop the other side and make sure nothing survives this function.
+	// The race is decided. Stop the other side and make sure nothing survives this function:
+	// this is reached for a winner AND for the both-failed case.
 	cancelOriginal()
 	cancelRace()
 
