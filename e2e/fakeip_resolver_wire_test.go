@@ -28,8 +28,21 @@ import (
 // recording is a wire fact rather than a log line. Two things are wrong with it at once: the flow
 // SUCCEEDS, and the destination is an address only the box can interpret.
 //
-// The assertions below are the inverse, and they are deliberately about BOTH halves: a refusal that
-// still asked the peer would leave the wire fact in place.
+// # Which assertion discriminates, and which one only corroborates
+//
+// The WIRE RECORDING is the load-bearing assertion, and it is the one that must not be removed. The hop
+// appends to its recording BEFORE it dials anything, so "the peer was never asked" holds whether or not
+// the synthetic address happens to be reachable.
+//
+// The reply-code assertion is a SECOND, environment-dependent signal and does NOT discriminate on its
+// own. MEASURED by an independent adversary on this host: `198.18.0.0/15` is live routed space here, so
+// in the BROKEN build the hop really did reach something and answered 0x00 - but on a host where
+// `198.18.0.2:443` is not reachable the hop writes 0x05, and `require.NotEqual(0x00, code)` PASSES in
+// the broken build. It is kept because it still catches the case where the hop answers success, and it
+// is labelled here so that nobody reads it as the discriminator.
+//
+// `require.Zero(hop.acceptCount())` is the second independent view of the same wire fact: the hop
+// counts the connections it ACCEPTED, which no reply code can fabricate.
 func TestAFakeIPDomainResolverNeverPutsASyntheticAddressOnTheWire(t *testing.T) {
 	const userTarget = "fakeip-resolver-leak.test"
 
@@ -48,14 +61,19 @@ func TestAFakeIPDomainResolverNeverPutsASyntheticAddressOnTheWire(t *testing.T) 
 	recorded := awaitHopRecording(t, hop, 200*time.Millisecond)
 	t.Logf("domain %q -> reply code 0x%02x, hop recorded %v", userTarget, code, recorded)
 
+	// The load-bearing assertion, first and separately labelled: the hop was never ASKED. It appends to
+	// its recording before dialling, so this holds regardless of what the client was told.
 	require.Empty(t, recorded,
 		"the peer was asked for %v: a fakeip server answered a destination lookup, so the address it "+
 			"invented travelled to a peer that cannot interpret it", recorded)
-	require.NotEqual(t, byte(0x00), code,
-		"the connect reported SUCCESS while nothing was reachable: the peer was never asked, so "+
-			"whatever the client received referred to a destination that does not exist")
+	// The second independent view: no connection was ACCEPTED, which no reply code can fabricate.
 	require.Zero(t, hop.acceptCount(),
 		"the hop accepted %d connection(s) for a destination that must never reach it", hop.acceptCount())
+	// Corroborating only - see the comment on this test. On a host where the synthetic address happens
+	// to be reachable this assertion passes in the BROKEN build, so it is not the discriminator.
+	require.NotEqual(t, byte(0x00), code,
+		"the connect reported SUCCESS: the peer was never asked, so whatever the client received "+
+			"referred to a destination that does not exist")
 }
 
 // awaitHopRecording gives an in-flight request a bounded window to be recorded, so that "the hop was

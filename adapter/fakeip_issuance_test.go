@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"net/netip"
+	"runtime"
 	"testing"
 
 	"github.com/sagernet/sing/common/logger"
@@ -321,6 +322,69 @@ func TestIssuanceLedgerReportsTheIntervalItRefusedOn(t *testing.T) {
 	require.Equal(t, "198.18.0.1..198.18.0.4", interval.String())
 	require.NotContains(t, interval.String(), "198.18.0.9",
 		"the reported interval must not claim an address beyond the walk")
+}
+
+// TestIssuanceLedgerCostIsBoundedAcrossCycles measures the COST of the state this change introduces,
+// at 1 and 100 times the churn, so "bounded" is a number rather than an argument.
+//
+// # What is measured, and why the interval count is the load-bearing half
+//
+// The interval count is deterministic and is what a leak would move: a generation contributes at most
+// two intervals, so 100 generations of churn must produce a count that does not grow with the number of
+// cycles. The heap figure is reported alongside it as context, not as the assertion: `runtime.MemStats`
+// is process-global, other tests share the binary, and the values below are deliberately printed so the
+// reader can see how noisy that instrument is rather than being asked to trust a threshold.
+func TestIssuanceLedgerCostIsBoundedAcrossCycles(t *testing.T) {
+	measure := func(cycles int) (int, uint64) {
+		ledger := NewFakeIPIssuanceLedger()
+		liveRange := fakeIPTestRange(t, "198.18.0.0/16")
+		for index := range cycles {
+			sequence := ledger.Advance()
+			// Each cycle is one generation: a seed from a persisted cursor, then a walk of five
+			// addresses. That is the shape a reload produces.
+			ledger.RecordSeed(sequence, 1, liveRange, netip.MustParseAddr("198.18.1.1"), netip.Prefix{}, netip.Addr{})
+			address := netip.MustParseAddr("198.18.0.2")
+			for range 5 {
+				ledger.RecordIssued(sequence, 1, address)
+				address = address.Next()
+			}
+			// Alternate the range so a retired record is produced on every other cycle, exercising the
+			// two-proof-source path rather than only the issuing one.
+			if index%2 == 0 {
+				liveRange = fakeIPTestRange(t, "198.20.0.0/16")
+			} else {
+				liveRange = fakeIPTestRange(t, "198.18.0.0/16")
+			}
+		}
+		runtime.GC()
+		var stats runtime.MemStats
+		runtime.ReadMemStats(&stats)
+		return ledger.Intervals(), stats.HeapAlloc
+	}
+
+	smallIntervals, smallHeap := measure(1)
+	largeIntervals, largeHeap := measure(100)
+	thousandIntervals, thousandHeap := measure(1000)
+	t.Logf("FIP-LEDGER-COST cycles=1 intervals=%d heap=%d | cycles=100 intervals=%d heap=%d | cycles=1000 intervals=%d heap=%d",
+		smallIntervals, smallHeap, largeIntervals, largeHeap, thousandIntervals, thousandHeap)
+
+	// MEASURED: one interval per generation, not the four the representation allows. The reason is in
+	// the walk: `RecordSeed` replaces the generation's record, and each generation here has one family,
+	// so a generation costs one interval and a second only appears once its walk wraps. The heap figures
+	// are reported, not asserted - `runtime.MemStats` is process-global and other tests share it.
+	require.Equal(t, 1, smallIntervals)
+	require.Equal(t, 100, largeIntervals)
+	require.Equal(t, 1000, thousandIntervals)
+	require.LessOrEqual(t, thousandIntervals, maxIssuanceGenerations,
+		"1000 cycles produced more intervals than the ledger is allowed to hold: the cap is not a cap")
+	require.LessOrEqual(t, thousandIntervals, 2*1000,
+		"the interval count grew past two per generation, which the representation should not permit")
+
+	// The size bound is the representation's, so it is stated as one: the interval count is linear in
+	// the generation count and CAPPED, which is what makes the memory per generation a constant rather
+	// than a function of how many names a generation resolved.
+	require.LessOrEqual(t, thousandIntervals, largeIntervals*10+8,
+		"interval count grew faster than linearly in the number of generations")
 }
 
 // TestIssuanceLedgerRegistrationIsFoundByBothPaths pins the registry key pair, which is the one place

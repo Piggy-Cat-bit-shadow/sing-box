@@ -94,8 +94,12 @@ func TestADestinationLookupRefusesAFakeIPResolver(t *testing.T) {
 //
 // It is a labelled double rather than the production dns/transport/fakeip.Transport, and that is forced
 // rather than chosen: that package imports this one, so a test in this package cannot import it back.
-// What the guard reads is the transport's declared TYPE and TAG, which this reproduces exactly, and the
-// production transport is exercised by e2e/zz_d4_fakeip_probe_test.go, which builds a real box.
+// What the guard reads is the transport's declared TYPE and TAG, which this reproduces exactly.
+//
+// The production transport is exercised end to end by `e2e/fakeip_resolver_wire_test.go`, which builds a
+// real box from this configuration and asserts the refusal at a real SOCKS5 peer. (An earlier version of
+// this comment named `e2e/zz_d4_fakeip_probe_test.go`, which has never existed in this repository - the
+// conclusion was right and the citation was not.)
 //
 // A refusal that still asked the question would be no refusal at all, which is why the count is the
 // evidence and the error alone is not.
