@@ -52,6 +52,18 @@ on:
 permissions:
   contents: read
 
+# `group` is keyed by the ref AND the event, so a newer push to the same ref supersedes
+# the run the previous push started - this workflow builds the ARM64 core on every push
+# that touches the product sources, and a superseded commit's 15-minute native build is
+# pure wall clock.
+#
+# A manual dispatch is deliberately NOT cancellable: `github.event_name` puts it in a
+# group of its own and `cancel-in-progress` is false for it, so a dispatch can never be
+# cancelled by a push - and a dispatch is how a release artifact is produced.
+concurrency:
+  group: android-core-arm64-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
 jobs:
   android-core-arm64:
     name: Android ARM64 core
@@ -86,6 +98,44 @@ jobs:
           cache-dependency-path: |
             go.sum
             test/go.sum
+
+      # Cheap structural gates first, so a failure lands near its cause instead of at the end of a
+      # 15-minute native build. They run before the JDK, the NDK download and the gomobile install
+      # below: gofmt, the module graph and the tag policy answer in seconds, and the NDK is the
+      # single slowest install in this job (~1 GB through sdkmanager) - a tag or format break must
+      # not wait for it.
+      - name: Format gate
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '^clients/') || true)"
+          if [ -n "$unformatted" ]; then
+            echo "FAIL: these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+          echo "PASS: gofmt clean"
+
+      - name: Module integrity
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Tag policy and builder tests
+        run: go test -count=1 ./cmd/internal/... ./cmd/ci-artifact-probe/...
+
+      - name: Emit the resolved tags and assert the product decisions
+        run: |
+          go run ./cmd/internal/build_libbox -print-resolved-tags android-main > /tmp/android-tags.txt
+          cat /tmp/android-tags.txt
+          python3 - <<'PY'
+          tags = open('/tmp/android-tags.txt').read().strip().split(',')
+          # gVisor was retired when the Android UI stopped depending on mixed/gvisor. It must not come
+          # back silently; the tag_policy test is the primary tripwire and this is the second one, on
+          # the resolved set the product actually compiles.
+          assert 'with_gvisor' not in tags, 'Android must not ship with_gvisor: %r' % (tags,)
+          # The mobile buffer geometry is a product decision made on measured evidence.
+          assert 'with_low_memory' in tags, 'Android must ship the mobile geometry: %r' % (tags,)
+          print('PASS: android-main carries the mobile geometry and no gVisor')
+          PY
 
       # JDK 17 and the NDK version are pinned rather than floated: a toolchain that changes under the
       # build would make a green run mean something different each week.
@@ -191,41 +241,6 @@ jobs:
             fi
           done
           echo "PASS: gomobile and gobind are built from the pinned fork at $GOMOBILE_VERSION"
-
-      # Cheap structural gates first, so a failure lands near its cause instead of at the end of a
-      # 15-minute native build.
-      - name: Format gate
-        run: |
-          unformatted="$(gofmt -l $(git ls-files '*.go' | grep -v '^clients/') || true)"
-          if [ -n "$unformatted" ]; then
-            echo "FAIL: these files are not gofmt-clean:" >&2
-            echo "$unformatted" >&2
-            exit 1
-          fi
-          echo "PASS: gofmt clean"
-
-      - name: Module integrity
-        run: |
-          go mod tidy -diff
-          go mod verify
-
-      - name: Tag policy and builder tests
-        run: go test -count=1 ./cmd/internal/... ./cmd/ci-artifact-probe/...
-
-      - name: Emit the resolved tags and assert the product decisions
-        run: |
-          go run ./cmd/internal/build_libbox -print-resolved-tags android-main > /tmp/android-tags.txt
-          cat /tmp/android-tags.txt
-          python3 - <<'PY'
-          tags = open('/tmp/android-tags.txt').read().strip().split(',')
-          # gVisor was retired when the Android UI stopped depending on mixed/gvisor. It must not come
-          # back silently; the tag_policy test is the primary tripwire and this is the second one, on
-          # the resolved set the product actually compiles.
-          assert 'with_gvisor' not in tags, 'Android must not ship with_gvisor: %r' % (tags,)
-          # The mobile buffer geometry is a product decision made on measured evidence.
-          assert 'with_low_memory' in tags, 'Android must ship the mobile geometry: %r' % (tags,)
-          print('PASS: android-main carries the mobile geometry and no gVisor')
-          PY
 
       # The real build, through the product's own builder. -platform selects the single ARM64 target:
       # an all-ABI AAR would not prove the ARM64 payload works, it would only prove gomobile can run.
