@@ -286,6 +286,35 @@ measurement on the wire rather than by comparison.
 The `lxref` remote was removed after this check: it is a comparison anchor, never a merge source, and
 leaving it configured is what caused the misdirection in the first place.
 
+## 5.3 DEBUG-04 — the build matrix and the shipped ABI
+
+Both measured this round with `CGO_ENABLED=0` and the production tag set, building `./cmd/sing-box`:
+
+```text
+windows/amd64   exit=0
+linux/amd64     exit=0
+linux/arm64     exit=0
+darwin/arm64    exit=0
+freebsd/amd64   exit=0
+```
+
+`freebsd/amd64` is included deliberately: this round changed a build tag in
+`experimental/libbox/link_flags_stub.go` (`!unix` -> `!unix && !windows`), and narrowing a tag is
+exactly the change that can strand a platform. It compiles, and the earlier `freebsd` failure reported
+by another workstream is in `daemon/`, from symbols unrelated to that change.
+
+**The libbox ABI is unchanged.** Compared with `go doc -all ./experimental/libbox` between the round's
+base `bc7456db` and the final tree:
+
+```text
+ABI IDENTICAL (383 exported symbols)
+```
+
+and the only files this round touched under `experimental/libbox/` are `link_flags_stub.go` and the
+new `link_flags_windows.go`, both of which add UNEXPORTED platform plumbing only. That matters because
+the Android and Apple clients are built against this surface, and a changed signature would break them
+silently at link time rather than at review time.
+
 ## 6. Preserved and NOT re-done
 
 The two earlier P0s (the original hop-direction reversal and the global network-union false
