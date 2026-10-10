@@ -37,8 +37,28 @@ import (
 // The sampling below mirrors testify's own shape - a fresh goroutine per evaluation, the same 200ms
 // window and 20ms tick - because that callback frame is part of what is being measured.
 
-// agentFLeakGate holds every injected worker open until the test closes it.
-var agentFLeakGate = make(chan struct{})
+// # Correction: this file measured a predicate that no longer exists
+//
+// The sweep below originally evaluated the production line verbatim -
+// `sniffGoroutines() > before+4`, on a callback goroutine - and reported that a fixed leak of one,
+// two or three goroutines was invisible. That measurement was acted on: `sniff_stream_test.go` now
+// uses `sniffGoroutinesFromCallback() > before`, which is exact. Leaving the old expression here
+// would have left a test whose message describes code that is gone, which is the defect class this
+// round exists to remove.
+//
+// So the sweep is REPOINTED at the live predicate rather than deleted. The method is unchanged - a
+// fixed, controllable leak, one size at a time, evaluated the way testify evaluates it - and the
+// answer is now the one a working instrument gives: every size is caught, starting at one. Its
+// value is that it subsumes the single-point check into a sweep, and that it would fail if the
+// correction were ever removed again.
+//
+// # And the gate that made this file un-runnable was removed
+//
+// `var agentFLeakGate` was package-level state closed by a `defer`, and nothing else used it - every
+// leak already had its own per-size channel. Under `-count=2` the second repetition closed an
+// already-closed channel and PANICKED with `close of closed channel`, taking the rest of the
+// package's repetitions with it. MEASURED: `go test -count=3 ./common/sniff` failed this file and
+// panicked. Dead state that can only panic is deleted, not guarded.
 
 // agentFLeak starts exactly n goroutines blocked on gate, whose stacks name this test package, and
 // returns once all of them are alive.
@@ -64,13 +84,14 @@ func agentFCensusFromCallback() int {
 	return <-done
 }
 
-// agentFPredicateWouldFire evaluates the production predicate the way testify does - on a goroutine it
-// creates, at the test's own 200ms window and 20ms tick - and reports whether it ever fired.
+// agentFPredicateWouldFire evaluates the LIVE production predicate the way testify does - on a
+// goroutine it creates, at the test's own 200ms window and 20ms tick - and reports whether it ever
+// fired.
 func agentFPredicateWouldFire(before int, window, tick time.Duration) bool {
 	deadline := time.Now().Add(window)
 	for time.Now().Before(deadline) {
 		done := make(chan bool, 1)
-		go func() { done <- sniffGoroutines() > before+4 }()
+		go func() { done <- sniffGoroutinesFromCallback() > before }()
 		if <-done {
 			return true
 		}
@@ -92,14 +113,18 @@ func TestAgentFSniffCensusFramesDifferByOne(t *testing.T) {
 }
 
 // TestAgentFSniffCensusSlackIsMeasured reports, for a fixed leak of one, two, three and four
-// goroutines, whether the production leak predicate catches it.
+// goroutines, whether the LIVE production leak predicate catches it.
+//
+// The expected answer after the repair is YES at every size. When this file was written the answer
+// was "hidden at one, two and three, caught at four", and that measurement is what the repair is
+// based on; keeping the sweep means a regression that restores a blanket allowance is caught here
+// rather than only in the single-point control.
 func TestAgentFSniffCensusSlackIsMeasured(t *testing.T) {
 	// Exactly what the production tests do: the baseline is read from the test goroutine.
 	before := sniffGoroutines()
-	t.Logf("MEASURED baseline from the test goroutine: %d; the predicate is `> %d`, evaluated on a "+
-		"callback goroutine that counts itself", before, before+4)
-
-	defer close(agentFLeakGate)
+	t.Logf("MEASURED baseline from the test goroutine: %d; the live predicate is "+
+		"`sniffGoroutinesFromCallback() > %d`, evaluated on a callback goroutine whose own frame the "+
+		"helper subtracts", before, before)
 
 	for _, n := range []int{1, 2, 3, 4} {
 		// One gate per leak size, released before the next, so each measurement is of exactly n
@@ -120,17 +145,13 @@ func TestAgentFSniffCensusSlackIsMeasured(t *testing.T) {
 
 		t.Logf("MEASURED fixed leak of %d: census %d against a baseline of %d (the callback frame is "+
 			"the +1), predicate `> %d` %s",
-			n, raw, before, before+4, map[bool]string{true: "FIRED (caught)", false: "did NOT fire (hidden)"}[fired])
+			n, raw, before, before, map[bool]string{true: "FIRED (caught)", false: "did NOT fire (hidden)"}[fired])
 
-		if n <= 3 {
-			require.False(t, fired,
-				"a fixed leak of %d goroutines is supposed to be hidden by the +4 tolerance; if this "+
-					"fires, the slack is narrower than measured and the finding is retracted", n)
-		} else {
-			require.True(t, fired,
-				"a leak of %d must be caught: this predicate is the only leak check these two tests "+
-					"have", n)
-		}
+		require.True(t, fired,
+			"a fixed leak of %d goroutines was NOT caught by the production leak predicate. The "+
+				"predicate is exact - the callback's own frame is subtracted and the allowance is "+
+				"zero - so this can only mean the correction was removed or an allowance crept back "+
+				"in, which is the blind spot this file measured at one, two and three goroutines", n)
 
 		close(gate)
 		require.Eventually(t, func() bool { return sniffGoroutines() == before+1 },
