@@ -400,13 +400,92 @@ check "the overlay is idempotent" python3 "$overlay" "$fixture"
 after="$(cat "$fixture/sing-box.xcodeproj/project.pbxproj" "$fixture/sing-box.xcodeproj/xcshareddata/xcschemes/SFM.xcscheme" | shasum | awk '{print $1}')"
 check "re-applying produced byte-identical files" test "$before" = "$after"
 
-echo "== the macOS overlay fails closed =="
-# Each corruption below is one that a naive implementation would accept: branding only
-# the Debug configuration, branding a configuration the overlay was never reviewed for,
-# and rewriting only part of the scheme.
-partial="$work/partial"
-write_fixture "$partial"
-python3 - "$partial/sing-box.xcodeproj/project.pbxproj" "$brand" <<'PY'
+echo "== the macOS overlay's field-wise state machine =="
+# The overlay decides each FIELD on its own, by exact equality:
+#
+#     value == old  ->  rewrite to new
+#     value == new  ->  already satisfied, leave it
+#     anything else ->  hard fail
+#
+# Per-field rather than per-configuration, because the pinned Apple source really ships a mixed
+# configuration: SFM Debug and Release carry PRODUCT_NAME = "sing-box" with
+# INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox" - the display name a user reads is branded and
+# the upstream product identifier is not. Treating that as partial corruption refused to build a
+# valid source; every case below is asserted so the state machine cannot silently lose a
+# transition.
+#
+# `set_field` writes one field of one SFM configuration to an exact value, which is how each
+# starting state is constructed.
+set_field() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import re, sys
+path, cid, key, value = sys.argv[1:5]
+src = open(path, encoding="utf-8").read()
+# The id appears FIRST in the configuration LIST, as a bare reference, and only later as the
+# definition. Anchoring on `cid /* Name */ = {` selects the definition; a plain str.index(cid)
+# lands on the reference and silently finds no fields.
+m = re.search(rf'{re.escape(cid)} /\* \w+ \*/ = \{{', src)
+if not m:
+    sys.exit(f"set_field: no block definition for {cid}")
+i = m.start()
+j = src.index("\n\t\t};", i)
+block = src[i:j]
+new_block, n = re.subn(rf'^(\s*{re.escape(key)} = )"[^"]*";', rf'\g<1>"{value}";', block, flags=re.M)
+if n != 1:
+    sys.exit(f"set_field: {key} matched {n} times in {cid}")
+open(path, "w", encoding="utf-8").write(src[:i] + new_block + src[j:])
+PY
+}
+sfm_debug=3AEC21162A459B1A00A63465
+sfm_release=3AEC21172A459B1A00A63465
+
+# --- old/old: the plain upstream project, fully overlaid --------------------
+both_upstream="$work/matrix-old-old"
+write_fixture "$both_upstream"
+check "old/old: the overlay applies" python3 "$overlay" "$both_upstream"
+for config in Debug Release; do
+  check "old/old: SFM $config PRODUCT_NAME is now $brand" \
+    test "$(setting "$both_upstream/sing-box.xcodeproj/project.pbxproj" SFM "$config" PRODUCT_NAME)" = "$brand"
+  check "old/old: SFM $config display name is now $brand" \
+    test "$(setting "$both_upstream/sing-box.xcodeproj/project.pbxproj" SFM "$config" INFOPLIST_KEY_CFBundleDisplayName)" = "$brand"
+done
+
+# --- old/new: the SOURCE-OWNED mixed state; only the rest is overlaid -------
+# This is the shape the pinned Apple source actually ships, so it is the case that matters.
+source_mixed="$work/matrix-old-new"
+write_fixture "$source_mixed"
+for cid in $sfm_debug $sfm_release; do
+  set_field "$source_mixed/sing-box.xcodeproj/project.pbxproj" "$cid" INFOPLIST_KEY_CFBundleDisplayName "$brand"
+done
+check "old/new: the fixture really carries the source-owned display name" \
+  test "$(setting "$source_mixed/sing-box.xcodeproj/project.pbxproj" SFM Debug INFOPLIST_KEY_CFBundleDisplayName)" = "$brand"
+check "old/new: and still the upstream product name" \
+  test "$(setting "$source_mixed/sing-box.xcodeproj/project.pbxproj" SFM Debug PRODUCT_NAME)" = "sing-box"
+check "old/new: the overlay completes the remaining field" python3 "$overlay" "$source_mixed"
+for config in Debug Release; do
+  check "old/new: SFM $config PRODUCT_NAME is now $brand" \
+    test "$(setting "$source_mixed/sing-box.xcodeproj/project.pbxproj" SFM "$config" PRODUCT_NAME)" = "$brand"
+  check "old/new: SFM $config display name is still $brand" \
+    test "$(setting "$source_mixed/sing-box.xcodeproj/project.pbxproj" SFM "$config" INFOPLIST_KEY_CFBundleDisplayName)" = "$brand"
+done
+
+# --- new/new: already fully branded, so a second apply is a no-op -----------
+check "new/new: a fully branded project is accepted, not refused" python3 "$overlay" "$both_upstream"
+
+# --- unknown/new: fail closed on a value this overlay does not recognise ----
+# The discriminating case: one field holds a third value. The overlay must refuse rather than
+# guess, which is what keeps "exact" meaningful.
+unknown_value="$work/matrix-unknown"
+write_fixture "$unknown_value"
+set_field "$unknown_value/sing-box.xcodeproj/project.pbxproj" "$sfm_debug" PRODUCT_NAME "SomethingElse"
+expects_fail "unknown/new: an unrecognised PRODUCT_NAME is refused" python3 "$overlay" "$unknown_value"
+check "unknown/new: the fixture was not modified by the refused run" \
+  test "$(setting "$unknown_value/sing-box.xcodeproj/project.pbxproj" SFM Release PRODUCT_NAME)" = "sing-box"
+
+# The states the overlay must still refuse, unchanged by the refactor.
+both_branded_one_upstream="$work/partial"
+write_fixture "$both_branded_one_upstream"
+python3 - "$both_branded_one_upstream/sing-box.xcodeproj/project.pbxproj" "$brand" <<'PY'
 import sys
 p, brand = sys.argv[1], sys.argv[2]
 src = open(p, encoding="utf-8").read()
@@ -416,11 +495,12 @@ j = src.index('name = Debug;', i)
 src = src[:i] + src[i:j].replace('"sing-box"', f'"{brand}"') + src[j:]
 open(p, "w", encoding="utf-8").write(src)
 PY
-check "the fixture was really put in a half-branded state" \
-  test "$(setting "$partial/sing-box.xcodeproj/project.pbxproj" SFM Debug PRODUCT_NAME)" = "$brand"
-check "the other configuration is still upstream" \
-  test "$(setting "$partial/sing-box.xcodeproj/project.pbxproj" SFM Release PRODUCT_NAME)" = "sing-box"
-expects_fail "a partially branded project is refused" python3 "$overlay" "$partial"
+check "a Debug configuration branded while Release is upstream is completed, not refused" \
+  python3 "$overlay" "$both_branded_one_upstream"
+check "and the completed Debug keeps the brand" \
+  test "$(setting "$both_branded_one_upstream/sing-box.xcodeproj/project.pbxproj" SFM Debug PRODUCT_NAME)" = "$brand"
+check "and Release was brought up to the brand too" \
+  test "$(setting "$both_branded_one_upstream/sing-box.xcodeproj/project.pbxproj" SFM Release PRODUCT_NAME)" = "$brand"
 
 unexpected="$work/unexpected"
 write_fixture "$unexpected"

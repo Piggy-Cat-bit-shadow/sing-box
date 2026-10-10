@@ -151,23 +151,11 @@ def settable(block: str, key: str) -> str | None:
     return m.group(1) if m else None
 
 
-def brand_block(block: str) -> str:
-    for key, (old, new) in EXPECTED.items():
-        block = re.sub(
-            rf'^(\s*{re.escape(key)} = )"{re.escape(old)}";',
-            rf'\g<1>"{new}";',
-            block,
-            flags=re.M,
-        )
-    return block
-
-
-def is_branded(block: str) -> bool:
-    return all(settable(block, key) == new for key, (_, new) in EXPECTED.items())
-
-
-def is_upstream(block: str) -> bool:
-    return all(settable(block, key) == old for key, (old, _) in EXPECTED.items())
+# `brand_block`, `is_branded` and `is_upstream` were removed with the per-configuration state
+# machine they served. They classified a whole configuration as (old,old) or (new,new), which
+# cannot describe the mixed state the pinned source ships, and the field-wise replacement in
+# main() is both simpler and stricter: it decides each field by exact equality and rewrites
+# only what still holds the upstream value.
 
 
 def scheme_counts(client: str) -> tuple[int, int]:
@@ -304,53 +292,93 @@ def main() -> int:
             [f"resolved {len(spans)} ids for {sorted(names)}"],
         )
 
-    # --- partial states -------------------------------------------------------
-    branded = {cid for cid, (_, _, _, b) in spans.items() if is_branded(b)}
-    upstream = {cid for cid, (_, _, _, b) in spans.items() if is_upstream(b)}
-    unknown = set(spans) - branded - upstream
-
-    if unknown:
-        details = []
-        for cid in sorted(unknown):
-            _, _, name, block = spans[cid]
-            current = {k: settable(block, k) for k in EXPECTED}
-            details.append(f"SFM {name}: {current}")
-        fail(
-            "some SFM configurations are in neither the upstream nor the branded state",
-            details + ["refusing to edit a partially branded project"],
-        )
-    if branded and upstream:
-        fail(
-            "SFM configurations disagree: some are branded and some are not",
-            [
-                f"branded: {sorted(spans[c][2] for c in branded)}",
-                f"upstream: {sorted(spans[c][2] for c in upstream)}",
-            ],
-        )
+    # --- the field-wise state machine -----------------------------------------
+    #
+    # Each field is decided ON ITS OWN, by exact equality:
+    #
+    #     value == old  ->  rewrite to new
+    #     value == new  ->  already satisfied, leave it
+    #     anything else ->  hard fail
+    #
+    # Per-FIELD, not per-configuration, because the pinned Apple source ships a legitimately
+    # MIXED configuration: SFM Debug and Release carry
+    #
+    #     PRODUCT_NAME = "sing-box"
+    #     INFOPLIST_KEY_CFBundleDisplayName = "Jiejiebox"
+    #
+    # - the source has branded the display name it shows a user and left the upstream product
+    # identifier alone, which is the same split this repository makes for the Windows
+    # executable name. Classifying a whole configuration as (old,old) or (new,new) called that
+    # partial corruption and refused to build; it is a valid starting state, and only the
+    # remaining field needs overlaying.
+    #
+    # Still exact, still fail-closed: there is no fuzzy or case-insensitive matching, a third
+    # value is a hard failure, and the counts are asserted per field.
+    pending_by_id: dict[str, dict[str, str]] = {}
+    for cid, (_, _, name, block) in spans.items():
+        pending: dict[str, str] = {}
+        for key, (old, new) in EXPECTED.items():
+            value = settable(block, key)
+            if value == old:
+                pending[key] = new
+            elif value == new:
+                continue
+            else:
+                fail(
+                    f"SFM {name}: {key} is neither the upstream nor the branded value",
+                    [
+                        f"found {value!r}",
+                        f"expected exactly {old!r} or {new!r}",
+                        "refusing to edit a project whose branding state this overlay does not "
+                        "recognise",
+                    ],
+                )
+        if pending:
+            pending_by_id[cid] = pending
 
     scheme = scheme_state(client)
     changed_ids = 0
 
-    if len(branded) == len(spans):
-        # Project fully branded. The scheme is validated above, so a project-new /
-        # scheme-old state is finished rather than reported as done.
+    if not pending_by_id:
+        # Every field already holds the branded value. The scheme is validated above, so a
+        # project-new / scheme-old state is finished rather than reported as done.
         print("  [branding] macOS project already applied")
     else:
         # Splice by descending offset so earlier spans stay valid.
         for cid in sorted(spans, key=lambda c: spans[c][0], reverse=True):
             start, end, name, block = spans[cid]
-            branded_block = brand_block(block)
+            pending = pending_by_id.get(cid)
+            if not pending:
+                continue  # this configuration was already fully branded
+            branded_block = block
+            for key, new in pending.items():
+                branded_block, replacements = re.subn(
+                    rf'^(\s*{re.escape(key)} = )"[^"]*";',
+                    rf'\g<1>"{new}";',
+                    branded_block,
+                    flags=re.M,
+                )
+                # Exactly one line is edited per pending field. A different count means the
+                # field moved or was duplicated between the read above and here.
+                if replacements != 1:
+                    fail(
+                        f"SFM {name}: expected to rewrite {key} once, rewrote it {replacements} time(s)",
+                        ["refusing to write a result this script cannot account for"],
+                    )
             if branded_block == block:
                 fail("a configuration needed branding but no substitution matched", [f"SFM {name}"])
             src = src[:start] + branded_block + src[end:]
             changed_ids += 1
-        if changed_ids != len(spans):
+        if changed_ids != len(pending_by_id):
             fail(
-                f"edited {changed_ids} of {len(spans)} SFM configurations",
+                f"edited {changed_ids} of {len(pending_by_id)} SFM configurations needing branding",
                 ["refusing to write a partial result"],
             )
         open(path, "w", encoding="utf-8").write(src)
-        print(f"  [branding] macOS SFM product renamed to {NEW_NAME} in {changed_ids} configurations")
+        print(
+            f"  [branding] macOS SFM product renamed to {NEW_NAME} "
+            f"in {changed_ids} configuration(s)"
+        )
 
     if scheme == "old":
         scheme_changed = patch_scheme(client)
