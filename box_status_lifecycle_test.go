@@ -86,6 +86,12 @@ type statusTestLeaf struct {
 	state     physicalpath.LifecycleState
 	barrier   *statusBarrier
 	onReport  func()
+	// lastError, when set, makes this hop a HopErrorReporter: the owner is publishing an error it has
+	// ALREADY observed, which is the only way a PathStatus.Failure is ever produced and therefore the
+	// only way its fields can be tested at the Box level.
+	lastError          error
+	lastErrorPhase     physicalpath.FailurePhase
+	lastErrorRecovered bool
 }
 
 func (l *statusTestLeaf) Type() string           { return l.leafType }
@@ -108,6 +114,12 @@ func (l *statusTestLeaf) StatusState() physicalpath.LifecycleState {
 		l.onReport()
 	}
 	return l.state
+}
+
+// StatusLastError publishes an error this hop has already observed. It reports only what the fixture
+// was given: no dial, no resolve, no probe - the same contract the interface documents.
+func (l *statusTestLeaf) StatusLastError() (error, physicalpath.FailurePhase, bool) {
+	return l.lastError, l.lastErrorPhase, l.lastErrorRecovered
 }
 
 // statusTestGroup is a control node that publishes its own selection state.
@@ -431,6 +443,14 @@ func TestStatusConcurrentWithClosePublishesNoHalfClosedPath(t *testing.T) {
 	exit := &statusTestLeaf{tag: "exit", leafType: "test", state: physicalpath.LifecycleStateReady, dependsOn: []string{"entry"}}
 	instance, _ := statusTestBox(entry, exit)
 
+	// The PREMISE, asserted rather than assumed: a discarded read and a read of a Box that never had a
+	// view are the same shape from the outside, and this test would pass vacuously if the second were
+	// what it measured. It is why the two halves below are both required - a complete live observation
+	// first, then the discards - rather than only the negative direction.
+	require.True(t, instance.statusView.Connected(),
+		"the Box under test must actually hold a live view before a straddling read can be discarded "+
+			"by one; without this the whole test would be satisfied by there being no view at all")
+
 	// The other half of the dichotomy, taken first: a read that finishes before the teardown is a
 	// complete observation of a live graph. Without this the test could only ever see discards.
 	live := instance.Status("exit", "tcp")
@@ -485,4 +505,77 @@ func TestStatusConcurrentWithClosePublishesNoHalfClosedPath(t *testing.T) {
 // itoaForTest names a subtest without pulling strconv into an assertion message.
 func itoaForTest(value int) string {
 	return strconv.Itoa(value)
+}
+
+// TestStatusFailureIsAValueOwnedByTheCaller closes the one field of a PathStatus the caller-owned-values
+// test could not reach, and it exists because an independent adversary measured that it was uncovered.
+//
+// # What was uncovered, and why it was
+//
+// `PathStatus.Failure` is a POINTER to a `HopFailure` whose `Reached` and `Unreached` are slices, so it
+// is the only field besides the four top-level slices that can alias the Box's own state. It is also
+// nil unless a hop reports an error - and no fixture in either Box test file implemented
+// `HopErrorReporter`, so no test in this package had ever produced a non-nil `Failure` at all. The
+// adversary checked every other field statically and reported this one as the sole gap; the reasoning
+// was right and the gap was real.
+//
+// The fixture publishes an error the hop has ALREADY observed, which is the only way a `Failure` is
+// produced: `firstFailure` scans for the first hop whose readiness is `ReadinessFailed`, and readiness
+// becomes `ReadinessFailed` only from an unrecovered `LastError`. The middle hop of a three-hop chain
+// is used so that BOTH `Reached` and `Unreached` are non-empty and both are exercised - a two-hop
+// chain with a failing first hop would leave one of them empty and the mutation would prove half of it.
+func TestStatusFailureIsAValueOwnedByTheCaller(t *testing.T) {
+	inner := &statusTestLeaf{tag: "inner", leafType: "test", state: physicalpath.LifecycleStateReady}
+	middle := &statusTestLeaf{
+		tag:            "middle",
+		leafType:       "test",
+		state:          physicalpath.LifecycleStateReady,
+		dependsOn:      []string{"inner"},
+		lastError:      errStatusNoDial,
+		lastErrorPhase: physicalpath.PhaseConnect,
+	}
+	outer := &statusTestLeaf{tag: "outer", leafType: "test", state: physicalpath.LifecycleStateReady, dependsOn: []string{"middle"}}
+	instance, _ := statusTestBox(inner, middle, outer)
+
+	first := instance.Status("outer", "tcp")
+	require.Len(t, first.Hops, 3, "the fixture must produce the three-hop packet order this test needs")
+	require.NotNil(t, first.Failure,
+		"the middle hop published an unrecovered error, so the status must carry a Failure; without one "+
+			"this test would be asserting about a nil pointer and would prove nothing")
+	require.Equal(t, "middle", first.Failure.Hop)
+	require.Equal(t, []string{"inner"}, first.Failure.Reached,
+		"the hops before the failing one are the ones known to have been entered")
+	require.Equal(t, []string{"outer"}, first.Failure.Unreached,
+		"the hops after it were never tried")
+
+	// Clobber every part of the Failure a caller can reach. The slices are mutated IN PLACE as well as
+	// appended to, because an aliased slice would be corrupted by the in-place write even if the
+	// caller's own header were a copy.
+	first.Failure.Hop = "clobbered"
+	first.Failure.Detail = "clobbered"
+	first.Failure.Position = 99
+	first.Failure.HopCount = 99
+	first.Failure.Phase = physicalpath.PhaseTunnel
+	first.Failure.Recovered = true
+	first.Failure.Reached[0] = "clobbered"
+	first.Failure.Unreached[0] = "clobbered"
+	first.Failure.Reached = append(first.Failure.Reached, "clobbered")
+	first.Failure.Unreached = append(first.Failure.Unreached, "clobbered")
+
+	second := instance.Status("outer", "tcp")
+	require.NotNil(t, second.Failure)
+	require.Equal(t, "middle", second.Failure.Hop)
+	require.Equal(t, 1, second.Failure.Position,
+		"the failing hop is the second of three in packet order (inner, middle, outer)")
+	require.Equal(t, 3, second.Failure.HopCount)
+	require.Equal(t, physicalpath.PhaseConnect, second.Failure.Phase)
+	require.False(t, second.Failure.Recovered)
+	require.NotContains(t, second.Failure.Detail, "clobbered")
+	require.Equal(t, []string{"inner"}, second.Failure.Reached,
+		"a caller's in-place write into Reached reached the Box's own state: one reader's edit would "+
+			"otherwise be the next reader's answer")
+	require.Equal(t, []string{"outer"}, second.Failure.Unreached)
+	require.NotSame(t, first.Failure, second.Failure,
+		"two reads must not share the HopFailure object, or a caller that kept the first would see it "+
+			"rewritten by the second")
 }
