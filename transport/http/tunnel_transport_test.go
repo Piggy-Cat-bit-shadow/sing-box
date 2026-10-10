@@ -15,8 +15,10 @@ import (
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
 )
@@ -157,9 +159,36 @@ func newTunnelTransportClient(t *testing.T, address string) *Client {
 
 // loopbackDialer dials a CONNECTED UDP socket, which QUIC requires: an unconnected socket has no
 // remote address, and the handshake would fail for a reason unrelated to what is being tested.
+//
+// # Why a non-UDP request is REFUSED rather than served with a UDP socket
+//
+// This fixture used to dial a connected UDP socket for EVERY network the client asked for, and that
+// made the fallback branch HANG instead of failing.
+//
+// The reason is that `net.DialUDP` to a port nothing listens on SUCCEEDS: UDP has no handshake, so a
+// connected socket is a local operation and the peer's absence is not observable until a datagram is
+// sent and no answer arrives. The HTTP/1 fallback therefore received a perfectly good "connection",
+// wrote its request into it, and then blocked in `ReadResponse` waiting for a reply that could never
+// arrive - with no deadline anywhere on that path, because the caller passed a background context.
+//
+// MEASURED: `TestTunnelTransportIsNotReportedWhenTheTunnelFails` hung until the 90-second test
+// timeout, which also blocked any `go test ./transport/http/` run on this machine. It was reproduced
+// at the baseline commit with none of this session's changes, so it was pre-existing rather than
+// introduced.
+//
+// The fix is to make the fixture model what it claims to model. QUIC needs the connected UDP socket,
+// and it is the NETWORK argument that says so; a stream request is refused, which is what "the
+// fallback will fail to connect" in `newTunnelTransportClient` always intended and never got. The
+// refusal cannot be a raw `net.DialTCP` failure either - `net.DialUDP` on port 1 is the only dial
+// this fixture can make honestly fail on Windows - so the error is explicit and names the reason.
 type loopbackDialer struct{}
 
 func (d *loopbackDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkUDP {
+		return nil, E.New("loopbackDialer: refusing a ", network, " dial to ", destination,
+			"; this fixture carries QUIC datagrams only, and answering a stream request with a connected ",
+			"UDP socket makes the fallback block on a reply that can never arrive")
+	}
 	return net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(
 		netip.AddrPortFrom(destination.Addr, destination.Port)))
 }

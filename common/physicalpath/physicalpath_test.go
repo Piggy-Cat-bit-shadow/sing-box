@@ -13,7 +13,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 
 	"github.com/stretchr/testify/require"
-)// The fixtures below are deliberately minimal objects that implement exactly the interfaces the
+) // The fixtures below are deliberately minimal objects that implement exactly the interfaces the
 // dial path reads: adapter.Outbound for a leaf, adapter.OutboundGroup for a control node. Nothing
 // here dials, and the group records how many times it was asked so a test can prove that a preview
 // consumed nothing.
@@ -52,7 +52,7 @@ type testEndpoint struct {
 }
 
 func (e *testEndpoint) Start(adapter.StartStage, *adapter.Scope) error { return nil }
-func (e *testEndpoint) Close() error                                  { return nil }
+func (e *testEndpoint) Close() error                                   { return nil }
 
 // testGroup is a control node. selected answers for the group; asks counts every question, which
 // is how a test proves a preview consumed nothing.

@@ -3,14 +3,14 @@
 //
 // # The three things that are not the same, and are routinely conflated
 //
-//	1. the SELECTED OUTBOUND ROOT      what a routing rule chose. One tag, reached through
-//	                                   the group nesting the rule named.
-//	2. the ACTUAL PHYSICAL HOPS        the real encapsulation chain: #0 is nearest to this
-//	                                   device, #N is the last dependency reached before the
-//	                                   traffic leaves for the destination.
-//	3. CONTROL GROUP NODES             a selector, a urltest or a loadbalance. It selects and
-//	                                   then disappears: it never wraps a connection, never sees
-//	                                   a byte, and is not a hop.
+//  1. the SELECTED OUTBOUND ROOT      what a routing rule chose. One tag, reached through
+//     the group nesting the rule named.
+//  2. the ACTUAL PHYSICAL HOPS        the real encapsulation chain: #0 is nearest to this
+//     device, #N is the last dependency reached before the
+//     traffic leaves for the destination.
+//  3. CONTROL GROUP NODES             a selector, a urltest or a loadbalance. It selects and
+//     then disappears: it never wraps a connection, never sees
+//     a byte, and is not a hop.
 //
 // A diagnostic that reports (3) as (2), or that reports (2) in the reverse order, is worse than
 // no diagnostic at all: it describes a path the traffic does not take.

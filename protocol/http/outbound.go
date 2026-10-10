@@ -97,6 +97,22 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	return nil
 }
 
+// DestinationDNSOwnership implements adapter.DestinationDNSOwner.
+//
+// It reports the same field the dial path reads, so the start-time dry run's view of what this outbound
+// can do cannot drift from what it actually does. That is the whole reason the capability exists
+// separately from the option: an operator can declare `destination_dns_ownership` on a type that never
+// reads it, and the resulting silence is the exact failure the flag exists to prevent. The dry run
+// compares declaration against capability and refuses the configuration when they disagree, and it can
+// only do that if the object has a way to say yes.
+//
+// The HTTP CONNECT path honours the declaration, including the fail-closed rules and the refusal of a
+// Host-header override that would make the authority the operator's value instead of the destination.
+// See DialContext.
+func (h *Outbound) DestinationDNSOwnership() bool {
+	return h.ownership.Declared
+}
+
 // lookupDestinationAddresses resolves a destination domain for the CONNECT authority.
 //
 // It is a package-level variable so a test can substitute a resolver without a DNS transport - the same
