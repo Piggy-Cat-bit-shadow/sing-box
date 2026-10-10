@@ -229,6 +229,98 @@ func TestRuntimeLinknamePullsAreGatedOnChecklinkname0(t *testing.T) {
 	}
 }
 
+// TestOOMProfileStubIsNotGatedOnTheChecklinknameTag is the REVERSE direction of the split in
+// experimental/libbox/internal/oomprofile.
+//
+// That package reads the runtime's profile buffers through //go:linkname pulls of runtime/pprof,
+// which pushes nothing, so the real implementation links only where the builder passes
+// -checklinkname=0. It is therefore split: the real files carry tfogo_checklinkname0, and
+// oomprofile_stub.go carries its NEGATION and exists so a bare `go build ./...` still links.
+//
+// The failure this guards against is the tempting edit: "the stub is only for the bare build, and the
+// bare build is the one that must link, so tag the stub too". Tagging it would compile it ALONGSIDE
+// the real writer in every product build, which is a redeclaration of WriteFile and profileSupport,
+// and would break every shipping build rather than the bare one. The stub's whole purpose is to be
+// the build that does NOT name the tag.
+func TestOOMProfileStubIsNotGatedOnTheChecklinknameTag(t *testing.T) {
+	root := repoRoot(t)
+	dir := filepath.Join(root, "experimental", "libbox", "internal", "oomprofile")
+
+	stub := filepath.Join(dir, "oomprofile_stub.go")
+	content, err := os.ReadFile(stub)
+	if err != nil {
+		t.Fatalf("read %s: %v. The link-safe half of the OOM profile package is what keeps a bare "+
+			"`go build ./...` working; if it was renamed or removed deliberately, delete this test "+
+			"deliberately too", filepath.Join("experimental", "libbox", "internal", "oomprofile",
+			"oomprofile_stub.go"), err)
+	}
+	if hasChecklinknameBuildConstraint(string(content)) {
+		t.Errorf("oomprofile_stub.go carries %s in its build constraint.\n"+
+			"    It must NOT: it is the file compiled when the tag is ABSENT, and naming the tag would\n"+
+			"    compile it alongside the real writer, redeclaring WriteFile and profileSupport in every\n"+
+			"    product build. Only the real implementation files may carry %s.",
+			checklinknameTag, checklinknameTag)
+	}
+
+	// And the other side: at least one file in the package must carry the tag, or the split has
+	// collapsed to "the real writer is never compiled" and OOM profiling is silently gone from every
+	// shippable build.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagged := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasChecklinknameBuildConstraint(string(body)) {
+			tagged++
+		}
+	}
+	if tagged == 0 {
+		t.Errorf("no file in experimental/libbox/internal/oomprofile carries %s in its build "+
+			"constraint, so the real OOM profile writer is compiled into NO build at all and the "+
+			"capability has been removed rather than gated. Every shipping tag set carries %s because "+
+			"its builder passes -checklinkname=0, so this would be a silent capability loss.",
+			checklinknameTag, checklinknameTag)
+	}
+}
+
+// hasChecklinknameBuildConstraint reports whether a file's //go:build line POSITIVELY requires the
+// checklinkname tag, i.e. whether the file is compiled only where the flag is passed.
+//
+// Two things make a naive search wrong, and both were wrong in the first version of this gate:
+//
+//   - the tag is also NAMED in the prose of both halves of the package - the stub's error message
+//     has to tell the reader which tag to add - so the search is anchored on the //go:build line;
+//   - the stub's constraint is its NEGATION, `!tfogo_checklinkname0`, so a match preceded by `!` is
+//     the opposite of what this asks and must not count.
+func hasChecklinknameBuildConstraint(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "//go:build ") {
+			continue
+		}
+		for i := strings.Index(trimmed, checklinknameTag); i >= 0; {
+			negated := i > 0 && trimmed[i-1] == '!'
+			if !negated {
+				return true
+			}
+			next := strings.Index(trimmed[i+len(checklinknameTag):], checklinknameTag)
+			if next < 0 {
+				break
+			}
+			i += len(checklinknameTag) + next
+		}
+	}
+	return false
+}
+
 // TestProfileTagFilesDoNotClaimChecklinkname0 is the other half: the tag must not reach a build
 // that cannot pass the flag.
 func TestProfileTagFilesDoNotClaimChecklinkname0(t *testing.T) {

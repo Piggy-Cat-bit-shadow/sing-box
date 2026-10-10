@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && tfogo_checklinkname0
 
 package oomprofile
 
