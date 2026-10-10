@@ -156,21 +156,101 @@ wire-level IP assertions, fail-closed, a single-hop control group, and an effect
 
 ---
 
-## D. K2 / K3 PHYSICAL PATH — NOT DONE
+## D. K2 / K3 PHYSICAL PATH — IMPLEMENTED AND TESTED
 
-**`PHYSICAL_PATH_CORE_STATUS = NOT_REQUIRED_BY_THIS_NOTE` is NOT claimed.** The model, the
-ControlPath/PhysicalPath separation, the Start-time reachable-leaf dry-run and per-hop observability are
-**NOT implemented in this session**. See section J-1 for the exact remaining work and the analysis
-already recorded in `docs/fork/v016-overnight-implementation-report.md` sections J-1 to J-3.
+### D.1 The model
 
-What WAS established this session and is reusable:
+`common/physicalpath/` — `physicalpath.go` (`Hop`, `Path`, `PathNode`, `Snapshot`, `Resolver`, `Build`),
+`leaves.go` (`Hops`, `Leaves`, cycle detection, panic containment), `dryrun.go` (`Declarations`,
+`HopCheck`, `Failure`, `Report`, `ValidateRoots`).
 
-- the direction question is answerable: a configured `detour` X→Y is a DEPENDENCY edge (X consumes Y), so
-  packet order is consumer-first — `#0` is the outbound the flow's routing selected, `#N` the last
-  dependency reached;
-- `common/dialer/path_mtu.go` already resolves an endpoint by tag and publishes its capacity, which is
-  the same registry access a path builder needs, and it demonstrates the "unknown must stay unknown"
-  discipline the path model requires.
+Direction, PROVEN from the source rather than assumed — a configured `detour` is a DEPENDENCY edge, so
+packet order is consumer-first:
+
+```text
+common/dialer/detour.go:61    init() resolves d.detour into Y
+common/dialer/detour.go:85    DialContext returns dialer.DialContext(...)   X asks Y to dial
+route/route.go:247/266        chain := []adapter.Outbound{outbound}; chain = append(chain, outbound)
+route/route.go:899/956        leaf := chain[len(chain)-1]                  the exit is dialled last
+```
+
+So `Hops[0]` is what routing selected and `Hops[len-1]` is the exit. `ControlPath` (tags, in selection
+order) is a separate field from `PhysicalHops`.
+
+Read-only by construction: `Resolver` holds only a lookup func, a `Snapshot` and a network name — no
+dialer, logger, context or clock in the type, so it cannot dial, log or time. No cloning (`require.Same`
+on the reported object). No invented hop: `Path.Unknowns` carries `{Node, Position, Reason}` and
+`Path.Exit()` returns false while any unknown is present.
+
+No rotation is consumed. The enumeration reads each group's DECLARED membership (`All()` U
+`Referrer.References()`), so it calls no selection function at all. Where `Build` needs a preview it calls
+`Selected(network)`, which for all three real groups is side-effect free — `LoadBalance.Selected` reaches
+`SelectForFlow(.., commit=false)`, which READS the cursor with `Load()` and advances it only when
+committing.
+
+### D.2 The Start-time dry run
+
+Hooked into `adapter/outbound.Manager.Start` by EXTENDING it, not duplicating it. The pre-existing sort
+was extracted as `lintOutbounds` with the start removed, so the dry run runs AFTER it and cannot replace
+its more precise message, and the order it computed is passed to `startOutbounds` rather than
+recomputed — no second sort that could disagree with the start.
+
+Compatibility, attributed honestly. `EnablePhysicalPathValidation` is what turns the dry run on, and only
+`box.New` calls it, so every existing fixture behaves exactly as before (`box_lifecycle*_test.go`,
+`box_lifecycle_ordering_test.go`, `box_lifecycle_stress_test.go`, `box_cross_kind_cycle_test.go`,
+`route/nested_chain_test.go`, `adapter/outbound/manager_cycle_test.go` all pass unchanged). Which check
+refuses what:
+
+| Case | Refused by |
+|---|---|
+| a member tag that names nothing | the PRE-EXISTING sort (it already read a group's member list through `Dependencies()`, so this failed Start before) |
+| a declared cycle | the PRE-EXISTING sort, pinned by `TestStartupCycleCheckStillRunsBeforeTheDryRun` |
+| a member that EXISTS and still cannot carry the flow | the DRY RUN only — the unselected-member case the sort cannot see |
+| a declared `destination_dns_ownership` the type cannot honour | the DRY RUN |
+
+The only newly-refused configuration is that last one, which is a fork-only option from this same cycle
+whose previous behaviour was a silent leak of the destination name. No configuration that started before
+is newly refused.
+
+### D.3 A latent panic found and fixed
+
+The start-order sort marks nodes started by TAG and stops when `len(started) == len(nodes)`. Two objects
+under one tag satisfy that count with one unvisited, and the dependency-reporting code then dereferenced
+the nil result: MEASURED as `invalid memory address or nil pointer dereference` inside `lintOutbounds`,
+not an error. Reproduced in a disposable clone with prints (`len(outbounds)=3 len(started)=2`,
+`currentOutbound nil=true`). Replaced by `duplicate outbound tag in the start graph: <tag>`, pinned by
+`TestDuplicateMemberTagIsRefusedRatherThanCrashingTheSort`.
+
+### D.4 Tests
+
+53 new tests across `common/physicalpath`, `adapter/outbound`, `box_test` and `route`, the last of them
+over the REAL `group.Selector` / `group.LoadBalance`. Coverage includes the direction matrix (1/2/3-hop,
+outbound->endpoint, MASQUE endpoint leaf, selector->leaf, selector->loadbalance->leaf, nested group,
+group+detour), `ControlPath != PhysicalPath`, hop `#0` being the real nearest entry, "the reported leaf IS
+the selected leaf IS the dialled leaf", two flows advancing a real cursor EXACTLY twice with a diagnostic
+walk in between, unknown-never-invented, multi-error hop/tag attribution, cycle and cross-kind cycle
+reporting, and the start-time cases.
+
+### D.5 Reverse-break — five mutations, all RED, each restored byte-identical
+
+```text
+A  a control group recorded as a physical hop        -> RED (4 tests)
+B  the packet order reversed                         -> RED (3 tests)
+C  a preview consumes a round-robin slot (fixture)    -> RED
+D  a control group recorded as a hop, REAL groups     -> RED (2 tests)
+E  a preview consumes a REAL LoadBalance slot         -> RED
+```
+
+```text
+PHYSICAL_PATH_CORE_STATUS               = READY
+PHYSICAL_PATH_STARTUP_VALIDATION_STATUS = READY
+```
+
+### D.6 Not done
+
+Per-hop status / error ownership / the MTU reason block (J-3 below) — needs the `adapter.Lifecycle` /
+resource walk and was explicitly out of scope. No public `type: chain`, no per-hop timers or probes, no
+second resource manager: none added, as required.
 
 ---
 
@@ -518,9 +598,11 @@ Zero-extra-copy audit    NOT_RUN
 CLASH_AND_DNS_CONCURRENCY_STATUS        = READY (previous session, unchanged and re-run green)
 DIRECT_FAST_PATH_BOUNDARY_STATUS        = READY (previous session, comments/tests only)
 DESTINATION_DNS_OWNERSHIP_STATUS        = READY (SOCKS TCP / SOCKS UDP / UoT / HTTP CONNECT)
-PHYSICAL_PATH_CORE_STATUS               = NOT_READY (not implemented)
-PHYSICAL_PATH_STARTUP_VALIDATION_STATUS = NOT_READY (not implemented)
-PHYSICAL_PATH_OBSERVABILITY_LIFECYCLE_STATUS = NOT_READY (only the MASQUE PortMTU lifecycle is done)
+PHYSICAL_PATH_CORE_STATUS               = READY
+PHYSICAL_PATH_STARTUP_VALIDATION_STATUS = READY
+PHYSICAL_PATH_OBSERVABILITY_LIFECYCLE_STATUS = NOT_READY (per-hop status is not implemented; the
+                                          MASQUE PortMTU lifecycle fix and the path-capacity
+                                          helper it needed ARE done)
 LX_SPEC119_QUERY_STATUS                 = READY
 LX_SPEC120_MTU_STATUS                   = PARTIAL (HY2 wired and measured; TUIC not wired;
                                           ChromeParrot override needs authorisation)
