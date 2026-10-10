@@ -114,7 +114,20 @@ func TestClientBindSendBeforeOpen(t *testing.T) {
 // Every lifecycle order an embedder can reach must be answerable: close before open, open after
 // close, close twice, open twice.
 func TestClientBindLifecycleOrders(t *testing.T) {
-	dialer := newSocketDialer(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 51820})
+	// A REAL UDP sink, as every other socket test in this file uses.
+	//
+	// The dialer must not point at a port where nothing listens. On Darwin a connected UDP
+	// socket whose datagram draws an ICMP port-unreachable keeps the resulting ECONNREFUSED and
+	// hands it to a LATER socket operation, so the second Send below fails with
+	// "write: connection refused" - a property of the dead port, not of the bind's lifecycle.
+	// This test is about the order of Close/Open/Send, so its Send must succeed on its own
+	// merits; loosening the require.NoError would have hidden a real ordering defect behind a
+	// networking artefact.
+	far, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer far.Close()
+
+	dialer := newSocketDialer(t, far.LocalAddr().(*net.UDPAddr))
 	bind := newSocketBind(t, dialer, true)
 	destination := remoteEndpoint(netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 1}), 51820))
 	payload := []byte{0x10, 0x11, 0x12, 0x13}
@@ -122,7 +135,7 @@ func TestClientBindLifecycleOrders(t *testing.T) {
 	// Close before Open: legal, and leaves the bind closed.
 	require.NoError(t, bind.Close())
 	require.NoError(t, bind.Close(), "Close must stay idempotent")
-	_, err := bind.connect()
+	_, err = bind.connect()
 	require.ErrorIs(t, err, net.ErrClosed, "a closed bind that was never opened must refuse a dial")
 
 	// Open after Close: this is what every rebind and every down/up transition does, so a closed
