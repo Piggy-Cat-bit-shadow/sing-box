@@ -201,39 +201,47 @@ checkout_macos() {
   local want; want="$(apple_sha)"
   load_refs
   local branch; branch="$(platform_branch macos)"
+  local repo="$APPLE_CLIENT_REPOSITORY"
 
-  # The submodule has to exist first: it is the local source the copy is taken from, so
-  # this command never needs the network for the commit itself.
-  local submodule="$ios_dir_default"
-  [ -d "$submodule/.git" ] || fail \
-    "$submodule is not checked out, so there is no Apple source to copy.
-  Run 'git submodule update --init --recursive $submodule' first."
-
-  fetch_branch "$submodule" "$branch"
-  require_commit "$submodule" "$want"
-  require_on_branch "$submodule" "$want" "$branch"
-
-  # Which source tree the copy was taken from is answered by its object-store wiring, not by
-  # `origin`: a `--shared` clone points `origin` at the source PATH rather than at the Apple
-  # repository URL, and the submodule's own URL can be re-pointed between runs, so comparing
-  # origin would be both wrong on a healthy tree and unstable across runs.
+  # The macOS tree is a second working copy of the SAME commit, and it is produced from the
+  # submodule when that exists because a local copy is cheap and needs no network.
   #
-  # The alternates file names the object store this copy draws from, which is exactly the
-  # question "is this copy of the source this commit pins?". It is also rewritten below on
-  # every call, so the two are kept in step.
-  local submodule_git_dir
-  submodule_git_dir="$(git -C "$submodule" rev-parse --absolute-git-dir)"
-  local submodule_objects="$submodule_git_dir/objects"
-  [ -d "$submodule_objects" ] || fail \
-    "cannot locate the object store of $submodule; the macOS copy cannot be refreshed from it."
+  # It is NOT required to exist. The macOS job deliberately checks the parent out with
+  # `submodules: false` - it has no use for the iOS tree, and the Libbox it links arrives as
+  # a downloaded artifact - so this function has to work with only the gitlink to go on.
+  # Requiring the submodule made that job fail with
+  # "clients/apple is not checked out, so there is no Apple source to copy" while the source
+  # it needed was one fetch away.
+  local submodule="$ios_dir_default"
+  local have_submodule=0
+  [ -d "$submodule/.git" ] && have_submodule=1
 
-  if [ -d "$dir/.git" ]; then
-    local copy_git_dir
-    copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
+  if [ "$have_submodule" = "1" ]; then
+    fetch_branch "$submodule" "$branch"
+    require_commit "$submodule" "$want"
+    require_on_branch "$submodule" "$want" "$branch"
+  fi
+
+  # Where the copy draws its objects from. With a submodule that is the submodule's own store,
+  # refreshed on every call; without one the clone's own store is used and the commit is
+  # fetched into it below.
+  local objects_source=""
+  if [ "$have_submodule" = "1" ]; then
+    objects_source="$(git -C "$submodule" rev-parse --absolute-git-dir)/objects"
+    [ -d "$objects_source" ] || fail \
+      "cannot locate the object store of $submodule; the macOS copy cannot be refreshed from it."
+  fi
+
+  # Which source tree the copy came from is answered by its object-store wiring, not by
+  # `origin`: a `--shared` clone points `origin` at the source PATH rather than at the Apple
+  # repository URL, and the URL can be re-pointed between runs, so comparing origin would be
+  # both wrong on a healthy tree and unstable across runs.
+  if [ -d "$dir/.git" ] && [ -n "$objects_source" ]; then
+    local copy_git_dir; copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
     local alternate=""
     [ -f "$copy_git_dir/objects/info/alternates" ] && \
       alternate="$(head -n 1 "$copy_git_dir/objects/info/alternates")"
-    if [ -n "$alternate" ] && [ "$alternate" != "$submodule_objects" ]; then
+    if [ -n "$alternate" ] && [ "$alternate" != "$objects_source" ]; then
       fail "$dir draws its objects from '$alternate' instead of $submodule.
   Remove $dir and re-run so the copy is taken from the source this commit pins."
     fi
@@ -242,32 +250,45 @@ checkout_macos() {
   if [ ! -d "$dir/.git" ]; then
     rm -rf "$dir"
     mkdir -p "$(dirname "$dir")"
-    # A local, shared-object clone: cheap, offline, and it carries every commit the
-    # submodule has - which is the commit we are about to check out.
-    git clone --shared --no-checkout "$submodule" "$dir" >/dev/null 2>&1 || fail \
-      "could not copy $submodule into $dir"
+    if [ "$have_submodule" = "1" ]; then
+      # A local, shared-object clone: cheap, offline, and it carries every commit the
+      # submodule has - which is the commit we are about to check out.
+      git clone --shared --no-checkout "$submodule" "$dir" >/dev/null 2>&1 || fail \
+        "could not copy $submodule into $dir"
+    else
+      # No submodule to copy: clone the declared repository instead. Blobless and
+      # single-branch, because only one commit is ever needed here.
+      git clone --filter=blob:none --no-checkout "$repo" "$dir" >/dev/null 2>&1 || fail \
+        "could not clone $repo into $dir"
+    fi
   fi
 
-  # The copy is refreshed from the SUBMODULE, not from the network. A `--shared` clone
-  # aliases the source's object database at clone time, but the submodule gains objects
-  # afterwards - every time the gitlink moves - so the alias has to be re-pointed at the
-  # submodule before the wanted commit can be resolved here.
-  #
-  # This is what makes the ephemeral tree follow the pin. Fetching a commit that exists only
-  # locally is awkward by design (a bare fetch of an arbitrary SHA is not guaranteed, and a
-  # refspec for a commit that is on no branch cannot be written), while an alternate is
-  # exactly the mechanism for "this object store is also mine".
-  local submodule_objects
-  submodule_objects="$(git -C "$submodule" rev-parse --absolute-git-dir)/objects"
-  [ -d "$submodule_objects" ] || fail \
-    "cannot locate the object store of $submodule; the macOS copy cannot be refreshed from it."
-  local copy_git_dir
-  copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
-  mkdir -p "$copy_git_dir/objects/info"
-  printf '%s\n' "$submodule_objects" > "$copy_git_dir/objects/info/alternates"
+  if [ "$have_submodule" = "1" ]; then
+    # Refresh the alias rather than fetch: a `--shared` clone aliases the source's object
+    # database at clone time, and the submodule gains objects afterwards - every time the
+    # gitlink moves - so the alias has to be re-pointed before the wanted commit resolves.
+    #
+    # Fetching a commit that exists only locally is awkward by design (a bare fetch of an
+    # arbitrary SHA is not guaranteed, and a refspec for a commit that is on no branch cannot
+    # be written), while an alternate is exactly the mechanism for "this object store is also
+    # mine".
+    local copy_git_dir; copy_git_dir="$(git -C "$dir" rev-parse --absolute-git-dir)"
+    mkdir -p "$copy_git_dir/objects/info"
+    printf '%s\n' "$objects_source" > "$copy_git_dir/objects/info/alternates"
+  elif ! git -C "$dir" cat-file -e "$want^{commit}" 2>/dev/null; then
+    # The clone does not have the commit yet. Fetch the reviewed branch and try again: the
+    # pinned commit is an ancestor of it by construction, so this resolves it in one fetch
+    # without depending on the server allowing a fetch by raw SHA.
+    git -C "$dir" fetch --no-tags --filter=blob:none origin \
+      "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || true
+    git -C "$dir" cat-file -e "$want^{commit}" 2>/dev/null || fail \
+      "$want is not reachable from origin/$branch of $repo.
+  The pinned Apple source must be a commit of the branch this fork reviews.
+  If the gitlink was just moved, push $branch first: the commit has to be on the branch a
+  fresh checkout can fetch."
+  fi
 
   require_commit "$dir" "$want"
-
   git -C "$dir" checkout --detach "$want" >/dev/null 2>&1 || fail \
     "could not check out $want in $dir"
   git -C "$dir" submodule update --init --recursive >/dev/null 2>&1 || fail \
