@@ -90,7 +90,7 @@ func TestControlGroupIsNotAPhysicalHopThroughRealGroups(t *testing.T) {
 		physicalpath.Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
 	require.Len(t, path.Hops, 1, "a selector over a loadbalance over a leaf is ONE physical hop")
-	require.Equal(t, []string{"sel", "lb"}, path.ControlPath,
+	require.Equal(t, []string{"lb", "sel"}, path.ControlPath,
 		"and TWO control nodes, which is why the two lists must never be reported as one")
 	require.NotContains(t, []string{path.Hops[0].DeclaredTag}, "sel")
 	require.NotContains(t, []string{path.Hops[0].DeclaredTag}, "lb")

@@ -209,10 +209,13 @@ func (h Hop) String() string {
 type Path struct {
 	// Root is the tag of the outbound the walk started from.
 	Root string
-	// ControlPath lists the tags involved in SELECTING, in descent order: the root, then each
-	// group as it was entered. It is not packet order and must never be reported as one.
+	// ControlPath lists the tags involved in SELECTING, in PACKET order to match Hops: the
+	// device-nearest selection first. It is not the physical path and must never be reported as one -
+	// a group is a control-plane object that never carries a byte.
 	ControlPath []string
-	// Hops is the physical path in PACKET order. Hops[0] is nearest to this device.
+	// Hops is the physical path in PACKET order: Hops[0] is nearest to this device and the last
+	// element is the exit. Packet order is the REVERSE of the dependency descent the configuration
+	// expresses, because `x.detour = y` makes x reach its own server through y.
 	Hops []Hop
 	// Unknowns names what could not be resolved, each with the reason. A hop that cannot be
 	// determined is reported here and never invented.
@@ -247,7 +250,26 @@ func (p Path) Exit() (Hop, bool) {
 	if len(p.Hops) == 0 || p.HasUnknown() {
 		return Hop{}, false
 	}
+	// Hops is in PACKET order, so the hop the traffic LEAVES from is the LAST one, and the hop
+	// nearest this device is Hops[0].
+	//
+	// This is the reading that changed with the direction fix, and it is the one that matters for a
+	// caller: a status view that reported Hops[0] as "the exit" would tell an operator their exit is
+	// down when the failure was in the first hop. `Path.Entry` makes the nearest hop explicit so a
+	// caller never has to reason about which end is which.
 	return p.Hops[len(p.Hops)-1], true
+}
+
+// Entry returns the hop nearest this device, which is the first one in packet order.
+//
+// It exists so that "which end is which" is answered by the model rather than by each caller: Hops[0]
+// and the last element are both meaningful and they are opposite ends of the same path, so a caller
+// that guesses has a fifty percent chance of naming a working hop as the broken one.
+func (p Path) Entry() (Hop, bool) {
+	if len(p.Hops) == 0 || p.HasUnknown() {
+		return Hop{}, false
+	}
+	return p.Hops[0], true
 }
 
 // GroupsNamed returns the control-plane nodes on this path, for a caller that wants to show
@@ -364,7 +386,61 @@ func Build(resolver *Resolver, root TagOrOutbound, options Options) (path Path, 
 	if err = resolver.walk(&path, entry, nil, ""); err != nil {
 		return Path{}, err
 	}
+	// The walk descends the dependency graph, so it records hops ROOT FIRST - which is the order they
+	// are CONFIGURED in, not the order the device reaches them. Packet order is the reverse.
+	//
+	// # Why the reverse is the correct reading, and how it was decided
+	//
+	// `exit.detour = entry` means exit reaches its OWN SERVER through entry. That is what putting a
+	// dialer in `DetourDialer` means, and it is what the SOCKS client does with it:
+	// `sing/protocol/socks/client.go:162` dials `c.serverAddr` through exactly that dialer, with the
+	// user's TARGET travelling in the request rather than in the dial. So the device reaches ENTRY's
+	// server first, EXIT's server second, and the destination last.
+	//
+	// This was NOT decided by reading the above. `common/dialer/detour_wire_order_test.go` observes the
+	// real `NewDetour` plumbing and records which hop is entered first, for two hops and for three, so
+	// the order comes from the dial path rather than from a comment. Its conclusion is that the hop
+	// nearest this device is the DEEPEST DEPENDENCY - so `Hops[0]` is the reverse of the walk.
+	//
+	// The reversal is done here, once, at the single point where the walk's output becomes a Path.
+	// Doing it inside the recursion would mean reversing at every level and getting it wrong somewhere;
+	// doing it here means there is exactly one place where packet order is established.
+	//
+	// HONEST LIMIT: this ordering is derived from the DIAL EDGE each hop declares. It is exact for a
+	// chain of forwarding proxies, which is what `detour` expresses. It does not model a hop that
+	// carries traffic for a server other than the one its dependency names, and it cannot see a route
+	// the configuration did not declare.
+	reversePacketOrder(&path)
 	return path, nil
+}
+
+// reversePacketOrder turns the walk's root-first descent into device-first packet order, and keeps
+// every index that describes a position consistent with it.
+//
+// ControlPath is reversed with the hops because it is in DESCENT order by definition, and descent order
+// means "from the routing decision towards the exit". Reporting it unreversed next to a reversed hop
+// list would make two adjacent fields describe the same path in opposite directions.
+func reversePacketOrder(path *Path) {
+	for left, right := 0, len(path.Hops)-1; left < right; left, right = left+1, right-1 {
+		path.Hops[left], path.Hops[right] = path.Hops[right], path.Hops[left]
+	}
+	for index := range path.Hops {
+		path.Hops[index].Position = index
+	}
+	for left, right := 0, len(path.ControlPath)-1; left < right; left, right = left+1, right-1 {
+		path.ControlPath[left], path.ControlPath[right] = path.ControlPath[right], path.ControlPath[left]
+	}
+	// An Unknown's Position names the hop index it belongs at. The walk recorded it before the
+	// reversal, so it is remapped through the same permutation rather than left describing a slot that
+	// now holds a different hop. A negative Position means "not on the path" and is left alone.
+	hopCount := len(path.Hops)
+	for index := range path.Unknowns {
+		position := path.Unknowns[index].Position
+		if position < 0 || position >= hopCount {
+			continue
+		}
+		path.Unknowns[index].Position = hopCount - 1 - position
+	}
 }
 
 // walk visits one node of the selection graph.
@@ -407,8 +483,13 @@ func (r *Resolver) walk(path *Path, node adapter.Outbound, chain []adapter.Outbo
 		hop.IsEndpoint = true
 	}
 	path.Hops = append(path.Hops, hop)
-	// The dependency edge. The CONSUMER is appended first, so the next hop is the dependency:
-	// packet order, not configuration order.
+	// The dependency edge. The CONSUMER is recorded first, so this slice is in DESCENT order - the
+	// order the configuration nests the hops in, ROOT first. It is NOT packet order, and it is not
+	// reversed here: `Build` reverses the finished slice once, in `reversePacketOrder`, so there is
+	// exactly one place where packet order is established.
+	//
+	// Reversing inside this recursion would be wrong, not just untidy: each level would flip its own
+	// suffix and the result would depend on the depth.
 	dependencyTag := firstDependency(node)
 	if dependencyTag == "" {
 		return nil

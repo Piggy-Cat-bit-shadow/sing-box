@@ -206,25 +206,39 @@ func TestDirectSingleLeafIsOneHop(t *testing.T) {
 //
 // `h2.detour = h1` means h2 CONSUMES h1, so the packet reaches h2 first. The configured field is
 // the dependency, and a walk that reported it as the predecessor would reverse the whole path.
-func TestDetourTwoHopIsConsumerFirst(t *testing.T) {
+func TestDetourTwoHopReachesTheDetourFirst(t *testing.T) {
+	// `h2.detour = h1`, so h2 reaches its OWN SERVER through h1, and the device reaches h1's server
+	// first. The wire reading that decides this is in common/dialer/detour_wire_order_test.go; this
+	// test only pins that the model agrees with it.
 	inner := tcpLeaf("h1")
 	outer := tcpLeaf("h2", "h1")
 	registry := newRegistry(inner, outer)
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "h2"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"h2", "h1"}, hopTags(path),
-		"packet order is the CONSUMER first: h2 asks h1 to dial, so h1 is reached second")
+	require.Equal(t, []string{"h1", "h2"}, hopTags(path),
+		"packet order is ENTRY first: h2 asks h1 to carry the connection to h2's own server, so h1 "+
+			"is the hop nearest this device and h2 is the exit")
 	require.Equal(t, []int{0, 1}, hopPositions(path))
-	require.Equal(t, "h2", path.Hops[0].DeclaredTag)
-	require.Equal(t, "", path.Hops[0].ControlOwner,
-		"the first hop was named by routing, not by a group")
-	require.Equal(t, "h2", path.Hops[1].ControlOwner,
-		"h1 is here because h2 declared it as its detour")
+	require.Equal(t, "h1", path.Hops[0].DeclaredTag)
+	require.Equal(t, "h2", path.Hops[0].ControlOwner,
+		"h1 is the first hop because h2 declared it as its detour")
+	require.Equal(t, "", path.Hops[1].ControlOwner,
+		"and h2 is the hop routing named, so no group owns it")
+
+	entry, ok := path.Entry()
+	require.True(t, ok)
+	require.Equal(t, "h1", entry.DeclaredTag, "Entry() is the hop nearest this device")
+	exit, ok := path.Exit()
+	require.True(t, ok)
+	require.Equal(t, "h2", exit.DeclaredTag,
+		"Exit() is the hop traffic leaves from, which is the END of packet order")
 }
 
-// TestDetourThreeHopKeepsTheOrder pins a deeper chain: the order must be the full descent, not
-// just the two ends.
+// TestDetourThreeHopKeepsTheOrder pins a deeper chain: the order must be the full traversal
+// reversed, not just the two ends.
+//
+// `h3.detour = h2` and `h2.detour = h1`, so the device enters h1, then h2, then h3.
 func TestDetourThreeHopKeepsTheOrder(t *testing.T) {
 	first := tcpLeaf("h1")
 	second := tcpLeaf("h2", "h1")
@@ -233,9 +247,11 @@ func TestDetourThreeHopKeepsTheOrder(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "h3"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"h3", "h2", "h1"}, hopTags(path))
+	require.Equal(t, []string{"h1", "h2", "h3"}, hopTags(path),
+		"the deepest dependency is reached first and the hop routing named is reached last")
 	require.Equal(t, []int{0, 1, 2}, hopPositions(path))
-	require.Equal(t, "h1", path.Hops[2].DeclaredTag, "the exit is the LAST dependency reached")
+	require.Equal(t, "h1", path.Hops[0].DeclaredTag, "the entry is the deepest dependency")
+	require.Equal(t, "h3", path.Hops[2].DeclaredTag, "the exit is the hop routing selected")
 }
 
 // TestEndpointLeafIsMarkedAsAnEndpoint pins the endpoint flag, and that an endpoint is still a
@@ -254,17 +270,21 @@ func TestEndpointLeafIsMarkedAsAnEndpoint(t *testing.T) {
 
 // TestOutboundToEndpointKeepsTheEndpointLast is the outbound -> endpoint case: a proxy that
 // carries the flow into a local tunnel endpoint. The endpoint is the exit.
-func TestOutboundToEndpointKeepsTheEndpointLast(t *testing.T) {
+func TestOutboundToEndpointReachesTheEndpointFirst(t *testing.T) {
+	// `proxy.detour = warp`, so the proxy reaches its own server through the endpoint: the endpoint
+	// is the first physical hop and the proxy is the exit.
 	endpoint := &testEndpoint{testLeaf{tag: "warp", leafType: "masque", networks: []string{N.NetworkTCP, N.NetworkUDP}}}
 	proxy := tcpLeaf("proxy", "warp")
 	registry := newRegistry(endpoint, proxy)
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "proxy"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"proxy", "warp"}, hopTags(path))
-	require.False(t, path.Hops[0].IsEndpoint)
-	require.True(t, path.Hops[1].IsEndpoint)
-	require.Equal(t, "proxy", path.Hops[1].ControlOwner)
+	require.Equal(t, []string{"warp", "proxy"}, hopTags(path))
+	require.True(t, path.Hops[0].IsEndpoint,
+		"the endpoint terminates the first hop, and it is nearest this device")
+	require.False(t, path.Hops[1].IsEndpoint)
+	require.Equal(t, "proxy", path.Hops[0].ControlOwner,
+		"the endpoint is first because the proxy declared it as its detour")
 }
 
 // TestMasqueEndpointLeafIsAPhysicalHopAndNotAGroup is the MASQUE shape: the endpoint advertises
@@ -321,8 +341,9 @@ func TestSelectorToLoadBalanceToLeafKeepsOnlyTheLeaf(t *testing.T) {
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "sel"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
 	require.Equal(t, []string{"leaf"}, hopTags(path))
-	require.Equal(t, []string{"sel", "lb"}, path.ControlPath,
-		"the control path is the descent order, which is not packet order")
+	require.Equal(t, []string{"lb", "sel"}, path.ControlPath,
+		"the control path is in packet order to match Hops: the device-nearest decision first. It is "+
+			"not the physical path, because a group never carries a byte")
 	require.Equal(t, "lb", path.Hops[0].ControlOwner,
 		"the owner reported is the group that made the DECIDING choice: the innermost one")
 }
@@ -340,8 +361,10 @@ func TestNestedGroupToLeafResolvesToTheInnermostLeaf(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "outer"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"leaf", "exit"}, hopTags(path))
-	require.Equal(t, []string{"outer", "inner"}, path.ControlPath)
+	require.Equal(t, []string{"exit", "leaf"}, hopTags(path),
+		"the leaf reaches its own server through exit, so exit is nearest this device")
+	require.Equal(t, []string{"inner", "outer"}, path.ControlPath,
+		"and the control path is in packet order too: the innermost group decides nearest this device")
 	require.Len(t, path.ControlPath, 2)
 	require.Len(t, path.Hops, 2, "a control node must not appear in the physical path")
 	require.Equal(t, []string{"inner"}, path.GroupsNamed(),
@@ -362,7 +385,8 @@ func TestGroupWithDetourKeepsBothChainsDistinct(t *testing.T) {
 	require.NotEqual(t, path.ControlPath, hopTags(path),
 		"ControlPath != PhysicalPath is the whole point of the model")
 	require.Equal(t, []string{"sel"}, path.ControlPath)
-	require.Equal(t, []string{"member", "exit"}, hopTags(path))
+	require.Equal(t, []string{"exit", "member"}, hopTags(path),
+		"packet order is entry first, while the control path below stays a separate list")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -434,8 +458,10 @@ func TestControlPathOrderIsNotPacketOrder(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "outer"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"outer", "inner"}, path.ControlPath)
-	require.Equal(t, []string{"member", "exit"}, hopTags(path))
+	require.Equal(t, []string{"inner", "outer"}, path.ControlPath,
+		"control path in packet order: the innermost group decides nearest this device")
+	require.Equal(t, []string{"exit", "member"}, hopTags(path),
+		"and the physical path is ENTRY first: member reaches its own server through exit")
 	require.NotContains(t, hopTags(path), "outer", "the root is a control node here and is not a hop")
 	require.NotContains(t, hopTags(path), "inner")
 }
@@ -623,7 +649,7 @@ func TestAMultiErrorPathReportsTheCorrectHopAndTag(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "root"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"root", "middle", "broken"}, hopTags(path),
+	require.Equal(t, []string{"broken", "middle", "root"}, hopTags(path),
 		"every hop that DOES exist is reported; only the missing one is unknown")
 	require.Len(t, path.Unknowns, 1)
 	require.Equal(t, "missing-exit", path.Unknowns[0].Node)
@@ -690,7 +716,9 @@ func TestCycleDetectionUsesIdentityNotTag(t *testing.T) {
 
 	path, err := Build(registry.resolver(), TagOrOutbound{Tag: "root"}, Options{Network: N.NetworkTCP})
 	require.NoError(t, err)
-	require.Equal(t, []string{"root", "shared"}, hopTags(path))
+	require.Equal(t, []string{"shared", "root"}, hopTags(path),
+		"packet order: the deepest dependency is nearest this device, so the shared hop is entered "+
+			"before the root")
 }
 
 // ---------------------------------------------------------------------------------------------
