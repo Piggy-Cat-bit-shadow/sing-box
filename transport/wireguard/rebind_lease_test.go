@@ -1106,22 +1106,26 @@ var (
 // than a standard bind produces - while tolerating the transient smaller reading. A reading of 0 is
 // ignored rather than recorded, and the first NON-ZERO reading is still required, so a census that
 // counts nothing cannot establish itself as the expectation.
+//
+// The returned value is NEVER the sentinel. An earlier version returned it when no settled reading had
+// been taken yet, and callers that compared before measuring then asserted that a real census equalled
+// -1: the macOS runner reported that as "expected: 2, actual: 0", because the sentinel had already been
+// overwritten by another test in the same process, so the number in the message was not even the value
+// being compared. Failing here instead makes the mistake say what it is.
 func measuredSocketsPerStandardBind(t *testing.T, observed int) int {
 	t.Helper()
 	socketCountMu.Lock()
 	defer socketCountMu.Unlock()
-	if observed == 0 {
-		// Not yet a settled reading; do not let it define the expectation.
-		return socketsPerStandardBind
-	}
-	if observed > socketsPerStandardBind {
+	if observed > 0 && observed > socketsPerStandardBind {
 		if socketsPerStandardBind == socketCountUnmeasured {
 			t.Logf("SOCKETS_PER_STANDARD_BIND=%d (established on this machine)", observed)
 		}
 		socketsPerStandardBind = observed
 	}
 	require.NotEqual(t, socketCountUnmeasured, socketsPerStandardBind,
-		"no settled reading was ever taken, so the assertions that compare against this would be vacuous")
+		"no settled reading was ever taken, so nothing can be compared against it. Measure from a "+
+			"started, settled endpoint - pass its census to this function - rather than reading the "+
+			"package variable, which is a sentinel until something does.")
 	return socketsPerStandardBind
 }
 
@@ -1268,7 +1272,15 @@ func TestFifteenStartCloseCyclesWithRecoveriesLeakNothing(t *testing.T) {
 		endpoint := fixture.endpoint
 		wgDevice := endpoint.device.Load()
 		ports = append(ports, fixture.livePort(t))
-		require.Equal(t, socketsPerStandardBind, socketCensus(t, endpoint),
+		// The expectation is established FROM this reading rather than read before it.
+		//
+		// `socketsPerStandardBind` is a sentinel (-1) until something measures it, and reading it here
+		// compared a real census against that sentinel - which is what the macOS runner reported as
+		// "expected: 2, actual: 0", the unmeasured value being whatever a previous test left behind.
+		// The endpoint is started and proved settled by this point, so its census IS "one socket's
+		// receivers on this machine", which is exactly the quantity the assertion is about.
+		held := socketCensus(t, endpoint)
+		require.Equal(t, measuredSocketsPerStandardBind(t, held), held,
 			"cycle %d: a started endpoint must own exactly one socket's receivers", cycle)
 
 		// A full recovery worker run: a stale session, a real rebind through the worker, and a clean exit.
@@ -1308,7 +1320,9 @@ func TestTwentyFourRecoveriesThroughTheWorker(t *testing.T) {
 	fixture.proveStandardBindBranch(t)
 
 	endpoint := fixture.endpoint
-	require.Equal(t, socketsPerStandardBind, socketCensus(t, endpoint))
+	// Established from this reading, not read before it: see the note in the cycle test above.
+	held := socketCensus(t, endpoint)
+	require.Equal(t, measuredSocketsPerStandardBind(t, held), held)
 	endpoint.recovery.settle = time.Millisecond
 	endpoint.recovery.poll = time.Millisecond
 	endpoint.registration.SetRecoveryWindow(time.Millisecond)
