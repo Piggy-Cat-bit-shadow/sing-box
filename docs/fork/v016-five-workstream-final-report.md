@@ -427,6 +427,14 @@ ZERO_EXTRA_COPY_STATUS = NOT_RUN
 PERF_NOT_MEASURED
 ```
 
+> **Superseded at `524ea41e` by [v016-copy-audit-and-verdict-scope.md](v016-copy-audit-and-verdict-scope.md).**
+> The state above was true for this round only. The later audit performs the executable-environment
+> benchmark and cost audit that §18 requires (per-path copy table with `file:line`, buffer size and
+> pooling, plus `-benchmem` allocation measurements from this machine), and it records the layer state
+> as measured: there is no `kernel_bypass` / `kernel_splice` / `zero-extra-copy` knob anywhere in the
+> tree, only the L0–L3 layers of [direct-offload.md](direct-offload.md). No production copy path was
+> changed, so this section's second line still stands as the round's own scope.
+
 ---
 
 ## H. C1–C4 ACTIONS
