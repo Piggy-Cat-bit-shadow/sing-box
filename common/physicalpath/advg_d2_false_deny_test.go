@@ -228,9 +228,18 @@ func advgD2Cases() []advgD2Case {
 			// The root has TWO routes and one of them is complete. This case is measured for the
 			// OTHER direction of the same predicate: whether a truncated route can still be
 			// reported as reachable when a sibling route carries an exit.
+			//
+			// RECORDED VERDICT CHANGED, after this table was written and because of what it found.
+			// The adversary measured `reachable=true failures=0` here and reported it as a residual
+			// false-ALLOW: the declared-dependency check ran AFTER an "if any node has Exit, this
+			// route is fine" early return, so m1's exit masked m2's truncated route. The integrator
+			// moved that check ahead of the exit question and made it per-node, so the same export
+			// that told a caller "proven usable" now reports the truncated route. `wantAccepted` is
+			// therefore false, and the row is kept - with its history - rather than deleted, because
+			// it is the case that proves the per-node reading is the one in force.
 			legal:        false,
 			shape:        "L.detour = G, G -> [m1 (complete), m2 (detour = ghost)]",
-			wantAccepted: true,
+			wantAccepted: false,
 			build: func() (*testRegistry, []adapter.Outbound) {
 				m1 := dualLeaf("m1")
 				m2 := dualLeaf("m2", "ghost")

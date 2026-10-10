@@ -128,8 +128,11 @@ type socketGate struct {
 	open   chan struct{}
 	// probe, when set, runs inside the socket operation before it is allowed to proceed.
 	probe func()
-	// attempts counts socket operations that reached the hook, across arms.
+	// attention. attempts counts socket operations that reached the hook, across arms.
 	attempts int64
+	// inFlight counts socket operations currently inside the control hook. See
+	// socketOperationsInFlight for what it is for and what it does not cover.
+	inFlight int64
 	// fail, when set, is the error the control hook returns instead of succeeding: the socket-open failure
 	// case of the matrix, injected at the earliest point a dialer can fail an operation.
 	fail func() error
@@ -186,6 +189,7 @@ func (g *socketGate) release() {
 func (g *socketGate) enter() error {
 	g.access.Lock()
 	g.attempts++
+	g.inFlight++
 	armed := g.armed
 	open := g.open
 	failure := g.fail
@@ -194,6 +198,11 @@ func (g *socketGate) enter() error {
 	// generation twice and make the assertion about which generation was revoked ambiguous.
 	g.probe = nil
 	g.access.Unlock()
+	defer func() {
+		g.access.Lock()
+		g.inFlight--
+		g.access.Unlock()
+	}()
 
 	if failure != nil {
 		return failure()
@@ -212,6 +221,31 @@ func (g *socketGate) enter() error {
 	}
 	<-open
 	return nil
+}
+
+// socketOperationsInFlight reports how many socket operations are inside the control hook right now.
+//
+// # Why the release assertions need this and the census cannot supply it
+//
+// The census counts RECEIVE GOROUTINES, and an independent adversary pinned a state in which a device
+// holds a bound socket and has none: `BindUpdate` calls `bind.Open`, which binds udp4 and then udp6
+// before assigning the bind, and the receive goroutines start only after `Open` returns. Arming the
+// fixture's gate from inside the udp4 entry therefore blocks the udp6 entry while the udp4 socket is
+// already bound, and MEASURED in that state: `port=60108 census=0 port_occupied=true`.
+//
+// So `socketCensus == 0` does not imply "no socket" while a reopen is in flight, and neither witness
+// can see it alone. The assertions that use them are sound at their call sites only because the tests
+// call `onPauseUpdated` synchronously and nothing is reopening - which was an unstated precondition
+// until this counter existed. It is now stated and checked: a release assertion that finds an operation
+// in flight FAILS rather than passing for a device that holds a socket.
+//
+// What it does not cover, recorded rather than implied: an operation that has already left the hook and
+// is between the hook and the bind is not counted. That window is a few instructions wide and the tests
+// that use the assertions do not overlap it, but this is a precondition check, not a proof.
+func (g *socketGate) socketOperationsInFlight() int64 {
+	g.access.Lock()
+	defer g.access.Unlock()
+	return g.inFlight
 }
 
 // socketAttempts reports how many socket operations reached the hook.
@@ -1264,7 +1298,7 @@ func TestTwentyConsecutiveRebindsKeepOneSocket(t *testing.T) {
 		current := fixture.livePort(t)
 		require.False(t, udpPortIsFree(t, current),
 			"cycle %d: the endpoint must hold the port it reports", cycle)
-		requirePortReleasedByTheEndpoint(t, endpoint, previous,
+		requirePortReleasedByTheEndpoint(t, fixture, previous,
 			fmt.Sprintf("cycle %d: the port the endpoint left behind (%d) must have been released, not "+
 				"merely superseded - a held port that is no longer reported is a leaked socket",
 				cycle, previous))
@@ -1325,7 +1359,7 @@ func TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket(t *testing.T) {
 
 		// And the out-of-process corroboration, disambiguated: see
 		// requirePortReleasedByTheEndpoint for why the bare port table cannot carry this alone.
-		requirePortReleasedByTheEndpoint(t, endpoint, held,
+		requirePortReleasedByTheEndpoint(t, fixture, held,
 			fmt.Sprintf("cycle %d: a network pause must RELEASE the socket", cycle))
 
 		endpoint.onPauseUpdated(pause.EventNetworkWake)
@@ -1356,7 +1390,7 @@ func TestPauseWakeCyclesInterleavedWithRebindsKeepOneSocket(t *testing.T) {
 		after := fixture.livePort(t)
 		require.False(t, udpPortIsFree(t, after),
 			"cycle %d: the endpoint must hold the port it reports after a rebind", cycle)
-		requirePortReleasedByTheEndpoint(t, endpoint, live,
+		requirePortReleasedByTheEndpoint(t, fixture, live,
 			fmt.Sprintf("cycle %d: the port from before the rebind must have been released", cycle))
 	}
 }
@@ -1387,7 +1421,7 @@ func TestCloseAfterAFaultInjectedOpenFailureLeavesNoSocket(t *testing.T) {
 	// Close must release whatever the failed rebind left, and a second Close must be safe.
 	require.NoError(t, endpoint.Close())
 	require.NoError(t, endpoint.Close())
-	requirePortReleasedByTheEndpoint(t, endpoint, port,
+	requirePortReleasedByTheEndpoint(t, fixture, port,
 		fmt.Sprintf("port %d must be free after Close, even though a rebind failed in front of it", port))
 	require.Eventually(t, func() bool {
 		return deviceReceiveCensus(wgDevice) == 0
@@ -1438,12 +1472,39 @@ func revokedRebindClaimed(err error) bool {
 // asserted DIRECTLY by the callers; this helper keeps the port table as corroboration, so an occupied
 // port fails the test only when the endpoint is holding more than one socket's worth of receivers -
 // which is exactly what a leaked socket looks like.
-func requirePortReleasedByTheEndpoint(t *testing.T, endpoint *Endpoint, port uint16, message string) {
+// requirePortReleasedByTheEndpoint asserts that the endpoint no longer holds a socket, and it CHECKS
+// its own precondition before it believes either witness.
+//
+// # Why a precondition check was needed, measured by an independent adversary
+//
+// `socketCensus == 0` does not imply "no socket". `BindUpdate` calls `bind.Open`, which binds udp4 and
+// then udp6 before assigning the bind, and the receive goroutines start only after `Open` returns - so
+// a device in the middle of a reopen HOLDS a bound socket with no receive goroutine in sight. The
+// adversary pinned that state deterministically by arming this fixture's gate from inside the udp4
+// entry, which blocks the udp6 entry: `ADVG_ITEM7_PINNED port=60108 census=0 port_occupied=true`.
+// In it, this helper's census half passed and its port half excused the occupied port with the same
+// number, so the two halves the file treats as independent are blind together.
+//
+// What the adversary could NOT show is an escaped leak: every failure path in `Open` closes the socket
+// it opened, and `BindUpdate`'s only post-`Open` early return is the `SetMark` path, which this
+// endpoint never reaches. So these assertions are sound at their call sites because the tests call
+// `onPauseUpdated` synchronously and nothing is reopening - which was true, unstated, and unchecked.
+// It is now checked: an operation inside the hook FAILS this helper instead of being read as a release.
+//
+// The limit, recorded rather than implied: an operation that has already left the hook and is between
+// the hook and the bind is not counted. That window is a few instructions wide, and closing it needs a
+// witness that survives a reopen rather than a precondition - which is a different instrument, not a
+// longer assertion.
+func requirePortReleasedByTheEndpoint(t *testing.T, fixture *rebindFixture, port uint16, message string) {
 	t.Helper()
+	require.Zero(t, fixture.gate.socketOperationsInFlight(),
+		"%s - a socket operation is INSIDE the fixture's control hook, so this reading cannot tell a "+
+			"released socket from one being reopened. A device mid-reopen holds a bound socket and has "+
+			"no receive goroutine yet, which is exactly the state the census cannot see", message)
 	if udpPortIsFree(t, port) {
 		return
 	}
-	held := socketCensus(t, endpoint)
+	held := socketCensus(t, fixture.endpoint)
 	require.LessOrEqual(t, held, socketsPerStandardBind,
 		"%s - port %d is occupied AND the endpoint holds %d receive goroutine(s) against one socket's "+
 			"worth of %d, so the holder is this endpoint: a held port that is no longer reported is a "+

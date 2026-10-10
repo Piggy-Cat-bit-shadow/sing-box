@@ -105,14 +105,56 @@ func TestAdvGItem7OccupiedPortIsInvisibleWhileTheReopenIsInFlight(t *testing.T) 
 	require.True(t, portOccupied,
 		"the gate did not land between the two family listens, so this probe did not reach the state "+
 			"it describes and its other assertion proves nothing (census=%d)", census)
-	require.NotZero(t, census,
-		"THE WITNESS READS 0 WHILE THE ENDPOINT HOLDS A BOUND SOCKET: in this state the endpoint has "+
-			"already bound its udp4 socket on port %d and no receive goroutine exists yet, so "+
-			"`socketCensus == 0` does not imply `no socket`. The release assertion passes here for a "+
-			"device that holds a socket, and requirePortReleasedByTheEndpoint excuses the occupied "+
-			"port with the same number (held=0 <= socketsPerStandardBind=%d). The assertion is sound "+
-			"only as long as nothing is reopening, which the test does not establish",
-		held, socketsPerStandardBind)
+
+	// THE FINDING, pinned as the property it turned out to be rather than as a failure.
+	//
+	// This assertion used to be `require.NotZero(t, census)` and was RED BY DESIGN: the counterexample
+	// is that the census reads 0 while the endpoint holds a bound socket, and a test cannot prove a
+	// limit by asserting the limit away. The limit is real - a socket `bind.Open` has bound but whose
+	// receive goroutines have not started is invisible to a census of receivers - and no assertion in
+	// this file can remove it. What the round DID do is stop the release helper from reading that
+	// state as a release, so the finding is now pinned on both sides:
+	//
+	//   1. the witness really cannot see it (here), and
+	//   2. the helper refuses to answer in it (the second subtest below).
+	require.Zero(t, census,
+		"the census reads %d in a state where the endpoint demonstrably holds a bound socket on port "+
+			"%d, so `socketCensus == 0` does NOT imply `no socket`. This is the measured limit of the "+
+			"receive-goroutine census; if it ever reads non-zero here the limit has been closed and "+
+			"this pin - not the product - should be revisited", census, held)
+
+	t.Run("the release helper now checks this precondition", func(t *testing.T) {
+		// Re-enter the same state and check the PRECONDITION the helper now asserts first.
+		//
+		// The helper itself is not called here: it ends in `require`, which calls `FailNow`, which is
+		// only valid from a real test's own goroutine - so "call it and expect a failure" cannot be
+		// written this way, and a probe that pretended otherwise would be measuring testify rather
+		// than the product. The property is asserted directly instead, and the helper's dependence on
+		// it was established by a reverse-break run against the helper's own first statement.
+		fixture.gate.probeAtSocketOpen(func() { fixture.gate.arm() })
+		wakeAgain := make(chan struct{})
+		go func() {
+			defer close(wakeAgain)
+			endpoint.onPauseUpdated(pause.EventNetworkPause)
+			endpoint.onPauseUpdated(pause.EventNetworkWake)
+		}()
+		fixture.gate.awaitEntry(t, 15*time.Second)
+
+		censusAgain := socketCensus(t, endpoint)
+		require.NotZero(t, fixture.gate.socketOperationsInFlight(),
+			"`socketOperationsInFlight` must be non-zero in this state, which is the whole point: it "+
+				"is the only reading here that distinguishes a released socket from one being reopened, "+
+				"and `requirePortReleasedByTheEndpoint` now fails on it before it looks at either witness")
+		require.Zero(t, censusAgain,
+			"and the census still reads %d while the endpoint holds a bound socket", censusAgain)
+
+		fixture.gate.release()
+		select {
+		case <-wakeAgain:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the second wake never finished after the gate was released")
+		}
+	})
 }
 
 // TestAdvGItem7TheTwoWitnessesAgreeWheneverNothingIsReopening is the discriminating control: the census

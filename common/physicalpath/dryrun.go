@@ -204,8 +204,8 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 		// so a caller that gates on it is told a route with no far end was proven. That is a false
 		// READY produced by this API, and it is fixed here rather than left to whichever caller
 		// happens to run a lint first.
-		if failure, truncated := truncatedRouteFailure(resolver, root, nodes); truncated {
-			report.Failures = append(report.Failures, failure)
+		if failures, truncated := truncatedRouteFailure(resolver, root, nodes); truncated {
+			report.Failures = append(report.Failures, failures...)
 		}
 		requirement := proven
 		if requirement == nil {
@@ -308,15 +308,29 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 // "the route is truncated" tells an operator nothing about which line of the configuration to fix.
 // The declaration is right there on the object, and it is read through the same `lookupDependency`
 // the enumeration used, so the name in the report cannot disagree with the edge that produced it.
-func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []PathNode) (Failure, bool) {
+func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []PathNode) ([]Failure, bool) {
 	if len(nodes) == 0 {
-		return Failure{}, false
+		// An empty root is deliberately left alone: it materialised no node, so there is nothing to
+		// prove about it. This is the case the "a group that is empty is left alone" comment means,
+		// and it is NOT the case below - an empty group hanging UNDER a hop still leaves that hop
+		// with no far end, and that is refused by the fallback at the end of this function.
+		// MEASURED by an independent adversary, which is why the distinction is spelled out: as a
+		// ROOT an empty group produces no node and is accepted, as a dependency it does not.
+		return nil, false
 	}
-	for _, node := range nodes {
-		if node.Exit {
-			return Failure{}, false
-		}
-	}
+	// THE DECLARED-DEPENDENCY CHECK IS PER NODE, and it runs BEFORE any question about exits.
+	//
+	// It used to run after an "if any node has Exit, this route is fine" early return, which let a
+	// sibling route mask a truncated one. MEASURED by an independent adversary: with `L.detour = G`
+	// and `G -> [m1 complete, m2 (detour = ghost)]`, the walk reports `nodes=4 exits=1 reachable=true
+	// failures=0` - m1's route carries the only Exit, and m2's route, which provably never reaches
+	// its far end, is never reported. That is the same false READY this function was written to
+	// remove, one level down, and the exported `Report.Reachable` is documented as the STRONGER
+	// question, so it is a defect of this API rather than of a caller's lint ordering.
+	//
+	// Every node with an unresolvable declared dependency is a route that cannot reach its far end,
+	// whatever any other node of the same root happens to be.
+	var failures []Failure
 	for _, node := range nodes {
 		if node.Outbound == nil {
 			// An unresolvable GROUP MEMBER is already a hop-shaped fact with Exit set, so it never
@@ -328,7 +342,7 @@ func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []Pa
 			continue
 		}
 		if dependency, _ := resolver.lookupDependency(dependencyTag); dependency == nil {
-			return Failure{
+			failures = append(failures, Failure{
 				Root:  root.Tag(),
 				Leaf:  node.Tag,
 				Route: node.Route(),
@@ -338,11 +352,19 @@ func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []Pa
 					"no outbound or endpoint with that tag exists; the route never reaches its far end, " +
 					"so no node of it can be proven usable and none of them claims to be where the flow " +
 					"arrives",
-			}, true
+			})
+		}
+	}
+	if len(failures) > 0 {
+		return failures, true
+	}
+	for _, node := range nodes {
+		if node.Exit {
+			return nil, false
 		}
 	}
 	last := nodes[len(nodes)-1]
-	return Failure{
+	return []Failure{{
 		Root:  root.Tag(),
 		Leaf:  last.Tag,
 		Route: last.Route(),
@@ -350,7 +372,7 @@ func truncatedRouteFailure(resolver *Resolver, root adapter.Outbound, nodes []Pa
 		Hop:   last.Position,
 		Reason: "this route never reached its far end: no node of it is where the flow arrives, so " +
 			"nothing in it was proven usable",
-	}, true
+	}}, true
 }
 
 // nodeRequirementFor reports the networks THIS node has to be able to carry, and nil when nothing
