@@ -165,7 +165,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	// an Initial packet cannot be smaller than 1200, so there is no safe number to send.
 	if hasCeiling && effectiveInitialPacketSize < dialer.MinimumQUICInitialPacketSize {
 		return nil, E.New("hysteria2: the lower tunnel (inner MTU ", pathCapacity.InnerMTU,
-			", ", (dialer.IPFamily)(pathCapacity.Family).String(),
+			", ", pathCapacity.Family.String(),
 			") leaves ", quicPayloadCeiling, " bytes of UDP payload, which cannot carry a QUIC Initial ",
 			"packet (minimum ", dialer.MinimumQUICInitialPacketSize,
 			"). This path cannot carry a standard QUIC handshake; configure a larger tunnel MTU or ",

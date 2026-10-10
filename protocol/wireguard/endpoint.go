@@ -214,6 +214,75 @@ func (w *Endpoint) PortMTU() uint32 {
 	return w.endpoint.PortMTU()
 }
 
+// WireGuard's transport-data framing, from the pinned module's own constants.
+//
+// # Where these numbers come from, in the pinned revision
+//
+// The module is github.com/sagernet/wireguard-go (go.mod), whose device package declares:
+//
+//	noise-protocol.go:67  MessageTransportHeaderSize = 16   // type+reserved(4), receiver index(4), counter(8)
+//	noise-protocol.go:69  MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize
+//	noise-protocol.go:26  PaddingMultiple            = 16
+//	send.go:734-735       elem.packet = append(elem.packet, paddingZeros[:calculatePaddingSize(...)]...)
+//	send.go:740-745       elem.packet = elem.keypair.send.Seal(header, nonce, elem.packet, nil)
+//	send.go:817           scratch = append(scratch, elem.packet)   // -> peer.SendBuffers -> the UDP socket
+//
+// `poly1305.TagSize` is 16, so one transport-data message is
+//
+//	16 header + payload + 0..15 padding-to-16 + 16 tag
+//
+// and the packet handed to the socket is exactly that, with no additional framing: the 8-byte
+// MessageEncapsulatingTransportSize is a writable PREFIX reserved in the buffer and re-sliced away
+// (send.go:748), which is why it is not part of this budget.
+//
+// # Why the fixed part is the whole budget, and the padding is not
+//
+// The padding is 0..15 bytes and depends on the payload's remainder modulo 16, so it is not a fixed
+// per-packet cost and cannot be added to a ceiling. It does not have to be: for any payload length D,
+// the padding takes the plaintext to the next multiple of 16, so the message length is in
+// [D+32, D+47], and a lower path that can carry D+47 bytes can certainly carry the real message. The
+// honest fixed claim is therefore D+32, which is what PortEncapOverhead returns.
+const (
+	// wireGuardTransportHeaderLength is device.MessageTransportHeaderSize: the transport-data header
+	// that precedes the payload in every packet.
+	wireGuardTransportHeaderLength = 16
+	// wireGuardTransportTagLength is poly1305.TagSize: the AEAD tag appended after the payload.
+	wireGuardTransportTagLength = 16
+	// wireGuardEncapOverhead is what an inner IP packet costs BEFORE it is put into an outer IP and UDP
+	// header: the transport header plus the AEAD tag. See the block comment above for the lines.
+	wireGuardEncapOverhead = wireGuardTransportHeaderLength + wireGuardTransportTagLength
+)
+
+// PortEncapOverhead reports the WireGuard transport framing that sits INSIDE the inner IP packet this
+// endpoint carries, so a protocol stacked on top of WireGuard as a `detour` sizes its own packets
+// against the real budget rather than against the tunnel MTU.
+//
+// # The two numbers this keeps apart
+//
+//	inner IP MTU (PortMTU)          1408 default  what enters the tunnel, and what the operator set
+//	encapsulation overhead            32          what WireGuard adds inside that 1408
+//	inner UDP budget                 1360         what a UDP payload inside the tunnel really has
+//	                                              over IPv4 (1408 - 20 - 8, or 1360 - 20 - 8 = 1332 for
+//	                                              a UDP datagram: see QuicPayloadCeiling)
+//
+// # Why folding 32 into PortMTU would be wrong
+//
+// PortMTU is also what the tunnel device is configured with, and what the endpoint answers about its
+// own inner capacity. Reporting 1376 there would mean the tunnel device refused packets between 1376
+// and 1408 that it actually carries, and would report a tunnel MTU no operator configured. The
+// overhead is a property of THIS transport, so it is published as its own fact and subtracted by the
+// shared helper - common/dialer/path_mtu.go, PathCapacity.IPPacketCeiling and QuicPayloadCeiling -
+// which is also where the IPv4/IPv6 header difference is applied once for every protocol.
+//
+// # What it does not claim
+//
+// It is a ceiling on the FIXED overhead, not a measurement of a particular packet: the real message is
+// 0..15 bytes larger because of WireGuard's padding-to-16 (device.PaddingMultiple). A consumer must
+// treat it as the floor of the cost, which is what a ceiling needs.
+func (w *Endpoint) PortEncapOverhead() uint32 {
+	return wireGuardEncapOverhead
+}
+
 func (w *Endpoint) UpstreamPort() any {
 	return w.endpoint
 }

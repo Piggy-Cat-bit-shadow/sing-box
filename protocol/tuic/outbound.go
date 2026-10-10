@@ -75,6 +75,63 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	// A proven lower tunnel caps what this QUIC connection may put on the wire.
+	//
+	// # TUIC goes through the same path as hysteria2, and the lines that say so
+	//
+	// TUIC does NOT build its own quic.Config. The pinned sing-quic TUIC client does it, and it calls
+	// the SAME applier hysteria2's does - in the module pinned by go.mod
+	// (github.com/sagernet/sing-quic v0.7.2-0.20260929152029-258509488380):
+	//
+	//	quic.go:54-78     func ApplyQUICOptions(quicConfig *quic.Config, options QUICOptions) {
+	//	quic.go:72-74         if options.InitialPacketSize > 0 {
+	//	quic.go:73                quicConfig.InitialPacketSize = uint16(options.InitialPacketSize)
+	//
+	//	tuic/client.go:60-65  quicConfig := &quic.Config{
+	//	                          DisablePathMTUDiscovery: !(GOOS == windows|linux|android|darwin),
+	//	                          EnableDatagrams: true, MaxIncomingUniStreams: 1 << 60,
+	//	                      }
+	//	                      qtls.ApplyQUICOptions(quicConfig, options.QUICOptions)
+	//	tuic/client.go:170/172 qtls.DialEarly / qtls.Dial(ctx, udpConn, c.tlsConfig, c.quicConfig)
+	//
+	// The field this outbound sets below (QUICOptions.InitialPacketSize) is the one read at
+	// quic.go:72, so the ceiling reaches the same library field hysteria2's does.
+	//
+	// # And the difference that makes this clamp effective where hysteria2's is not
+	//
+	// Grep for ChromeParrot in this module: `tuic` never sets it, and nothing in sing-quic's TUIC path
+	// can - quic-go's own guard says so, internal/handshake/tls_conn_utls.go:58
+	// ("quic: tls.Config.VerifyConnection is not supported with ChromeParrot"). Only hysteria2's
+	// outbound sets the field (protocol/hysteria2/outbound.go: `ChromeParrot: !options.DisableChromeParrot`),
+	// and the pinned quic-go then REPLACES whatever the caller configured with
+	// chromeInitialPacketSize = 1250 (quic-go config.go:109-121). TUIC never enters that branch, so for
+	// TUIC the ceiling is what actually goes on the wire. MEASURED, not inferred:
+	// `TestTheCeilingReachesTheTUICFirstDatagram` in this package reads len(p) of the first datagram the
+	// real client config produces.
+	//
+	// An unknown path yields no ceiling and the configured value is used unchanged, so a direct dial
+	// keeps exactly its previous behaviour.
+	pathCapacity := dialer.DetourPathCapacity(ctx, options.DialerOptions.Detour)
+	quicPayloadCeiling, hasCeiling := pathCapacity.QuicPayloadCeiling()
+	effectiveInitialPacketSize := dialer.ClampToCeiling(options.InitialPacketSize, quicPayloadCeiling, hasCeiling)
+	if hasCeiling && effectiveInitialPacketSize != options.InitialPacketSize {
+		logger.Info("path capacity: inner MTU ", pathCapacity.InnerMTU,
+			" caps the QUIC payload at ", quicPayloadCeiling,
+			", so initial_packet_size ",
+			options.InitialPacketSize, " becomes ", effectiveInitialPacketSize)
+	}
+	// A ceiling below the QUIC minimum is a configuration-level impossibility, not a value to clamp:
+	// an Initial packet cannot be smaller than 1200 (RFC 9000 section 14.1), so there is no safe number
+	// to send. The same refusal, with the same wording, is what hysteria2 already does - the two
+	// protocols share the helper, so they must share the boundary too.
+	if hasCeiling && effectiveInitialPacketSize < dialer.MinimumQUICInitialPacketSize {
+		return nil, E.New("tuic: the lower tunnel (inner MTU ", pathCapacity.InnerMTU,
+			", ", pathCapacity.Family.String(),
+			") leaves ", quicPayloadCeiling, " bytes of UDP payload, which cannot carry a QUIC Initial ",
+			"packet (minimum ", dialer.MinimumQUICInitialPacketSize,
+			"). This path cannot carry a standard QUIC handshake; configure a larger tunnel MTU or ",
+			"reach this server without this detour")
+	}
 	client, err := tuic.NewClient(tuic.ClientOptions{
 		Context:       ctx,
 		Dialer:        outboundDialer,
@@ -86,7 +143,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
 			ConnectionReceiveWindow: options.ConnectionReceiveWindow.Value(),
 			MaxConcurrentStreams:    options.MaxConcurrentStreams,
-			InitialPacketSize:       options.InitialPacketSize,
+			InitialPacketSize:       effectiveInitialPacketSize,
 			DisablePathMTUDiscovery: options.DisablePathMTUDiscovery,
 		},
 		UUID:              userUUID,

@@ -101,11 +101,18 @@ func overheadFor(family IPFamily) int {
 //   - the lower MTU is smaller than the headers alone, so no payload fits at all. That is a
 //     configuration-level impossibility rather than a value to clamp, and reporting it as a number
 //     would be inventing capacity that does not exist.
-func PacketOverheadCeiling(innerMTU uint32, family IPFamily) (uint32, bool) {
+//
+// # encapsulatedOverhead
+//
+// The free function above answers for a lower path that puts the packet straight into an IP header and
+// a UDP header. A lower path that adds its OWN encapsulation first needs the extra bytes subtracted
+// too, and the second argument carries them; pass 0 for the plain case. It is a parameter rather than a
+// field of a struct so both callers go through one implementation of the arithmetic.
+func PacketOverheadCeiling(innerMTU uint32, family IPFamily, encapsulatedOverhead uint32) (uint32, bool) {
 	if innerMTU == 0 {
 		return 0, false
 	}
-	overhead := uint32(overheadFor(family))
+	overhead := uint32(overheadFor(family)) + encapsulatedOverhead
 	if innerMTU <= overhead {
 		return 0, false
 	}
@@ -119,11 +126,32 @@ func PacketOverheadCeiling(innerMTU uint32, family IPFamily) (uint32, bool) {
 // reading it as "no capacity" and refusing a working configuration.
 type PathCapacity struct {
 	// InnerMTU is the inner IP MTU the lower path carries. Meaningful only when Known is true.
+	//
+	// It is the number the lower path PUBLISHES as its own inner capacity and, for a tunnel whose
+	// device is configured with it, the number it actually enforces. It is deliberately NOT reduced by
+	// the lower path's own encapsulation: see EncapsulatedOverhead for why the two are kept apart and
+	// QuicPayloadCeiling for where they are composed.
 	InnerMTU uint32
 	// Family is the family the lower path's packets travel in, or IPFamilyUnknown.
 	Family IPFamily
 	// Known reports whether the capacity was actually proven.
 	Known bool
+	// EncapsulatedOverhead is the framing the lower path adds INSIDE an inner IP packet, beyond the
+	// outer IP and UDP headers, when the lower path declares any.
+	//
+	// # Why this is a field here and not folded into InnerMTU
+	//
+	// WireGuard is the case that makes it necessary. Its inner IP packet contains a WireGuard transport
+	// message, which contains the payload, so a 1408-byte inner packet cannot carry a 1408-byte UDP
+	// payload: 32 bytes of transport framing sit in between. If that 32 were folded into InnerMTU, the
+	// diagnostic would report a tunnel MTU no operator configured, and every consumer that already
+	// accounts for its own overhead would subtract it a second time. Kept apart, InnerMTU stays the
+	// answer to "what enters this tunnel" and this field answers "what does this tunnel cost".
+	//
+	// Zero means either "this lower path declares no encapsulation" - which is true of every QUIC-based
+	// tunnel, where the inner IP packet holds one UDP datagram and nothing else - or "it was never
+	// asked", and the two are deliberately not distinguished: neither changes the arithmetic.
+	EncapsulatedOverhead uint32
 }
 
 // PortMTUProvider is implemented by a lower layer that has a FIXED inner IP capacity it can state.
@@ -136,6 +164,32 @@ type PortMTUProvider interface {
 	// PortMTU reports the inner IP MTU. It must be answerable BEFORE the provider is Started, because
 	// the protocols stacked on top of it are constructed first and size themselves at construction.
 	PortMTU() uint32
+}
+
+// PortEncapOverheadProvider is implemented by a lower layer whose transport adds framing of its own
+// INSIDE the inner IP packet it carries, and which can state how many bytes that framing costs.
+//
+// # Why this is separate from PortMTUProvider
+//
+// A QUIC-based tunnel's inner IP packet contains one UDP datagram, so "inner IP MTU minus an IP header
+// and a UDP header" is exactly the payload budget, and PortMTUProvider alone is enough. WireGuard's
+// does not: its inner IP packet contains a WireGuard transport message, which contains the payload, so
+// the payload budget is smaller by the transport message's own framing. A protocol stacked on WireGuard
+// that only read PortMTU would size its packets 32 bytes too large and have every one of them
+// fragmented or dropped on the outer path.
+//
+// # What it deliberately does not say
+//
+// The bytes returned are a FIXED per-packet overhead. A transport whose framing varies per packet - the
+// optional padding in WireGuard's spec, a compression layer that only sometimes expands - cannot
+// implement this honestly, and must not: the number is treated as a hard floor on the budget. Such a
+// transport declares the largest fixed framing it always adds, or it does not implement the interface
+// and its capacity is reported without a declared overhead.
+type PortEncapOverheadProvider interface {
+	// PortEncapOverhead reports the bytes the transport adds to every packet it carries, inside the
+	// inner IP MTU. It must be answerable BEFORE the provider is Started, for the same reason
+	// PortMTU is: the consumers size themselves at construction.
+	PortEncapOverhead() uint32
 }
 
 // DetourPathCapacity resolves the capacity of the tunnel a `detour` names, if that detour is a fixed
@@ -180,19 +234,24 @@ func DetourPathCapacity(ctx context.Context, detourTag string) PathCapacity {
 	if innerMTU == 0 {
 		return PathCapacity{}
 	}
-	return PathCapacity{InnerMTU: innerMTU, Family: IPFamilyUnknown, Known: true}
+	capacity := PathCapacity{InnerMTU: innerMTU, Family: IPFamilyUnknown, Known: true}
+	if overheadProvider, isOverheadProvider := endpoint.(PortEncapOverheadProvider); isOverheadProvider {
+		capacity.EncapsulatedOverhead = overheadProvider.PortEncapOverhead()
+	}
+	return capacity
 }
 
 // QuicPayloadCeiling returns the largest QUIC UDP payload that fits a proven lower path, and whether a
 // ceiling applies at all.
 //
-// It is the composition of the two facts above: the lower capacity, and this protocol's own overhead.
-// Returning ok=false for an unknown path is the whole contract - see PacketOverheadCeiling.
+// It is the composition of the three facts above: the lower capacity, the lower path's own
+// encapsulation when it declares one, and this protocol's IP and UDP overhead. An unknown path returns
+// ok=false, which is the whole contract - see PacketOverheadCeiling.
 func (c PathCapacity) QuicPayloadCeiling() (uint32, bool) {
 	if !c.Known {
 		return 0, false
 	}
-	return PacketOverheadCeiling(c.InnerMTU, c.Family)
+	return PacketOverheadCeiling(c.InnerMTU, c.Family, c.EncapsulatedOverhead)
 }
 
 // ClampToCeiling applies a proven ceiling to a configured value.

@@ -92,7 +92,7 @@ func TestPacketOverheadCeilingByFamily(t *testing.T) {
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			got, ok := PacketOverheadCeiling(testCase.inner, testCase.family)
+			got, ok := PacketOverheadCeiling(testCase.inner, testCase.family, 0)
 			require.Equal(t, testCase.wantOK, ok, testCase.comment)
 			if testCase.wantOK {
 				require.Equal(t, testCase.want, got)
@@ -109,8 +109,8 @@ func TestPacketOverheadCeilingByFamily(t *testing.T) {
 // because it is the one whose failure mode is silent: an IPv4-sized packet on an IPv6 path is 20 bytes
 // over and fragments, and nothing reports it.
 func TestUnknownFamilyIsNeverTheSmallerBudget(t *testing.T) {
-	ipv4Ceiling, ok4 := PacketOverheadCeiling(1280, IPFamilyIPv4)
-	unknownCeiling, okUnknown := PacketOverheadCeiling(1280, IPFamilyUnknown)
+	ipv4Ceiling, ok4 := PacketOverheadCeiling(1280, IPFamilyIPv4, 0)
+	unknownCeiling, okUnknown := PacketOverheadCeiling(1280, IPFamilyUnknown, 0)
 	require.True(t, ok4)
 	require.True(t, okUnknown)
 	require.Less(t, unknownCeiling, ipv4Ceiling,
@@ -188,6 +188,16 @@ func (e *fixedMTUEndpoint) PortMTU() uint32 { return e.mtu }
 type openEndpoint struct {
 	adapter.Endpoint
 }
+
+// fixedEncapEndpoint is a fixed-MTU endpoint that ALSO declares the framing its transport adds inside
+// the inner IP packet it carries - the WireGuard shape. Both capabilities are optional and independent:
+// a QUIC tunnel implements only the first.
+type fixedEncapEndpoint struct {
+	fixedMTUEndpoint
+	overhead uint32
+}
+
+func (e *fixedEncapEndpoint) PortEncapOverhead() uint32 { return e.overhead }
 
 // endpointManagerStub serves the tags a test registers.
 type endpointManagerStub struct {
@@ -284,6 +294,136 @@ func TestDetourPathCapacity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// A lower path that encapsulates INSIDE the inner IP packet
+// ---------------------------------------------------------------------------
+//
+// WireGuard is the case: a 1408-byte inner IP packet contains a WireGuard transport message, which
+// contains the payload, so a protocol stacked on it must subtract the transport message's framing as
+// well as the outer IP and UDP headers. The two numbers are kept apart - InnerMTU stays what the
+// operator configured and what the tunnel device enforces, EncapsulatedOverhead is what this transport
+// costs - and the composition happens once, in PacketOverheadCeiling.
+
+// TestADeclaredEncapOverheadIsSubtractedFromTheBudget is the arithmetic half. The measured half - that
+// 32 is really what the pinned WireGuard costs on the wire - is
+// protocol/wireguard/mtu_budget_test.go.
+func TestADeclaredEncapOverheadIsSubtractedFromTheBudget(t *testing.T) {
+	// WireGuard's fixed framing: transport header 16 + Poly1305 tag 16.
+	const wireGuardOverhead = 32
+
+	cases := []struct {
+		name     string
+		innerMTU uint32
+		family   IPFamily
+		overhead uint32
+		want     uint32
+		wantOK   bool
+		comment  string
+	}{
+		{
+			name: "the WireGuard default inner MTU over IPv6", innerMTU: 1408,
+			family: IPFamilyIPv6, overhead: wireGuardOverhead,
+			want: 1408 - 48 - 32, wantOK: true,
+			comment: "1328 bytes of QUIC payload: 40 + 8 of headers and 32 of WireGuard framing",
+		},
+		{
+			name: "the WireGuard default inner MTU over IPv4", innerMTU: 1408,
+			family: IPFamilyIPv4, overhead: wireGuardOverhead,
+			want: 1408 - 28 - 32, wantOK: true,
+			comment: "the IPv4 case is 20 bytes more generous, and that difference is the whole " +
+				"reason the family is an argument",
+		},
+		{
+			name: "the WireGuard default with an undecided family", innerMTU: 1408,
+			family: IPFamilyUnknown, overhead: wireGuardOverhead,
+			want: 1408 - 48 - 32, wantOK: true,
+			comment: "an undecided family takes the IPv6 budget, as everywhere else in this file",
+		},
+		{
+			name: "no declared overhead is the case that already worked", innerMTU: 1408,
+			family: IPFamilyIPv6, overhead: 0,
+			want: 1408 - 48, wantOK: true,
+			comment: "a QUIC-based tunnel declares nothing, and its budget must be exactly what it " +
+				"was before this capability existed",
+		},
+		{
+			name: "a tunnel of exactly the headers plus the framing", innerMTU: 80,
+			family: IPFamilyIPv6, overhead: wireGuardOverhead,
+			want: 0, wantOK: false,
+			comment: "80 == 48 + 32 exactly: no payload fits, so it must be refused rather than " +
+				"reported as a usable zero",
+		},
+		{
+			name: "one byte more than the headers plus the framing", innerMTU: 81,
+			family: IPFamilyIPv6, overhead: wireGuardOverhead,
+			want: 1, wantOK: true,
+			comment: "the boundary is inclusive of a single byte of payload",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			capacity := PathCapacity{
+				InnerMTU:             testCase.innerMTU,
+				Family:               testCase.family,
+				Known:                true,
+				EncapsulatedOverhead: testCase.overhead,
+			}
+			got, ok := capacity.QuicPayloadCeiling()
+			require.Equal(t, testCase.wantOK, ok, testCase.comment)
+			if !testCase.wantOK {
+				require.Zero(t, got, "a refused ceiling must not report a number a caller could use")
+				return
+			}
+			require.Equal(t, testCase.want, got, testCase.comment)
+			require.EqualValues(t,
+				overheadFor(testCase.family)+int(testCase.overhead), testCase.innerMTU-got,
+				"the ceiling, the IP and UDP headers and the declared framing must account for the "+
+					"inner MTU exactly, with nothing left over and nothing double-counted")
+		})
+	}
+}
+
+// TestTheEncapOverheadCannotChangeAFamilyThatDeclaresNone is the compatibility control: the field is new
+// and every existing provider leaves it zero, so no configuration that worked before may move.
+func TestTheEncapOverheadCannotChangeAFamilyThatDeclaresNone(t *testing.T) {
+	for _, family := range []IPFamily{IPFamilyUnknown, IPFamilyIPv4, IPFamilyIPv6} {
+		for _, innerMTU := range []uint32{1280, 1408, 1500} {
+			withZero, okWithZero := PacketOverheadCeiling(innerMTU, family, 0)
+			require.True(t, okWithZero)
+			require.Equal(t, withZero, innerMTU-uint32(overheadFor(family)),
+				"with no declared encapsulation the ceiling must be exactly the pre-existing value")
+		}
+	}
+}
+
+// TestTheDetourReportsTheEncapOverhead is the discovery half: DetourPathCapacity has to carry the
+// declared overhead through, or the subtraction above never happens for a real configuration.
+func TestTheDetourReportsTheEncapOverhead(t *testing.T) {
+	ctx := capacityContext(map[string]adapter.Endpoint{
+		"wg-1":     &fixedEncapEndpoint{fixedMTUEndpoint: fixedMTUEndpoint{mtu: 1408}, overhead: 32},
+		"masque-1": &fixedMTUEndpoint{mtu: 1280},
+	})
+
+	wireGuard := DetourPathCapacity(ctx, "wg-1")
+	require.True(t, wireGuard.Known)
+	require.EqualValues(t, 1408, wireGuard.InnerMTU,
+		"the reported inner MTU stays the CONFIGURED one; the overhead must not be folded into it")
+	require.EqualValues(t, 32, wireGuard.EncapsulatedOverhead)
+	udpCeiling, hasCeiling := wireGuard.QuicPayloadCeiling()
+	require.True(t, hasCeiling)
+	require.EqualValues(t, 1408-48-32, udpCeiling)
+
+	masque := DetourPathCapacity(ctx, "masque-1")
+	require.True(t, masque.Known)
+	require.Zero(t, masque.EncapsulatedOverhead,
+		"a tunnel that does not implement the capability declares nothing, and nothing is assumed")
+	masqueCeiling, masqueHasCeiling := masque.QuicPayloadCeiling()
+	require.True(t, masqueHasCeiling)
+	require.EqualValues(t, 1232, masqueCeiling,
+		"and its own budget is unchanged by the existence of the new capability")
 }
 
 // TestDetourPathCapacityWithoutAManager keeps the helper usable in a process that has no endpoint
