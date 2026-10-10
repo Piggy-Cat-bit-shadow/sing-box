@@ -268,12 +268,13 @@ func ValidateRoots(resolver *Resolver, roots []adapter.Outbound, endpoints Endpo
 //
 // # Why the requirement is not the same for every node of a route
 //
-// The flow the routing selected reaches the FIRST physical node. Every node after it is a
-// dependency of the node above, and a dependency is dialled to carry that consumer's own
-// connection - not the business flow - so its network requirement is a TRANSPORT requirement, and
-// the consumer's transport is not published by any object before Start. A dependency that carries
-// the business network is therefore accepted, and one that does not is left UNVERIFIED rather than
-// refused: UDP-over-TCP is a legal conversion and this is exactly the case it covers.
+// The flow the routing selected ARRIVES at the node where nothing is dialled through it: the far end
+// of packet order, which is the hop `businessEntry` names. Every hop BEFORE it on that route is a
+// dependency of the hop above, and a dependency is dialled to carry that consumer's own connection -
+// not the business flow - so its network requirement is a TRANSPORT requirement, and the consumer's
+// transport is not published by any object before Start. A dependency that carries the business
+// network is therefore accepted, and one that does not is left UNVERIFIED rather than refused:
+// UDP-over-TCP is a legal conversion and this is exactly the case it covers.
 //
 // # Why the exemption reads the PARENT EDGE and not the whole control path
 //
@@ -378,26 +379,28 @@ func routeUnder(nodes []PathNode, rootTag string) string {
 
 // businessEntry reports whether the flow the routing selected ARRIVES at this node.
 //
-// # Why this is not Position == 0
+// # Why this is neither Position == 0 nor Position == len(PhysicalPath)-1
 //
 // `Position` is an index into PACKET order, whose origin is the hop nearest THIS DEVICE. For a route
 // with a detour the device-nearest hop is a DEPENDENCY, so reading position 0 as "the flow arrives
 // here" demands the BUSINESS network of an underlay hop and refuses a legal TCP-only middle hop under
 // a UDP-carrying outbound.
 //
-// The business entry is the far end of packet order: the hop the routing selected. A node therefore
-// is the entry exactly when nothing was dialled THROUGH it, which is when its own physical chain does
-// not continue past it. `Position` is the node's index in `PhysicalPath`, so that is
-// `len(PhysicalPath)-1 == Position`.
+// The second candidate - "my chain does not continue past me", which is `len(PhysicalPath)-1 ==
+// Position` - reads like the same statement and is not. Every node carries the prefix of its route
+// that ENDS AT IT, so that identity holds for EVERY node of a route and the predicate answered true
+// for all of them. MEASURED, `a <- b <- c` with `c` the routing-selected hop, reached through a
+// group: `b` carries the chain [a b] at position 1, so the predicate named the MIDDLE hop as the
+// entry, `c` was never checked, and a UDP flow delivered to a TCP-only `c` was reported REACHABLE.
 //
-// It is stated in terms of the node's OWN CHAIN rather than in terms of an index, so it stays correct
-// whichever end the ordering convention counts from.
+// The business entry is the FAR END of a COMPLETE route, which is the hop the routing selected, and
+// the enumeration says exactly that: it is the node no longer chain on its own route extends, and
+// `Exit` is set on it alone. Requiring `Resolved` keeps the one node that is Exit without being a far
+// end out of the answer - a group member that names no object ends a route of its own because nothing
+// below it exists to extend it, and it is refused by the existence check rather than being told what
+// networks to carry.
 func businessEntry(hop PathNode) bool {
-	if len(hop.PhysicalPath) == 0 {
-		// No physical chain at all: the root itself, which is where the flow is delivered.
-		return true
-	}
-	return hop.Position == len(hop.PhysicalPath)-1
+	return hop.Exit && hop.Resolved
 }
 
 // hasNetworkFilteringGroup used to report whether any group on these nodes' control paths filters
@@ -456,11 +459,11 @@ func networkFilteringGroup(group adapter.OutboundGroup) bool {
 // group's own answer about a selection it has not made, and for a selector that answer is a
 // blanket covering both networks regardless of its members.
 //
-// Only the nodes the business flow can actually arrive at are counted - the ones at position 0.
-// A node further down the chain is a dependency, so its network set describes what it can serve as
-// a PROXY, not what the flow entering this root can be: a TCP-only middle hop under a UDP-carrying
-// outbound is the ordinary shape of UDP-over-TCP, and unioning its answer in would make the root
-// responsible for a network no flow reaches it with.
+// Only the nodes the business flow can actually ARRIVE at are counted - the business entries, one per
+// complete route. A node the flow is dialled THROUGH is a dependency, so its network set describes
+// what it can serve as a PROXY, not what the flow entering this root can be: a TCP-only middle hop
+// under a UDP-carrying outbound is the ordinary shape of UDP-over-TCP, and unioning its answer in
+// would make the root responsible for a network no flow reaches it with.
 func advertisedNetworks(nodes []PathNode) []string {
 	var advertised []string
 	for _, node := range nodes {

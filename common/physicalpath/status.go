@@ -391,7 +391,10 @@ type PathStatus struct {
 	Root string
 	// Network is the network the walk answered for, e.g. "tcp".
 	Network string
-	// ControlPath is the CONTROL chain in packet order, as the model reports it.
+	// ControlPath is the CONTROL chain in DESCENT order - the routing decision first, then each group
+	// entered, then the leaf - which is the order the model publishes it in. It is NOT packet order:
+	// a group never carries a byte, so a control chain has no physical direction at all. Use Hops for
+	// the physical order.
 	ControlPath []string
 	// Controls is the same chain with each group's published decision.
 	Controls []ControlNode

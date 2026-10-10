@@ -509,9 +509,8 @@ func Build(resolver *Resolver, root TagOrOutbound, options Options) (path Path, 
 // reversePacketOrder turns the walk's root-first descent into device-first packet order, and keeps
 // every index that describes a position consistent with it.
 //
-// ControlPath is reversed with the hops because it is in DESCENT order by definition, and descent order
-// means "from the routing decision towards the exit". Reporting it unreversed next to a reversed hop
-// list would make two adjacent fields describe the same path in opposite directions.
+// ControlPath is deliberately left in descent order; see the note inside. Only `Hops` is a physical
+// list, and only a physical list has a packet order to correct.
 func reversePacketOrder(path *Path) {
 	for left, right := 0, len(path.Hops)-1; left < right; left, right = left+1, right-1 {
 		path.Hops[left], path.Hops[right] = path.Hops[right], path.Hops[left]
@@ -533,8 +532,10 @@ func reversePacketOrder(path *Path) {
 	// Reversing ControlPath was applying a PHYSICAL correction to a CONTROL-plane list. The selection
 	// sequence is root-to-leaf by definition, and packet order does not change who decided what.
 	//
-	// This is pinned by TestControlPathIsRootToLeafRegardlessOfPacketOrder, which builds a topology
-	// whose two orders are provably different and asserts each list against its own rule.
+	// This is pinned by TestControlPathIsShorterThanThePhysicalPath, which builds a topology whose two
+	// orders are provably different and asserts each list against its own rule. (`Path.GroupsNamed`
+	// reads the same list for the same reason.)
+	//
 	// An Unknown's Position names the hop index it belongs at. The walk recorded it before the
 	// reversal, so it is remapped through the same permutation rather than left describing a slot that
 	// now holds a different hop. A negative Position means "not on the path" and is left alone.

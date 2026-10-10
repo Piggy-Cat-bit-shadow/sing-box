@@ -38,7 +38,21 @@ type PathNode struct {
 	// ControlPath is the descent that reached this node: the root, then every group entered, in
 	// selection order. It is not packet order.
 	ControlPath []string
-	// PhysicalPath is the packet-order chain that ends at this node.
+	// PhysicalPath is the packet-order chain that ends at this node: the hops from the one nearest
+	// THIS DEVICE up to this node, and no further.
+	//
+	// # Why the prefix that ENDS here, and not the route's whole chain
+	//
+	// Both readings exist in the field's history and they answer different questions. The whole
+	// route's chain would say "here is the route" and leave `Position` to place the node in it; the
+	// prefix says the same thing and is self-indexing: `Position` is the last index of the field
+	// beside it, so a reader (and `businessEntry`) can tell where the node sits WITHOUT holding the
+	// route. A node whose chain is a PROPER PREFIX of another node's chain on the same route is
+	// therefore a hop something is dialled THROUGH, and the node no chain continues past is where
+	// the flow arrives.
+	//
+	// The prefixes of one route share a single backing array; the enumeration's answer is read-only
+	// and no caller may write to it.
 	PhysicalPath []string
 	// Tag is the node's own tag, which may name no existing object when a group declared a member
 	// that does not exist.
@@ -50,8 +64,20 @@ type PathNode struct {
 	// therefore what it requires this node to be able to carry. A node with no group above it
 	// carries the root's own networks.
 	RequiredNetworks []string
-	// Exit is true when this node is where the packet leaves: a node with no dependency of its
-	// own. Exactly one hop per route is the exit.
+	// Exit is true when this node is the far end of a COMPLETE route, which is the hop the routing
+	// selected: exactly one hop per route.
+	//
+	// # What it is not
+	//
+	// It is not "the node with no dependency of its own". On a chain the deepest dependency has no
+	// dependency either, and that hop is the one nearest this device - the opposite end. It is also
+	// not claimed by a route that stopped at a dependency which does not resolve: such a route never
+	// reached its far end, so no node of it is an exit and none may be promoted to one.
+	//
+	// The one node that is Exit without being a far end is a group member that names no object: there
+	// is nothing below it to extend the route, so it ends a route of its own, and it is refused by
+	// the existence check rather than counted as a leaf anything reaches. businessEntry excludes it
+	// by requiring Resolved.
 	Exit bool
 	// IsCurrent is true when this node is on the path the root resolves to RIGHT NOW, as opposed
 	// to one of the other reachable members. It is derived from the members the groups DECLARED as
@@ -59,7 +85,8 @@ type PathNode struct {
 	IsCurrent bool
 	// Resolved reports whether the tag names an object that exists.
 	Resolved bool
-	// Position is the node's packet-order index within this route.
+	// Position is the node's packet-order index within this route, which is also the last index of
+	// PhysicalPath: the two are set together and cannot disagree.
 	Position int
 }
 
@@ -195,12 +222,19 @@ func (r *Resolver) Hops(root adapter.Outbound) (nodes []PathNode, err error) {
 		}
 	}()
 	scope := newEnumeration(r)
-	// One call for the whole graph. Each route is reversed as it completes; a route that
-	// never completes - an error - is discarded below.
-	_, err = scope.enumerateHops(root, root.Tag(), nil, nil, networksOf(root), true)
+	// One call for the whole graph, and the outcome it returns is NOT discarded: the route that
+	// starts at the root is owned by this call, so this is the frame that has to number it. It used
+	// to be thrown away - `_, err = scope.enumerateHops(...)` - and a route whose far end is the
+	// root itself was therefore never numbered at all: every node kept Position 0, no node carried
+	// Exit, `Leaves()` reported nothing for a one-hop outbound and `businessEntry` could not name
+	// the hop the flow arrives at. See completeRoute.
+	outcome, err := scope.enumerateHops(root, root.Tag(), nil, nil, networksOf(root), true)
 	if err != nil {
 		// The enumeration is discarded rather than partially reported: see DefaultNodeBudget.
 		return nil, err
+	}
+	if outcome == routeComplete {
+		scope.completeRoute(0)
 	}
 	return scope.hops, nil
 }
@@ -225,12 +259,31 @@ func (r *Resolver) Leaves(root adapter.Outbound) ([]PathNode, error) {
 	return leaves, nil
 }
 
-// enumerateHops visits one node of the selection graph and reports whether it ENDED its
-// route, so the caller can reverse that route once it is complete.
-func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain []adapter.Outbound, physicalPath []string, required []string, isCurrent bool) (endedRoute bool, err error) {
+// routeOutcome is how one enumerateHops frame left the route it was extending. It replaced a bool,
+// because "the route ended" and "the route ended at its FAR END" are different facts and only one of
+// them licenses numbering the route:
+//
+//	routeContinues  this frame is a group, or a physical hop whose dependency is a group. It appends
+//	                no route end of its own, so the frame that OWNS the route decides.
+//	routeComplete   the descent reached a physical hop that declares no dependency. The route is
+//	                over and its far end is known, so packet order can be established.
+//	routeTruncated  a physical hop declared a dependency that does not resolve. The route stops
+//	                short of its far end: it has no packet order and no exit, and numbering it would
+//	                claim a far end the configuration never provided.
+type routeOutcome int
+
+const (
+	routeContinues routeOutcome = iota
+	routeComplete
+	routeTruncated
+)
+
+// enumerateHops visits one node of the selection graph and reports how it left the route it was
+// extending, so the frame that OWNS that route can number it exactly once, when it is complete.
+func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain []adapter.Outbound, physicalPath []string, required []string, isCurrent bool) (routeOutcome, error) {
 	e.visited++
 	if e.visited > e.budget {
-		return false, errNodeBudgetExceeded(rootTag, e.budget)
+		return routeContinues, errNodeBudgetExceeded(rootTag, e.budget)
 	}
 	chain = append(chain, node)
 	group, isGroup := node.(adapter.OutboundGroup)
@@ -264,8 +317,11 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 					Position:         len(physicalPath),
 				})
 				_ = reason
-				// A route of its own, and immediately complete: nothing below it exists to extend
-				// it, so it is already in packet order and needs no reversal.
+				// A route of its own, recorded at its own position: nothing below it exists to
+				// extend it, so nothing can be prepended to it and it needs no numbering. Its
+				// Position is the length of the group's own chain rather than an index into a chain
+				// of its own, because it has no chain of its own - it names no object. That is what
+				// makes it UNKNOWN rather than the far end of anything: see businessEntry.
 				continue
 			}
 			// The cycle check runs BEFORE the recursion, and it reads the CURRENT descent rather
@@ -276,23 +332,27 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 			// membership and the DECLARED dependencies - the same edges the start-order sort and the
 			// cross-kind validator read - not a second graph.
 			if containsNode(chain, member) {
-				return false, cycleObjectsError(chain, member)
+				return routeContinues, cycleObjectsError(chain, member)
 			}
-			// Each member is a SIBLING route, not a continuation of a chain, so each opens its
-			// own range and is reversed on its own.
+			// Each member is a SIBLING route, not a continuation of a chain, so each opens its own
+			// range and the loop that opened it is what numbers it, once its recursion reports that
+			// it reached its far end.
 			memberStart := len(e.hops)
-			memberEnded, err := e.enumerateHops(member, rootTag, chain, physicalPath, required,
+			outcome, err := e.enumerateHops(member, rootTag, chain, physicalPath, required,
 				isCurrent && selectedTag == memberTag)
 			if err != nil {
-				return false, err
+				return routeContinues, err
 			}
-			if memberEnded {
-				e.reverseRoute(memberStart)
+			if outcome == routeComplete {
+				e.completeRoute(memberStart)
 			}
+			// A member route that stopped at a dependency which does not resolve is left exactly as
+			// it was recorded - declared order, no exit - because packet order is not knowable for a
+			// route whose far end was never reached.
 		}
-		// A group is a control node: it never terminates a physical route by itself, so whether the
-		// route ended is answered below it, not here.
-		return false, nil
+		// A group is a control node: it never terminates a physical route by itself, so how the route
+		// it extends ended is answered below it, not here.
+		return routeContinues, nil
 	}
 	// A physical hop. It is recorded ONCE PER ROUTE, which is the whole point: the same object
 	// reached by a second route carries different requirements, a different physical chain and a
@@ -313,68 +373,85 @@ func (e *enumeration) enumerateHops(node adapter.Outbound, rootTag string, chain
 		RequiredNetworks: append([]string(nil), required...),
 		IsCurrent:        isCurrent,
 		Resolved:         true,
-		// Exit and Position are set by reverseRoute, once the whole route is known. Setting them
-		// here would be setting them in descent order, which is the order being corrected.
+		// Position indexes the chain recorded above, which is in DECLARED order - the hop the
+		// routing selected first, its deepest dependency last. completeRoute renumbers it in packet
+		// order once the route is known to be complete. A route that never completes keeps this
+		// value, and it is still true of the node: it indexes the chain the node carries.
+		Position: len(physicalPath) - 1,
 	})
 	if dependencyTag == "" {
-		// The deepest dependency. This node ends the route.
-		return true, nil
+		// The deepest dependency. This node ends the route, and it is the far end of it: the hop
+		// nearest this device is the LAST one in packet order to be reached, so it is the routing
+		// agreement's own answer to "where does the flow arrive".
+		return routeComplete, nil
 	}
 	dependency, _ := e.resolver.lookupDependency(dependencyTag)
 	if dependency == nil {
-		// The dependency does not exist. The enumeration stops here rather than inventing the hop;
-		// Validate reports the missing tag through Build, which reads the same edge. This node is
-		// the last one the route reached, so the route ends here too.
-		return true, nil
+		// The dependency does not exist. The enumeration stops here rather than inventing the hop,
+		// and the route is TRUNCATED rather than complete: it never reached its far end, so it has
+		// no packet order and no node of it may claim to be the exit. The missing tag itself is
+		// reported by the caller's own existence check - Build reports it as an Unknown, and
+		// adapter/outbound's start-order lint refuses the configuration before the dry run runs.
+		return routeTruncated, nil
 	}
 	if containsNode(chain, dependency) {
 		// A cycle. Reported with its chain rather than followed, and detected against the CURRENT
 		// descent - not against the set of nodes some route already visited, which would report a
 		// legal diamond as a cycle. A configuration error that starts successfully and then never
 		// returns a connection must not be swallowed.
-		return false, cycleObjectsError(chain, dependency)
+		return routeContinues, cycleObjectsError(chain, dependency)
 	}
 	return e.enumerateHops(dependency, rootTag, chain, physicalPath, required, isCurrent)
 }
 
-// reverseRoute turns one completed route from descent order into packet order.
+// completeRoute numbers ONE completed route in packet order, in place.
 //
-// # Why the route is reversed as a WHOLE, once
+// # Why the frame that OWNS the range is the one that calls this
 //
-// The nodes of a route are appended as the descent unwinds, so they arrive in descent order: the hop
-// the routing selected first, its dependency second, the deepest dependency last. Packet order is the
-// reverse. Reversing inside the descent would flip each suffix at every level and the result would
-// depend on the depth, so the reversal is done once, by the frame that knows the route is over.
+// A route is a maximal declared chain: the hop the routing selected, then the hop it dials through,
+// then that hop's own dependency, and so on until a hop declares none. `enumerateHops` records one
+// route per contiguous range in DECLARED order, and this is the single place where such a range
+// becomes a packet-order route.
 //
-// Everything about a route is reversed TOGETHER - the nodes, each node's physical chain, the
-// positions and the `Exit` flag - because a chain and the index into it that disagree are worse than
-// either order on its own.
+// The caller is the frame that opened the range - a group's member loop for a member route, and
+// `Hops` for the route that begins at the root - and it calls this only when that recursion reported
+// routeComplete. Numbering from anywhere else is what left the root's own route in declared order,
+// with every Position at zero and no Exit at all.
 //
-// # Why this must agree with Build
+// # What every node of the route carries afterwards
 //
-// `Build` already reverses its own walk in `reversePacketOrder`, and the two functions describe the
-// SAME topology. Before this change `Hops` numbered `exit.detour = entry` as [exit, entry] while
-// `Build` reported [entry, exit], so `Exit` meant the routing-selected hop in one API and the deepest
-// underlay in the other, and `Position` counted from opposite ends. A consumer reporting a failure
-// would name the hop nearest the device as the exit. The direction itself was settled by observing
-// the real dial path - see common/dialer/detour_wire_order_test.go - and is not re-derived here.
-func (e *enumeration) reverseRoute(start int) {
+// The route is DEVICE FIRST: the deepest dependency is the hop nearest this device and the routing
+// selected hop is the far end. Each node then carries the PREFIX of that route that ENDS AT IT, so
+// `Position` - the last index of the field beside it - is the node's packet-order index, and the one
+// node whose chain nothing continues past is the far end, which is the exit. That is the shape
+// `businessEntry` reads: a node whose chain a longer chain on the same route extends is a hop
+// something is dialled THROUGH, and the flow arrives at the node that no chain extends.
+//
+// # Why the prefixes share one backing array
+//
+// A route of k hops has k prefixes of k(k+1)/2 elements between them, and each node needs its own
+// LENGTH but not its own storage: the answer is read-only and nothing in this package writes to a
+// node's chain after it is numbered. One array per route keeps the enumeration's memory linear in
+// the number of nodes instead of quadratic in the depth of a chain.
+func (e *enumeration) completeRoute(start int) {
 	route := e.hops[start:]
+	// The declared range reversed IS packet order, and the reversal is done once, here, rather than
+	// inside the descent: reversing inside would flip each suffix at every level and the result would
+	// depend on the depth.
+	chain := make([]string, len(route))
+	for index := range route {
+		chain[len(route)-1-index] = route[index].Tag
+	}
 	for left, right := 0, len(route)-1; left < right; left, right = left+1, right-1 {
 		route[left], route[right] = route[right], route[left]
 	}
 	for index := range route {
-		physical := route[index].PhysicalPath
-		for left, right := 0, len(physical)-1; left < right; left, right = left+1, right-1 {
-			physical[left], physical[right] = physical[right], physical[left]
-		}
-		route[index].PhysicalPath = physical
+		// The chain that ENDS at this node, which is the packet-order prefix of length index+1.
+		route[index].PhysicalPath = chain[:index+1]
 		route[index].Position = index
-		// The exit is the LAST hop in packet order, which is the hop the routing selected - the same
+		// The exit is the last hop in packet order, which is the hop the routing selected - the same
 		// answer `Path.Exit()` gives. It is "last" rather than "the node with no dependency" because
-		// a route that ended at a dependency which does not resolve has no routing-selected hop in it
-		// at all, and promoting its truncated end would claim an exit the configuration never
-		// provided.
+		// that node is the deepest dependency, at the OTHER end: the hop nearest this device.
 		route[index].Exit = index == len(route)-1
 	}
 }

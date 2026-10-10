@@ -20,10 +20,16 @@ package physicalpath
 //
 // # The direction of a physical chain
 //
-// These tests render a route's physical chain as PathNode.Path() and, in ONE place, compare it as a
-// string. That rendering is leaves.go's own contract - the consumer first, its declared dependency
-// second - and it is independent of `Path.Hops` packet order in physicalpath.go, which these tests
-// deliberately never index.
+// A node's chain is the PACKET-ORDER PREFIX that ENDS at it: the hop nearest this device first, the
+// node itself last, and nothing beyond it. So a dependency's chain stops at the dependency (the
+// entry's chain is the only one that reaches the end of the route), and `Position` - the node's
+// packet-order index - is always the last index of the chain beside it. That is the rendering
+// leaves.go documents on PathNode.PhysicalPath, and it is independent of `Path.Hops` packet order in
+// physicalpath.go, which these tests deliberately never index.
+//
+// It is NOT the route's whole chain on every node: a chain that continued past the node would make
+// "my chain does not continue past me" true for every node of a route at once, which is a predicate
+// that cannot name the hop the flow arrives at.
 
 import (
 	"slices"
@@ -148,6 +154,7 @@ func TestDiamondKeepsPerRoutePhysicalPosition(t *testing.T) {
 	type routeContext struct {
 		physicalChain string
 		position      int
+		exit          bool
 		required      string
 	}
 	contexts := make(map[string]routeContext, 2)
@@ -158,18 +165,23 @@ func TestDiamondKeepsPerRoutePhysicalPosition(t *testing.T) {
 		contexts[node.Route()] = routeContext{
 			physicalChain: node.Path(),
 			position:      node.Position,
+			exit:          node.Exit,
 			required:      strings.Join(node.RequiredNetworks, ","),
 		}
 	}
 	require.Equal(t, map[string]routeContext{
-		// Packet order: the device reaches `shared` first and `middle` second, so on route A the
-		// shared object sits at position 0 with the chain that continues past it.
-		"outer -> A -> shared": {physicalChain: "shared -> middle", position: 0, required: N.NetworkTCP},
-		// Route B reaches the shared object directly, so it is both the entry and the exit there.
-		"outer -> B -> shared": {physicalChain: "shared", position: 0, required: N.NetworkUDP},
+		// Packet order: the device reaches `shared` first and `middle` second. A node's chain is the
+		// prefix that ENDS at it, so on route A - where `shared` is the hop nearest the device and
+		// `middle` is dialled through it - the chain stops at `shared`, `middle` is the exit, and the
+		// requirement is route A's own.
+		"outer -> A -> shared": {physicalChain: "shared", position: 0, exit: false, required: N.NetworkTCP},
+		// Route B reaches the shared object directly, so here it is both the entry and the exit, the
+		// chain is the whole of route B, and the requirement is route B's.
+		"outer -> B -> shared": {physicalChain: "shared", position: 0, exit: true, required: N.NetworkUDP},
 	}, contexts,
-		"the shared object's physical position, chain and requirement are per ROUTE: on route A it is "+
-			"a dependency of the entry, on route B it is the entry itself")
+		"every route-dependent fact about the shared object is per ROUTE: on route A it is a "+
+			"dependency of the entry (neither the exit nor the entry point), on route B it is the entry "+
+			"itself, and the two routes require different networks of it")
 }
 
 // TestSharedLeafFailureIsAttributedToItsOwnRoute is the report-layer statement of the same
@@ -192,10 +204,11 @@ func TestSharedLeafFailureIsAttributedToItsOwnRoute(t *testing.T) {
 	//
 	// It asserted that the `shared` leaf fails on BOTH routes, so that the two failures could be
 	// told apart by their route. Measurement says otherwise, and the reason is the contract rather
-	// than a bug: `shared` under route A is a DEPENDENCY hop (position 1), and a dependency carries
-	// the CONSUMER's own transport rather than the business network, so nothing is required of it
-	// that it cannot do. `shared` under route B is position 0, where the business UDP flow actually
-	// arrives, and it carries TCP only - so THAT is the route that fails.
+	// than a bug: `shared` under route A is a DEPENDENCY hop (the hop nearest the device, and not
+	// the route's far end), and a dependency carries the CONSUMER's own transport rather than the
+	// business network, so nothing is required of it that it cannot do. `shared` under route B is
+	// where the business UDP flow actually arrives, and it carries TCP only - so THAT is the route
+	// that fails.
 	//
 	// The property the name claims is still real and still worth pinning; it just needs a fixture
 	// where two routes genuinely fail. See TestTwoRoutesToOneLeafAreBothReported below.
