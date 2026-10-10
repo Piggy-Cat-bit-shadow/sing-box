@@ -145,9 +145,9 @@ func newConfiguredHTTP3Endpoint(t *testing.T) *ServerEndpoint {
 				Listen:     common.Ptr(badoption.Addr(netip.AddrFrom4([4]byte{127, 0, 0, 1}))),
 				ListenPort: 0,
 			},
-			Version:  badoption.Listable[int]{3},
-			Address:  badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.0.0.0/24")},
-			Path:     "/",
+			Version: badoption.Listable[int]{3},
+			Address: badoption.Listable[netip.Prefix]{netip.MustParsePrefix("10.0.0.0/24")},
+			Path:    "/",
 			InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
 				TLS: &option.InboundTLSOptions{
 					Enabled:     true,

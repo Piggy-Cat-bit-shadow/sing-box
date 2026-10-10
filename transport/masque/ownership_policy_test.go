@@ -1101,4 +1101,3 @@ func TestTheOwnershipScanIsLinearOverAdvertisedRanges(t *testing.T) {
 			"in ownership_scan_count_test.go cannot run either")
 	}
 }
-

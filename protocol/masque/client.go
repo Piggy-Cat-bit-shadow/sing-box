@@ -539,8 +539,27 @@ func (c *ClientEndpoint) PortAddresses() (netip.Addr, netip.Addr) {
 	return c.device.PortAddresses()
 }
 
+// PortMTU reports the inner IP capacity of this tunnel.
+//
+// # Why it reads `c.mtu` and not `c.device.PortMTU()`
+//
+// The device is created in `StartStateInitialize`, so between construction and Start, `c.device` is nil
+// and the previous form - `return c.device.PortMTU()` - panicked on a nil interface.
+//
+// That window is exactly when the answer is needed. A protocol stacked ON TOP of this tunnel (HY2, TUIC,
+// anything reached through this endpoint as a `detour`) has to size its own payload ceiling, and it does
+// that during CONSTRUCTION: it cannot wait for this endpoint's Start, because nothing orders one
+// endpoint's Start before another outbound's construction. So the capacity has to be answerable from the
+// configuration alone, and it is: `c.mtu` is seeded from `options.MTU` (defaulting to
+// masque.DefaultMTU) before the device exists, and `StartStatePostStart` hands that SAME value to
+// `device.Configuration{MTU: c.mtu}`. The device therefore runs at this value for its whole life.
+//
+// The consequence to keep in mind when reading callers: this is the CONFIGURED capacity, and it is
+// deliberately not a live measurement. A device that could be reconfigured to a different MTU at runtime
+// would need a stronger story than this one, and nothing does that today - `UpdateConfiguration` is
+// called once, with `c.mtu`.
 func (c *ClientEndpoint) PortMTU() uint32 {
-	return c.device.PortMTU()
+	return c.mtu
 }
 
 func (c *ClientEndpoint) UpstreamPort() any {

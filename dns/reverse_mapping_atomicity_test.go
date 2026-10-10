@@ -314,4 +314,3 @@ func TestReverseMappingRecordingIsRefusedOnceTheInvalidationHasCompleted(t *test
 			"completed: the ownership check and the write are not one decision, so an answer asked "+
 			"for under the retired resolver set survives the purge that was supposed to retire it")
 }
-

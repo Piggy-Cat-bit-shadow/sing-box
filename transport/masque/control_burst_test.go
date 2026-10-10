@@ -1306,7 +1306,6 @@ func serverLookupMiss(t *testing.T, routes []AddressRange) bool {
 	return server.lookup(netip.MustParseAddr("203.0.113.1"), 0) != nil
 }
 
-
 // ---------------------------------------------------------------------------
 // Transport-level framing sanity.
 // ---------------------------------------------------------------------------

@@ -70,9 +70,9 @@ func (m *benchmarkTransportManager) Transport(tag string) (adapter.DNSTransport,
 	return nil, false
 }
 
-func (m *benchmarkTransportManager) Default() adapter.DNSTransport          { return m.transports[0] }
-func (m *benchmarkTransportManager) FakeIP() adapter.FakeIPTransport        { return nil }
-func (m *benchmarkTransportManager) Remove(tag string) error                { return nil }
+func (m *benchmarkTransportManager) Default() adapter.DNSTransport   { return m.transports[0] }
+func (m *benchmarkTransportManager) FakeIP() adapter.FakeIPTransport { return nil }
+func (m *benchmarkTransportManager) Remove(tag string) error         { return nil }
 
 func (m *benchmarkTransportManager) Create(ctx context.Context, logger log.ContextLogger, tag string, outboundType string, options any) error {
 	return nil
