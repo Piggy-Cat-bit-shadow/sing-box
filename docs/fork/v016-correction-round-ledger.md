@@ -203,7 +203,8 @@ production consumer that overclaims.
    | `protocol/shadowtls` | FAIL | **ok 0.022s** |
    | `common/tls` | FAIL (the same 3 cases) | FAIL (the same 3 cases) |
    | `common/tlsspoof` | FAIL (the same 3 cases) | FAIL (the same 3 cases) |
-   | `common/urltest` | FAIL | FAIL |
+   | `common/urltest` | FAIL (4 cases) | FAIL (6 cases) |
+   | ... | *fails at BOTH SHAs, but its failing case NAMES differ between runs* | |
    | `common/windivert` | FAIL (the same 5 cases) | FAIL (the same 5 cases) |
    | `experimental/clashapi` | FAIL (the same 2 cases) | FAIL (the same 2 cases) |
    | `experimental/libbox` | FAIL (the same 1 case) | FAIL (the same 1 case) |
@@ -220,8 +221,18 @@ production consumer that overclaims.
    Windows (a TCP dial returns WSAECONNREFUSED, 10061) and whose message is LOCALIZED by the OS.
 
    So this round's tree is the first in which `transport/http` runs to completion here - `ok 16.643s`,
-   and `ok 18.4s` under `-race` - and the six packages that fail do so identically at both SHAs, which
-   is what makes them attributable to the environment rather than to this work.
+   and `ok 18.4s` under `-race`.
+
+   **One row needs reading rather than comparing: `common/urltest`.** It fails at BOTH SHAs, and its
+   failing case NAMES differ between runs of the SAME commit. It is the only suite in the list with
+   that property - the other five reproduce the identical case names every time - so it is environment
+   dependent in a way they are not, and comparing its counts would be meaningless. It is reported as
+   failing at both rather than as a list, because a list of names that change is not evidence.
+
+   The five remaining suites fail with byte-identical case names at both SHAs, which is what makes them
+   attributable to the environment rather than to this work. The final sweep also reached the END of
+   the module, which the baseline could not, so the comparison covers the whole tree rather than the
+   part before the hang.
 
    The six remaining packages are identical at both SHAs. Two apparent regressions in `common/dialer`
    and `common/power` appeared only in a PARALLEL sweep and BOTH PASS in isolation at the final SHA;
