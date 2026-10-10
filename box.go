@@ -3,6 +3,7 @@ package box
 import (
 	"context"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
+	boxGroup "github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/route"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -130,6 +132,19 @@ type Box struct {
 	// registered as a service so a subsystem asks it instead of inventing a second epoch.
 	runtimeCoordinator *runtimecoord.Coordinator
 	scope              *adapter.Scope
+
+	// statusView is the read-only per-hop status view THIS Box owns, and statusResolver is the
+	// read-only walk it reads through. They are created together at the end of New - when the
+	// object graph they describe is complete - and the view is disconnected as the FIRST act of
+	// close, before any component of that graph is torn down. See Status for the read, and close
+	// for the linearisation point.
+	//
+	// Nothing else in the Box reads them: the status surface is optional, and a Box that created
+	// them and never answered with them behaves exactly as this Box did before they existed. That
+	// is why they are not registered on the context and not added to the scope - a client opts in
+	// by asking, and no lifecycle ordering depends on it.
+	statusView     *physicalpath.StatusView
+	statusResolver *physicalpath.Resolver
 }
 
 type Options struct {
@@ -802,6 +817,29 @@ func New(options Options) (*Box, error) {
 		})
 		timeService.TimeService = ntpService
 	}
+	// The read-only status surface, created HERE: the object graph it describes is complete, and the
+	// Box is about to take ownership of it.
+	//
+	// # Who builds the resolver, and on what
+	//
+	// `outboundManager.Outbound` and nothing else. It is the canonical read-only lookup this tree
+	// has - common/physicalpath's Resolver doc names it as such - because it answers from the
+	// outbound map and falls back to the ENDPOINT namespace, which is exactly the lookup the dial
+	// path performs. A resolver built on `Outbounds()` would hand a walk a snapshot of a slice that
+	// ignores endpoints; one built on the registry would skip the tag collision rules the manager
+	// enforces. The manager also owns `m.access`, so the lookup is safe for concurrent reads
+	// without this Box holding anything.
+	//
+	// # Why the Snapshot is EMPTY
+	//
+	// A Snapshot entry REPLACES the live answer, and the only selection this Box may state as the
+	// path is one the group itself has committed. Filling `Selections` from the configuration's
+	// declared defaults, or from a cachefile's stored member, would present a preference as the
+	// route the traffic takes - the defect protocol/group/selector.go's References() was corrected
+	// for and that Status re-checks per group. Nothing here needs a pin: `Build` takes a preview
+	// that consumes no group state (no round-robin cursor, no sticky key, no URLTest measurement),
+	// which is the property the status answer is allowed to rely on.
+	statusView, statusResolver := newStatusSurface(outboundManager.Outbound)
 	box := &Box{
 		ctx:                 ctx,
 		ownedURLTestHistory: ownedURLTestHistory,
@@ -828,6 +866,8 @@ func New(options Options) (*Box, error) {
 		internalService:     internalServices,
 		ntpService:          ntpService,
 		scope:               adapter.NewScope(ctx, logFactory.Logger()),
+		statusView:          statusView,
+		statusResolver:      statusResolver,
 	}
 
 	// Releasing reusable connections is deferred to DEEP_IDLE rather than done the moment the screen
@@ -1072,6 +1112,30 @@ func (s *Box) Close() error {
 }
 
 func (s *Box) close() error {
+	// The status view is detached FIRST - before the pause callback, before the governor, and
+	// before the scope walks a single component.
+	//
+	// # Why this is the linearisation point, and why it is here rather than last
+	//
+	// Everything below this line tears down the object graph the status view reads. A view that was
+	// still answered from after that point would report hops of a closed box as the current path,
+	// which is the one lie this whole surface exists to prevent - and a caller reading a diagnostic
+	// is precisely the caller who cannot tell a live tunnel from a dismantled one.
+	//
+	// Disconnect publishes one bool and returns: it does NOT wait for a snapshot in flight, so this
+	// cannot block teardown behind a reporter that is slow or wedged - the case that matters, since
+	// a hop's status method belongs to an adapter this Box does not control. The other half of the
+	// rule is in physicalpath: a snapshot reads the generation before it observes anything and
+	// again after, and one whose observation straddled this call discards its own result rather
+	// than publishing a half-live path.
+	//
+	// It runs INSIDE closeOnce, so a repeated or concurrent Close reaches it exactly once - the
+	// same property that keeps every other cleanup below from running twice.
+	//
+	// A nil view is a legal value here (the receiver contract on physicalpath.StatusView), which
+	// is what keeps a Box assembled by a test - or one that never reached the status construction
+	// above - closing without a status surface at all.
+	s.statusView.Disconnect()
 	// The governor is closed first and its callback unregistered, so no lifecycle event can arrive
 	// while the scope is tearing down components that would have asked it what to do.
 	if s.pauseManager != nil && s.pauseCallback != nil {
@@ -1106,6 +1170,168 @@ func (s *Box) Outbound() adapter.OutboundManager {
 
 func (s *Box) Endpoint() adapter.EndpointManager {
 	return s.endpoint
+}
+
+// selectionStatusReporter is the read-only capability a control group publishes about its OWN
+// selection: which one of the four things it knows, plus the evidence for the three it is not in.
+//
+// # Why it is an interface here rather than a concrete type
+//
+// The Box must not care which group implementation it is reading - the capability is the contract,
+// exactly as physicalpath's optional hop reporters are. A group that does not implement it keeps the
+// model's References-derived answer, which is the right answer for a group that publishes one.
+type selectionStatusReporter interface {
+	SelectionStatus() boxGroup.SelectionReport
+}
+
+// newStatusSurface builds the pair a Box owns: the read-only view, and the read-only walk it answers
+// through. It is a named function so the construction `New` performs is the construction a test can
+// perform, which is what lets a lifecycle test drive the real view rather than a look-alike.
+//
+// lookup MUST be read-only and MUST NOT create anything; see the Resolver contract in
+// common/physicalpath. The Snapshot is deliberately empty - see the call site in New for why an
+// entry there would state a selection the group has not committed.
+func newStatusSurface(lookup func(tag string) (adapter.Outbound, bool)) (*physicalpath.StatusView, *physicalpath.Resolver) {
+	return physicalpath.NewStatusView(), physicalpath.NewResolver(lookup, physicalpath.Snapshot{})
+}
+
+// Status reports the read-only status of the path the named root currently resolves to.
+//
+// This is the whole of the Box's status surface, and it is OPTIONAL: nothing in this Box's own
+// lifecycle calls it, and a client that never does pays one mutex and one closure. It exists so a
+// client CAN read it - the model in common/physicalpath is only useful once something in the
+// lifecycle owns a view, and until now nothing did.
+//
+// # What it answers, and what it refuses to answer
+//
+// The result is a VALUE: every field is a copy, taken for this call. It describes the hops `Build`
+// reconstructs in PACKET order, each with the readiness its owner reports, the error it has already
+// observed, and its capacity. A hop that reports nothing is UNKNOWN with a reason; "the object was
+// constructed" is never returned as "the peer answers".
+//
+//   - Before Start, an outbound exists but has committed no selection, so a group reports no live
+//     member and the path is UNKNOWN - never the configuration's default, never a cachefile's stored
+//     preference, and never READY.
+//   - After Close - including a Close reached through a failed Start - the view is disconnected and
+//     the answer says so, whatever the caller asks for.
+//   - A Box that has no view at all answers the same way rather than with a blank PathStatus, which
+//     would read as "a path was walked and nothing was wrong with it".
+//
+// network is the flow the question is about ("tcp", "udp", or "" for no requirement). root is a tag
+// in the outbound or ENDPOINT namespace - the same namespace the dial path resolves in.
+//
+// # Read-only, in the strong sense
+//
+// It dials nothing, resolves nothing, starts nothing, measures no latency, runs no URLTest, and
+// takes no selection. The walk it performs is `Build`, whose preview consumes no group state, and the
+// only group method this file calls itself is `SelectionStatus`, which is documented and tested as a
+// read that changes nothing. It holds no lock across a call into a hop, so a hop reporter may call it
+// back - a re-entrant read performs its own walk and neither sees nor disturbs the outer one.
+//
+// # The one cost, stated rather than hidden
+//
+// Explaining a group that has committed nothing asks that group for its own report, and an unstarted
+// selector answers from the cachefile - the same read-only `LoadSelected` its own Start performs. It
+// is a bounded read of state the selector already owns, not a probe, and it happens only while no
+// member is live; once a member is committed the report is an atomic load. A caller reading a
+// diagnostic before Start is the caller who most needs the preference named, so the read is bought
+// deliberately rather than avoided.
+//
+// # Why the view is not handed out
+//
+// A `*physicalpath.StatusView` carries the one mutator in this surface - `Disconnect` - so returning
+// it would let a caller detach the Box's own diagnostic, or hand a second component a capability to
+// do so. This method returns values instead, and a caller that mutates what it gets back changes
+// nothing here: the next call walks the graph again.
+func (s *Box) Status(root string, network string) physicalpath.PathStatus {
+	status := s.statusView.SnapshotStatus(
+		s.statusResolver,
+		physicalpath.TagOrOutbound{Tag: root},
+		physicalpath.Options{Network: network},
+	)
+	// The control nodes are re-read from each group's own report. It is skipped entirely when there
+	// is no resolver to look a group up through, which is also the case for the answers that never
+	// walked - an absent or disconnected view has no controls to explain.
+	if s.statusResolver == nil {
+		return status
+	}
+	for index := range status.Controls {
+		s.explainSelection(&status.Controls[index])
+	}
+	return status
+}
+
+// explainSelection replaces the model's References-derived answer for one control node with the
+// group's OWN report, when the group publishes one.
+//
+// # Why the group's own report is the authority
+//
+// `physicalpath`'s control node is derived from `adapter.Referrer`, which publishes the COMMITTED
+// member and nothing else. That is never wrong, and it is not the whole answer: from it a reader
+// cannot tell whether nothing is committed because the configuration names a default, because a
+// cachefile holds a stored preference, or because there is no preference at all. Those are three
+// different facts with three different remedies, and `SelectionStatus` is the read that separates
+// them.
+//
+// # The one rule
+//
+// `Committed` is true EXACTLY when the group reports its live slot filled, and the decision is the
+// member that slot holds. A configured default (`SelectionConfigured`) and a stored preference
+// (`SelectionPersisted`) are PREFERENCES - what a start WOULD install, not what any flow takes - so
+// neither is ever reported as this group's decision. Presenting one as the current value would
+// describe a route the traffic may not take, which is the same defect `protocol/group/selector.go`'s
+// References() was corrected for; this is where the Box stops it from reaching a caller.
+func (s *Box) explainSelection(node *physicalpath.ControlNode) {
+	object, loaded := s.statusResolver.Lookup(node.Tag)
+	if !loaded || object == nil {
+		return
+	}
+	reporter, isReporter := object.(selectionStatusReporter)
+	if !isReporter {
+		// A group that does not publish its own selection - a urltest, a balancing group - keeps
+		// the model's answer. It is not second best: for a per-flow group the model's "no single
+		// decision describes this path" is exactly right.
+		return
+	}
+	report := reporter.SelectionStatus()
+	if report.State == boxGroup.SelectionCommitted {
+		node.Decision = report.Committed
+		node.Committed = true
+		node.Reason = ""
+		return
+	}
+	// Nothing is committed. The decision field stays EMPTY - a preference is not a decision - and
+	// the reason names which of the three remaining states this is, with its evidence.
+	node.Decision = ""
+	node.Committed = false
+	var reason strings.Builder
+	reason.WriteString("this group has committed no member, so no single member describes the traffic it carries; " +
+		"its selection is ")
+	reason.WriteString(report.State.String())
+	switch report.State {
+	case boxGroup.SelectionConfigured:
+		reason.WriteString(": the configuration names ")
+		reason.WriteString(quoteTag(report.ConfiguredDefault))
+		reason.WriteString(" as this group's default, which is the preference a start would install and not what any flow takes")
+	case boxGroup.SelectionPersisted:
+		reason.WriteString(": the cachefile holds ")
+		reason.WriteString(quoteTag(report.Persisted))
+		reason.WriteString(" as this group's stored selection, which this group declares, and which is likewise a preference a start would restore rather than a commitment")
+	default:
+		reason.WriteString(": neither the configuration nor the cachefile names a member, and the group has not started")
+	}
+	if report.PersistedRejected != "" {
+		reason.WriteString("; the cachefile holds ")
+		reason.WriteString(quoteTag(report.PersistedRejected))
+		reason.WriteString(", which this group does not declare, so it was refused")
+	}
+	node.Reason = reason.String()
+}
+
+// quoteTag renders a configuration tag the way a diagnostic should show it: quoted, so an empty or
+// whitespace-bearing tag is visible as itself rather than as a gap in the sentence.
+func quoteTag(tag string) string {
+	return "\"" + tag + "\""
 }
 
 func (s *Box) CreatedAt() time.Time {
