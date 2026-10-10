@@ -366,30 +366,28 @@ func (f *rebindFixture) proveStandardBindBranch(t *testing.T) {
 	f.establishSocketsPerStandardBind(t)
 }
 
-// establishSocketsPerStandardBind takes the first settled socket reading on this machine and requires the
-// socket-count instrument to agree with it from then on. See socketsPerStandardBind for why the count is
-// measured rather than written down.
+// establishSocketsPerStandardBind records what one settled standard bind holds ON THIS MACHINE.
 //
-// It runs AFTER the three checks above, on a fixture that has proved it is on the standard bind and is
-// settled, so the reading is of exactly the object the assertions below count.
+// It runs AFTER the three checks above, on a fixture that has proved it is on the standard bind
+// and is settled, so the reading is of exactly the object the assertions below count.
+//
+// This used to be a second, self-contained memo: it took the FIRST reading and then required every
+// later one to equal it. That is wrong twice over, and the second failure is the one CI saw.
+//
+//   - A standard bind does not reach its full set of receivers atomically: `StdNetBind.Open` listens
+//     on udp4, listens on udp6, and only then starts one receiver per listener. A reading taken while
+//     the bind is still coming up legitimately sees fewer, so "equal to the first reading" is not a
+//     property of a correct endpoint.
+//   - Because it was a duplicate, the measured helper below was dead code, so the fix that was
+//     supposed to replace it never ran. MEASURED on the macOS runner, where the full set is 1:
+//     the readings within one process were 0 and 1, and this assertion failed on both.
 func (f *rebindFixture) establishSocketsPerStandardBind(t *testing.T) {
 	t.Helper()
 	observed := deviceReceiveCensus(f.endpoint.device.Load())
-	socketCountMu.Lock()
-	defer socketCountMu.Unlock()
-	if socketsPerStandardBind == socketCountUnmeasured {
-		require.NotZero(t, observed,
-			"the socket census counted no receive goroutines on a settled standard bind, so it is not "+
-				"measuring sockets at all and every assertion that compares against it would be vacuous")
-		socketsPerStandardBind = observed
-		t.Logf("SOCKETS_PER_STANDARD_BIND=%d (established on this machine)", observed)
-		return
+	settled := measuredSocketsPerStandardBind(t, observed)
+	if observed != 0 && observed == settled {
+		t.Logf("SOCKETS_PER_STANDARD_BIND=%d (established on this machine)", settled)
 	}
-	require.Equal(t, socketsPerStandardBind, observed,
-		"a settled standard bind must hold the same number of receivers every time on this machine; the "+
-			"first reading established %d and this one saw %d, so the count is not stable and the "+
-			"assertions built on it would be measuring drift rather than the endpoint's state",
-		socketsPerStandardBind, observed)
 }
 
 // livePort reads the port the running device reports.
