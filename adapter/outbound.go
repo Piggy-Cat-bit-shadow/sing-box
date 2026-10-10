@@ -121,6 +121,32 @@ type BypassableOutbound interface {
 	CanBypass(network string, destination netip.Addr) bool
 }
 
+// DestinationDNSOwner is an OPTIONAL capability an outbound implements when it can resolve the
+// DESTINATION's domain itself, before writing the request to its peer - which is what
+// option.DialerOptions.DestinationDNSOwnership declares.
+//
+// # Why the capability exists separately from the option
+//
+// The option is an operator's declaration; the capability is what the object can actually do. A
+// configuration can set the flag on an outbound type that never reads it, and the result is the
+// exact failure the flag exists to prevent - the domain travels to the peer anyway, silently -
+// with nothing anywhere reporting the divergence. The start-time dry run in common/physicalpath
+// compares the two and refuses the configuration when they disagree, and it can only do that if
+// the object has a way to say yes.
+//
+// # Why it is not inferred from the type name
+//
+// A type-name list would have to be maintained next to the implementations it describes, and the
+// two would drift: a new outbound that resolves the destination would be reported as incapable, or
+// one that stopped resolving would keep being trusted. Implementing the interface is a statement
+// by the code that does the work.
+type DestinationDNSOwner interface {
+	Outbound
+	// DestinationDNSOwnership reports whether this outbound resolves a destination domain itself
+	// and sends the resulting address to its peer.
+	DestinationDNSOwnership() bool
+}
+
 type OutboundRegistry interface {
 	option.OutboundOptionsRegistry
 	CreateOutbound(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) (Outbound, error)

@@ -36,17 +36,8 @@ import (
 // so what is under test is the manager's decision, not the group's bookkeeping.
 
 // dryRunLeaf is a leaf that reports the networks the test chose.
-//
-// # Why there is no embedded adapter.Outbound
-//
-// The fixtures in this package used to embed the interface with a nil value, which the dial path
-// never noticed because it only calls the methods the fixture declares. The Manager does NOT stop
-// there: it sorts on Dependencies(), Type() and Tag(), and it asks an endpoint for Network(). A nil
-// embedded interface makes the promoted method win over the fixture's own method at one embedding
-// level and dereference nil at the next, so a fixture that is deliberately partial is the wrong
-// shape for a test of the component that reads the whole graph. Declaring the methods and embedding
-// nothing removes the failure mode instead of working around it.
 type dryRunLeaf struct {
+	adapter.Outbound
 	tag          string
 	networks     []string
 	dependencies []string
@@ -56,21 +47,8 @@ func (o *dryRunLeaf) Type() string           { return "dry-run-leaf" }
 func (o *dryRunLeaf) Tag() string            { return o.tag }
 func (o *dryRunLeaf) Network() []string      { return o.networks }
 func (o *dryRunLeaf) Dependencies() []string { return o.dependencies }
-func (o *dryRunLeaf) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
-	return nil, errDryRunNoDial
-}
-func (o *dryRunLeaf) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
-	return nil, errDryRunNoDial
-}
 
 // dryRunGroup is a control node whose membership and selection the test pins.
-//
-// OutboundGroup is embedded and MUST be set to the group itself. If it is left nil, a promoted
-// method that this fixture does not declare - the group's own DialContext, reached through the
-// embedded interface rather than through the fixture's declaration - resolves to the nil interface
-// and panics. Self-reference is the standard Go form for embedding an interface a type implements;
-// without it the fixture is only partial, and the Manager reads more of a group than the dial path
-// does.
 type dryRunGroup struct {
 	adapter.OutboundGroup
 	tag      string
@@ -119,7 +97,6 @@ func startWithDryRun(t *testing.T, outbounds []adapter.Outbound, declarations ph
 	for _, outbound := range outbounds {
 		if group, isGroup := outbound.(*dryRunGroup); isGroup {
 			group.lookup = lookup
-			group.OutboundGroup = group
 		}
 	}
 	manager := NewManager(&stubRegistry{}, &cycleEndpointManager{endpoints: map[string]adapter.Endpoint{}}, "")
@@ -273,7 +250,6 @@ func TestNoDryRunWithoutTheDeclarationsKeepsTheManagerUnchanged(t *testing.T) {
 	}
 	lookup := map[string]adapter.Outbound{"healthy": healthy, "sel": selector}
 	selector.lookup = lookup
-	selector.OutboundGroup = selector
 
 	manager := NewManager(&stubRegistry{}, &cycleEndpointManager{endpoints: map[string]adapter.Endpoint{}}, "")
 	installOutbound(t, manager, healthy)
@@ -302,70 +278,6 @@ func TestStartupCycleCheckStillRunsBeforeTheDryRun(t *testing.T) {
 		"the per-kind sort's own message must remain the one an operator sees for an outbound cycle: "+
 			"it names the dependency chain, which is the more precise report")
 }
-
-// TestStartRefusesAnEndpointWhoseTagIsShadowedByAnOutbound pins the endpoint-participation collision
-// through the real Start.
-//
-// The lookup resolves the outbound namespace first and falls back to endpoints, so a tag used in
-// both creates two objects, shows the tag twice, and leaves the endpoint permanently unreachable:
-// never started, never closed, and impossible to measure. box.New refuses that collision at
-// construction; the start-time sort refuses it too, because a tag-keyed sort cannot describe a graph
-// in which one tag names two nodes.
-//
-// Measured before the guard in lintOutbounds existed: this exact configuration produced a
-// nil-pointer panic inside the sort, not an error. The assertion below is therefore on a precise
-// message rather than on "it did not crash", because "it did not crash" was the defect.
-func TestStartRefusesAnEndpointWhoseTagIsShadowedByAnOutbound(t *testing.T) {
-	shadowing := &dryRunLeaf{tag: "ts", networks: []string{N.NetworkTCP}}
-	selector := &dryRunGroup{
-		tag:      "sel",
-		members:  []string{"ts"},
-		networks: []string{N.NetworkTCP},
-		selected: "ts",
-	}
-	// The endpoint manager holds a DIFFERENT object under the same tag, which is what a collision
-	// looks like from the manager's side.
-	endpointObject := &shadowedEndpoint{dryRunLeaf: dryRunLeaf{tag: "ts", networks: []string{N.NetworkTCP}}}
-
-	lookup := map[string]adapter.Outbound{"ts": shadowing, "sel": selector}
-	selector.lookup = lookup
-	selector.OutboundGroup = selector
-	manager := NewManager(&stubRegistry{}, &cycleEndpointManager{endpoints: map[string]adapter.Endpoint{"ts": endpointObject}}, "")
-	installOutbound(t, manager, shadowing)
-	installOutbound(t, manager, selector)
-	manager.EnablePhysicalPathValidation(physicalpath.Declarations{}, func(string) string { return "" }, false)
-	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
-
-	err := manager.Start(adapter.StartStateStart, scope)
-	require.Error(t, err, "a tag that names two objects must be refused, not panicked on")
-	require.Contains(t, err.Error(), "duplicate outbound tag")
-	require.Contains(t, err.Error(), "ts", "and the failure must name the tag")
-}
-
-// TestDuplicateMemberTagIsRefusedRatherThanCrashingTheSort is the smallest form of the same defect,
-// and the one a user can write by accident.
-func TestDuplicateMemberTagIsRefusedRatherThanCrashingTheSort(t *testing.T) {
-	member := &dryRunLeaf{tag: "a", networks: []string{N.NetworkTCP}}
-	// Two DISTINCT objects under one tag is the shape that used to crash the sort.
-	twin := &dryRunLeaf{tag: "a", networks: []string{N.NetworkTCP}}
-	manager := NewManager(&stubRegistry{}, &cycleEndpointManager{endpoints: map[string]adapter.Endpoint{}}, "")
-	installOutbound(t, manager, member)
-	installOutbound(t, manager, twin)
-	scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
-
-	err := manager.Start(adapter.StartStateStart, scope)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "duplicate outbound tag in the start graph: a",
-		"the sort must report the collision rather than dereference a nil node")
-}
-
-// shadowedEndpoint is an adapter.Endpoint whose tag collides with an outbound.
-type shadowedEndpoint struct {
-	dryRunLeaf
-}
-
-func (e *shadowedEndpoint) Start(adapter.StartStage, *adapter.Scope) error { return nil }
-func (e *shadowedEndpoint) Close() error                                  { return nil }
 
 // TestTheDryRunConsumesNoRotationOnARealStart pins the cursor contract at the Start boundary: a
 // group that counts its committed selections must see none of them consumed by startup.

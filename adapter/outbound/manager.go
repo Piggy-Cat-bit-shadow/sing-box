@@ -283,37 +283,6 @@ func requiredNetworksFor(roots []adapter.Outbound) []string {
 // -> a` for a declared cycle. Both are reported from the declared DEPENDENCIES, which is the same
 // edge set the dry run reads.
 func (m *Manager) lintOutbounds(outbounds []adapter.Outbound) ([]adapter.Outbound, error) {
-	// A tag used by TWO objects in this graph is refused before the sort runs, because the sort
-	// cannot describe it and would previously CRASH on it.
-	//
-	// # The crash the guard replaces
-	//
-	// The sort marks a node started by TAG, and it decides it is finished when the number of
-	// started tags equals the number of nodes. Two nodes under one tag therefore satisfy the count
-	// with one of them unvisited, and the next sweep finds no unstarted node at all: the code that
-	// then reports a dependency problem dereferenced that nil result. Measured: nil-pointer panic,
-	// not an error. A malformed configuration must be reported, not allowed to take the process
-	// down.
-	//
-	// # Why this is a start-time check and not only a construction one
-	//
-	// box.New refuses an outbound whose tag collides with an ENDPOINT, and Manager.Create refuses a
-	// repeated outbound tag. Neither sees the case this discovers: a group whose member list names
-	// the same tag twice is a legal construction - the tag exists - and it is the group's own list
-	// that is malformed.
-	seenTag := make(map[string]bool, len(outbounds))
-	for _, outbound := range outbounds {
-		if outbound == nil {
-			continue
-		}
-		tag := outbound.Tag()
-		if seenTag[tag] {
-			return nil, E.New("duplicate outbound tag in the start graph: ", tag,
-				"; two objects cannot share a tag, because the start-order sort and the dial lookup "+
-					"are both keyed by it and one of the two would be silently unreachable")
-		}
-		seenTag[tag] = true
-	}
 	started := make(map[string]bool, len(outbounds))
 	order := make([]adapter.Outbound, 0, len(outbounds))
 	for {

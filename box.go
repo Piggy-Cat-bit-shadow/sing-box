@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/netns"
+	"github.com/sagernet/sing-box/common/physicalpath"
 	"github.com/sagernet/sing-box/common/power"
 	"github.com/sagernet/sing-box/common/runtimecoord"
 	"github.com/sagernet/sing-box/common/taskmonitor"
@@ -175,6 +176,43 @@ func Context(
 		ctx = service.ContextWith[adapter.CertificateProviderRegistry](ctx, certificateProviderRegistry)
 	}
 	return ctx
+}
+
+// declaredDestinationDNSOwnership collects the tags whose CONFIGURATION declared
+// dialer_options.destination_dns_ownership.
+//
+// # Why it is collected here rather than read from the object later
+//
+// The declaration and the object are two different things, and the whole value of the start-time
+// check is comparing them: an outbound type that does not read the field produces an object that
+// cannot report it, and the configuration would otherwise look honoured while every destination
+// name travels to the peer. The configuration text is the only place the declaration exists, and
+// the Box is what holds it.
+//
+// Both namespaces are walked, because the field lives on the shared DialerOptions: an endpoint
+// that declares it is exactly as much a downstream hop as an outbound that does.
+func declaredDestinationDNSOwnership(options option.Options) physicalpath.Declarations {
+	declarations := physicalpath.Declarations{DestinationDNSOwnership: make(map[string]bool)}
+	record := func(tag string, index int, entryOptions any) {
+		name := tag
+		if name == "" {
+			name = F.ToString(index)
+		}
+		wrapper, isWrapper := entryOptions.(option.DialerOptionsWrapper)
+		if !isWrapper {
+			return
+		}
+		if wrapper.TakeDialerOptions().DestinationDNSOwnership {
+			declarations.DestinationDNSOwnership[name] = true
+		}
+	}
+	for index, outboundOptions := range options.Outbounds {
+		record(outboundOptions.Tag, index, outboundOptions.Options)
+	}
+	for index, endpointOptions := range options.Endpoints {
+		record(endpointOptions.Tag, index, endpointOptions.Options)
+	}
+	return declarations
 }
 
 // ensureURLTestServices supplies the URL-test services a Box needs, if the caller has not.
@@ -353,6 +391,29 @@ func New(options Options) (*Box, error) {
 	endpointManager := endpoint.NewManager(endpointRegistry)
 	inboundManager := inbound.NewManager(inboundRegistry, endpointManager)
 	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, routeOptions.Final)
+	// The reachable-leaf dry run needs three facts the outbound objects cannot report themselves:
+	// which tags DECLARED destination_dns_ownership, how a domain resolver is derived for one of
+	// them, and whether the network layer configures a resolver that applies when an outbound
+	// declares none. See adapter/outbound/manager.go for why the check itself lives in the manager
+	// rather than here, and common/physicalpath/dryrun.go for the per-leaf contract.
+	//
+	// The resolver derivation reads Adapter.DomainResolverReference, which is the SAME edge
+	// route/reference.go walks and the same one common/dialer builds the ResolveDialer from, so
+	// the dry run and the dial path cannot disagree about which transport an outbound uses.
+	outboundManager.EnablePhysicalPathValidation(
+		declaredDestinationDNSOwnership(options.Options),
+		func(tag string) string {
+			outboundToCheck, loaded := outboundManager.Outbound(tag)
+			if !loaded {
+				return ""
+			}
+			if provider, isProvider := outboundToCheck.(interface{ DomainResolverReference() string }); isProvider {
+				return provider.DomainResolverReference()
+			}
+			return ""
+		},
+		common.PtrValueOrDefault(routeOptions.DefaultDomainResolver).Server != "",
+	)
 	dnsTransportManager := dns.NewTransportManager(dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(certificateProviderRegistry)

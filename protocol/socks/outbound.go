@@ -41,6 +41,8 @@ func RegisterOutbound(registry *outbound.Registry) {
 
 var _ adapter.Outbound = (*Outbound)(nil)
 
+var _ adapter.DestinationDNSOwner = (*Outbound)(nil)
+
 type Outbound struct {
 	outbound.Adapter
 	dnsRouter adapter.DNSRouter
@@ -200,6 +202,15 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	return outbound, nil
+}
+
+// DestinationDNSOwnership implements adapter.DestinationDNSOwner.
+//
+// It reports the fact the DIAL path above acts on, from the same field that path reads, so the
+// start-time dry run and the wire cannot disagree: a configuration that declares
+// destination_dns_ownership and finds this true is a configuration whose declaration is honoured.
+func (h *Outbound) DestinationDNSOwnership() bool {
+	return h.destinationDNSOwnership
 }
 
 // EarlyConnectionBufferGrowth implements adapter.ConnectionCopyTuner.

@@ -62,6 +62,16 @@ func (o *routeRecordingOutbound) Type() string      { return "recording" }
 func (o *routeRecordingOutbound) Tag() string       { return o.tag }
 func (o *routeRecordingOutbound) Network() []string { return o.networks }
 
+// Dependencies is declared explicitly rather than promoted from the embedded adapter.Outbound.
+//
+// The embedded field is nil in every fixture in this package, so the promoted method dereferences a
+// nil interface and panics. That was invisible while only the dial path used these objects; a
+// read-only walk of the object graph reads Dependencies() on every hop - which is what a detour
+// edge IS - so the promoted method would make every diagnostic over these fixtures crash.
+// Declaring it with the correct answer, no detour, is what the fixture's own contract already
+// implied.
+func (o *routeRecordingOutbound) Dependencies() []string { return nil }
+
 func (o *routeRecordingOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	o.access.Lock()
 	o.dials++
