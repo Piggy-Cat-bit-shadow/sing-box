@@ -279,7 +279,11 @@ still exist; check them first, and do not duplicate the work.
 - `P3.3` `Disconnect()` versus an in-flight snapshot: needs an explicit linearisation rule.
 - Also: a panicking reporter must not become a silent `READY`, and error strings must stay redacted.
 
-**`C:\Deepseek\内核\wC2` — C / Group (P2 + P4).** Owns `protocol/group/selector.go` and
+**`C:\Deepseek\内核\wC2` — C / Group (P2 + P4).** **P2 HAS LANDED** as `35246a212`, cherry-picked onto the tip as `96e6dc41`:
+872 insertions across `protocol/group/selector.go` and
+`protocol/group/selector_selection_state_test.go`. `protocol/group`, `route` and the root package are
+all green. **`physicalpath_edge_test.go` (P4) is still UNCOMMITTED in `wC2`** — it is a new untracked
+file, so check there before redoing P4. Owns `protocol/group/selector.go` and
 `common/physicalpath/dryrun.go`.
 - `P2` `Selector.References()` returns `s.tags[:1]` when `selected == nil`, even when `defaultTag` is a
   different member. **The trap**: `References()` may carry a structural role for the start-order sort
