@@ -193,6 +193,49 @@ const networkRequirementGroupNoMemberCanCarry = `{
   }
 }`
 
+// Case D2: case D with the outbounds declared in the OPPOSITE order.
+//
+// # Why the declaration order must not be a verdict
+//
+// The dry run validates each root on its own, and the same tag can be a root AND a dependency of
+// another root. If a tag that merely APPEARED in an earlier root's route could suppress a later
+// root's failure at it, then this fixture and case D would disagree while describing the same
+// graph - the verdict would be a property of the file's line order rather than of the
+// configuration.
+const networkRequirementUoTReversedOrder = `{
+  "log": {"disabled": true},
+  "outbounds": [
+    {"type": "socks", "tag": "uot", "server": "127.0.0.1", "server_port": 1080, "version": "5",
+     "udp_over_tcp": {"enabled": true}, "detour": "middle"},
+    {"type": "socks", "tag": "middle", "server": "127.0.0.1", "server_port": 1081,
+     "version": "5", "network": "tcp", "detour": "exit"},
+    {"type": "socks", "tag": "exit", "server": "127.0.0.1", "server_port": 1082, "version": "5"}
+  ],
+  "route": {
+    "rules": [
+      {"network": "udp", "outbound": "uot"},
+      {"network": "tcp", "outbound": "uot"}
+    ]
+  }
+}`
+
+// Case G3: case G with the group declared LAST, so the broken member's own root entry is validated
+// first.
+const networkRequirementGroupMemberFirst = `{
+  "log": {"disabled": true},
+  "outbounds": [
+    {"type": "socks", "tag": "udp-only", "server": "127.0.0.1", "server_port": 1081,
+     "version": "5", "network": "udp"},
+    {"type": "socks", "tag": "dual", "server": "127.0.0.1", "server_port": 1080, "version": "5"},
+    {"type": "selector", "tag": "sel", "outbounds": ["dual", "udp-only"], "default": "dual"}
+  ],
+  "route": {
+    "rules": [
+      {"network": "tcp", "outbound": "sel"}
+    ]
+  }
+}`
+
 // Case F1: a declared member that does not exist. The start-order sort owns this message and it
 // must keep owning it.
 const networkRequirementMissingMember = `{
@@ -267,6 +310,12 @@ var networkRequirementMatrix = []networkRequirementCase{
 		wantStart: true,
 	},
 	{
+		id:        "START-01-D2-uot-reversed-declaration-order",
+		why:       "the same graph declared in the other order must reach the same verdict: order is not a configuration property",
+		config:    networkRequirementUoTReversedOrder,
+		wantStart: true,
+	},
+	{
 		id:        "START-01-E-udp-route-to-tcp-only-leaf",
 		why:       "a route that explicitly delivers UDP to a leaf that declares tcp-only is a real defect and must stay refused",
 		config:    networkRequirementUDPRouteToTCPOnlyLeaf,
@@ -277,6 +326,13 @@ var networkRequirementMatrix = []networkRequirementCase{
 		id:        "START-01-G-group-with-illegal-reachable-member",
 		why:       "the routes deliver TCP to a network-blind selector, so its UDP-only member is genuinely illegal",
 		config:    networkRequirementGroupWithIllegalReachableMember,
+		wantStart: false,
+		wantErr:   []string{"cannot serve the tcp flow", "udp-only", "outbound/sel"},
+	},
+	{
+		id:        "START-01-G3-group-declared-last",
+		why:       "the group's illegal member must be refused whichever root is validated first",
+		config:    networkRequirementGroupMemberFirst,
 		wantStart: false,
 		wantErr:   []string{"cannot serve the tcp flow", "udp-only", "outbound/sel"},
 	},

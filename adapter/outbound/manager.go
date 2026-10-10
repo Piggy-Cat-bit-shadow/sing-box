@@ -228,7 +228,23 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 		entries = append(entries, rootEntry{root: endpoint, optional: true})
 	}
 	report := physicalpath.Report{}
+	// described is the set of tags a previous root already REPRESENTED, and it is what keeps one
+	// defect from being reported once per route that reaches it. It is filled from the tags this
+	// root actually covers.
 	described := make(map[string]bool)
+	// reported is the set of tags that were already the LEAF of a failure, and it is deliberately
+	// narrower than described.
+	//
+	// # Why a verdict cannot be suppressed by a tag that never failed
+	//
+	// The requirement is a fact about ONE root: what the routes proved reaches it, or what its own
+	// objects advertise. A tag that appeared in an earlier root's route WITHOUT failing has not
+	// been judged against this root's requirement, so suppressing its failure here makes the
+	// report depend on the order the outbounds happen to be declared in - the same configuration
+	// refused when a dependency is listed first and accepted when it is listed last. Filtering on
+	// the failures that were actually reported keeps the deduplication (one line per defect) and
+	// drops the order dependence.
+	reported := make(map[string]bool)
 	seenRoot := make(map[adapter.Outbound]bool)
 	for _, entry := range entries {
 		root := entry.root
@@ -246,9 +262,10 @@ func (m *Manager) validatePhysicalPaths(outbounds []adapter.Outbound, validation
 		report.Roots = append(report.Roots, rootReport.Roots...)
 		report.Nodes = append(report.Nodes, rootReport.Nodes...)
 		for _, failure := range rootReport.Failures {
-			if described[failure.Leaf] {
+			if reported[failure.Leaf] {
 				continue
 			}
+			reported[failure.Leaf] = true
 			report.Failures = append(report.Failures, failure)
 		}
 		// The set of tags this root DESCRIBED. The roots that follow must not repeat them: a
